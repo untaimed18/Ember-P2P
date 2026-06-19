@@ -51,14 +51,19 @@ impl FileIndexer {
             })
             .filter_map(|e| match e {
                 Ok(entry) => Some(entry),
-                Err(e) => { warn!("WalkDir error: {e}"); None }
+                Err(e) => {
+                    warn!("WalkDir error: {e}");
+                    None
+                }
             })
         {
             if entry.file_type().is_file() {
                 let name = entry.file_name().to_string_lossy();
                 // Skip temporary/partial download files
-                if name.ends_with(".part") || name.ends_with(".part.met")
-                    || name.ends_with(".met.tmp") || name.ends_with(".bak")
+                if name.ends_with(".part")
+                    || name.ends_with(".part.met")
+                    || name.ends_with(".met.tmp")
+                    || name.ends_with(".bak")
                 {
                     continue;
                 }
@@ -99,7 +104,8 @@ impl FileIndexer {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        let folder = path.parent()
+        let folder = path
+            .parent()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
 
@@ -147,8 +153,10 @@ impl FileIndexer {
     }
 
     /// Cancellable version -- computes both hashes in a single pass.
-    pub fn hash_file_cancellable(path: &Path, cancelled: &AtomicBool) -> anyhow::Result<(String, String)> {
+    pub fn hash_file_cancellable(
+        path: &Path,
+        cancelled: &AtomicBool,
+    ) -> anyhow::Result<(String, String)> {
         hash_file_combined_cancellable(path, cancelled)
     }
-
 }

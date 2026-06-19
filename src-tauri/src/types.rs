@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::network::kad::types::{DEFAULT_TCP_PORT, DEFAULT_UDP_PORT};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileInfo {
@@ -296,7 +296,11 @@ impl MediaMetadata {
 
     /// Wrap in `Some` only when at least one field is set.
     pub fn into_option(self) -> Option<MediaMetadata> {
-        if self.is_empty() { None } else { Some(self) }
+        if self.is_empty() {
+            None
+        } else {
+            Some(self)
+        }
     }
 }
 
@@ -643,7 +647,8 @@ pub struct Ed2kDownloadLimits {
 impl AppSettings {
     pub fn ed2k_download_limits(&self) -> Ed2kDownloadLimits {
         let gib = self.max_download_file_size_gib.clamp(1, 16_384) as u128;
-        let max_download_bytes = (gib.saturating_mul(1024 * 1024 * 1024)).min(u64::MAX as u128) as u64;
+        let max_download_bytes =
+            (gib.saturating_mul(1024 * 1024 * 1024)).min(u64::MAX as u128) as u64;
         Ed2kDownloadLimits {
             queue_wait_secs: self.download_queue_wait_secs.clamp(60, 14400),
             multisource_retry_rounds: self.multisource_retry_rounds.clamp(1, 20),
@@ -862,7 +867,10 @@ fn default_close_to_tray_behavior() -> String {
 impl Default for AppSettings {
     fn default() -> Self {
         let download_dir = directories::UserDirs::new()
-            .and_then(|d| d.download_dir().map(|p| p.join("Ember").to_string_lossy().to_string()))
+            .and_then(|d| {
+                d.download_dir()
+                    .map(|p| p.join("Ember").to_string_lossy().to_string())
+            })
             .unwrap_or_else(|| {
                 std::path::PathBuf::from(std::env::temp_dir())
                     .join("Ember")

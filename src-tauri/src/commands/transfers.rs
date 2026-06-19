@@ -9,7 +9,10 @@ use crate::network::NetworkCommand;
 use crate::sharing::manager::TransferControl;
 use crate::types::*;
 
-async fn db_blocking<F>(f: F) where F: FnOnce() + Send + 'static {
+async fn db_blocking<F>(f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
     if let Err(e) = tokio::task::spawn_blocking(f).await {
         tracing::warn!("DB task failed: {e}");
     }
@@ -19,14 +22,20 @@ fn parse_peer_ip(peer_id: &str) -> String {
     if let Ok(addr) = peer_id.parse::<std::net::SocketAddr>() {
         return addr.ip().to_string();
     }
-    peer_id.rsplit_once(':').map(|(ip, _)| ip.to_string()).unwrap_or_default()
+    peer_id
+        .rsplit_once(':')
+        .map(|(ip, _)| ip.to_string())
+        .unwrap_or_default()
 }
 
 fn parse_peer_port(peer_id: &str) -> u16 {
     if let Ok(addr) = peer_id.parse::<std::net::SocketAddr>() {
         return addr.port();
     }
-    peer_id.rsplit_once(':').and_then(|(_, p)| p.parse().ok()).unwrap_or(0)
+    peer_id
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse().ok())
+        .unwrap_or(0)
 }
 
 fn transfer_status_key(status: &TransferStatus) -> &'static str {
@@ -52,7 +61,10 @@ pub(crate) async fn persist_transfer(state: &AppState, transfer: &Transfer) {
     let transfer = transfer.clone();
     match tokio::task::spawn_blocking(move || db.save_transfer(&transfer)).await {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::warn!("Failed to persist transfer {}: {e}", transfer_id_short(&tid)),
+        Ok(Err(e)) => tracing::warn!(
+            "Failed to persist transfer {}: {e}",
+            transfer_id_short(&tid)
+        ),
         Err(e) => tracing::warn!("Transfer persist task panicked: {e}"),
     }
 }
@@ -135,12 +147,20 @@ async fn delete_with_retry(path: &Path, max_attempts: u32, delay_ms: u64) {
             Err(e) if attempt + 1 < max_attempts => {
                 tracing::debug!(
                     "Delete {} attempt {}/{} failed ({}), retrying...",
-                    path.display(), attempt + 1, max_attempts, e
+                    path.display(),
+                    attempt + 1,
+                    max_attempts,
+                    e
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             }
             Err(e) => {
-                tracing::warn!("Failed to delete {} after {} attempts: {}", path.display(), max_attempts, e);
+                tracing::warn!(
+                    "Failed to delete {} after {} attempts: {}",
+                    path.display(),
+                    max_attempts,
+                    e
+                );
             }
         }
     }
@@ -191,10 +211,7 @@ pub async fn sweep_orphan_part_files(
     let mut entries = match tokio::fs::read_dir(&temp_dir).await {
         Ok(e) => e,
         Err(e) => {
-            tracing::warn!(
-                "Orphan sweep: failed to read {}: {e}",
-                temp_dir.display()
-            );
+            tracing::warn!("Orphan sweep: failed to read {}: {e}", temp_dir.display());
             return;
         }
     };
@@ -236,10 +253,7 @@ pub async fn sweep_orphan_part_files(
             }
             Err(e) => {
                 failed += 1;
-                tracing::warn!(
-                    "Orphan sweep: failed to remove {}: {e}",
-                    path.display()
-                );
+                tracing::warn!("Orphan sweep: failed to remove {}: {e}", path.display());
             }
         }
     }
@@ -310,7 +324,10 @@ pub async fn start_download(
             // Strip IPv6 brackets if present so the network task's
             // `Ipv4Addr::parse` path matches. IPv6 sources aren't
             // supported on the eD2K download path; drop them now.
-            let ip_str = ip_part.trim_start_matches('[').trim_end_matches(']').to_string();
+            let ip_str = ip_part
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_string();
             ip_str.parse::<std::net::Ipv4Addr>().ok()?;
             Some((ip_str, port))
         })
@@ -624,9 +641,9 @@ pub async fn cancel_transfers_batch(
     for transfer_id in transfer_ids {
         let (promoted, cancelled_info) = {
             let mut manager = state.transfer_manager.write().await;
-            let info = manager.get_transfer(&transfer_id).map(|t| {
-                (t.file_hash.clone(), t.file_name.clone(), t.total_size)
-            });
+            let info = manager
+                .get_transfer(&transfer_id)
+                .map(|t| (t.file_hash.clone(), t.file_name.clone(), t.total_size));
             if let Some(control) = manager.get_control(&transfer_id) {
                 control.cancel();
             }
@@ -634,7 +651,10 @@ pub async fn cancel_transfers_batch(
         };
         if let Some((file_hash, file_name, file_size)) = cancelled_info {
             let db = state.db.clone();
-            db_blocking(move || { let _ = db.record_download_history(&file_hash, &file_name, file_size, "cancelled"); }).await;
+            db_blocking(move || {
+                let _ = db.record_download_history(&file_hash, &file_name, file_size, "cancelled");
+            })
+            .await;
         }
         for p in promoted {
             promoted_by_id.entry(p.id.clone()).or_insert(p);
@@ -658,7 +678,10 @@ pub async fn cancel_transfers_batch(
         {
             let db = state.db.clone();
             let tid = transfer_id.clone();
-            db_blocking(move || { let _ = db.remove_transfer(&tid); }).await;
+            db_blocking(move || {
+                let _ = db.remove_transfer(&tid);
+            })
+            .await;
         }
     }
     let promoted: Vec<Transfer> = promoted_by_id.into_values().collect();
@@ -722,7 +745,10 @@ pub async fn stop_transfer(
 /// Completed file in `Downloads/`, or in-progress `.part` in `Temp/`.
 /// Always prefers the final file in Downloads/ over the .part in Temp/ so
 /// that a stale in-memory status never misdirects the user.
-fn resolve_transfer_reveal_path(transfer: &Transfer, download_folder: &str) -> Result<PathBuf, String> {
+fn resolve_transfer_reveal_path(
+    transfer: &Transfer,
+    download_folder: &str,
+) -> Result<PathBuf, String> {
     if transfer.direction != TransferDirection::Download {
         return Err(coded("transfers_not_a_download", "Not a download"));
     }
@@ -753,7 +779,10 @@ fn resolve_transfer_reveal_path(transfer: &Transfer, download_folder: &str) -> R
         .canonicalize()
         .map_err(|e| coded_ctx("transfers_invalid_base", "Invalid base", e))?;
     if !canonical.starts_with(&canonical_base) {
-        return Err(coded("transfers_path_escapes_dir", "File path escapes download directory"));
+        return Err(coded(
+            "transfers_path_escapes_dir",
+            "File path escapes download directory",
+        ));
     }
     Ok(canonical)
 }
@@ -764,11 +793,17 @@ fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
     // NTFS paths cannot contain `"` but a crafted / non-NTFS path could.
     // Reject it outright so we never interpolate user-controlled quote
     // characters into the raw command line below.
-    let path_str = path
-        .to_str()
-        .ok_or_else(|| coded("transfers_path_non_utf8", "Path contains non-UTF8 characters"))?;
+    let path_str = path.to_str().ok_or_else(|| {
+        coded(
+            "transfers_path_non_utf8",
+            "Path contains non-UTF8 characters",
+        )
+    })?;
     if path_str.contains('"') || path_str.contains('\0') {
-        return Err(coded("transfers_path_unsupported_chars", "Path contains unsupported characters"));
+        return Err(coded(
+            "transfers_path_unsupported_chars",
+            "Path contains unsupported characters",
+        ));
     }
     // explorer.exe doesn't understand \\?\-prefixed long paths — strip it so
     // the /select, argument resolves against the user-visible namespace.
@@ -777,24 +812,40 @@ fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
     std::process::Command::new("explorer")
         .raw_arg(raw)
         .spawn()
-        .map_err(|e| coded_ctx("transfers_open_explorer_failed", "Failed to open File Explorer", e))?;
+        .map_err(|e| {
+            coded_ctx(
+                "transfers_open_explorer_failed",
+                "Failed to open File Explorer",
+                e,
+            )
+        })?;
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
 fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
-    let path_str = path.to_str().ok_or_else(|| coded("transfers_invalid_path_encoding", "Invalid path encoding"))?;
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| coded("transfers_invalid_path_encoding", "Invalid path encoding"))?;
     std::process::Command::new("open")
         .args(["-R", path_str])
         .spawn()
-        .map_err(|e| coded_ctx("transfers_reveal_finder_failed", "Failed to reveal in Finder", e))?;
+        .map_err(|e| {
+            coded_ctx(
+                "transfers_reveal_finder_failed",
+                "Failed to reveal in Finder",
+                e,
+            )
+        })?;
     Ok(())
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
     use std::process::Command;
-    let path_str = path.to_str().ok_or_else(|| coded("transfers_invalid_path_encoding", "Invalid path encoding"))?;
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| coded("transfers_invalid_path_encoding", "Invalid path encoding"))?;
     for cmd in ["nautilus", "dolphin", "nemo"] {
         if Command::new(cmd)
             .args(["--select", path_str])
@@ -809,7 +860,10 @@ fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
             .map_err(|e| coded_ctx("transfers_open_folder_failed", "Failed to open folder", e))?;
         return Ok(());
     }
-    Err(coded("transfers_open_location_failed", "Could not open file location"))
+    Err(coded(
+        "transfers_open_location_failed",
+        "Could not open file location",
+    ))
 }
 
 #[tauri::command]
@@ -818,13 +872,14 @@ pub async fn open_transfer_file_location(
     transfer_id: String,
 ) -> Result<(), String> {
     let (transfer, dl_folder) = {
-        let (mgr, cfg) = tokio::join!(
-            state.transfer_manager.read(),
-            state.config.read(),
-        );
-        (mgr.get_transfer(&transfer_id).cloned(), cfg.settings.download_folder.clone())
+        let (mgr, cfg) = tokio::join!(state.transfer_manager.read(), state.config.read(),);
+        (
+            mgr.get_transfer(&transfer_id).cloned(),
+            cfg.settings.download_folder.clone(),
+        )
     };
-    let transfer = transfer.ok_or_else(|| coded("transfers_transfer_not_found", "Transfer not found"))?;
+    let transfer =
+        transfer.ok_or_else(|| coded("transfers_transfer_not_found", "Transfer not found"))?;
     // `resolve_transfer_reveal_path` performs several `canonicalize()`/`is_file()`
     // syscalls; run path resolution AND the reveal together on the blocking pool
     // so a slow path (network/cloud/AV-locked) can't stall the async runtime and
@@ -833,8 +888,8 @@ pub async fn open_transfer_file_location(
         let path = resolve_transfer_reveal_path(&transfer, &dl_folder)?;
         reveal_in_file_manager(&path)
     })
-        .await
-        .map_err(|e| coded_ctx("transfers_reveal_task_failed", "Reveal task failed", e))??;
+    .await
+    .map_err(|e| coded_ctx("transfers_reveal_task_failed", "Reveal task failed", e))??;
     Ok(())
 }
 
@@ -844,19 +899,22 @@ pub async fn open_file(
     transfer_id: String,
 ) -> Result<(), String> {
     let (transfer, dl_folder) = {
-        let (mgr, cfg) = tokio::join!(
-            state.transfer_manager.read(),
-            state.config.read(),
-        );
-        (mgr.get_transfer(&transfer_id).cloned(), cfg.settings.download_folder.clone())
+        let (mgr, cfg) = tokio::join!(state.transfer_manager.read(), state.config.read(),);
+        (
+            mgr.get_transfer(&transfer_id).cloned(),
+            cfg.settings.download_folder.clone(),
+        )
     };
-    let transfer = transfer.ok_or_else(|| coded("transfers_transfer_not_found", "Transfer not found"))?;
+    let transfer =
+        transfer.ok_or_else(|| coded("transfers_transfer_not_found", "Transfer not found"))?;
     let safe_name = crate::security::sanitize_filename(&transfer.file_name);
     if crate::security::is_dangerous_extension(&safe_name) {
-        return Err(coded("transfers_dangerous_file_type", "Cannot open potentially dangerous file types. Please use a dedicated application."));
+        return Err(coded(
+            "transfers_dangerous_file_type",
+            "Cannot open potentially dangerous file types. Please use a dedicated application.",
+        ));
     }
-    let download_dir = std::path::PathBuf::from(&dl_folder)
-        .join("Downloads");
+    let download_dir = std::path::PathBuf::from(&dl_folder).join("Downloads");
     // Prefer the exact path recorded at completion time. Falling back to
     // `Downloads/<name>` is only correct when no dedup suffix was applied;
     // the canonical-containment check below still confines either choice to
@@ -867,15 +925,28 @@ pub async fn open_file(
     };
     tokio::task::spawn_blocking(move || {
         if !file_path.exists() {
-            return Err(coded("transfers_download_not_finished", "Download has not finished yet"));
+            return Err(coded(
+                "transfers_download_not_finished",
+                "Download has not finished yet",
+            ));
         }
-        let canonical = file_path.canonicalize().map_err(|e| coded_ctx("transfers_invalid_path", "Invalid path", e))?;
-        let canonical_base = download_dir.canonicalize().map_err(|e| coded_ctx("transfers_invalid_base", "Invalid base", e))?;
+        let canonical = file_path
+            .canonicalize()
+            .map_err(|e| coded_ctx("transfers_invalid_path", "Invalid path", e))?;
+        let canonical_base = download_dir
+            .canonicalize()
+            .map_err(|e| coded_ctx("transfers_invalid_base", "Invalid base", e))?;
         if !canonical.starts_with(&canonical_base) {
-            return Err(coded("transfers_path_escapes_dir", "File path escapes download directory"));
+            return Err(coded(
+                "transfers_path_escapes_dir",
+                "File path escapes download directory",
+            ));
         }
-        opener::open(&canonical).map_err(|e| coded_ctx("transfers_open_file_failed", "Failed to open file", e))
-    }).await.map_err(|e| coded_ctx("transfers_open_task_failed", "Open task failed", e))??;
+        opener::open(&canonical)
+            .map_err(|e| coded_ctx("transfers_open_file_failed", "Failed to open file", e))
+    })
+    .await
+    .map_err(|e| coded_ctx("transfers_open_task_failed", "Open task failed", e))??;
     Ok(())
 }
 
@@ -925,9 +996,9 @@ pub async fn cancel_transfer(
 ) -> Result<(), String> {
     let (promoted, cancelled_info) = {
         let mut manager = state.transfer_manager.write().await;
-        let info = manager.get_transfer(&transfer_id).map(|t| {
-            (t.file_hash.clone(), t.file_name.clone(), t.total_size)
-        });
+        let info = manager
+            .get_transfer(&transfer_id)
+            .map(|t| (t.file_hash.clone(), t.file_name.clone(), t.total_size));
         if let Some(control) = manager.get_control(&transfer_id) {
             control.cancel();
         }
@@ -936,7 +1007,10 @@ pub async fn cancel_transfer(
 
     if let Some((file_hash, file_name, file_size)) = cancelled_info {
         let db = state.db.clone();
-        db_blocking(move || { let _ = db.record_download_history(&file_hash, &file_name, file_size, "cancelled"); }).await;
+        db_blocking(move || {
+            let _ = db.record_download_history(&file_hash, &file_name, file_size, "cancelled");
+        })
+        .await;
     }
 
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
@@ -961,7 +1035,10 @@ pub async fn cancel_transfer(
     {
         let db = state.db.clone();
         let tid = transfer_id.clone();
-        db_blocking(move || { let _ = db.remove_transfer(&tid); }).await;
+        db_blocking(move || {
+            let _ = db.remove_transfer(&tid);
+        })
+        .await;
     }
 
     start_promoted_downloads(&state, &promoted).await;
@@ -1000,18 +1077,18 @@ pub async fn remove_transfer(
     let _ = tokio::time::timeout(CMD_REPLY_TIMEOUT, ack_rx).await;
     let db = state.db.clone();
     let tid = transfer_id.clone();
-    tokio::join!(
-        cleanup_partial_files(&dl_folder, &transfer_id),
-        async { db_blocking(move || { let _ = db.remove_transfer(&tid); }).await; },
-    );
+    tokio::join!(cleanup_partial_files(&dl_folder, &transfer_id), async {
+        db_blocking(move || {
+            let _ = db.remove_transfer(&tid);
+        })
+        .await;
+    },);
     start_promoted_downloads(&state, &promoted).await;
     Ok(())
 }
 
 #[tauri::command]
-pub async fn get_transfers(
-    state: tauri::State<'_, AppState>,
-) -> Result<Vec<Transfer>, String> {
+pub async fn get_transfers(state: tauri::State<'_, AppState>) -> Result<Vec<Transfer>, String> {
     let manager = state.transfer_manager.read().await;
     Ok(manager.get_all())
 }
@@ -1029,7 +1106,12 @@ pub async fn get_upload_queue(
         .network_tx
         .try_send(NetworkCommand::GetUploadQueueSnapshot { tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    await_reply(rx, "transfers_upload_queue_failed", "Failed to get upload queue").await
+    await_reply(
+        rx,
+        "transfers_upload_queue_failed",
+        "Failed to get upload queue",
+    )
+    .await
 }
 
 /// Snapshot of every persisted SecIdent credit record. Backs the
@@ -1044,7 +1126,12 @@ pub async fn get_known_clients(
         .network_tx
         .try_send(NetworkCommand::GetKnownClientsSnapshot { tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    await_reply(rx, "transfers_known_clients_failed", "Failed to get known clients").await
+    await_reply(
+        rx,
+        "transfers_known_clients_failed",
+        "Failed to get known clients",
+    )
+    .await
 }
 
 #[tauri::command]
@@ -1055,7 +1142,11 @@ pub async fn set_transfer_priority(
 ) -> Result<(), String> {
     let valid = ["verylow", "low", "normal", "high", "release", "auto"];
     if !valid.contains(&priority.as_str()) {
-        return Err(coded_ctx("transfers_invalid_priority", format!("Invalid priority: {priority}. Must be one of: {valid:?}"), priority));
+        return Err(coded_ctx(
+            "transfers_invalid_priority",
+            format!("Invalid priority: {priority}. Must be one of: {valid:?}"),
+            priority,
+        ));
     }
     {
         let mut manager = state.transfer_manager.write().await;
@@ -1064,7 +1155,10 @@ pub async fn set_transfer_priority(
     let db = state.db.clone();
     let tid = transfer_id.clone();
     let prio = priority.clone();
-    db_blocking(move || { let _ = db.update_transfer_priority(&tid, &prio); }).await;
+    db_blocking(move || {
+        let _ = db.update_transfer_priority(&tid, &prio);
+    })
+    .await;
     Ok(())
 }
 
@@ -1075,7 +1169,10 @@ pub async fn set_transfer_category(
     category: String,
 ) -> Result<(), String> {
     if category.len() > 256 {
-        return Err(coded("transfers_category_too_long", "Category name too long (max 256 bytes)"));
+        return Err(coded(
+            "transfers_category_too_long",
+            "Category name too long (max 256 bytes)",
+        ));
     }
     {
         let mut manager = state.transfer_manager.write().await;
@@ -1084,7 +1181,10 @@ pub async fn set_transfer_category(
     let db = state.db.clone();
     let tid = transfer_id.clone();
     let cat = category.clone();
-    db_blocking(move || { let _ = db.update_transfer_category(&tid, &cat); }).await;
+    db_blocking(move || {
+        let _ = db.update_transfer_category(&tid, &cat);
+    })
+    .await;
     Ok(())
 }
 
@@ -1114,12 +1214,12 @@ pub async fn set_preview_priority(
 /// pause may interleave; last command wins per transfer. Callers should
 /// debounce in the UI rather than expect a transactional guarantee.
 #[tauri::command]
-pub async fn pause_all_transfers(
-    state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
+pub async fn pause_all_transfers(state: tauri::State<'_, AppState>) -> Result<(), String> {
     let (statuses, pause_ids) = {
         let mut manager = state.transfer_manager.write().await;
-        let active_ids: Vec<String> = manager.active.iter()
+        let active_ids: Vec<String> = manager
+            .active
+            .iter()
             .filter(|(_, t)| t.direction == TransferDirection::Download)
             .map(|(id, _)| id.clone())
             .collect();
@@ -1132,14 +1232,23 @@ pub async fn pause_all_transfers(
         let queued_ids: Vec<String> = manager
             .queue
             .iter()
-            .filter(|t| t.direction == TransferDirection::Download && t.status != TransferStatus::Paused && t.status != TransferStatus::Stopped)
+            .filter(|t| {
+                t.direction == TransferDirection::Download
+                    && t.status != TransferStatus::Paused
+                    && t.status != TransferStatus::Stopped
+            })
             .map(|t| t.id.clone())
             .collect();
         for id in &queued_ids {
             manager.pause(id);
         }
-        let all_ids: Vec<String> = active_ids.iter().chain(queued_ids.iter()).cloned().collect();
-        let statuses = active_ids.into_iter()
+        let all_ids: Vec<String> = active_ids
+            .iter()
+            .chain(queued_ids.iter())
+            .cloned()
+            .collect();
+        let statuses = active_ids
+            .into_iter()
             .chain(queued_ids)
             .filter_map(|id| manager.get_transfer(&id).map(|t| (id, t.status.clone())))
             .collect::<Vec<_>>();
@@ -1153,21 +1262,20 @@ pub async fn pause_all_transfers(
             })
             .await;
     }
-    futures::future::join_all(
-        statuses.into_iter().map(|(id, status)| {
-            let state = &state;
-            async move { persist_transfer_status(state, &id, &status).await; }
-        })
-    ).await;
+    futures::future::join_all(statuses.into_iter().map(|(id, status)| {
+        let state = &state;
+        async move {
+            persist_transfer_status(state, &id, &status).await;
+        }
+    }))
+    .await;
     Ok(())
 }
 
 #[tauri::command]
 /// Resume every paused / stopped download. See pause_all_transfers for the
 /// same eventual-consistency caveat.
-pub async fn resume_all_transfers(
-    state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
+pub async fn resume_all_transfers(state: tauri::State<'_, AppState>) -> Result<(), String> {
     let (promoted, restart_ids, statuses) = {
         let mut manager = state.transfer_manager.write().await;
         let active_ids: Vec<String> = manager.active.keys().cloned().collect();
@@ -1188,7 +1296,9 @@ pub async fn resume_all_transfers(
         let queued_ids: Vec<String> = manager
             .queue
             .iter()
-            .filter(|t| t.status == TransferStatus::Paused || t.status == TransferStatus::Insufficient)
+            .filter(|t| {
+                t.status == TransferStatus::Paused || t.status == TransferStatus::Insufficient
+            })
             .map(|t| t.id.clone())
             .collect();
         for id in queued_ids {
@@ -1204,13 +1314,22 @@ pub async fn resume_all_transfers(
         (promoted, restart_ids, statuses)
     };
     futures::future::join_all(
-        statuses.into_iter()
-            .filter(|(_, status)| matches!(status, TransferStatus::Searching | TransferStatus::Queued | TransferStatus::Active))
+        statuses
+            .into_iter()
+            .filter(|(_, status)| {
+                matches!(
+                    status,
+                    TransferStatus::Searching | TransferStatus::Queued | TransferStatus::Active
+                )
+            })
             .map(|(id, status)| {
                 let state = &state;
-                async move { persist_transfer_status(state, &id, &status).await; }
-            })
-    ).await;
+                async move {
+                    persist_transfer_status(state, &id, &status).await;
+                }
+            }),
+    )
+    .await;
     let mut to_start = promoted;
     {
         let manager = state.transfer_manager.read().await;
@@ -1234,9 +1353,7 @@ pub async fn get_transfer_sources(
 }
 
 #[tauri::command]
-pub async fn clear_completed(
-    state: tauri::State<'_, AppState>,
-) -> Result<u32, String> {
+pub async fn clear_completed(state: tauri::State<'_, AppState>) -> Result<u32, String> {
     // L1: completed rows have no live network state (their upload/download
     // tasks already returned), so there's nothing for CancelDownload to
     // clean up. Just drop from the manager's completed bucket and delete
@@ -1264,7 +1381,10 @@ pub async fn clear_completed(
     for id in &ids {
         let db_ref = db.clone();
         let tid = id.clone();
-        db_blocking(move || { let _ = db_ref.remove_transfer(&tid); }).await;
+        db_blocking(move || {
+            let _ = db_ref.remove_transfer(&tid);
+        })
+        .await;
         cleanup_partial_files(&dl_folder, id).await;
     }
     Ok(count)
@@ -1276,18 +1396,20 @@ pub async fn recover_archive(
     transfer_id: String,
 ) -> Result<String, String> {
     let (transfer_info, dl_folder) = {
-        let (mgr, cfg) = tokio::join!(
-            state.transfer_manager.read(),
-            state.config.read(),
-        );
-        let t = mgr.get_transfer(&transfer_id)
+        let (mgr, cfg) = tokio::join!(state.transfer_manager.read(), state.config.read(),);
+        let t = mgr
+            .get_transfer(&transfer_id)
             .map(|t| (t.file_name.clone(), t.total_size, t.id.clone()));
         (t, cfg.settings.download_folder.clone())
     };
-    let (file_name, file_size, transfer_id_clone) = transfer_info.ok_or_else(|| coded("transfers_transfer_not_found", "Transfer not found"))?;
+    let (file_name, file_size, transfer_id_clone) =
+        transfer_info.ok_or_else(|| coded("transfers_transfer_not_found", "Transfer not found"))?;
 
     if !crate::network::ed2k::archive_recovery::is_recoverable_archive(&file_name) {
-        return Err(coded("transfers_not_supported_archive", "File is not a supported archive format (ZIP, RAR, ACE)"));
+        return Err(coded(
+            "transfers_not_supported_archive",
+            "File is not a supported archive format (ZIP, RAR, ACE)",
+        ));
     }
 
     let part_path = std::path::PathBuf::from(&dl_folder)
@@ -1295,17 +1417,31 @@ pub async fn recover_archive(
         .join(format!("{transfer_id_clone}.part"));
 
     if !part_path.exists() {
-        return Err(coded("transfers_part_file_not_found", "Part file not found — download may not have started"));
+        return Err(coded(
+            "transfers_part_file_not_found",
+            "Part file not found — download may not have started",
+        ));
     }
 
     let pp = part_path.clone();
     let filled_ranges = tokio::task::spawn_blocking(move || {
         let tracker = crate::network::ed2k::part_tracker::PartTracker::new(file_size, &pp);
         tracker.filled_ranges()
-    }).await.map_err(|e| coded_ctx("transfers_part_tracker_task_failed", "PartTracker task failed", e))?;
+    })
+    .await
+    .map_err(|e| {
+        coded_ctx(
+            "transfers_part_tracker_task_failed",
+            "PartTracker task failed",
+            e,
+        )
+    })?;
 
     if filled_ranges.is_empty() {
-        return Err(coded("transfers_no_parts_for_recovery", "No completed parts available for recovery"));
+        return Err(coded(
+            "transfers_no_parts_for_recovery",
+            "No completed parts available for recovery",
+        ));
     }
 
     let fname = file_name.clone();

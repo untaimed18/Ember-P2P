@@ -2,7 +2,7 @@ pub mod limiter;
 pub mod uss;
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, atomic::AtomicBool};
+use std::sync::{atomic::AtomicBool, Arc, Mutex};
 
 /// Shared RTT samples from the network loop (KAD Ping/Pong) to the limiter loop (USS).
 pub type UssRttQueue = Arc<Mutex<VecDeque<f64>>>;

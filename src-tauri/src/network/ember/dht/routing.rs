@@ -32,7 +32,10 @@ impl Bucket {
     }
 
     fn subnet_count(&self, subnet: u64) -> usize {
-        self.contacts.iter().filter(|c| c.subnet_key() == subnet).count()
+        self.contacts
+            .iter()
+            .filter(|c| c.subnet_key() == subnet)
+            .count()
     }
 
     fn find(&self, id: &EmberNodeId) -> Option<usize> {
@@ -54,7 +57,10 @@ pub enum AddResult {
     Added,
     /// Bucket is full; the caller should ping this contact to see if it's alive.
     /// If the ping fails, call `evict_and_replace` to swap it out.
-    PingOldest { addr: SocketAddr, node_id: EmberNodeId },
+    PingOldest {
+        addr: SocketAddr,
+        node_id: EmberNodeId,
+    },
     /// Contact was rejected (duplicate subnet, etc.).
     Rejected,
 }
@@ -121,7 +127,10 @@ impl RoutingTable {
 
         // Subnet diversity check: per-bucket
         if bucket.subnet_count(subnet) >= MAX_PER_SUBNET_PER_BUCKET {
-            trace!("Rejected contact {} (subnet limit per bucket)", contact.node_id);
+            trace!(
+                "Rejected contact {} (subnet limit per bucket)",
+                contact.node_id
+            );
             self.add_to_cache(bucket_idx, contact);
             return AddResult::Rejected;
         }
@@ -191,7 +200,10 @@ impl RoutingTable {
             bucket.contacts.push_back(replacement);
             true
         } else {
-            debug!("Evicted dead contact {}, no replacement available", removed.node_id);
+            debug!(
+                "Evicted dead contact {}, no replacement available",
+                removed.node_id
+            );
             false
         }
     }
@@ -261,9 +273,9 @@ impl RoutingTable {
         if bucket_idx >= ID_BITS {
             return None;
         }
-        self.buckets[bucket_idx].find(&node_id).map(|pos| {
-            &self.buckets[bucket_idx].contacts[pos]
-        })
+        self.buckets[bucket_idx]
+            .find(&node_id)
+            .map(|pos| &self.buckets[bucket_idx].contacts[pos])
     }
 
     /// Return bucket indices that need refreshing (no activity for `threshold_secs`).
@@ -272,9 +284,7 @@ impl RoutingTable {
         self.buckets
             .iter()
             .enumerate()
-            .filter(|(_, b)| {
-                !b.contacts.is_empty() && (now - b.last_activity) > threshold_secs
-            })
+            .filter(|(_, b)| !b.contacts.is_empty() && (now - b.last_activity) > threshold_secs)
             .map(|(i, _)| i)
             .collect()
     }
@@ -410,7 +420,10 @@ mod tests {
             last_seen: chrono::Utc::now().timestamp(),
             failed_queries: 0,
         };
-        assert!(matches!(rt.add_contact(extra), AddResult::PingOldest { .. }));
+        assert!(matches!(
+            rt.add_contact(extra),
+            AddResult::PingOldest { .. }
+        ));
     }
 
     #[test]

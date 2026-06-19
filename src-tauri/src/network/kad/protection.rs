@@ -22,18 +22,18 @@ const MAX_OPCODE_ENTRIES: usize = 50_000;
 
 fn opcode_limit(opcode: u8) -> u32 {
     match opcode {
-        0x01 => 2,   // BootstrapReq
-        0x11 => 3,   // HelloReq
-        0x21 => 10,  // KadReq (searches generate bursts)
-        0x33 => 5,   // SearchKeyReq
-        0x34 => 5,   // SearchSourceReq
-        0x35 => 5,   // SearchNotesReq
-        0x43 => 8,   // PublishKeyReq
-        0x44 => 8,   // PublishSourceReq
-        0x45 => 8,   // PublishNotesReq
-        0x50 => 3,   // FirewalledReq
-        0x53 => 3,   // Firewalled2Req
-        0x60 => 3,   // Ping
+        0x01 => 2,  // BootstrapReq
+        0x11 => 3,  // HelloReq
+        0x21 => 10, // KadReq (searches generate bursts)
+        0x33 => 5,  // SearchKeyReq
+        0x34 => 5,  // SearchSourceReq
+        0x35 => 5,  // SearchNotesReq
+        0x43 => 8,  // PublishKeyReq
+        0x44 => 8,  // PublishSourceReq
+        0x45 => 8,  // PublishNotesReq
+        0x50 => 3,  // FirewalledReq
+        0x53 => 3,  // Firewalled2Req
+        0x60 => 3,  // Ping
         _ => DEFAULT_OPCODE_LIMIT,
     }
 }
@@ -144,7 +144,12 @@ impl FloodProtection {
     /// `0xFF` when we can't peek inside (obfuscated envelope). It is *not*
     /// trustworthy for classifying responses — an obfuscated PublishRes
     /// looks identical to any other obfuscated packet until we decrypt it.
-    pub fn check_rate_limit_with_opcode(&mut self, ip: IpAddr, known_peer: bool, opcode: u8) -> bool {
+    pub fn check_rate_limit_with_opcode(
+        &mut self,
+        ip: IpAddr,
+        known_peer: bool,
+        opcode: u8,
+    ) -> bool {
         let now = Instant::now();
 
         // Layer 1: per-(IP, opcode) within OPCODE_WINDOW_SECS.
@@ -162,7 +167,9 @@ impl FloodProtection {
         // what the opcode is punishes the responder for us, not the flooder.
         if opcode != 0xFF && is_request_opcode(opcode) {
             let op_key = (ip, opcode);
-            if self.opcode_counters.len() >= MAX_OPCODE_ENTRIES && !self.opcode_counters.contains_key(&op_key) {
+            if self.opcode_counters.len() >= MAX_OPCODE_ENTRIES
+                && !self.opcode_counters.contains_key(&op_key)
+            {
                 // K19: previous behaviour rejected the new peer outright as
                 // soon as the per-opcode table filled — an attacker that fills
                 // the table with one-shot spam permanently locks out legit
@@ -208,7 +215,11 @@ impl FloodProtection {
             }
         }
         let entry = self.ip_counters.entry(ip).or_insert((0, now));
-        let max_packets = if known_peer { MAX_PACKETS_PER_SEC_KNOWN } else { MAX_PACKETS_PER_SEC_UNKNOWN };
+        let max_packets = if known_peer {
+            MAX_PACKETS_PER_SEC_KNOWN
+        } else {
+            MAX_PACKETS_PER_SEC_UNKNOWN
+        };
         if now.saturating_duration_since(entry.1).as_secs() >= 1 {
             entry.0 = 1;
             entry.1 = now;
@@ -228,7 +239,9 @@ impl FloodProtection {
     /// Returns true if we've sent too many packets to this IP recently.
     pub fn check_outgoing_rate(&mut self, ip: IpAddr) -> bool {
         let now = Instant::now();
-        if self.outgoing_counters.len() >= MAX_IP_ENTRIES && !self.outgoing_counters.contains_key(&ip) {
+        if self.outgoing_counters.len() >= MAX_IP_ENTRIES
+            && !self.outgoing_counters.contains_key(&ip)
+        {
             // K19: LRU-evict instead of hard-failing.
             if let Some(oldest_ip) = self
                 .outgoing_counters
@@ -391,21 +404,22 @@ impl FloodProtection {
     pub fn cleanup(&mut self) {
         let now = Instant::now();
 
-        self.ip_counters.retain(|_, (_, last)| {
-            now.saturating_duration_since(*last).as_secs() < 60
-        });
+        self.ip_counters
+            .retain(|_, (_, last)| now.saturating_duration_since(*last).as_secs() < 60);
 
         self.opcode_counters.retain(|_, (_, last)| {
             now.saturating_duration_since(*last).as_secs() < OPCODE_WINDOW_SECS * 2
         });
 
-        self.outgoing_counters.retain(|_, (_, last)| {
-            now.saturating_duration_since(*last).as_secs() < 60
-        });
+        self.outgoing_counters
+            .retain(|_, (_, last)| now.saturating_duration_since(*last).as_secs() < 60);
 
-        let stale: Vec<(IpAddr, u8)> = self.request_times
+        let stale: Vec<(IpAddr, u8)> = self
+            .request_times
             .iter()
-            .filter(|(_, time)| now.saturating_duration_since(**time).as_secs() > TRACKER_EXPIRY_SECS)
+            .filter(|(_, time)| {
+                now.saturating_duration_since(**time).as_secs() > TRACKER_EXPIRY_SECS
+            })
             .map(|(key, _)| *key)
             .collect();
         for key in stale {
@@ -413,13 +427,11 @@ impl FloodProtection {
             self.request_times.remove(&key);
         }
 
-        self.recent_ips.retain(|_, last| {
-            now.saturating_duration_since(*last).as_secs() < TRACKER_EXPIRY_SECS
-        });
+        self.recent_ips
+            .retain(|_, last| now.saturating_duration_since(*last).as_secs() < TRACKER_EXPIRY_SECS);
         // K21: compressed-packet budget table follows the same 60s cleanup.
-        self.compressed_counters.retain(|_, (_, last)| {
-            now.saturating_duration_since(*last).as_secs() < 60
-        });
+        self.compressed_counters
+            .retain(|_, (_, last)| now.saturating_duration_since(*last).as_secs() < 60);
     }
 }
 
@@ -461,7 +473,10 @@ mod kad_protection_tests {
         for _ in 0..10 {
             assert!(!fp.over_compressed_budget(ip));
         }
-        assert!(fp.over_compressed_budget(ip), "11th compressed packet must trip the budget");
+        assert!(
+            fp.over_compressed_budget(ip),
+            "11th compressed packet must trip the budget"
+        );
     }
 
     /// outgoing_requests is multiset: sending N requests to the same

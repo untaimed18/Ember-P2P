@@ -2,9 +2,9 @@ use tokio::sync::oneshot;
 
 use crate::app_state::AppState;
 use crate::commands::errors::{coded, coded_ctx};
-use crate::network::{NetworkCommand, SearchMethod};
 use crate::network::ed2k::hash;
 use crate::network::kad::publish::md4_bytes_to_kad_id;
+use crate::network::{NetworkCommand, SearchMethod};
 use crate::search::cleanup::{cleanup_filename, parse_cleanup_strings, strip_comment_urls};
 use crate::search::merge;
 use crate::search::spam::{BatchSpamContext, CommunityRating, SpamFilter, SpamFilterProfile};
@@ -59,7 +59,10 @@ fn validate_spam_payload(
             MAX_MARK_SPAM_KEYWORDS,
         ));
     }
-    if search_keywords.iter().any(|k| k.len() > MAX_MARK_SPAM_KEYWORD_LEN) {
+    if search_keywords
+        .iter()
+        .any(|k| k.len() > MAX_MARK_SPAM_KEYWORD_LEN)
+    {
         return Err(coded_ctx(
             "search_spam_keyword_too_long",
             format!("a search_keyword exceeds {MAX_MARK_SPAM_KEYWORD_LEN} bytes"),
@@ -71,9 +74,13 @@ fn validate_spam_payload(
 
 fn parse_exact_file_hash(file_hash: &str) -> Result<[u8; 16], String> {
     if file_hash.len() != 32 || !file_hash.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(coded("search_invalid_file_hash_hex", "Invalid file hash: expected 32 hex characters"));
+        return Err(coded(
+            "search_invalid_file_hash_hex",
+            "Invalid file hash: expected 32 hex characters",
+        ));
     }
-    let raw = hex::decode(file_hash).map_err(|e| coded_ctx("search_invalid_hash", "Invalid hash", e))?;
+    let raw =
+        hex::decode(file_hash).map_err(|e| coded_ctx("search_invalid_hash", "Invalid hash", e))?;
     let mut hash = [0u8; 16];
     hash.copy_from_slice(&raw);
     Ok(hash)
@@ -105,7 +112,10 @@ pub fn apply_search_enrichment(
     };
     for result in results.iter_mut() {
         if spam_enabled {
-            let cr = community.get(&result.file.hash).copied().unwrap_or_default();
+            let cr = community
+                .get(&result.file.hash)
+                .copied()
+                .unwrap_or_default();
             result.spam_rating =
                 spam.rate_result(result, search_keywords, server_ip, spam_profile, cr, &batch);
             result.is_spam = SpamFilter::is_spam(result.spam_rating, spam_profile);
@@ -126,10 +136,7 @@ pub async fn enrich_results(
     search_keywords: &[String],
     server_ip: Option<&str>,
 ) {
-    let (config, spam) = tokio::join!(
-        state.config.read(),
-        state.spam_filter.read(),
-    );
+    let (config, spam) = tokio::join!(state.config.read(), state.spam_filter.read(),);
     let spam_enabled = config.settings.spam_filter_enabled;
     let spam_profile = SpamFilterProfile::from_setting(&config.settings.spam_filter_profile);
     let cleanup_strings = parse_cleanup_strings(&config.settings.filename_cleanups);
@@ -180,15 +187,22 @@ pub async fn search_files(
         .collect();
 
     let (local_hits, timeout_secs) = {
-        let (li, c) = tokio::join!(
-            state.local_index.read(),
-            state.config.read(),
-        );
-        (li.search(query.trim()), c.settings.search_timeout_secs.clamp(SEARCH_TIMEOUT_MIN, SEARCH_TIMEOUT_MAX))
+        let (li, c) = tokio::join!(state.local_index.read(), state.config.read(),);
+        (
+            li.search(query.trim()),
+            c.settings
+                .search_timeout_secs
+                .clamp(SEARCH_TIMEOUT_MIN, SEARCH_TIMEOUT_MAX),
+        )
     };
 
     let file_type_filter = file_type.clone();
-    let filters = if min_size.is_some() || max_size.is_some() || file_type.is_some() || file_extension.is_some() || min_availability.is_some() {
+    let filters = if min_size.is_some()
+        || max_size.is_some()
+        || file_type.is_some()
+        || file_extension.is_some()
+        || min_availability.is_some()
+    {
         Some(crate::network::SearchFilters {
             min_size,
             max_size,
@@ -211,21 +225,21 @@ pub async fn search_files(
         })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
 
-    let mut results = match tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        rx,
-    )
-    .await
-    {
-        Ok(Ok(results)) => results,
-        Ok(Err(e)) => return Err(coded_ctx("search_failed", "Search failed", e)),
-        Err(_) => {
-            let _ = state
-                .network_tx
-                .try_send(NetworkCommand::CancelSearch { request_id });
-            return Err(coded_ctx("search_timed_out", format!("Search timed out after {timeout_secs}s"), timeout_secs));
-        }
-    };
+    let mut results =
+        match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
+            Ok(Ok(results)) => results,
+            Ok(Err(e)) => return Err(coded_ctx("search_failed", "Search failed", e)),
+            Err(_) => {
+                let _ = state
+                    .network_tx
+                    .try_send(NetworkCommand::CancelSearch { request_id });
+                return Err(coded_ctx(
+                    "search_timed_out",
+                    format!("Search timed out after {timeout_secs}s"),
+                    timeout_secs,
+                ));
+            }
+        };
 
     results = merge::merge_search_vecs(results, local_hits);
     if let Some(ref ft) = file_type_filter {
@@ -265,12 +279,11 @@ pub async fn find_notes(
 
     let timeout_secs = {
         let c = state.config.read().await;
-        c.settings.search_timeout_secs.clamp(SEARCH_TIMEOUT_MIN, SEARCH_TIMEOUT_MAX)
+        c.settings
+            .search_timeout_secs
+            .clamp(SEARCH_TIMEOUT_MIN, SEARCH_TIMEOUT_MAX)
     };
-    let mut results = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        rx,
-    )
+    let mut results = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx)
         .await
         .map_err(|_| format!("Notes search timed out after {timeout_secs}s"))?
         .map_err(|e| coded_ctx("search_notes_search_failed", "Notes search failed", e))?;
@@ -299,7 +312,9 @@ pub async fn find_sources(
 
     let timeout_secs = {
         let c = state.config.read().await;
-        c.settings.search_timeout_secs.clamp(SEARCH_TIMEOUT_MIN, SEARCH_TIMEOUT_MAX)
+        c.settings
+            .search_timeout_secs
+            .clamp(SEARCH_TIMEOUT_MIN, SEARCH_TIMEOUT_MAX)
     };
     tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx)
         .await
@@ -315,16 +330,28 @@ pub async fn publish_note(
     comment: String,
 ) -> Result<String, String> {
     if rating > 5 {
-        return Err(coded("search_rating_range", "Rating must be between 0 and 5"));
+        return Err(coded(
+            "search_rating_range",
+            "Rating must be between 0 and 5",
+        ));
     }
     if comment.len() > 4096 {
-        return Err(coded("search_comment_too_long", "Comment too long (max 4096 bytes)"));
+        return Err(coded(
+            "search_comment_too_long",
+            "Comment too long (max 4096 bytes)",
+        ));
     }
     if rating == 0 && comment.trim().is_empty() {
-        return Err(coded("search_empty_note", "Add a rating or a comment before publishing"));
+        return Err(coded(
+            "search_empty_note",
+            "Add a rating or a comment before publishing",
+        ));
     }
     if state.cached_contacts.read().await.is_empty() {
-        return Err(coded("search_no_kad_contacts", "No Kad contacts available to publish note"));
+        return Err(coded(
+            "search_no_kad_contacts",
+            "No Kad contacts available to publish note",
+        ));
     }
 
     let kad_hash = md4_bytes_to_kad_id(&parse_exact_file_hash(&file_hash)?);
@@ -336,7 +363,12 @@ pub async fn publish_note(
             rating,
             comment,
         })
-        .map_err(|_| coded("search_network_busy_retry", "Network is busy, please try again"))?;
+        .map_err(|_| {
+            coded(
+                "search_network_busy_retry",
+                "Network is busy, please try again",
+            )
+        })?;
 
     Ok("Note publish queued".to_string())
 }
@@ -364,7 +396,10 @@ pub async fn cancel_search(
 #[tauri::command]
 pub async fn compute_ed2k_hash(data: Vec<u8>) -> Result<String, String> {
     if data.len() > 100 * 1024 * 1024 {
-        return Err(coded("search_input_too_large", "Input too large (max 100MB)"));
+        return Err(coded(
+            "search_input_too_large",
+            "Input too large (max 100MB)",
+        ));
     }
     tokio::task::spawn_blocking(move || hash::ed2k_hash_bytes(&data))
         .await
@@ -374,10 +409,16 @@ pub async fn compute_ed2k_hash(data: Vec<u8>) -> Result<String, String> {
 #[tauri::command]
 pub fn format_ed2k_link(name: String, size: u64, file_hash: String) -> Result<String, String> {
     if name.is_empty() || name.len() > 4096 {
-        return Err(coded("search_file_name_invalid", "File name is empty or too long"));
+        return Err(coded(
+            "search_file_name_invalid",
+            "File name is empty or too long",
+        ));
     }
     if file_hash.len() != 32 || !file_hash.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(coded("search_link_invalid_hash", "Invalid file hash (expected 32 hex characters)"));
+        return Err(coded(
+            "search_link_invalid_hash",
+            "Invalid file hash (expected 32 hex characters)",
+        ));
     }
     Ok(hash::format_ed2k_link(&name, size, &file_hash))
 }
@@ -394,7 +435,12 @@ pub struct Ed2kLinkInfo {
 #[tauri::command]
 pub fn parse_ed2k_link(link: String) -> Result<Ed2kLinkInfo, String> {
     hash::parse_ed2k_link(&link)
-        .map(|(name, size, hash, aich)| Ed2kLinkInfo { name, size, hash, aich })
+        .map(|(name, size, hash, aich)| Ed2kLinkInfo {
+            name,
+            size,
+            hash,
+            aich,
+        })
         .ok_or_else(|| coded("search_invalid_ed2k_link", "Invalid ed2k link format"))
 }
 
@@ -414,10 +460,16 @@ pub async fn build_ed2k_link(
     with_sources: bool,
 ) -> Result<String, String> {
     if name.is_empty() || name.len() > 4096 {
-        return Err(coded("search_file_name_invalid", "File name is empty or too long"));
+        return Err(coded(
+            "search_file_name_invalid",
+            "File name is empty or too long",
+        ));
     }
     if file_hash.len() != 32 || !file_hash.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(coded("search_link_invalid_hash", "Invalid file hash (expected 32 hex characters)"));
+        return Err(coded(
+            "search_link_invalid_hash",
+            "Invalid file hash (expected 32 hex characters)",
+        ));
     }
 
     let aich = aich_hash.and_then(|h| {
@@ -432,9 +484,13 @@ pub async fn build_ed2k_link(
             .network_tx
             .try_send(NetworkCommand::GetNetworkStatsSnapshot { tx })
             .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-        let stats = rx
-            .await
-            .map_err(|e| coded_ctx("search_link_sources_failed", "Failed to read network state", e))?;
+        let stats = rx.await.map_err(|e| {
+            coded_ctx(
+                "search_link_sources_failed",
+                "Failed to read network state",
+                e,
+            )
+        })?;
         if stats.firewalled {
             return Err(coded(
                 "search_link_firewalled",
@@ -533,7 +589,9 @@ pub async fn mark_spam(
                     false
                 }
             }
-        }).await.unwrap_or(false);
+        })
+        .await
+        .unwrap_or(false);
         if ok {
             state.spam_filter.write().await.mark_saved(gen);
         }
@@ -563,7 +621,9 @@ pub async fn mark_not_spam(
                     false
                 }
             }
-        }).await.unwrap_or(false);
+        })
+        .await
+        .unwrap_or(false);
         if ok {
             state.spam_filter.write().await.mark_saved(gen);
         }
@@ -667,9 +727,7 @@ pub async fn explain_spam_result(
 }
 
 #[tauri::command]
-pub async fn reset_spam_filter(
-    state: tauri::State<'_, AppState>,
-) -> Result<String, String> {
+pub async fn reset_spam_filter(state: tauri::State<'_, AppState>) -> Result<String, String> {
     let save_data = {
         let mut spam = state.spam_filter.write().await;
         spam.reset();
@@ -766,7 +824,11 @@ pub async fn clear_download_history(
             "completed" | "cancelled" => {
                 db.clear_download_history(&status)?;
             }
-            _ => return Err(anyhow::anyhow!("Invalid status: {status}. Must be 'completed', 'cancelled', or 'all'")),
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "Invalid status: {status}. Must be 'completed', 'cancelled', or 'all'"
+                ))
+            }
         }
         Ok(())
     })

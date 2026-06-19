@@ -6,7 +6,9 @@ use tracing::{info, warn};
 pub type GeoIpReader = Arc<Option<maxminddb::Reader<Vec<u8>>>>;
 
 pub fn load(resource_dir: &Path) -> GeoIpReader {
-    let db_path = resource_dir.join("resources").join("dbip-country-lite.mmdb");
+    let db_path = resource_dir
+        .join("resources")
+        .join("dbip-country-lite.mmdb");
     if !db_path.exists() {
         let alt = resource_dir.join("dbip-country-lite.mmdb");
         if alt.exists() {

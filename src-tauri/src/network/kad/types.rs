@@ -94,7 +94,11 @@ impl KadUDPKey {
     }
 
     pub fn get_key_value(&self, ip: u32) -> u32 {
-        if ip == self.ip { self.key } else { 0 }
+        if ip == self.ip {
+            self.key
+        } else {
+            0
+        }
     }
 
     pub fn is_valid(&self) -> bool {
@@ -158,7 +162,12 @@ impl KadId {
     pub(crate) fn chunk(&self, i: usize) -> u32 {
         debug_assert!(i < KAD_ID_SIZE / 4, "KadId::chunk index out of bounds");
         let base = i * 4;
-        u32::from_le_bytes([self.0[base], self.0[base + 1], self.0[base + 2], self.0[base + 3]])
+        u32::from_le_bytes([
+            self.0[base],
+            self.0[base + 1],
+            self.0[base + 2],
+            self.0[base + 3],
+        ])
     }
 
     fn set_chunk(&mut self, i: usize, val: u32) {
@@ -301,10 +310,16 @@ impl Ord for KadId {
         for i in 0..4 {
             let base = i * 4;
             let a = u32::from_le_bytes([
-                self.0[base], self.0[base + 1], self.0[base + 2], self.0[base + 3],
+                self.0[base],
+                self.0[base + 1],
+                self.0[base + 2],
+                self.0[base + 3],
             ]);
             let b = u32::from_le_bytes([
-                other.0[base], other.0[base + 1], other.0[base + 2], other.0[base + 3],
+                other.0[base],
+                other.0[base + 1],
+                other.0[base + 2],
+                other.0[base + 3],
             ]);
             match a.cmp(&b) {
                 std::cmp::Ordering::Equal => continue,
@@ -531,7 +546,7 @@ pub struct KadTag {
 }
 
 impl KadTag {
-        /// Maximum allowed string length in tags (64 KiB, matching eMule limits)
+    /// Maximum allowed string length in tags (64 KiB, matching eMule limits)
     const MAX_TAG_STRING_LEN: usize = 65536;
     /// Maximum allowed blob size in tags (256 KiB)
     const MAX_TAG_BLOB_LEN: usize = 262144;
@@ -836,9 +851,11 @@ mod kad_tag_wire_layout_tests {
             buf,
             vec![
                 TAGTYPE_UINT16, // 0x03 — no 0x80 bit
-                0x01, 0x00,     // u16 LE name length = 1
+                0x01,
+                0x00,           // u16 LE name length = 1
                 TAG_SOURCEPORT, // 0xFD
-                0xA7, 0x9E,     // 40615 LE
+                0xA7,
+                0x9E, // 40615 LE
             ],
             "KAD tag wire format must match eMule's CDataIO::WriteTag exactly"
         );
@@ -851,11 +868,26 @@ mod kad_tag_wire_layout_tests {
     #[test]
     fn publish_source_tag_bundle_roundtrips() {
         let tags = vec![
-            KadTag { name: TagName::Id(TAG_SOURCEPORT), value: TagValue::Uint16(4662) },
-            KadTag { name: TagName::Id(TAG_SOURCEUPORT), value: TagValue::Uint16(4672) },
-            KadTag { name: TagName::Id(TAG_SOURCETYPE), value: TagValue::Uint8(1) },
-            KadTag { name: TagName::Id(TAG_FILESIZE), value: TagValue::Uint64(1_234_567_890) },
-            KadTag { name: TagName::Id(TAG_ENCRYPTION), value: TagValue::Uint8(0x0C) },
+            KadTag {
+                name: TagName::Id(TAG_SOURCEPORT),
+                value: TagValue::Uint16(4662),
+            },
+            KadTag {
+                name: TagName::Id(TAG_SOURCEUPORT),
+                value: TagValue::Uint16(4672),
+            },
+            KadTag {
+                name: TagName::Id(TAG_SOURCETYPE),
+                value: TagValue::Uint8(1),
+            },
+            KadTag {
+                name: TagName::Id(TAG_FILESIZE),
+                value: TagValue::Uint64(1_234_567_890),
+            },
+            KadTag {
+                name: TagName::Id(TAG_ENCRYPTION),
+                value: TagValue::Uint8(0x0C),
+            },
         ];
         let mut buf = Vec::new();
         write_tag_list(&mut buf, &tags).unwrap();
@@ -867,8 +899,14 @@ mod kad_tag_wire_layout_tests {
         // Pin each (name, value) pair rather than relying on
         // derive(PartialEq) we don't have.
         for (a, b) in parsed.iter().zip(tags.iter()) {
-            let a_id = match &a.name { TagName::Id(x) => *x, _ => panic!("not an Id name") };
-            let b_id = match &b.name { TagName::Id(x) => *x, _ => panic!("not an Id name") };
+            let a_id = match &a.name {
+                TagName::Id(x) => *x,
+                _ => panic!("not an Id name"),
+            };
+            let b_id = match &b.name {
+                TagName::Id(x) => *x,
+                _ => panic!("not an Id name"),
+            };
             assert_eq!(a_id, b_id, "tag name id mismatch");
         }
         assert_eq!(parsed[0].uint16_value(), Some(4662));
@@ -894,8 +932,8 @@ mod kad_id_wire_layout_tests {
     #[test]
     fn chunk_matches_emule_uint128_get32bitchunk() {
         let wire_bytes = [
-            0x67, 0x45, 0x23, 0x01, 0xEF, 0xCD, 0xAB, 0x89,
-            0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+            0x67, 0x45, 0x23, 0x01, 0xEF, 0xCD, 0xAB, 0x89, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03,
+            0x02, 0x01,
         ];
         let id = KadId(wire_bytes);
         assert_eq!(id.chunk(0), 0x0123_4567, "chunk(0) = m_uData[0]");

@@ -105,7 +105,12 @@ pub fn try_decrypt_kad_packet(
         key_data[16..20].copy_from_slice(&sender_ip.to_le_bytes());
         key_data[20] = 91; // MAGICVALUE_UDP
         key_data[21..23].copy_from_slice(&random_key_part.to_le_bytes());
-        if let Some(result) = try_decrypt_with_key(data, &md5::Md5::digest(&key_data[..23]), receiver_verify_key, sender_ip) {
+        if let Some(result) = try_decrypt_with_key(
+            data,
+            &md5::Md5::digest(&key_data[..23]),
+            receiver_verify_key,
+            sender_ip,
+        ) {
             return Some(result);
         }
     } else if marker == 2 && receiver_verify_key != 0 {
@@ -113,7 +118,12 @@ pub fn try_decrypt_kad_packet(
         let mut vkey_data = [0u8; 6];
         vkey_data[..4].copy_from_slice(&receiver_verify_key.to_le_bytes());
         vkey_data[4..6].copy_from_slice(&random_key_part.to_le_bytes());
-        if let Some(result) = try_decrypt_with_key(data, &md5::Md5::digest(&vkey_data), receiver_verify_key, sender_ip) {
+        if let Some(result) = try_decrypt_with_key(
+            data,
+            &md5::Md5::digest(&vkey_data),
+            receiver_verify_key,
+            sender_ip,
+        ) {
             return Some(result);
         }
     }
@@ -122,7 +132,12 @@ pub fn try_decrypt_kad_packet(
     let mut nid_data = [0u8; 18];
     nid_data[..16].copy_from_slice(&local_kad_id.0);
     nid_data[16..18].copy_from_slice(&random_key_part.to_le_bytes());
-    if let Some(result) = try_decrypt_with_key(data, &md5::Md5::digest(&nid_data), receiver_verify_key, sender_ip) {
+    if let Some(result) = try_decrypt_with_key(
+        data,
+        &md5::Md5::digest(&nid_data),
+        receiver_verify_key,
+        sender_ip,
+    ) {
         return Some(result);
     }
 
@@ -131,7 +146,12 @@ pub fn try_decrypt_kad_packet(
     key_data[16..20].copy_from_slice(&sender_ip.to_le_bytes());
     key_data[20] = 91;
     key_data[21..23].copy_from_slice(&random_key_part.to_le_bytes());
-    if let Some(result) = try_decrypt_with_key(data, &md5::Md5::digest(&key_data[..23]), receiver_verify_key, sender_ip) {
+    if let Some(result) = try_decrypt_with_key(
+        data,
+        &md5::Md5::digest(&key_data[..23]),
+        receiver_verify_key,
+        sender_ip,
+    ) {
         return Some(result);
     }
 
@@ -139,7 +159,12 @@ pub fn try_decrypt_kad_packet(
         let mut vkey_data = [0u8; 6];
         vkey_data[..4].copy_from_slice(&receiver_verify_key.to_le_bytes());
         vkey_data[4..6].copy_from_slice(&random_key_part.to_le_bytes());
-        if let Some(result) = try_decrypt_with_key(data, &md5::Md5::digest(&vkey_data), receiver_verify_key, sender_ip) {
+        if let Some(result) = try_decrypt_with_key(
+            data,
+            &md5::Md5::digest(&vkey_data),
+            receiver_verify_key,
+            sender_ip,
+        ) {
             return Some(result);
         }
     }
@@ -354,7 +379,10 @@ fn try_decrypt_with_key(
     let receiver_key = u32::from_le_bytes(receiver_key_bytes);
     let sender_key = u32::from_le_bytes(sender_key_bytes);
     let sender_udp_key = if sender_key != 0 {
-        Some(KadUDPKey { key: sender_key, ip: sender_ip })
+        Some(KadUDPKey {
+            key: sender_key,
+            ip: sender_ip,
+        })
     } else {
         None
     };

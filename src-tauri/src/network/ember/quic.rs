@@ -48,9 +48,7 @@ pub struct QuicConfig {
 
 /// Generate a self-signed TLS certificate for QUIC using the Ember node ID
 /// as the subject CN.
-pub fn generate_self_signed_cert(
-    ember_node_id: &[u8; 16],
-) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+pub fn generate_self_signed_cert(ember_node_id: &[u8; 16]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     let cn = format!("ember-{}", hex::encode(ember_node_id));
     let subject_alt_names = vec![cn];
     let rcgen::CertifiedKey { cert, key_pair } =
@@ -76,8 +74,16 @@ fn build_transport_config() -> Arc<quinn::TransportConfig> {
         .unwrap_or_else(|_| quinn::IdleTimeout::from(quinn::VarInt::from_u32(30_000)));
     transport.max_idle_timeout(Some(idle_timeout));
     transport.keep_alive_interval(Some(Duration::from_secs(KEEP_ALIVE_SECS)));
-    transport.stream_receive_window(STREAM_RECEIVE_WINDOW_BYTES.try_into().unwrap_or(quinn::VarInt::MAX));
-    transport.receive_window(RECEIVE_WINDOW_BYTES.try_into().unwrap_or(quinn::VarInt::MAX));
+    transport.stream_receive_window(
+        STREAM_RECEIVE_WINDOW_BYTES
+            .try_into()
+            .unwrap_or(quinn::VarInt::MAX),
+    );
+    transport.receive_window(
+        RECEIVE_WINDOW_BYTES
+            .try_into()
+            .unwrap_or(quinn::VarInt::MAX),
+    );
     transport.send_window(SEND_WINDOW_BYTES);
     Arc::new(transport)
 }
@@ -378,10 +384,7 @@ impl EmberQuicEndpoint {
     }
 
     /// Connect to a remote peer.
-    pub async fn connect(
-        &self,
-        addr: SocketAddr,
-    ) -> anyhow::Result<quinn::Connection> {
+    pub async fn connect(&self, addr: SocketAddr) -> anyhow::Result<quinn::Connection> {
         let conn = self
             .endpoint
             .connect_with(self.client_config.clone(), addr, "ember")?
@@ -480,9 +483,7 @@ pub fn build_server_client_endpoint(
                     // first). We're still up — but the advertised port has
                     // changed, so anything that exposes our QUIC reachability
                     // (rendezvous, friend presence, …) needs to read it back.
-                    info!(
-                        "QUIC requested port {bind_port} unavailable; bound on {local} instead",
-                    );
+                    info!("QUIC requested port {bind_port} unavailable; bound on {local} instead",);
                 }
                 return Ok(endpoint);
             }

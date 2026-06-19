@@ -145,11 +145,9 @@ fn packet_poll_timeout_result(encrypted: bool) -> PollReadPacketResult {
 
 impl Ed2kServerConnection {
     pub async fn connect(addr: SocketAddr) -> anyhow::Result<Self> {
-        let stream = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            TcpStream::connect(addr),
-        )
-        .await??;
+        let stream =
+            tokio::time::timeout(std::time::Duration::from_secs(10), TcpStream::connect(addr))
+                .await??;
         let _ = stream.set_nodelay(true);
 
         let (reader, writer) = stream.into_split();
@@ -193,8 +191,13 @@ impl Ed2kServerConnection {
             flags |= SRVCAP_SUPPORTCRYPT | SRVCAP_REQUESTCRYPT | SRVCAP_REQUIRECRYPT;
         }
         let payload = build_login_request(user_hash, tcp_port, nickname, flags);
-        info!("Sending OP_LOGINREQUEST ({} bytes, encrypted={}): port={}, flags=0x{:04X}",
-            payload.len(), is_encrypted, tcp_port, flags);
+        info!(
+            "Sending OP_LOGINREQUEST ({} bytes, encrypted={}): port={}, flags=0x{:04X}",
+            payload.len(),
+            is_encrypted,
+            tcp_port,
+            flags
+        );
 
         // Build the full wire packet: [protocol(1)][length(4)][opcode(1)][payload]
         let mut wire_packet = Vec::with_capacity(6 + payload.len());
@@ -233,7 +236,10 @@ impl Ed2kServerConnection {
             let (opcode, payload) = match self.read_packet().await {
                 Ok(p) => p,
                 Err(e) => {
-                    info!("Server read error on packet {i}: kind={:?} msg={e}", e.kind());
+                    info!(
+                        "Server read error on packet {i}: kind={:?} msg={e}",
+                        e.kind()
+                    );
                     last_error = Some(format!("{} ({})", e, e.kind()));
                     break;
                 }
@@ -253,26 +259,62 @@ impl Ed2kServerConnection {
                 }
                 OP_IDCHANGE => {
                     if payload.len() >= 4 {
-                        session.client_id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                        session.client_id =
+                            u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
                         if session.client_id == 0 {
                             return Err(anyhow::anyhow!("server rejected login (client_id=0)"));
                         }
                         if payload.len() >= 8 {
-                            session.server_flags = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                            session.server_flags = u32::from_le_bytes([
+                                payload[4], payload[5], payload[6], payload[7],
+                            ]);
                             let f = session.server_flags;
                             info!(
                                 "Server TCP flags: 0x{f:04X} [{}{}{}{}{}{}{}]",
-                                if f & SRV_TCPFLG_COMPRESSION != 0 { "zlib " } else { "" },
-                                if f & SRV_TCPFLG_NEWTAGS != 0 { "newtags " } else { "" },
-                                if f & SRV_TCPFLG_UNICODE != 0 { "unicode " } else { "" },
-                                if f & SRV_TCPFLG_RELATEDSEARCH != 0 { "relsearch " } else { "" },
-                                if f & SRV_TCPFLG_TYPETAGINTEGER != 0 { "typeint " } else { "" },
-                                if f & SRV_TCPFLG_LARGEFILES != 0 { "large " } else { "" },
-                                if f & SRV_TCPFLG_TCPOBFUSCATION != 0 { "obfu " } else { "" },
+                                if f & SRV_TCPFLG_COMPRESSION != 0 {
+                                    "zlib "
+                                } else {
+                                    ""
+                                },
+                                if f & SRV_TCPFLG_NEWTAGS != 0 {
+                                    "newtags "
+                                } else {
+                                    ""
+                                },
+                                if f & SRV_TCPFLG_UNICODE != 0 {
+                                    "unicode "
+                                } else {
+                                    ""
+                                },
+                                if f & SRV_TCPFLG_RELATEDSEARCH != 0 {
+                                    "relsearch "
+                                } else {
+                                    ""
+                                },
+                                if f & SRV_TCPFLG_TYPETAGINTEGER != 0 {
+                                    "typeint "
+                                } else {
+                                    ""
+                                },
+                                if f & SRV_TCPFLG_LARGEFILES != 0 {
+                                    "large "
+                                } else {
+                                    ""
+                                },
+                                if f & SRV_TCPFLG_TCPOBFUSCATION != 0 {
+                                    "obfu "
+                                } else {
+                                    ""
+                                },
                             );
                         }
                         if payload.len() >= 16 {
-                            let reported_ip = u32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]);
+                            let reported_ip = u32::from_le_bytes([
+                                payload[12],
+                                payload[13],
+                                payload[14],
+                                payload[15],
+                            ]);
                             if reported_ip >= LOWID_THRESHOLD {
                                 session.server_reported_ip = reported_ip;
                             }
@@ -285,9 +327,14 @@ impl Ed2kServerConnection {
                 }
                 OP_SERVERSTATUS => {
                     if payload.len() >= 8 {
-                        session.user_count = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                        session.file_count = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
-                        debug!("Server status: {} users, {} files", session.user_count, session.file_count);
+                        session.user_count =
+                            u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                        session.file_count =
+                            u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                        debug!(
+                            "Server status: {} users, {} files",
+                            session.user_count, session.file_count
+                        );
                     }
                 }
                 OP_SERVERIDENT => {
@@ -321,25 +368,29 @@ impl Ed2kServerConnection {
 
     async fn read_packet(&mut self) -> io::Result<(u8, Vec<u8>)> {
         match &mut self.transport {
-            ServerTransport::Plain { reader, .. } => {
-                read_server_packet_timeout(reader).await
-            }
+            ServerTransport::Plain { reader, .. } => read_server_packet_timeout(reader).await,
             ServerTransport::Encrypted(stream) => {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
-                    stream.read_packet(),
-                )
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "encrypted server read timed out"))?
+                tokio::time::timeout(std::time::Duration::from_secs(30), stream.read_packet())
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::TimedOut, "encrypted server read timed out")
+                    })?
             }
         }
     }
 
     /// Write a zlib-compressed packet (eMule header 0xD4 instead of 0xE3).
-    async fn write_packet_compressed(&mut self, opcode: u8, compressed_payload: &[u8]) -> io::Result<()> {
+    async fn write_packet_compressed(
+        &mut self,
+        opcode: u8,
+        compressed_payload: &[u8],
+    ) -> io::Result<()> {
         const OP_PACKEDPROT: u8 = 0xD4;
         let wire_len = u32::try_from(1 + compressed_payload.len()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "compressed packet too large for u32 length field")
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "compressed packet too large for u32 length field",
+            )
         })?;
         match &mut self.transport {
             ServerTransport::Plain { writer, .. } => {
@@ -373,7 +424,10 @@ impl Ed2kServerConnection {
             }
             ServerTransport::Encrypted(stream) => {
                 let wire_len = u32::try_from(1 + payload.len()).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "packet payload too large for u32 length field")
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "packet payload too large for u32 length field",
+                    )
                 })?;
                 let mut wire = Vec::with_capacity(6 + payload.len());
                 wire.push(OP_EDONKEYHEADER);
@@ -405,7 +459,9 @@ impl Ed2kServerConnection {
                     match tokio::time::timeout(
                         std::time::Duration::from_millis(SERVER_POLL_READABLE_TIMEOUT_MS),
                         tcp.readable(),
-                    ).await {
+                    )
+                    .await
+                    {
                         Ok(Ok(_)) => {}
                         _ => return PollReadPacketResult::Idle,
                     }
@@ -413,14 +469,20 @@ impl Ed2kServerConnection {
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(SERVER_POLL_PACKET_TIMEOUT_SECS),
                     read_server_packet(reader),
-                ).await {
+                )
+                .await
+                {
                     Ok(result) => match classify_packet_read_result(result, false) {
                         PollReadPacketResult::Packet(pkt) => {
-                            info!("Server packet: opcode=0x{:02X}, {} bytes", pkt.0, pkt.1.len());
+                            info!(
+                                "Server packet: opcode=0x{:02X}, {} bytes",
+                                pkt.0,
+                                pkt.1.len()
+                            );
                             PollReadPacketResult::Packet(pkt)
                         }
                         other => other,
-                    }
+                    },
                     Err(_) => {
                         if has_buffered {
                             // BufReader had data and we started reading a packet;
@@ -442,7 +504,9 @@ impl Ed2kServerConnection {
                     match tokio::time::timeout(
                         std::time::Duration::from_millis(SERVER_POLL_READABLE_TIMEOUT_MS),
                         tcp.readable(),
-                    ).await {
+                    )
+                    .await
+                    {
                         Ok(Ok(_)) => {}
                         _ => return PollReadPacketResult::Idle,
                     }
@@ -450,14 +514,20 @@ impl Ed2kServerConnection {
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(SERVER_POLL_PACKET_TIMEOUT_SECS),
                     stream.read_packet(),
-                ).await {
+                )
+                .await
+                {
                     Ok(result) => match classify_packet_read_result(result, true) {
                         PollReadPacketResult::Packet(pkt) => {
-                            info!("Server packet (encrypted): opcode=0x{:02X}, {} bytes", pkt.0, pkt.1.len());
+                            info!(
+                                "Server packet (encrypted): opcode=0x{:02X}, {} bytes",
+                                pkt.0,
+                                pkt.1.len()
+                            );
                             PollReadPacketResult::Packet(pkt)
                         }
                         other => other,
-                    }
+                    },
                     Err(_) => {
                         if has_buffered {
                             packet_poll_timeout_result(true)
@@ -478,7 +548,8 @@ impl Ed2kServerConnection {
         let payload = build_search_request(query);
         info!(
             "Sending OP_SEARCHREQUEST ({} bytes payload) for query '{}'",
-            payload.len(), query
+            payload.len(),
+            query
         );
         self.write_packet(OP_SEARCHREQUEST, &payload).await?;
         Ok(())
@@ -519,7 +590,11 @@ impl Ed2kServerConnection {
     /// payload) so callers can attribute the cost to source-exchange
     /// overhead in the Statistics panel. Returns 0 when the request was
     /// silently skipped (e.g. the server lacks LARGEFILES support).
-    pub async fn send_get_sources(&mut self, file_hash: &[u8; 16], file_size: u64) -> anyhow::Result<u64> {
+    pub async fn send_get_sources(
+        &mut self,
+        file_hash: &[u8; 16],
+        file_size: u64,
+    ) -> anyhow::Result<u64> {
         let mut payload = Vec::with_capacity(28);
         payload.extend_from_slice(file_hash);
         let srv_flags = self.session.as_ref().map(|s| s.server_flags).unwrap_or(0);
@@ -559,7 +634,11 @@ impl Ed2kServerConnection {
         };
         debug!(
             "OP_GETSOURCES: opcode={} (0x{:02X}), file_size={}, conn_encrypted={}, srv_obfu={}",
-            if opcode == OP_GETSOURCES_OBFU { "OBFU" } else { "PLAIN" },
+            if opcode == OP_GETSOURCES_OBFU {
+                "OBFU"
+            } else {
+                "PLAIN"
+            },
             opcode,
             file_size,
             is_encrypted,
@@ -572,7 +651,8 @@ impl Ed2kServerConnection {
 
     /// eMule keep-alive: send empty OP_OFFERFILES (file count = 0).
     pub async fn keep_alive(&mut self) -> anyhow::Result<()> {
-        self.write_packet(OP_OFFERFILES, &0u32.to_le_bytes()).await?;
+        self.write_packet(OP_OFFERFILES, &0u32.to_le_bytes())
+            .await?;
         Ok(())
     }
 
@@ -638,7 +718,11 @@ impl Ed2kServerConnection {
     /// Send a single OP_OFFERFILES packet (one chunk). Matches eMule
     /// SharedFileList.cpp's per-file encoding; uses magic client ID/port
     /// values when the server supports SRV_TCPFLG_COMPRESSION.
-    async fn offer_files_chunk(&mut self, files: &[OfferFile], tcp_port: u16) -> anyhow::Result<()> {
+    async fn offer_files_chunk(
+        &mut self,
+        files: &[OfferFile],
+        tcp_port: u16,
+    ) -> anyhow::Result<()> {
         let real_client_id = self.our_client_id().unwrap_or(0);
         let srv_flags = self.session.as_ref().map(|s| s.server_flags).unwrap_or(0);
         let use_magic_ids = (srv_flags & SRV_TCPFLG_COMPRESSION) != 0;
@@ -694,9 +778,17 @@ impl Ed2kServerConnection {
             let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
             match encoder.write_all(&payload).and_then(|_| encoder.finish()) {
                 Ok(compressed) if compressed.len() < payload.len() => {
-                    debug!("Compressed OP_OFFERFILES: {} -> {} bytes", payload.len(), compressed.len());
-                    self.write_packet_compressed(OP_OFFERFILES, &compressed).await?;
-                    info!("Sent compressed OP_OFFERFILES with {} shared files to server", files.len());
+                    debug!(
+                        "Compressed OP_OFFERFILES: {} -> {} bytes",
+                        payload.len(),
+                        compressed.len()
+                    );
+                    self.write_packet_compressed(OP_OFFERFILES, &compressed)
+                        .await?;
+                    info!(
+                        "Sent compressed OP_OFFERFILES with {} shared files to server",
+                        files.len()
+                    );
                     return Ok(());
                 }
                 Ok(_) => debug!("OP_OFFERFILES compression not smaller, sending uncompressed"),
@@ -704,7 +796,10 @@ impl Ed2kServerConnection {
             }
         }
         self.write_packet(OP_OFFERFILES, &payload).await?;
-        info!("Sent OP_OFFERFILES with {} shared files to server", files.len());
+        info!(
+            "Sent OP_OFFERFILES with {} shared files to server",
+            files.len()
+        );
         Ok(())
     }
 
@@ -713,7 +808,10 @@ impl Ed2kServerConnection {
         loop {
             match self.poll_read_packet().await {
                 PollReadPacketResult::Packet((opcode, payload)) => {
-                    info!("Server poll received opcode=0x{opcode:02X}, {} bytes", payload.len());
+                    info!(
+                        "Server poll received opcode=0x{opcode:02X}, {} bytes",
+                        payload.len()
+                    );
                     events.extend(parse_server_event(opcode, &payload));
                 }
                 PollReadPacketResult::Idle => break,
@@ -741,16 +839,15 @@ impl Ed2kServerConnection {
     pub async fn disconnect(self) {
         match self.transport {
             ServerTransport::Plain { mut writer, .. } => {
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    writer.shutdown(),
-                ).await;
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), writer.shutdown())
+                    .await;
             }
             ServerTransport::Encrypted(mut stream) => {
                 let _ = tokio::time::timeout(
                     std::time::Duration::from_secs(2),
                     stream.writer.shutdown(),
-                ).await;
+                )
+                .await;
             }
         }
     }
@@ -766,13 +863,23 @@ pub enum ServerEvent {
     },
     CallbackFailed,
     Message(String),
-    StatusUpdate { users: u32, files: u32 },
-    ServerIdent { name: String },
+    StatusUpdate {
+        users: u32,
+        files: u32,
+    },
+    ServerIdent {
+        name: String,
+    },
     ServerList {
         data: Vec<u8>,
     },
-    SearchResult { results: Vec<ServerSearchResult> },
-    FoundSources { file_hash: [u8; 16], sources: Vec<ServerSource> },
+    SearchResult {
+        results: Vec<ServerSearchResult>,
+    },
+    FoundSources {
+        file_hash: [u8; 16],
+        sources: Vec<ServerSource>,
+    },
 }
 
 fn parse_server_event(opcode: u8, payload: &[u8]) -> Vec<ServerEvent> {
@@ -780,9 +887,7 @@ fn parse_server_event(opcode: u8, payload: &[u8]) -> Vec<ServerEvent> {
     match opcode {
         OP_CALLBACKREQUESTED => {
             if payload.len() >= 6 {
-                let ip = std::net::Ipv4Addr::new(
-                    payload[0], payload[1], payload[2], payload[3],
-                );
+                let ip = std::net::Ipv4Addr::new(payload[0], payload[1], payload[2], payload[3]);
                 let port = u16::from_le_bytes([payload[4], payload[5]]);
                 let crypt_options = payload.get(6).copied();
                 let user_hash = if payload.len() >= 23 {
@@ -828,23 +933,27 @@ fn parse_server_event(opcode: u8, payload: &[u8]) -> Vec<ServerEvent> {
         }
         OP_SERVERLIST => {
             debug!("Got server list from server ({} bytes)", payload.len());
-            events.push(ServerEvent::ServerList { data: payload.to_vec() });
+            events.push(ServerEvent::ServerList {
+                data: payload.to_vec(),
+            });
         }
-        OP_SEARCHRESULT => {
-            match parse_search_result(payload) {
-                Ok(results) => {
-                    debug!("Server search result: {} files", results.len());
-                    events.push(ServerEvent::SearchResult { results });
-                }
-                Err(e) => {
-                    debug!("Failed to parse search result: {e}");
-                }
+        OP_SEARCHRESULT => match parse_search_result(payload) {
+            Ok(results) => {
+                debug!("Server search result: {} files", results.len());
+                events.push(ServerEvent::SearchResult { results });
             }
-        }
+            Err(e) => {
+                debug!("Failed to parse search result: {e}");
+            }
+        },
         OP_FOUNDSOURCES | OP_FOUNDSOURCES_OBFU => {
             match parse_found_sources(payload, opcode == OP_FOUNDSOURCES_OBFU) {
                 Ok((file_hash, sources)) => {
-                    debug!("Server found {} sources for file {}", sources.len(), hex::encode(file_hash));
+                    debug!(
+                        "Server found {} sources for file {}",
+                        sources.len(),
+                        hex::encode(file_hash)
+                    );
                     events.push(ServerEvent::FoundSources { file_hash, sources });
                 }
                 Err(e) => {
@@ -864,7 +973,8 @@ fn parse_server_ident_name(payload: &[u8]) -> Option<String> {
     if payload.len() < 26 {
         return None;
     }
-    let tag_count = u32::from_le_bytes([payload[22], payload[23], payload[24], payload[25]]) as usize;
+    let tag_count =
+        u32::from_le_bytes([payload[22], payload[23], payload[24], payload[25]]) as usize;
     let mut offset = 26;
     for _ in 0..tag_count.min(32) {
         if offset >= payload.len() {
@@ -1010,7 +1120,7 @@ mod tests {
         );
         let buf = build_search_tree(&expr);
         assert_eq!(buf[0], 0x00); // AND
-        // left leaf
+                                  // left leaf
         assert_eq!(buf[1], 0x01); // STRING
         assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 5);
         assert_eq!(&buf[4..9], b"hello");
@@ -1048,7 +1158,10 @@ mod tests {
         let expr = SearchExpression::MinSize(1_048_576);
         let buf = build_search_tree(&expr);
         assert_eq!(buf[0], 0x03); // META_UINT32
-        assert_eq!(u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]), 1_048_576);
+        assert_eq!(
+            u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]),
+            1_048_576
+        );
         assert_eq!(buf[5], 0x03); // GREATER_EQUAL
         assert_eq!(u16::from_le_bytes([buf[6], buf[7]]), 1);
         assert_eq!(buf[8], 0x02); // FT_FILESIZE
@@ -1059,7 +1172,10 @@ mod tests {
         let expr = SearchExpression::MaxSize(500_000);
         let buf = build_search_tree(&expr);
         assert_eq!(buf[0], 0x03);
-        assert_eq!(u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]), 500_000);
+        assert_eq!(
+            u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]),
+            500_000
+        );
         assert_eq!(buf[5], 0x04); // LESS_EQUAL
         assert_eq!(buf[8], 0x02); // FT_FILESIZE
     }
@@ -1376,7 +1492,13 @@ fn truncate_utf8_safe(bytes: &[u8], max_len: usize) -> usize {
     }
     if len > 0 && bytes[len - 1] >= 0xC0 {
         let start = len - 1;
-        let expected = if bytes[start] < 0xE0 { 2 } else if bytes[start] < 0xF0 { 3 } else { 4 };
+        let expected = if bytes[start] < 0xE0 {
+            2
+        } else if bytes[start] < 0xF0 {
+            3
+        } else {
+            4
+        };
         if start + expected > max_len {
             len = start;
         }
@@ -1562,7 +1684,9 @@ fn read_tag_value(
             };
             match name_id {
                 0x02 => sink.file_size = (sink.file_size & 0xFFFF_FFFF_0000_0000) | v as u64,
-                0x3A => sink.file_size = (sink.file_size & 0x0000_0000_FFFF_FFFF) | ((v as u64) << 32),
+                0x3A => {
+                    sink.file_size = (sink.file_size & 0x0000_0000_FFFF_FFFF) | ((v as u64) << 32)
+                }
                 _ => sink.apply_uint(name_id, name, v as u64),
             }
             true
@@ -1616,8 +1740,11 @@ fn read_tag_value(
         // TAGTYPE_UINT16 (0x08)
         0x08 => {
             if let Ok(v) = ReadBytesExt::read_u16::<LittleEndian>(cursor) {
-                if name_id == 0x02 { sink.file_size = v as u64; }
-                else { sink.apply_uint(name_id, name, v as u64); }
+                if name_id == 0x02 {
+                    sink.file_size = v as u64;
+                } else {
+                    sink.apply_uint(name_id, name, v as u64);
+                }
                 true
             } else {
                 false
@@ -1626,8 +1753,11 @@ fn read_tag_value(
         // TAGTYPE_UINT8 (0x09)
         0x09 => {
             if let Ok(v) = ReadBytesExt::read_u8(cursor) {
-                if name_id == 0x02 { sink.file_size = v as u64; }
-                else { sink.apply_uint(name_id, name, v as u64); }
+                if name_id == 0x02 {
+                    sink.file_size = v as u64;
+                } else {
+                    sink.apply_uint(name_id, name, v as u64);
+                }
                 true
             } else {
                 false
@@ -1651,7 +1781,8 @@ fn read_tag_value(
         // TAGTYPE_UINT64 (0x0B)
         0x0B => {
             if let Ok(v) = ReadBytesExt::read_u64::<LittleEndian>(cursor) {
-                if name_id == 0x02 { // FT_FILESIZE
+                if name_id == 0x02 {
+                    // FT_FILESIZE
                     sink.file_size = v;
                 } else {
                     sink.apply_uint(name_id, name, v);
@@ -1705,7 +1836,10 @@ fn parse_search_result(payload: &[u8]) -> anyhow::Result<Vec<ServerSearchResult>
         for _ in 0..tag_limit {
             let (name_id, tag_type, name) = match read_tag_header(&mut cursor) {
                 Some(v) => v,
-                None => { in_sync = false; break; }
+                None => {
+                    in_sync = false;
+                    break;
+                }
             };
             if !read_tag_value(&mut cursor, tag_type, name_id, name.as_deref(), &mut tags) {
                 in_sync = false;
@@ -1722,9 +1856,18 @@ fn parse_search_result(payload: &[u8]) -> anyhow::Result<Vec<ServerSearchResult>
             for _ in tag_limit..tag_count {
                 let (name_id, tag_type, name) = match read_tag_header(&mut cursor) {
                     Some(v) => v,
-                    None => { in_sync = false; break; }
+                    None => {
+                        in_sync = false;
+                        break;
+                    }
                 };
-                if !read_tag_value(&mut cursor, tag_type, name_id, name.as_deref(), &mut discard) {
+                if !read_tag_value(
+                    &mut cursor,
+                    tag_type,
+                    name_id,
+                    name.as_deref(),
+                    &mut discard,
+                ) {
                     in_sync = false;
                     break;
                 }
@@ -1757,9 +1900,15 @@ fn parse_search_result(payload: &[u8]) -> anyhow::Result<Vec<ServerSearchResult>
     Ok(results)
 }
 
-fn parse_found_sources(payload: &[u8], obfuscated: bool) -> anyhow::Result<([u8; 16], Vec<ServerSource>)> {
+fn parse_found_sources(
+    payload: &[u8],
+    obfuscated: bool,
+) -> anyhow::Result<([u8; 16], Vec<ServerSource>)> {
     if payload.len() < 17 {
-        anyhow::bail!("found_sources payload too short ({} bytes, need at least 17)", payload.len());
+        anyhow::bail!(
+            "found_sources payload too short ({} bytes, need at least 17)",
+            payload.len()
+        );
     }
     let mut cursor = Cursor::new(payload);
     let mut file_hash = [0u8; 16];
@@ -1827,7 +1976,10 @@ async fn write_server_packet<W: AsyncWriteExt + Unpin>(
     payload: &[u8],
 ) -> io::Result<()> {
     let wire_len = u32::try_from(1 + payload.len()).map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidInput, "packet payload too large for u32 length field")
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "packet payload too large for u32 length field",
+        )
     })?;
     writer.write_u8(OP_EDONKEYHEADER).await?;
     writer.write_u32_le(wire_len).await?;
@@ -1851,9 +2003,7 @@ async fn read_server_packet_timeout<R: AsyncReadExt + Unpin>(
 const OP_PACKEDPROT: u8 = 0xD4;
 const MAX_UNCOMPRESSED_SERVER_PACKET: usize = 300_000;
 
-async fn read_server_packet<R: AsyncReadExt + Unpin>(
-    reader: &mut R,
-) -> io::Result<(u8, Vec<u8>)> {
+async fn read_server_packet<R: AsyncReadExt + Unpin>(reader: &mut R) -> io::Result<(u8, Vec<u8>)> {
     let protocol = reader.read_u8().await?;
     if protocol != OP_EDONKEYHEADER && protocol != OP_PACKEDPROT {
         return Err(io::Error::new(
@@ -1889,7 +2039,10 @@ async fn read_server_packet<R: AsyncReadExt + Unpin>(
 
     if protocol == OP_PACKEDPROT {
         let decompressed = decompress_server_payload(&payload)?;
-        debug!("Decompressed server packet: opcode=0x{opcode:02X}, {payload_len} -> {} bytes", decompressed.len());
+        debug!(
+            "Decompressed server packet: opcode=0x{opcode:02X}, {payload_len} -> {} bytes",
+            decompressed.len()
+        );
         Ok((opcode, decompressed))
     } else {
         Ok((opcode, payload))

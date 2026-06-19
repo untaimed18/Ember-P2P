@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use ed25519_dalek::SigningKey;
-use rand::Rng;
 use rand::rngs::OsRng;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -155,7 +155,9 @@ impl NodeIdentity {
                              automatically because this would permanently reset your KAD ID, \
                              user hash, friend relationships, and upload credits. Sign in as the \
                              original Windows user, or restore/delete identity.json to reset.",
-                            path.display(), unwrap_err, backup_note
+                            path.display(),
+                            unwrap_err,
+                            backup_note
                         ));
                     }
                 };
@@ -173,10 +175,14 @@ impl NodeIdentity {
                             id.ed25519_public_key = public_key.to_bytes();
                             id.ember_hash = crypto::node_id_from_public_key(&public_key);
                             migrated = true;
-                            info!("Migrated identity: generated Ed25519 keypair, derived ember_hash");
+                            info!(
+                                "Migrated identity: generated Ed25519 keypair, derived ember_hash"
+                            );
                         } else if id.ember_hash == [0u8; 16] {
                             // Has keys but ember_hash wasn't derived yet
-                            if let Some(pk) = crypto::verifying_key_from_bytes(&id.ed25519_public_key) {
+                            if let Some(pk) =
+                                crypto::verifying_key_from_bytes(&id.ed25519_public_key)
+                            {
                                 id.ember_hash = crypto::node_id_from_public_key(&pk);
                                 migrated = true;
                                 info!("Migrated identity: derived ember_hash from existing Ed25519 key");
@@ -187,9 +193,8 @@ impl NodeIdentity {
                         if id.noise_private_key == [0u8; 32] {
                             let noise_params: snow::params::NoiseParams =
                                 "Noise_XX_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
-                            let noise_keypair = snow::Builder::new(noise_params)
-                                .generate_keypair()
-                                .unwrap();
+                            let noise_keypair =
+                                snow::Builder::new(noise_params).generate_keypair().unwrap();
                             id.noise_private_key.copy_from_slice(&noise_keypair.private);
                             id.noise_public_key.copy_from_slice(&noise_keypair.public);
                             migrated = true;
@@ -201,7 +206,10 @@ impl NodeIdentity {
                             let protected = crate::storage::secret_store::protect(&updated)?;
                             crate::security::atomic_write(&path, &protected, true)?;
                         }
-                        info!("Loaded persistent identity (KAD ID={}…)", &hex::encode(id.kad_id)[..4]);
+                        info!(
+                            "Loaded persistent identity (KAD ID={}…)",
+                            &hex::encode(id.kad_id)[..4]
+                        );
                         Ok(id)
                     }
                     Err(parse_err) => {
@@ -213,7 +221,9 @@ impl NodeIdentity {
                                 format!("A copy has been saved to {}. ", bak.display())
                             }
                             Err(bak_err) => {
-                                tracing::warn!("Failed to back up corrupt identity.json: {bak_err}");
+                                tracing::warn!(
+                                    "Failed to back up corrupt identity.json: {bak_err}"
+                                );
                                 String::new()
                             }
                         };
@@ -223,7 +233,9 @@ impl NodeIdentity {
                              permanently reset your KAD ID, user hash, friend relationships, and \
                              upload credits. To reset, delete the identity.json file and restart; \
                              to recover, restore a backup copy of identity.json.",
-                            path.display(), parse_err, backup_note
+                            path.display(),
+                            parse_err,
+                            backup_note
                         ))
                     }
                 }
@@ -234,7 +246,10 @@ impl NodeIdentity {
                 let protected = crate::storage::secret_store::protect(&data)?;
                 std::fs::create_dir_all(data_dir)?;
                 crate::security::atomic_write(&path, &protected, true)?;
-                info!("Generated new identity (KAD ID={}…)", &hex::encode(id.kad_id)[..4]);
+                info!(
+                    "Generated new identity (KAD ID={}…)",
+                    &hex::encode(id.kad_id)[..4]
+                );
                 Ok(id)
             }
             Err(e) => {
@@ -244,7 +259,8 @@ impl NodeIdentity {
                 Err(anyhow::anyhow!(
                     "Failed to read identity file at {}: {}. Fix the underlying I/O error \
                      (permissions, disk, antivirus) and restart.",
-                    path.display(), e
+                    path.display(),
+                    e
                 ))
             }
         }

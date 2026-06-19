@@ -169,7 +169,10 @@ impl ChunkSelector {
         // Sort by score, then randomize among ties (eMule-style anti-herding)
         candidates.sort_by_key(|&(_, score)| score);
         let best_score = candidates[0].1;
-        let tie_count = candidates.iter().take_while(|&&(_, s)| s == best_score).count();
+        let tie_count = candidates
+            .iter()
+            .take_while(|&&(_, s)| s == best_score)
+            .count();
         if tie_count > 1 {
             use rand::Rng;
             let pick = rand::thread_rng().gen_range(0..tie_count);

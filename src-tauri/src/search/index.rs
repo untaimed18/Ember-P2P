@@ -137,7 +137,9 @@ impl LocalIndex {
         let indices = self.hash_map.get(hash)?;
         let mut best: Option<&FileInfo> = None;
         for &idx in indices {
-            let Some(candidate) = self.files.get(idx) else { continue };
+            let Some(candidate) = self.files.get(idx) else {
+                continue;
+            };
             best = Some(match best {
                 None => candidate,
                 Some(prev) => {
@@ -231,9 +233,11 @@ impl LocalIndex {
         let last_idx = self.files.len() - 1;
         let moved = pos != last_idx;
         let moved_key = if moved {
-            Some((self.files[last_idx].path.clone(),
-                  self.files[last_idx].hash.clone(),
-                  tokenize(&self.files[last_idx].name.to_lowercase())))
+            Some((
+                self.files[last_idx].path.clone(),
+                self.files[last_idx].hash.clone(),
+                tokenize(&self.files[last_idx].name.to_lowercase()),
+            ))
         } else {
             None
         };
@@ -283,7 +287,13 @@ impl LocalIndex {
         removed
     }
 
-    pub fn update_alltime_stats(&mut self, hash: &str, alltime_requests: u32, alltime_accepted: u32, alltime_transferred: u64) {
+    pub fn update_alltime_stats(
+        &mut self,
+        hash: &str,
+        alltime_requests: u32,
+        alltime_accepted: u32,
+        alltime_transferred: u64,
+    ) {
         if let Some(indices) = self.hash_map.get(hash).cloned() {
             for idx in indices {
                 if let Some(file) = self.files.get_mut(idx) {
@@ -296,7 +306,12 @@ impl LocalIndex {
     }
 
     /// Session + all-time request/accept counters when peers ask for / get a slot for this file.
-    pub fn apply_upload_share_deltas(&mut self, hash_hex: &str, inc_requests: u32, inc_accepted: u32) {
+    pub fn apply_upload_share_deltas(
+        &mut self,
+        hash_hex: &str,
+        inc_requests: u32,
+        inc_accepted: u32,
+    ) {
         if inc_requests == 0 && inc_accepted == 0 {
             return;
         }
@@ -353,7 +368,11 @@ impl LocalIndex {
     /// Returns the `(path, hash)` of each file actually changed so the caller
     /// can push the new priority into `known.met`. Files already at `priority`
     /// are skipped so the returned set stays minimal.
-    pub fn set_priority_under_folder(&mut self, folder: &str, priority: &str) -> Vec<(String, String)> {
+    pub fn set_priority_under_folder(
+        &mut self,
+        folder: &str,
+        priority: &str,
+    ) -> Vec<(String, String)> {
         let mut changed = Vec::new();
         for file in &mut self.files {
             if crate::security::path_matches_dir(&file.path, folder) && file.priority != priority {
@@ -517,49 +536,42 @@ fn tokenize(s: &str) -> Vec<String> {
 pub fn infer_file_type(extension: &str) -> String {
     match extension.to_lowercase().as_str() {
         // Audio -- eMule ED2KFT_AUDIO + modern additions (opus)
-        "aac" | "ac3" | "aif" | "aifc" | "aiff" | "amr" | "ape" | "au" | "aud"
-        | "audio" | "cda" | "dmf" | "dsm" | "dts" | "far" | "flac" | "it"
-        | "m1a" | "m2a" | "m4a" | "mdl" | "med" | "mid" | "midi" | "mka"
-        | "mod" | "mp1" | "mp2" | "mp3" | "mpa" | "mpc" | "mtm" | "ogg"
-        | "opus" | "psm" | "ptm" | "ra" | "rmi" | "s3m" | "snd" | "stm"
-        | "umx" | "wav" | "wma" | "xm" => "Audio".into(),
+        "aac" | "ac3" | "aif" | "aifc" | "aiff" | "amr" | "ape" | "au" | "aud" | "audio"
+        | "cda" | "dmf" | "dsm" | "dts" | "far" | "flac" | "it" | "m1a" | "m2a" | "m4a" | "mdl"
+        | "med" | "mid" | "midi" | "mka" | "mod" | "mp1" | "mp2" | "mp3" | "mpa" | "mpc"
+        | "mtm" | "ogg" | "opus" | "psm" | "ptm" | "ra" | "rmi" | "s3m" | "snd" | "stm" | "umx"
+        | "wav" | "wma" | "xm" => "Audio".into(),
 
         // Video -- eMule ED2KFT_VIDEO + modern additions (webm)
-        "3g2" | "3gp" | "3gp2" | "3gpp" | "amv" | "asf" | "avi" | "bik"
-        | "divx" | "dvr-ms" | "flc" | "fli" | "flic" | "flv" | "hdmov"
-        | "ifo" | "m1v" | "m2t" | "m2ts" | "m2v" | "m4b" | "m4v" | "mkv"
-        | "mov" | "movie" | "mp1v" | "mp2v" | "mp4" | "mpe" | "mpeg"
-        | "mpg" | "mpv" | "mpv1" | "mpv2" | "ogm" | "pva" | "qt" | "ram"
-        | "ratdvd" | "rm" | "rmm" | "rmvb" | "rv" | "smil" | "smk" | "swf"
-        | "tp" | "ts" | "vid" | "video" | "vob" | "vp6" | "webm" | "wm"
-        | "wmv" | "xvid" => "Video".into(),
+        "3g2" | "3gp" | "3gp2" | "3gpp" | "amv" | "asf" | "avi" | "bik" | "divx" | "dvr-ms"
+        | "flc" | "fli" | "flic" | "flv" | "hdmov" | "ifo" | "m1v" | "m2t" | "m2ts" | "m2v"
+        | "m4b" | "m4v" | "mkv" | "mov" | "movie" | "mp1v" | "mp2v" | "mp4" | "mpe" | "mpeg"
+        | "mpg" | "mpv" | "mpv1" | "mpv2" | "ogm" | "pva" | "qt" | "ram" | "ratdvd" | "rm"
+        | "rmm" | "rmvb" | "rv" | "smil" | "smk" | "swf" | "tp" | "ts" | "vid" | "video"
+        | "vob" | "vp6" | "webm" | "wm" | "wmv" | "xvid" => "Video".into(),
 
         // Image -- eMule ED2KFT_IMAGE + modern additions (svg, webp)
-        "bmp" | "emf" | "gif" | "ico" | "jfif" | "jpe" | "jpeg" | "jpg"
-        | "pct" | "pcx" | "pic" | "pict" | "png" | "psd" | "psp" | "svg"
-        | "tga" | "tif" | "tiff" | "webp" | "wmf" | "wmp" | "xif" => "Image".into(),
+        "bmp" | "emf" | "gif" | "ico" | "jfif" | "jpe" | "jpeg" | "jpg" | "pct" | "pcx" | "pic"
+        | "pict" | "png" | "psd" | "psp" | "svg" | "tga" | "tif" | "tiff" | "webp" | "wmf"
+        | "wmp" | "xif" => "Image".into(),
 
         // Program -- eMule ED2KFT_PROGRAM + modern additions (apk, deb, rpm, scr, app)
-        "bat" | "cmd" | "com" | "exe" | "hta" | "js" | "jse" | "msc"
-        | "vbe" | "vbs" | "wsf" | "wsh"
-        | "apk" | "app" | "deb" | "rpm" | "scr" => "Pro".into(),
+        "bat" | "cmd" | "com" | "exe" | "hta" | "js" | "jse" | "msc" | "vbe" | "vbs" | "wsf"
+        | "wsh" | "apk" | "app" | "deb" | "rpm" | "scr" => "Pro".into(),
 
         // Document -- eMule ED2KFT_DOCUMENT + modern additions (docx, xlsx, pptx, odt, etc.)
-        "chm" | "css" | "diz" | "doc" | "dot" | "hlp" | "htm" | "html"
-        | "nfo" | "pdf" | "pps" | "ppt" | "ps" | "rtf" | "text" | "txt"
-        | "wri" | "xls" | "xml"
-        | "docx" | "xlsx" | "pptx" | "odt" | "ods" | "odp" | "epub"
-        | "djvu" | "lit" | "mobi" | "azw" => "Doc".into(),
+        "chm" | "css" | "diz" | "doc" | "dot" | "hlp" | "htm" | "html" | "nfo" | "pdf" | "pps"
+        | "ppt" | "ps" | "rtf" | "text" | "txt" | "wri" | "xls" | "xml" | "docx" | "xlsx"
+        | "pptx" | "odt" | "ods" | "odp" | "epub" | "djvu" | "lit" | "mobi" | "azw" => "Doc".into(),
 
         // Archive -- eMule ED2KFT_ARCHIVE + modern additions (xz)
-        "7z" | "ace" | "alz" | "arc" | "arj" | "bz2" | "cab" | "cbr"
-        | "cbz" | "gz" | "hqx" | "lha" | "lzh" | "msi" | "pak" | "par"
-        | "par2" | "rar" | "sit" | "sitx" | "tar" | "tbz2" | "tgz"
-        | "xpi" | "xz" | "z" | "zip" => "Arc".into(),
+        "7z" | "ace" | "alz" | "arc" | "arj" | "bz2" | "cab" | "cbr" | "cbz" | "gz" | "hqx"
+        | "lha" | "lzh" | "msi" | "pak" | "par" | "par2" | "rar" | "sit" | "sitx" | "tar"
+        | "tbz2" | "tgz" | "xpi" | "xz" | "z" | "zip" => "Arc".into(),
 
         // CD-Image -- eMule ED2KFT_CDIMAGE
-        "bin" | "bwa" | "bwi" | "bws" | "bwt" | "ccd" | "cue" | "dmg"
-        | "img" | "iso" | "mdf" | "mds" | "nrg" | "sub" | "toast" => "Iso".into(),
+        "bin" | "bwa" | "bwi" | "bws" | "bwt" | "ccd" | "cue" | "dmg" | "img" | "iso" | "mdf"
+        | "mds" | "nrg" | "sub" | "toast" => "Iso".into(),
 
         // Collection
         "emulecollection" => "EmuleCollection".into(),

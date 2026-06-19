@@ -100,7 +100,10 @@ impl UploadSpeedSense {
         if self.state == UssState::Preparing && self.ping_history.len() >= BASELINE_SAMPLES {
             self.initial_ping_ms = self.compute_median();
             self.state = UssState::Monitoring;
-            info!("USS: Baseline RTT established: {:.1}ms (from {} samples)", self.initial_ping_ms, BASELINE_SAMPLES);
+            info!(
+                "USS: Baseline RTT established: {:.1}ms (from {} samples)",
+                self.initial_ping_ms, BASELINE_SAMPLES
+            );
         }
     }
 
@@ -117,15 +120,25 @@ impl UploadSpeedSense {
         let current_ping = self.compute_median();
         let target_ping = self.initial_ping_ms * self.ping_tolerance;
 
-        let is_fast_reaction = self.start_time
+        let is_fast_reaction = self
+            .start_time
             .map(|s| s.elapsed().as_secs() < FAST_REACTION_SECS)
             .unwrap_or(false);
 
-        let up_divider = if is_fast_reaction { (self.going_up_divider * 0.5).max(1.01) } else { self.going_up_divider };
-        let down_divider = if is_fast_reaction { (self.going_down_divider * 0.5).max(1.1) } else { self.going_down_divider };
+        let up_divider = if is_fast_reaction {
+            (self.going_up_divider * 0.5).max(1.01)
+        } else {
+            self.going_up_divider
+        };
+        let down_divider = if is_fast_reaction {
+            (self.going_down_divider * 0.5).max(1.1)
+        } else {
+            self.going_down_divider
+        };
 
         if current_ping > target_ping {
-            let new_limit = (self.current_limit as f64 - (self.current_limit as f64 / down_divider)) as u64;
+            let new_limit =
+                (self.current_limit as f64 - (self.current_limit as f64 / down_divider)) as u64;
             self.current_limit = new_limit.max(self.min_upload);
             // Never exceed the configured cap, even on the decrease path: if
             // the user just lowered `max_upload` below `current_limit`, this
@@ -133,11 +146,15 @@ impl UploadSpeedSense {
             if self.max_upload > 0 && self.current_limit > self.max_upload {
                 self.current_limit = self.max_upload.max(self.min_upload.min(self.max_upload));
             }
-            debug!("USS: RTT {current_ping:.1}ms > target {target_ping:.1}ms, decreasing to {} B/s", self.current_limit);
+            debug!(
+                "USS: RTT {current_ping:.1}ms > target {target_ping:.1}ms, decreasing to {} B/s",
+                self.current_limit
+            );
         } else {
             let headroom = 1.0 - (current_ping / target_ping);
             if headroom > 0.1 {
-                let new_limit = (self.current_limit as f64 + (self.current_limit as f64 / up_divider)) as u64;
+                let new_limit =
+                    (self.current_limit as f64 + (self.current_limit as f64 / up_divider)) as u64;
                 self.current_limit = if self.max_upload > 0 {
                     new_limit.min(self.max_upload)
                 } else {

@@ -1,14 +1,14 @@
 pub mod a4af;
 pub mod aich;
 pub mod archive_recovery;
-pub mod ember_auth;
-pub mod friend_connect;
 pub mod chunk_selection;
 pub mod collection;
 pub mod comments;
 pub mod corruption_blackbox;
 pub mod credits;
 pub mod dead_sources;
+pub mod ember_auth;
+pub mod friend_connect;
 pub mod hash;
 pub mod messages;
 pub mod multi_source;

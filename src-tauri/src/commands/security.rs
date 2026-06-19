@@ -1,5 +1,5 @@
-use std::net::Ipv4Addr;
 use std::io::{Cursor, Read};
+use std::net::Ipv4Addr;
 
 use tokio::sync::oneshot;
 use tracing::info;
@@ -16,14 +16,23 @@ const MAX_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
 
 fn extract_ipfilter_from_zip(zip_bytes: &[u8]) -> Result<Vec<u8>, String> {
     let cursor = Cursor::new(zip_bytes);
-    let mut archive = ZipArchive::new(cursor)
-        .map_err(|e| coded_ctx("security_failed_to_open_ipfilter_zip", "Failed to open ipfilter.zip", e))?;
+    let mut archive = ZipArchive::new(cursor).map_err(|e| {
+        coded_ctx(
+            "security_failed_to_open_ipfilter_zip",
+            "Failed to open ipfilter.zip",
+            e,
+        )
+    })?;
 
     let mut best_candidate: Option<(usize, i32)> = None;
     for idx in 0..archive.len() {
-        let entry = archive
-            .by_index(idx)
-            .map_err(|e| coded_ctx("security_failed_to_inspect_archive_entry", "Failed to inspect archive entry", format!("#{idx}: {e}")))?;
+        let entry = archive.by_index(idx).map_err(|e| {
+            coded_ctx(
+                "security_failed_to_inspect_archive_entry",
+                "Failed to inspect archive entry",
+                format!("#{idx}: {e}"),
+            )
+        })?;
         if !entry.is_file() {
             continue;
         }
@@ -46,18 +55,28 @@ fn extract_ipfilter_from_zip(zip_bytes: &[u8]) -> Result<Vec<u8>, String> {
             continue;
         };
 
-        if best_candidate.map(|(_, best_score)| score > best_score).unwrap_or(true) {
+        if best_candidate
+            .map(|(_, best_score)| score > best_score)
+            .unwrap_or(true)
+        {
             best_candidate = Some((idx, score));
         }
     }
 
     let selected_idx = best_candidate.map(|(idx, _)| idx).ok_or_else(|| {
-        coded("security_archive_no_usable_ipfilter", "Archive does not contain a usable ipfilter.dat/.dat/.txt/.p2p file")
+        coded(
+            "security_archive_no_usable_ipfilter",
+            "Archive does not contain a usable ipfilter.dat/.dat/.txt/.p2p file",
+        )
     })?;
 
-    let entry = archive
-        .by_index(selected_idx)
-        .map_err(|e| coded_ctx("security_failed_to_read_selected_archive_entry", "Failed to read selected archive entry", e))?;
+    let entry = archive.by_index(selected_idx).map_err(|e| {
+        coded_ctx(
+            "security_failed_to_read_selected_archive_entry",
+            "Failed to read selected archive entry",
+            e,
+        )
+    })?;
     // Reject early on the declared size, but never *trust* it: `entry.size()`
     // is central-directory metadata an attacker fully controls, and the
     // deflate reader decompresses until the compressed stream ends rather
@@ -65,7 +84,10 @@ fn extract_ipfilter_from_zip(zip_bytes: &[u8]) -> Result<Vec<u8>, String> {
     // stream with `take` — a zip bomb that understates its size can't grow
     // the buffer past the limit and exhaust memory.
     if entry.size() > MAX_RESPONSE_BYTES as u64 {
-        return Err(coded("security_extracted_ipfilter_too_large", "Extracted ipfilter.dat is too large"));
+        return Err(coded(
+            "security_extracted_ipfilter_too_large",
+            "Extracted ipfilter.dat is too large",
+        ));
     }
 
     let cap = MAX_RESPONSE_BYTES as u64;
@@ -73,9 +95,18 @@ fn extract_ipfilter_from_zip(zip_bytes: &[u8]) -> Result<Vec<u8>, String> {
     entry
         .take(cap + 1)
         .read_to_end(&mut extracted)
-        .map_err(|e| coded_ctx("security_failed_to_extract_ipfilter", "Failed to extract ipfilter.dat", e))?;
+        .map_err(|e| {
+            coded_ctx(
+                "security_failed_to_extract_ipfilter",
+                "Failed to extract ipfilter.dat",
+                e,
+            )
+        })?;
     if extracted.len() as u64 > cap {
-        return Err(coded("security_extracted_ipfilter_too_large", "Extracted ipfilter.dat is too large"));
+        return Err(coded(
+            "security_extracted_ipfilter_too_large",
+            "Extracted ipfilter.dat is too large",
+        ));
     }
     Ok(extracted)
 }
@@ -93,8 +124,19 @@ pub async fn get_ip_filter_stats(
 
     tokio::time::timeout(CMD_TIMEOUT, rx)
         .await
-        .map_err(|_| coded("security_network_not_responding", "Network not responding (timeout)"))?
-        .map_err(|e| coded_ctx("security_failed_to_receive_ip_filter_stats", "Failed to receive IP filter stats", e))
+        .map_err(|_| {
+            coded(
+                "security_network_not_responding",
+                "Network not responding (timeout)",
+            )
+        })?
+        .map_err(|e| {
+            coded_ctx(
+                "security_failed_to_receive_ip_filter_stats",
+                "Failed to receive IP filter stats",
+                e,
+            )
+        })
 }
 
 #[tauri::command]
@@ -111,12 +153,18 @@ pub async fn add_ip_filter_range(
         .parse()
         .map_err(|_| coded("security_invalid_end_ip", "Invalid end IP address"))?;
     if u32::from(start) > u32::from(end) {
-        return Err(coded("security_start_ip_must_be_less_than_end", "Start IP must be less than or equal to end IP"));
+        return Err(coded(
+            "security_start_ip_must_be_less_than_end",
+            "Start IP must be less than or equal to end IP",
+        ));
     }
     // Bound the persisted description so a runaway caller can't grow the
     // ip-filter config unboundedly.
     if description.len() > 256 {
-        return Err(coded("security_description_too_long", "Description too long (max 256 bytes)"));
+        return Err(coded(
+            "security_description_too_long",
+            "Description too long (max 256 bytes)",
+        ));
     }
 
     state
@@ -138,14 +186,24 @@ pub async fn remove_ip_filter_range(
     start_ip: String,
     end_ip: String,
 ) -> Result<(), String> {
-    start_ip.parse::<Ipv4Addr>().map_err(|_| coded("security_invalid_start_ip", "Invalid start IP address"))?;
-    end_ip.parse::<Ipv4Addr>().map_err(|_| coded("security_invalid_end_ip", "Invalid end IP address"))?;
+    start_ip
+        .parse::<Ipv4Addr>()
+        .map_err(|_| coded("security_invalid_start_ip", "Invalid start IP address"))?;
+    end_ip
+        .parse::<Ipv4Addr>()
+        .map_err(|_| coded("security_invalid_end_ip", "Invalid end IP address"))?;
 
     state
         .network_tx
         .send(NetworkCommand::RemoveIpRange { start_ip, end_ip })
         .await
-        .map_err(|e| coded_ctx("security_failed_to_remove_range", "Failed to remove range", e))?;
+        .map_err(|e| {
+            coded_ctx(
+                "security_failed_to_remove_range",
+                "Failed to remove range",
+                e,
+            )
+        })?;
 
     Ok(())
 }
@@ -159,16 +217,27 @@ pub async fn set_ip_filter_enabled(
         .network_tx
         .send(NetworkCommand::SetIpFilterEnabled { enabled })
         .await
-        .map_err(|e| coded_ctx("security_failed_to_update_filter", "Failed to update filter", e))?;
+        .map_err(|e| {
+            coded_ctx(
+                "security_failed_to_update_filter",
+                "Failed to update filter",
+                e,
+            )
+        })?;
 
     let save_data = {
         let mut config = state.config.write().await;
         config.settings.ip_filter_enabled = enabled;
-        config.prepare_save().map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?
+        config
+            .prepare_save()
+            .map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?
     };
     tokio::task::spawn_blocking(move || {
         crate::storage::config::AppConfig::write_to_disk(&save_data.0, &save_data.1, &save_data.2)
-    }).await.map_err(|e| coded_ctx("security_save_task_failed", "Save task failed", e))?.map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?;
+    })
+    .await
+    .map_err(|e| coded_ctx("security_save_task_failed", "Save task failed", e))?
+    .map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?;
 
     Ok(())
 }
@@ -182,16 +251,27 @@ pub async fn set_block_private_ips(
         .network_tx
         .send(NetworkCommand::SetBlockPrivateIps { block_private })
         .await
-        .map_err(|e| coded_ctx("security_failed_to_update_filter", "Failed to update filter", e))?;
+        .map_err(|e| {
+            coded_ctx(
+                "security_failed_to_update_filter",
+                "Failed to update filter",
+                e,
+            )
+        })?;
 
     let save_data = {
         let mut config = state.config.write().await;
         config.settings.block_private_ips = block_private;
-        config.prepare_save().map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?
+        config
+            .prepare_save()
+            .map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?
     };
     tokio::task::spawn_blocking(move || {
         crate::storage::config::AppConfig::write_to_disk(&save_data.0, &save_data.1, &save_data.2)
-    }).await.map_err(|e| coded_ctx("security_save_task_failed", "Save task failed", e))?.map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?;
+    })
+    .await
+    .map_err(|e| coded_ctx("security_save_task_failed", "Save task failed", e))?
+    .map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?;
 
     Ok(())
 }
@@ -203,13 +283,17 @@ pub async fn download_and_load_ipfilter(
 ) -> Result<String, String> {
     info!("Downloading ipfilter.zip from {DEFAULT_IPFILTER_ARCHIVE_URL}");
 
-    let response = crate::security::fetch_pinned_get(DEFAULT_IPFILTER_ARCHIVE_URL).await
+    let response = crate::security::fetch_pinned_get(DEFAULT_IPFILTER_ARCHIVE_URL)
+        .await
         .map_err(|e| coded_ctx("security_http_request_failed", "HTTP request failed", e))?
         .error_for_status()
         .map_err(|e| coded_ctx("security_http_error", "HTTP error", e))?;
     if let Some(cl) = response.content_length() {
         if cl > MAX_RESPONSE_BYTES as u64 {
-            return Err(coded("security_response_too_large_content_length", "Response too large (Content-Length exceeds limit)"));
+            return Err(coded(
+                "security_response_too_large_content_length",
+                "Response too large (Content-Length exceeds limit)",
+            ));
         }
     }
     let bytes = {
@@ -217,7 +301,13 @@ pub async fn download_and_load_ipfilter(
         let mut body = Vec::new();
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| coded_ctx("security_failed_to_read_response", "Failed to read response", e))?;
+            let chunk = chunk.map_err(|e| {
+                coded_ctx(
+                    "security_failed_to_read_response",
+                    "Failed to read response",
+                    e,
+                )
+            })?;
             body.extend_from_slice(&chunk);
             if body.len() > MAX_RESPONSE_BYTES {
                 return Err(coded("security_response_too_large", "Response too large"));
@@ -228,12 +318,22 @@ pub async fn download_and_load_ipfilter(
 
     let extracted = tokio::task::spawn_blocking(move || extract_ipfilter_from_zip(&bytes))
         .await
-        .map_err(|e| coded_ctx("security_extraction_task_failed", "Extraction task failed", e))??;
+        .map_err(|e| {
+            coded_ctx(
+                "security_extraction_task_failed",
+                "Extraction task failed",
+                e,
+            )
+        })??;
 
     let data_dir = crate::storage::paths::resolve_data_dir_with_app(&app);
-    tokio::fs::create_dir_all(&data_dir)
-        .await
-        .map_err(|e| coded_ctx("security_failed_to_create_data_dir", "Failed to create data dir", e))?;
+    tokio::fs::create_dir_all(&data_dir).await.map_err(|e| {
+        coded_ctx(
+            "security_failed_to_create_data_dir",
+            "Failed to create data dir",
+            e,
+        )
+    })?;
 
     let filter_path = data_dir.join("ipfilter.dat");
     // Use atomic_write so a crash mid-save can't leave a partial
@@ -243,12 +343,16 @@ pub async fn download_and_load_ipfilter(
     {
         let path = filter_path.clone();
         let payload = extracted.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::security::atomic_write(&path, &payload, false)
-        })
-        .await
-        .map_err(|e| coded_ctx("security_save_task_failed", "Save task failed", e))?
-        .map_err(|e| coded_ctx("security_failed_to_write_ipfilter", "Failed to write ipfilter.dat", e))?;
+        tokio::task::spawn_blocking(move || crate::security::atomic_write(&path, &payload, false))
+            .await
+            .map_err(|e| coded_ctx("security_save_task_failed", "Save task failed", e))?
+            .map_err(|e| {
+                coded_ctx(
+                    "security_failed_to_write_ipfilter",
+                    "Failed to write ipfilter.dat",
+                    e,
+                )
+            })?;
     }
 
     let byte_count = extracted.len();
@@ -256,28 +360,47 @@ pub async fn download_and_load_ipfilter(
 
     state
         .network_tx
-        .send(NetworkCommand::ReloadIpFilter {
-            path: filter_path,
-        })
+        .send(NetworkCommand::ReloadIpFilter { path: filter_path })
         .await
-        .map_err(|e| coded_ctx("security_failed_to_reload_filter", "Failed to reload filter", e))?;
+        .map_err(|e| {
+            coded_ctx(
+                "security_failed_to_reload_filter",
+                "Failed to reload filter",
+                e,
+            )
+        })?;
 
     // Also enable the filter if it wasn't already
     state
         .network_tx
         .send(NetworkCommand::SetIpFilterEnabled { enabled: true })
         .await
-        .map_err(|e| coded_ctx("security_failed_to_enable_filter", "Failed to enable filter", e))?;
+        .map_err(|e| {
+            coded_ctx(
+                "security_failed_to_enable_filter",
+                "Failed to enable filter",
+                e,
+            )
+        })?;
 
     {
         let save_data = {
             let mut config = state.config.write().await;
             config.settings.ip_filter_enabled = true;
-            config.prepare_save().map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?
+            config.prepare_save().map_err(|e| {
+                coded_ctx("security_failed_to_save_config", "Failed to save config", e)
+            })?
         };
         tokio::task::spawn_blocking(move || {
-            crate::storage::config::AppConfig::write_to_disk(&save_data.0, &save_data.1, &save_data.2)
-        }).await.map_err(|e| coded_ctx("security_save_task_failed", "Save task failed", e))?.map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?;
+            crate::storage::config::AppConfig::write_to_disk(
+                &save_data.0,
+                &save_data.1,
+                &save_data.2,
+            )
+        })
+        .await
+        .map_err(|e| coded_ctx("security_save_task_failed", "Save task failed", e))?
+        .map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?;
     }
 
     let msg = format!(
@@ -314,7 +437,10 @@ pub async fn update_ipfilter_from_url(
         .map_err(|e| coded_ctx("security_http_error", "HTTP error", e))?;
     if let Some(cl) = response.content_length() {
         if cl > MAX_RESPONSE_BYTES as u64 {
-            return Err(coded("security_response_too_large_content_length", "Response too large (Content-Length exceeds limit)"));
+            return Err(coded(
+                "security_response_too_large_content_length",
+                "Response too large (Content-Length exceeds limit)",
+            ));
         }
     }
     let bytes = {
@@ -322,7 +448,13 @@ pub async fn update_ipfilter_from_url(
         let mut body = Vec::new();
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| coded_ctx("security_failed_to_read_response", "Failed to read response", e))?;
+            let chunk = chunk.map_err(|e| {
+                coded_ctx(
+                    "security_failed_to_read_response",
+                    "Failed to read response",
+                    e,
+                )
+            })?;
             body.extend_from_slice(&chunk);
             if body.len() > MAX_RESPONSE_BYTES {
                 return Err(coded("security_response_too_large", "Response too large"));
@@ -331,33 +463,51 @@ pub async fn update_ipfilter_from_url(
         body
     };
 
-    let is_zip = bytes.len() >= 4 && bytes[0] == 0x50 && bytes[1] == 0x4B && bytes[2] == 0x03 && bytes[3] == 0x04;
+    let is_zip = bytes.len() >= 4
+        && bytes[0] == 0x50
+        && bytes[1] == 0x4B
+        && bytes[2] == 0x03
+        && bytes[3] == 0x04;
     let filter_bytes = if is_zip {
         info!("Detected zip archive, extracting ipfilter…");
         let zb = bytes;
         tokio::task::spawn_blocking(move || extract_ipfilter_from_zip(&zb))
             .await
-            .map_err(|e| coded_ctx("security_extraction_task_failed", "Extraction task failed", e))??
+            .map_err(|e| {
+                coded_ctx(
+                    "security_extraction_task_failed",
+                    "Extraction task failed",
+                    e,
+                )
+            })??
     } else {
         bytes
     };
 
     let data_dir = crate::storage::paths::resolve_data_dir_with_app(&app);
-    tokio::fs::create_dir_all(&data_dir)
-        .await
-        .map_err(|e| coded_ctx("security_failed_to_create_data_dir", "Failed to create data dir", e))?;
+    tokio::fs::create_dir_all(&data_dir).await.map_err(|e| {
+        coded_ctx(
+            "security_failed_to_create_data_dir",
+            "Failed to create data dir",
+            e,
+        )
+    })?;
 
     let filter_path = data_dir.join("ipfilter.dat");
     // Atomic write: crash safety as in `download_and_load_ipfilter`.
     {
         let path = filter_path.clone();
         let payload = filter_bytes.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::security::atomic_write(&path, &payload, false)
-        })
-        .await
-        .map_err(|e| coded_ctx("security_save_task_failed", "Save task failed", e))?
-        .map_err(|e| coded_ctx("security_failed_to_write_ipfilter", "Failed to write ipfilter.dat", e))?;
+        tokio::task::spawn_blocking(move || crate::security::atomic_write(&path, &payload, false))
+            .await
+            .map_err(|e| coded_ctx("security_save_task_failed", "Save task failed", e))?
+            .map_err(|e| {
+                coded_ctx(
+                    "security_failed_to_write_ipfilter",
+                    "Failed to write ipfilter.dat",
+                    e,
+                )
+            })?;
     }
 
     let byte_count = filter_bytes.len();
@@ -365,27 +515,46 @@ pub async fn update_ipfilter_from_url(
 
     state
         .network_tx
-        .send(NetworkCommand::ReloadIpFilter {
-            path: filter_path,
-        })
+        .send(NetworkCommand::ReloadIpFilter { path: filter_path })
         .await
-        .map_err(|e| coded_ctx("security_failed_to_reload_filter", "Failed to reload filter", e))?;
+        .map_err(|e| {
+            coded_ctx(
+                "security_failed_to_reload_filter",
+                "Failed to reload filter",
+                e,
+            )
+        })?;
 
     state
         .network_tx
         .send(NetworkCommand::SetIpFilterEnabled { enabled: true })
         .await
-        .map_err(|e| coded_ctx("security_failed_to_enable_filter", "Failed to enable filter", e))?;
+        .map_err(|e| {
+            coded_ctx(
+                "security_failed_to_enable_filter",
+                "Failed to enable filter",
+                e,
+            )
+        })?;
 
     {
         let save_data = {
             let mut config = state.config.write().await;
             config.settings.ip_filter_enabled = true;
-            config.prepare_save().map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?
+            config.prepare_save().map_err(|e| {
+                coded_ctx("security_failed_to_save_config", "Failed to save config", e)
+            })?
         };
         tokio::task::spawn_blocking(move || {
-            crate::storage::config::AppConfig::write_to_disk(&save_data.0, &save_data.1, &save_data.2)
-        }).await.map_err(|e| coded_ctx("security_save_task_failed", "Save task failed", e))?.map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?;
+            crate::storage::config::AppConfig::write_to_disk(
+                &save_data.0,
+                &save_data.1,
+                &save_data.2,
+            )
+        })
+        .await
+        .map_err(|e| coded_ctx("security_save_task_failed", "Save task failed", e))?
+        .map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?;
     }
 
     let extracted_note = if is_zip { " (extracted from zip)" } else { "" };
@@ -409,49 +578,97 @@ pub async fn import_ipfilter_file(
     // string across thread boundaries unnecessarily.
     const MAX_PATH_LEN: usize = 4 * 1024;
     if file_path.len() > MAX_PATH_LEN {
-        return Err(coded_ctx("security_file_path_too_long", "File path exceeds maximum length", format!("{MAX_PATH_LEN} bytes")));
+        return Err(coded_ctx(
+            "security_file_path_too_long",
+            "File path exceeds maximum length",
+            format!("{MAX_PATH_LEN} bytes"),
+        ));
     }
     let path = tokio::task::spawn_blocking(move || {
         let path = std::path::PathBuf::from(&file_path);
         if !path.exists() {
             return Err(coded("security_file_does_not_exist", "File does not exist"));
         }
-        let canonical = path.canonicalize().map_err(|e| coded_ctx("security_invalid_path", "Invalid path", e))?;
+        let canonical = path
+            .canonicalize()
+            .map_err(|e| coded_ctx("security_invalid_path", "Invalid path", e))?;
         let blocked_segments: &[&str] = &[
-            "windows", "program files", "program files (x86)",
-            "programdata", ".ssh", ".gnupg",
-            "etc", "usr", "bin", "sbin", "var", "root",
+            "windows",
+            "program files",
+            "program files (x86)",
+            "programdata",
+            ".ssh",
+            ".gnupg",
+            "etc",
+            "usr",
+            "bin",
+            "sbin",
+            "var",
+            "root",
         ];
         for component in canonical.components() {
             if let std::path::Component::Normal(seg) = component {
                 let seg_lower = seg.to_string_lossy().to_lowercase();
                 if blocked_segments.contains(&seg_lower.as_str()) {
-                    return Err(coded_ctx("security_cannot_import_system_dir", "Cannot import from system directory", canonical.display()));
+                    return Err(coded_ctx(
+                        "security_cannot_import_system_dir",
+                        "Cannot import from system directory",
+                        canonical.display(),
+                    ));
                 }
             }
         }
-        if canonical.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()) != Some("dat".to_string())
-            && canonical.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()) != Some("txt".to_string())
-            && canonical.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()) != Some("gz".to_string())
-            && canonical.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()) != Some("zip".to_string())
-            && canonical.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()) != Some("p2p".to_string())
+        if canonical
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase())
+            != Some("dat".to_string())
+            && canonical
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase())
+                != Some("txt".to_string())
+            && canonical
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase())
+                != Some("gz".to_string())
+            && canonical
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase())
+                != Some("zip".to_string())
+            && canonical
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase())
+                != Some("p2p".to_string())
         {
-            return Err(coded("security_invalid_ipfilter_file_type", "IP filter file must be a .dat, .txt, .gz, .zip, or .p2p file"));
+            return Err(coded(
+                "security_invalid_ipfilter_file_type",
+                "IP filter file must be a .dat, .txt, .gz, .zip, or .p2p file",
+            ));
         }
         Ok(canonical)
     })
     .await
     .map_err(|e| coded_ctx("security_task_failed", "Task failed", e))??;
 
-    let ext = path.extension()
+    let ext = path
+        .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_lowercase())
         .unwrap_or_default();
 
     let load_path = if ext == "gz" || ext == "zip" {
         let data_dir = crate::storage::paths::resolve_data_dir_with_app(&app);
-        tokio::fs::create_dir_all(&data_dir).await
-            .map_err(|e| coded_ctx("security_failed_to_create_data_dir", "Failed to create data dir", e))?;
+        tokio::fs::create_dir_all(&data_dir).await.map_err(|e| {
+            coded_ctx(
+                "security_failed_to_create_data_dir",
+                "Failed to create data dir",
+                e,
+            )
+        })?;
         let dest = data_dir.join("ipfilter.dat");
 
         let src = path.clone();
@@ -468,13 +685,21 @@ pub async fn import_ipfilter_file(
                 let decoder = GzDecoder::new(std::io::Cursor::new(&raw));
                 let mut limited = decoder.take(MAX_RESPONSE_BYTES as u64 + 1);
                 let mut out = Vec::new();
-                limited.read_to_end(&mut out)
-                    .map_err(|e| coded_ctx("security_failed_to_decompress_gz", "Failed to decompress .gz file", e))?;
+                limited.read_to_end(&mut out).map_err(|e| {
+                    coded_ctx(
+                        "security_failed_to_decompress_gz",
+                        "Failed to decompress .gz file",
+                        e,
+                    )
+                })?;
                 if out.len() > MAX_RESPONSE_BYTES {
                     return Err(coded_ctx(
                         "security_decompressed_gz_too_large",
                         "Decompressed .gz file is too large",
-                        format!("over {} MiB — refusing to load", MAX_RESPONSE_BYTES / (1024 * 1024))
+                        format!(
+                            "over {} MiB — refusing to load",
+                            MAX_RESPONSE_BYTES / (1024 * 1024)
+                        ),
                     ));
                 }
                 out
@@ -484,8 +709,13 @@ pub async fn import_ipfilter_file(
             // Atomic write: prevents partial-file corruption on crash
             // mid-decompression-write. Already inside spawn_blocking,
             // so calling the sync helper directly is fine.
-            crate::security::atomic_write(&dest, &decompressed, false)
-                .map_err(|e| coded_ctx("security_failed_to_write_ipfilter", "Failed to write ipfilter.dat", e))?;
+            crate::security::atomic_write(&dest, &decompressed, false).map_err(|e| {
+                coded_ctx(
+                    "security_failed_to_write_ipfilter",
+                    "Failed to write ipfilter.dat",
+                    e,
+                )
+            })?;
             Ok::<std::path::PathBuf, String>(dest)
         })
         .await
@@ -498,23 +728,44 @@ pub async fn import_ipfilter_file(
         .network_tx
         .send(NetworkCommand::ReloadIpFilter { path: load_path })
         .await
-        .map_err(|e| coded_ctx("security_failed_to_reload_filter", "Failed to reload filter", e))?;
+        .map_err(|e| {
+            coded_ctx(
+                "security_failed_to_reload_filter",
+                "Failed to reload filter",
+                e,
+            )
+        })?;
 
     state
         .network_tx
         .send(NetworkCommand::SetIpFilterEnabled { enabled: true })
         .await
-        .map_err(|e| coded_ctx("security_failed_to_enable_filter", "Failed to enable filter", e))?;
+        .map_err(|e| {
+            coded_ctx(
+                "security_failed_to_enable_filter",
+                "Failed to enable filter",
+                e,
+            )
+        })?;
 
     {
         let save_data = {
             let mut config = state.config.write().await;
             config.settings.ip_filter_enabled = true;
-            config.prepare_save().map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?
+            config.prepare_save().map_err(|e| {
+                coded_ctx("security_failed_to_save_config", "Failed to save config", e)
+            })?
         };
         tokio::task::spawn_blocking(move || {
-            crate::storage::config::AppConfig::write_to_disk(&save_data.0, &save_data.1, &save_data.2)
-        }).await.map_err(|e| coded_ctx("security_save_task_failed", "Save task failed", e))?.map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?;
+            crate::storage::config::AppConfig::write_to_disk(
+                &save_data.0,
+                &save_data.1,
+                &save_data.2,
+            )
+        })
+        .await
+        .map_err(|e| coded_ctx("security_save_task_failed", "Save task failed", e))?
+        .map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?;
     }
 
     Ok("Imported and loaded IP filter — filter is now active".into())
@@ -541,7 +792,12 @@ pub async fn get_antileech_patterns(
         .network_tx
         .try_send(NetworkCommand::GetAntiLeechSnapshot { tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    await_reply(rx, "security_failed_to_read_antileech", "Failed to read anti-leech filter").await
+    await_reply(
+        rx,
+        "security_failed_to_read_antileech",
+        "Failed to read anti-leech filter",
+    )
+    .await
 }
 
 /// Replace the entire pattern list, persist to disk, and recompile.
@@ -556,17 +812,28 @@ pub async fn set_antileech_patterns(
     // Bound the pattern set so a runaway caller can't push an unbounded list
     // (each pattern is compiled and held in memory by the network task).
     if patterns.len() > 10_000 {
-        return Err(coded("security_too_many_patterns", "Too many anti-leech patterns (max 10000)"));
+        return Err(coded(
+            "security_too_many_patterns",
+            "Too many anti-leech patterns (max 10000)",
+        ));
     }
     if patterns.iter().any(|p| p.len() > 1024) {
-        return Err(coded("security_pattern_too_long", "Anti-leech pattern too long (max 1024 bytes)"));
+        return Err(coded(
+            "security_pattern_too_long",
+            "Anti-leech pattern too long (max 1024 bytes)",
+        ));
     }
     let (tx, rx) = oneshot::channel();
     state
         .network_tx
         .try_send(NetworkCommand::SetAntiLeechPatterns { patterns, tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    await_reply(rx, "security_failed_to_update_antileech", "Failed to update anti-leech filter").await?
+    await_reply(
+        rx,
+        "security_failed_to_update_antileech",
+        "Failed to update anti-leech filter",
+    )
+    .await?
 }
 
 /// Toggle the filter on or off without touching the pattern list.
@@ -582,7 +849,12 @@ pub async fn set_antileech_enabled(
         .network_tx
         .try_send(NetworkCommand::SetAntiLeechEnabled { enabled, tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    await_reply(rx, "security_failed_to_toggle_antileech", "Failed to toggle anti-leech filter").await??;
+    await_reply(
+        rx,
+        "security_failed_to_toggle_antileech",
+        "Failed to toggle anti-leech filter",
+    )
+    .await??;
 
     // Persist the toggle to the config file so a restart preserves it.
     // Done after the network task confirms the flip so a failure mid-
@@ -594,15 +866,23 @@ pub async fn set_antileech_enabled(
             .map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?
     };
     tokio::task::spawn_blocking(move || {
-        crate::storage::config::AppConfig::write_to_disk(
-            &save_data.0,
-            &save_data.1,
-            &save_data.2,
-        )
+        crate::storage::config::AppConfig::write_to_disk(&save_data.0, &save_data.1, &save_data.2)
     })
     .await
-    .map_err(|e| coded_ctx("security_config_save_task_failed", "Config save task failed", e))?
-    .map_err(|e| coded_ctx("security_failed_to_write_config", "Failed to write config", e))?;
+    .map_err(|e| {
+        coded_ctx(
+            "security_config_save_task_failed",
+            "Config save task failed",
+            e,
+        )
+    })?
+    .map_err(|e| {
+        coded_ctx(
+            "security_failed_to_write_config",
+            "Failed to write config",
+            e,
+        )
+    })?;
     Ok(())
 }
 
@@ -618,5 +898,10 @@ pub async fn reset_antileech_to_defaults(
         .network_tx
         .try_send(NetworkCommand::ResetAntiLeechToDefaults { tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    await_reply(rx, "security_failed_to_reset_antileech", "Failed to reset anti-leech filter").await?
+    await_reply(
+        rx,
+        "security_failed_to_reset_antileech",
+        "Failed to reset anti-leech filter",
+    )
+    .await?
 }

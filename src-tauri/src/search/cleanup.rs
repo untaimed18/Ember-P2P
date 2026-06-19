@@ -32,7 +32,9 @@ pub fn cleanup_filename(name: &str, cleanup_strings: &[String]) -> String {
                     break;
                 }
                 result = chars[..char_offset].iter().collect::<String>()
-                    + &chars[char_offset + pat_char_len..].iter().collect::<String>();
+                    + &chars[char_offset + pat_char_len..]
+                        .iter()
+                        .collect::<String>();
             } else {
                 break;
             }
@@ -70,7 +72,9 @@ pub fn strip_comment_urls(comment: &str) -> String {
         let pat_lower = pattern.to_lowercase();
         loop {
             let lower = result.to_lowercase();
-            let Some(lower_start) = lower.find(&pat_lower) else { break };
+            let Some(lower_start) = lower.find(&pat_lower) else {
+                break;
+            };
             let char_offset = lower[..lower_start].chars().count();
             let start: usize = result.chars().take(char_offset).map(|c| c.len_utf8()).sum();
             if start >= result.len() {
@@ -112,10 +116,9 @@ fn url_decode(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(
-                std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""),
-                16,
-            ) {
+            if let Ok(byte) =
+                u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+            {
                 if byte >= 0x20 {
                     decoded_bytes.push(byte);
                     i += 3;
@@ -143,8 +146,13 @@ fn replace_dots_with_spaces(s: &str) -> String {
                 // decimals (e.g. "1.5", "3.14") from scene-style separators
                 // (e.g. "2024.1080").  Keep the dot only when at least one
                 // side is a short (≤2 digit) number.
-                let left_digits = (0..i).rev().take_while(|&j| chars[j].is_ascii_digit()).count();
-                let right_digits = (i + 1..len).take_while(|&j| chars[j].is_ascii_digit()).count();
+                let left_digits = (0..i)
+                    .rev()
+                    .take_while(|&j| chars[j].is_ascii_digit())
+                    .count();
+                let right_digits = (i + 1..len)
+                    .take_while(|&j| chars[j].is_ascii_digit())
+                    .count();
                 if left_digits <= 2 || right_digits <= 2 {
                     result.push('.');
                 } else {
@@ -264,10 +272,7 @@ mod tests {
 
     #[test]
     fn test_url_removal() {
-        let result = cleanup_filename(
-            "Song_-_Artist_[www.site.com].mp3",
-            &default_cleanup(),
-        );
+        let result = cleanup_filename("Song_-_Artist_[www.site.com].mp3", &default_cleanup());
         assert!(!result.contains("www"));
         assert!(!result.contains("site"));
     }

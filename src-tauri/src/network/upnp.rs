@@ -70,7 +70,10 @@ impl UpnpMappings {
             igd_next::PortMappingProtocol::TCP => "TCP",
             igd_next::PortMappingProtocol::UDP => "UDP",
         };
-        match gateway.add_port(protocol, port, local, LEASE_SECS, label).await {
+        match gateway
+            .add_port(protocol, port, local, LEASE_SECS, label)
+            .await
+        {
             Ok(()) => {
                 info!("UPnP: mapped {proto} port {port} ({label})");
                 true
@@ -89,9 +92,14 @@ impl UpnpMappings {
             }
             Err(igd_next::AddPortError::PortInUse) => {
                 let _ = gateway.remove_port(protocol, port).await;
-                match gateway.add_port(protocol, port, local, LEASE_SECS, label).await {
+                match gateway
+                    .add_port(protocol, port, local, LEASE_SECS, label)
+                    .await
+                {
                     Ok(()) => {
-                        info!("UPnP: re-mapped {proto} port {port} ({label}) after mapping conflict");
+                        info!(
+                            "UPnP: re-mapped {proto} port {port} ({label}) after mapping conflict"
+                        );
                         true
                     }
                     Err(e) => {
@@ -239,10 +247,7 @@ impl UpnpMappings {
     /// Returns whether the TCP or KAD UDP mapping is currently in place.
     pub async fn maintain(&mut self) -> bool {
         if self.gateway.is_none() {
-            if self
-                .next_discovery_at
-                .is_some_and(|t| Instant::now() < t)
-            {
+            if self.next_discovery_at.is_some_and(|t| Instant::now() < t) {
                 return false;
             }
             self.setup().await;
@@ -265,15 +270,21 @@ impl UpnpMappings {
     pub async fn teardown(&mut self) {
         if let Some(ref gateway) = self.gateway {
             if self.tcp_mapped {
-                let _ = gateway.remove_port(igd_next::PortMappingProtocol::TCP, self.tcp_port).await;
+                let _ = gateway
+                    .remove_port(igd_next::PortMappingProtocol::TCP, self.tcp_port)
+                    .await;
             }
             if self.udp_mapped {
-                let _ = gateway.remove_port(igd_next::PortMappingProtocol::UDP, self.udp_port).await;
+                let _ = gateway
+                    .remove_port(igd_next::PortMappingProtocol::UDP, self.udp_port)
+                    .await;
             }
             if self.quic_mapped {
                 if let Some(qp) = self.quic_port {
                     if qp != self.udp_port {
-                        let _ = gateway.remove_port(igd_next::PortMappingProtocol::UDP, qp).await;
+                        let _ = gateway
+                            .remove_port(igd_next::PortMappingProtocol::UDP, qp)
+                            .await;
                     }
                 }
             }
@@ -378,12 +389,16 @@ mod tests {
         assert!(m.next_discovery_at.is_none());
         m.note_discovery_failure();
         assert_eq!(m.discovery_failures, 1);
-        let first = m.next_discovery_at.expect("backoff armed after first failure");
+        let first = m
+            .next_discovery_at
+            .expect("backoff armed after first failure");
         // A later failure schedules its retry no earlier than the first
         // (the schedule is monotonically non-decreasing).
         m.note_discovery_failure();
         assert_eq!(m.discovery_failures, 2);
-        let second = m.next_discovery_at.expect("backoff armed after second failure");
+        let second = m
+            .next_discovery_at
+            .expect("backoff armed after second failure");
         assert!(second >= first);
     }
 
@@ -393,7 +408,11 @@ mod tests {
         // Distinct from the KAD UDP port → needs its own mapping, but no
         // gateway has been discovered yet, so it can't be mapped right now.
         assert!(!m.map_quic_port(5000).await);
-        assert_eq!(m.quic_port, Some(5000), "port is recorded for a later maintain()");
+        assert_eq!(
+            m.quic_port,
+            Some(5000),
+            "port is recorded for a later maintain()"
+        );
         assert!(!m.quic_mapped);
     }
 

@@ -1,6 +1,6 @@
 pub mod ed2k;
-pub mod kad;
 pub mod ember;
+pub mod kad;
 pub mod rendezvous;
 pub mod upnp;
 
@@ -11,12 +11,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use byteorder::{LittleEndian, ReadBytesExt};
+use futures::FutureExt;
 use tauri::{Emitter, Manager};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, RwLock};
-use futures::FutureExt;
 use tracing::{debug, error, info, warn};
 
 use crate::bandwidth::limiter::BandwidthLimiter;
@@ -27,27 +27,32 @@ use crate::types::*;
 
 use self::ed2k::a4af::A4AFManager;
 use self::ed2k::comments::CommentManager;
-use self::ed2k::credits::CreditManager;
 use self::ed2k::corruption_blackbox::CorruptionBlackBox;
+use self::ed2k::credits::CreditManager;
 use self::ed2k::dead_sources::DeadSourceList;
+use self::ed2k::messages::{OP_EDONKEYHEADER, OP_EMULEPROT, OP_PORTTEST};
+use self::ed2k::multi_source::{DownloadSource, MultiSourceDownload, SharedTrackerRegistry};
 use self::ed2k::server::{Ed2kServerConnection, ServerSession};
 use self::ed2k::server_list::{ServerEntry, ServerList};
-use self::ed2k::server_udp::{ServerUdpSocket, ServerUdpResponse};
+use self::ed2k::server_udp::{ServerUdpResponse, ServerUdpSocket};
 use self::ed2k::sources::SourceManager;
-use self::ed2k::upload::{self as upload_server, UploadEvent, UploadEventKind};
-use self::ed2k::multi_source::{DownloadSource, MultiSourceDownload, SharedTrackerRegistry};
 use self::ed2k::transfer::{classify_error, DownloadEvent, Ed2kDownload, SourceFailureKind};
+use self::ed2k::upload::{self as upload_server, UploadEvent, UploadEventKind};
 use self::kad::bootstrap;
-use self::kad::buddy::{BuddyManager, BuddyState, BuddyEvent, BuddyWriteStream, PendingBuddySet};
+use self::kad::buddy::{BuddyEvent, BuddyManager, BuddyState, BuddyWriteStream, PendingBuddySet};
 use self::kad::firewall::FirewallChecker;
 use self::kad::ip_filter::{IpFilter, IpFilterStats};
 use self::kad::messages::{self, KadMessage, KADEMLIA_FIND_NODE};
-use self::ed2k::messages::{OP_EDONKEYHEADER, OP_EMULEPROT, OP_PORTTEST};
 use self::kad::obfuscation;
 use self::kad::protection::FloodProtection;
-use self::kad::publish::{PublishManager, PublishableFile, md4_bytes_to_kad_id, kad_id_to_md4_bytes};
+use self::kad::publish::{
+    kad_id_to_md4_bytes, md4_bytes_to_kad_id, KeywordPublishBatch, PublishManager, PublishableFile,
+};
 use self::kad::routing::RoutingTable;
-use self::kad::search::{SearchId, SearchManager, SearchPhase, SearchType, SEARCH_INITIAL_CONTACTS};
+use self::kad::search::{
+    SearchId, SearchManager, SearchPhase, SearchType, SEARCH_INITIAL_CONTACTS,
+    STORE_PUBLISH_TARGET_TOTAL,
+};
 use self::kad::store::DhtStore;
 use self::kad::types::*;
 
@@ -188,11 +193,7 @@ fn record_known_ember_peer(
         return false;
     }
     if map.len() >= MAX_KNOWN_EMBER_PEERS {
-        if let Some(oldest_key) = map
-            .iter()
-            .min_by_key(|(_, ts)| *ts)
-            .map(|(k, _)| *k)
-        {
+        if let Some(oldest_key) = map.iter().min_by_key(|(_, ts)| *ts).map(|(k, _)| *k) {
             map.remove(&oldest_key);
         }
     }
@@ -236,17 +237,17 @@ fn record_ember_noise_key(
     let now = std::time::Instant::now();
     let key = (ip, port);
     if let Some((existing, ts)) = map.get_mut(&key) {
-        let prev = if *existing != noise_pub { Some(*existing) } else { None };
+        let prev = if *existing != noise_pub {
+            Some(*existing)
+        } else {
+            None
+        };
         *existing = noise_pub;
         *ts = now;
         return prev;
     }
     if map.len() >= MAX_KNOWN_EMBER_NOISE_KEYS {
-        if let Some(oldest_key) = map
-            .iter()
-            .min_by_key(|(_, (_, ts))| *ts)
-            .map(|(k, _)| *k)
-        {
+        if let Some(oldest_key) = map.iter().min_by_key(|(_, (_, ts))| *ts).map(|(k, _)| *k) {
             map.remove(&oldest_key);
         }
     }
@@ -344,7 +345,10 @@ async fn handle_epx_sources(
             if flags & ember::SOURCE_FLAG_FIREWALLED != 0 && (state.firewalled || state.low_id) {
                 continue;
             }
-            if state.dead_sources.is_dead_source_for_file(file_hash, u32::from(ip), port) {
+            if state
+                .dead_sources
+                .is_dead_source_for_file(file_hash, u32::from(ip), port)
+            {
                 continue;
             }
             if crate::security::is_special_use_v4(ip) || ip.is_multicast() {
@@ -436,7 +440,10 @@ async fn handle_epx_sources(
             );
             continue;
         }
-        let matches_trusted = state.aich_hash_sets.iter().any(|hs| hs.root_hash == *aich_root);
+        let matches_trusted = state
+            .aich_hash_sets
+            .iter()
+            .any(|hs| hs.root_hash == *aich_root);
         if matches_trusted {
             state.aich_root_map.insert(*file_hash, *aich_root);
             tracing::debug!(
@@ -474,7 +481,10 @@ async fn handle_epx_sources(
     }
 
     if total_injected > 0 {
-        state.stats.epx_sources_received = state.stats.epx_sources_received.saturating_add(total_injected as u32);
+        state.stats.epx_sources_received = state
+            .stats
+            .epx_sources_received
+            .saturating_add(total_injected as u32);
         state.ember_payload_dirty = true;
 
         let mut mgr = transfer_manager.write().await;
@@ -562,9 +572,7 @@ fn enqueue_overflow_source(
     true
 }
 
-fn drain_active_source_overflow(
-    state: &mut NetworkState,
-) -> Vec<(String, usize, usize)> {
+fn drain_active_source_overflow(state: &mut NetworkState) -> Vec<(String, usize, usize)> {
     let mut drained = Vec::new();
     let transfer_ids: Vec<String> = state.active_source_overflow.keys().cloned().collect();
 
@@ -604,7 +612,9 @@ fn drain_active_source_overflow(
             state.active_established_senders.remove(&transfer_id);
             state.active_source_overflow.remove(&transfer_id);
             state.active_kad_search_state.remove(&transfer_id);
-            state.download_source_searches.retain(|_, (tid, _)| tid != &transfer_id);
+            state
+                .download_source_searches
+                .retain(|_, (tid, _)| tid != &transfer_id);
             continue;
         }
 
@@ -798,7 +808,10 @@ const MAX_FAIL_COUNT_FOR_UDP: u32 = 3;
 /// path resets the per-server counter via `record_udp_reply`.
 const MAX_UDP_CONSECUTIVE_FAILURES: u32 = 5;
 
-fn is_eligible_udp_server(server: &ed2k::server_list::ServerEntry, connected_addr: Option<SocketAddr>) -> bool {
+fn is_eligible_udp_server(
+    server: &ed2k::server_list::ServerEntry,
+    connected_addr: Option<SocketAddr>,
+) -> bool {
     if server.fail_count >= MAX_FAIL_COUNT_FOR_UDP {
         return false;
     }
@@ -831,7 +844,9 @@ fn build_all_getsources_packets(
         if !is_eligible_udp_server(server, state.server_addr) {
             continue;
         }
-        if let Some(packet) = ServerUdpSocket::build_get_sources_packet(server, file_hash, file_size) {
+        if let Some(packet) =
+            ServerUdpSocket::build_get_sources_packet(server, file_hash, file_size)
+        {
             packets.push(packet);
         }
     }
@@ -963,28 +978,47 @@ fn inject_source_into_active_transfers(
         state.active_established_senders.remove(transfer_id);
         state.active_source_overflow.remove(transfer_id);
         state.active_kad_search_state.remove(transfer_id);
-        state.download_source_searches.retain(|_, (tid, _)| tid != transfer_id);
+        state
+            .download_source_searches
+            .retain(|_, (tid, _)| tid != transfer_id);
     }
 
     let hash_hex = hex::encode(file_hash);
     if stats.injected > 0 {
         info!(
             "Source {}:{} injected into {} transfer(s) for {} (persisted={}, injected={})",
-            source.peer_ip, source.peer_port, stats.injected, hash_hex, stats.persisted, stats.injected
+            source.peer_ip,
+            source.peer_port,
+            stats.injected,
+            hash_hex,
+            stats.persisted,
+            stats.injected
         );
     }
     if stats.dropped_full > 0 || stats.dropped_closed > 0 {
         warn!(
             "Source {}:{} for {} had drops: full={}, overflowed={}, closed={} (stale: {:?})",
-            source.peer_ip, source.peer_port, hash_hex,
-            stats.dropped_full, stats.overflowed, stats.dropped_closed, stale_transfer_ids
+            source.peer_ip,
+            source.peer_port,
+            hash_hex,
+            stats.dropped_full,
+            stats.overflowed,
+            stats.dropped_closed,
+            stale_transfer_ids
         );
     }
 
     stats
 }
 
-async fn try_connect_server(ip: &str, port: u16, obf_port: u16, app: &tauri::AppHandle, force_plain: bool, obfuscation_enabled: bool) -> anyhow::Result<(Ed2kServerConnection, SocketAddr)> {
+async fn try_connect_server(
+    ip: &str,
+    port: u16,
+    obf_port: u16,
+    app: &tauri::AppHandle,
+    force_plain: bool,
+    obfuscation_enabled: bool,
+) -> anyhow::Result<(Ed2kServerConnection, SocketAddr)> {
     // Decide whether/where to attempt the obfuscated (DH) server handshake.
     // eMule negotiates protocol obfuscation via a DH agreement on the server's
     // *standard* port when no separate obfuscation port is advertised (its log:
@@ -1010,7 +1044,10 @@ async fn try_connect_server(ip: &str, port: u16, obf_port: u16, app: &tauri::App
                 .find(|addr| addr.is_ipv4())
                 .ok_or_else(|| anyhow::anyhow!("No IPv4 address found for {ip}:{enc_port}"))?;
             info!("Trying encrypted DH connection to server {ip}:{enc_port}");
-            emit_server_log(app, &format!("Trying encrypted connection to {ip}:{enc_port}..."));
+            emit_server_log(
+                app,
+                &format!("Trying encrypted connection to {ip}:{enc_port}..."),
+            );
             match Ed2kServerConnection::connect_encrypted(enc_addr).await {
                 Ok(conn) => {
                     info!("Encrypted DH connection to server {ip}:{enc_port} established");
@@ -1019,7 +1056,10 @@ async fn try_connect_server(ip: &str, port: u16, obf_port: u16, app: &tauri::App
                 }
                 Err(e) => {
                     warn!("Encrypted DH connection to server {ip}:{enc_port} failed: {e}, falling back to plain");
-                    emit_server_log(app, &format!("Encrypted connection failed, trying plain TCP on port {port}..."));
+                    emit_server_log(
+                        app,
+                        &format!("Encrypted connection failed, trying plain TCP on port {port}..."),
+                    );
                 }
             }
         } else {
@@ -1054,7 +1094,10 @@ fn spawn_rendezvous_friend_lookup(
     let our_uh = state.user_hash;
     let our_eh = ember_hash;
     let nick = settings.nickname.clone();
-    let cid = state.external_ip.map(|eip| u32::from_le_bytes(eip.octets())).unwrap_or(0);
+    let cid = state
+        .external_ip
+        .map(|eip| u32::from_le_bytes(eip.octets()))
+        .unwrap_or(0);
     let tcp = settings.tcp_port;
     let udp = settings.udp_port;
     let obfuscate = settings.friend_session_encryption;
@@ -1066,7 +1109,12 @@ fn spawn_rendezvous_friend_lookup(
     tokio::spawn(async move {
         match rendezvous::lookup(&rv_url, &target_hash).await {
             Ok(Some((ip, port))) => {
-                info!("Rendezvous found friend {} at {}:{}", hex::encode(target_hash), ip, port);
+                info!(
+                    "Rendezvous found friend {} at {}:{}",
+                    hex::encode(target_hash),
+                    ip,
+                    port
+                );
                 let addr = std::net::SocketAddr::new(ip.into(), port);
 
                 // Fast path: a persistent session for this peer is
@@ -1077,12 +1125,18 @@ fn spawn_rendezvous_friend_lookup(
                 // idempotent in the frontend's Set-based handlers
                 // — and don't dial again.
                 if sess_fc.read().await.contains_key(&target_hash) {
-                    let _ = app_fc.emit("ember:friend-confirmed", serde_json::json!({
-                        "user_hash": hex::encode(target_hash),
-                    }));
-                    let _ = app_fc.emit("ember:friend-online", serde_json::json!({
-                        "user_hash": hex::encode(target_hash),
-                    }));
+                    let _ = app_fc.emit(
+                        "ember:friend-confirmed",
+                        serde_json::json!({
+                            "user_hash": hex::encode(target_hash),
+                        }),
+                    );
+                    let _ = app_fc.emit(
+                        "ember:friend-online",
+                        serde_json::json!({
+                            "user_hash": hex::encode(target_hash),
+                        }),
+                    );
                 } else {
                     // Single-dial discovery. Earlier this site ran a
                     // short-lived `connect_and_send_friend_request`
@@ -1118,12 +1172,27 @@ fn spawn_rendezvous_friend_lookup(
                     // the broken reciprocal-handshake step entirely
                     // and saves one redundant TCP round-trip per
                     // discovery.
-                    info!("Opening persistent session to {} after rendezvous friend discovery", addr);
+                    info!(
+                        "Opening persistent session to {} after rendezvous friend discovery",
+                        addr
+                    );
                     match ed2k::friend_connect::open_and_run_friend_session(
-                        addr, our_uh, our_eh, nick,
-                        cid, tcp, udp, obfuscate, sess_fc, ultx_fc.clone(), fh_fc,
-                        Some(ed25519_pubkey), Some(ed25519_secret_key),
-                    ).await {
+                        addr,
+                        our_uh,
+                        our_eh,
+                        nick,
+                        cid,
+                        tcp,
+                        udp,
+                        obfuscate,
+                        sess_fc,
+                        ultx_fc.clone(),
+                        fh_fc,
+                        Some(ed25519_pubkey),
+                        Some(ed25519_secret_key),
+                    )
+                    .await
+                    {
                         Ok(_) => {
                             // Session is up — only NOW are we sure
                             // the peer is reachable for chat /
@@ -1131,19 +1200,29 @@ fn spawn_rendezvous_friend_lookup(
                             // to mark them online. `friend-confirmed`
                             // is emitted alongside to clear the
                             // searching spinner.
-                            let _ = app_fc.emit("ember:friend-confirmed", serde_json::json!({
-                                "user_hash": hex::encode(target_hash),
-                            }));
-                            let _ = app_fc.emit("ember:friend-online", serde_json::json!({
-                                "user_hash": hex::encode(target_hash),
-                            }));
+                            let _ = app_fc.emit(
+                                "ember:friend-confirmed",
+                                serde_json::json!({
+                                    "user_hash": hex::encode(target_hash),
+                                }),
+                            );
+                            let _ = app_fc.emit(
+                                "ember:friend-online",
+                                serde_json::json!({
+                                    "user_hash": hex::encode(target_hash),
+                                }),
+                            );
                         }
                         Err(e) => {
                             info!("Persistent session to {} failed: {e}", addr);
                             let emsg = format!("{e}");
-                            let reason = if emsg.contains("timeout") { "timeout" }
-                                else if emsg.contains("refused") { "refused" }
-                                else { "error" };
+                            let reason = if emsg.contains("timeout") {
+                                "timeout"
+                            } else if emsg.contains("refused") {
+                                "refused"
+                            } else {
+                                "error"
+                            };
                             // No `EmberFriendDisconnected` — we never
                             // emitted online for this peer so there's
                             // nothing to roll back. The trailing
@@ -1152,27 +1231,42 @@ fn spawn_rendezvous_friend_lookup(
                             // auto-retry sweep will pick the friend
                             // up again without an immediate dogpiled
                             // retry.
-                            let _ = app_fc.emit("ember:friend-search-failed", serde_json::json!({
-                                "user_hash": hex::encode(target_hash),
-                                "reason": reason,
-                            }));
+                            let _ = app_fc.emit(
+                                "ember:friend-search-failed",
+                                serde_json::json!({
+                                    "user_hash": hex::encode(target_hash),
+                                    "reason": reason,
+                                }),
+                            );
                         }
                     }
                 }
             }
             Ok(None) => {
-                info!("Rendezvous lookup: friend {} not found", hex::encode(target_hash));
-                let _ = app_fc.emit("ember:friend-search-failed", serde_json::json!({
-                    "user_hash": hex::encode(target_hash),
-                    "reason": "not_found",
-                }));
+                info!(
+                    "Rendezvous lookup: friend {} not found",
+                    hex::encode(target_hash)
+                );
+                let _ = app_fc.emit(
+                    "ember:friend-search-failed",
+                    serde_json::json!({
+                        "user_hash": hex::encode(target_hash),
+                        "reason": "not_found",
+                    }),
+                );
             }
             Err(e) => {
-                warn!("Rendezvous lookup failed for {}: {e}", hex::encode(target_hash));
-                let _ = app_fc.emit("ember:friend-search-failed", serde_json::json!({
-                    "user_hash": hex::encode(target_hash),
-                    "reason": "error",
-                }));
+                warn!(
+                    "Rendezvous lookup failed for {}: {e}",
+                    hex::encode(target_hash)
+                );
+                let _ = app_fc.emit(
+                    "ember:friend-search-failed",
+                    serde_json::json!({
+                        "user_hash": hex::encode(target_hash),
+                        "reason": "error",
+                    }),
+                );
             }
         }
 
@@ -1200,10 +1294,14 @@ fn spawn_rendezvous_friend_lookup(
         // misleading `ember:friend-offline` / `ember:browse-error`
         // events for a peer who was never online from the user's
         // point of view.
-        let _ = ultx_fc.send(upload_server::UploadEvent {
-            transfer_id: String::new(),
-            kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: target_hash },
-        }).await;
+        let _ = ultx_fc
+            .send(upload_server::UploadEvent {
+                transfer_id: String::new(),
+                kind: upload_server::UploadEventKind::EmberFriendSearchFailed {
+                    ember_hash: target_hash,
+                },
+            })
+            .await;
     });
 }
 
@@ -1211,7 +1309,9 @@ fn spawn_rendezvous_friend_lookup(
 mod tests {
     use super::*;
     use crate::network::kad::messages::SearchResultEntry;
-    use crate::network::kad::types::{KadTag, TagName, TagValue, TAG_DESCRIPTION, TAG_FILENAME, TAG_FILERATING};
+    use crate::network::kad::types::{
+        KadTag, TagName, TagValue, TAG_DESCRIPTION, TAG_FILENAME, TAG_FILERATING,
+    };
 
     fn sample_download_source() -> DownloadSource {
         DownloadSource {
@@ -1382,10 +1482,7 @@ mod tests {
             Some(key_fresh)
         );
         // Stale entry is hidden from lookups even before the prune sweep.
-        assert_eq!(
-            lookup_ember_noise_key_at(&map, stale_ip, port, now),
-            None
-        );
+        assert_eq!(lookup_ember_noise_key_at(&map, stale_ip, port, now), None);
 
         // Prune sweep evicts the stale entry from the map itself.
         prune_stale_ember_noise_keys_at(&mut map, now);
@@ -1401,7 +1498,9 @@ mod tests {
     fn extract_kad_sources_round_trip_picks_up_noise_pubkey() {
         use crate::network::kad::messages::SearchResultEntry;
         use crate::network::kad::publish::{EMBER_CAP_RELAY_PUNCH_V1, EMBER_NOISE_PUB_TAG};
-        use crate::network::kad::types::{KadId, KadTag, TagName, TagValue, TAG_SOURCEIP, TAG_SOURCEPORT, TAG_SOURCETYPE};
+        use crate::network::kad::types::{
+            KadId, KadTag, TagName, TagValue, TAG_SOURCEIP, TAG_SOURCEPORT, TAG_SOURCETYPE,
+        };
 
         let mut npub = [0u8; 32];
         for (i, b) in npub.iter_mut().enumerate() {
@@ -1447,7 +1546,9 @@ mod tests {
     fn extract_kad_sources_rejects_invalid_noise_pubkey_blobs() {
         use crate::network::kad::messages::SearchResultEntry;
         use crate::network::kad::publish::EMBER_NOISE_PUB_TAG;
-        use crate::network::kad::types::{KadId, KadTag, TagName, TagValue, TAG_SOURCEIP, TAG_SOURCEPORT, TAG_SOURCETYPE};
+        use crate::network::kad::types::{
+            KadId, KadTag, TagName, TagValue, TAG_SOURCEIP, TAG_SOURCEPORT, TAG_SOURCETYPE,
+        };
 
         let make_entry = |blob: Vec<u8>| SearchResultEntry {
             id: KadId([0; 16]),
@@ -1533,8 +1634,10 @@ mod tests {
             ident_state_label(IdentState::Needed),
             ident_state_label(IdentState::Unknown),
         ] {
-            assert!(label.chars().all(|c| c.is_ascii_alphanumeric()),
-                "label {label} contains non-alphanumeric chars (would break ident-* class lookup)");
+            assert!(
+                label.chars().all(|c| c.is_ascii_alphanumeric()),
+                "label {label} contains non-alphanumeric chars (would break ident-* class lookup)"
+            );
         }
     }
 
@@ -1563,7 +1666,10 @@ mod tests {
         let results = convert_note_search_results(&entries, &file_hash);
 
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].file.hash, hex::encode(kad_id_to_md4_bytes(&file_hash)));
+        assert_eq!(
+            results[0].file.hash,
+            hex::encode(kad_id_to_md4_bytes(&file_hash))
+        );
         assert_eq!(results[0].peer_id, publisher.to_hex());
         assert_eq!(results[0].comment.as_deref(), Some("Looks good"));
         assert_eq!(results[0].rating, Some(5));
@@ -1574,14 +1680,38 @@ mod tests {
         let entries = vec![SearchResultEntry {
             id: KadId([0x44; 16]),
             tags: vec![
-                KadTag { name: TagName::Id(TAG_FILENAME), value: TagValue::String("track.mp3".to_string()) },
-                KadTag { name: TagName::Id(TAG_FILESIZE), value: TagValue::Uint32(4_000_000) },
-                KadTag { name: TagName::Id(TAG_MEDIA_ARTIST), value: TagValue::String("Some Artist".to_string()) },
-                KadTag { name: TagName::Id(TAG_MEDIA_ALBUM), value: TagValue::String("Some Album".to_string()) },
-                KadTag { name: TagName::Id(TAG_MEDIA_TITLE), value: TagValue::String("Some Title".to_string()) },
-                KadTag { name: TagName::Id(TAG_MEDIA_LENGTH), value: TagValue::Uint32(225) },
-                KadTag { name: TagName::Id(TAG_MEDIA_BITRATE), value: TagValue::Uint32(320) },
-                KadTag { name: TagName::Id(TAG_MEDIA_CODEC), value: TagValue::String("mp3".to_string()) },
+                KadTag {
+                    name: TagName::Id(TAG_FILENAME),
+                    value: TagValue::String("track.mp3".to_string()),
+                },
+                KadTag {
+                    name: TagName::Id(TAG_FILESIZE),
+                    value: TagValue::Uint32(4_000_000),
+                },
+                KadTag {
+                    name: TagName::Id(TAG_MEDIA_ARTIST),
+                    value: TagValue::String("Some Artist".to_string()),
+                },
+                KadTag {
+                    name: TagName::Id(TAG_MEDIA_ALBUM),
+                    value: TagValue::String("Some Album".to_string()),
+                },
+                KadTag {
+                    name: TagName::Id(TAG_MEDIA_TITLE),
+                    value: TagValue::String("Some Title".to_string()),
+                },
+                KadTag {
+                    name: TagName::Id(TAG_MEDIA_LENGTH),
+                    value: TagValue::Uint32(225),
+                },
+                KadTag {
+                    name: TagName::Id(TAG_MEDIA_BITRATE),
+                    value: TagValue::Uint32(320),
+                },
+                KadTag {
+                    name: TagName::Id(TAG_MEDIA_CODEC),
+                    value: TagValue::String("mp3".to_string()),
+                },
             ],
         }];
 
@@ -1601,8 +1731,14 @@ mod tests {
         let entries = vec![SearchResultEntry {
             id: KadId([0x55; 16]),
             tags: vec![
-                KadTag { name: TagName::Id(TAG_FILENAME), value: TagValue::String("doc.pdf".to_string()) },
-                KadTag { name: TagName::Id(TAG_FILESIZE), value: TagValue::Uint32(1234) },
+                KadTag {
+                    name: TagName::Id(TAG_FILENAME),
+                    value: TagValue::String("doc.pdf".to_string()),
+                },
+                KadTag {
+                    name: TagName::Id(TAG_FILESIZE),
+                    value: TagValue::Uint32(1234),
+                },
             ],
         }];
         let results = convert_search_results(&entries);
@@ -1631,10 +1767,22 @@ mod tests {
                     // 1.2.3.4 in network byte order -> u32(0x01020304)
                     value: TagValue::Uint32(u32::from_be_bytes([1, 2, 3, 4])),
                 },
-                KadTag { name: TagName::Id(TAG_SOURCEPORT), value: TagValue::Uint16(4662) },
-                KadTag { name: TagName::Id(TAG_SOURCETYPE), value: TagValue::Uint8(1) },
-                KadTag { name: TagName::Id(TAG_FILESIZE), value: TagValue::Uint64(123) },
-                KadTag { name: TagName::Id(TAG_ENCRYPTION), value: TagValue::Uint8(0) },
+                KadTag {
+                    name: TagName::Id(TAG_SOURCEPORT),
+                    value: TagValue::Uint16(4662),
+                },
+                KadTag {
+                    name: TagName::Id(TAG_SOURCETYPE),
+                    value: TagValue::Uint8(1),
+                },
+                KadTag {
+                    name: TagName::Id(TAG_FILESIZE),
+                    value: TagValue::Uint64(123),
+                },
+                KadTag {
+                    name: TagName::Id(TAG_ENCRYPTION),
+                    value: TagValue::Uint8(0),
+                },
                 KadTag {
                     name: TagName::Str("ember".to_string()),
                     value: TagValue::Uint8(EMBER_CAP_RELAY_PUNCH_V1),
@@ -1650,8 +1798,14 @@ mod tests {
                     name: TagName::Id(TAG_SOURCEIP),
                     value: TagValue::Uint32(u32::from_be_bytes([5, 6, 7, 8])),
                 },
-                KadTag { name: TagName::Id(TAG_SOURCEPORT), value: TagValue::Uint16(4663) },
-                KadTag { name: TagName::Id(TAG_SOURCETYPE), value: TagValue::Uint8(1) },
+                KadTag {
+                    name: TagName::Id(TAG_SOURCEPORT),
+                    value: TagValue::Uint16(4663),
+                },
+                KadTag {
+                    name: TagName::Id(TAG_SOURCETYPE),
+                    value: TagValue::Uint8(1),
+                },
             ],
         };
 
@@ -2049,7 +2203,10 @@ fn check_disk_space(download_dir: &std::path::Path, needed_bytes: u64) -> bool {
             }
         }
         Err(e) => {
-            debug!("Could not check disk space on {}: {e}", download_dir.display());
+            debug!(
+                "Could not check disk space on {}: {e}",
+                download_dir.display()
+            );
             true
         }
     }
@@ -2168,10 +2325,12 @@ struct NetworkState {
     /// *every* successful delivery instead of collapsing to one per
     /// target (fixes the long-standing 0-confirmed publish cycle bug
     /// where many peers acked but we silently dropped all but the first).
-    /// Value carries the original file hash (for retry book-keeping),
-    /// the send timestamp (for stale cleanup), and whether this is a
-    /// source publish (vs keyword/notes).
-    publish_pending: HashMap<(KadId, SocketAddr), (KadId, i64, bool)>,
+    /// Value carries the original file hash/target (for retry book-keeping),
+    /// the latest send timestamp (for stale cleanup), whether this is a source
+    /// publish (vs keyword/notes), and how many publish packets are pending for
+    /// this `(target, peer)` pair. The count matters for eMule-style keyword
+    /// batches split into multiple `PublishKeyReq` packets with the same target.
+    publish_pending: HashMap<(KadId, SocketAddr), (KadId, i64, bool, u32)>,
     publish_confirmed: u32,
     /// Diagnostic counters for `PublishRes` packet accounting. These let
     /// the `Publish cycle:` log line surface exactly where packets are
@@ -2207,8 +2366,8 @@ struct NetworkState {
     /// has no entries because we never searched/downloaded them).
     /// Reset to 0 at the start of each source-publish cycle.
     source_publish_acks: HashMap<KadId, u32>,
-    /// Store-keyword searches: search_id -> (file PublishableFile, keyword publish messages)
-    store_keyword_searches: HashMap<SearchId, (PublishableFile, Vec<(KadId, KadMessage)>)>,
+    /// Store-keyword searches: search_id -> keyword-centric publish batch.
+    store_keyword_searches: HashMap<SearchId, KeywordPublishBatch>,
     /// Store-source searches: search_id -> (file_hash, publish message)
     store_source_searches: HashMap<SearchId, (KadId, KadMessage)>,
     /// Pending notes searches: search_id -> response sender
@@ -2347,7 +2506,8 @@ struct NetworkState {
     /// when the download completes / fails / is cancelled. Always
     /// registered/removed in lockstep with `active_source_senders` so
     /// neither leaks past the other.
-    active_established_senders: HashMap<String, mpsc::Sender<ed2k::multi_source::EstablishedSource>>,
+    active_established_senders:
+        HashMap<String, mpsc::Sender<ed2k::multi_source::EstablishedSource>>,
     /// Overflow queue for sources discovered faster than the active download can accept them
     active_source_overflow: HashMap<String, VecDeque<DownloadSource>>,
     /// JoinHandles for spawned download tasks, keyed by transfer_id
@@ -2372,7 +2532,18 @@ struct NetworkState {
     /// Event receiver for the client we're serving as buddy for
     serving_event_rx: Option<mpsc::Receiver<BuddyEvent>>,
     /// Background buddy outgoing connect+handshake task
-    pending_outgoing_buddy: Option<tokio::task::JoinHandle<Option<(KadId, std::net::Ipv4Addr, u16, mpsc::Receiver<BuddyEvent>, BuddyWriteStream, tokio::task::JoinHandle<()>)>>>,
+    pending_outgoing_buddy: Option<
+        tokio::task::JoinHandle<
+            Option<(
+                KadId,
+                std::net::Ipv4Addr,
+                u16,
+                mpsc::Receiver<BuddyEvent>,
+                BuddyWriteStream,
+                tokio::task::JoinHandle<()>,
+            )>,
+        >,
+    >,
     /// Whether the server auto-reconnect loop is allowed to run.
     /// Starts from settings; enabled on manual connect, disabled on manual disconnect.
     server_auto_reconnect: bool,
@@ -2540,7 +2711,10 @@ const MAX_AICH_ROOT_MAP_SOFT_CAP: usize = 100_000;
 /// Filter search results by file type, matching eMule's AddToList behavior:
 /// when a type filter is active, reject any result whose inferred type
 /// doesn't match the requested type.
-fn filter_results_by_type(mut results: Vec<SearchResult>, file_type_filter: &Option<String>) -> Vec<SearchResult> {
+fn filter_results_by_type(
+    mut results: Vec<SearchResult>,
+    file_type_filter: &Option<String>,
+) -> Vec<SearchResult> {
     if let Some(ref ft) = file_type_filter {
         results.retain(|r| {
             let inferred = crate::search::index::infer_file_type(&r.file.extension);
@@ -2567,7 +2741,10 @@ fn emit_search_results(
     }
     let _ = app_handle.emit(
         "search-results",
-        SearchResultsEvent { request_id, results },
+        SearchResultsEvent {
+            request_id,
+            results,
+        },
     );
 }
 
@@ -2625,9 +2802,8 @@ async fn enrich_and_emit_search_results(
         return;
     }
     let spam_enabled = settings.spam_filter_enabled;
-    let spam_profile = crate::search::spam::SpamFilterProfile::from_setting(
-        &settings.spam_filter_profile,
-    );
+    let spam_profile =
+        crate::search::spam::SpamFilterProfile::from_setting(&settings.spam_filter_profile);
     let cleanup_strings =
         crate::search::cleanup::parse_cleanup_strings(&settings.filename_cleanups);
 
@@ -2645,7 +2821,10 @@ async fn enrich_and_emit_search_results(
                     if total > 0 {
                         Some((
                             r.file.hash.clone(),
-                            crate::search::spam::CommunityRating { fake_votes: fake, total_votes: total },
+                            crate::search::spam::CommunityRating {
+                                fake_votes: fake,
+                                total_votes: total,
+                            },
                         ))
                     } else {
                         None
@@ -2704,18 +2883,11 @@ fn maybe_finish_active_search(
         state.active_search_request = None;
         state.server_search_age = 0;
         state.server_udp_search_age = 0;
-        let _ = app_handle.emit(
-            "search-complete",
-            SearchCompleteEvent { request_id },
-        );
+        let _ = app_handle.emit("search-complete", SearchCompleteEvent { request_id });
     }
 }
 
-fn cancel_search_request(
-    state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
-    request_id: u64,
-) {
+fn cancel_search_request(state: &mut NetworkState, app_handle: &tauri::AppHandle, request_id: u64) {
     let cancelled: Vec<SearchId> = state
         .pending_keyword_searches
         .iter()
@@ -2730,13 +2902,16 @@ fn cancel_search_request(
     }
 
     for sid in &cancelled {
-        if let Some(PendingKeywordSearch { tx, local_results, .. }) =
-            state.pending_keyword_searches.remove(sid)
+        if let Some(PendingKeywordSearch {
+            tx, local_results, ..
+        }) = state.pending_keyword_searches.remove(sid)
         {
             let _ = tx.send(local_results);
         }
         if let Some(removed) = state.search_manager.remove(sid) {
-            state.routing_table.release_contacts_in_use(&removed.in_use_ids);
+            state
+                .routing_table
+                .release_contacts_in_use(&removed.in_use_ids);
         }
     }
 
@@ -2762,10 +2937,7 @@ fn cancel_search_request(
         state.server_search_age = 0;
         state.server_udp_search_age = 0;
         state.udp_search_queue.clear();
-        let _ = app_handle.emit(
-            "search-complete",
-            SearchCompleteEvent { request_id },
-        );
+        let _ = app_handle.emit("search-complete", SearchCompleteEvent { request_id });
     }
 }
 
@@ -2833,7 +3005,10 @@ async fn handle_server_disconnect(
         }
     }
     state.stats.server_status = "disconnected".to_string();
-    let _ = app_handle.emit("server-status-changed", serde_json::json!({ "status": "disconnected" }));
+    let _ = app_handle.emit(
+        "server-status-changed",
+        serde_json::json!({ "status": "disconnected" }),
+    );
 }
 
 async fn flush_credit_state(
@@ -2853,7 +3028,17 @@ async fn flush_credit_state(
         let records: Vec<([u8; 16], u64, u64, i64, Vec<u8>, u32, u8)> = cm
             .all_records()
             .iter()
-            .map(|r| (r.user_hash, r.uploaded, r.downloaded, r.last_seen, r.public_key.clone(), r.ident_ip, r.ident_state.to_u8()))
+            .map(|r| {
+                (
+                    r.user_hash,
+                    r.uploaded,
+                    r.downloaded,
+                    r.last_seen,
+                    r.public_key.clone(),
+                    r.ident_ip,
+                    r.ident_state.to_u8(),
+                )
+            })
             .collect();
         // Snapshot the Ember table too. The columns are plain scalars
         // so an owned copy is cheap; holding the read lock only long
@@ -2862,18 +3047,20 @@ async fn flush_credit_state(
         let ember_records: Vec<([u8; 32], u64, u64, i64, i64, u32, u32, u64, i64, bool)> = cm
             .all_ember_records()
             .iter()
-            .map(|r| (
-                r.pub_key,
-                r.uploaded,
-                r.downloaded,
-                r.last_upload_time,
-                r.last_download_time,
-                r.completed_sessions,
-                r.total_sessions,
-                r.avg_upload_speed,
-                r.last_seen,
-                r.ident_verified,
-            ))
+            .map(|r| {
+                (
+                    r.pub_key,
+                    r.uploaded,
+                    r.downloaded,
+                    r.last_upload_time,
+                    r.last_download_time,
+                    r.completed_sessions,
+                    r.total_sessions,
+                    r.avg_upload_speed,
+                    r.last_seen,
+                    r.ident_verified,
+                )
+            })
             .collect();
         (bytes, records, ember_records)
     };
@@ -2891,10 +3078,13 @@ async fn flush_credit_state(
             .collect();
         // Persist both credit tables in ONE SQLite transaction so they can
         // never diverge across a crash or partial failure.
-        let ember_refs: Vec<(&[u8; 32], u64, u64, i64, i64, u32, u32, u64, i64, bool)> = ember_owned
-            .iter()
-            .map(|(pk, u, d, lu, ld, c, t, s, ls, v)| (pk, *u, *d, *lu, *ld, *c, *t, *s, *ls, *v))
-            .collect();
+        let ember_refs: Vec<(&[u8; 32], u64, u64, i64, i64, u32, u32, u64, i64, bool)> =
+            ember_owned
+                .iter()
+                .map(|(pk, u, d, lu, ld, c, t, s, ls, v)| {
+                    (pk, *u, *d, *lu, *ld, *c, *t, *s, *ls, *v)
+                })
+                .collect();
         let result = db_ref.save_all_credits_with_ember(&refs, &ember_refs);
         db_ref.incremental_vacuum();
         result
@@ -2997,7 +3187,8 @@ async fn try_start_pending_download_from_known_sources(
     // pending_downloads) but must wait for promotion before connecting.
     {
         let mgr = transfer_manager.read().await;
-        let is_active = mgr.get_transfer(transfer_id)
+        let is_active = mgr
+            .get_transfer(transfer_id)
             .map(|t| !matches!(t.status, TransferStatus::Queued))
             .unwrap_or(false);
         if !is_active {
@@ -3016,7 +3207,9 @@ async fn try_start_pending_download_from_known_sources(
             arr
         }
         _ => {
-            state.pending_downloads.insert(transfer_id.to_string(), pending);
+            state
+                .pending_downloads
+                .insert(transfer_id.to_string(), pending);
             return false;
         }
     };
@@ -3027,12 +3220,18 @@ async fn try_start_pending_download_from_known_sources(
     };
     let live_sources: Vec<(String, u16)> = sm_sources
         .into_iter()
-        .filter(|(ip, port)| !state.dead_sources.is_dead_source_for_file(&hash_bytes, u32::from(*ip), *port))
+        .filter(|(ip, port)| {
+            !state
+                .dead_sources
+                .is_dead_source_for_file(&hash_bytes, u32::from(*ip), *port)
+        })
         .map(|(ip, port)| (ip.to_string(), port))
         .collect();
 
     if live_sources.is_empty() {
-        state.pending_downloads.insert(transfer_id.to_string(), pending);
+        state
+            .pending_downloads
+            .insert(transfer_id.to_string(), pending);
         return false;
     }
 
@@ -3042,13 +3241,16 @@ async fn try_start_pending_download_from_known_sources(
         mgr.update_status(transfer_id, TransferStatus::Active);
         mgr.update_sources(transfer_id, source_count, 0, 0);
     }
-    let _ = app_handle.emit("transfer-status", serde_json::json!({
-        "id": transfer_id,
-        "status": "active",
-        "sources": source_count,
-        "active_sources": 0,
-        "queued_sources": 0,
-    }));
+    let _ = app_handle.emit(
+        "transfer-status",
+        serde_json::json!({
+            "id": transfer_id,
+            "status": "active",
+            "sources": source_count,
+            "active_sources": 0,
+            "queued_sources": 0,
+        }),
+    );
 
     {
         let pfs = state
@@ -3092,9 +3294,13 @@ async fn try_start_pending_download_from_known_sources(
             if !seen.insert((ip.clone(), *port)) {
                 continue;
             }
-            let uh = ip.parse::<Ipv4Addr>().ok()
+            let uh = ip
+                .parse::<Ipv4Addr>()
+                .ok()
                 .and_then(|v4| sm.get_user_hash(&hash_bytes, v4, *port));
-            let co = ip.parse::<Ipv4Addr>().ok()
+            let co = ip
+                .parse::<Ipv4Addr>()
+                .ok()
                 .and_then(|v4| sm.get_connect_options(&hash_bytes, v4, *port));
             out.push(DownloadSource {
                 peer_ip: ip.clone(),
@@ -3134,11 +3340,11 @@ async fn try_start_pending_download_from_known_sources(
         server_addr: state.server_addr,
         new_source_rx: Some(src_inject_rx),
         new_established_rx: Some(est_inject_rx),
-                        ed2k_limits: settings.ed2k_download_limits(),
-                        ember_hash,
-                        ed25519_public_key: ed25519_pubkey,
-                        ed25519_secret_key,
-                        friend_hashes: Some(friend_hashes.clone()),
+        ed2k_limits: settings.ed2k_download_limits(),
+        ember_hash,
+        ed25519_public_key: ed25519_pubkey,
+        ed25519_secret_key,
+        friend_hashes: Some(friend_hashes.clone()),
         ember_payload: shared_ember_payload.clone(),
         ember_payload_generation: ember_payload_generation.clone(),
         ip_filter: Some(state.shared_ip_filter.clone()),
@@ -3153,21 +3359,35 @@ async fn try_start_pending_download_from_known_sources(
     let dl_tid2 = dl_tid.clone();
     info!(
         "Starting download {} ({}) with {} source(s) [try_start_from_known]",
-        dl_tid, hex::encode(hash_bytes), live_sources.len()
+        dl_tid,
+        hex::encode(hash_bytes),
+        live_sources.len()
     );
-    state.active_source_senders.insert(dl_tid.clone(), src_inject_tx);
-    state.active_established_senders.insert(dl_tid.clone(), est_inject_tx);
+    state
+        .active_source_senders
+        .insert(dl_tid.clone(), src_inject_tx);
+    state
+        .active_established_senders
+        .insert(dl_tid.clone(), est_inject_tx);
     let tx = dl_event_tx.clone();
     let tx2 = tx.clone();
     if let Some(old_handle) = state.download_handles.remove(&dl_tid2) {
-        warn!("Aborting existing download task for {dl_tid2} before starting multi-source download");
+        warn!(
+            "Aborting existing download task for {dl_tid2} before starting multi-source download"
+        );
         old_handle.abort();
     }
     let handle = tokio::spawn(async move {
         if let Err(e) = ms_download.run(tx).await {
             error!("Multi-source download failed: {e}");
             let kind = classify_error(&e.to_string());
-            let _ = tx2.send(DownloadEvent::Failed { transfer_id: dl_tid, error: e.to_string(), failure_kind: kind }).await;
+            let _ = tx2
+                .send(DownloadEvent::Failed {
+                    transfer_id: dl_tid,
+                    error: e.to_string(),
+                    failure_kind: kind,
+                })
+                .await;
         }
     });
     state.download_handles.insert(dl_tid2, handle);
@@ -3214,7 +3434,12 @@ fn kad_searches_snapshot(state: &NetworkState) -> Vec<KadSearchInfo> {
                 SearchType::FindSource { .. } => state
                     .download_source_searches
                     .get(sid)
-                    .and_then(|(tid, _)| state.pending_downloads.get(tid).map(|pd| pd.file_name.clone()))
+                    .and_then(|(tid, _)| {
+                        state
+                            .pending_downloads
+                            .get(tid)
+                            .map(|pd| pd.file_name.clone())
+                    })
                     .unwrap_or_else(|| "Source Search".to_string()),
                 SearchType::FindBuddy => "Find Buddy".to_string(),
                 _ => String::new(),
@@ -3253,13 +3478,21 @@ fn kad_searches_snapshot(state: &NetworkState) -> Vec<KadSearchInfo> {
             let responded = search.responded_during_lookup.len() as u32;
             let pending = search.pending.len() as u32;
             let load_total = queried.saturating_add(pending);
-            let load_pct = if queried == 0 { 0 } else { (responded * 100) / queried };
+            let load_pct = if queried == 0 {
+                0
+            } else {
+                (responded * 100) / queried
+            };
             KadSearchInfo {
                 id: sid.0,
                 target: search.target.to_hex(),
                 search_type: type_name.to_string(),
                 name,
-                status: if search.completed { "stopping".to_string() } else { "active".to_string() },
+                status: if search.completed {
+                    "stopping".to_string()
+                } else {
+                    "active".to_string()
+                },
                 load: load_pct,
                 load_response: responded,
                 load_total,
@@ -3317,7 +3550,11 @@ async fn peers_snapshot(state: &NetworkState, db: &Arc<Database>) -> Vec<PeerInf
         .map(|contact| PeerInfo {
             id: contact.id.to_hex(),
             addresses: vec![format!("{}:{}", contact.ip, contact.udp_port)],
-            nickname: state.peer_nicknames.get(&contact.id).cloned().unwrap_or_default(),
+            nickname: state
+                .peer_nicknames
+                .get(&contact.id)
+                .cloned()
+                .unwrap_or_default(),
             last_seen: contact.last_seen,
             files_shared: 0,
             banned: false,
@@ -3454,9 +3691,9 @@ async fn upload_queue_snapshot(
             .map(|v4| u32::from_be_bytes(v4.octets()))
             .unwrap_or(0);
         let credit_ratio = cm.get_score_ratio(&entry.user_hash, peer_ip_u32);
-        let ident_state = ident_state_label(
-            cm.get_current_ident_state(&entry.user_hash, peer_ip_u32),
-        ).to_string();
+        let ident_state =
+            ident_state_label(cm.get_current_ident_state(&entry.user_hash, peer_ip_u32))
+                .to_string();
         let (uploaded, downloaded) = cm
             .get_record(&entry.user_hash)
             .map(|r| (r.uploaded, r.downloaded))
@@ -3513,9 +3750,9 @@ async fn known_clients_snapshot(
         .all_records()
         .iter()
         .map(|record| {
-            let ident_state = ident_state_label(
-                cm.get_current_ident_state(&record.user_hash, record.ident_ip),
-            ).to_string();
+            let ident_state =
+                ident_state_label(cm.get_current_ident_state(&record.user_hash, record.ident_ip))
+                    .to_string();
             let credit_ratio = cm.get_score_ratio(&record.user_hash, record.ident_ip);
             let last_known_ip = if record.ident_ip != 0 {
                 let octets = record.ident_ip.to_be_bytes();
@@ -3611,7 +3848,9 @@ fn antileech_reset_defaults(
     {
         let f = state.antileech.read();
         if let Err(e) = f.save_to_file(&antileech_file_path(state)) {
-            return Err(format!("Defaults restored in memory but persist failed: {e}"));
+            return Err(format!(
+                "Defaults restored in memory but persist failed: {e}"
+            ));
         }
     }
     Ok(antileech_snapshot(state))
@@ -3639,11 +3878,13 @@ pub async fn start_network(
     uss_enabled_flag: crate::bandwidth::UssEnabledFlag,
     spam_filter: Arc<RwLock<crate::search::spam::SpamFilter>>,
 ) -> anyhow::Result<()> {
-    let data_dir = crate::storage::paths::ensure_data_dir()
-        .unwrap_or_else(|_| PathBuf::from("."));
+    let data_dir = crate::storage::paths::ensure_data_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     let geoip = {
-        let resource_dir = app_handle.path().resource_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let resource_dir = app_handle
+            .path()
+            .resource_dir()
+            .unwrap_or_else(|_| PathBuf::from("."));
         crate::geoip::load(&resource_dir)
     };
 
@@ -3681,9 +3922,12 @@ pub async fn start_network(
             Ok(s) => s,
             Err(e) => {
                 error!("Failed to create UDP socket: {e}");
-                let _ = app_handle.emit("network-error", serde_json::json!({
-                    "message": format!("Failed to create UDP socket: {e}"),
-                }));
+                let _ = app_handle.emit(
+                    "network-error",
+                    serde_json::json!({
+                        "message": format!("Failed to create UDP socket: {e}"),
+                    }),
+                );
                 anyhow::bail!("Failed to create UDP socket: {e}");
             }
         };
@@ -3719,7 +3963,10 @@ pub async fn start_network(
     };
     let udp_port = bound_udp_port;
     if udp_port != settings.udp_port {
-        warn!("Configured UDP port {} was unavailable, bound to port {} instead", settings.udp_port, udp_port);
+        warn!(
+            "Configured UDP port {} was unavailable, bound to port {} instead",
+            settings.udp_port, udp_port
+        );
         let _ = app_handle.emit("network-warning", serde_json::json!({
             "message": format!("UDP port {} was in use. Using port {} instead.", settings.udp_port, udp_port),
         }));
@@ -3788,7 +4035,9 @@ pub async fn start_network(
             }
             if let Some(addr_str) = peer.addresses.first() {
                 if let Some((ip_str, port_str)) = addr_str.rsplit_once(':') {
-                    if let (Ok(ip), Ok(port)) = (ip_str.parse::<Ipv4Addr>(), port_str.parse::<u16>()) {
+                    if let (Ok(ip), Ok(port)) =
+                        (ip_str.parse::<Ipv4Addr>(), port_str.parse::<u16>())
+                    {
                         if let Some(kad_id) = KadId::from_hex(&peer.id) {
                             boot_contacts.push(KadContact {
                                 id: kad_id,
@@ -3935,9 +4184,18 @@ pub async fn start_network(
     dht_store.set_local_id(local_id);
 
     let udp_key_seed = identity.udp_key_seed;
-    let pending_buddy_hashes: PendingBuddySet = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-    let buddy_manager = BuddyManager::new(local_id, user_hash, settings.nickname.clone(), tcp_port, udp_port, pending_buddy_hashes.clone());
-    let shared_buddy_info: upload_server::SharedBuddyInfo = std::sync::Arc::new(tokio::sync::RwLock::new(None));
+    let pending_buddy_hashes: PendingBuddySet =
+        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let buddy_manager = BuddyManager::new(
+        local_id,
+        user_hash,
+        settings.nickname.clone(),
+        tcp_port,
+        udp_port,
+        pending_buddy_hashes.clone(),
+    );
+    let shared_buddy_info: upload_server::SharedBuddyInfo =
+        std::sync::Arc::new(tokio::sync::RwLock::new(None));
     info!(
         "IP filter: enabled={}, block_private={}, ranges={}",
         ip_filter.is_enabled(),
@@ -3960,10 +4218,7 @@ pub async fn start_network(
         .iter()
         .filter(|p| p.banned)
         .flat_map(|p| p.addresses.iter())
-        .filter_map(|addr| {
-            addr.rsplit_once(':')
-                .and_then(|(ip, _)| ip.parse().ok())
-        })
+        .filter_map(|addr| addr.rsplit_once(':').and_then(|(ip, _)| ip.parse().ok()))
         .collect();
     banned_ips.extend(db.get_banned_ips().unwrap_or_default());
 
@@ -4030,7 +4285,10 @@ pub async fn start_network(
             Ok(loaded) => loaded,
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::NotFound {
-                    info!("No persisted server.met at {:?} — seeding hardcoded list", met_path);
+                    info!(
+                        "No persisted server.met at {:?} — seeding hardcoded list",
+                        met_path
+                    );
                 } else {
                     warn!("Failed to load persisted server.met from {:?}: {} — seeding hardcoded list", met_path, e);
                 }
@@ -4057,7 +4315,11 @@ pub async fn start_network(
         publish_manager,
         dht_store,
         stats: NetworkStats {
-            status: if settings.auto_connect_kad { NetworkStatus::Connecting } else { NetworkStatus::Disconnected },
+            status: if settings.auto_connect_kad {
+                NetworkStatus::Connecting
+            } else {
+                NetworkStatus::Disconnected
+            },
             ..Default::default()
         },
         pending_keyword_searches: HashMap::new(),
@@ -4156,7 +4418,9 @@ pub async fn start_network(
         uss_rtt_queue,
         uss_enabled_flag,
         aich_hash_sets: Vec::new(),
-        upload_max_slots: Arc::new(std::sync::atomic::AtomicUsize::new(settings.max_concurrent_uploads as usize)),
+        upload_max_slots: Arc::new(std::sync::atomic::AtomicUsize::new(
+            settings.max_concurrent_uploads as usize,
+        )),
         obfuscation_enabled_shared: Arc::new(std::sync::atomic::AtomicBool::new(
             settings.obfuscation_enabled,
         )),
@@ -4250,7 +4514,9 @@ pub async fn start_network(
         let mut skipped_at_cap = 0usize;
         for line in contents.lines() {
             if let Some((ed2k_hex, aich_hex)) = line.split_once('=') {
-                if let (Ok(ed2k_bytes), Ok(aich_bytes)) = (hex::decode(ed2k_hex.trim()), hex::decode(aich_hex.trim())) {
+                if let (Ok(ed2k_bytes), Ok(aich_bytes)) =
+                    (hex::decode(ed2k_hex.trim()), hex::decode(aich_hex.trim()))
+                {
                     if ed2k_bytes.len() == 16 && aich_bytes.len() == 20 {
                         if state.aich_root_map.len() >= MAX_AICH_ROOT_MAP_SOFT_CAP {
                             skipped_at_cap = skipped_at_cap.saturating_add(1);
@@ -4271,7 +4537,10 @@ pub async fn start_network(
                 skipped_at_cap, MAX_AICH_ROOT_MAP_SOFT_CAP,
             );
         }
-        info!("Loaded {} AICH root mappings from cache", state.aich_root_map.len());
+        info!(
+            "Loaded {} AICH root mappings from cache",
+            state.aich_root_map.len()
+        );
     }
 
     // Initialize statistics manager
@@ -4289,8 +4558,7 @@ pub async fn start_network(
     // Keep a per-transfer "last persisted at" map and only flush to SQLite
     // once per `DB_PROGRESS_PERSIST_INTERVAL`, plus always at terminal
     // state transitions (handled separately via `update_transfer_status`).
-    const DB_PROGRESS_PERSIST_INTERVAL: std::time::Duration =
-        std::time::Duration::from_secs(3);
+    const DB_PROGRESS_PERSIST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
     let mut db_progress_last_persist: HashMap<String, std::time::Instant> = HashMap::new();
 
     // Load comments from database
@@ -4306,7 +4574,11 @@ pub async fn start_network(
             if let Some(kad_id) = KadId::from_hex(&hash_hex) {
                 state.published_notes.insert(
                     kad_id,
-                    PublishedNote { rating, comment, last_publish },
+                    PublishedNote {
+                        rating,
+                        comment,
+                        last_publish,
+                    },
                 );
             }
         }
@@ -4354,7 +4626,8 @@ pub async fn start_network(
     let (ul_event_tx, mut ul_event_rx) = mpsc::channel::<UploadEvent>(4096);
 
     // Buddy connection channel (upload listener sends recognized buddy connections here)
-    let (buddy_conn_tx, mut buddy_conn_rx) = mpsc::channel::<upload_server::BuddyConnectionParts>(4);
+    let (buddy_conn_tx, mut buddy_conn_rx) =
+        mpsc::channel::<upload_server::BuddyConnectionParts>(4);
 
     // Callback connection channel: upload listener sends firewalled sources that
     // connected back (both KAD buddy callbacks and server LowID callbacks).
@@ -4365,8 +4638,10 @@ pub async fn start_network(
     // discovery the old 32-slot buffer regularly hit its cap and the
     // network task self-deadlocked when awaiting on it — `try_send` plus a
     // larger cushion prevents both.
-    let (kad_callback_tx, mut kad_callback_rx) = mpsc::channel::<upload_server::KadCallbackParts>(256);
-    let (udp_fw_check_tx, mut udp_fw_check_rx) = mpsc::channel::<upload_server::UdpFirewallCheckRequest>(16);
+    let (kad_callback_tx, mut kad_callback_rx) =
+        mpsc::channel::<upload_server::KadCallbackParts>(256);
+    let (udp_fw_check_tx, mut udp_fw_check_rx) =
+        mpsc::channel::<upload_server::UdpFirewallCheckRequest>(16);
     let pending_kad_callbacks: upload_server::PendingKadCallbacks =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
@@ -4403,7 +4678,9 @@ pub async fn start_network(
         let mut cm = CreditManager::new();
         cm.load_or_create_keypair(&data_dir);
         if let Ok(records) = db.load_credits() {
-            for (hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state) in records {
+            for (hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state) in
+                records
+            {
                 // `get_or_create` bumps `last_seen` to "now" — the right
                 // behaviour for live mutations but wrong on a startup
                 // load. The explicit `record.last_seen = last_seen`
@@ -4423,7 +4700,10 @@ pub async fn start_network(
                 record.ident_ip = ident_ip;
                 record.ident_state = ed2k::credits::IdentState::from_u8(ident_state);
             }
-            info!("Loaded {} credit records from database", cm.all_records().len());
+            info!(
+                "Loaded {} credit records from database",
+                cm.all_records().len()
+            );
         }
         // Ember credit records live in a separate v15 table. Same
         // "bump-last-seen in helper, overwrite after load" dance as
@@ -4432,7 +4712,19 @@ pub async fn start_network(
         // persisted value so the 90-day prune honours real ages.
         if let Ok(records) = db.load_ember_credits() {
             let loaded_count = records.len();
-            for (pk, up, down, last_up, last_down, completed, total, avg_speed, last_seen, verified) in records {
+            for (
+                pk,
+                up,
+                down,
+                last_up,
+                last_down,
+                completed,
+                total,
+                avg_speed,
+                last_seen,
+                verified,
+            ) in records
+            {
                 let record = cm.get_or_create_ember(pk);
                 record.uploaded = up;
                 record.downloaded = down;
@@ -4489,10 +4781,13 @@ pub async fn start_network(
 
     let a4af_shared: Arc<RwLock<A4AFManager>> = Arc::new(RwLock::new(A4AFManager::new()));
     let pending_dl_hashes: Arc<RwLock<Vec<[u8; 16]>>> = Arc::new(RwLock::new(Vec::new()));
-    let active_port_tests: Arc<tokio::sync::Mutex<HashMap<std::net::IpAddr, mpsc::Sender<()>>>> = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let active_port_tests: Arc<tokio::sync::Mutex<HashMap<std::net::IpAddr, mpsc::Sender<()>>>> =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let shared_server_addr: Arc<RwLock<Option<SocketAddr>>> = Arc::new(RwLock::new(None));
-    let shared_ember_payload: ember::SharedEmberPayload = Arc::new(RwLock::new(Arc::new(Vec::new())));
-    let ember_payload_generation: ember::EmberPayloadGeneration = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let shared_ember_payload: ember::SharedEmberPayload =
+        Arc::new(RwLock::new(Arc::new(Vec::new())));
+    let ember_payload_generation: ember::EmberPayloadGeneration =
+        Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // Upload queue shared between the upload listener (owner/writer) and
     // the UDP reask-ack handler (reader that needs to answer the real queue
@@ -4605,9 +4900,8 @@ pub async fn start_network(
 
     // Bind a separate UDP socket for ed2k server status pings.
     // Servers respond on their TCP port + 4; we can use any local port.
-    let mut server_udp = ServerUdpSocket::from_socket(
-        tokio::net::UdpSocket::bind("0.0.0.0:0").await?,
-    );
+    let mut server_udp =
+        ServerUdpSocket::from_socket(tokio::net::UdpSocket::bind("0.0.0.0:0").await?);
     let mut server_udp_ping_idx: usize = 0;
 
     // Use MissedTickBehavior::Skip on ALL timers so that slow loop iterations
@@ -4620,6 +4914,11 @@ pub async fn start_network(
     let mut bootstrap_attempts: u32 = 0;
     let mut publish_timer = tokio::time::interval(std::time::Duration::from_secs(60));
     publish_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // eMule's Kad publish driver wakes every KADEMLIAPUBLISHTIME (2s)
+    // and starts at most one due source/keyword/note store per tick while
+    // respecting per-type active-search caps.
+    let mut kad_publish_timer = tokio::time::interval(std::time::Duration::from_secs(2));
+    kad_publish_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // Publish health heartbeat: 60s is too coarse to debug the publish
     // ack pipeline. The full `Publish cycle:` log fires *before* the
     // cycle's publishes are dispatched (it's the first thing the timer
@@ -4641,7 +4940,8 @@ pub async fn start_network(
     // of having to enable debug logging.
     let mut udp_discovery_health_timer = tokio::time::interval(std::time::Duration::from_secs(30));
     udp_discovery_health_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut last_udp_discovery_health: UdpDiscoveryHealthSnapshot = UdpDiscoveryHealthSnapshot::default();
+    let mut last_udp_discovery_health: UdpDiscoveryHealthSnapshot =
+        UdpDiscoveryHealthSnapshot::default();
     let mut search_poll_timer = tokio::time::interval(std::time::Duration::from_secs(1));
     search_poll_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // eMule UDPSEARCHSPEED = SEC2MS(3)/4 = 750ms: send one UDP search per tick
@@ -4716,9 +5016,8 @@ pub async fn start_network(
     // returns `WouldBlock` instantly when nothing's queued) plus a
     // hashmap lookup for the cooldown — negligible.
     let initial_ping_interval_ms = 200u64;
-    let mut server_udp_ping_timer = tokio::time::interval(
-        std::time::Duration::from_millis(initial_ping_interval_ms),
-    );
+    let mut server_udp_ping_timer =
+        tokio::time::interval(std::time::Duration::from_millis(initial_ping_interval_ms));
     server_udp_ping_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut stats_timer = tokio::time::interval(std::time::Duration::from_secs(1));
     stats_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -4759,7 +5058,8 @@ pub async fn start_network(
     let mut broker_timer = tokio::time::interval(std::time::Duration::from_millis(200));
     broker_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // UDP source sweep for active downloads (eMule UDPSERVERREASKTIME = 30 min)
-    let mut server_udp_source_timer = tokio::time::interval(std::time::Duration::from_secs(30 * 60));
+    let mut server_udp_source_timer =
+        tokio::time::interval(std::time::Duration::from_secs(30 * 60));
     server_udp_source_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut uss_ping_timer = tokio::time::interval(std::time::Duration::from_secs(2));
     uss_ping_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -4786,7 +5086,10 @@ pub async fn start_network(
             let dl_folder = settings.download_folder.clone();
             for mut transfer in incomplete {
                 let control = TransferControl::new();
-                if matches!(transfer.status, TransferStatus::Paused | TransferStatus::Stopped) {
+                if matches!(
+                    transfer.status,
+                    TransferStatus::Paused | TransferStatus::Stopped
+                ) {
                     control.pause();
                 }
 
@@ -4796,13 +5099,15 @@ pub async fn start_network(
                     .join(format!("{}.part", transfer.id));
                 if part_path.exists() && transfer.total_size > 0 {
                     let tracker = crate::network::ed2k::part_tracker::PartTracker::new(
-                        transfer.total_size, &part_path,
+                        transfer.total_size,
+                        &part_path,
                     );
                     let completed_bytes = tracker.completed_bytes();
                     transfer.transferred = completed_bytes;
                     transfer.completed_size = transfer.transferred;
-                    transfer.progress = ((transfer.transferred as f64 / transfer.total_size as f64) * 100.0)
-                        .min(100.0);
+                    transfer.progress =
+                        ((transfer.transferred as f64 / transfer.total_size as f64) * 100.0)
+                            .min(100.0);
                     // Publish preview-readiness from the resumed on-disk state.
                     // Paused/stopped/queued downloads have no running worker to
                     // compute this, so without it the UI's Preview action would
@@ -4852,9 +5157,13 @@ pub async fn start_network(
                             transfer.status = TransferStatus::Completed;
                             transfer.progress = 100.0;
                             transfer.speed = 0;
-                            transfer.completed_path = Some(final_path.to_string_lossy().into_owned());
+                            transfer.completed_path =
+                                Some(final_path.to_string_lossy().into_owned());
                             if let Err(e) = db.save_transfer(&transfer) {
-                                warn!("DB save_transfer failed for completed transfer {}: {e}", transfer.id);
+                                warn!(
+                                    "DB save_transfer failed for completed transfer {}: {e}",
+                                    transfer.id
+                                );
                             }
                             let mut mgr = transfer_manager.write().await;
                             mgr.completed.push(transfer);
@@ -4873,7 +5182,8 @@ pub async fn start_network(
 
                     if part_path.exists() && transfer.total_size > 0 {
                         let tracker = crate::network::ed2k::part_tracker::PartTracker::new(
-                            transfer.total_size, &part_path,
+                            transfer.total_size,
+                            &part_path,
                         );
                         if tracker.all_complete() {
                             info!(
@@ -4892,7 +5202,10 @@ pub async fn start_network(
                             transfer.status = TransferStatus::Verifying;
                             transfer.speed = 0;
                             if let Err(e) = db.save_transfer(&transfer) {
-                                warn!("DB save_transfer failed for verifying transfer {}: {e}", transfer.id);
+                                warn!(
+                                    "DB save_transfer failed for verifying transfer {}: {e}",
+                                    transfer.id
+                                );
                             }
                             {
                                 let mut mgr = transfer_manager.write().await;
@@ -4906,22 +5219,29 @@ pub async fn start_network(
                             let handle = tokio::spawn(async move {
                                 let result = reverify_complete_part_file(
                                     &dl_tid, &file_hash, &file_name, file_size, &dl_dir,
-                                ).await;
+                                )
+                                .await;
                                 match result {
                                     Ok(final_path) => {
-                                        let _ = tx.send(DownloadEvent::Completed {
-                                            transfer_id: dl_tid,
-                                            final_path: Some(final_path.to_string_lossy().into_owned()),
-                                        }).await;
+                                        let _ = tx
+                                            .send(DownloadEvent::Completed {
+                                                transfer_id: dl_tid,
+                                                final_path: Some(
+                                                    final_path.to_string_lossy().into_owned(),
+                                                ),
+                                            })
+                                            .await;
                                     }
                                     Err(e) => {
                                         warn!("Re-verification of restored download failed: {e}");
                                         let kind = ed2k::transfer::classify_error(&e.to_string());
-                                        let _ = tx.send(DownloadEvent::Failed {
-                                            transfer_id: dl_tid,
-                                            error: e.to_string(),
-                                            failure_kind: kind,
-                                        }).await;
+                                        let _ = tx
+                                            .send(DownloadEvent::Failed {
+                                                transfer_id: dl_tid,
+                                                error: e.to_string(),
+                                                failure_kind: kind,
+                                            })
+                                            .await;
                                     }
                                 }
                             });
@@ -4953,17 +5273,25 @@ pub async fn start_network(
                 // or queued. Queued downloads still need source discovery
                 // (KAD searches, server queries, retry timer) so they have
                 // sources ready when promoted.
-                if active_now || matches!(transfer.status, TransferStatus::Searching | TransferStatus::Queued) {
-                    state.pending_downloads.insert(transfer.id.clone(), PendingDownload {
-                        transfer_id: transfer.id.clone(),
-                        file_hash: transfer.file_hash.clone(),
-                        file_name: transfer.file_name.clone(),
-                        file_size: transfer.total_size,
-                        control,
-                        search_count: 0,
-                        last_search_at: 0,
-                        priority: priority_str_to_u32(&transfer.priority),
-                    });
+                if active_now
+                    || matches!(
+                        transfer.status,
+                        TransferStatus::Searching | TransferStatus::Queued
+                    )
+                {
+                    state.pending_downloads.insert(
+                        transfer.id.clone(),
+                        PendingDownload {
+                            transfer_id: transfer.id.clone(),
+                            file_hash: transfer.file_hash.clone(),
+                            file_name: transfer.file_name.clone(),
+                            file_size: transfer.total_size,
+                            control,
+                            search_count: 0,
+                            last_search_at: 0,
+                            priority: priority_str_to_u32(&transfer.priority),
+                        },
+                    );
                 }
 
                 // Register partial download for KAD source publishing
@@ -4979,6 +5307,15 @@ pub async fn start_network(
                             file_size: transfer.total_size,
                             file_type: crate::search::index::infer_file_type(&ext),
                             complete_sources: 0,
+                            keyword_publishable: false,
+                            last_source_publish: {
+                                let mut raw = [0u8; 16];
+                                raw.copy_from_slice(&hash_bytes[..16]);
+                                known_files
+                                    .find_by_hash(&raw)
+                                    .map(|r| r.last_publish_src as i64)
+                                    .unwrap_or(0)
+                            },
                         });
                     }
                 }
@@ -4999,11 +5336,8 @@ pub async fn start_network(
             let mgr = transfer_manager.read().await;
             mgr.get_all().into_iter().map(|t| t.id).collect()
         };
-        crate::commands::transfers::sweep_orphan_part_files(
-            &settings.download_folder,
-            &known_ids,
-        )
-        .await;
+        crate::commands::transfers::sweep_orphan_part_files(&settings.download_folder, &known_ids)
+            .await;
     }
 
     #[cfg(target_os = "windows")]
@@ -5023,7 +5357,8 @@ pub async fn start_network(
         }
     }
 
-    let (aich_set_tx, mut aich_set_rx) = tokio::sync::mpsc::channel::<ed2k::aich::AICHRecoveryHashSet>(128);
+    let (aich_set_tx, mut aich_set_rx) =
+        tokio::sync::mpsc::channel::<ed2k::aich::AICHRecoveryHashSet>(128);
 
     info!("Network event loop starting");
 
@@ -5405,6 +5740,11 @@ pub async fn start_network(
                         file_name: file_name.clone(),
                         file_type: crate::search::index::infer_file_type(&ext),
                         complete_sources: 0,
+                        keyword_publishable: false,
+                        last_source_publish: known_files
+                            .find_by_hash(file_hash)
+                            .map(|r| r.last_publish_src as i64)
+                            .unwrap_or(0),
                     });
                 }
                 if let DownloadEvent::Completed { ref transfer_id, .. } = event {
@@ -5562,6 +5902,15 @@ pub async fn start_network(
                                     file_size: shared_file.size,
                                     file_type: crate::search::index::infer_file_type(&shared_file.extension),
                                     complete_sources: 0,
+                                    keyword_publishable: true,
+                                    last_source_publish: {
+                                        let mut raw = [0u8; 16];
+                                        raw.copy_from_slice(&hash_bytes[..16]);
+                                        known_files
+                                            .find_by_hash(&raw)
+                                            .map(|r| r.last_publish_src as i64)
+                                            .unwrap_or(0)
+                                    },
                                 });
 
                                 // Offer to eD2K server
@@ -6958,9 +7307,15 @@ pub async fn start_network(
                                 .get(sid)
                                 .map(|(fh, _)| *fh)
                                 .unwrap_or(target);
-                            state
+                            let now_ts = chrono::Utc::now().timestamp();
+                            let pending = state
                                 .publish_pending
-                                .insert((target, *addr), (file_hash, chrono::Utc::now().timestamp(), is_source));
+                                .entry((target, *addr))
+                                .or_insert((file_hash, now_ts, is_source, 0));
+                            pending.0 = file_hash;
+                            pending.1 = now_ts;
+                            pending.2 = is_source;
+                            pending.3 = pending.3.saturating_add(1);
                         }
                     }
                 }
@@ -6991,10 +7346,15 @@ pub async fn start_network(
                                             state.flood_protection.track_request(addr, opcode);
                                             let _ = send_kad_packet(&udp_socket, &packet, addr, &state, &contact.id).await;
                                             if let Some(target) = publish_target {
-                                                state.publish_pending.insert(
-                                                    (target, addr),
-                                                    (file_hash, chrono::Utc::now().timestamp(), true),
-                                                );
+                                                let now_ts = chrono::Utc::now().timestamp();
+                                                let pending = state
+                                                    .publish_pending
+                                                    .entry((target, addr))
+                                                    .or_insert((file_hash, now_ts, true, 0));
+                                                pending.0 = file_hash;
+                                                pending.1 = now_ts;
+                                                pending.2 = true;
+                                                pending.3 = pending.3.saturating_add(1);
                                             }
                                         }
                                     }
@@ -8256,12 +8616,15 @@ pub async fn start_network(
                             Vec::new()
                         };
                         let _ = tx.send(results);
-                    } else if let Some((file, kw_publishes)) = state.store_keyword_searches.remove(&sid) {
-                        // StoreKeyword search completed - send publish messages to the closest nodes found
+                    } else if let Some(batch) = state.store_keyword_searches.remove(&sid) {
+                        // StoreKeyword search completed - send publish messages to the closest nodes found.
+                        // eMule publishes by keyword, carrying all complete files
+                        // that reference the keyword (up to 150, split into
+                        // 50-entry packets), not one DHT walk per file token.
                         if let Some(search) = state.search_manager.get(&sid) {
                             let now = chrono::Utc::now().timestamp();
                             let mut sent_any = false;
-                            for (kw_hash, msg) in &kw_publishes {
+                            for msg in &batch.messages {
                                 // Publish only to nodes that actually answered during
                                 // the lookup AND fall within the eMule search tolerance
                                 // of the keyword target (mirrors the StoreSource path).
@@ -8271,26 +8634,34 @@ pub async fn start_network(
                                     .filter(|c| !state.overloaded_nodes.contains_key(&c.ip)
                                         && search.responded_during_lookup.contains(&c.id)
                                         && kad::search::within_search_tolerance_pub(&search.target, &c.id))
-                                    .take(10)
+                                    .take(STORE_PUBLISH_TARGET_TOTAL)
                                 {
                                     let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                                     if let Ok(packet) = messages::encode_packet(msg) {
                                         state.flood_protection.track_request(addr, kad_request_opcode(msg).unwrap_or(0));
                                         let _ = send_kad_packet(&udp_socket, &packet, addr, &state, &contact.id).await;
                                         // Per-peer pending entry so every ack counts.
-                                        state.publish_pending.insert(
-                                            (*kw_hash, addr),
-                                            (file.file_hash, now, false),
-                                        );
+                                        let pending = state
+                                            .publish_pending
+                                            .entry((batch.keyword_hash, addr))
+                                            .or_insert((batch.keyword_hash, now, false, 0));
+                                        pending.0 = batch.keyword_hash;
+                                        pending.1 = now;
+                                        pending.2 = false;
+                                        pending.3 = pending.3.saturating_add(1);
                                         sent_any = true;
                                     }
                                 }
                             }
                             if sent_any {
-                                state.publish_manager.mark_keyword_published(&file.file_hash);
+                                state.publish_manager.mark_keyword_published(&batch.keyword_hash);
                                 info!(
-                                    "StoreKeyword search {} completed: published {} keywords to {} closest nodes",
-                                    sid.0, kw_publishes.len(), search.closest.len().min(3)
+                                    "StoreKeyword search {} completed: published keyword '{}' ({} file entries, {} packet(s)) to up to {} closest nodes",
+                                    sid.0,
+                                    batch.keyword,
+                                    batch.file_hashes.len(),
+                                    batch.messages.len(),
+                                    STORE_PUBLISH_TARGET_TOTAL,
                                 );
                             }
                         }
@@ -8302,6 +8673,7 @@ pub async fn start_network(
                             let mut sent = 0;
                             let already_published = &search.store_sent;
                             let responded = &search.responded_during_lookup;
+                            let remaining = STORE_PUBLISH_TARGET_TOTAL.saturating_sub(already_published.len());
                             let candidates: Vec<&kad::types::KadContact> = search.closest.iter()
                                 .filter(|c| {
                                     !already_published.contains(&c.id)
@@ -8309,6 +8681,7 @@ pub async fn start_network(
                                         && responded.contains(&c.id)
                                         && kad::search::within_search_tolerance_pub(&search.target, &c.id)
                                 })
+                                .take(remaining)
                                 .collect();
                             for contact in candidates {
                                 let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
@@ -8321,19 +8694,26 @@ pub async fn start_network(
                                     // in PublishRes (for source publishes these
                                     // are the same value, but keyword/notes
                                     // would differ).
-                                    state.publish_pending.insert(
-                                        (search.target, addr),
-                                        (file_hash, now, true),
-                                    );
+                                    let pending = state
+                                        .publish_pending
+                                        .entry((search.target, addr))
+                                        .or_insert((file_hash, now, true, 0));
+                                    pending.0 = file_hash;
+                                    pending.1 = now;
+                                    pending.2 = true;
+                                    pending.3 = pending.3.saturating_add(1);
                                     sent += 1;
                                 }
                             }
                             let total_published = already_published.len() + sent;
                             if total_published > 0 {
+                                let now_ts = chrono::Utc::now().timestamp();
                                 state.publish_manager.mark_source_published(&file_hash);
-                                // Fresh publish cycle: reset ack counter so the
-                                // Sources column reflects acks from THIS cycle only.
-                                state.source_publish_acks.insert(file_hash, 0);
+                                let raw_hash = kad_id_to_md4_bytes(&file_hash);
+                                if let Some(record) = known_files.find_by_hash_mut(&raw_hash) {
+                                    record.last_publish_src = (now_ts.max(0) as u64).min(u32::MAX as u64) as u32;
+                                    known_files.mark_dirty();
+                                }
                                 info!("StoreSource search {} completed: published to {} nodes ({} during lookup, {} at completion)",
                                     sid.0, total_published, already_published.len(), sent);
                             }
@@ -8384,7 +8764,7 @@ pub async fn start_network(
                                 .filter(|c| !state.overloaded_nodes.contains_key(&c.ip)
                                     && search.responded_during_lookup.contains(&c.id)
                                     && kad::search::within_search_tolerance_pub(&search.target, &c.id))
-                                .take(10) {
+                                .take(STORE_PUBLISH_TARGET_TOTAL) {
                                 let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                                 if let Ok(packet) = messages::encode_packet(&msg) {
                                     state.flood_protection.track_request(addr, kad_request_opcode(&msg).unwrap_or(0));
@@ -8397,10 +8777,14 @@ pub async fn start_network(
                                     // every notes ack show up as
                                     // `publish_res_unmatched` in diagnostics
                                     // even when the publish succeeded.
-                                    state.publish_pending.insert(
-                                        (file_hash, addr),
-                                        (file_hash, now, false),
-                                    );
+                                    let pending = state
+                                        .publish_pending
+                                        .entry((file_hash, addr))
+                                        .or_insert((file_hash, now, false, 0));
+                                    pending.0 = file_hash;
+                                    pending.1 = now;
+                                    pending.2 = false;
+                                    pending.3 = pending.3.saturating_add(1);
                                     sent += 1;
                                 }
                             }
@@ -8762,6 +9146,15 @@ pub async fn start_network(
                                         file_size: f.size,
                                         file_type: crate::search::index::infer_file_type(&f.extension),
                                         complete_sources: f.complete_sources,
+                                        keyword_publishable: true,
+                                        last_source_publish: {
+                                            let mut raw = [0u8; 16];
+                                            raw.copy_from_slice(&hash_bytes[..16]);
+                                            known_files
+                                                .find_by_hash(&raw)
+                                                .map(|r| r.last_publish_src as i64)
+                                                .unwrap_or(0)
+                                        },
                                     })
                                 })
                                 .collect()
@@ -8789,6 +9182,15 @@ pub async fn start_network(
                                     file_size: transfer.total_size,
                                     file_type: crate::search::index::infer_file_type(&ext),
                                     complete_sources: 0,
+                                    keyword_publishable: false,
+                                    last_source_publish: {
+                                        let mut raw = [0u8; 16];
+                                        raw.copy_from_slice(&hash_bytes[..16]);
+                                        known_files
+                                            .find_by_hash(&raw)
+                                            .map(|r| r.last_publish_src as i64)
+                                            .unwrap_or(0)
+                                    },
                                 });
                                 partial_count += 1;
                             }
@@ -9073,10 +9475,10 @@ pub async fn start_network(
                 } else {
                 let total_files = state.publish_manager.file_count();
                 let needing_source = state.publish_manager.files_needing_source_publish().len();
-                let needing_keyword = state.publish_manager.files_needing_keyword_publish().len();
+                let needing_keyword = state.publish_manager.keywords_needing_publish_count();
                 info!(
                     "Publish cycle: {total_files} files registered, {needing_source} need source publish, \
-                     {needing_keyword} need keyword publish, {} confirmed, {} outstanding pending ack, \
+                     {needing_keyword} keyword targets need publish, {} confirmed, {} outstanding pending ack, \
                      PublishRes plain_seen={} obf_decoded={}/{} wire={} received={} unmatched={}, \
                      firewalled={}, routing_table={}",
                     state.publish_confirmed,
@@ -9186,142 +9588,140 @@ pub async fn start_network(
                     }
                 }
 
-                // Limit publishes per cycle; use higher limits for the first burst after connect
-                let max_source_per_cycle: usize = if !state.first_publish_done || state.publish_confirmed == 0 { 10 } else { 3 };
-                let max_keyword_per_cycle: usize = if !state.first_publish_done || state.publish_confirmed == 0 { 5 } else { 2 };
+                } // end is_empty guard
+            }
 
-                let source_files = state.publish_manager.files_needing_source_publish()
-                    .into_iter().take(max_source_per_cycle).cloned().collect::<Vec<_>>();
-                for file in &source_files {
-                    let Some(msg) = state.publish_manager.build_source_publish(file) else {
-                        warn!(
-                            "Skipping source publish for {} — firewalled={} buddy={} direct_udp_cb={}",
-                            file.file_hash,
-                            state.publish_manager.firewalled,
-                            state.publish_manager.buddy_id.is_some(),
-                            state.publish_manager.direct_udp_callback,
-                        );
-                        continue;
-                    };
-                    let closest = state.routing_table.find_closest_prefer_verified(&file.file_hash, SEARCH_INITIAL_CONTACTS);
-                    if !closest.is_empty() {
-                        let sid = state.search_manager.start_search(
-                            file.file_hash,
-                            SearchType::StoreFile,
-                            closest,
-                        );
-                        if sid != SearchId(0) {
-                            state.store_source_searches.insert(sid, (file.file_hash, msg));
-                        }
-                    }
+            // eMule-compatible Kad publish scheduler. The 60s publish_timer
+            // above is now only for coarse diagnostics and Ember rendezvous
+            // work; this 2s arm mirrors KADEMLIAPUBLISHTIME and starts at
+            // most one source, one keyword, and one note store per tick while
+            // respecting the local eMule per-type active-search caps.
+            _ = kad_publish_timer.tick() => {
+                const KADEMLIA_TOTAL_STORE_SRC: usize = 4;
+                const KADEMLIA_TOTAL_STORE_KEY: usize = 3;
+                const KADEMLIA_TOTAL_STORE_NOTES: usize = 1;
+                const REPUBLISH_NOTE_SECS: i64 = 24 * 3600;
+
+                if state.stats.status == NetworkStatus::Disconnected || state.routing_table.is_empty() {
+                    continue;
                 }
 
-                // K4: files is capped by `max_keyword_per_cycle`, but each
-                // file can contain many keywords and each keyword starts a
-                // fresh DHT walk. A single pathological filename with
-                // dozens of tokens would fire dozens of parallel
-                // `StoreKeyword` searches per cycle — a self-DoS. Cap the
-                // *total* searches launched this cycle too so egress stays
-                // predictable regardless of tokenization.
-                let max_keyword_searches_per_cycle: usize =
-                    if !state.first_publish_done || state.publish_confirmed == 0 { 20 } else { 8 };
-                let mut keyword_searches_started: usize = 0;
-                let keyword_files = state.publish_manager.files_needing_keyword_publish()
-                    .into_iter().take(max_keyword_per_cycle).cloned().collect::<Vec<_>>();
-                'kwfiles: for file in &keyword_files {
-                    let publishes = state.publish_manager.build_keyword_publishes(&file);
-                    if publishes.is_empty() { continue; }
-                    let mut any_started = false;
-                    for (kw_hash, msg) in publishes {
-                        if keyword_searches_started >= max_keyword_searches_per_cycle {
+                let active_store_src = state.store_source_searches.len();
+                if active_store_src < KADEMLIA_TOTAL_STORE_SRC {
+                    let in_flight_sources: HashSet<KadId> = state
+                        .store_source_searches
+                        .values()
+                        .map(|(hash, _)| *hash)
+                        .collect();
+                    if let Some(file) = state
+                        .publish_manager
+                        .files_needing_source_publish()
+                        .into_iter()
+                        .find(|file| !in_flight_sources.contains(&file.file_hash))
+                        .cloned()
+                    {
+                        if let Some(msg) = state.publish_manager.build_source_publish(&file) {
+                            let closest = state
+                                .routing_table
+                                .find_closest_prefer_verified(&file.file_hash, SEARCH_INITIAL_CONTACTS);
+                            if !closest.is_empty() {
+                                let sid = state.search_manager.start_search(
+                                    file.file_hash,
+                                    SearchType::StoreFile,
+                                    closest,
+                                );
+                                if sid != SearchId(0) {
+                                    // Fresh publish cycle: reset before lookup-time
+                                    // publishes can receive acks.
+                                    state.source_publish_acks.insert(file.file_hash, 0);
+                                    state.store_source_searches.insert(sid, (file.file_hash, msg));
+                                }
+                            }
+                        } else {
                             debug!(
-                                "Keyword publish cycle hit cap ({}); deferring remaining keywords",
-                                max_keyword_searches_per_cycle
+                                "Skipping source publish for {} — firewalled={} buddy={} direct_udp_cb={}",
+                                file.file_hash,
+                                state.publish_manager.firewalled,
+                                state.publish_manager.buddy_id.is_some(),
+                                state.publish_manager.direct_udp_callback,
                             );
-                            break 'kwfiles;
                         }
-                        let closest = state.routing_table.find_closest_prefer_verified(&kw_hash, SEARCH_INITIAL_CONTACTS);
-                        if closest.is_empty() { continue; }
-                        let sid = state.search_manager.start_search(
-                            kw_hash,
-                            SearchType::StoreKeyword,
-                            closest,
-                        );
-                        if sid == SearchId(0) { continue; }
-                        state.store_keyword_searches.insert(sid, (file.clone(), vec![(kw_hash, msg)]));
-                        any_started = true;
-                        keyword_searches_started += 1;
-                    }
-                    if !any_started {
-                        // No search started for any keyword — don't mark as published
                     }
                 }
 
-                // Periodic notes republish: our own published comments/ratings
-                // expire from the DHT after ~24h, so re-push any that are due.
-                // Mirrors the keyword/source republish above and reuses the
-                // same StoreNotes -> PublishNotesReq path as the on-demand
-                // `PublishNote` command. Capped per cycle to keep egress
-                // predictable.
-                {
-                    const REPUBLISH_NOTE_SECS: i64 = 24 * 3600;
-                    let max_notes_per_cycle: usize =
-                        if !state.first_publish_done || state.publish_confirmed == 0 { 5 } else { 2 };
+                let active_store_key = state.store_keyword_searches.len();
+                if active_store_key < KADEMLIA_TOTAL_STORE_KEY {
+                    let in_flight_keywords: HashSet<KadId> = state
+                        .store_keyword_searches
+                        .values()
+                        .map(|batch| batch.keyword_hash)
+                        .collect();
+                    if let Some(batch) = state
+                        .publish_manager
+                        .keyword_batches_needing_publish(KADEMLIA_TOTAL_STORE_KEY)
+                        .into_iter()
+                        .find(|batch| !in_flight_keywords.contains(&batch.keyword_hash))
+                    {
+                        let closest = state
+                            .routing_table
+                            .find_closest_prefer_verified(&batch.keyword_hash, SEARCH_INITIAL_CONTACTS);
+                        if !closest.is_empty() {
+                            let sid = state.search_manager.start_search(
+                                batch.keyword_hash,
+                                SearchType::StoreKeyword,
+                                closest,
+                            );
+                            if sid != SearchId(0) {
+                                state.store_keyword_searches.insert(sid, batch);
+                            }
+                        }
+                    }
+                }
+
+                let active_store_notes = state.pending_note_publishes.len();
+                if active_store_notes < KADEMLIA_TOTAL_STORE_NOTES {
                     let now_ts = chrono::Utc::now().timestamp();
-                    // Don't start a second republish for a note whose previous
-                    // publish search is still in flight.
                     let in_flight: HashSet<KadId> = state
                         .pending_note_publishes
                         .values()
                         .map(|(h, _, _)| *h)
                         .collect();
-                    let due_notes: Vec<(KadId, u8, String)> = state
+                    let due_note = state
                         .published_notes
                         .iter()
-                        .filter(|(hash, note)| {
+                        .find(|(hash, note)| {
                             now_ts - note.last_publish > REPUBLISH_NOTE_SECS
                                 && !in_flight.contains(*hash)
                         })
-                        .take(max_notes_per_cycle)
-                        .map(|(hash, note)| (*hash, note.rating, note.comment.clone()))
-                        .collect();
-                    for (file_hash, rating, comment) in due_notes {
+                        .map(|(hash, note)| (*hash, note.rating, note.comment.clone()));
+
+                    if let Some((file_hash, rating, comment)) = due_note {
                         let closest = state
                             .routing_table
                             .find_closest_prefer_verified(&file_hash, SEARCH_INITIAL_CONTACTS);
-                        if closest.is_empty() {
-                            continue;
+                        if !closest.is_empty() {
+                            let sid = state.search_manager.start_search(
+                                file_hash,
+                                SearchType::StoreNotes,
+                                closest,
+                            );
+                            if sid != SearchId(0) {
+                                state
+                                    .pending_note_publishes
+                                    .insert(sid, (file_hash, rating, comment.clone()));
+                                if let Some(note) = state.published_notes.get_mut(&file_hash) {
+                                    note.last_publish = now_ts;
+                                }
+                                if let Err(e) =
+                                    db.save_published_note(&file_hash.to_hex(), rating, &comment, now_ts)
+                                {
+                                    warn!("Failed to persist note republish timestamp: {e}");
+                                }
+                                info!("Republishing KAD note for file {file_hash} (search {})", sid.0);
+                            }
                         }
-                        let sid = state.search_manager.start_search(
-                            file_hash,
-                            SearchType::StoreNotes,
-                            closest,
-                        );
-                        if sid == SearchId(0) {
-                            continue;
-                        }
-                        state
-                            .pending_note_publishes
-                            .insert(sid, (file_hash, rating, comment.clone()));
-                        // Optimistically mark republished now so the next cycle
-                        // doesn't re-trigger while this search is in flight, and
-                        // persist the new timestamp so the schedule survives a
-                        // restart. A transient failure just defers the next
-                        // attempt by the normal interval, which is acceptable
-                        // for an already-published note.
-                        if let Some(note) = state.published_notes.get_mut(&file_hash) {
-                            note.last_publish = now_ts;
-                        }
-                        if let Err(e) =
-                            db.save_published_note(&file_hash.to_hex(), rating, &comment, now_ts)
-                        {
-                            warn!("Failed to persist note republish timestamp: {e}");
-                        }
-                        info!("Republishing KAD note for file {file_hash} (search {})", sid.0);
                     }
                 }
-
-                } // end is_empty guard
             }
 
             // Publish-pipeline health heartbeat (10s). Only logs when at
@@ -9649,8 +10049,8 @@ pub async fn start_network(
                 // file regardless of how many peers we had outstanding.
                 let stale_keys: Vec<((KadId, SocketAddr), KadId, bool)> = state.publish_pending
                     .iter()
-                    .filter(|(_, (_, sent_at, _))| now - sent_at > 120)
-                    .map(|(k, (file_hash, _, is_source))| (*k, *file_hash, *is_source))
+                    .filter(|(_, (_, sent_at, _, _))| now - sent_at > 120)
+                    .map(|(k, (file_hash, _, is_source, _))| (*k, *file_hash, *is_source))
                     .collect();
                 let mut retried_files: std::collections::HashSet<(KadId, bool)> = std::collections::HashSet::new();
                 for (key, file_hash, is_source) in &stale_keys {
@@ -9664,7 +10064,9 @@ pub async fn start_network(
                         if *is_source {
                             state.publish_manager.reset_source_publish(file_hash);
                         } else {
-                            state.publish_manager.reset_keyword_publish(file_hash);
+                            state
+                                .publish_manager
+                                .reset_keyword_target_publish(file_hash);
                         }
                         debug!("Retrying unconfirmed publish for target {} (peer {})", key.0, key.1);
                     }
@@ -15072,7 +15474,10 @@ pub async fn start_network(
     }).catch_unwind().await;
 
     if let Err(panic_info) = loop_panic {
-        error!("Network event loop panicked: {}", describe_panic(&*panic_info));
+        error!(
+            "Network event loop panicked: {}",
+            describe_panic(&*panic_info)
+        );
         let _ = app_handle.emit("network-error", serde_json::json!({
             "message": "Internal error in network task. The application may need to be restarted.",
         }));
@@ -15125,7 +15530,10 @@ pub async fn start_network(
     // waits for that hand-off instead of dropping the save, while the timeout
     // still guarantees shutdown can't hang on a genuinely stuck tracker.
     let trackers: Vec<_> = match state.tracker_registry.lock() {
-        Ok(reg) => reg.iter().map(|(tid, t)| (tid.clone(), t.clone())).collect(),
+        Ok(reg) => reg
+            .iter()
+            .map(|(tid, t)| (tid.clone(), t.clone()))
+            .collect(),
         Err(poisoned) => poisoned
             .into_inner()
             .iter()
@@ -15135,12 +15543,7 @@ pub async fn start_network(
     if !trackers.is_empty() {
         let count = trackers.len();
         for (tid, tracker) in trackers {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                tracker.read(),
-            )
-            .await
-            {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), tracker.read()).await {
                 Ok(guard) => {
                     guard.save();
                     debug!("Saved .part.met for aborted download {tid}");
@@ -15163,9 +15566,7 @@ pub async fn start_network(
     info!("Shutting down network");
     // Final Path B tally so even a short test run (under the 60 s periodic
     // cadence) always captures the queued-source-model counters.
-    if let Some((in_use, max, acquires, contended)) =
-        ed2k::multi_source::global_dl_conn_stats()
-    {
+    if let Some((in_use, max, acquires, contended)) = ed2k::multi_source::global_dl_conn_stats() {
         let (detaches, diversions, rotations) = ed2k::multi_source::pathb_event_counts();
         info!(
             "Path B final stats: dl-conns {in_use}/{max} in use at shutdown, {acquires} acquires \
@@ -15209,7 +15610,10 @@ pub async fn start_network(
         if let Err(e) = ed2k::aich::save_known2_met(&known2_path, &state.aich_hash_sets) {
             error!("Failed to save known2_64.met on shutdown: {e}");
         } else {
-            info!("Saved {} AICH hash sets to known2_64.met", state.aich_hash_sets.len());
+            info!(
+                "Saved {} AICH hash sets to known2_64.met",
+                state.aich_hash_sets.len()
+            );
         }
     }
     flush_credit_state(&credit_manager, &db, &state.data_dir, true).await;
@@ -15219,7 +15623,10 @@ pub async fn start_network(
     if let Err(e) = state.reputation.save(&rep_path) {
         error!("Failed to save reputation.json on shutdown: {e}");
     } else {
-        info!("Reputation data saved on shutdown ({} peers tracked)", state.reputation.tracked_count());
+        info!(
+            "Reputation data saved on shutdown ({} peers tracked)",
+            state.reputation.tracked_count()
+        );
     }
 
     // Persist the source cache (peer user hashes + crypt options) so the next
@@ -15264,11 +15671,8 @@ pub async fn start_network(
         // shutdown on TCP connect timeouts. Timed leases expire on their own
         // within the hour, and permanent-lease mappings (the error-725
         // fallback) are reclaimed by the next session's conflict handling.
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            upnp_mappings.teardown(),
-        )
-        .await;
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(5), upnp_mappings.teardown()).await;
     }
 
     Ok(())
@@ -15284,8 +15688,8 @@ async fn send_kad_packet(
     target_id: &KadId,
 ) -> std::io::Result<usize> {
     let contact = state.routing_table.get_contact(target_id);
-    let use_obfuscation = state.obfuscation_enabled
-        && contact.map_or(false, |c| c.supports_obfuscation());
+    let use_obfuscation =
+        state.obfuscation_enabled && contact.map_or(false, |c| c.supports_obfuscation());
 
     let result = if use_obfuscation {
         let their_ip = match addr.ip() {
@@ -15298,12 +15702,8 @@ async fn send_kad_packet(
             .filter(|k| k.is_valid())
             .map(|k| k.get_key_value(their_ip))
             .unwrap_or(0);
-        let encrypted = obfuscation::encrypt_kad_packet(
-            packet,
-            target_id,
-            sender_key.key,
-            receiver_key_val,
-        );
+        let encrypted =
+            obfuscation::encrypt_kad_packet(packet, target_id, sender_key.key, receiver_key_val);
         socket.send_to(&encrypted, addr).await
     } else {
         socket.send_to(packet, addr).await
@@ -15329,16 +15729,14 @@ async fn send_kad_packet(
 /// hashing `(ip, port)` into the 128-bit KadId space so the same peer
 /// always resolves to the same synthetic identity regardless of what
 /// they claim on the wire.
-fn resolve_verified_sender_id(
-    state: &NetworkState,
-    from: SocketAddr,
-    claimed: &KadId,
-) -> KadId {
+fn resolve_verified_sender_id(state: &NetworkState, from: SocketAddr, claimed: &KadId) -> KadId {
     let v4 = match from.ip() {
         std::net::IpAddr::V4(v4) => v4,
         _ => return *claimed,
     };
-    if let Some(c) = state.routing_table.all_contacts()
+    if let Some(c) = state
+        .routing_table
+        .all_contacts()
         .find(|c| c.ip == v4 && c.udp_port == from.port())
     {
         return c.id;
@@ -15392,12 +15790,8 @@ async fn send_kad_response(
     let result = if use_obfuscation {
         if let Some(kad_id) = target_kad_id {
             let sender_key = KadUDPKey::generate(state.udp_key_seed, their_ip).key;
-            let encrypted = obfuscation::encrypt_kad_packet(
-                packet,
-                &kad_id,
-                sender_key,
-                receiver_key_val,
-            );
+            let encrypted =
+                obfuscation::encrypt_kad_packet(packet, &kad_id, sender_key, receiver_key_val);
             socket.send_to(&encrypted, addr).await
         } else {
             socket.send_to(packet, addr).await
@@ -15481,7 +15875,8 @@ fn build_kad_connect_options(state: &NetworkState) -> u8 {
     let supports_crypt = state.obfuscation_enabled as u8;
     let requests_crypt = state.obfuscation_enabled as u8;
     let requires_crypt = 0u8;
-    let direct_udp_callback = (state.firewalled && !state.udp_firewalled && state.udp_fw_verified) as u8;
+    let direct_udp_callback =
+        (state.firewalled && !state.udp_firewalled && state.udp_fw_verified) as u8;
     (direct_udp_callback << 3) | (requires_crypt << 2) | (requests_crypt << 1) | supports_crypt
 }
 
@@ -15505,8 +15900,10 @@ fn set_external_ip(state: &mut NetworkState, ip: Option<Ipv4Addr>) {
 
 fn update_publish_manager_state(state: &mut NetworkState) {
     state.publish_manager.firewalled = state.firewalled;
-    state.publish_manager.use_extern_kad_port = matches!(state.external_udp_port, Some(port) if port != 0 && port != state.udp_port);
-    state.publish_manager.direct_udp_callback = state.firewalled && !state.udp_firewalled && state.udp_fw_verified;
+    state.publish_manager.use_extern_kad_port =
+        matches!(state.external_udp_port, Some(port) if port != 0 && port != state.udp_port);
+    state.publish_manager.direct_udp_callback =
+        state.firewalled && !state.udp_firewalled && state.udp_fw_verified;
     state.publish_manager.connect_options = build_kad_connect_options(state);
 
     if let Some(buddy) = state.buddy_manager.buddy_id().cloned() {
@@ -15527,7 +15924,9 @@ fn update_publish_manager_state(state: &mut NetworkState) {
             // The parse side (`extract_kad_sources` for TAG_SERVERIP) mirrors
             // this with `.to_le_bytes()`; the two must stay in sync.
             state.publish_manager.buddy_ip = u32::from_le_bytes(ip.octets());
-            let buddy_udp = state.routing_table.get_contact(&buddy)
+            let buddy_udp = state
+                .routing_table
+                .get_contact(&buddy)
                 .map(|c| c.udp_port)
                 .unwrap_or_else(|| tcp_port.saturating_add(3));
             state.publish_manager.buddy_port = buddy_udp;
@@ -15571,12 +15970,18 @@ fn dispatch_udp_firewall_probe_requests(state: &mut NetworkState, settings: &App
     let contacts: Vec<KadContact> = candidates.into_iter().take(4).collect();
 
     if !contacts.is_empty() {
-        info!("Dispatching {} UDP firewall probe(s) (ext_udp_port={})", contacts.len(), external_udp_port);
+        info!(
+            "Dispatching {} UDP firewall probe(s) (ext_udp_port={})",
+            contacts.len(),
+            external_udp_port
+        );
     }
     let external_ip = state.external_ip;
     let obfuscation_enabled = settings.obfuscation_enabled;
     for contact in contacts {
-        state.firewall_checker.record_udp_firewall_request_sent(contact.ip);
+        state
+            .firewall_checker
+            .record_udp_firewall_request_sent(contact.ip);
         spawn_udp_firewall_probe_request(
             contact,
             state.user_hash,
@@ -15618,8 +16023,10 @@ fn spawn_udp_firewall_probe_request(
         )
         .await
         {
-            Ok(()) => debug!("UDP firewall probe sent to {}:{} (asking for reply on ports {}/{})",
-                contact_ip, contact_tcp, udp_port, external_udp_port),
+            Ok(()) => debug!(
+                "UDP firewall probe sent to {}:{} (asking for reply on ports {}/{})",
+                contact_ip, contact_tcp, udp_port, external_udp_port
+            ),
             // Probe failures are routine — Windows surfaces remote
             // ICMP-unreachable as `os error 10054`, which just means the
             // peer's UDP port is closed (very common for stale routing
@@ -15628,7 +16035,10 @@ fn spawn_udp_firewall_probe_request(
             // so per-probe failures are debug-only. The aggregate
             // outcome is logged separately as "UDP firewall test
             // passed/failed".
-            Err(e) => debug!("UDP firewall probe to {}:{} failed: {e}", contact_ip, contact_tcp),
+            Err(e) => debug!(
+                "UDP firewall probe to {}:{} failed: {e}",
+                contact_ip, contact_tcp
+            ),
         }
     });
 }
@@ -15663,24 +16073,48 @@ async fn send_udp_firewall_probe_request(
         &nickname,
         None,
     );
-    write_ed2k_packet_simple(&mut writer, OP_EDONKEYHEADER, ed2k::messages::OP_HELLO, &hello).await?;
+    write_ed2k_packet_simple(
+        &mut writer,
+        OP_EDONKEYHEADER,
+        ed2k::messages::OP_HELLO,
+        &hello,
+    )
+    .await?;
 
     let (proto, opcode, _) = read_ed2k_packet_simple(&mut reader).await?;
     if proto != OP_EDONKEYHEADER || opcode != ed2k::messages::OP_HELLOANSWER {
-        anyhow::bail!("expected HelloAnswer from {addr}, got proto=0x{proto:02X} op=0x{opcode:02X}");
+        anyhow::bail!(
+            "expected HelloAnswer from {addr}, got proto=0x{proto:02X} op=0x{opcode:02X}"
+        );
     }
 
     let emule_info = ed2k::messages::build_emule_info(udp_port, obfuscation_enabled, None, None);
-    write_ed2k_packet_simple(&mut writer, OP_EMULEPROT, ed2k::messages::OP_EMULEINFO, &emule_info).await?;
+    write_ed2k_packet_simple(
+        &mut writer,
+        OP_EMULEPROT,
+        ed2k::messages::OP_EMULEINFO,
+        &emule_info,
+    )
+    .await?;
 
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), read_ed2k_packet_simple(&mut reader)).await;
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        read_ed2k_packet_simple(&mut reader),
+    )
+    .await;
 
     let mut payload = Vec::with_capacity(8);
     payload.extend_from_slice(&udp_port.to_le_bytes());
     payload.extend_from_slice(&external_udp_port.to_le_bytes());
     let receiver_key = KadUDPKey::generate(udp_key_seed, u32::from(contact.ip)).key;
     payload.extend_from_slice(&receiver_key.to_le_bytes());
-    write_ed2k_packet_simple(&mut writer, OP_EMULEPROT, ed2k::messages::OP_FWCHECKUDPREQ, &payload).await?;
+    write_ed2k_packet_simple(
+        &mut writer,
+        OP_EMULEPROT,
+        ed2k::messages::OP_FWCHECKUDPREQ,
+        &payload,
+    )
+    .await?;
     // Give the remote peer time to read and process the request before
     // we drop the TCP connection.  Without this, some clients abort
     // processing when they see the connection close immediately.
@@ -15794,11 +16228,10 @@ async fn handle_ember_native_udp(
     from: SocketAddr,
     state: &mut NetworkState,
 ) {
-    if let Err(p) = std::panic::AssertUnwindSafe(handle_ember_native_udp_inner(
-        socket, data, from, state,
-    ))
-    .catch_unwind()
-    .await
+    if let Err(p) =
+        std::panic::AssertUnwindSafe(handle_ember_native_udp_inner(socket, data, from, state))
+            .catch_unwind()
+            .await
     {
         error!(
             "Ember UDP handler panicked (recovered, network loop continues): {}",
@@ -15844,7 +16277,9 @@ async fn handle_ember_native_udp_inner(
             if let Some((sent_at, tx)) = state.ember_pending_pings.remove(&nonce) {
                 let _ = tx.send(sent_at.elapsed());
             } else {
-                debug!("Ember transport: Pong nonce {nonce} from {from} did not match a pending ping");
+                debug!(
+                    "Ember transport: Pong nonce {nonce} from {from} did not match a pending ping"
+                );
             }
         }
         None => {
@@ -15910,7 +16345,10 @@ async fn handle_udp_packet_inner(
 ) {
     // Reject oversized packets (max 64 KiB for UDP)
     if data.len() > 65535 {
-        debug!("Dropping oversized packet from {from}: {} bytes", data.len());
+        debug!(
+            "Dropping oversized packet from {from}: {} bytes",
+            data.len()
+        );
         return;
     }
 
@@ -15965,7 +16403,10 @@ async fn handle_udp_packet_inner(
                 }
                 _ => state.flood_protection.has_recent_ip(from.ip()),
             };
-            if state.flood_protection.check_rate_limit_with_opcode(from.ip(), known_peer, 0xFF) {
+            if state
+                .flood_protection
+                .check_rate_limit_with_opcode(from.ip(), known_peer, 0xFF)
+            {
                 debug!("Rate limit exceeded for Ember UDP from {from}, dropping packet");
                 return;
             }
@@ -15996,7 +16437,10 @@ async fn handle_udp_packet_inner(
             }
 
             // eMule UDP reask: peer asks if we still have a file and what their queue rank is
-            if header == OP_EMULEPROT && opcode == ed2k::messages::OP_REASKFILEPING && payload.len() >= 16 {
+            if header == OP_EMULEPROT
+                && opcode == ed2k::messages::OP_REASKFILEPING
+                && payload.len() >= 16
+            {
                 let mut file_hash = [0u8; 16];
                 file_hash.copy_from_slice(&payload[..16]);
                 let hash_hex = hex::encode(file_hash);
@@ -16063,7 +16507,11 @@ async fn handle_udp_packet_inner(
             }
 
             // eMule UDP: queue full or file not found responses
-            if header == OP_EMULEPROT && (opcode == ed2k::messages::OP_QUEUEFULL_UDP || opcode == ed2k::messages::OP_FILEREQANSNOFIL || opcode == ed2k::messages::OP_FILENOTFOUND_UDP) {
+            if header == OP_EMULEPROT
+                && (opcode == ed2k::messages::OP_QUEUEFULL_UDP
+                    || opcode == ed2k::messages::OP_FILEREQANSNOFIL
+                    || opcode == ed2k::messages::OP_FILENOTFOUND_UDP)
+            {
                 let v4_opt = match from.ip() {
                     IpAddr::V4(v4) => Some(v4),
                     IpAddr::V6(v6) => v6.to_ipv4_mapped(),
@@ -16077,7 +16525,8 @@ async fn handle_udp_packet_inner(
                                     src.state = ed2k::sources::DownloadSourceState::Banned;
                                     src.state_changed = std::time::Instant::now();
                                 } else if opcode == ed2k::messages::OP_QUEUEFULL_UDP {
-                                    src.state = ed2k::sources::DownloadSourceState::OnQueue { rank: None };
+                                    src.state =
+                                        ed2k::sources::DownloadSourceState::OnQueue { rank: None };
                                     src.state_changed = std::time::Instant::now();
                                 } else {
                                     src.state = ed2k::sources::DownloadSourceState::Failed;
@@ -16261,7 +16710,10 @@ async fn handle_udp_packet_inner(
     } else {
         0xFF
     };
-    if state.flood_protection.check_rate_limit_with_opcode(from.ip(), known_peer, opcode_hint) {
+    if state
+        .flood_protection
+        .check_rate_limit_with_opcode(from.ip(), known_peer, opcode_hint)
+    {
         debug!("Rate limit exceeded for {from} (opcode 0x{opcode_hint:02X}), dropping packet");
         return;
     }
@@ -16274,9 +16726,7 @@ async fn handle_udp_packet_inner(
     if data.first() == Some(&kad::messages::OP_KADEMLIAPACKEDPROT)
         && state.flood_protection.over_compressed_budget(from.ip())
     {
-        debug!(
-            "Dropping compressed KAD packet from {from}: per-IP decompression budget exhausted"
-        );
+        debug!("Dropping compressed KAD packet from {from}: per-IP decompression budget exhausted");
         return;
     }
 
@@ -16286,7 +16736,9 @@ async fn handle_udp_packet_inner(
         Ok(m) => m,
         Err(_first_err) => {
             let receiver_vk = match from.ip() {
-                std::net::IpAddr::V4(ip) => KadUDPKey::generate(state.udp_key_seed, u32::from(ip)).key,
+                std::net::IpAddr::V4(ip) => {
+                    KadUDPKey::generate(state.udp_key_seed, u32::from(ip)).key
+                }
                 _ => 0,
             };
             let sender_ip_u32 = match from.ip() {
@@ -16308,13 +16760,15 @@ async fn handle_udp_packet_inner(
                         // so the `Publish cycle:` log can distinguish
                         // "obfuscated path is broken" from "PublishRes
                         // specifically is missing" from "remote never sent".
-                        state.obf_decoded_total =
-                            state.obf_decoded_total.saturating_add(1);
+                        state.obf_decoded_total = state.obf_decoded_total.saturating_add(1);
                         if matches!(&m, KadMessage::PublishRes { .. }) {
                             state.publish_res_obf_decoded =
                                 state.publish_res_obf_decoded.saturating_add(1);
                         }
-                        debug!("Decrypted obfuscated KAD packet from {from} ({} bytes)", data.len());
+                        debug!(
+                            "Decrypted obfuscated KAD packet from {from} ({} bytes)",
+                            data.len()
+                        );
                         m
                     }
                     Err(e) => {
@@ -16332,9 +16786,15 @@ async fn handle_udp_packet_inner(
                 // log at debug only.
                 let header = data.first().copied().unwrap_or(0);
                 if header == 0xE4 || header == 0xE5 {
-                    debug!("Failed to decode KAD packet from {from} ({} bytes): {_first_err}", data.len());
+                    debug!(
+                        "Failed to decode KAD packet from {from} ({} bytes): {_first_err}",
+                        data.len()
+                    );
                 } else {
-                    debug!("Unreadable packet from {from} ({} bytes, header 0x{header:02X})", data.len());
+                    debug!(
+                        "Unreadable packet from {from} ({} bytes, header 0x{header:02X})",
+                        data.len()
+                    );
                 }
                 return;
             }
@@ -16411,7 +16871,9 @@ async fn handle_udp_packet_inner(
                 contacts,
             };
             if let Ok(packet) = messages::encode_packet(&res) {
-                let _ = send_kad_response(socket, &packet, from, state, None, packet_sender_udp_key).await;
+                let _ =
+                    send_kad_response(socket, &packet, from, state, None, packet_sender_udp_key)
+                        .await;
             }
         }
 
@@ -16421,10 +16883,7 @@ async fn handle_udp_packet_inner(
             version,
             contacts,
         } => {
-            debug!(
-                "BootstrapRes from {from}: {} contacts",
-                contacts.len()
-            );
+            debug!("BootstrapRes from {from}: {} contacts", contacts.len());
             let ip = match from.ip() {
                 std::net::IpAddr::V4(v4) => v4,
                 _ => return,
@@ -16483,8 +16942,12 @@ async fn handle_udp_packet_inner(
                     if version >= KADEMLIA_VERSION8_49B {
                         let mut our_options: u8 = 0;
                         our_options |= 0x04;
-                        if state.udp_firewalled { our_options |= 0x01; }
-                        if state.firewalled { our_options |= 0x02; }
+                        if state.udp_firewalled {
+                            our_options |= 0x01;
+                        }
+                        if state.firewalled {
+                            our_options |= 0x02;
+                        }
                         tags.push(KadTag {
                             name: TagName::Id(TAG_KADMISCOPTIONS),
                             value: TagValue::Uint8(our_options),
@@ -16501,7 +16964,15 @@ async fn handle_udp_packet_inner(
             };
             if let Ok(packet) = messages::encode_packet(&hello) {
                 state.flood_protection.track_request(from, 0x11);
-                let _ = send_kad_response(socket, &packet, from, state, Some(&sender_id), packet_sender_udp_key).await;
+                let _ = send_kad_response(
+                    socket,
+                    &packet,
+                    from,
+                    state,
+                    Some(&sender_id),
+                    packet_sender_udp_key,
+                )
+                .await;
                 debug!("Sent HelloReq to bootstrap node {from}");
             }
 
@@ -16522,7 +16993,9 @@ async fn handle_udp_packet_inner(
                 && table_size >= 2
                 && now_ts >= state.kad_started_at + SELF_LOOKUP_FIRST_DELAY_SECS
             {
-                let closest = state.routing_table.find_closest(&state.local_id, SEARCH_INITIAL_CONTACTS);
+                let closest = state
+                    .routing_table
+                    .find_closest(&state.local_id, SEARCH_INITIAL_CONTACTS);
                 if !closest.is_empty() {
                     let sid = state.search_manager.start_search(
                         state.local_id,
@@ -16556,14 +17029,20 @@ async fn handle_udp_packet_inner(
             }
 
             // Parse TAG_KADMISCOPTIONS
-            let kad_options = tags.iter()
+            let kad_options = tags
+                .iter()
                 .find(|t| matches!(&t.name, TagName::Id(TAG_KADMISCOPTIONS)))
-                .and_then(|t| t.uint8_value().or_else(|| t.uint16_value().map(|v| v as u8)).or_else(|| t.uint32_value().map(|v| v as u8)))
+                .and_then(|t| {
+                    t.uint8_value()
+                        .or_else(|| t.uint16_value().map(|v| v as u8))
+                        .or_else(|| t.uint32_value().map(|v| v as u8))
+                })
                 .unwrap_or(0);
             let peer_udp_firewalled = kad_options & 0x01 != 0;
 
             let valid_receiver_key = packet_valid_receiver_key;
-            let received_hello_port = tags.iter()
+            let received_hello_port = tags
+                .iter()
                 .find(|t| matches!(&t.name, TagName::Id(TAG_SOURCEUPORT)))
                 .and_then(|t| t.uint16_value())
                 .unwrap_or(from.port());
@@ -16587,10 +17066,14 @@ async fn handle_udp_packet_inner(
                     received_hello: true,
                 });
             } else {
-                debug!("Not adding UDP-firewalled contact {} from {}", sender_id, from);
+                debug!(
+                    "Not adding UDP-firewalled contact {} from {}",
+                    sender_id, from
+                );
             }
 
-            if let Some(nick) = tags.iter()
+            if let Some(nick) = tags
+                .iter()
                 .find(|t| matches!(&t.name, TagName::Id(TAG_FILENAME)))
                 .and_then(|t| t.string_value())
             {
@@ -16620,9 +17103,15 @@ async fn handle_udp_packet_inner(
                 && (needs_ack || state.udp_firewalled || state.firewalled)
             {
                 let mut our_options: u8 = 0;
-                if state.udp_firewalled { our_options |= 0x01; }
-                if state.firewalled { our_options |= 0x02; }
-                if needs_ack { our_options |= 0x04; }
+                if state.udp_firewalled {
+                    our_options |= 0x01;
+                }
+                if state.firewalled {
+                    our_options |= 0x02;
+                }
+                if needs_ack {
+                    our_options |= 0x04;
+                }
                 res_tags.push(KadTag {
                     name: TagName::Id(TAG_KADMISCOPTIONS),
                     value: TagValue::Uint8(our_options),
@@ -16637,17 +17126,32 @@ async fn handle_udp_packet_inner(
             };
             if let Ok(packet) = messages::encode_packet(&res) {
                 state.flood_protection.track_request(from, 0x19);
-                let _ = send_kad_response(socket, &packet, from, state, Some(&sender_id), packet_sender_udp_key).await;
+                let _ = send_kad_response(
+                    socket,
+                    &packet,
+                    from,
+                    state,
+                    Some(&sender_id),
+                    packet_sender_udp_key,
+                )
+                .await;
             }
 
             if !valid_receiver_key && version <= KADEMLIA_VERSION7_49A {
                 let ping = KadMessage::Ping;
                 if let Ok(packet) = messages::encode_packet(&ping) {
                     state.flood_protection.track_request(from, 0x60);
-                    let _ = send_kad_response(socket, &packet, from, state, Some(&sender_id), packet_sender_udp_key).await;
+                    let _ = send_kad_response(
+                        socket,
+                        &packet,
+                        from,
+                        state,
+                        Some(&sender_id),
+                        packet_sender_udp_key,
+                    )
+                    .await;
                 }
             }
-
         }
 
         KadMessage::HelloRes {
@@ -16667,16 +17171,22 @@ async fn handle_udp_packet_inner(
                 return;
             }
 
-            let kad_options = tags.iter()
+            let kad_options = tags
+                .iter()
                 .find(|t| matches!(&t.name, TagName::Id(TAG_KADMISCOPTIONS)))
-                .and_then(|t| t.uint8_value().or_else(|| t.uint16_value().map(|v| v as u8)).or_else(|| t.uint32_value().map(|v| v as u8)))
+                .and_then(|t| {
+                    t.uint8_value()
+                        .or_else(|| t.uint16_value().map(|v| v as u8))
+                        .or_else(|| t.uint32_value().map(|v| v as u8))
+                })
                 .unwrap_or(0);
             let peer_udp_firewalled = kad_options & 0x01 != 0;
 
             let valid_receiver_key = packet_valid_receiver_key;
 
             let now = chrono::Utc::now().timestamp();
-            let received_hello_port = tags.iter()
+            let received_hello_port = tags
+                .iter()
                 .find(|t| matches!(&t.name, TagName::Id(TAG_SOURCEUPORT)))
                 .and_then(|t| t.uint16_value())
                 .unwrap_or(from.port());
@@ -16698,7 +17208,10 @@ async fn handle_udp_packet_inner(
                     received_hello: true,
                 });
             } else {
-                debug!("Not adding UDP-firewalled contact {} from HelloRes ({from})", sender_id);
+                debug!(
+                    "Not adding UDP-firewalled contact {} from HelloRes ({from})",
+                    sender_id
+                );
             }
 
             // If valid receiver key, also verify the contact in the routing table
@@ -16707,7 +17220,8 @@ async fn handle_udp_packet_inner(
             }
             state.stats.connected_peers = state.routing_table.len() as u32;
 
-            let nick = tags.iter()
+            let nick = tags
+                .iter()
                 .find(|t| matches!(&t.name, TagName::Id(TAG_FILENAME)))
                 .and_then(|t| t.string_value())
                 .map(|n| crate::security::sanitize_display_name(n))
@@ -16729,7 +17243,15 @@ async fn handle_udp_packet_inner(
                 };
                 if packet_sender_udp_key.is_some() {
                     if let Ok(packet) = messages::encode_packet(&ack) {
-                        let _ = send_kad_response(socket, &packet, from, state, Some(&sender_id), packet_sender_udp_key).await;
+                        let _ = send_kad_response(
+                            socket,
+                            &packet,
+                            from,
+                            state,
+                            Some(&sender_id),
+                            packet_sender_udp_key,
+                        )
+                        .await;
                     }
                 }
             }
@@ -16771,7 +17293,10 @@ async fn handle_udp_packet_inner(
                 .map(|contact| contact.ip == sender_ip)
                 .unwrap_or(false);
             if !valid_sender {
-                warn!("Ignoring HelloResAck from {from}: sender {} does not match routing table", sender_id);
+                warn!(
+                    "Ignoring HelloResAck from {from}: sender {} does not match routing table",
+                    sender_id
+                );
                 return;
             }
 
@@ -16799,21 +17324,33 @@ async fn handle_udp_packet_inner(
             if requested_count == 0 {
                 debug!("KadReq from {from}: search_type 0 is invalid, ignoring");
             } else {
-                let closest = state
-                    .routing_table
-                    .find_closest_verified_by_type(&target, requested_count, 2);
+                let closest =
+                    state
+                        .routing_table
+                        .find_closest_verified_by_type(&target, requested_count, 2);
                 let res = KadMessage::KadRes {
                     target,
                     contacts: closest,
                 };
                 if let Ok(packet) = messages::encode_packet(&res) {
-                    let _ = send_kad_response(socket, &packet, from, state, None, packet_sender_udp_key).await;
+                    let _ = send_kad_response(
+                        socket,
+                        &packet,
+                        from,
+                        state,
+                        None,
+                        packet_sender_udp_key,
+                    )
+                    .await;
                 }
             }
         }
 
         KadMessage::KadRes { target, contacts } => {
-            debug!("KadRes from {from}: {} contacts for target {target}", contacts.len());
+            debug!(
+                "KadRes from {from}: {} contacts for target {target}",
+                contacts.len()
+            );
 
             // eMule Process_KADEMLIA2_RES: verify we have an active search for this target.
             let expected = state.search_manager.get_expected_response_count(&target);
@@ -16826,7 +17363,11 @@ async fn handle_udp_packet_inner(
             // Peers commonly return more contacts than requested (e.g. 4 for a
             // FIND_VALUE request asking for 2).
             if contacts.len() > KADEMLIA_FIND_NODE as usize {
-                warn!("KadRes from {from}: contact count {} exceeds max {}, ignoring", contacts.len(), KADEMLIA_FIND_NODE);
+                warn!(
+                    "KadRes from {from}: contact count {} exceeds max {}, ignoring",
+                    contacts.len(),
+                    KADEMLIA_FIND_NODE
+                );
                 return;
             }
 
@@ -16838,7 +17379,10 @@ async fn handle_udp_packet_inner(
             };
 
             let owning_sid: Option<SearchId> = sender_ip_port.and_then(|(ip, port)| {
-                state.search_manager.active.iter()
+                state
+                    .search_manager
+                    .active
+                    .iter()
                     .filter(|(_, s)| s.target == target && !s.completed)
                     .find(|(_, s)| s.tried.contains_key(&(ip, port)))
                     .map(|(id, _)| *id)
@@ -16856,7 +17400,10 @@ async fn handle_udp_packet_inner(
                 // unsolicited peer inject contacts (eMule's IsOnOutTrackList).
                 sender_ip_port
                     .and_then(|(ip, _)| {
-                        state.search_manager.active.iter()
+                        state
+                            .search_manager
+                            .active
+                            .iter()
                             .filter(|(_, s)| s.target == target && !s.completed)
                             .find(|(_, s)| s.tried.keys().any(|(tip, _)| *tip == ip))
                             .map(|(id, _)| *id)
@@ -16870,23 +17417,28 @@ async fn handle_udp_packet_inner(
             }
 
             for sid in search_ids {
-                let sender_id = sender_ip_port.and_then(|(ip, port)| {
-                    state.search_manager.active.get(&sid).and_then(|s| {
-                        // Exact (ip, port) first, then any contact from the
-                        // same IP we queried (NAT port rewrite).
-                        s.tried.get(&(ip, port)).copied().or_else(|| {
-                            s.tried.iter()
-                                .find(|((tip, _), _)| *tip == ip)
-                                .map(|(_, id)| *id)
+                let sender_id = sender_ip_port
+                    .and_then(|(ip, port)| {
+                        state.search_manager.active.get(&sid).and_then(|s| {
+                            // Exact (ip, port) first, then any contact from the
+                            // same IP we queried (NAT port rewrite).
+                            s.tried.get(&(ip, port)).copied().or_else(|| {
+                                s.tried
+                                    .iter()
+                                    .find(|((tip, _), _)| *tip == ip)
+                                    .map(|(_, id)| *id)
+                            })
                         })
                     })
-                }).or_else(|| {
-                    sender_ip_port.and_then(|(ip, port)| {
-                        state.routing_table.all_contacts()
-                            .find(|c| c.ip == ip && c.udp_port == port)
-                            .map(|c| c.id)
-                    })
-                });
+                    .or_else(|| {
+                        sender_ip_port.and_then(|(ip, port)| {
+                            state
+                                .routing_table
+                                .all_contacts()
+                                .find(|c| c.ip == ip && c.udp_port == port)
+                                .map(|c| c.id)
+                        })
+                    });
 
                 if let (Some(search), Some(sender_id)) =
                     (state.search_manager.get_mut(&sid), sender_id)
@@ -16908,7 +17460,8 @@ async fn handle_udp_packet_inner(
                     };
                     *subnet_counts.entry(sender_subnet).or_insert(0) += 1;
 
-                    let safe_contacts: Vec<KadContact> = contacts.iter()
+                    let safe_contacts: Vec<KadContact> = contacts
+                        .iter()
                         .filter(|c| {
                             // eMule: reject Kad1 contacts (version <= 1)
                             if !c.is_kad2() {
@@ -16918,8 +17471,7 @@ async fn handle_udp_packet_inner(
                             if c.udp_port == 53 && c.version <= KADEMLIA_VERSION5_48A {
                                 return false;
                             }
-                            if state.ip_filter.is_blocked(c.ip)
-                                || state.banned_ips.contains(&c.ip)
+                            if state.ip_filter.is_blocked(c.ip) || state.banned_ips.contains(&c.ip)
                             {
                                 return false;
                             }
@@ -16938,7 +17490,10 @@ async fn handle_udp_packet_inner(
                                 let count = subnet_counts.entry(subnet).or_insert(0);
                                 *count += 1;
                                 if *count > 2 {
-                                    debug!("KadRes: >2 contacts from subnet {}.{}.{}.0, ignoring {}", o[0], o[1], o[2], c.ip);
+                                    debug!(
+                                        "KadRes: >2 contacts from subnet {}.{}.{}.0, ignoring {}",
+                                        o[0], o[1], o[2], c.ip
+                                    );
                                     return false;
                                 }
                             }
@@ -16946,7 +17501,13 @@ async fn handle_udp_packet_inner(
                         })
                         .cloned()
                         .collect();
-                    debug!("  Search {}: processing {} contacts from {} ({} filtered)", sid.0, safe_contacts.len(), sender_id, contacts.len() - safe_contacts.len());
+                    debug!(
+                        "  Search {}: processing {} contacts from {} ({} filtered)",
+                        sid.0,
+                        safe_contacts.len(),
+                        sender_id,
+                        contacts.len() - safe_contacts.len()
+                    );
                     search.handle_response(&sender_id, safe_contacts.clone());
 
                     // eMule behavior: for FindBuddy searches, send FindBuddyReq
@@ -16966,9 +17527,7 @@ async fn handle_udp_packet_inner(
                         };
                         if let Ok(packet) = messages::encode_packet(&msg) {
                             state.flood_protection.track_request(from, 0x51);
-                            let _ = send_kad_packet(
-                                socket, &packet, from, state, &sender_id,
-                            ).await;
+                            let _ = send_kad_packet(socket, &packet, from, state, &sender_id).await;
                         }
                     }
 
@@ -16986,7 +17545,9 @@ async fn handle_udp_packet_inner(
         } => {
             debug!(
                 "SearchRes from {} for target {}: {} entries",
-                from, target, results.len()
+                from,
+                target,
+                results.len()
             );
             // Log first few entries with their tag details for debugging
             for (i, entry) in results.iter().take(3).enumerate() {
@@ -17007,7 +17568,12 @@ async fn handle_udp_packet_inner(
                 }
                 debug!(
                     "  Entry[{}]: hash={}, tags={}, TAG_SOURCES={}, has_name={}, src_ip={}",
-                    i, hex::encode(raw_md4), entry.tags.len(), sources_val, has_name, src_ip
+                    i,
+                    hex::encode(raw_md4),
+                    entry.tags.len(),
+                    sources_val,
+                    has_name,
+                    src_ip
                 );
             }
 
@@ -17018,7 +17584,10 @@ async fn handle_udp_packet_inner(
             };
 
             let owning_sid: Option<SearchId> = sender_ip_port.and_then(|(ip, port)| {
-                state.search_manager.active.iter()
+                state
+                    .search_manager
+                    .active
+                    .iter()
                     .filter(|(_, s)| s.target == target && !s.completed)
                     .find(|(_, s)| s.tried.contains_key(&(ip, port)))
                     .map(|(id, _)| *id)
@@ -17034,7 +17603,10 @@ async fn handle_udp_packet_inner(
                 // an unsolicited peer poison the result set.
                 sender_ip_port
                     .and_then(|(ip, _)| {
-                        state.search_manager.active.iter()
+                        state
+                            .search_manager
+                            .active
+                            .iter()
                             .filter(|(_, s)| s.target == target && !s.completed)
                             .find(|(_, s)| s.tried.keys().any(|(tip, _)| *tip == ip))
                             .map(|(id, _)| *id)
@@ -17048,23 +17620,28 @@ async fn handle_udp_packet_inner(
             }
 
             for sid in search_ids {
-                let resolved_sender_id = sender_ip_port.and_then(|(ip, port)| {
-                    state.search_manager.active.get(&sid).and_then(|s| {
-                        // Exact (ip, port) first, then any contact from the
-                        // same IP we queried (NAT port rewrite).
-                        s.tried.get(&(ip, port)).copied().or_else(|| {
-                            s.tried.iter()
-                                .find(|((tip, _), _)| *tip == ip)
-                                .map(|(_, id)| *id)
+                let resolved_sender_id = sender_ip_port
+                    .and_then(|(ip, port)| {
+                        state.search_manager.active.get(&sid).and_then(|s| {
+                            // Exact (ip, port) first, then any contact from the
+                            // same IP we queried (NAT port rewrite).
+                            s.tried.get(&(ip, port)).copied().or_else(|| {
+                                s.tried
+                                    .iter()
+                                    .find(|((tip, _), _)| *tip == ip)
+                                    .map(|(_, id)| *id)
+                            })
                         })
                     })
-                }).or_else(|| {
-                    sender_ip_port.and_then(|(ip, port)| {
-                        state.routing_table.all_contacts()
-                            .find(|c| c.ip == ip && c.udp_port == port)
-                            .map(|c| c.id)
-                    })
-                });
+                    .or_else(|| {
+                        sender_ip_port.and_then(|(ip, port)| {
+                            state
+                                .routing_table
+                                .all_contacts()
+                                .find(|c| c.ip == ip && c.udp_port == port)
+                                .map(|c| c.id)
+                        })
+                    });
 
                 if let (Some(search), Some(resolved_sender_id)) =
                     (state.search_manager.get_mut(&sid), resolved_sender_id)
@@ -17080,7 +17657,10 @@ async fn handle_udp_packet_inner(
                         search.results.iter().map(|r| &r.id).collect();
                     debug!(
                         "  Search {} now has {} raw / {} unique results (phase={:?})",
-                        sid.0, search.results.len(), unique.len(), search.phase
+                        sid.0,
+                        search.results.len(),
+                        unique.len(),
+                        search.phase
                     );
                 } else {
                     debug!("Ignoring SearchRes from {from}: sender could not be resolved from queried contacts");
@@ -17107,63 +17687,66 @@ async fn handle_udp_packet_inner(
             // was acknowledged even if we can't identify the exact peer,
             // which is what the counter is really measuring. Without
             // this, many networks silently show `0 confirmed` forever.
-            let matched_key: Option<(KadId, SocketAddr)> = if state.publish_pending.contains_key(&(target, from)) {
-                Some((target, from))
-            } else {
-                let from_ip = from.ip();
-                state
-                    .publish_pending
-                    .keys()
-                    .find(|(t, a)| *t == target && a.ip() == from_ip)
-                    .copied()
-                    .or_else(|| {
-                        state
-                            .publish_pending
-                            .keys()
-                            .find(|(t, _)| *t == target)
-                            .copied()
-                    })
-            };
-            if let Some(key) = matched_key {
-                state.publish_pending.remove(&key);
+            let matched_key: Option<(KadId, SocketAddr)> =
+                if state.publish_pending.contains_key(&(target, from)) {
+                    Some((target, from))
+                } else {
+                    let from_ip = from.ip();
+                    state
+                        .publish_pending
+                        .keys()
+                        .find(|(t, a)| *t == target && a.ip() == from_ip)
+                        .copied()
+                        .or_else(|| {
+                            state
+                                .publish_pending
+                                .keys()
+                                .find(|(t, _)| *t == target)
+                                .copied()
+                        })
+                };
+            let matched_pending = matched_key.and_then(|key| {
+                let mut remove_entry = false;
+                let matched = state.publish_pending.get_mut(&key).map(|pending| {
+                    if pending.3 > 1 {
+                        pending.3 -= 1;
+                    } else {
+                        remove_entry = true;
+                    }
+                    (key, pending.0, pending.2)
+                });
+                if remove_entry {
+                    state.publish_pending.remove(&key);
+                }
+                matched
+            });
+            if let Some((key, publish_file_hash, is_source_publish)) = matched_pending {
                 state.publish_confirmed += 1;
                 debug!(
                     "Publish confirmed for {target} from {from} (orig_key={:?}, load={load}, total_confirmed={})",
                     key, state.publish_confirmed
                 );
+                if is_source_publish {
+                    if let Some(count) = state.source_publish_acks.get_mut(&publish_file_hash) {
+                        *count = count.saturating_add(1);
+                    }
+                } else {
+                    state
+                        .publish_manager
+                        .record_keyword_publish_load(&target, load);
+                }
             } else {
                 state.publish_res_unmatched = state.publish_res_unmatched.saturating_add(1);
                 debug!(
                     "PublishRes from {from} for {target} matched no pending entry (load={load})"
                 );
             }
-            // Count this ack toward the file's "complete sources" estimate.
-            // `target` for a source publish equals the file hash, so presence
-            // in `source_publish_acks` both identifies source-publish acks and
-            // filters out keyword-publish acks (whose target is a keyword hash).
-            if let Some(count) = state.source_publish_acks.get_mut(&target) {
-                *count = count.saturating_add(1);
-                // K15: use the reported load to adapt source republish
-                // frequency for this file hash. High load = back off.
-                state.publish_manager.record_source_publish_load(&target, load);
-            } else {
-                // K15: keyword publish path. The target is a keyword hash,
-                // not a file hash, so we route the feedback through the
-                // keyword-search → file mapping we keep in
-                // store_keyword_searches.
-                if let Some((file, _)) = state.store_keyword_searches
-                    .values()
-                    .find(|(_, entries)| entries.iter().any(|(kw, _)| *kw == target))
-                {
-                    state
-                        .publish_manager
-                        .record_keyword_publish_load(&file.file_hash, load);
-                }
-            }
             // KAD v9+: acknowledge the PublishRes
             let ack = KadMessage::PublishResAck;
             if let Ok(packet) = messages::encode_packet(&ack) {
-                let _ = send_kad_response(socket, &packet, from, state, None, packet_sender_udp_key).await;
+                let _ =
+                    send_kad_response(socket, &packet, from, state, None, packet_sender_udp_key)
+                        .await;
             }
             if load >= 100 {
                 if let std::net::IpAddr::V4(ipv4) = from.ip() {
@@ -17177,9 +17760,13 @@ async fn handle_udp_packet_inner(
         }
 
         KadMessage::Ping => {
-            let pong = KadMessage::Pong { udp_port: from.port() };
+            let pong = KadMessage::Pong {
+                udp_port: from.port(),
+            };
             if let Ok(packet) = messages::encode_packet(&pong) {
-                let _ = send_kad_response(socket, &packet, from, state, None, packet_sender_udp_key).await;
+                let _ =
+                    send_kad_response(socket, &packet, from, state, None, packet_sender_udp_key)
+                        .await;
             }
         }
 
@@ -17204,7 +17791,9 @@ async fn handle_udp_packet_inner(
             // eMule's own check before accepting an identity claim.
             if packet_valid_receiver_key {
                 if let std::net::IpAddr::V4(v4) = from.ip() {
-                    let contact_id = state.routing_table.all_contacts()
+                    let contact_id = state
+                        .routing_table
+                        .all_contacts()
                         .find(|c| c.ip == v4 && c.udp_port == from.port())
                         .map(|c| c.id);
                     if let Some(contact) = contact_id {
@@ -17223,7 +17812,11 @@ async fn handle_udp_packet_inner(
             }
         }
 
-        KadMessage::SearchKeyReq { target, start_position, search_terms } => {
+        KadMessage::SearchKeyReq {
+            target,
+            start_position,
+            search_terms,
+        } => {
             let search_expr = if search_terms.is_empty() {
                 None
             } else {
@@ -17248,9 +17841,9 @@ async fn handle_udp_packet_inner(
                         break;
                     }
                     let file_keywords = kad::publish::extract_keywords(&file.name);
-                    let matches_keyword = file_keywords.iter().any(|kw| {
-                        kad::publish::keyword_to_kad_id(kw) == target
-                    });
+                    let matches_keyword = file_keywords
+                        .iter()
+                        .any(|kw| kad::publish::keyword_to_kad_id(kw) == target);
                     if !matches_keyword {
                         continue;
                     }
@@ -17264,11 +17857,28 @@ async fn handle_udp_packet_inner(
                         results.push(kad::messages::SearchResultEntry {
                             id: kad_hash,
                             tags: vec![
-                                KadTag { name: TagName::Id(TAG_FILENAME), value: TagValue::String(file.name.clone()) },
-                                KadTag { name: TagName::Id(TAG_FILESIZE), value: TagValue::Uint64(file.size) },
-                                KadTag { name: TagName::Id(TAG_FILETYPE), value: TagValue::String(crate::search::index::infer_file_type(&file.extension)) },
-                                KadTag { name: TagName::Id(TAG_SOURCES), value: TagValue::Uint32(1) },
-                                KadTag { name: TagName::Id(TAG_COMPLETE_SOURCES), value: TagValue::Uint32(file.complete_sources.max(1)) },
+                                KadTag {
+                                    name: TagName::Id(TAG_FILENAME),
+                                    value: TagValue::String(file.name.clone()),
+                                },
+                                KadTag {
+                                    name: TagName::Id(TAG_FILESIZE),
+                                    value: TagValue::Uint64(file.size),
+                                },
+                                KadTag {
+                                    name: TagName::Id(TAG_FILETYPE),
+                                    value: TagValue::String(crate::search::index::infer_file_type(
+                                        &file.extension,
+                                    )),
+                                },
+                                KadTag {
+                                    name: TagName::Id(TAG_SOURCES),
+                                    value: TagValue::Uint32(1),
+                                },
+                                KadTag {
+                                    name: TagName::Id(TAG_COMPLETE_SOURCES),
+                                    value: TagValue::Uint32(file.complete_sources.max(1)),
+                                },
                             ],
                         });
                     }
@@ -17276,7 +17886,11 @@ async fn handle_udp_packet_inner(
             }
             let start = (start_position & 0x7FFF) as usize;
             let end = results.len().min(start + 200);
-            let page = if start < results.len() { results[start..end].to_vec() } else { Vec::new() };
+            let page = if start < results.len() {
+                results[start..end].to_vec()
+            } else {
+                Vec::new()
+            };
 
             if !page.is_empty() {
                 send_kad_search_results(
@@ -17287,18 +17901,29 @@ async fn handle_udp_packet_inner(
                     target,
                     &page,
                     packet_sender_udp_key,
-                ).await;
+                )
+                .await;
             }
         }
 
-        KadMessage::SearchSourceReq { target, start_position, file_size } => {
-            let results = state.dht_store.search_sources(&target)
+        KadMessage::SearchSourceReq {
+            target,
+            start_position,
+            file_size,
+        } => {
+            let results = state
+                .dht_store
+                .search_sources(&target)
                 .into_iter()
                 .filter(|entry| matches_requested_file_size(entry, file_size))
                 .collect::<Vec<_>>();
             let start = (start_position & 0x7FFF) as usize;
             let end = results.len().min(start + 200);
-            let page = if start < results.len() { results[start..end].to_vec() } else { Vec::new() };
+            let page = if start < results.len() {
+                results[start..end].to_vec()
+            } else {
+                Vec::new()
+            };
 
             // eMule behavior: do not send SearchRes when there are no results.
             if !page.is_empty() {
@@ -17310,7 +17935,8 @@ async fn handle_udp_packet_inner(
                     target,
                     &page,
                     packet_sender_udp_key,
-                ).await;
+                )
+                .await;
             }
         }
 
@@ -17322,7 +17948,15 @@ async fn handle_udp_packet_inner(
                 // with load=100 so they mark us "done" and move on.
                 let res = KadMessage::PublishRes { target, load: 100 };
                 if let Ok(packet) = messages::encode_packet(&res) {
-                    let _ = send_kad_response(socket, &packet, from, state, None, packet_sender_udp_key).await;
+                    let _ = send_kad_response(
+                        socket,
+                        &packet,
+                        from,
+                        state,
+                        None,
+                        packet_sender_udp_key,
+                    )
+                    .await;
                 }
                 return;
             }
@@ -17330,7 +17964,15 @@ async fn handle_udp_packet_inner(
                 debug!("PublishKeyReq for {target} rejected - outside tolerance zone");
                 let res = KadMessage::PublishRes { target, load: 100 };
                 if let Ok(packet) = messages::encode_packet(&res) {
-                    let _ = send_kad_response(socket, &packet, from, state, None, packet_sender_udp_key).await;
+                    let _ = send_kad_response(
+                        socket,
+                        &packet,
+                        from,
+                        state,
+                        None,
+                        packet_sender_udp_key,
+                    )
+                    .await;
                 }
             } else {
                 // Identify the sender by IP:port from the routing table
@@ -17339,32 +17981,58 @@ async fn handle_udp_packet_inner(
                         std::net::IpAddr::V4(v4) => v4,
                         _ => Ipv4Addr::UNSPECIFIED,
                     };
-                    state.routing_table.all_contacts()
+                    state
+                        .routing_table
+                        .all_contacts()
                         .find(|c| c.ip == v4 && c.udp_port == from.port())
                         .map(|c| c.id)
                         .unwrap_or_else(|| {
                             let mut id = KadId::zero();
                             let octets = v4.octets();
-                            id.0[0] = octets[0]; id.0[1] = octets[1];
-                            id.0[2] = octets[2]; id.0[3] = octets[3];
+                            id.0[0] = octets[0];
+                            id.0[1] = octets[1];
+                            id.0[2] = octets[2];
+                            id.0[3] = octets[3];
                             id
                         })
                 };
-                let load = state.dht_store.store_keyword_entries(&target, entries, &sender_kad_id);
+                let load = state
+                    .dht_store
+                    .store_keyword_entries(&target, entries, &sender_kad_id);
                 let res = KadMessage::PublishRes { target, load };
                 if let Ok(packet) = messages::encode_packet(&res) {
-                    let _ = send_kad_response(socket, &packet, from, state, Some(&sender_kad_id), packet_sender_udp_key).await;
+                    let _ = send_kad_response(
+                        socket,
+                        &packet,
+                        from,
+                        state,
+                        Some(&sender_kad_id),
+                        packet_sender_udp_key,
+                    )
+                    .await;
                 }
             }
         }
 
-        KadMessage::PublishSourceReq { target, sender_id, tags } => {
+        KadMessage::PublishSourceReq {
+            target,
+            sender_id,
+            tags,
+        } => {
             if state.udp_firewalled {
                 // K14: see PublishKeyReq for the rationale; also emit a
                 // reject PublishRes so the publisher stops retrying us.
                 let res = KadMessage::PublishRes { target, load: 100 };
                 if let Ok(packet) = messages::encode_packet(&res) {
-                    let _ = send_kad_response(socket, &packet, from, state, Some(&sender_id), packet_sender_udp_key).await;
+                    let _ = send_kad_response(
+                        socket,
+                        &packet,
+                        from,
+                        state,
+                        Some(&sender_id),
+                        packet_sender_udp_key,
+                    )
+                    .await;
                 }
                 return;
             }
@@ -17378,7 +18046,15 @@ async fn handle_udp_packet_inner(
                 debug!("PublishSourceReq for {target} rejected - outside tolerance zone");
                 let res = KadMessage::PublishRes { target, load: 100 };
                 if let Ok(packet) = messages::encode_packet(&res) {
-                    let _ = send_kad_response(socket, &packet, from, state, Some(&verified_sender_id), packet_sender_udp_key).await;
+                    let _ = send_kad_response(
+                        socket,
+                        &packet,
+                        from,
+                        state,
+                        Some(&verified_sender_id),
+                        packet_sender_udp_key,
+                    )
+                    .await;
                 }
             } else {
                 let sender_ip = match from.ip() {
@@ -17386,21 +18062,45 @@ async fn handle_udp_packet_inner(
                     _ => return,
                 };
                 let load = state.dht_store.store_source_entry(
-                    &target, verified_sender_id, tags, sender_ip, from.port(),
+                    &target,
+                    verified_sender_id,
+                    tags,
+                    sender_ip,
+                    from.port(),
                 );
                 let res = KadMessage::PublishRes { target, load };
                 if let Ok(packet) = messages::encode_packet(&res) {
-                    let _ = send_kad_response(socket, &packet, from, state, Some(&verified_sender_id), packet_sender_udp_key).await;
+                    let _ = send_kad_response(
+                        socket,
+                        &packet,
+                        from,
+                        state,
+                        Some(&verified_sender_id),
+                        packet_sender_udp_key,
+                    )
+                    .await;
                 }
             }
         }
 
-        KadMessage::PublishNotesReq { target, sender_id, ref tags } => {
+        KadMessage::PublishNotesReq {
+            target,
+            sender_id,
+            ref tags,
+        } => {
             if state.udp_firewalled {
                 // K14: emit a reject PublishRes so the publisher stops.
                 let res = KadMessage::PublishRes { target, load: 100 };
                 if let Ok(packet) = messages::encode_packet(&res) {
-                    let _ = send_kad_response(socket, &packet, from, state, Some(&sender_id), packet_sender_udp_key).await;
+                    let _ = send_kad_response(
+                        socket,
+                        &packet,
+                        from,
+                        state,
+                        Some(&sender_id),
+                        packet_sender_udp_key,
+                    )
+                    .await;
                 }
                 return;
             }
@@ -17412,7 +18112,15 @@ async fn handle_udp_packet_inner(
             if !state.dht_store.is_within_tolerance(&target) {
                 let res = KadMessage::PublishRes { target, load: 100 };
                 if let Ok(packet) = messages::encode_packet(&res) {
-                    let _ = send_kad_response(socket, &packet, from, state, Some(&verified_sender_id), packet_sender_udp_key).await;
+                    let _ = send_kad_response(
+                        socket,
+                        &packet,
+                        from,
+                        state,
+                        Some(&verified_sender_id),
+                        packet_sender_udp_key,
+                    )
+                    .await;
                 }
                 return;
             }
@@ -17437,19 +18145,42 @@ async fn handle_udp_packet_inner(
                 let hash_hex = target.to_hex();
                 let peer_name = verified_sender_id.to_hex()[..8].to_string();
                 use ed2k::comments::rating_name;
-                debug!("Received peer note for {}: rating={} ({})", hash_hex, note_rating, rating_name(note_rating));
-                state.comment_manager.write().await.add_peer_comment(&hash_hex, peer_name, note_rating, note_comment, 1);
+                debug!(
+                    "Received peer note for {}: rating={} ({})",
+                    hash_hex,
+                    note_rating,
+                    rating_name(note_rating)
+                );
+                state.comment_manager.write().await.add_peer_comment(
+                    &hash_hex,
+                    peer_name,
+                    note_rating,
+                    note_comment,
+                    1,
+                );
             }
             let tags_owned = tags.clone();
-            let load = state.dht_store.store_notes_entry(&target, verified_sender_id, tags_owned);
+            let load = state
+                .dht_store
+                .store_notes_entry(&target, verified_sender_id, tags_owned);
             let res = KadMessage::PublishRes { target, load };
             if let Ok(packet) = messages::encode_packet(&res) {
-                let _ = send_kad_response(socket, &packet, from, state, Some(&verified_sender_id), packet_sender_udp_key).await;
+                let _ = send_kad_response(
+                    socket,
+                    &packet,
+                    from,
+                    state,
+                    Some(&verified_sender_id),
+                    packet_sender_udp_key,
+                )
+                .await;
             }
         }
 
         KadMessage::SearchNotesReq { target, file_size } => {
-            let results = state.dht_store.search_notes(&target)
+            let results = state
+                .dht_store
+                .search_notes(&target)
                 .into_iter()
                 .filter(|entry| matches_requested_file_size(entry, file_size))
                 .collect::<Vec<_>>();
@@ -17463,7 +18194,8 @@ async fn handle_udp_packet_inner(
                     target,
                     &results,
                     packet_sender_udp_key,
-                ).await;
+                )
+                .await;
             }
         }
 
@@ -17475,7 +18207,9 @@ async fn handle_udp_packet_inner(
             );
         }
 
-        KadMessage::FirewalledReq { tcp_port: peer_tcp_port } => {
+        KadMessage::FirewalledReq {
+            tcp_port: peer_tcp_port,
+        } => {
             // Return the requester's external IP as we see it
             let peer_ip = match from.ip() {
                 std::net::IpAddr::V4(v4) => v4,
@@ -17484,7 +18218,9 @@ async fn handle_udp_packet_inner(
             let ip_raw = u32::from_be_bytes(peer_ip.octets());
             let res = KadMessage::FirewalledRes { ip: ip_raw };
             if let Ok(packet) = messages::encode_packet(&res) {
-                let _ = send_kad_response(socket, &packet, from, state, None, packet_sender_udp_key).await;
+                let _ =
+                    send_kad_response(socket, &packet, from, state, None, packet_sender_udp_key)
+                        .await;
             }
 
             // K18: per-IP cooldown for the (expensive) TCP connect-back.
@@ -17542,7 +18278,8 @@ async fn handle_udp_packet_inner(
                                 pkt.push(ed2k::messages::OP_KAD_FWTCPCHECK_ACK);
                                 pkt
                             };
-                            let _ = tokio::io::AsyncWriteExt::write_all(&mut writer, &ack_packet).await;
+                            let _ =
+                                tokio::io::AsyncWriteExt::write_all(&mut writer, &ack_packet).await;
                             let _ = tokio::io::AsyncWriteExt::flush(&mut writer).await;
                         }
                         _ => debug!("Peer {tcp_addr} is NOT reachable on TCP"),
@@ -17580,7 +18317,9 @@ async fn handle_udp_packet_inner(
             }
             // K7: pass the reporter IP so the firewall checker can count
             // distinct /24 networks instead of raw vote counts.
-            state.firewall_checker.handle_firewalled_response(external_ip, sender_ip);
+            state
+                .firewall_checker
+                .handle_firewalled_response(external_ip, sender_ip);
 
             // K8: only write state.external_ip once the firewall checker
             // has confirmed it (≥3 distinct /24 voters). The prior
@@ -17604,12 +18343,17 @@ async fn handle_udp_packet_inner(
                 }
             }
 
-            if prev_ip.is_none() && state.external_ip.is_some() && state.nat_info.nat_type == ember::nat::NatType::Unknown {
+            if prev_ip.is_none()
+                && state.external_ip.is_some()
+                && state.nat_info.nat_type == ember::nat::NatType::Unknown
+            {
                 info!("External IP discovered via KAD — running initial NAT probe");
                 state.nat_info = match tokio::time::timeout(
                     ember::nat::PROBE_NAT_OVERALL_TIMEOUT,
                     ember::nat::probe_nat(socket),
-                ).await {
+                )
+                .await
+                {
                     Ok(info) => info,
                     Err(_) => {
                         tracing::warn!(
@@ -17628,10 +18372,10 @@ async fn handle_udp_packet_inner(
                 // `Unknown`). Mirrors the same fallback already in the
                 // server-HighID branch above.
                 if let Some(ext_ip) = state.external_ip {
-                    if state.nat_info.apply_highid_fallback(
-                        std::net::IpAddr::V4(ext_ip),
-                        state.udp_port,
-                    ) {
+                    if state
+                        .nat_info
+                        .apply_highid_fallback(std::net::IpAddr::V4(ext_ip), state.udp_port)
+                    {
                         info!(
                             "NAT probe failed but KAD confirmed external IP {} — assuming PortRestricted (mapped {}:{})",
                             ext_ip, ext_ip, state.udp_port,
@@ -17643,23 +18387,32 @@ async fn handle_udp_packet_inner(
             if state.external_ip.is_some() {
                 let tcp_status = state.firewall_checker.tcp_status();
                 let udp_status = state.firewall_checker.udp_status();
-                let _ = app_handle.emit("firewall-status", serde_json::json!({
-                    "firewalled": state.firewalled,
-                    "external_ip": state.stats.external_ip,
-                    "tcp_status": format!("{:?}", tcp_status),
-                    "udp_status": format!("{:?}", udp_status),
-                }));
+                let _ = app_handle.emit(
+                    "firewall-status",
+                    serde_json::json!({
+                        "firewalled": state.firewalled,
+                        "external_ip": state.stats.external_ip,
+                        "tcp_status": format!("{:?}", tcp_status),
+                        "udp_status": format!("{:?}", udp_status),
+                    }),
+                );
             }
         }
 
-        KadMessage::Firewalled2Req { tcp_port: peer_tcp_port, user_hash, connect_options } => {
+        KadMessage::Firewalled2Req {
+            tcp_port: peer_tcp_port,
+            user_hash,
+            connect_options,
+        } => {
             let ip_raw = match from.ip() {
                 std::net::IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
                 _ => return,
             };
             let res = KadMessage::FirewalledRes { ip: ip_raw };
             if let Ok(packet) = messages::encode_packet(&res) {
-                let _ = send_kad_response(socket, &packet, from, state, None, packet_sender_udp_key).await;
+                let _ =
+                    send_kad_response(socket, &packet, from, state, None, packet_sender_udp_key)
+                        .await;
             }
             if peer_tcp_port > 0 {
                 let peer_ip = match from.ip() {
@@ -17677,7 +18430,8 @@ async fn handle_udp_packet_inner(
                     let connect_result = tokio::time::timeout(
                         std::time::Duration::from_secs(5),
                         tokio::net::TcpStream::connect(tcp_addr),
-                    ).await;
+                    )
+                    .await;
                     match connect_result {
                         Ok(Ok(stream)) => {
                             debug!("Peer {tcp_addr} is reachable on TCP (Firewalled2)");
@@ -17692,10 +18446,20 @@ async fn handle_udp_packet_inner(
                                 pkt
                             };
                             let write_res = if allow_obf && user_hash != [0u8; 16] {
-                                match ed2k::tcp_obfuscation::negotiate_outgoing(&mut reader, &mut writer, &user_hash).await {
+                                match ed2k::tcp_obfuscation::negotiate_outgoing(
+                                    &mut reader,
+                                    &mut writer,
+                                    &user_hash,
+                                )
+                                .await
+                                {
                                     Ok((recv_key, send_key)) => {
-                                        let _obf_reader = tokio::io::BufReader::new(ed2k::tcp_obfuscation::Rc4Reader::new(reader, recv_key));
-                                        let mut obf_writer = tokio::io::BufWriter::new(ed2k::tcp_obfuscation::Rc4Writer::new(writer, send_key));
+                                        let _obf_reader = tokio::io::BufReader::new(
+                                            ed2k::tcp_obfuscation::Rc4Reader::new(reader, recv_key),
+                                        );
+                                        let mut obf_writer = tokio::io::BufWriter::new(
+                                            ed2k::tcp_obfuscation::Rc4Writer::new(writer, send_key),
+                                        );
                                         match obf_writer.write_all(&ack_packet).await {
                                             Ok(()) => obf_writer.flush().await,
                                             Err(e) => Err(e),
@@ -17708,18 +18472,24 @@ async fn handle_udp_packet_inner(
                                         match tokio::time::timeout(
                                             std::time::Duration::from_secs(5),
                                             tokio::net::TcpStream::connect(tcp_addr),
-                                        ).await {
+                                        )
+                                        .await
+                                        {
                                             Ok(Ok(plain_stream)) => {
-                                                let mut pw = tokio::io::BufWriter::new(plain_stream);
+                                                let mut pw =
+                                                    tokio::io::BufWriter::new(plain_stream);
                                                 match pw.write_all(&ack_packet).await {
                                                     Ok(()) => pw.flush().await,
                                                     Err(e) => Err(e),
                                                 }
                                             }
                                             Ok(Err(e)) => Err(e),
-                                            Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "plain fallback connect timeout")),
+                                            Err(_) => Err(std::io::Error::new(
+                                                std::io::ErrorKind::TimedOut,
+                                                "plain fallback connect timeout",
+                                            )),
                                         }
-                                    },
+                                    }
                                 }
                             } else {
                                 match writer.write_all(&ack_packet).await {
@@ -17739,7 +18509,10 @@ async fn handle_udp_packet_inner(
             }
         }
 
-        KadMessage::FirewallUdp { error_code, udp_port } => {
+        KadMessage::FirewallUdp {
+            error_code,
+            udp_port,
+        } => {
             debug!("FirewallUdp from {from}: error={error_code}, port={udp_port}");
             let sender_ip = match from.ip() {
                 std::net::IpAddr::V4(v4) => v4,
@@ -17755,9 +18528,7 @@ async fn handle_udp_packet_inner(
                 .external_udp_port()
                 .or(state.external_udp_port)
                 .unwrap_or(0);
-            if udp_port == 0
-                || (udp_port != expected_internal && udp_port != expected_external)
-            {
+            if udp_port == 0 || (udp_port != expected_internal && udp_port != expected_external) {
                 warn!(
                     "Ignoring FirewallUdp from {from}: unexpected incoming port {} (internal={}, external={})",
                     udp_port, expected_internal, expected_external
@@ -17781,16 +18552,21 @@ async fn handle_udp_packet_inner(
                 }
                 state.stats.tcp_status = format!("{:?}", state.firewall_checker.tcp_status());
                 state.stats.udp_status = format!("{:?}", state.firewall_checker.udp_status());
-                let _ = app_handle.emit("firewall-status", serde_json::json!({
-                    "firewalled": state.firewalled,
-                    "external_ip": state.stats.external_ip,
-                    "tcp_status": state.stats.tcp_status,
-                    "udp_status": state.stats.udp_status,
-                }));
+                let _ = app_handle.emit(
+                    "firewall-status",
+                    serde_json::json!({
+                        "firewalled": state.firewalled,
+                        "external_ip": state.stats.external_ip,
+                        "tcp_status": state.stats.tcp_status,
+                        "udp_status": state.stats.udp_status,
+                    }),
+                );
                 if !was_already_verified {
                     info!("UDP firewall test passed - UDP port {udp_port} is reachable, not UDP-firewalled");
                 } else {
-                    debug!("UDP firewall test: additional confirmation on port {udp_port} from {from}");
+                    debug!(
+                        "UDP firewall test: additional confirmation on port {udp_port} from {from}"
+                    );
                 }
             } else {
                 state.firewall_checker.handle_udp_firewall_result(false);
@@ -17798,9 +18574,17 @@ async fn handle_udp_packet_inner(
             }
         }
 
-        KadMessage::FindBuddyReq { buddy_id, user_id, tcp_port: peer_tcp_port } => {
+        KadMessage::FindBuddyReq {
+            buddy_id,
+            user_id,
+            tcp_port: peer_tcp_port,
+        } => {
             debug!("FindBuddyReq from {from}: buddy_id={buddy_id}, user_id={user_id}");
-            if !state.firewalled && !state.udp_firewalled && state.udp_fw_verified && !state.buddy_manager.is_serving() {
+            if !state.firewalled
+                && !state.udp_firewalled
+                && state.udp_fw_verified
+                && !state.buddy_manager.is_serving()
+            {
                 let res = KadMessage::FindBuddyRes {
                     buddy_id,
                     user_hash: state.user_hash,
@@ -17808,17 +18592,36 @@ async fn handle_udp_packet_inner(
                     connect_options: build_kad_connect_options(state),
                 };
                 if let Ok(packet) = messages::encode_packet(&res) {
-                    let _ = send_kad_response(socket, &packet, from, state, None, packet_sender_udp_key).await;
+                    let _ = send_kad_response(
+                        socket,
+                        &packet,
+                        from,
+                        state,
+                        None,
+                        packet_sender_udp_key,
+                    )
+                    .await;
                 }
-                info!("Offered to be buddy for {user_id} (tcp_port={})", peer_tcp_port);
+                info!(
+                    "Offered to be buddy for {user_id} (tcp_port={})",
+                    peer_tcp_port
+                );
 
                 // Register this user's hash so the upload listener recognizes the incoming
                 // buddy TCP connection (the firewalled client will connect to us).
-                state.buddy_manager.register_pending_buddy(cuint128_swap(&user_id.0), buddy_id).await;
+                state
+                    .buddy_manager
+                    .register_pending_buddy(cuint128_swap(&user_id.0), buddy_id)
+                    .await;
             }
         }
 
-        KadMessage::FindBuddyRes { buddy_id, user_hash, tcp_port: peer_tcp_port, connect_options } => {
+        KadMessage::FindBuddyRes {
+            buddy_id,
+            user_hash,
+            tcp_port: peer_tcp_port,
+            connect_options,
+        } => {
             info!("FindBuddyRes from {from}: buddy_id={buddy_id}, tcp_port={peer_tcp_port}, connect_options=0x{connect_options:02X}");
             let search_expected_target = state
                 .search_manager
@@ -17864,22 +18667,31 @@ async fn handle_udp_packet_inner(
                     state.pending_buddy_hashes.clone(),
                 );
                 state.pending_outgoing_buddy = Some(tokio::spawn(async move {
-                    match mgr_clone.handle_findbuddy_response(
-                        buddy_id,
-                        buddy_ip,
-                        peer_tcp_port,
-                        user_hash,
-                        connect_options,
-                        allow_obfuscation,
-                    ).await {
-                        Some((rx, writer, reader_handle)) => Some((buddy_id, buddy_ip, peer_tcp_port, rx, writer, reader_handle)),
+                    match mgr_clone
+                        .handle_findbuddy_response(
+                            buddy_id,
+                            buddy_ip,
+                            peer_tcp_port,
+                            user_hash,
+                            connect_options,
+                            allow_obfuscation,
+                        )
+                        .await
+                    {
+                        Some((rx, writer, reader_handle)) => {
+                            Some((buddy_id, buddy_ip, peer_tcp_port, rx, writer, reader_handle))
+                        }
                         None => None,
                     }
                 }));
             }
         }
 
-        KadMessage::CallbackReq { buddy_id, file_id, tcp_port: peer_tcp_port } => {
+        KadMessage::CallbackReq {
+            buddy_id,
+            file_id,
+            tcp_port: peer_tcp_port,
+        } => {
             debug!("CallbackReq from {from}: buddy_id={buddy_id}, file_id={file_id}");
             // eMule Process_KADEMLIA_CALLBACK_REQ relays whenever we have a
             // serving buddy client; it does not verify the check token
@@ -17889,9 +18701,10 @@ async fn handle_udp_packet_inner(
                     std::net::IpAddr::V4(v4) => v4,
                     _ => return,
                 };
-                let relayed = state.buddy_manager.send_callback_relay(
-                    &buddy_id, client_ip, peer_tcp_port, file_id.0,
-                ).await;
+                let relayed = state
+                    .buddy_manager
+                    .send_callback_relay(&buddy_id, client_ip, peer_tcp_port, file_id.0)
+                    .await;
                 if relayed {
                     debug!("Callback relayed via OP_CALLBACK to buddy");
                 } else {
@@ -17908,7 +18721,6 @@ async fn handle_udp_packet_inner(
             // Match eMule behavior: silently ignore deprecated Kad1 opcodes.
             debug!("Ignoring deprecated Kad1 opcode 0x{opcode:02X} from {from}");
         }
-
     }
 }
 
@@ -18018,7 +18830,13 @@ async fn handle_command_inner(
     upload_queue: &ed2k::upload::UploadQueueRef,
 ) {
     match cmd {
-        NetworkCommand::SearchFiles { query, method, request_id, tx, search_filters } => {
+        NetworkCommand::SearchFiles {
+            query,
+            method,
+            request_id,
+            tx,
+            search_filters,
+        } => {
             if let Some(active) = state.active_search_request.take() {
                 if active.request_id != request_id {
                     cancel_search_request(state, app_handle, active.request_id);
@@ -18043,10 +18861,7 @@ async fn handle_command_inner(
                 if let Some(tx) = tx.take() {
                     let _ = tx.send(local_results.take().unwrap_or_default());
                 }
-                let _ = app_handle.emit(
-                    "search-complete",
-                    SearchCompleteEvent { request_id },
-                );
+                let _ = app_handle.emit("search-complete", SearchCompleteEvent { request_id });
                 return;
             }
             active_request.keywords = keywords.clone();
@@ -18060,17 +18875,20 @@ async fn handle_command_inner(
             let kad_file_type = search_filters.as_ref().and_then(|f| f.file_type.clone());
             let search_constraints = kad::messages::SearchConstraints {
                 file_type: kad_file_type.as_deref(),
-                file_extension: search_filters.as_ref().and_then(|f| f.file_extension.as_deref()),
+                file_extension: search_filters
+                    .as_ref()
+                    .and_then(|f| f.file_extension.as_deref()),
                 min_size: search_filters.as_ref().and_then(|f| f.min_size),
                 max_size: search_filters.as_ref().and_then(|f| f.max_size),
                 min_availability: search_filters.as_ref().and_then(|f| f.min_availability),
             };
-            let search_expr = kad::messages::build_search_expression(&keywords, &search_constraints);
+            let search_expr =
+                kad::messages::build_search_expression(&keywords, &search_constraints);
 
             // --- TCP server search ---
             let run_server = matches!(method, SearchMethod::Global | SearchMethod::Server);
-            let run_udp    = matches!(method, SearchMethod::Global);
-            let run_kad    = matches!(method, SearchMethod::Global | SearchMethod::Kad);
+            let run_udp = matches!(method, SearchMethod::Global);
+            let run_kad = matches!(method, SearchMethod::Global | SearchMethod::Kad);
 
             if run_server && state.server_connected {
                 if let Some(mut conn) = state.server_connection.take() {
@@ -18098,7 +18916,9 @@ async fn handle_command_inner(
                 let servers = state.server_list.servers();
                 let mut dropped = 0usize;
                 for server in servers {
-                    if let Some(pkt) = ServerUdpSocket::build_global_search_packet(server, &search_expr) {
+                    if let Some(pkt) =
+                        ServerUdpSocket::build_global_search_packet(server, &search_expr)
+                    {
                         if state.udp_search_queue.len() >= MAX_UDP_SEARCH_QUEUE {
                             dropped = dropped.saturating_add(1);
                             continue;
@@ -18115,7 +18935,10 @@ async fn handle_command_inner(
                 if !state.udp_search_queue.is_empty() {
                     active_request.udp_pending = true;
                     state.server_udp_search_age = 0;
-                    info!("UDP global search queued for {} servers", state.udp_search_queue.len());
+                    info!(
+                        "UDP global search queued for {} servers",
+                        state.udp_search_queue.len()
+                    );
                 }
             }
 
@@ -18128,7 +18951,11 @@ async fn handle_command_inner(
                     break 'kad false;
                 };
                 let keyword_hash = kad::publish::keyword_to_kad_id(primary_keyword);
-                info!("Searching KAD ({} keywords) -> hash {}", keywords.len(), keyword_hash);
+                info!(
+                    "Searching KAD ({} keywords) -> hash {}",
+                    keywords.len(),
+                    keyword_hash
+                );
 
                 let closest = state
                     .routing_table
@@ -18139,7 +18966,11 @@ async fn handle_command_inner(
                     break 'kad false;
                 }
 
-                stats_manager.add_overhead(crate::storage::statistics::OverheadCategory::Kad, crate::storage::statistics::OverheadDirection::Upload, 64);
+                stats_manager.add_overhead(
+                    crate::storage::statistics::OverheadCategory::Kad,
+                    crate::storage::statistics::OverheadDirection::Upload,
+                    64,
+                );
                 let sid = state.search_manager.start_search(
                     keyword_hash,
                     SearchType::FindKeyword,
@@ -18158,14 +18989,17 @@ async fn handle_command_inner(
                     tracing::error!("KAD search: tx already consumed");
                     break 'kad false;
                 };
-                state.pending_keyword_searches.insert(sid, PendingKeywordSearch {
-                    tx: search_tx,
-                    local_results: local_results.take().unwrap_or_default(),
-                    keywords,
-                    request_id,
-                    last_streamed_count: 0,
-                    file_type_filter,
-                });
+                state.pending_keyword_searches.insert(
+                    sid,
+                    PendingKeywordSearch {
+                        tx: search_tx,
+                        local_results: local_results.take().unwrap_or_default(),
+                        keywords,
+                        request_id,
+                        last_streamed_count: 0,
+                        file_type_filter,
+                    },
+                );
                 true
             };
 
@@ -18174,10 +19008,7 @@ async fn handle_command_inner(
                     let _ = tx.send(local_results.take().unwrap_or_default());
                 }
                 if !active_request.server_pending && !active_request.udp_pending {
-                    let _ = app_handle.emit(
-                        "search-complete",
-                        SearchCompleteEvent { request_id },
-                    );
+                    let _ = app_handle.emit("search-complete", SearchCompleteEvent { request_id });
                     return;
                 }
             }
@@ -18190,21 +19021,28 @@ async fn handle_command_inner(
             info!("Cancelled search request {}", request_id);
         }
 
-        NetworkCommand::CancelDownload { transfer_id, cleanup_ack } => {
+        NetworkCommand::CancelDownload {
+            transfer_id,
+            cleanup_ack,
+        } => {
             // eMule: CPartFile::DeletePartFile -> StopFile -> PauseFile ->
             //   CSearchManager::StopSearch(GetKadFileSearchID(), true)
             // Remove from pending_downloads so no new searches are started
             let removed_pending = state.pending_downloads.remove(&transfer_id);
 
             // Find and stop all active KAD source searches for this transfer
-            let search_ids: Vec<SearchId> = state.download_source_searches.iter()
+            let search_ids: Vec<SearchId> = state
+                .download_source_searches
+                .iter()
                 .filter(|(_, (tid, _))| tid == &transfer_id)
                 .map(|(sid, _)| *sid)
                 .collect();
             for sid in &search_ids {
                 state.download_source_searches.remove(sid);
                 if let Some(removed) = state.search_manager.remove(sid) {
-                    state.routing_table.release_contacts_in_use(&removed.in_use_ids);
+                    state
+                        .routing_table
+                        .release_contacts_in_use(&removed.in_use_ids);
                 }
             }
 
@@ -18223,7 +19061,9 @@ async fn handle_command_inner(
                     // Stop path: preserve .part.met for resume
                     if let Ok(reg) = state.tracker_registry.lock() {
                         if let Some(tracker) = reg.get(&transfer_id) {
-                            if let Ok(t) = tracker.try_read() { t.save(); }
+                            if let Ok(t) = tracker.try_read() {
+                                t.save();
+                            }
                         }
                     }
                 }
@@ -18240,11 +19080,15 @@ async fn handle_command_inner(
             }
 
             // Remove partial download from KAD source publish
-            let cancel_hash = removed_pending.as_ref().map(|p| p.file_hash.clone())
+            let cancel_hash = removed_pending
+                .as_ref()
+                .map(|p| p.file_hash.clone())
                 .or_else(|| {
                     // Not in pending — check transfer_manager for file hash
                     // (use try_read to avoid blocking the event loop)
-                    transfer_manager.try_read().ok()
+                    transfer_manager
+                        .try_read()
+                        .ok()
                         .and_then(|mgr| mgr.get_transfer(&transfer_id).map(|t| t.file_hash.clone()))
                 });
             if let Some(fh) = cancel_hash {
@@ -18294,7 +19138,9 @@ async fn handle_command_inner(
             if let Some(handle) = state.download_handles.remove(&transfer_id) {
                 if let Ok(reg) = state.tracker_registry.lock() {
                     if let Some(tracker) = reg.get(&transfer_id) {
-                        if let Ok(t) = tracker.try_read() { t.save(); }
+                        if let Ok(t) = tracker.try_read() {
+                            t.save();
+                        }
                     }
                 }
                 handle.abort();
@@ -18331,7 +19177,9 @@ async fn handle_command_inner(
             // `try_start_pending_download_from_known_sources` guards against
             // starting them until resumed. (L4: earlier comment wrongly
             // said paused downloads are "removed from pending_downloads".)
-            let in_flight = state.download_source_searches.values()
+            let in_flight = state
+                .download_source_searches
+                .values()
                 .filter(|(tid, _)| tid == &transfer_id)
                 .count();
 
@@ -18393,7 +19241,8 @@ async fn handle_command_inner(
                 }
                 let mut validated_extras: Vec<(Ipv4Addr, u16, String)> =
                     Vec::with_capacity(extra_sources.len().min(MAX_SEED_EXTRA_SOURCES));
-                for (extra_ip_str, extra_port) in extra_sources.iter().take(MAX_SEED_EXTRA_SOURCES) {
+                for (extra_ip_str, extra_port) in extra_sources.iter().take(MAX_SEED_EXTRA_SOURCES)
+                {
                     if extra_ip_str.is_empty() || *extra_port == 0 {
                         continue;
                     }
@@ -18423,10 +19272,14 @@ async fn handle_command_inner(
                     let sm = source_manager.read().await;
                     let uh = if let std::net::IpAddr::V4(v4) = source_addr.ip() {
                         sm.get_user_hash(&hash_bytes, v4, source_addr.port())
-                    } else { None };
+                    } else {
+                        None
+                    };
                     let co = if let std::net::IpAddr::V4(v4) = source_addr.ip() {
                         sm.get_connect_options(&hash_bytes, v4, source_addr.port())
-                    } else { None };
+                    } else {
+                        None
+                    };
                     let mut sources = Vec::with_capacity(1 + validated_extras.len());
                     sources.push(DownloadSource {
                         peer_ip: peer_ip.clone(),
@@ -18465,7 +19318,9 @@ async fn handle_command_inner(
                 }
                 let (src_inject_tx, src_inject_rx) = mpsc::channel::<DownloadSource>(32);
                 let (est_inject_tx, est_inject_rx) =
-                    mpsc::channel::<ed2k::multi_source::EstablishedSource>(ESTABLISHED_SOURCE_CHANNEL_CAP);
+                    mpsc::channel::<ed2k::multi_source::EstablishedSource>(
+                        ESTABLISHED_SOURCE_CHANNEL_CAP,
+                    );
                 let ms_download = MultiSourceDownload {
                     // Clone instead of move so the outer `transfer_id`
                     // survives for the source-discovery dispatch below.
@@ -18489,11 +19344,11 @@ async fn handle_command_inner(
                     server_addr: state.server_addr,
                     new_source_rx: Some(src_inject_rx),
                     new_established_rx: Some(est_inject_rx),
-                        ed2k_limits: settings.ed2k_download_limits(),
-                        ember_hash,
-                        ed25519_public_key: ed25519_pubkey,
-                        ed25519_secret_key,
-                        friend_hashes: Some(friend_hashes.clone()),
+                    ed2k_limits: settings.ed2k_download_limits(),
+                    ember_hash,
+                    ed25519_public_key: ed25519_pubkey,
+                    ed25519_secret_key,
+                    friend_hashes: Some(friend_hashes.clone()),
                     ember_payload: shared_ember_payload.clone(),
                     ember_payload_generation: ember_payload_generation.clone(),
                     ip_filter: Some(state.shared_ip_filter.clone()),
@@ -18508,8 +19363,12 @@ async fn handle_command_inner(
                 let tx = dl_event_tx.clone();
                 let tid = ms_download.transfer_id.clone();
                 let tid2 = tid.clone();
-                state.active_source_senders.insert(tid.clone(), src_inject_tx);
-                state.active_established_senders.insert(tid.clone(), est_inject_tx);
+                state
+                    .active_source_senders
+                    .insert(tid.clone(), src_inject_tx);
+                state
+                    .active_established_senders
+                    .insert(tid.clone(), est_inject_tx);
                 let tx2 = tx.clone();
                 if let Some(old_handle) = state.download_handles.remove(&tid2) {
                     warn!("Aborting existing download task for {tid2} before starting new one");
@@ -18519,7 +19378,13 @@ async fn handle_command_inner(
                     if let Err(e) = ms_download.run(tx).await {
                         error!("Multi-source download failed: {e}");
                         let kind = classify_error(&e.to_string());
-                        let _ = tx2.send(DownloadEvent::Failed { transfer_id: tid, error: e.to_string(), failure_kind: kind }).await;
+                        let _ = tx2
+                            .send(DownloadEvent::Failed {
+                                transfer_id: tid,
+                                error: e.to_string(),
+                                failure_kind: kind,
+                            })
+                            .await;
                     }
                 });
                 state.download_handles.insert(tid2, handle);
@@ -18594,10 +19459,7 @@ async fn handle_command_inner(
                 // soon as KAD is available again.
                 state.active_kad_search_state.insert(
                     transfer_id.clone(),
-                    (
-                        now_ts,
-                        if initial_kad_search_started { 1 } else { 0 },
-                    ),
+                    (now_ts, if initial_kad_search_started { 1 } else { 0 }),
                 );
 
                 // Immediate TCP `OP_GETSOURCES` to the connected eD2K
@@ -18605,10 +19467,7 @@ async fn handle_command_inner(
                 // 4-minute batch.
                 if state.server_connected {
                     if let Some(conn) = state.server_connection.as_mut() {
-                        if let Ok(bytes) = conn
-                            .send_get_sources(&hash_bytes, file_size)
-                            .await
-                        {
+                        if let Ok(bytes) = conn.send_get_sources(&hash_bytes, file_size).await {
                             if bytes > 0 {
                                 stats_manager.add_overhead(
                                     crate::storage::statistics::OverheadCategory::SourceExchange,
@@ -18630,14 +19489,10 @@ async fn handle_command_inner(
                 // UDP fan-out to every eligible known server, paced via
                 // `udp_source_queue` so we don't burst-send on add.
                 {
-                    let packets = build_all_getsources_packets(
-                        &state,
-                        &hash_bytes,
-                        file_size,
-                    );
+                    let packets = build_all_getsources_packets(&state, &hash_bytes, file_size);
                     if !packets.is_empty() {
-                        let room = MAX_UDP_SOURCE_QUEUE
-                            .saturating_sub(state.udp_source_queue.len());
+                        let room =
+                            MAX_UDP_SOURCE_QUEUE.saturating_sub(state.udp_source_queue.len());
                         debug!(
                             "Queuing {}/{} UDP source requests for new active download {}",
                             packets.len().min(room),
@@ -18661,7 +19516,9 @@ async fn handle_command_inner(
                 };
                 let kad_hash = md4_bytes_to_kad_id(&hash_bytes);
 
-                let mut closest = state.routing_table.find_closest_prefer_verified(&kad_hash, SEARCH_INITIAL_CONTACTS);
+                let mut closest = state
+                    .routing_table
+                    .find_closest_prefer_verified(&kad_hash, SEARCH_INITIAL_CONTACTS);
                 if closest.is_empty() {
                     warn!("No routing table contacts for source search, download will retry later");
                 }
@@ -18735,13 +19592,25 @@ async fn handle_command_inner(
                     if sid != SearchId(0) {
                         let mut fh = [0u8; 16];
                         fh.copy_from_slice(&hash_bytes[..16]);
-                        state.download_source_searches.insert(sid, (transfer_id.clone(), fh));
-                        stats_manager.add_overhead(crate::storage::statistics::OverheadCategory::FileRequest, crate::storage::statistics::OverheadDirection::Upload, 48);
-                        info!("Started source search {} for download {}", sid.0, transfer_id);
-                        let _ = app_handle.emit("transfer:source-search", serde_json::json!({
-                            "transfer_id": &transfer_id,
-                            "kind": "kad_search",
-                        }));
+                        state
+                            .download_source_searches
+                            .insert(sid, (transfer_id.clone(), fh));
+                        stats_manager.add_overhead(
+                            crate::storage::statistics::OverheadCategory::FileRequest,
+                            crate::storage::statistics::OverheadDirection::Upload,
+                            48,
+                        );
+                        info!(
+                            "Started source search {} for download {}",
+                            sid.0, transfer_id
+                        );
+                        let _ = app_handle.emit(
+                            "transfer:source-search",
+                            serde_json::json!({
+                                "transfer_id": &transfer_id,
+                                "kind": "kad_search",
+                            }),
+                        );
                         true
                     } else {
                         false
@@ -18758,16 +19627,19 @@ async fn handle_command_inner(
                         .map(|t| priority_str_to_u32(&t.priority))
                         .unwrap_or(1)
                 };
-                state.pending_downloads.insert(transfer_id.clone(), PendingDownload {
-                    transfer_id: transfer_id.clone(),
-                    file_hash: file_hash.clone(),
-                    file_name,
-                    file_size,
-                    control,
-                    search_count: if kad_search_started { 1 } else { 0 },
-                    last_search_at: if kad_search_started { now } else { 0 },
-                    priority: pending_priority,
-                });
+                state.pending_downloads.insert(
+                    transfer_id.clone(),
+                    PendingDownload {
+                        transfer_id: transfer_id.clone(),
+                        file_hash: file_hash.clone(),
+                        file_name,
+                        file_size,
+                        control,
+                        search_count: if kad_search_started { 1 } else { 0 },
+                        last_search_at: if kad_search_started { now } else { 0 },
+                        priority: pending_priority,
+                    },
+                );
 
                 // Request sources from the connected ed2k server (non-blocking)
                 if state.server_connected {
@@ -18781,10 +19653,13 @@ async fn handle_command_inner(
                                     crate::storage::statistics::OverheadDirection::Upload,
                                     bytes,
                                 );
-                                let _ = app_handle.emit("transfer:source-search", serde_json::json!({
-                                    "transfer_id": &transfer_id,
-                                    "kind": "server_query",
-                                }));
+                                let _ = app_handle.emit(
+                                    "transfer:source-search",
+                                    serde_json::json!({
+                                        "transfer_id": &transfer_id,
+                                        "kind": "server_query",
+                                    }),
+                                );
                             }
                         }
                     }
@@ -18794,15 +19669,18 @@ async fn handle_command_inner(
                 {
                     let mut file_hash_arr = [0u8; 16];
                     file_hash_arr.copy_from_slice(&hash_bytes);
-                    let packets = build_all_getsources_packets(
-                        &state,
-                        &file_hash_arr,
-                        file_size,
-                    );
+                    let packets = build_all_getsources_packets(&state, &file_hash_arr, file_size);
                     if !packets.is_empty() {
-                        let room = MAX_UDP_SOURCE_QUEUE.saturating_sub(state.udp_source_queue.len());
-                        debug!("Queuing {}/{} UDP source requests for new download", packets.len().min(room), packets.len());
-                        state.udp_source_queue.extend(packets.into_iter().take(room));
+                        let room =
+                            MAX_UDP_SOURCE_QUEUE.saturating_sub(state.udp_source_queue.len());
+                        debug!(
+                            "Queuing {}/{} UDP source requests for new download",
+                            packets.len().min(room),
+                            packets.len()
+                        );
+                        state
+                            .udp_source_queue
+                            .extend(packets.into_iter().take(room));
                     }
                 }
             }
@@ -18815,6 +19693,15 @@ async fn handle_command_inner(
                         file_size,
                         file_type: crate::search::index::infer_file_type(&publish_ext),
                         complete_sources: 0,
+                        keyword_publishable: false,
+                        last_source_publish: {
+                            let mut raw = [0u8; 16];
+                            raw.copy_from_slice(&hb[..16]);
+                            known_files
+                                .find_by_hash(&raw)
+                                .map(|r| r.last_publish_src as i64)
+                                .unwrap_or(0)
+                        },
                     });
                     info!("Published partial download to KAD source publish");
                 }
@@ -18823,9 +19710,13 @@ async fn handle_command_inner(
 
         NetworkCommand::AnnounceFiles { files } => {
             for file in files {
-                if !file.shared { continue; }
+                if !file.shared {
+                    continue;
+                }
                 if let Ok(raw_bytes) = hex::decode(&file.hash) {
-                    if raw_bytes.len() != 16 { continue; }
+                    if raw_bytes.len() != 16 {
+                        continue;
+                    }
                     let kad_hash = md4_bytes_to_kad_id(&raw_bytes);
                     let publishable = PublishableFile {
                         file_hash: kad_hash,
@@ -18833,6 +19724,15 @@ async fn handle_command_inner(
                         file_size: file.size,
                         file_type: crate::search::index::infer_file_type(&file.extension),
                         complete_sources: file.complete_sources,
+                        keyword_publishable: true,
+                        last_source_publish: {
+                            let mut raw = [0u8; 16];
+                            raw.copy_from_slice(&raw_bytes);
+                            known_files
+                                .find_by_hash(&raw)
+                                .map(|r| r.last_publish_src as i64)
+                                .unwrap_or(0)
+                        },
                     };
                     state.publish_manager.add_file(publishable);
                 }
@@ -18849,7 +19749,10 @@ async fn handle_command_inner(
                 return;
             };
             if raw_bytes.len() != 16 {
-                warn!("RepublishFile: expected 16-byte MD4 hash, got {}", raw_bytes.len());
+                warn!(
+                    "RepublishFile: expected 16-byte MD4 hash, got {}",
+                    raw_bytes.len()
+                );
                 return;
             }
             let kad_hash = md4_bytes_to_kad_id(&raw_bytes);
@@ -18861,7 +19764,11 @@ async fn handle_command_inner(
             );
         }
 
-        NetworkCommand::PublishNote { file_hash, rating, comment } => {
+        NetworkCommand::PublishNote {
+            file_hash,
+            rating,
+            comment,
+        } => {
             let closest = state
                 .routing_table
                 .find_closest_prefer_verified(&file_hash, SEARCH_INITIAL_CONTACTS);
@@ -18871,18 +19778,21 @@ async fn handle_command_inner(
                 return;
             }
 
-            let sid = state.search_manager.start_search(
-                file_hash,
-                SearchType::StoreNotes,
-                closest,
-            );
+            let sid = state
+                .search_manager
+                .start_search(file_hash, SearchType::StoreNotes, closest);
             if sid == SearchId(0) {
                 warn!("Failed to start StoreNotes search: too many active searches");
             } else {
-                state.pending_note_publishes.insert(sid, (file_hash, rating, comment.clone()));
+                state
+                    .pending_note_publishes
+                    .insert(sid, (file_hash, rating, comment.clone()));
                 info!(
                     "Started StoreNotes search {} for file {} (rating={}, comment_len={})",
-                    sid.0, file_hash, rating, comment.len()
+                    sid.0,
+                    file_hash,
+                    rating,
+                    comment.len()
                 );
                 // Remember this note so it gets re-published every ~24h (DHT
                 // note entries expire), and persist it so republishing
@@ -18894,9 +19804,15 @@ async fn handle_command_inner(
                     let now_ts = chrono::Utc::now().timestamp();
                     state.published_notes.insert(
                         file_hash,
-                        PublishedNote { rating, comment: comment.clone(), last_publish: now_ts },
+                        PublishedNote {
+                            rating,
+                            comment: comment.clone(),
+                            last_publish: now_ts,
+                        },
                     );
-                    if let Err(e) = db.save_published_note(&file_hash.to_hex(), rating, &comment, now_ts) {
+                    if let Err(e) =
+                        db.save_published_note(&file_hash.to_hex(), rating, &comment, now_ts)
+                    {
                         warn!("Failed to persist published note for republish: {e}");
                     }
                 }
@@ -19004,7 +19920,6 @@ async fn handle_command_inner(
             info!("Unbanned peer {peer_id_hex}");
         }
 
-
         NetworkCommand::GetPeersSnapshot { tx } => {
             let _ = tx.send(peers_snapshot(state, db).await);
         }
@@ -19032,7 +19947,11 @@ async fn handle_command_inner(
             let _ = tx.send(diag);
         }
 
-        NetworkCommand::SendEmberPing { addr, peer_pubkey, tx } => {
+        NetworkCommand::SendEmberPing {
+            addr,
+            peer_pubkey,
+            tx,
+        } => {
             // Feature gate: refuse here so the harness gets a clear
             // "feature off" string instead of a silent timeout.
             if !settings.ember_native_enabled {
@@ -19090,8 +20009,7 @@ async fn handle_command_inner(
             // third party watching the wire).
             let nonce: u64 = rand::random();
 
-            let payload =
-                ember::transport::EmberControlMessage::Ping { nonce }.encode();
+            let payload = ember::transport::EmberControlMessage::Ping { nonce }.encode();
 
             match state
                 .ember_transport
@@ -19134,7 +20052,8 @@ async fn handle_command_inner(
                 local_index,
                 friend_hashes,
                 geoip,
-            ).await;
+            )
+            .await;
             let _ = tx.send(snap);
         }
 
@@ -19173,7 +20092,9 @@ async fn handle_command_inner(
             let sid = crate::network::kad::search::SearchId(id);
             if let Some(removed) = state.search_manager.remove(&sid) {
                 if !removed.in_use_ids.is_empty() {
-                    state.routing_table.release_contacts_in_use(&removed.in_use_ids);
+                    state
+                        .routing_table
+                        .release_contacts_in_use(&removed.in_use_ids);
                 }
                 info!("KAD search {id} cancelled by user");
             } else {
@@ -19190,7 +20111,11 @@ async fn handle_command_inner(
             let _ = tx.send(online);
         }
 
-        NetworkCommand::FindNotes { file_hash, file_size, tx } => {
+        NetworkCommand::FindNotes {
+            file_hash,
+            file_size,
+            tx,
+        } => {
             let closest = state
                 .routing_table
                 .find_closest_prefer_verified(&file_hash, SEARCH_INITIAL_CONTACTS);
@@ -19212,7 +20137,11 @@ async fn handle_command_inner(
             state.pending_notes_searches.insert(sid, tx);
         }
 
-        NetworkCommand::FindSources { file_hash, file_size, tx } => {
+        NetworkCommand::FindSources {
+            file_hash,
+            file_size,
+            tx,
+        } => {
             let closest = state
                 .routing_table
                 .find_closest_prefer_verified(&file_hash, SEARCH_INITIAL_CONTACTS);
@@ -19243,8 +20172,7 @@ async fn handle_command_inner(
             let table_size = state.routing_table.len();
             info!(
                 "Injected {} bootstrap contacts, routing table now has {} entries",
-                count,
-                table_size
+                count, table_size
             );
 
             // eMule: GetBootstrapContacts returns at most 20 contacts.
@@ -19273,7 +20201,9 @@ async fn handle_command_inner(
             }
             // Load from the (now updated) default path
             state.ip_filter.load_from_file(&default_path);
-            state.ip_filter.update_shared_snapshot(&state.shared_ip_filter);
+            state
+                .ip_filter
+                .update_shared_snapshot(&state.shared_ip_filter);
             info!(
                 "Reloaded IP filter: {} ranges",
                 state.ip_filter.range_count(),
@@ -19293,18 +20223,33 @@ async fn handle_command_inner(
             let _ = tx.send(state.ip_filter.get_stats());
         }
 
-        NetworkCommand::AddIpRange { start_ip, end_ip, description } => {
-            if let (Ok(start), Ok(end)) = (start_ip.parse::<Ipv4Addr>(), end_ip.parse::<Ipv4Addr>()) {
+        NetworkCommand::AddIpRange {
+            start_ip,
+            end_ip,
+            description,
+        } => {
+            if let (Ok(start), Ok(end)) = (start_ip.parse::<Ipv4Addr>(), end_ip.parse::<Ipv4Addr>())
+            {
                 state.ip_filter.add_range(start, end, description);
-                state.ip_filter.update_shared_snapshot(&state.shared_ip_filter);
-                info!("Added IP filter range {start_ip} - {end_ip}, total ranges: {}", state.ip_filter.range_count());
+                state
+                    .ip_filter
+                    .update_shared_snapshot(&state.shared_ip_filter);
+                info!(
+                    "Added IP filter range {start_ip} - {end_ip}, total ranges: {}",
+                    state.ip_filter.range_count()
+                );
             }
         }
 
         NetworkCommand::RemoveIpRange { start_ip, end_ip } => {
             if state.ip_filter.remove_range(&start_ip, &end_ip) {
-                state.ip_filter.update_shared_snapshot(&state.shared_ip_filter);
-                info!("Removed IP filter range {start_ip} - {end_ip}, total ranges: {}", state.ip_filter.range_count());
+                state
+                    .ip_filter
+                    .update_shared_snapshot(&state.shared_ip_filter);
+                info!(
+                    "Removed IP filter range {start_ip} - {end_ip}, total ranges: {}",
+                    state.ip_filter.range_count()
+                );
             }
         }
 
@@ -19322,22 +20267,31 @@ async fn handle_command_inner(
                 let default_path = state.data_dir.join("ipfilter.dat");
                 if default_path.exists() {
                     let n = state.ip_filter.load_from_file(&default_path);
-                    info!("Loaded {n} IP filter entries on enable ({} ranges after merge)", state.ip_filter.range_count());
+                    info!(
+                        "Loaded {n} IP filter entries on enable ({} ranges after merge)",
+                        state.ip_filter.range_count()
+                    );
                 }
             }
-            state.ip_filter.update_shared_snapshot(&state.shared_ip_filter);
+            state
+                .ip_filter
+                .update_shared_snapshot(&state.shared_ip_filter);
             info!("IP filter enabled: {enabled}");
         }
 
         NetworkCommand::SetBlockPrivateIps { block_private } => {
             state.ip_filter.set_block_private(block_private);
-            state.ip_filter.update_shared_snapshot(&state.shared_ip_filter);
+            state
+                .ip_filter
+                .update_shared_snapshot(&state.shared_ip_filter);
             info!("Block private IPs: {block_private}");
         }
 
         NetworkCommand::KadConnect => {
             info!("KAD connect requested");
-            state.upload_disconnected.store(false, std::sync::atomic::Ordering::Relaxed);
+            state
+                .upload_disconnected
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             state.stats.status = NetworkStatus::Connecting;
             state.self_lookup_done = false;
             state.last_self_lookup = 0;
@@ -19385,7 +20339,10 @@ async fn handle_command_inner(
                         let _ = socket.send_to(&packet, addr).await;
                     }
                 }
-                info!("Bootstrapped from {} default contacts", default_contacts.len());
+                info!(
+                    "Bootstrapped from {} default contacts",
+                    default_contacts.len()
+                );
             } else {
                 for contact in contacts.iter().take(20) {
                     let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
@@ -19395,7 +20352,10 @@ async fn handle_command_inner(
                         let _ = socket.send_to(&packet, addr).await;
                     }
                 }
-                info!("Sent bootstrap requests to {} existing contacts", contacts.len().min(20));
+                info!(
+                    "Sent bootstrap requests to {} existing contacts",
+                    contacts.len().min(20)
+                );
             }
 
             // Firewall check is deferred to the periodic bootstrap_timer recheck,
@@ -19413,12 +20373,21 @@ async fn handle_command_inner(
             if let Err(e) = bootstrap::save_nodes_dat(&nodes_path, &contacts) {
                 error!("Failed to save nodes.dat on disconnect: {e}");
             } else {
-                info!("Saved {} contacts to nodes.dat on disconnect", contacts.len());
+                info!(
+                    "Saved {} contacts to nodes.dat on disconnect",
+                    contacts.len()
+                );
             }
 
             // Stop all searches and cancel pending oneshot channels
             state.search_manager = SearchManager::new();
-            for (_, PendingKeywordSearch { tx, local_results, .. }) in state.pending_keyword_searches.drain() {
+            for (
+                _,
+                PendingKeywordSearch {
+                    tx, local_results, ..
+                },
+            ) in state.pending_keyword_searches.drain()
+            {
                 let _ = tx.send(local_results);
             }
             for (_, tx) in state.pending_source_searches.drain() {
@@ -19440,7 +20409,9 @@ async fn handle_command_inner(
             set_external_ip(state, None);
             state.external_udp_port = None;
             state.firewalled = true;
-            state.firewalled_shared.store(true, std::sync::atomic::Ordering::Relaxed);
+            state
+                .firewalled_shared
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             state.firewall_checks_sent = 0;
             state.firewall_checker = FirewallChecker::new();
             state.self_lookup_done = false;
@@ -19464,9 +20435,12 @@ async fn handle_command_inner(
             state.rendezvous_last_register = None;
             // Emit offline for all previously-online friends
             for eh in state.online_friends.keys() {
-                let _ = app_handle.emit("ember:friend-offline", serde_json::json!({
-                    "user_hash": hex::encode(eh),
-                }));
+                let _ = app_handle.emit(
+                    "ember:friend-offline",
+                    serde_json::json!({
+                        "user_hash": hex::encode(eh),
+                    }),
+                );
             }
             state.online_friends.clear();
             state.outbound_session_tasks.clear();
@@ -19530,8 +20504,13 @@ async fn handle_command_inner(
             // restarted when the network is reconnected.
             {
                 let mut mgr = transfer_manager.write().await;
-                let active_tids: Vec<String> = mgr.get_all().iter()
-                    .filter(|t| t.status == TransferStatus::Active && t.direction == TransferDirection::Download)
+                let active_tids: Vec<String> = mgr
+                    .get_all()
+                    .iter()
+                    .filter(|t| {
+                        t.status == TransferStatus::Active
+                            && t.direction == TransferDirection::Download
+                    })
                     .map(|t| t.id.clone())
                     .collect();
                 for tid in &active_tids {
@@ -19543,31 +20522,39 @@ async fn handle_command_inner(
                         mgr.register_control(tid, control.clone());
                         mgr.update_sources(tid, t.sources, 0, 0);
                         mgr.update_status(tid, TransferStatus::Searching);
-                        state.pending_downloads.insert(tid.clone(), PendingDownload {
-                            transfer_id: tid.clone(),
-                            file_hash: t.file_hash.clone(),
-                            file_name: t.file_name.clone(),
-                            file_size: t.total_size,
-                            control,
-                            search_count: 0,
-                            last_search_at: 0,
-                            priority: priority_str_to_u32(&t.priority),
-                        });
+                        state.pending_downloads.insert(
+                            tid.clone(),
+                            PendingDownload {
+                                transfer_id: tid.clone(),
+                                file_hash: t.file_hash.clone(),
+                                file_name: t.file_name.clone(),
+                                file_size: t.total_size,
+                                control,
+                                search_count: 0,
+                                last_search_at: 0,
+                                priority: priority_str_to_u32(&t.priority),
+                            },
+                        );
                         if let Some(pfs) = state.per_file_sources.get_mut(tid) {
                             pfs.reset_active_states();
                         }
-                        let _ = app_handle.emit("transfer-status", serde_json::json!({
-                            "id": tid,
-                            "status": "searching",
-                            "sources": t.sources,
-                        }));
+                        let _ = app_handle.emit(
+                            "transfer-status",
+                            serde_json::json!({
+                                "id": tid,
+                                "status": "searching",
+                                "sources": t.sources,
+                            }),
+                        );
                     }
                 }
             }
 
             // Signal the upload listener to reject new connections and
             // terminate active upload sessions (eMule: all uploads stop on disconnect).
-            state.upload_disconnected.store(true, std::sync::atomic::Ordering::Relaxed);
+            state
+                .upload_disconnected
+                .store(true, std::sync::atomic::Ordering::Relaxed);
 
             state.stats.status = NetworkStatus::Disconnected;
             state.stats.connected_peers = 0;
@@ -19590,7 +20577,8 @@ async fn handle_command_inner(
                     &shared_server_addr,
                     &app_handle,
                     "KAD disconnected",
-                ).await;
+                )
+                .await;
             }
 
             info!("KAD fully disconnected — all activity stopped");
@@ -19660,57 +20648,55 @@ async fn handle_command_inner(
             // `fetch_pinned_get` re-validates the URL and every redirect hop
             // against the private-IP rules, so a malicious redirect can't
             // pivot the bootstrap fetch onto an internal host.
-            let outcome: Result<String, String> =
-                match crate::security::fetch_pinned_get(&url).await {
-                        Ok(resp) => {
-                            if !resp.status().is_success() {
-                                Err(format!(
-                                    "HTTP {} from {}",
-                                    resp.status().as_u16(),
-                                    url
-                                ))
-                            } else {
-                                let download_result: Result<Vec<u8>, String> = {
-                                    use futures::StreamExt;
-                                    let mut body = Vec::new();
-                                    let mut stream = resp.bytes_stream();
-                                    let mut err: Option<String> = None;
-                                    while let Some(chunk) = stream.next().await {
-                                        match chunk {
-                                            Ok(data) => {
-                                                body.extend_from_slice(&data);
-                                                if body.len() > MAX_NODES_BYTES {
-                                                    err = Some(format!(
-                                                        "Response exceeded {} byte cap",
-                                                        MAX_NODES_BYTES
-                                                    ));
-                                                    break;
-                                                }
-                                            }
-                                            Err(e) => {
-                                                err = Some(format!("Download failed: {e}"));
-                                                break;
-                                            }
+            let outcome: Result<String, String> = match crate::security::fetch_pinned_get(&url)
+                .await
+            {
+                Ok(resp) => {
+                    if !resp.status().is_success() {
+                        Err(format!("HTTP {} from {}", resp.status().as_u16(), url))
+                    } else {
+                        let download_result: Result<Vec<u8>, String> = {
+                            use futures::StreamExt;
+                            let mut body = Vec::new();
+                            let mut stream = resp.bytes_stream();
+                            let mut err: Option<String> = None;
+                            while let Some(chunk) = stream.next().await {
+                                match chunk {
+                                    Ok(data) => {
+                                        body.extend_from_slice(&data);
+                                        if body.len() > MAX_NODES_BYTES {
+                                            err = Some(format!(
+                                                "Response exceeded {} byte cap",
+                                                MAX_NODES_BYTES
+                                            ));
+                                            break;
                                         }
                                     }
-                                    if let Some(e) = err { Err(e) } else { Ok(body) }
-                                };
-                                match download_result {
-                                    Ok(bytes) => {
-                                        let tmp_dir = std::env::temp_dir();
-                                        let tmp_path = tmp_dir.join(format!(
-                                            "ember-nodes-{}.dat",
-                                            chrono::Utc::now().timestamp()
-                                        ));
-                                        match tokio::fs::write(&tmp_path, &bytes).await {
-                                            Err(e) => Err(format!(
-                                                "Failed to write temp nodes.dat: {e}"
-                                            )),
-                                            Ok(_) => {
-                                                let parse_res =
-                                                    bootstrap::load_nodes_dat(&tmp_path);
-                                                let _ = tokio::fs::remove_file(&tmp_path).await;
-                                                match parse_res {
+                                    Err(e) => {
+                                        err = Some(format!("Download failed: {e}"));
+                                        break;
+                                    }
+                                }
+                            }
+                            if let Some(e) = err {
+                                Err(e)
+                            } else {
+                                Ok(body)
+                            }
+                        };
+                        match download_result {
+                            Ok(bytes) => {
+                                let tmp_dir = std::env::temp_dir();
+                                let tmp_path = tmp_dir.join(format!(
+                                    "ember-nodes-{}.dat",
+                                    chrono::Utc::now().timestamp()
+                                ));
+                                match tokio::fs::write(&tmp_path, &bytes).await {
+                                    Err(e) => Err(format!("Failed to write temp nodes.dat: {e}")),
+                                    Ok(_) => {
+                                        let parse_res = bootstrap::load_nodes_dat(&tmp_path);
+                                        let _ = tokio::fs::remove_file(&tmp_path).await;
+                                        match parse_res {
                                                     Err(e) => Err(format!(
                                                         "Parsed {} bytes but file is not a valid nodes.dat: {e}",
                                                         bytes.len()
@@ -19755,15 +20741,15 @@ async fn handle_command_inner(
                                                         }
                                                     }
                                                 }
-                                            }
-                                        }
                                     }
-                                    Err(e) => Err(e),
                                 }
                             }
+                            Err(e) => Err(e),
                         }
-                    Err(e) => Err(format!("KAD bootstrap fetch failed: {e}")),
-                };
+                    }
+                }
+                Err(e) => Err(format!("KAD bootstrap fetch failed: {e}")),
+            };
             if let Err(ref e) = outcome {
                 warn!("KAD bootstrap from {url} failed: {e}");
             }
@@ -19813,7 +20799,9 @@ async fn handle_command_inner(
 
             state.firewall_checker.start_check();
             state.external_udp_port = None;
-            if let Ok(mut probes) = firewall_probe_ips.lock() { probes.clear(); }
+            if let Ok(mut probes) = firewall_probe_ips.lock() {
+                probes.clear();
+            }
 
             let contacts: Vec<KadContact> = state
                 .routing_table
@@ -19826,17 +20814,27 @@ async fn handle_command_inner(
             for contact in &contacts {
                 let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                 let (msg, track_opcode) = if contact.version > KADEMLIA_VERSION6_49ABETA {
-                    (KadMessage::Firewalled2Req {
-                        tcp_port: state.tcp_port,
-                        user_hash: state.user_hash,
-                        connect_options: build_kad_connect_options(&state),
-                    }, 0x53u8)
+                    (
+                        KadMessage::Firewalled2Req {
+                            tcp_port: state.tcp_port,
+                            user_hash: state.user_hash,
+                            connect_options: build_kad_connect_options(&state),
+                        },
+                        0x53u8,
+                    )
                 } else {
-                    (KadMessage::FirewalledReq { tcp_port: state.tcp_port }, 0x50u8)
+                    (
+                        KadMessage::FirewalledReq {
+                            tcp_port: state.tcp_port,
+                        },
+                        0x50u8,
+                    )
                 };
                 if let Ok(packet) = messages::encode_packet(&msg) {
                     state.flood_protection.track_request(addr, track_opcode);
-                    if let Ok(mut probes) = firewall_probe_ips.lock() { probes.insert(contact.ip); }
+                    if let Ok(mut probes) = firewall_probe_ips.lock() {
+                        probes.insert(contact.ip);
+                    }
                     let _ = send_kad_packet(socket, &packet, addr, &state, &contact.id).await;
                     state.firewall_checks_sent += 1;
                     state.firewall_checker.record_tcp_request_sent(contact.ip);
@@ -19865,12 +20863,18 @@ async fn handle_command_inner(
             // or falls back to settings.udp_port). Pong handler will also retry.
             dispatch_udp_firewall_probe_requests(state, &settings);
 
-            info!("Sent {} firewall checks and {} ping probes", state.firewall_checks_sent, ping_contacts.len());
-            let _ = tx.send(if state.firewall_checks_sent > 0 || !ping_contacts.is_empty() {
-                Ok((state.firewall_checks_sent as usize) + ping_contacts.len())
-            } else {
-                Err("No verified contacts available for firewall recheck".to_string())
-            });
+            info!(
+                "Sent {} firewall checks and {} ping probes",
+                state.firewall_checks_sent,
+                ping_contacts.len()
+            );
+            let _ = tx.send(
+                if state.firewall_checks_sent > 0 || !ping_contacts.is_empty() {
+                    Ok((state.firewall_checks_sent as usize) + ping_contacts.len())
+                } else {
+                    Err("No verified contacts available for firewall recheck".to_string())
+                },
+            );
         }
 
         NetworkCommand::UpdateSettings { .. } => {
@@ -19891,12 +20895,18 @@ async fn handle_command_inner(
                 state.server_addr = None;
                 *shared_server_addr.write().await = None;
                 state.stats.server_status = "disconnected".to_string();
-                let _ = app_handle.emit("server-status-changed", serde_json::json!({ "status": "disconnected" }));
+                let _ = app_handle.emit(
+                    "server-status-changed",
+                    serde_json::json!({ "status": "disconnected" }),
+                );
             }
             let user_hash = state.user_hash;
             let nickname = settings.nickname.clone();
             let tcp_port = state.tcp_port;
-            let obf_port = state.server_list.servers().iter()
+            let obf_port = state
+                .server_list
+                .servers()
+                .iter()
                 .find(|s| s.ip == ip && s.port == port)
                 .map(|s| s.obfuscation_port_tcp)
                 .unwrap_or(0);
@@ -19910,7 +20920,10 @@ async fn handle_command_inner(
             info!("Connecting to ed2k server {ip}:{port} (background)...");
             emit_server_log(app_handle, &format!("Connecting to {ip}:{port}..."));
             state.stats.server_status = "connecting".to_string();
-            let _ = app_handle.emit("server-status-changed", serde_json::json!({ "status": "connecting" }));
+            let _ = app_handle.emit(
+                "server-status-changed",
+                serde_json::json!({ "status": "connecting" }),
+            );
             state.pending_server_connect = Some(tokio::spawn(async move {
                 let result = async {
                     const MAX_LOGIN_ATTEMPTS: u32 = 3;
@@ -19985,7 +20998,8 @@ async fn handle_command_inner(
             if let Some(conn) = state.server_connection.take() {
                 conn.disconnect().await;
             }
-            handle_server_disconnect(state, shared_server_addr, app_handle, "User disconnected").await;
+            handle_server_disconnect(state, shared_server_addr, app_handle, "User disconnected")
+                .await;
         }
 
         NetworkCommand::AddServer { ip, port, name, tx } => {
@@ -20037,14 +21051,24 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::GetServerListSnapshot { tx } => {
-            let _ = tx.send(state.server_list.servers().iter().map(server_entry_to_info).collect());
+            let _ = tx.send(
+                state
+                    .server_list
+                    .servers()
+                    .iter()
+                    .map(server_entry_to_info)
+                    .collect(),
+            );
         }
 
         NetworkCommand::GetConnectedServerSnapshot { tx } => {
             let _ = tx.send(connected_server_info(state));
         }
 
-        NetworkCommand::SetUploadPriority { file_hash_hex, priority } => {
+        NetworkCommand::SetUploadPriority {
+            file_hash_hex,
+            priority,
+        } => {
             // Push a priority change from the UI directly into the
             // in-memory `KnownFileList` so the upload server's
             // per-request priority lookup sees it without waiting for
@@ -20106,13 +21130,7 @@ async fn handle_command_inner(
                                     r.upload_priority,
                                     r.last_publish_src,
                                 ),
-                                None => (
-                                    f.bytes_transferred,
-                                    f.requests,
-                                    f.accepted,
-                                    0,
-                                    0,
-                                ),
+                                None => (f.bytes_transferred, f.requests, f.accepted, 0, 0),
                             };
                             let part_hashes = existing
                                 .as_ref()
@@ -20145,7 +21163,8 @@ async fn handle_command_inner(
                 }
             }
             let mut seen_hashes = std::collections::HashSet::new();
-            let files: Vec<PublishableFile> = index.all_files()
+            let files: Vec<PublishableFile> = index
+                .all_files()
                 .iter()
                 .filter(|f| f.shared)
                 .filter_map(|f| {
@@ -20153,13 +21172,24 @@ async fn handle_command_inner(
                         return None;
                     }
                     let hash_bytes = hex::decode(&f.hash).ok()?;
-                    if hash_bytes.len() < 16 { return None; }
+                    if hash_bytes.len() < 16 {
+                        return None;
+                    }
                     Some(PublishableFile {
                         file_hash: md4_bytes_to_kad_id(&hash_bytes[..16]),
                         file_name: f.name.clone(),
                         file_size: f.size,
                         file_type: crate::search::index::infer_file_type(&f.extension),
                         complete_sources: f.complete_sources,
+                        keyword_publishable: true,
+                        last_source_publish: {
+                            let mut raw = [0u8; 16];
+                            raw.copy_from_slice(&hash_bytes[..16]);
+                            known_files
+                                .find_by_hash(&raw)
+                                .map(|r| r.last_publish_src as i64)
+                                .unwrap_or(0)
+                        },
                     })
                 })
                 .collect();
@@ -20175,9 +21205,20 @@ async fn handle_command_inner(
             {
                 let mgr = transfer_manager.read().await;
                 for transfer in mgr.active.values().chain(mgr.queue.iter()) {
-                    if transfer.direction != TransferDirection::Download { continue; }
-                    if matches!(transfer.status, TransferStatus::Completed | TransferStatus::Failed) { continue; }
-                    if transfer.file_hash.is_empty() || !seen_hashes.insert(transfer.file_hash.clone()) { continue; }
+                    if transfer.direction != TransferDirection::Download {
+                        continue;
+                    }
+                    if matches!(
+                        transfer.status,
+                        TransferStatus::Completed | TransferStatus::Failed
+                    ) {
+                        continue;
+                    }
+                    if transfer.file_hash.is_empty()
+                        || !seen_hashes.insert(transfer.file_hash.clone())
+                    {
+                        continue;
+                    }
                     let hash_bytes = match hex::decode(&transfer.file_hash) {
                         Ok(bytes) if bytes.len() >= 16 => bytes,
                         _ => continue,
@@ -20192,6 +21233,15 @@ async fn handle_command_inner(
                         file_size: transfer.total_size,
                         file_type: crate::search::index::infer_file_type(&ext),
                         complete_sources: 0,
+                        keyword_publishable: false,
+                        last_source_publish: {
+                            let mut raw = [0u8; 16];
+                            raw.copy_from_slice(&hash_bytes[..16]);
+                            known_files
+                                .find_by_hash(&raw)
+                                .map(|r| r.last_publish_src as i64)
+                                .unwrap_or(0)
+                        },
                     });
                     partial_count += 1;
                 }
@@ -20202,7 +21252,8 @@ async fn handle_command_inner(
             if state.server_connected {
                 if let Some(conn) = state.server_connection.as_mut() {
                     let mut seen_offer_hashes = std::collections::HashSet::new();
-                    let mut offer_files: Vec<ed2k::server::OfferFile> = index.all_files()
+                    let mut offer_files: Vec<ed2k::server::OfferFile> = index
+                        .all_files()
                         .iter()
                         .filter(|f| f.shared)
                         .filter_map(|f| {
@@ -20231,10 +21282,15 @@ async fn handle_command_inner(
                             if transfer.direction != TransferDirection::Download {
                                 continue;
                             }
-                            if matches!(transfer.status, TransferStatus::Completed | TransferStatus::Failed) {
+                            if matches!(
+                                transfer.status,
+                                TransferStatus::Completed | TransferStatus::Failed
+                            ) {
                                 continue;
                             }
-                            if transfer.file_hash.is_empty() || !seen_offer_hashes.insert(transfer.file_hash.clone()) {
+                            if transfer.file_hash.is_empty()
+                                || !seen_offer_hashes.insert(transfer.file_hash.clone())
+                            {
                                 continue;
                             }
                             let hash_bytes = match hex::decode(&transfer.file_hash) {
@@ -20263,8 +21319,16 @@ async fn handle_command_inner(
             }
         }
 
-        NetworkCommand::SetFileComment { file_hash, rating, comment } => {
-            state.comment_manager.write().await.set_our_comment(&file_hash, rating, comment.clone());
+        NetworkCommand::SetFileComment {
+            file_hash,
+            rating,
+            comment,
+        } => {
+            state.comment_manager.write().await.set_our_comment(
+                &file_hash,
+                rating,
+                comment.clone(),
+            );
             if let Err(e) = db.save_file_comment(&file_hash, rating, &comment) {
                 warn!("Failed to save comment: {e}");
             }
@@ -20368,174 +21432,118 @@ async fn handle_command_inner(
         }
 
         // UpdateIpFilterFromUrl removed — download now happens directly in the command handler with DNS-pinned client
-
-        NetworkCommand::SendChatMessage { ember_hash: friend_eh, message, tx } => {
+        NetworkCommand::SendChatMessage {
+            ember_hash: friend_eh,
+            message,
+            tx,
+        } => {
             if settings.friend_chat_disabled {
                 let _ = tx.send(Err("Chat is disabled in Friends settings".into()));
             } else {
-            let sessions = state.ember_sessions.read().await;
-            if let Some(sender) = sessions.get(&friend_eh) {
-                let msg_bytes = message.as_bytes();
-                let mut packet = Vec::with_capacity(6 + msg_bytes.len());
-                packet.push(OP_EMULEPROT);
-                let size = (1 + msg_bytes.len()) as u32;
-                packet.extend_from_slice(&size.to_le_bytes());
-                packet.push(ed2k::messages::OP_EMBER_CHAT_MSG);
-                packet.extend_from_slice(msg_bytes);
-                match sender.try_send(packet) {
-                    Ok(()) => {
-                        let hash_hex = hex::encode(friend_eh);
-                        let db2 = db.clone();
-                        let msg2 = message.clone();
-                        tokio::task::spawn_blocking(move || {
-                            if let Err(e) = db2.insert_chat_message(&hash_hex, "sent", &msg2) {
-                                tracing::warn!("Failed to persist sent chat message: {e}");
-                            }
-                        });
-                        let _ = app_handle.emit("ember:chat-message", serde_json::json!({
-                            "user_hash": hex::encode(friend_eh),
-                            "message": message,
-                            "direction": "sent",
-                            "timestamp": chrono::Utc::now().timestamp(),
-                        }));
-                        let _ = tx.send(Ok(()));
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => { let _ = tx.send(Err("Connection channel full".into())); }
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => { let _ = tx.send(Err("Connection to friend closed".into())); }
-                }
-            } else {
-                drop(sessions);
-                if state.outbound_session_tasks.contains_key(&friend_eh) {
-                    let _ = tx.send(Err("Connecting to friend, please retry in a moment".into()));
-                } else {
-                    let db2 = db.clone();
-                    let hash_hex = hex::encode(friend_eh);
-                    let addr_opt = tokio::task::spawn_blocking(move || db2.get_friend_address(&hash_hex))
-                        .await.ok().and_then(|r| r.ok()).flatten();
-                    if let Some((ip_str, port)) = addr_opt {
-                        if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
-                            let addr = SocketAddr::new(ip.into(), port);
-                            state.outbound_session_tasks.insert(friend_eh, std::time::Instant::now());
-                            let our_user_hash = state.user_hash;
-                            let our_ember_hash = ember_hash;
-                            let nickname = settings.nickname.clone();
-                            let client_id = state.external_ip
-                                .map(|eip| u32::from_le_bytes(eip.octets()))
-                                .unwrap_or(0);
-                            let tcp = settings.tcp_port;
-                            let udp = settings.udp_port;
-                            let obfs = settings.friend_session_encryption;
-                            let sessions_clone = state.ember_sessions.clone();
-                            let ul_tx = ul_event_tx.clone();
-                            let fh = friend_hashes.clone();
-                            let app2 = app_handle.clone();
-                            let db3 = db.clone();
-                            let msg = message.clone();
-                            let ul_tx2 = ul_event_tx.clone();
-                            // debug! (not info!) because the Ember hash + address pair
-                            // is identity-correlatable PII; we keep it for troubleshooting
-                            // but don't surface it in the default log stream.
-                            debug!("Auto-connecting to friend {} for chat at {}", hex::encode(friend_eh), addr);
-                            tokio::spawn(async move {
-                                match ed2k::friend_connect::open_and_run_friend_session(
-                                    addr, our_user_hash, our_ember_hash, nickname,
-                                    client_id, tcp, udp, obfs, sessions_clone.clone(), ul_tx, fh,
-                                    Some(ed25519_pubkey), Some(ed25519_secret_key),
-                                ).await {
-                                    Ok(handle) => {
-                                        let msg_bytes = msg.as_bytes();
-                                        let mut packet = Vec::with_capacity(6 + msg_bytes.len());
-                                        packet.push(OP_EMULEPROT);
-                                        let size = (1 + msg_bytes.len()) as u32;
-                                        packet.extend_from_slice(&size.to_le_bytes());
-                                        packet.push(ed2k::messages::OP_EMBER_CHAT_MSG);
-                                        packet.extend_from_slice(msg_bytes);
-                                        if handle.outbound_tx.try_send(packet).is_ok() {
-                                            let hash_hex = hex::encode(friend_eh);
-                                            let msg_for_db = msg.clone();
-                                            let db_for_msg = db3.clone();
-                                            tokio::task::spawn_blocking(move || {
-                                                if let Err(e) = db_for_msg.insert_chat_message(&hash_hex, "sent", &msg_for_db) {
-                                                    tracing::warn!("Failed to persist sent chat message: {e}");
-                                                }
-                                            });
-                                            let _ = app2.emit("ember:chat-message", serde_json::json!({
-                                                "user_hash": hex::encode(friend_eh),
-                                                "message": msg,
-                                                "direction": "sent",
-                                                "timestamp": chrono::Utc::now().timestamp(),
-                                            }));
-                                            let _ = tx.send(Ok(()));
-                                        } else {
-                                            let _ = tx.send(Err("Failed to send on new connection".into()));
-                                        }
-                                    }
-                                    Err(e) => {
-                                        debug!("Auto-connect for chat to {} failed: {e}", hex::encode(friend_eh));
-                                        let _ = tx.send(Err(format!("Auto-connect failed: {e}")));
-                                        // Stored IP is dead — clear it so the
-                                        // next chat attempt skips the
-                                        // multi-second TCP timeout against
-                                        // the same address and goes straight
-                                        // to rendezvous.
-                                        let hash_hex_clear = hex::encode(friend_eh);
-                                        let db_for_clear = db3.clone();
-                                        let _ = tokio::task::spawn_blocking(move || db_for_clear.clear_friend_address(&hash_hex_clear)).await;
-                                        // EmberFriendSearchFailed not
-                                        // EmberFriendDisconnected: we never
-                                        // had a session and emitting offline
-                                        // / browse-error / scheduling a
-                                        // reconnect would just dogpile.
-                                        let _ = ul_tx2.send(upload_server::UploadEvent {
-                                            transfer_id: String::new(),
-                                            kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
-                                        }).await;
-                                    }
+                let sessions = state.ember_sessions.read().await;
+                if let Some(sender) = sessions.get(&friend_eh) {
+                    let msg_bytes = message.as_bytes();
+                    let mut packet = Vec::with_capacity(6 + msg_bytes.len());
+                    packet.push(OP_EMULEPROT);
+                    let size = (1 + msg_bytes.len()) as u32;
+                    packet.extend_from_slice(&size.to_le_bytes());
+                    packet.push(ed2k::messages::OP_EMBER_CHAT_MSG);
+                    packet.extend_from_slice(msg_bytes);
+                    match sender.try_send(packet) {
+                        Ok(()) => {
+                            let hash_hex = hex::encode(friend_eh);
+                            let db2 = db.clone();
+                            let msg2 = message.clone();
+                            tokio::task::spawn_blocking(move || {
+                                if let Err(e) = db2.insert_chat_message(&hash_hex, "sent", &msg2) {
+                                    tracing::warn!("Failed to persist sent chat message: {e}");
                                 }
                             });
-                        } else {
-                            // Stored IP wasn't a parseable v4 address —
-                            // wipe it so the next attempt falls through
-                            // to rendezvous instead of repeating the
-                            // same parse failure. No `outbound_session_tasks`
-                            // entry was inserted in this branch, so no
-                            // cleanup event is required here.
-                            let hash_hex_clear = hex::encode(friend_eh);
-                            let db_for_clear = db.clone();
-                            let _ = tokio::task::spawn_blocking(move || db_for_clear.clear_friend_address(&hash_hex_clear)).await;
-                            let _ = tx.send(Err("Invalid friend IP address".into()));
+                            let _ = app_handle.emit(
+                                "ember:chat-message",
+                                serde_json::json!({
+                                    "user_hash": hex::encode(friend_eh),
+                                    "message": message,
+                                    "direction": "sent",
+                                    "timestamp": chrono::Utc::now().timestamp(),
+                                }),
+                            );
+                            let _ = tx.send(Ok(()));
                         }
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            let _ = tx.send(Err("Connection channel full".into()));
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            let _ = tx.send(Err("Connection to friend closed".into()));
+                        }
+                    }
+                } else {
+                    drop(sessions);
+                    if state.outbound_session_tasks.contains_key(&friend_eh) {
+                        let _ =
+                            tx.send(Err("Connecting to friend, please retry in a moment".into()));
                     } else {
-                        let rv_url = settings.rendezvous_url.clone();
-                        let our_uh = state.user_hash;
-                        let our_eh = ember_hash;
-                        let nick = settings.nickname.clone();
-                        let cid = state.external_ip.map(|eip| u32::from_le_bytes(eip.octets())).unwrap_or(0);
-                        let tcp = settings.tcp_port;
-                        let udp = settings.udp_port;
-                        let obfs = settings.friend_session_encryption;
-                        let sess = state.ember_sessions.clone();
-                        let ultx = ul_event_tx.clone();
-                        let fh = friend_hashes.clone();
-                        let app2 = app_handle.clone();
-                        let db3 = db.clone();
-                        let msg = message.clone();
-                        let ultx2 = ul_event_tx.clone();
-                        state.outbound_session_tasks.insert(friend_eh, std::time::Instant::now());
-                        debug!("No stored address for {}, trying rendezvous for chat", hex::encode(friend_eh));
-                        tokio::spawn(async move {
-                            let mut session_alive = false;
-                            match crate::network::rendezvous::lookup(&rv_url, &friend_eh).await {
-                                Ok(Some((ip, port))) => {
-                                    let addr = std::net::SocketAddr::new(ip.into(), port);
+                        let db2 = db.clone();
+                        let hash_hex = hex::encode(friend_eh);
+                        let addr_opt =
+                            tokio::task::spawn_blocking(move || db2.get_friend_address(&hash_hex))
+                                .await
+                                .ok()
+                                .and_then(|r| r.ok())
+                                .flatten();
+                        if let Some((ip_str, port)) = addr_opt {
+                            if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
+                                let addr = SocketAddr::new(ip.into(), port);
+                                state
+                                    .outbound_session_tasks
+                                    .insert(friend_eh, std::time::Instant::now());
+                                let our_user_hash = state.user_hash;
+                                let our_ember_hash = ember_hash;
+                                let nickname = settings.nickname.clone();
+                                let client_id = state
+                                    .external_ip
+                                    .map(|eip| u32::from_le_bytes(eip.octets()))
+                                    .unwrap_or(0);
+                                let tcp = settings.tcp_port;
+                                let udp = settings.udp_port;
+                                let obfs = settings.friend_session_encryption;
+                                let sessions_clone = state.ember_sessions.clone();
+                                let ul_tx = ul_event_tx.clone();
+                                let fh = friend_hashes.clone();
+                                let app2 = app_handle.clone();
+                                let db3 = db.clone();
+                                let msg = message.clone();
+                                let ul_tx2 = ul_event_tx.clone();
+                                // debug! (not info!) because the Ember hash + address pair
+                                // is identity-correlatable PII; we keep it for troubleshooting
+                                // but don't surface it in the default log stream.
+                                debug!(
+                                    "Auto-connecting to friend {} for chat at {}",
+                                    hex::encode(friend_eh),
+                                    addr
+                                );
+                                tokio::spawn(async move {
                                     match ed2k::friend_connect::open_and_run_friend_session(
-                                        addr, our_uh, our_eh, nick, cid, tcp, udp, obfs, sess, ultx, fh,
-                                        Some(ed25519_pubkey), Some(ed25519_secret_key),
-                                    ).await {
+                                        addr,
+                                        our_user_hash,
+                                        our_ember_hash,
+                                        nickname,
+                                        client_id,
+                                        tcp,
+                                        udp,
+                                        obfs,
+                                        sessions_clone.clone(),
+                                        ul_tx,
+                                        fh,
+                                        Some(ed25519_pubkey),
+                                        Some(ed25519_secret_key),
+                                    )
+                                    .await
+                                    {
                                         Ok(handle) => {
-                                            session_alive = true;
                                             let msg_bytes = msg.as_bytes();
-                                            let mut packet = Vec::with_capacity(6 + msg_bytes.len());
+                                            let mut packet =
+                                                Vec::with_capacity(6 + msg_bytes.len());
                                             packet.push(OP_EMULEPROT);
                                             let size = (1 + msg_bytes.len()) as u32;
                                             packet.extend_from_slice(&size.to_le_bytes());
@@ -20546,58 +21554,206 @@ async fn handle_command_inner(
                                                 let msg_for_db = msg.clone();
                                                 let db_for_msg = db3.clone();
                                                 tokio::task::spawn_blocking(move || {
-                                                    if let Err(e) = db_for_msg.insert_chat_message(&hash_hex, "sent", &msg_for_db) {
+                                                    if let Err(e) = db_for_msg.insert_chat_message(
+                                                        &hash_hex,
+                                                        "sent",
+                                                        &msg_for_db,
+                                                    ) {
                                                         tracing::warn!("Failed to persist sent chat message: {e}");
                                                     }
                                                 });
-                                                let _ = app2.emit("ember:chat-message", serde_json::json!({
+                                                let _ = app2.emit(
+                                                    "ember:chat-message",
+                                                    serde_json::json!({
+                                                        "user_hash": hex::encode(friend_eh),
+                                                        "message": msg,
+                                                        "direction": "sent",
+                                                        "timestamp": chrono::Utc::now().timestamp(),
+                                                    }),
+                                                );
+                                                let _ = tx.send(Ok(()));
+                                            } else {
+                                                let _ = tx.send(Err(
+                                                    "Failed to send on new connection".into(),
+                                                ));
+                                            }
+                                        }
+                                        Err(e) => {
+                                            debug!(
+                                                "Auto-connect for chat to {} failed: {e}",
+                                                hex::encode(friend_eh)
+                                            );
+                                            let _ =
+                                                tx.send(Err(format!("Auto-connect failed: {e}")));
+                                            // Stored IP is dead — clear it so the
+                                            // next chat attempt skips the
+                                            // multi-second TCP timeout against
+                                            // the same address and goes straight
+                                            // to rendezvous.
+                                            let hash_hex_clear = hex::encode(friend_eh);
+                                            let db_for_clear = db3.clone();
+                                            let _ = tokio::task::spawn_blocking(move || {
+                                                db_for_clear.clear_friend_address(&hash_hex_clear)
+                                            })
+                                            .await;
+                                            // EmberFriendSearchFailed not
+                                            // EmberFriendDisconnected: we never
+                                            // had a session and emitting offline
+                                            // / browse-error / scheduling a
+                                            // reconnect would just dogpile.
+                                            let _ = ul_tx2.send(upload_server::UploadEvent {
+                                            transfer_id: String::new(),
+                                            kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
+                                        }).await;
+                                        }
+                                    }
+                                });
+                            } else {
+                                // Stored IP wasn't a parseable v4 address —
+                                // wipe it so the next attempt falls through
+                                // to rendezvous instead of repeating the
+                                // same parse failure. No `outbound_session_tasks`
+                                // entry was inserted in this branch, so no
+                                // cleanup event is required here.
+                                let hash_hex_clear = hex::encode(friend_eh);
+                                let db_for_clear = db.clone();
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    db_for_clear.clear_friend_address(&hash_hex_clear)
+                                })
+                                .await;
+                                let _ = tx.send(Err("Invalid friend IP address".into()));
+                            }
+                        } else {
+                            let rv_url = settings.rendezvous_url.clone();
+                            let our_uh = state.user_hash;
+                            let our_eh = ember_hash;
+                            let nick = settings.nickname.clone();
+                            let cid = state
+                                .external_ip
+                                .map(|eip| u32::from_le_bytes(eip.octets()))
+                                .unwrap_or(0);
+                            let tcp = settings.tcp_port;
+                            let udp = settings.udp_port;
+                            let obfs = settings.friend_session_encryption;
+                            let sess = state.ember_sessions.clone();
+                            let ultx = ul_event_tx.clone();
+                            let fh = friend_hashes.clone();
+                            let app2 = app_handle.clone();
+                            let db3 = db.clone();
+                            let msg = message.clone();
+                            let ultx2 = ul_event_tx.clone();
+                            state
+                                .outbound_session_tasks
+                                .insert(friend_eh, std::time::Instant::now());
+                            debug!(
+                                "No stored address for {}, trying rendezvous for chat",
+                                hex::encode(friend_eh)
+                            );
+                            tokio::spawn(async move {
+                                let mut session_alive = false;
+                                match crate::network::rendezvous::lookup(&rv_url, &friend_eh).await
+                                {
+                                    Ok(Some((ip, port))) => {
+                                        let addr = std::net::SocketAddr::new(ip.into(), port);
+                                        match ed2k::friend_connect::open_and_run_friend_session(
+                                            addr,
+                                            our_uh,
+                                            our_eh,
+                                            nick,
+                                            cid,
+                                            tcp,
+                                            udp,
+                                            obfs,
+                                            sess,
+                                            ultx,
+                                            fh,
+                                            Some(ed25519_pubkey),
+                                            Some(ed25519_secret_key),
+                                        )
+                                        .await
+                                        {
+                                            Ok(handle) => {
+                                                session_alive = true;
+                                                let msg_bytes = msg.as_bytes();
+                                                let mut packet =
+                                                    Vec::with_capacity(6 + msg_bytes.len());
+                                                packet.push(OP_EMULEPROT);
+                                                let size = (1 + msg_bytes.len()) as u32;
+                                                packet.extend_from_slice(&size.to_le_bytes());
+                                                packet.push(ed2k::messages::OP_EMBER_CHAT_MSG);
+                                                packet.extend_from_slice(msg_bytes);
+                                                if handle.outbound_tx.try_send(packet).is_ok() {
+                                                    let hash_hex = hex::encode(friend_eh);
+                                                    let msg_for_db = msg.clone();
+                                                    let db_for_msg = db3.clone();
+                                                    tokio::task::spawn_blocking(move || {
+                                                        if let Err(e) = db_for_msg
+                                                            .insert_chat_message(
+                                                                &hash_hex,
+                                                                "sent",
+                                                                &msg_for_db,
+                                                            )
+                                                        {
+                                                            tracing::warn!("Failed to persist sent chat message: {e}");
+                                                        }
+                                                    });
+                                                    let _ = app2.emit("ember:chat-message", serde_json::json!({
                                                     "user_hash": hex::encode(friend_eh),
                                                     "message": msg,
                                                     "direction": "sent",
                                                     "timestamp": chrono::Utc::now().timestamp(),
                                                 }));
-                                                let _ = app2.emit("ember:friend-online", serde_json::json!({
-                                                    "user_hash": hex::encode(friend_eh),
-                                                }));
-                                                let _ = tx.send(Ok(()));
-                                            } else {
-                                                let _ = tx.send(Err("Failed to send on new connection".into()));
+                                                    let _ = app2.emit(
+                                                        "ember:friend-online",
+                                                        serde_json::json!({
+                                                            "user_hash": hex::encode(friend_eh),
+                                                        }),
+                                                    );
+                                                    let _ = tx.send(Ok(()));
+                                                } else {
+                                                    let _ = tx.send(Err(
+                                                        "Failed to send on new connection".into(),
+                                                    ));
+                                                }
+                                            }
+                                            Err(e) => {
+                                                let _ =
+                                                    tx.send(Err(format!("Could not connect: {e}")));
                                             }
                                         }
-                                        Err(e) => {
-                                            let _ = tx.send(Err(format!("Could not connect: {e}")));
-                                        }
+                                    }
+                                    _ => {
+                                        let _ = tx.send(Err("Friend is offline".into()));
                                     }
                                 }
-                                _ => {
-                                    let _ = tx.send(Err("Friend is offline".into()));
-                                }
-                            }
-                            if !session_alive {
-                                // No live session was opened for
-                                // `friend_eh`; release the outbound
-                                // task slot so the next chat / browse
-                                // / auto-retry can proceed without
-                                // waiting for the 10-min TTL sweep.
-                                // EmberFriendSearchFailed (not
-                                // EmberFriendDisconnected) avoids the
-                                // misleading offline UI events and
-                                // the automatic reconnect cycle that
-                                // would just hammer the same
-                                // unreachable peer.
-                                let _ = ultx2.send(upload_server::UploadEvent {
+                                if !session_alive {
+                                    // No live session was opened for
+                                    // `friend_eh`; release the outbound
+                                    // task slot so the next chat / browse
+                                    // / auto-retry can proceed without
+                                    // waiting for the 10-min TTL sweep.
+                                    // EmberFriendSearchFailed (not
+                                    // EmberFriendDisconnected) avoids the
+                                    // misleading offline UI events and
+                                    // the automatic reconnect cycle that
+                                    // would just hammer the same
+                                    // unreachable peer.
+                                    let _ = ultx2.send(upload_server::UploadEvent {
                                     transfer_id: String::new(),
                                     kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
                                 }).await;
-                            }
-                        });
+                                }
+                            });
+                        }
                     }
                 }
             }
-            }
         }
 
-        NetworkCommand::BrowseFriend { ember_hash: friend_eh, tx } => {
+        NetworkCommand::BrowseFriend {
+            ember_hash: friend_eh,
+            tx,
+        } => {
             if settings.friend_browse_disabled {
                 let _ = tx.send(Err("Browse is disabled in Friends settings".into()));
             } else {
@@ -20609,27 +21765,41 @@ async fn handle_command_inner(
                     packet.extend_from_slice(&size.to_le_bytes());
                     packet.push(ed2k::messages::OP_EMBER_BROWSE_REQ);
                     match sender.try_send(packet) {
-                        Ok(()) => { let _ = tx.send(Ok(())); }
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => { let _ = tx.send(Err("Connection channel full".into())); }
-                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => { let _ = tx.send(Err("Connection to friend closed".into())); }
+                        Ok(()) => {
+                            let _ = tx.send(Ok(()));
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            let _ = tx.send(Err("Connection channel full".into()));
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            let _ = tx.send(Err("Connection to friend closed".into()));
+                        }
                     }
                 } else {
                     drop(sessions);
                     if state.outbound_session_tasks.contains_key(&friend_eh) {
-                        let _ = tx.send(Err("Connecting to friend, please retry in a moment".into()));
+                        let _ =
+                            tx.send(Err("Connecting to friend, please retry in a moment".into()));
                     } else {
                         let db2 = db.clone();
                         let hash_hex = hex::encode(friend_eh);
-                        let addr_opt = tokio::task::spawn_blocking(move || db2.get_friend_address(&hash_hex))
-                            .await.ok().and_then(|r| r.ok()).flatten();
+                        let addr_opt =
+                            tokio::task::spawn_blocking(move || db2.get_friend_address(&hash_hex))
+                                .await
+                                .ok()
+                                .and_then(|r| r.ok())
+                                .flatten();
                         if let Some((ip_str, port)) = addr_opt {
                             if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
                                 let addr = SocketAddr::new(ip.into(), port);
-                                state.outbound_session_tasks.insert(friend_eh, std::time::Instant::now());
+                                state
+                                    .outbound_session_tasks
+                                    .insert(friend_eh, std::time::Instant::now());
                                 let our_user_hash = state.user_hash;
                                 let our_ember_hash = ember_hash;
                                 let nickname = settings.nickname.clone();
-                                let client_id = state.external_ip
+                                let client_id = state
+                                    .external_ip
                                     .map(|eip| u32::from_le_bytes(eip.octets()))
                                     .unwrap_or(0);
                                 let tcp = settings.tcp_port;
@@ -20639,14 +21809,30 @@ async fn handle_command_inner(
                                 let ul_tx = ul_event_tx.clone();
                                 let fh = friend_hashes.clone();
                                 let ul_tx2 = ul_event_tx.clone();
-                                info!("Auto-connecting to friend {} for browse at {}", hex::encode(friend_eh), addr);
+                                info!(
+                                    "Auto-connecting to friend {} for browse at {}",
+                                    hex::encode(friend_eh),
+                                    addr
+                                );
                                 let db3 = db.clone();
                                 tokio::spawn(async move {
                                     match ed2k::friend_connect::open_and_run_friend_session(
-                                        addr, our_user_hash, our_ember_hash, nickname,
-                                        client_id, tcp, udp, obfs, sessions_clone.clone(), ul_tx, fh,
-                                        Some(ed25519_pubkey), Some(ed25519_secret_key),
-                                    ).await {
+                                        addr,
+                                        our_user_hash,
+                                        our_ember_hash,
+                                        nickname,
+                                        client_id,
+                                        tcp,
+                                        udp,
+                                        obfs,
+                                        sessions_clone.clone(),
+                                        ul_tx,
+                                        fh,
+                                        Some(ed25519_pubkey),
+                                        Some(ed25519_secret_key),
+                                    )
+                                    .await
+                                    {
                                         Ok(handle) => {
                                             let mut packet = Vec::with_capacity(6);
                                             packet.push(OP_EMULEPROT);
@@ -20672,7 +21858,10 @@ async fn handle_command_inner(
                                             }
                                         }
                                         Err(e) => {
-                                            info!("Auto-connect for browse to {} failed: {e}", hex::encode(friend_eh));
+                                            info!(
+                                                "Auto-connect for browse to {} failed: {e}",
+                                                hex::encode(friend_eh)
+                                            );
                                             let _ = tx.send(Err(format!("Could not connect: {e}")));
                                             // Stored IP is dead; clear it so
                                             // the next browse / chat attempt
@@ -20681,7 +21870,10 @@ async fn handle_command_inner(
                                             // dial timeout. Same rationale as
                                             // the chat path above.
                                             let hash_hex_clear = hex::encode(friend_eh);
-                                            let _ = tokio::task::spawn_blocking(move || db3.clear_friend_address(&hash_hex_clear)).await;
+                                            let _ = tokio::task::spawn_blocking(move || {
+                                                db3.clear_friend_address(&hash_hex_clear)
+                                            })
+                                            .await;
                                             let _ = ul_tx2.send(upload_server::UploadEvent {
                                                 transfer_id: String::new(),
                                                 kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
@@ -20696,7 +21888,10 @@ async fn handle_command_inner(
                                 // inserted in this branch.
                                 let hash_hex_clear = hex::encode(friend_eh);
                                 let db_for_clear = db.clone();
-                                let _ = tokio::task::spawn_blocking(move || db_for_clear.clear_friend_address(&hash_hex_clear)).await;
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    db_for_clear.clear_friend_address(&hash_hex_clear)
+                                })
+                                .await;
                                 let _ = tx.send(Err("Invalid friend IP address".into()));
                             }
                         } else {
@@ -20704,7 +21899,10 @@ async fn handle_command_inner(
                             let our_uh = state.user_hash;
                             let our_eh = ember_hash;
                             let nick = settings.nickname.clone();
-                            let cid = state.external_ip.map(|eip| u32::from_le_bytes(eip.octets())).unwrap_or(0);
+                            let cid = state
+                                .external_ip
+                                .map(|eip| u32::from_le_bytes(eip.octets()))
+                                .unwrap_or(0);
                             let tcp = settings.tcp_port;
                             let udp = settings.udp_port;
                             let obfs = settings.friend_session_encryption;
@@ -20713,17 +21911,36 @@ async fn handle_command_inner(
                             let fh = friend_hashes.clone();
                             let app2 = app_handle.clone();
                             let ultx2 = ul_event_tx.clone();
-                            state.outbound_session_tasks.insert(friend_eh, std::time::Instant::now());
-                            info!("No stored address for {}, trying rendezvous for browse", hex::encode(friend_eh));
+                            state
+                                .outbound_session_tasks
+                                .insert(friend_eh, std::time::Instant::now());
+                            info!(
+                                "No stored address for {}, trying rendezvous for browse",
+                                hex::encode(friend_eh)
+                            );
                             tokio::spawn(async move {
                                 let mut session_alive = false;
-                                match crate::network::rendezvous::lookup(&rv_url, &friend_eh).await {
+                                match crate::network::rendezvous::lookup(&rv_url, &friend_eh).await
+                                {
                                     Ok(Some((ip, port))) => {
                                         let addr = std::net::SocketAddr::new(ip.into(), port);
                                         match ed2k::friend_connect::open_and_run_friend_session(
-                                            addr, our_uh, our_eh, nick, cid, tcp, udp, obfs, sess, ultx, fh,
-                                            Some(ed25519_pubkey), Some(ed25519_secret_key),
-                                        ).await {
+                                            addr,
+                                            our_uh,
+                                            our_eh,
+                                            nick,
+                                            cid,
+                                            tcp,
+                                            udp,
+                                            obfs,
+                                            sess,
+                                            ultx,
+                                            fh,
+                                            Some(ed25519_pubkey),
+                                            Some(ed25519_secret_key),
+                                        )
+                                        .await
+                                        {
                                             Ok(handle) => {
                                                 session_alive = true;
                                                 let mut packet = Vec::with_capacity(6);
@@ -20737,9 +21954,12 @@ async fn handle_command_inner(
                                                 // browse packet.
                                                 match handle.outbound_tx.try_send(packet) {
                                                     Ok(()) => {
-                                                        let _ = app2.emit("ember:friend-online", serde_json::json!({
-                                                            "user_hash": hex::encode(friend_eh),
-                                                        }));
+                                                        let _ = app2.emit(
+                                                            "ember:friend-online",
+                                                            serde_json::json!({
+                                                                "user_hash": hex::encode(friend_eh),
+                                                            }),
+                                                        );
                                                         let _ = tx.send(Ok(()));
                                                     }
                                                     Err(e) => {
@@ -20750,7 +21970,8 @@ async fn handle_command_inner(
                                                 }
                                             }
                                             Err(e) => {
-                                                let _ = tx.send(Err(format!("Could not connect: {e}")));
+                                                let _ =
+                                                    tx.send(Err(format!("Could not connect: {e}")));
                                             }
                                         }
                                     }
@@ -20777,7 +21998,9 @@ async fn handle_command_inner(
             }
         }
 
-        NetworkCommand::FriendRemoved { ember_hash: removed_hash } => {
+        NetworkCommand::FriendRemoved {
+            ember_hash: removed_hash,
+        } => {
             state.online_friends.remove(&removed_hash);
             state.ember_sessions.write().await.remove(&removed_hash);
             // Also drop any pending outbound-search slot so a remove
@@ -20786,7 +22009,9 @@ async fn handle_command_inner(
             state.outbound_session_tasks.remove(&removed_hash);
         }
 
-        NetworkCommand::FindFriendAndConnect { ember_hash: target_hash } => {
+        NetworkCommand::FindFriendAndConnect {
+            ember_hash: target_hash,
+        } => {
             // Skip if the friend is already online or has a live
             // session. Mirrors the pre-existing guard in
             // `RetryFriendSearch`. Without this, the new
@@ -20804,36 +22029,63 @@ async fn handle_command_inner(
                     hex::encode(target_hash),
                 );
             } else if !state.outbound_session_tasks.contains_key(&target_hash) {
-                state.outbound_session_tasks.insert(target_hash, std::time::Instant::now());
-                let _ = app_handle.emit("ember:friend-searching", serde_json::json!({
-                    "user_hash": hex::encode(target_hash),
-                }));
+                state
+                    .outbound_session_tasks
+                    .insert(target_hash, std::time::Instant::now());
+                let _ = app_handle.emit(
+                    "ember:friend-searching",
+                    serde_json::json!({
+                        "user_hash": hex::encode(target_hash),
+                    }),
+                );
                 spawn_rendezvous_friend_lookup(
-                    &settings, &state, ember_hash, target_hash,
-                    &app_handle, &friend_hashes, &ul_event_tx,
-                    ed25519_pubkey, ed25519_secret_key,
+                    &settings,
+                    &state,
+                    ember_hash,
+                    target_hash,
+                    &app_handle,
+                    &friend_hashes,
+                    &ul_event_tx,
+                    ed25519_pubkey,
+                    ed25519_secret_key,
                 );
             }
         }
 
-        NetworkCommand::RetryFriendSearch { ember_hash: target_hash, tx } => {
+        NetworkCommand::RetryFriendSearch {
+            ember_hash: target_hash,
+            tx,
+        } => {
             let hash_hex = hex::encode(target_hash);
 
-            if state.online_friends.contains_key(&target_hash) || state.ember_sessions.read().await.contains_key(&target_hash) {
+            if state.online_friends.contains_key(&target_hash)
+                || state.ember_sessions.read().await.contains_key(&target_hash)
+            {
                 info!("RetryFriendSearch: {} already online/connected", hash_hex);
                 let _ = tx.send(Ok(()));
                 return;
             }
 
-            state.outbound_session_tasks.insert(target_hash, std::time::Instant::now());
-            let _ = app_handle.emit("ember:friend-searching", serde_json::json!({
-                "user_hash": hash_hex,
-            }));
+            state
+                .outbound_session_tasks
+                .insert(target_hash, std::time::Instant::now());
+            let _ = app_handle.emit(
+                "ember:friend-searching",
+                serde_json::json!({
+                    "user_hash": hash_hex,
+                }),
+            );
 
             spawn_rendezvous_friend_lookup(
-                &settings, &state, ember_hash, target_hash,
-                &app_handle, &friend_hashes, &ul_event_tx,
-                ed25519_pubkey, ed25519_secret_key,
+                &settings,
+                &state,
+                ember_hash,
+                target_hash,
+                &app_handle,
+                &friend_hashes,
+                &ul_event_tx,
+                ed25519_pubkey,
+                ed25519_secret_key,
             );
 
             let _ = tx.send(Ok(()));
@@ -20887,11 +22139,10 @@ async fn reverify_complete_part_file(
         .join(format!("{transfer_id}.part"));
     let expected = file_hash.to_string();
     let verify_path = part_path.clone();
-    let computed_hash = tokio::task::spawn_blocking(move || {
-        ed2k::hash::ed2k_hash_file(&verify_path)
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
+    let computed_hash =
+        tokio::task::spawn_blocking(move || ed2k::hash::ed2k_hash_file(&verify_path))
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
 
     if computed_hash != expected {
         anyhow::bail!("Re-verification hash mismatch — .part preserved for retry");
@@ -20899,15 +22150,15 @@ async fn reverify_complete_part_file(
 
     let safe_name = crate::security::sanitize_filename(file_name);
     let completed_dir = download_dir.join("Downloads");
-    tokio::fs::create_dir_all(&completed_dir).await
+    tokio::fs::create_dir_all(&completed_dir)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to create Downloads dir: {e}"))?;
     let final_target = completed_dir.join(&safe_name);
     let pp = part_path.clone();
-    let actual_final = tokio::task::spawn_blocking(move || {
-        ed2k::transfer::move_part_to_final(&pp, &final_target)
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
+    let actual_final =
+        tokio::task::spawn_blocking(move || ed2k::transfer::move_part_to_final(&pp, &final_target))
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
 
     // Clean up .part.met
     let met_path = part_path.with_extension("part.met");
@@ -20944,7 +22195,11 @@ async fn handle_download_event(
             downloaded,
             total,
         } => {
-            let capped_downloaded = if total > 0 { downloaded.min(total) } else { downloaded };
+            let capped_downloaded = if total > 0 {
+                downloaded.min(total)
+            } else {
+                downloaded
+            };
             let speed = {
                 let mut mgr = transfer_manager.write().await;
                 mgr.update_progress(&transfer_id, capped_downloaded, 0);
@@ -20971,7 +22226,9 @@ async fn handle_download_event(
                 Some(last) => last.elapsed() >= db_progress_persist_interval,
             };
             if should_persist_db {
-                if let Err(e) = db.update_transfer_progress(&transfer_id, capped_downloaded, progress, speed) {
+                if let Err(e) =
+                    db.update_transfer_progress(&transfer_id, capped_downloaded, progress, speed)
+                {
                     warn!("DB update_transfer_progress failed for {transfer_id}: {e}");
                 }
                 db_progress_last_persist.insert(transfer_id.clone(), std::time::Instant::now());
@@ -21032,14 +22289,14 @@ async fn handle_download_event(
                         current_status,
                         Some(crate::types::TransferStatus::Queued)
                             | Some(crate::types::TransferStatus::Searching)
-                    )
-                {
+                    ) {
                     mgr.update_status(&transfer_id, crate::types::TransferStatus::Active);
                     true
                 } else {
                     false
                 };
-                let payload = mgr.source_counts(&transfer_id)
+                let payload = mgr
+                    .source_counts(&transfer_id)
                     .map(|(sources, active_sources, queued_sources)| {
                         crate::types::TransferSourcesPayload {
                             id: transfer_id.as_str(),
@@ -21059,13 +22316,16 @@ async fn handle_download_event(
             // Emit the status change first so the Status column updates in the
             // same tick the Sources column does.
             if promoted_active {
-                let _ = app_handle.emit("transfer-status", serde_json::json!({
-                    "id": transfer_id.as_str(),
-                    "status": "active",
-                    "sources": payload.sources,
-                    "active_sources": payload.active_sources,
-                    "queued_sources": payload.queued_sources,
-                }));
+                let _ = app_handle.emit(
+                    "transfer-status",
+                    serde_json::json!({
+                        "id": transfer_id.as_str(),
+                        "status": "active",
+                        "sources": payload.sources,
+                        "active_sources": payload.active_sources,
+                        "queued_sources": payload.queued_sources,
+                    }),
+                );
             }
             let _ = app_handle.emit("transfer-sources", &payload);
         }
@@ -21122,9 +22382,8 @@ async fn handle_download_event(
             // state for the peer.
             let placeholder_removed = {
                 let mut mgr = transfer_manager.write().await;
-                let removed = mgr.remove_callback_placeholders_for_ip_except(
-                    &transfer_id, &ip, Some(port),
-                );
+                let removed =
+                    mgr.remove_callback_placeholders_for_ip_except(&transfer_id, &ip, Some(port));
                 mgr.update_source_detail(
                     &transfer_id,
                     crate::types::SourceInfo {
@@ -21144,8 +22403,7 @@ async fn handle_download_event(
                 removed
             };
             for (rem_ip, rem_port) in placeholder_removed {
-                callback_row_pending_since
-                    .remove(&(transfer_id.clone(), rem_ip.clone(), rem_port));
+                callback_row_pending_since.remove(&(transfer_id.clone(), rem_ip.clone(), rem_port));
                 let _ = app_handle.emit(
                     "transfer-source-detail",
                     serde_json::json!({
@@ -21193,7 +22451,10 @@ async fn handle_download_event(
                 }),
             );
         }
-        DownloadEvent::Completed { transfer_id, final_path } => {
+        DownloadEvent::Completed {
+            transfer_id,
+            final_path,
+        } => {
             stats_manager.record_completed_download();
             // A download reaches Completed only after every part is present
             // and hash-verified, so the terminal row represents the whole
@@ -21223,7 +22484,10 @@ async fn handle_download_event(
                 mgr.complete(&transfer_id)
             } {
                 for t in &promoted {
-                    info!("Promoted queued transfer {} ({}) to active", t.id, t.file_name);
+                    info!(
+                        "Promoted queued transfer {} ({}) to active",
+                        t.id, t.file_name
+                    );
                 }
                 promoted_out.extend(promoted);
             } else {
@@ -21236,7 +22500,12 @@ async fn handle_download_event(
             {
                 let mgr = transfer_manager.read().await;
                 if let Some(t) = mgr.get_transfer(&transfer_id) {
-                    if let Err(e) = db.record_download_history(&t.file_hash, &t.file_name, t.total_size, "completed") {
+                    if let Err(e) = db.record_download_history(
+                        &t.file_hash,
+                        &t.file_name,
+                        t.total_size,
+                        "completed",
+                    ) {
                         tracing::warn!("Failed to record download history: {e}");
                     }
                 }
@@ -21254,7 +22523,10 @@ async fn handle_download_event(
             let met_path = temp_dir.join(format!("{transfer_id}.part.met"));
             if part_path.exists() {
                 if let Err(e) = tokio::fs::remove_file(&part_path).await {
-                    warn!("Failed to clean up leftover .part after completion: {} — {e}", part_path.display());
+                    warn!(
+                        "Failed to clean up leftover .part after completion: {} — {e}",
+                        part_path.display()
+                    );
                 } else {
                     info!("Cleaned up leftover .part file for completed download {transfer_id}");
                 }
@@ -21269,7 +22541,11 @@ async fn handle_download_event(
                 let _ = db.remove_transfer(&transfer_id);
             }
         }
-        DownloadEvent::Failed { transfer_id, error, failure_kind } => {
+        DownloadEvent::Failed {
+            transfer_id,
+            error,
+            failure_kind,
+        } => {
             let failure_stage = ed2k::transfer::infer_stage_from_error(&error).to_string();
             let failure_kind_name = ed2k::transfer::failure_kind_name(&failure_kind);
             let failure_summary = ed2k::transfer::summarize_error(&error, &failure_kind);
@@ -21277,7 +22553,10 @@ async fn handle_download_event(
                 let mgr = transfer_manager.read().await;
                 mgr.get_transfer(&transfer_id).map(|t| t.status.clone())
             };
-            if matches!(current_status, Some(TransferStatus::Paused | TransferStatus::Stopped)) {
+            if matches!(
+                current_status,
+                Some(TransferStatus::Paused | TransferStatus::Stopped)
+            ) {
                 return;
             }
             // Flush final progress snapshot (see Completed above) and drop
@@ -21289,7 +22568,9 @@ async fn handle_download_event(
                     .map(|t| (t.transferred, t.progress, t.speed))
             };
             if let Some((transferred, progress, speed)) = final_progress {
-                if let Err(e) = db.update_transfer_progress(&transfer_id, transferred, progress, speed) {
+                if let Err(e) =
+                    db.update_transfer_progress(&transfer_id, transferred, progress, speed)
+                {
                     warn!("DB update_transfer_progress (final) failed for {transfer_id}: {e}");
                 }
             }
@@ -21304,7 +22585,10 @@ async fn handle_download_event(
                 )
             } {
                 for t in &promoted {
-                    info!("Promoted queued transfer {} ({}) to active", t.id, t.file_name);
+                    info!(
+                        "Promoted queued transfer {} ({}) to active",
+                        t.id, t.file_name
+                    );
                 }
                 promoted_out.extend(promoted);
             } else {
@@ -21326,7 +22610,9 @@ async fn handle_download_event(
         DownloadEvent::SourceExchange { .. } => {
             // Handled directly in the network event loop (source injection).
         }
-        DownloadEvent::EmberSources { .. } | DownloadEvent::EmberPeerDiscovered { .. } | DownloadEvent::EmberFriendRequest { .. } => {
+        DownloadEvent::EmberSources { .. }
+        | DownloadEvent::EmberPeerDiscovered { .. }
+        | DownloadEvent::EmberFriendRequest { .. } => {
             // Handled directly in the network event loop (EPX source injection / peer tracking / friend requests).
         }
         DownloadEvent::DataReceived { .. }
@@ -21406,23 +22692,27 @@ async fn handle_upload_event(
                 let mut mgr = transfer_manager.write().await;
                 mgr.enqueue(transfer.clone());
             }
-            let _ = app_handle.emit(
-                "transfer-started",
-                &transfer,
-            );
+            let _ = app_handle.emit("transfer-started", &transfer);
         }
         UploadEventKind::Progress { uploaded, total } => {
-            let capped_uploaded = if total > 0 { uploaded.min(total) } else { uploaded };
+            let capped_uploaded = if total > 0 {
+                uploaded.min(total)
+            } else {
+                uploaded
+            };
             let (speed, upload_time_ms) = {
                 let mut mgr = transfer_manager.write().await;
                 mgr.update_progress(&event.transfer_id, capped_uploaded, 0);
                 let t = mgr.active.get_mut(&event.transfer_id);
                 let speed = t.as_ref().map(|t| t.speed).unwrap_or(0);
-                let ut = t.map(|t| {
-                    let elapsed = (chrono::Utc::now().timestamp() - t.started_at).max(0) as u64 * 1000;
-                    t.upload_time = elapsed;
-                    elapsed
-                }).unwrap_or(0);
+                let ut = t
+                    .map(|t| {
+                        let elapsed =
+                            (chrono::Utc::now().timestamp() - t.started_at).max(0) as u64 * 1000;
+                        t.upload_time = elapsed;
+                        elapsed
+                    })
+                    .unwrap_or(0);
                 (speed, ut)
             };
             let progress = if total > 0 {
@@ -21471,7 +22761,10 @@ async fn handle_upload_event(
             // already removed) which returned `None` here.
             stats_manager.record_completed_upload();
             for t in &promoted {
-                info!("Promoted queued transfer {} ({}) to active", t.id, t.file_name);
+                info!(
+                    "Promoted queued transfer {} ({}) to active",
+                    t.id, t.file_name
+                );
             }
             promoted_out.extend(promoted);
             let _ = app_handle.emit(
@@ -21491,10 +22784,8 @@ async fn handle_upload_event(
             // (`summarize_error` only ever returns fixed, canned strings), so peer
             // IPs / local paths from anyhow chains don't leak into the UI's
             // `failure_reason` or upload history.
-            let upload_failure_summary = ed2k::transfer::summarize_error(
-                &error,
-                &ed2k::transfer::classify_error(&error),
-            );
+            let upload_failure_summary =
+                ed2k::transfer::summarize_error(&error, &ed2k::transfer::classify_error(&error));
             let promoted = match {
                 let mut mgr = transfer_manager.write().await;
                 let promoted = mgr.fail(&event.transfer_id, &upload_failure_summary, None, None);
@@ -21505,7 +22796,10 @@ async fn handle_upload_event(
                 None => return,
             };
             for t in &promoted {
-                info!("Promoted queued transfer {} ({}) to active", t.id, t.file_name);
+                info!(
+                    "Promoted queued transfer {} ({}) to active",
+                    t.id, t.file_name
+                );
             }
             promoted_out.extend(promoted);
             let _ = app_handle.emit(
@@ -21531,16 +22825,25 @@ async fn handle_upload_event(
 fn name_spam_penalty(name: &str) -> usize {
     let lower = name.to_lowercase();
     let mut score = 0;
-    for pat in ["http://", "https://", "www.", ".com/", ".org/", ".net/", "download at", "powered by"] {
-        if lower.contains(pat) { score += 10; }
+    for pat in [
+        "http://",
+        "https://",
+        "www.",
+        ".com/",
+        ".org/",
+        ".net/",
+        "download at",
+        "powered by",
+    ] {
+        if lower.contains(pat) {
+            score += 10;
+        }
     }
     score += name.matches('[').count().saturating_sub(1) * 3;
     score
 }
 
-fn convert_search_results(
-    entries: &[kad::messages::SearchResultEntry],
-) -> Vec<SearchResult> {
+fn convert_search_results(entries: &[kad::messages::SearchResultEntry]) -> Vec<SearchResult> {
     use crate::search::index::infer_file_type;
 
     struct ParsedEntry {
@@ -21598,65 +22901,91 @@ fn convert_search_results(
                 match &tag.name {
                     TagName::Id(TAG_MEDIA_ARTIST) => {
                         if let Some(s) = tag.string_value() {
-                            if !s.is_empty() { media.artist = Some(s.to_string()); }
+                            if !s.is_empty() {
+                                media.artist = Some(s.to_string());
+                            }
                         }
                     }
                     TagName::Id(TAG_MEDIA_ALBUM) => {
                         if let Some(s) = tag.string_value() {
-                            if !s.is_empty() { media.album = Some(s.to_string()); }
+                            if !s.is_empty() {
+                                media.album = Some(s.to_string());
+                            }
                         }
                     }
                     TagName::Id(TAG_MEDIA_TITLE) => {
                         if let Some(s) = tag.string_value() {
-                            if !s.is_empty() { media.title = Some(s.to_string()); }
+                            if !s.is_empty() {
+                                media.title = Some(s.to_string());
+                            }
                         }
                     }
                     TagName::Id(TAG_MEDIA_LENGTH) => {
                         if let Some(v) = parse_media_length(tag) {
-                            if v > 0 { media.duration = Some(v); }
+                            if v > 0 {
+                                media.duration = Some(v);
+                            }
                         }
                     }
                     TagName::Id(TAG_MEDIA_BITRATE) => {
                         if let Some(v) = tag.uint32_value() {
-                            if v > 0 { media.bitrate = Some(v); }
+                            if v > 0 {
+                                media.bitrate = Some(v);
+                            }
                         } else if let Some(v) = tag.uint16_value() {
-                            if v > 0 { media.bitrate = Some(v as u32); }
+                            if v > 0 {
+                                media.bitrate = Some(v as u32);
+                            }
                         }
                     }
                     TagName::Id(TAG_MEDIA_CODEC) => {
                         if let Some(s) = tag.string_value() {
-                            if !s.is_empty() { media.codec = Some(s.to_string()); }
+                            if !s.is_empty() {
+                                media.codec = Some(s.to_string());
+                            }
                         }
                     }
                     // ED2K-bridged KAD entries may carry the string tag names.
                     TagName::Str(s) if s.eq_ignore_ascii_case("artist") => {
                         if let Some(v) = tag.string_value() {
-                            if !v.is_empty() { media.artist = Some(v.to_string()); }
+                            if !v.is_empty() {
+                                media.artist = Some(v.to_string());
+                            }
                         }
                     }
                     TagName::Str(s) if s.eq_ignore_ascii_case("album") => {
                         if let Some(v) = tag.string_value() {
-                            if !v.is_empty() { media.album = Some(v.to_string()); }
+                            if !v.is_empty() {
+                                media.album = Some(v.to_string());
+                            }
                         }
                     }
                     TagName::Str(s) if s.eq_ignore_ascii_case("title") => {
                         if let Some(v) = tag.string_value() {
-                            if !v.is_empty() { media.title = Some(v.to_string()); }
+                            if !v.is_empty() {
+                                media.title = Some(v.to_string());
+                            }
                         }
                     }
                     TagName::Str(s) if s.eq_ignore_ascii_case("length") => {
                         if let Some(v) = parse_media_length(tag) {
-                            if v > 0 { media.duration = Some(v); }
+                            if v > 0 {
+                                media.duration = Some(v);
+                            }
                         }
                     }
                     TagName::Str(s) if s.eq_ignore_ascii_case("bitrate") => {
                         if let Some(v) = tag.uint32_value() {
-                            if v > 0 { media.bitrate = Some(v); }
+                            if v > 0 {
+                                media.bitrate = Some(v);
+                            }
                         }
                     }
                     TagName::Str(s) if s.eq_ignore_ascii_case("codec") => {
                         if let Some(v) = tag.string_value() {
-                            if !v.is_empty() { media.codec = Some(v.to_string()); }
+                            if !v.is_empty() {
+                                media.codec = Some(v.to_string());
+                            }
                         }
                     }
                     TagName::Id(TAG_FILENAME) => {
@@ -21814,13 +23143,27 @@ fn convert_search_results(
             // Fill any media fields this node provided that we don't have yet
             // (only allocate the struct when there's something to store).
             if !p.media.is_empty() {
-                let em = existing.media.get_or_insert_with(crate::types::MediaMetadata::default);
-                if em.duration.is_none() { em.duration = p.media.duration; }
-                if em.bitrate.is_none() { em.bitrate = p.media.bitrate; }
-                if em.codec.is_none() { em.codec = p.media.codec.clone(); }
-                if em.artist.is_none() { em.artist = p.media.artist.clone(); }
-                if em.album.is_none() { em.album = p.media.album.clone(); }
-                if em.title.is_none() { em.title = p.media.title.clone(); }
+                let em = existing
+                    .media
+                    .get_or_insert_with(crate::types::MediaMetadata::default);
+                if em.duration.is_none() {
+                    em.duration = p.media.duration;
+                }
+                if em.bitrate.is_none() {
+                    em.bitrate = p.media.bitrate;
+                }
+                if em.codec.is_none() {
+                    em.codec = p.media.codec.clone();
+                }
+                if em.artist.is_none() {
+                    em.artist = p.media.artist.clone();
+                }
+                if em.album.is_none() {
+                    em.album = p.media.album.clone();
+                }
+                if em.title.is_none() {
+                    em.title = p.media.title.clone();
+                }
             }
         } else {
             let mut source_addresses = Vec::new();
@@ -21958,7 +23301,11 @@ fn convert_note_search_results(
             Some(SearchResult {
                 file: FileInfo {
                     id: forced_hash.clone(),
-                    name: if name.is_empty() { "File note".to_string() } else { name },
+                    name: if name.is_empty() {
+                        "File note".to_string()
+                    } else {
+                        name
+                    },
                     path: String::new(),
                     size,
                     hash: forced_hash.clone(),
@@ -22057,9 +23404,7 @@ fn is_self_source(src: &KadSource, state: &NetworkState) -> bool {
     false
 }
 
-fn extract_kad_sources(
-    entries: &[kad::messages::SearchResultEntry],
-) -> Vec<KadSource> {
+fn extract_kad_sources(entries: &[kad::messages::SearchResultEntry]) -> Vec<KadSource> {
     let mut sources = Vec::new();
     for entry in entries {
         let mut ip = 0u32;
@@ -22075,25 +23420,39 @@ fn extract_kad_sources(
         for tag in &entry.tags {
             match &tag.name {
                 TagName::Id(TAG_SOURCEIP) => {
-                    if let Some(v) = tag.uint32_value() { ip = v; }
+                    if let Some(v) = tag.uint32_value() {
+                        ip = v;
+                    }
                 }
                 TagName::Id(TAG_SOURCEPORT) => {
-                    if let Some(v) = tag.uint16_value() { port = v; }
+                    if let Some(v) = tag.uint16_value() {
+                        port = v;
+                    }
                 }
                 TagName::Id(TAG_SOURCEUPORT) => {
-                    if let Some(v) = tag.uint16_value() { udp_port = v; }
+                    if let Some(v) = tag.uint16_value() {
+                        udp_port = v;
+                    }
                 }
                 TagName::Id(TAG_SOURCETYPE) => {
-                    if let Some(v) = tag.uint8_value() { source_type = v; }
+                    if let Some(v) = tag.uint8_value() {
+                        source_type = v;
+                    }
                 }
                 TagName::Id(TAG_ENCRYPTION) => {
-                    if let Some(v) = tag.uint8_value() { connect_options = v; }
+                    if let Some(v) = tag.uint8_value() {
+                        connect_options = v;
+                    }
                 }
                 TagName::Id(TAG_SERVERIP) => {
-                    if let Some(v) = tag.uint32_value() { server_ip = v; }
+                    if let Some(v) = tag.uint32_value() {
+                        server_ip = v;
+                    }
                 }
                 TagName::Id(TAG_SERVERPORT) => {
-                    if let Some(v) = tag.uint16_value() { server_port = v; }
+                    if let Some(v) = tag.uint16_value() {
+                        server_port = v;
+                    }
                 }
                 TagName::Id(TAG_BUDDYHASH) => {
                     if let Some(h) = tag.hash_value() {
@@ -22116,8 +23475,7 @@ fn extract_kad_sources(
                 // stays `false`, which is exactly what gates the broker.
                 TagName::Str(s) if s == "ember" => {
                     if let Some(v) = tag.uint8_value() {
-                        is_ember_capable =
-                            (v & kad::publish::EMBER_CAP_RELAY_PUNCH_V1) != 0;
+                        is_ember_capable = (v & kad::publish::EMBER_CAP_RELAY_PUNCH_V1) != 0;
                     }
                 }
                 // Ember Noise pubkey for the publisher — see
@@ -22149,7 +23507,10 @@ fn extract_kad_sources(
             1 | 4 => {
                 if ip != 0 && port != 0 {
                     let addr = Ipv4Addr::from(ip.to_be_bytes());
-                    if !sources.iter().any(|s: &KadSource| s.ip == addr && s.tcp_port == port) {
+                    if !sources
+                        .iter()
+                        .any(|s: &KadSource| s.ip == addr && s.tcp_port == port)
+                    {
                         sources.push(KadSource {
                             ip: addr,
                             tcp_port: port,
@@ -22170,8 +23531,15 @@ fn extract_kad_sources(
                 }
             }
             2 => {
-                if ip > 0 && ip < ed2k::server::LOWID_THRESHOLD && server_ip != 0 && server_port != 0 {
-                    if !sources.iter().any(|s: &KadSource| s.lowid == ip && s.ed2k_server_ip == server_ip) {
+                if ip > 0
+                    && ip < ed2k::server::LOWID_THRESHOLD
+                    && server_ip != 0
+                    && server_port != 0
+                {
+                    if !sources
+                        .iter()
+                        .any(|s: &KadSource| s.lowid == ip && s.ed2k_server_ip == server_ip)
+                    {
                         sources.push(KadSource {
                             ip: Ipv4Addr::UNSPECIFIED,
                             tcp_port: port,
@@ -22191,7 +23559,10 @@ fn extract_kad_sources(
                     }
                 } else if ip != 0 && port != 0 {
                     let addr = Ipv4Addr::from(ip.to_be_bytes());
-                    if !sources.iter().any(|s: &KadSource| s.ip == addr && s.tcp_port == port) {
+                    if !sources
+                        .iter()
+                        .any(|s: &KadSource| s.ip == addr && s.tcp_port == port)
+                    {
                         sources.push(KadSource {
                             ip: addr,
                             tcp_port: port,
@@ -22232,7 +23603,9 @@ fn extract_kad_sources(
                     // firewalled source ever connected back.
                     let b_ip = Ipv4Addr::from(server_ip.to_le_bytes());
                     let b_hash = buddy_hash.map(KadId);
-                    if !sources.iter().any(|s: &KadSource| s.buddy_ip == Some(b_ip) && s.buddy_port == Some(server_port)) {
+                    if !sources.iter().any(|s: &KadSource| {
+                        s.buddy_ip == Some(b_ip) && s.buddy_port == Some(server_port)
+                    }) {
                         sources.push(KadSource {
                             ip: source_addr,
                             tcp_port: port,
@@ -22253,7 +23626,10 @@ fn extract_kad_sources(
                 } else if ip != 0 && port != 0 {
                     let addr = Ipv4Addr::from(ip.to_be_bytes());
                     debug!("Source type {} without buddy tags, treating {addr}:{port} as direct fallback", source_type);
-                    if !sources.iter().any(|s: &KadSource| s.ip == addr && s.tcp_port == port) {
+                    if !sources
+                        .iter()
+                        .any(|s: &KadSource| s.ip == addr && s.tcp_port == port)
+                    {
                         sources.push(KadSource {
                             ip: addr,
                             tcp_port: port,
@@ -22277,7 +23653,10 @@ fn extract_kad_sources(
                 if ip != 0 && port != 0 {
                     let addr = Ipv4Addr::from(ip.to_be_bytes());
                     debug!("Type-6 source {addr}:{port} treated as direct fallback");
-                    if !sources.iter().any(|s: &KadSource| s.ip == addr && s.tcp_port == port) {
+                    if !sources
+                        .iter()
+                        .any(|s: &KadSource| s.ip == addr && s.tcp_port == port)
+                    {
                         sources.push(KadSource {
                             ip: addr,
                             tcp_port: port,
@@ -22300,7 +23679,10 @@ fn extract_kad_sources(
             _ => {
                 if ip != 0 && port != 0 {
                     let addr = Ipv4Addr::from(ip.to_be_bytes());
-                    if !sources.iter().any(|s: &KadSource| s.ip == addr && s.tcp_port == port) {
+                    if !sources
+                        .iter()
+                        .any(|s: &KadSource| s.ip == addr && s.tcp_port == port)
+                    {
                         sources.push(KadSource {
                             ip: addr,
                             tcp_port: port,
@@ -22331,8 +23713,15 @@ enum KadSearchExpr {
     Or(Box<KadSearchExpr>, Box<KadSearchExpr>),
     Not(Box<KadSearchExpr>, Box<KadSearchExpr>),
     String(String),
-    MetaString { tag: SearchTagRef, value: String },
-    Numeric { tag: SearchTagRef, op: KadNumericOp, value: u64 },
+    MetaString {
+        tag: SearchTagRef,
+        value: String,
+    },
+    Numeric {
+        tag: SearchTagRef,
+        op: KadNumericOp,
+        value: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -22394,13 +23783,24 @@ fn parse_kad_search_expression_node(
     match ReadBytesExt::read_u8(cursor)? {
         0x00 => {
             let op = ReadBytesExt::read_u8(cursor)?;
-            let left = Box::new(parse_kad_search_expression_node(cursor, depth + 1, node_budget)?);
-            let right = Box::new(parse_kad_search_expression_node(cursor, depth + 1, node_budget)?);
+            let left = Box::new(parse_kad_search_expression_node(
+                cursor,
+                depth + 1,
+                node_budget,
+            )?);
+            let right = Box::new(parse_kad_search_expression_node(
+                cursor,
+                depth + 1,
+                node_budget,
+            )?);
             match op {
                 0x00 => Ok(KadSearchExpr::And(left, right)),
                 0x01 => Ok(KadSearchExpr::Or(left, right)),
                 0x02 => Ok(KadSearchExpr::Not(left, right)),
-                _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "unknown boolean search operator")),
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unknown boolean search operator",
+                )),
             }
         }
         0x01 => Ok(KadSearchExpr::String(read_kad_search_string(cursor)?)),
@@ -22421,7 +23821,10 @@ fn parse_kad_search_expression_node(
             let tag = read_kad_search_tag_ref(cursor)?;
             Ok(KadSearchExpr::Numeric { tag, op, value })
         }
-        _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "unknown search expression node")),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unknown search expression node",
+        )),
     }
 }
 
@@ -22433,7 +23836,10 @@ fn read_kad_numeric_op(op: u8) -> std::io::Result<KadNumericOp> {
         0x03 => Ok(KadNumericOp::Ge),
         0x04 => Ok(KadNumericOp::Le),
         0x05 => Ok(KadNumericOp::Ne),
-        _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "unknown numeric search operator")),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unknown numeric search operator",
+        )),
     }
 }
 
@@ -22442,7 +23848,10 @@ fn read_kad_search_string(cursor: &mut Cursor<&[u8]>) -> std::io::Result<String>
     let start = cursor.position() as usize;
     let end = start.saturating_add(len);
     if end > cursor.get_ref().len() {
-        return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "search string exceeds payload"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "search string exceeds payload",
+        ));
     }
     let bytes = &cursor.get_ref()[start..end];
     cursor.set_position(end as u64);
@@ -22454,37 +23863,54 @@ fn read_kad_search_tag_ref(cursor: &mut Cursor<&[u8]>) -> std::io::Result<Search
     let start = cursor.position() as usize;
     let end = start.saturating_add(len);
     if end > cursor.get_ref().len() {
-        return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "search tag name exceeds payload"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "search tag name exceeds payload",
+        ));
     }
     let bytes = &cursor.get_ref()[start..end];
     cursor.set_position(end as u64);
     if len == 1 {
         Ok(SearchTagRef::Id(bytes[0]))
     } else {
-        Ok(SearchTagRef::Str(String::from_utf8_lossy(bytes).to_string().to_lowercase()))
+        Ok(SearchTagRef::Str(
+            String::from_utf8_lossy(bytes).to_string().to_lowercase(),
+        ))
     }
 }
 
-fn matches_search_expr_for_local_file(expr: &KadSearchExpr, file_name: &str, file_size: u64) -> bool {
+fn matches_search_expr_for_local_file(
+    expr: &KadSearchExpr,
+    file_name: &str,
+    file_size: u64,
+) -> bool {
     let lower_name = file_name.to_lowercase();
     let extension = file_name
         .rsplit_once('.')
         .map(|(_, ext)| ext.to_string())
         .unwrap_or_default();
     let file_type = crate::search::index::infer_file_type(&extension);
-    let tags = vec![
-        KadTag { name: TagName::Id(TAG_FILETYPE), value: TagValue::String(file_type) },
-    ];
+    let tags = vec![KadTag {
+        name: TagName::Id(TAG_FILETYPE),
+        value: TagValue::String(file_type),
+    }];
     matches_search_expr_impl(expr, &lower_name, file_size, Some(&tags))
 }
 
-fn matches_search_expr_for_entry(expr: &KadSearchExpr, entry: &kad::messages::SearchResultEntry) -> bool {
-    let file_name = entry.tags.iter()
+fn matches_search_expr_for_entry(
+    expr: &KadSearchExpr,
+    entry: &kad::messages::SearchResultEntry,
+) -> bool {
+    let file_name = entry
+        .tags
+        .iter()
         .find(|tag| matches!(&tag.name, TagName::Id(TAG_FILENAME)))
         .and_then(|tag| tag.string_value())
         .unwrap_or_default()
         .to_lowercase();
-    let file_size = entry.tags.iter()
+    let file_size = entry
+        .tags
+        .iter()
         .find_map(search_entry_tag_u64)
         .unwrap_or(0);
     matches_search_expr_impl(expr, &file_name, file_size, Some(&entry.tags))
@@ -22541,7 +23967,8 @@ fn matches_search_expr_impl(
                 tags.iter()
                     .find(|entry_tag| tag_name_matches(tag, &entry_tag.name))
                     .and_then(|entry_tag| {
-                        entry_tag.uint64_value()
+                        entry_tag
+                            .uint64_value()
                             .or_else(|| entry_tag.uint32_value().map(|v| v as u64))
                             .or_else(|| entry_tag.uint16_value().map(|v| v as u64))
                             .or_else(|| entry_tag.uint8_value().map(|v| v as u64))
@@ -22549,14 +23976,16 @@ fn matches_search_expr_impl(
             } else {
                 None
             };
-            numeric.map(|actual| match op {
-                KadNumericOp::Eq => actual == *value,
-                KadNumericOp::Gt => actual > *value,
-                KadNumericOp::Lt => actual < *value,
-                KadNumericOp::Ge => actual >= *value,
-                KadNumericOp::Le => actual <= *value,
-                KadNumericOp::Ne => actual != *value,
-            }).unwrap_or(false)
+            numeric
+                .map(|actual| match op {
+                    KadNumericOp::Eq => actual == *value,
+                    KadNumericOp::Gt => actual > *value,
+                    KadNumericOp::Lt => actual < *value,
+                    KadNumericOp::Ge => actual >= *value,
+                    KadNumericOp::Le => actual <= *value,
+                    KadNumericOp::Ne => actual != *value,
+                })
+                .unwrap_or(false)
         }
     }
 }
@@ -22584,9 +24013,17 @@ fn tag_matches_filesize(tag: &SearchTagRef) -> bool {
     }
 }
 
-fn matches_requested_file_size(entry: &kad::messages::SearchResultEntry, requested_size: u64) -> bool {
+fn matches_requested_file_size(
+    entry: &kad::messages::SearchResultEntry,
+    requested_size: u64,
+) -> bool {
     if requested_size == 0 {
         return true;
     }
-    entry.tags.iter().find_map(search_entry_tag_u64).map(|size| size == requested_size).unwrap_or(true)
+    entry
+        .tags
+        .iter()
+        .find_map(search_entry_tag_u64)
+        .map(|size| size == requested_size)
+        .unwrap_or(true)
 }

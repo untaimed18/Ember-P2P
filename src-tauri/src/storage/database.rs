@@ -39,13 +39,16 @@ impl Database {
     fn run_migrations(&self) -> anyhow::Result<()> {
         let conn = self.conn.lock();
 
-        conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL DEFAULT 0);")?;
-        let version: i64 = conn.query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM schema_version",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL DEFAULT 0);",
+        )?;
+        let version: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
 
         // Refuse to run against a database that was last opened by a newer
         // Ember build. Silently running would invite subtle data corruption
@@ -63,7 +66,10 @@ impl Database {
 
         let set_version = |tx: &Connection, v: i64| -> anyhow::Result<()> {
             tx.execute("DELETE FROM schema_version", [])?;
-            tx.execute("INSERT INTO schema_version (version) VALUES (?1)", params![v])?;
+            tx.execute(
+                "INSERT INTO schema_version (version) VALUES (?1)",
+                params![v],
+            )?;
             Ok(())
         };
 
@@ -115,7 +121,12 @@ impl Database {
                 CREATE INDEX IF NOT EXISTS idx_transfers_status ON transfers(status);
                 ",
             )?;
-            Self::add_column_if_missing(&tx, "shared_files", "aich_hash", "TEXT NOT NULL DEFAULT ''")?;
+            Self::add_column_if_missing(
+                &tx,
+                "shared_files",
+                "aich_hash",
+                "TEXT NOT NULL DEFAULT ''",
+            )?;
             set_version(&tx, 1)?;
             tx.commit()?;
         }
@@ -154,14 +165,24 @@ impl Database {
 
         if version < 4 {
             let tx = conn.unchecked_transaction()?;
-            Self::add_column_if_missing(&tx, "shared_files", "shared", "INTEGER NOT NULL DEFAULT 1")?;
+            Self::add_column_if_missing(
+                &tx,
+                "shared_files",
+                "shared",
+                "INTEGER NOT NULL DEFAULT 1",
+            )?;
             set_version(&tx, 4)?;
             tx.commit()?;
         }
 
         if version < 5 {
             let tx = conn.unchecked_transaction()?;
-            Self::add_column_if_missing(&tx, "transfers", "priority", "TEXT NOT NULL DEFAULT 'normal'")?;
+            Self::add_column_if_missing(
+                &tx,
+                "transfers",
+                "priority",
+                "TEXT NOT NULL DEFAULT 'normal'",
+            )?;
             Self::add_column_if_missing(&tx, "transfers", "category", "TEXT NOT NULL DEFAULT ''")?;
             set_version(&tx, 5)?;
             tx.commit()?;
@@ -210,17 +231,23 @@ impl Database {
                  DROP TABLE IF EXISTS settings_v7_backup;
                  DROP INDEX IF EXISTS idx_shared_files_hash;",
             )?;
-            let has_shared: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='shared_files'",
-                [], |r| r.get(0),
-            ).unwrap_or(0);
+            let has_shared: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='shared_files'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
             if has_shared > 0 {
                 tx.execute_batch("ALTER TABLE shared_files RENAME TO shared_files_v7_backup;")?;
             }
-            let has_settings: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='settings'",
-                [], |r| r.get(0),
-            ).unwrap_or(0);
+            let has_settings: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='settings'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
             if has_settings > 0 {
                 tx.execute_batch("ALTER TABLE settings RENAME TO settings_v7_backup;")?;
             }
@@ -265,7 +292,12 @@ impl Database {
         if version < 11 {
             let tx = conn.unchecked_transaction()?;
             Self::add_column_if_missing(&tx, "friend_requests", "sender_ip", "TEXT DEFAULT ''")?;
-            Self::add_column_if_missing(&tx, "friend_requests", "sender_port", "INTEGER DEFAULT 0")?;
+            Self::add_column_if_missing(
+                &tx,
+                "friend_requests",
+                "sender_port",
+                "INTEGER DEFAULT 0",
+            )?;
             set_version(&tx, 11)?;
             tx.commit()?;
         }
@@ -279,7 +311,7 @@ impl Database {
                     file_size INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL,
                     timestamp INTEGER NOT NULL
-                );"
+                );",
             )?;
             set_version(&tx, 12)?;
             tx.commit()?;
@@ -311,7 +343,12 @@ impl Database {
             // unverified. Re-sending a friend request will refresh the
             // flag per the latest exchange.
             let tx = conn.unchecked_transaction()?;
-            Self::add_column_if_missing(&tx, "friend_requests", "verified", "INTEGER NOT NULL DEFAULT 0")?;
+            Self::add_column_if_missing(
+                &tx,
+                "friend_requests",
+                "verified",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
             set_version(&tx, 14)?;
             tx.commit()?;
         }
@@ -381,7 +418,12 @@ impl Database {
             // are correct for rows migrated from v16.
             let tx = conn.unchecked_transaction()?;
             Self::add_column_if_missing(&tx, "credits", "ident_ip", "INTEGER NOT NULL DEFAULT 0")?;
-            Self::add_column_if_missing(&tx, "credits", "ident_state", "INTEGER NOT NULL DEFAULT 0")?;
+            Self::add_column_if_missing(
+                &tx,
+                "credits",
+                "ident_state",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
             set_version(&tx, 17)?;
             tx.commit()?;
         }
@@ -426,8 +468,11 @@ impl Database {
     ) -> anyhow::Result<()> {
         let valid_ident =
             |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-        let valid_col_type =
-            |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == ' ' || c == '\'');
+        let valid_col_type = |s: &str| {
+            !s.is_empty()
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == ' ' || c == '\'')
+        };
         if !valid_ident(table) || !valid_ident(column) || !valid_col_type(col_type) {
             anyhow::bail!("Invalid SQL identifier in migration: {table}.{column} {col_type}");
         }
@@ -436,9 +481,8 @@ impl Database {
             .is_ok();
         if !has_column {
             let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {col_type}");
-            conn.execute(&sql, []).map_err(|e| {
-                anyhow::anyhow!("Failed to add column {table}.{column}: {e}")
-            })?;
+            conn.execute(&sql, [])
+                .map_err(|e| anyhow::anyhow!("Failed to add column {table}.{column}: {e}"))?;
             info!("Added column {table}.{column}");
         }
         Ok(())
@@ -490,7 +534,10 @@ impl Database {
             })?
             .filter_map(|r| match r {
                 Ok(v) => Some(v),
-                Err(e) => { tracing::warn!("Failed to read DB row: {e}"); None }
+                Err(e) => {
+                    tracing::warn!("Failed to read DB row: {e}");
+                    None
+                }
             })
             .collect();
 
@@ -529,7 +576,11 @@ impl Database {
     /// upserted with `banned = 1` so a peer we only ever saw as an inbound
     /// uploader still exists for `unban_peer` to flip. Idempotent: an IP
     /// already present (under any port) is not duplicated.
-    pub fn add_banned_peer_address(&self, peer_id: &str, ip: std::net::Ipv4Addr) -> anyhow::Result<()> {
+    pub fn add_banned_peer_address(
+        &self,
+        peer_id: &str,
+        ip: std::net::Ipv4Addr,
+    ) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         let existing: Option<String> = conn
             .query_row(
@@ -564,7 +615,12 @@ impl Database {
     /// (0 = permanent). Re-banning an already-listed IP refreshes the
     /// reason and extends the expiry, never shortening an existing
     /// permanent ban down to a finite one.
-    pub fn ban_ip(&self, ip: std::net::Ipv4Addr, reason: &str, expires_at: u64) -> anyhow::Result<()> {
+    pub fn ban_ip(
+        &self,
+        ip: std::net::Ipv4Addr,
+        reason: &str,
+        expires_at: u64,
+    ) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -579,7 +635,12 @@ impl Database {
                  WHEN banned_ips.expires_at = 0 OR excluded.expires_at = 0 THEN 0
                  ELSE MAX(banned_ips.expires_at, excluded.expires_at)
                END",
-            params![ip.to_string(), reason, now as i64, expires_at.min(i64::MAX as u64) as i64],
+            params![
+                ip.to_string(),
+                reason,
+                now as i64,
+                expires_at.min(i64::MAX as u64) as i64
+            ],
         )?;
         Ok(())
     }
@@ -587,7 +648,10 @@ impl Database {
     /// Remove an automatic IP ban.
     pub fn unban_ip(&self, ip: std::net::Ipv4Addr) -> anyhow::Result<()> {
         let conn = self.conn.lock();
-        conn.execute("DELETE FROM banned_ips WHERE ip = ?1", params![ip.to_string()])?;
+        conn.execute(
+            "DELETE FROM banned_ips WHERE ip = ?1",
+            params![ip.to_string()],
+        )?;
         Ok(())
     }
 
@@ -599,7 +663,10 @@ impl Database {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0) as i64;
-        conn.execute("DELETE FROM banned_ips WHERE expires_at != 0 AND expires_at <= ?1", params![now])?;
+        conn.execute(
+            "DELETE FROM banned_ips WHERE expires_at != 0 AND expires_at <= ?1",
+            params![now],
+        )?;
         let mut stmt = conn.prepare("SELECT ip FROM banned_ips")?;
         let ips = stmt
             .query_map([], |row| row.get::<_, String>(0))?
@@ -721,7 +788,9 @@ impl Database {
                     failure_reason: None,
                     failure_kind: None,
                     failure_stage: None,
-                    priority: row.get::<_, String>(12).unwrap_or_else(|_| "normal".to_string()),
+                    priority: row
+                        .get::<_, String>(12)
+                        .unwrap_or_else(|_| "normal".to_string()),
                     sources: 0,
                     active_sources: 0,
                     queued_sources: 0,
@@ -763,7 +832,8 @@ impl Database {
             "SELECT 1 FROM transfers WHERE id = ?1",
             params![transfer_id],
             |_| Ok(()),
-        ).is_ok()
+        )
+        .is_ok()
     }
 
     pub fn remove_transfer(&self, transfer_id: &str) -> anyhow::Result<()> {
@@ -793,12 +863,21 @@ impl Database {
             "UPDATE transfers
              SET transferred = ?1, progress = ?2, speed = ?3
              WHERE id = ?4",
-            params![i64::try_from(transferred).unwrap_or(i64::MAX), progress, i64::try_from(speed).unwrap_or(i64::MAX), transfer_id],
+            params![
+                i64::try_from(transferred).unwrap_or(i64::MAX),
+                progress,
+                i64::try_from(speed).unwrap_or(i64::MAX),
+                transfer_id
+            ],
         )?;
         Ok(())
     }
 
-    pub fn update_transfer_priority(&self, transfer_id: &str, priority: &str) -> anyhow::Result<()> {
+    pub fn update_transfer_priority(
+        &self,
+        transfer_id: &str,
+        priority: &str,
+    ) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         conn.execute(
             "UPDATE transfers SET priority = ?1 WHERE id = ?2",
@@ -807,7 +886,11 @@ impl Database {
         Ok(())
     }
 
-    pub fn update_transfer_category(&self, transfer_id: &str, category: &str) -> anyhow::Result<()> {
+    pub fn update_transfer_category(
+        &self,
+        transfer_id: &str,
+        category: &str,
+    ) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         conn.execute(
             "UPDATE transfers SET category = ?1 WHERE id = ?2",
@@ -823,7 +906,11 @@ impl Database {
             .query_map([], |row| {
                 let hash_blob: Vec<u8> = row.get(0)?;
                 if hash_blob.len() < 16 {
-                    return Err(rusqlite::Error::InvalidColumnType(0, "user_hash too short".into(), rusqlite::types::Type::Blob));
+                    return Err(rusqlite::Error::InvalidColumnType(
+                        0,
+                        "user_hash too short".into(),
+                        rusqlite::types::Type::Blob,
+                    ));
                 }
                 let mut hash = [0u8; 16];
                 hash.copy_from_slice(&hash_blob[..16]);
@@ -854,7 +941,9 @@ impl Database {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT key, value FROM statistics")?;
         let rows = stmt
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
             .filter_map(|r| match r {
                 Ok(v) => Some(v),
                 Err(e) => {
@@ -870,7 +959,8 @@ impl Database {
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
         {
-            let mut stmt = tx.prepare("INSERT OR REPLACE INTO statistics (key, value) VALUES (?1, ?2)")?;
+            let mut stmt =
+                tx.prepare("INSERT OR REPLACE INTO statistics (key, value) VALUES (?1, ?2)")?;
             for (key, value) in pairs {
                 stmt.execute(params![key, value])?;
             }
@@ -901,7 +991,12 @@ impl Database {
         Ok(rows)
     }
 
-    pub fn save_file_comment(&self, file_hash: &str, rating: u8, comment: &str) -> anyhow::Result<()> {
+    pub fn save_file_comment(
+        &self,
+        file_hash: &str,
+        rating: u8,
+        comment: &str,
+    ) -> anyhow::Result<()> {
         // Defense-in-depth cap matching the IPC layer
         // (`commands/comments.rs::set_file_comment`). The IPC entry point
         // already rejects > 4096-byte comments, but enforcing it again
@@ -930,8 +1025,8 @@ impl Database {
     /// after a restart instead of silently expiring from the network.
     pub fn load_published_notes(&self) -> anyhow::Result<Vec<(String, u8, String, i64)>> {
         let conn = self.conn.lock();
-        let mut stmt = conn
-            .prepare("SELECT file_hash, rating, comment, last_publish FROM published_notes")?;
+        let mut stmt =
+            conn.prepare("SELECT file_hash, rating, comment, last_publish FROM published_notes")?;
         let rows = stmt
             .query_map([], |row| {
                 Ok((
@@ -996,7 +1091,10 @@ impl Database {
     // Retained as a focused, unit-tested building block (full-replacement
     // semantics); production flushes go through `save_all_credits_with_ember`.
     #[allow(dead_code)]
-    pub fn save_all_credits(&self, credits: &[(&[u8; 16], u64, u64, i64, &[u8], u32, u8)]) -> anyhow::Result<()> {
+    pub fn save_all_credits(
+        &self,
+        credits: &[(&[u8; 16], u64, u64, i64, &[u8], u32, u8)],
+    ) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
         tx.execute("DELETE FROM credits", [])?;
@@ -1004,8 +1102,18 @@ impl Database {
             let mut stmt = tx.prepare(
                 "INSERT INTO credits (user_hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
             )?;
-            for (hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state) in credits {
-                stmt.execute(params![&hash[..], i64::try_from(*uploaded).unwrap_or(i64::MAX), i64::try_from(*downloaded).unwrap_or(i64::MAX), *last_seen, *public_key, i64::from(*ident_ip), i64::from(*ident_state)])?;
+            for (hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state) in
+                credits
+            {
+                stmt.execute(params![
+                    &hash[..],
+                    i64::try_from(*uploaded).unwrap_or(i64::MAX),
+                    i64::try_from(*downloaded).unwrap_or(i64::MAX),
+                    *last_seen,
+                    *public_key,
+                    i64::from(*ident_ip),
+                    i64::from(*ident_state)
+                ])?;
             }
         }
         tx.commit()?;
@@ -1097,7 +1205,19 @@ impl Database {
                     completed_sessions, total_sessions, avg_upload_speed, last_seen, ident_verified\
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?;
-            for (pk, up, down, last_up, last_down, completed, total, avg_speed, last_seen, verified) in credits {
+            for (
+                pk,
+                up,
+                down,
+                last_up,
+                last_down,
+                completed,
+                total,
+                avg_speed,
+                last_seen,
+                verified,
+            ) in credits
+            {
                 stmt.execute(params![
                     &pk[..],
                     i64::try_from(*up).unwrap_or(i64::MAX),
@@ -1137,8 +1257,18 @@ impl Database {
             let mut stmt = tx.prepare(
                 "INSERT INTO credits (user_hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
             )?;
-            for (hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state) in credits {
-                stmt.execute(params![&hash[..], i64::try_from(*uploaded).unwrap_or(i64::MAX), i64::try_from(*downloaded).unwrap_or(i64::MAX), *last_seen, *public_key, i64::from(*ident_ip), i64::from(*ident_state)])?;
+            for (hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state) in
+                credits
+            {
+                stmt.execute(params![
+                    &hash[..],
+                    i64::try_from(*uploaded).unwrap_or(i64::MAX),
+                    i64::try_from(*downloaded).unwrap_or(i64::MAX),
+                    *last_seen,
+                    *public_key,
+                    i64::from(*ident_ip),
+                    i64::from(*ident_state)
+                ])?;
             }
         }
         tx.execute("DELETE FROM ember_credits", [])?;
@@ -1149,7 +1279,19 @@ impl Database {
                     completed_sessions, total_sessions, avg_upload_speed, last_seen, ident_verified\
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?;
-            for (pk, up, down, last_up, last_down, completed, total, avg_speed, last_seen, verified) in ember_credits {
+            for (
+                pk,
+                up,
+                down,
+                last_up,
+                last_down,
+                completed,
+                total,
+                avg_speed,
+                last_seen,
+                verified,
+            ) in ember_credits
+            {
                 stmt.execute(params![
                     &pk[..],
                     i64::try_from(*up).unwrap_or(i64::MAX),
@@ -1182,16 +1324,26 @@ impl Database {
     pub fn remove_friend(&self, user_hash: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM chat_messages WHERE friend_hash = ?1", params![user_hash])?;
-        tx.execute("DELETE FROM friends WHERE user_hash = ?1", params![user_hash])?;
-        tx.execute("DELETE FROM friend_requests WHERE sender_hash = ?1", params![user_hash])?;
+        tx.execute(
+            "DELETE FROM chat_messages WHERE friend_hash = ?1",
+            params![user_hash],
+        )?;
+        tx.execute(
+            "DELETE FROM friends WHERE user_hash = ?1",
+            params![user_hash],
+        )?;
+        tx.execute(
+            "DELETE FROM friend_requests WHERE sender_hash = ?1",
+            params![user_hash],
+        )?;
         tx.commit()?;
         Ok(())
     }
 
     pub fn get_friends(&self) -> anyhow::Result<Vec<(String, String, i64)>> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare("SELECT user_hash, nickname, added_at FROM friends ORDER BY added_at DESC")?;
+        let mut stmt = conn
+            .prepare("SELECT user_hash, nickname, added_at FROM friends ORDER BY added_at DESC")?;
         let rows = stmt
             .query_map([], |row| {
                 Ok((
@@ -1218,7 +1370,12 @@ impl Database {
         Ok(updated > 0)
     }
 
-    pub fn update_friend_address(&self, user_hash: &str, ip: &str, port: u16) -> anyhow::Result<()> {
+    pub fn update_friend_address(
+        &self,
+        user_hash: &str,
+        ip: &str,
+        port: u16,
+    ) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         let now = chrono::Utc::now().timestamp();
         conn.execute(
@@ -1243,7 +1400,10 @@ impl Database {
             "SELECT COALESCE(last_ip, ''), COALESCE(last_port, 0) FROM friends WHERE user_hash = ?1"
         )?;
         let result = stmt.query_row(params![user_hash], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?.clamp(0, u16::MAX as i64) as u16))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?.clamp(0, u16::MAX as i64) as u16,
+            ))
         });
         match result {
             Ok((ip, port)) if !ip.is_empty() && port > 0 => Ok(Some((ip, port))),
@@ -1253,7 +1413,9 @@ impl Database {
         }
     }
 
-    pub fn get_friends_full(&self) -> anyhow::Result<Vec<(String, String, i64, String, u16, i64, bool)>> {
+    pub fn get_friends_full(
+        &self,
+    ) -> anyhow::Result<Vec<(String, String, i64, String, u16, i64, bool)>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT user_hash, nickname, added_at, COALESCE(last_ip, ''), COALESCE(last_port, 0), COALESCE(last_seen, 0), COALESCE(mutual, 0) FROM friends ORDER BY added_at DESC"
@@ -1275,7 +1437,14 @@ impl Database {
         Ok(rows)
     }
 
-    pub fn add_friend_request(&self, sender_hash: &str, nickname: &str, sender_ip: &str, sender_port: u16, verified: bool) -> anyhow::Result<()> {
+    pub fn add_friend_request(
+        &self,
+        sender_hash: &str,
+        nickname: &str,
+        sender_ip: &str,
+        sender_port: u16,
+        verified: bool,
+    ) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         let now = chrono::Utc::now().timestamp();
 
@@ -1294,17 +1463,17 @@ impl Database {
         // the cap — it just refreshes the existing row via the
         // UPSERT.
         const MAX_FRIEND_REQUESTS: i64 = 100;
-        let already_present: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM friend_requests WHERE sender_hash = ?1",
-            params![sender_hash],
-            |row| row.get(0),
-        ).unwrap_or(0);
-        if already_present == 0 {
-            let total: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM friend_requests",
-                [],
+        let already_present: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM friend_requests WHERE sender_hash = ?1",
+                params![sender_hash],
                 |row| row.get(0),
-            ).unwrap_or(0);
+            )
+            .unwrap_or(0);
+        if already_present == 0 {
+            let total: i64 = conn
+                .query_row("SELECT COUNT(*) FROM friend_requests", [], |row| row.get(0))
+                .unwrap_or(0);
             if total >= MAX_FRIEND_REQUESTS {
                 let to_evict = (total - MAX_FRIEND_REQUESTS + 1).max(1);
                 let evicted_unverified = conn.execute(
@@ -1351,7 +1520,9 @@ impl Database {
         Ok(())
     }
 
-    pub fn get_friend_requests(&self) -> anyhow::Result<Vec<(String, String, i64, String, u16, bool)>> {
+    pub fn get_friend_requests(
+        &self,
+    ) -> anyhow::Result<Vec<(String, String, i64, String, u16, bool)>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT sender_hash, sender_nickname, received_at, COALESCE(sender_ip, ''), COALESCE(sender_port, 0), COALESCE(verified, 0) FROM friend_requests ORDER BY received_at DESC"
@@ -1374,7 +1545,10 @@ impl Database {
 
     pub fn remove_friend_request(&self, sender_hash: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock();
-        conn.execute("DELETE FROM friend_requests WHERE sender_hash = ?1", params![sender_hash])?;
+        conn.execute(
+            "DELETE FROM friend_requests WHERE sender_hash = ?1",
+            params![sender_hash],
+        )?;
         Ok(())
     }
 
@@ -1495,7 +1669,12 @@ impl Database {
         Ok(updated)
     }
 
-    pub fn insert_chat_message(&self, friend_hash: &str, direction: &str, message: &str) -> anyhow::Result<i64> {
+    pub fn insert_chat_message(
+        &self,
+        friend_hash: &str,
+        direction: &str,
+        message: &str,
+    ) -> anyhow::Result<i64> {
         // Cap stored message length. Incoming chat text comes straight off
         // the wire from a peer, so bound it here (on a char boundary, so we
         // never split a multi-byte sequence) to stop a hostile friend from
@@ -1543,23 +1722,46 @@ impl Database {
         Ok(new_id)
     }
 
-    pub fn get_chat_messages(&self, friend_hash: &str, limit: i64, before_id: Option<i64>) -> anyhow::Result<Vec<(i64, String, String, i64, bool)>> {
+    pub fn get_chat_messages(
+        &self,
+        friend_hash: &str,
+        limit: i64,
+        before_id: Option<i64>,
+    ) -> anyhow::Result<Vec<(i64, String, String, i64, bool)>> {
         let conn = self.conn.lock();
         if let Some(bid) = before_id {
             let mut stmt = conn.prepare(
                 "SELECT id, direction, message, timestamp, read FROM chat_messages WHERE friend_hash = ?1 AND id < ?2 ORDER BY id DESC LIMIT ?3"
             )?;
-            let rows = stmt.query_map(params![friend_hash, bid, limit], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get::<_, i64>(4)? != 0))
-            })?.filter_map(|r| r.ok()).collect();
+            let rows = stmt
+                .query_map(params![friend_hash, bid, limit], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get::<_, i64>(4)? != 0,
+                    ))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
             Ok(rows)
         } else {
             let mut stmt = conn.prepare(
                 "SELECT id, direction, message, timestamp, read FROM chat_messages WHERE friend_hash = ?1 ORDER BY id DESC LIMIT ?2"
             )?;
-            let rows = stmt.query_map(params![friend_hash, limit], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get::<_, i64>(4)? != 0))
-            })?.filter_map(|r| r.ok()).collect();
+            let rows = stmt
+                .query_map(params![friend_hash, limit], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get::<_, i64>(4)? != 0,
+                    ))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
             Ok(rows)
         }
     }
@@ -1576,7 +1778,7 @@ impl Database {
     pub fn unread_message_counts(&self) -> anyhow::Result<Vec<(String, i64)>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT friend_hash, COUNT(*) FROM chat_messages WHERE read = 0 GROUP BY friend_hash"
+            "SELECT friend_hash, COUNT(*) FROM chat_messages WHERE read = 0 GROUP BY friend_hash",
         )?;
         let rows = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
@@ -1628,7 +1830,13 @@ impl Database {
                file_size = excluded.file_size,
                status = excluded.status,
                timestamp = excluded.timestamp",
-            params![file_hash, file_name, i64::try_from(file_size).unwrap_or(i64::MAX), status, now],
+            params![
+                file_hash,
+                file_name,
+                i64::try_from(file_size).unwrap_or(i64::MAX),
+                status,
+                now
+            ],
         )?;
         Ok(())
     }
@@ -1652,7 +1860,8 @@ impl Database {
                 placeholders.join(",")
             );
             let mut stmt = conn.prepare(&sql)?;
-            let params: Vec<&dyn rusqlite::ToSql> = chunk.iter().map(|h| h as &dyn rusqlite::ToSql).collect();
+            let params: Vec<&dyn rusqlite::ToSql> =
+                chunk.iter().map(|h| h as &dyn rusqlite::ToSql).collect();
             let rows = stmt
                 .query_map(params.as_slice(), |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -1668,14 +1877,20 @@ impl Database {
     /// Remove a specific file from download history (per-row user override).
     pub fn remove_download_history(&self, file_hash: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock();
-        conn.execute("DELETE FROM download_history WHERE file_hash = ?1", params![file_hash])?;
+        conn.execute(
+            "DELETE FROM download_history WHERE file_hash = ?1",
+            params![file_hash],
+        )?;
         Ok(())
     }
 
     /// Clear all download history entries of a given status.
     pub fn clear_download_history(&self, status: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock();
-        conn.execute("DELETE FROM download_history WHERE status = ?1", params![status])?;
+        conn.execute(
+            "DELETE FROM download_history WHERE status = ?1",
+            params![status],
+        )?;
         Ok(())
     }
 
@@ -1717,7 +1932,9 @@ mod tests {
             );",
         )
         .expect("create schema");
-        Database { conn: Mutex::new(conn) }
+        Database {
+            conn: Mutex::new(conn),
+        }
     }
 
     /// Regression: `save_all_credits` MUST act as a full replacement so
@@ -1792,7 +2009,9 @@ mod tests {
             );",
         )
         .expect("create schema");
-        Database { conn: Mutex::new(conn) }
+        Database {
+            conn: Mutex::new(conn),
+        }
     }
 
     #[test]

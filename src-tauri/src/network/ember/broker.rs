@@ -112,12 +112,15 @@ pub async fn punch_quic(
     endpoint: &quinn::Endpoint,
     addr: SocketAddr,
 ) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
-    let conn = endpoint.connect(addr, "ember-punch")
+    let conn = endpoint
+        .connect(addr, "ember-punch")
         .map_err(|e| format!("quinn connect error: {e}"))?
         .await
         .map_err(|e| format!("QUIC handshake failed with {addr}: {e}"))?;
 
-    let (send, recv) = conn.open_bi().await
+    let (send, recv) = conn
+        .open_bi()
+        .await
         .map_err(|e| format!("QUIC open_bi failed: {e}"))?;
 
     Ok((send, recv))
@@ -177,15 +180,9 @@ pub enum BrokerEvent {
         reason: String,
     },
     /// Spawned punch task reports failure -- broker should escalate to relay.
-    PunchFailed {
-        attempt_key: String,
-        reason: String,
-    },
+    PunchFailed { attempt_key: String, reason: String },
     /// Spawned relay task reports failure -- broker should emit ConnectionFailed.
-    RelayFailed {
-        attempt_key: String,
-        reason: String,
-    },
+    RelayFailed { attempt_key: String, reason: String },
 }
 
 impl ConnectionBroker {
@@ -233,11 +230,17 @@ impl ConnectionBroker {
         // Check cooldown
         if let Some((last, count)) = self.cooldowns.get(&source_key) {
             if last.elapsed() < ATTEMPT_COOLDOWN {
-                debug!("Broker: source {}:{} is in cooldown ({} previous attempts)", source_ip, source_port, count);
+                debug!(
+                    "Broker: source {}:{} is in cooldown ({} previous attempts)",
+                    source_ip, source_port, count
+                );
                 return false;
             }
             if *count >= MAX_ATTEMPTS_PER_SOURCE {
-                debug!("Broker: source {}:{} exceeded max attempts", source_ip, source_port);
+                debug!(
+                    "Broker: source {}:{} exceeded max attempts",
+                    source_ip, source_port
+                );
                 return false;
             }
         }
@@ -253,7 +256,11 @@ impl ConnectionBroker {
         }
 
         let now = Instant::now();
-        let cooldown_count = self.cooldowns.get(&source_key).map(|(_, c)| *c).unwrap_or(0);
+        let cooldown_count = self
+            .cooldowns
+            .get(&source_key)
+            .map(|(_, c)| *c)
+            .unwrap_or(0);
         self.cooldowns.insert(source_key, (now, cooldown_count + 1));
 
         // Decide starting phase based on NAT type
@@ -287,25 +294,31 @@ impl ConnectionBroker {
             AttemptPhase::HolePunch => {
                 if let Some(ext_addr) = our_external_addr {
                     self.stats.punch_attempts = self.stats.punch_attempts.saturating_add(1);
-                    emit_event(&self.event_tx, BrokerEvent::StartPunch {
-                        attempt_key,
-                        source_ip,
-                        source_port,
-                        our_external_addr: ext_addr,
-                        our_nat_type: our_nat,
-                    });
+                    emit_event(
+                        &self.event_tx,
+                        BrokerEvent::StartPunch {
+                            attempt_key,
+                            source_ip,
+                            source_port,
+                            our_external_addr: ext_addr,
+                            our_nat_type: our_nat,
+                        },
+                    );
                 }
             }
             AttemptPhase::FindRelay => {
                 let relay_addr = self.pick_relay_candidate();
                 self.stats.relay_attempts = self.stats.relay_attempts.saturating_add(1);
-                emit_event(&self.event_tx, BrokerEvent::StartRelay {
-                    attempt_key,
-                    source_ip,
-                    source_port,
-                    file_hash,
-                    relay_addr,
-                });
+                emit_event(
+                    &self.event_tx,
+                    BrokerEvent::StartRelay {
+                        attempt_key,
+                        source_ip,
+                        source_port,
+                        file_hash,
+                        relay_addr,
+                    },
+                );
             }
             _ => {}
         }
@@ -324,13 +337,16 @@ impl ConnectionBroker {
             attempt.relay_candidate = relay_addr;
 
             self.stats.relay_attempts = self.stats.relay_attempts.saturating_add(1);
-            emit_event(&self.event_tx, BrokerEvent::StartRelay {
-                attempt_key: attempt_key.to_string(),
-                source_ip: attempt.source_ip,
-                source_port: attempt.source_port,
-                file_hash: attempt.file_hash,
-                relay_addr,
-            });
+            emit_event(
+                &self.event_tx,
+                BrokerEvent::StartRelay {
+                    attempt_key: attempt_key.to_string(),
+                    source_ip: attempt.source_ip,
+                    source_port: attempt.source_port,
+                    file_hash: attempt.file_hash,
+                    relay_addr,
+                },
+            );
         }
     }
 
@@ -339,12 +355,15 @@ impl ConnectionBroker {
         if let Some(attempt) = self.attempts.remove(attempt_key) {
             warn!("Broker: relay failed for {attempt_key}: {reason}");
             self.stats.relay_failures = self.stats.relay_failures.saturating_add(1);
-            emit_event(&self.event_tx, BrokerEvent::ConnectionFailed {
-                transfer_id: attempt.transfer_id,
-                source_ip: attempt.source_ip,
-                source_port: attempt.source_port,
-                reason: reason.to_string(),
-            });
+            emit_event(
+                &self.event_tx,
+                BrokerEvent::ConnectionFailed {
+                    transfer_id: attempt.transfer_id,
+                    source_ip: attempt.source_ip,
+                    source_port: attempt.source_port,
+                    reason: reason.to_string(),
+                },
+            );
         }
     }
 
@@ -367,14 +386,20 @@ impl ConnectionBroker {
 
     /// Add a relay-capable peer discovered via EPX.
     pub fn add_relay_candidate(&mut self, ip: Ipv4Addr, port: u16) {
-        if let Some(existing) = self.relay_candidates.iter_mut().find(|c| c.ip == ip && c.port == port) {
+        if let Some(existing) = self
+            .relay_candidates
+            .iter_mut()
+            .find(|c| c.ip == ip && c.port == port)
+        {
             existing.last_seen = Instant::now();
             return;
         }
         const MAX_RELAY_CANDIDATES: usize = 50;
         if self.relay_candidates.len() >= MAX_RELAY_CANDIDATES {
             // Evict oldest
-            if let Some(oldest_idx) = self.relay_candidates.iter()
+            if let Some(oldest_idx) = self
+                .relay_candidates
+                .iter()
                 .enumerate()
                 .min_by_key(|(_, c)| c.last_seen)
                 .map(|(i, _)| i)
@@ -393,15 +418,23 @@ impl ConnectionBroker {
     /// Pick the best available relay candidate (fewest sessions, most recent).
     fn pick_relay_candidate(&self) -> Option<(Ipv4Addr, u16)> {
         let stale_threshold = Duration::from_secs(600);
-        self.relay_candidates.iter()
+        self.relay_candidates
+            .iter()
             .filter(|c| c.last_seen.elapsed() < stale_threshold)
-            .min_by_key(|c| (c.relay_sessions, std::cmp::Reverse(c.last_seen.elapsed().as_secs())))
+            .min_by_key(|c| {
+                (
+                    c.relay_sessions,
+                    std::cmp::Reverse(c.last_seen.elapsed().as_secs()),
+                )
+            })
             .map(|c| (c.ip, c.port))
     }
 
     /// Clean up expired attempts. Called periodically from the main loop.
     pub async fn tick(&mut self) {
-        let expired: Vec<String> = self.attempts.iter()
+        let expired: Vec<String> = self
+            .attempts
+            .iter()
             .filter(|(_, a)| a.is_expired())
             .map(|(k, _)| k.clone())
             .collect();
@@ -423,10 +456,12 @@ impl ConnectionBroker {
 
         // Prune stale relay candidates
         let stale = Duration::from_secs(1800);
-        self.relay_candidates.retain(|c| c.last_seen.elapsed() < stale);
+        self.relay_candidates
+            .retain(|c| c.last_seen.elapsed() < stale);
 
         // Prune old cooldowns
-        self.cooldowns.retain(|_, (ts, _)| ts.elapsed() < Duration::from_secs(600));
+        self.cooldowns
+            .retain(|_, (ts, _)| ts.elapsed() < Duration::from_secs(600));
     }
 
     #[allow(dead_code)]
@@ -442,15 +477,27 @@ impl ConnectionBroker {
     /// Look up attempt metadata. Returns (transfer_id, file_hash, source_ip, source_port).
     pub fn get_attempt_info(&self, attempt_key: &str) -> Option<(String, [u8; 16], Ipv4Addr, u16)> {
         self.attempts.get(attempt_key).map(|a| {
-            (a.transfer_id.clone(), a.file_hash, a.source_ip, a.source_port)
+            (
+                a.transfer_id.clone(),
+                a.file_hash,
+                a.source_ip,
+                a.source_port,
+            )
         })
     }
 
     /// Increment the relay session count for a relay candidate after a successful relay.
     pub fn increment_relay_sessions(&mut self, ip: Ipv4Addr, port: u16) {
-        if let Some(candidate) = self.relay_candidates.iter_mut().find(|c| c.ip == ip && c.port == port) {
+        if let Some(candidate) = self
+            .relay_candidates
+            .iter_mut()
+            .find(|c| c.ip == ip && c.port == port)
+        {
             candidate.relay_sessions += 1;
-            debug!("Broker: incremented relay_sessions for {}:{} to {}", ip, port, candidate.relay_sessions);
+            debug!(
+                "Broker: incremented relay_sessions for {}:{} to {}",
+                ip, port, candidate.relay_sessions
+            );
         }
     }
 
@@ -472,17 +519,29 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(16);
         let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
 
-        let started = broker.attempt_low_to_low(
-            "t1", [1u8; 16], Ipv4Addr::new(1, 2, 3, 4), 4662,
-            NatType::PortRestricted, Some("5.6.7.8:9999".parse().unwrap()),
-        ).await;
+        let started = broker
+            .attempt_low_to_low(
+                "t1",
+                [1u8; 16],
+                Ipv4Addr::new(1, 2, 3, 4),
+                4662,
+                NatType::PortRestricted,
+                Some("5.6.7.8:9999".parse().unwrap()),
+            )
+            .await;
         assert!(started);
 
         // Second attempt to same source should fail (cooldown)
-        let started2 = broker.attempt_low_to_low(
-            "t1", [1u8; 16], Ipv4Addr::new(1, 2, 3, 4), 4662,
-            NatType::PortRestricted, Some("5.6.7.8:9999".parse().unwrap()),
-        ).await;
+        let started2 = broker
+            .attempt_low_to_low(
+                "t1",
+                [1u8; 16],
+                Ipv4Addr::new(1, 2, 3, 4),
+                4662,
+                NatType::PortRestricted,
+                Some("5.6.7.8:9999".parse().unwrap()),
+            )
+            .await;
         assert!(!started2);
 
         // Drain events
@@ -494,10 +553,16 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(16);
         let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
 
-        broker.attempt_low_to_low(
-            "t2", [2u8; 16], Ipv4Addr::new(10, 20, 30, 40), 4662,
-            NatType::Symmetric, Some("5.6.7.8:9999".parse().unwrap()),
-        ).await;
+        broker
+            .attempt_low_to_low(
+                "t2",
+                [2u8; 16],
+                Ipv4Addr::new(10, 20, 30, 40),
+                4662,
+                NatType::Symmetric,
+                Some("5.6.7.8:9999".parse().unwrap()),
+            )
+            .await;
 
         // Should emit StartRelay, not StartPunch
         if let Some(event) = rx.recv().await {
@@ -510,10 +575,16 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(16);
         let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
 
-        broker.attempt_low_to_low(
-            "t3", [3u8; 16], Ipv4Addr::new(10, 20, 30, 40), 4662,
-            NatType::PortRestricted, Some("5.6.7.8:9999".parse().unwrap()),
-        ).await;
+        broker
+            .attempt_low_to_low(
+                "t3",
+                [3u8; 16],
+                Ipv4Addr::new(10, 20, 30, 40),
+                4662,
+                NatType::PortRestricted,
+                Some("5.6.7.8:9999".parse().unwrap()),
+            )
+            .await;
 
         if let Some(event) = rx.recv().await {
             assert!(matches!(event, BrokerEvent::StartPunch { .. }));
@@ -542,10 +613,16 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(16);
         let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
 
-        broker.attempt_low_to_low(
-            "t4", [4u8; 16], Ipv4Addr::new(10, 20, 30, 40), 4662,
-            NatType::PortRestricted, Some("5.6.7.8:9999".parse().unwrap()),
-        ).await;
+        broker
+            .attempt_low_to_low(
+                "t4",
+                [4u8; 16],
+                Ipv4Addr::new(10, 20, 30, 40),
+                4662,
+                NatType::PortRestricted,
+                Some("5.6.7.8:9999".parse().unwrap()),
+            )
+            .await;
 
         // Drain punch event
         let _ = rx.recv().await;

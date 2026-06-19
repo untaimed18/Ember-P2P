@@ -241,7 +241,10 @@ impl EmberTransport {
             buf[0] = EMBER_MAGIC[0];
             buf[1] = EMBER_MAGIC[1];
             buf[2] = PKT_TRANSPORT;
-            match session.transport.write_message(message, &mut buf[HEADER_LEN..]) {
+            match session
+                .transport
+                .write_message(message, &mut buf[HEADER_LEN..])
+            {
                 Ok(len) => {
                     buf.truncate(HEADER_LEN + len);
                     return OutgoingResult::Ready { packet: buf };
@@ -334,11 +337,7 @@ impl EmberTransport {
     /// Pulled out of the network task's `handle_ember_native_udp` so
     /// the same code path can be exercised by `cargo test` over real
     /// loopback UDP without constructing a full `NetworkState`.
-    pub fn dispatch_incoming(
-        &mut self,
-        data: &[u8],
-        from: SocketAddr,
-    ) -> DispatchOutcome {
+    pub fn dispatch_incoming(&mut self, data: &[u8], from: SocketAddr) -> DispatchOutcome {
         let mut outcome = DispatchOutcome::default();
         let result = self.process_incoming(data, from);
 
@@ -382,9 +381,7 @@ impl EmberTransport {
             // happens, surface it via the empty-responses + Some(Ping)
             // shape and let the caller log the diagnostic miss.
             let pong = EmberControlMessage::Pong { nonce }.encode();
-            if let OutgoingResult::Ready { packet } =
-                self.prepare_outgoing(from, None, &pong)
-            {
+            if let OutgoingResult::Ready { packet } = self.prepare_outgoing(from, None, &pong) {
                 outcome.responses.push(packet);
             }
         }
@@ -610,11 +607,7 @@ impl EmberTransport {
 
     // ── Noise_XX handshake (2-RTT, we don't know the peer's static key) ──
 
-    fn start_xx_handshake(
-        &mut self,
-        peer: SocketAddr,
-        first_message: &[u8],
-    ) -> OutgoingResult {
+    fn start_xx_handshake(&mut self, peer: SocketAddr, first_message: &[u8]) -> OutgoingResult {
         let params = match NOISE_PATTERN_XX.parse::<snow::params::NoiseParams>() {
             Ok(p) => p,
             Err(e) => return OutgoingResult::Error(format!("noise params: {e}")),
@@ -707,9 +700,7 @@ impl EmberTransport {
 
     fn handle_xx_msg2(&mut self, from: SocketAddr, data: &[u8]) -> IncomingResult {
         let pending = match self.pending.remove(&from) {
-            Some(PendingHandshake::XxInitiatorMsg1 {
-                state, queued, ..
-            }) => (state, queued),
+            Some(PendingHandshake::XxInitiatorMsg1 { state, queued, .. }) => (state, queued),
             Some(other) => {
                 self.pending.insert(from, other);
                 debug!("Unexpected XX msg2 from {from}");
@@ -818,7 +809,9 @@ impl EmberTransport {
         let remote_noise_pub = match extract_remote_static(&state) {
             Some(k) => k,
             None => {
-                debug!("XX msg3 responder: handshake completed without remote static key from {from}");
+                debug!(
+                    "XX msg3 responder: handshake completed without remote static key from {from}"
+                );
                 return IncomingResult::Rejected;
             }
         };
@@ -1129,7 +1122,9 @@ mod tests {
                 ..
             } => {
                 assert_eq!(
-                    decrypted_payload.as_deref().and_then(EmberControlMessage::decode),
+                    decrypted_payload
+                        .as_deref()
+                        .and_then(EmberControlMessage::decode),
                     Some(EmberControlMessage::Ping { nonce: 1 }),
                 );
                 packets_to_send
@@ -1265,7 +1260,9 @@ mod tests {
             other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
         };
         let resp = match bob.process_incoming(&init, alice_addr) {
-            IncomingResult::HandshakeComplete { packets_to_send, .. } => packets_to_send,
+            IncomingResult::HandshakeComplete {
+                packets_to_send, ..
+            } => packets_to_send,
             _ => panic!("expected HandshakeComplete on responder side"),
         };
         assert_eq!(resp.len(), 1);
@@ -1401,8 +1398,16 @@ mod tests {
         assert_ne!(EMBER_MAGIC[0], OP_EMULEPROT);
 
         // And the magic-detector itself rejects KAD-style packets.
-        assert!(!EmberTransport::is_ember_packet(&[OP_EDONKEYHEADER, 0x00, 0x00]));
-        assert!(!EmberTransport::is_ember_packet(&[OP_EMULEPROT, 0x00, 0x00]));
+        assert!(!EmberTransport::is_ember_packet(&[
+            OP_EDONKEYHEADER,
+            0x00,
+            0x00
+        ]));
+        assert!(!EmberTransport::is_ember_packet(&[
+            OP_EMULEPROT,
+            0x00,
+            0x00
+        ]));
         // Ember packets need at least header_len bytes too.
         assert!(!EmberTransport::is_ember_packet(&[EMBER_MAGIC[0]]));
         assert!(!EmberTransport::is_ember_packet(&[]));

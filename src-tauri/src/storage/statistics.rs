@@ -52,12 +52,16 @@ pub struct SxOverheadCounters {
 
 impl SxOverheadCounters {
     pub fn record_upload(&self, bytes: u64) {
-        if bytes == 0 { return; }
+        if bytes == 0 {
+            return;
+        }
         self.upload_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
     pub fn record_download(&self, bytes: u64) {
-        if bytes == 0 { return; }
+        if bytes == 0 {
+            return;
+        }
         self.download_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 }
@@ -110,10 +114,18 @@ impl StatsManager {
         let up = self.sx_counters.upload_bytes.swap(0, Ordering::Relaxed);
         let down = self.sx_counters.download_bytes.swap(0, Ordering::Relaxed);
         if up > 0 {
-            self.add_overhead(OverheadCategory::SourceExchange, OverheadDirection::Upload, up);
+            self.add_overhead(
+                OverheadCategory::SourceExchange,
+                OverheadDirection::Upload,
+                up,
+            );
         }
         if down > 0 {
-            self.add_overhead(OverheadCategory::SourceExchange, OverheadDirection::Download, down);
+            self.add_overhead(
+                OverheadCategory::SourceExchange,
+                OverheadDirection::Download,
+                down,
+            );
         }
     }
 
@@ -128,8 +140,12 @@ impl StatsManager {
                         "cum_down_overhead" => self.stats.cum_down_overhead = value.max(0) as u64,
                         "cum_up_overhead" => self.stats.cum_up_overhead = value.max(0) as u64,
                         "cum_conn_time" => self.stats.cum_conn_time = value.max(0) as u64,
-                        "cum_completed_down" => self.stats.cum_completed_down = value.max(0).min(u32::MAX as i64) as u32,
-                        "cum_completed_up" => self.stats.cum_completed_up = value.max(0).min(u32::MAX as i64) as u32,
+                        "cum_completed_down" => {
+                            self.stats.cum_completed_down = value.max(0).min(u32::MAX as i64) as u32
+                        }
+                        "cum_completed_up" => {
+                            self.stats.cum_completed_up = value.max(0).min(u32::MAX as i64) as u32
+                        }
                         "stat_last_reset" => self.stats.stat_last_reset = value,
                         _ => {}
                     }
@@ -141,24 +157,50 @@ impl StatsManager {
     pub fn save_cumulative(&self, db: &Database) {
         let safe_add = |a: u64, b: u64| -> i64 {
             let sum = a.saturating_add(b);
-            if sum > i64::MAX as u64 { i64::MAX } else { sum as i64 }
+            if sum > i64::MAX as u64 {
+                i64::MAX
+            } else {
+                sum as i64
+            }
         };
-        let safe_add32 = |a: u32, b: u32| -> i64 {
-            (a as i64).saturating_add(b as i64)
-        };
+        let safe_add32 = |a: u32, b: u32| -> i64 { (a as i64).saturating_add(b as i64) };
         let pairs = vec![
-            ("cum_downloaded", safe_add(self.stats.cum_downloaded, self.stats.session_downloaded)),
-            ("cum_uploaded", safe_add(self.stats.cum_uploaded, self.stats.session_uploaded)),
-            ("cum_down_overhead", safe_add(self.stats.cum_down_overhead, self.stats.session_down_overhead)),
-            ("cum_up_overhead", safe_add(self.stats.cum_up_overhead, self.stats.session_up_overhead)),
+            (
+                "cum_downloaded",
+                safe_add(self.stats.cum_downloaded, self.stats.session_downloaded),
+            ),
+            (
+                "cum_uploaded",
+                safe_add(self.stats.cum_uploaded, self.stats.session_uploaded),
+            ),
+            (
+                "cum_down_overhead",
+                safe_add(
+                    self.stats.cum_down_overhead,
+                    self.stats.session_down_overhead,
+                ),
+            ),
+            (
+                "cum_up_overhead",
+                safe_add(self.stats.cum_up_overhead, self.stats.session_up_overhead),
+            ),
             ("cum_conn_time", {
                 // Monotonic elapsed time — immune to wall-clock jumps that
                 // would otherwise spike the cumulative connection time.
                 let session_time = self.session_start_instant.elapsed().as_secs();
                 safe_add(self.stats.cum_conn_time, session_time)
             }),
-            ("cum_completed_down", safe_add32(self.stats.cum_completed_down, self.stats.session_completed_down)),
-            ("cum_completed_up", safe_add32(self.stats.cum_completed_up, self.stats.session_completed_up)),
+            (
+                "cum_completed_down",
+                safe_add32(
+                    self.stats.cum_completed_down,
+                    self.stats.session_completed_down,
+                ),
+            ),
+            (
+                "cum_completed_up",
+                safe_add32(self.stats.cum_completed_up, self.stats.session_completed_up),
+            ),
             ("stat_last_reset", self.stats.stat_last_reset),
         ];
         if let Err(e) = db.save_statistics(&pairs) {
@@ -210,7 +252,12 @@ impl StatsManager {
         let window = 10.min(history.len());
         if window > 1 {
             let sum: u64 = history.iter().rev().take(window - 1).map(|(_, v)| v).sum();
-            let oldest_ts = history.iter().rev().nth(window - 1).map(|(t, _)| *t).unwrap_or(now);
+            let oldest_ts = history
+                .iter()
+                .rev()
+                .nth(window - 1)
+                .map(|(t, _)| *t)
+                .unwrap_or(now);
             let elapsed = now.saturating_sub(oldest_ts).max(1) as f64;
             sum as f64 / elapsed
         } else if window == 1 {
@@ -220,16 +267,37 @@ impl StatsManager {
         }
     }
 
-    pub fn add_overhead(&mut self, category: OverheadCategory, direction: OverheadDirection, bytes: u64) {
+    pub fn add_overhead(
+        &mut self,
+        category: OverheadCategory,
+        direction: OverheadDirection,
+        bytes: u64,
+    ) {
         match direction {
-            OverheadDirection::Download => self.stats.session_down_overhead = self.stats.session_down_overhead.saturating_add(bytes),
-            OverheadDirection::Upload => self.stats.session_up_overhead = self.stats.session_up_overhead.saturating_add(bytes),
+            OverheadDirection::Download => {
+                self.stats.session_down_overhead =
+                    self.stats.session_down_overhead.saturating_add(bytes)
+            }
+            OverheadDirection::Upload => {
+                self.stats.session_up_overhead =
+                    self.stats.session_up_overhead.saturating_add(bytes)
+            }
         }
         match category {
-            OverheadCategory::Kad => self.stats.overhead_kad = self.stats.overhead_kad.saturating_add(bytes),
-            OverheadCategory::FileRequest => self.stats.overhead_file_request = self.stats.overhead_file_request.saturating_add(bytes),
-            OverheadCategory::Server => self.stats.overhead_server = self.stats.overhead_server.saturating_add(bytes),
-            OverheadCategory::SourceExchange => self.stats.overhead_source_exchange = self.stats.overhead_source_exchange.saturating_add(bytes),
+            OverheadCategory::Kad => {
+                self.stats.overhead_kad = self.stats.overhead_kad.saturating_add(bytes)
+            }
+            OverheadCategory::FileRequest => {
+                self.stats.overhead_file_request =
+                    self.stats.overhead_file_request.saturating_add(bytes)
+            }
+            OverheadCategory::Server => {
+                self.stats.overhead_server = self.stats.overhead_server.saturating_add(bytes)
+            }
+            OverheadCategory::SourceExchange => {
+                self.stats.overhead_source_exchange =
+                    self.stats.overhead_source_exchange.saturating_add(bytes)
+            }
         }
     }
 
@@ -270,7 +338,8 @@ mod tests {
     fn rate_steady_state_is_accurate() {
         let mut mgr = StatsManager::new();
         for t in 0..=10i64 {
-            mgr.session_down_counter.store((t as u64) * 100, Ordering::Relaxed);
+            mgr.session_down_counter
+                .store((t as u64) * 100, Ordering::Relaxed);
             mgr.record_rate(t);
         }
         assert!(
@@ -305,7 +374,8 @@ mod tests {
     fn upload_rate_uses_same_window() {
         let mut mgr = StatsManager::new();
         for t in 0..=10i64 {
-            mgr.session_up_counter.store((t as u64) * 2048, Ordering::Relaxed);
+            mgr.session_up_counter
+                .store((t as u64) * 2048, Ordering::Relaxed);
             mgr.record_rate(t);
         }
         assert!(

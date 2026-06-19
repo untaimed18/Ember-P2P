@@ -338,7 +338,10 @@ impl TransferManager {
             .values()
             .filter(|transfer| {
                 transfer.direction == TransferDirection::Download
-                    && !matches!(transfer.status, TransferStatus::Paused | TransferStatus::Stopped)
+                    && !matches!(
+                        transfer.status,
+                        TransferStatus::Paused | TransferStatus::Stopped
+                    )
             })
             .count()
     }
@@ -426,7 +429,10 @@ impl TransferManager {
             self.active.insert(id, transfer);
             true
         } else {
-            if !matches!(transfer.status, TransferStatus::Paused | TransferStatus::Stopped) {
+            if !matches!(
+                transfer.status,
+                TransferStatus::Paused | TransferStatus::Stopped
+            ) {
                 transfer.status = Self::queued_wait_status(&transfer);
             }
             self.queue.push_back(transfer);
@@ -435,8 +441,13 @@ impl TransferManager {
     }
 
     pub fn has_pending_for_hash(&self, file_hash: &str) -> bool {
-        self.active.values().any(|transfer| transfer.file_hash == file_hash)
-            || self.queue.iter().any(|transfer| transfer.file_hash == file_hash)
+        self.active
+            .values()
+            .any(|transfer| transfer.file_hash == file_hash)
+            || self
+                .queue
+                .iter()
+                .any(|transfer| transfer.file_hash == file_hash)
     }
 
     pub fn pending_transfer_id_for_hash(&self, file_hash: &str) -> Option<String> {
@@ -459,7 +470,8 @@ impl TransferManager {
         if let Some(transfer) = self.active.get_mut(id) {
             let now = Instant::now();
 
-            let history = self.speed_history
+            let history = self
+                .speed_history
                 .entry(id.to_string())
                 .or_insert_with(VecDeque::new);
 
@@ -470,7 +482,9 @@ impl TransferManager {
                 history.pop_front();
             }
             while history.len() > 1 {
-                let elapsed = now.saturating_duration_since(history.front().unwrap().1).as_millis();
+                let elapsed = now
+                    .saturating_duration_since(history.front().unwrap().1)
+                    .as_millis();
                 if elapsed > SPEED_WINDOW_MS {
                     history.pop_front();
                 } else {
@@ -492,8 +506,16 @@ impl TransferManager {
                 0
             };
 
-            transfer.transferred = if transfer.total_size > 0 { transferred.min(transfer.total_size) } else { transferred };
-            transfer.completed_size = if transfer.total_size > 0 { transferred.min(transfer.total_size) } else { transferred };
+            transfer.transferred = if transfer.total_size > 0 {
+                transferred.min(transfer.total_size)
+            } else {
+                transferred
+            };
+            transfer.completed_size = if transfer.total_size > 0 {
+                transferred.min(transfer.total_size)
+            } else {
+                transferred
+            };
             transfer.speed = speed;
             transfer.last_received = Some(chrono::Utc::now().timestamp());
             Self::clear_failure_context(transfer);
@@ -595,7 +617,10 @@ impl TransferManager {
             }
         } else if let Some(transfer) = self.queue.iter_mut().find(|t| t.id == id) {
             transfer.status = status;
-            if matches!(transfer.status, TransferStatus::Active | TransferStatus::Completed) {
+            if matches!(
+                transfer.status,
+                TransferStatus::Active | TransferStatus::Completed
+            ) {
                 Self::clear_failure_context(transfer);
                 Self::clear_runtime_health(transfer);
             }
@@ -630,13 +655,20 @@ impl TransferManager {
     }
 
     pub fn source_counts(&self, id: &str) -> Option<(u32, u32, u32)> {
-        self.get_transfer(id).map(|t| (t.sources, t.active_sources, t.queued_sources))
+        self.get_transfer(id)
+            .map(|t| (t.sources, t.active_sources, t.queued_sources))
     }
 
     /// Update or insert a per-source detail entry for a transfer.
     pub fn update_source_detail(&mut self, transfer_id: &str, source: crate::types::SourceInfo) {
-        let sources = self.source_details.entry(transfer_id.to_string()).or_default();
-        if let Some(existing) = sources.iter_mut().find(|s| s.ip == source.ip && s.port == source.port) {
+        let sources = self
+            .source_details
+            .entry(transfer_id.to_string())
+            .or_default();
+        if let Some(existing) = sources
+            .iter_mut()
+            .find(|s| s.ip == source.ip && s.port == source.port)
+        {
             existing.status = source.status;
             if source.queue_rank.is_some() {
                 existing.queue_rank = source.queue_rank;
@@ -661,7 +693,8 @@ impl TransferManager {
         } else {
             const MAX_SOURCES_PER_TRANSFER: usize = 500;
             if sources.len() >= MAX_SOURCES_PER_TRANSFER {
-                let evict_idx = sources.iter()
+                let evict_idx = sources
+                    .iter()
                     .enumerate()
                     .max_by_key(|(_, s)| match s.status {
                         crate::types::SourceStatus::Failed => 4,
@@ -684,9 +717,9 @@ impl TransferManager {
         // strongest signal it can express — a single source that holds every
         // part. That captures the common seeder case; partial sources that
         // only together cover 100% aren't detectable from counts alone.
-        let seen_complete = sources.iter().any(|s| {
-            matches!((s.available_parts, s.total_parts), (Some(a), Some(t)) if t > 0 && a >= t)
-        });
+        let seen_complete = sources.iter().any(
+            |s| matches!((s.available_parts, s.total_parts), (Some(a), Some(t)) if t > 0 && a >= t),
+        );
         if seen_complete {
             if let Some(transfer) = self.active.get_mut(transfer_id) {
                 transfer.last_seen_complete = Some(chrono::Utc::now().timestamp());
@@ -696,7 +729,10 @@ impl TransferManager {
 
     /// Get all source details for a transfer.
     pub fn get_source_details(&self, transfer_id: &str) -> Vec<crate::types::SourceInfo> {
-        self.source_details.get(transfer_id).cloned().unwrap_or_default()
+        self.source_details
+            .get(transfer_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn is_callback_placeholder_row(s: &crate::types::SourceInfo) -> bool {
@@ -780,9 +816,8 @@ impl TransferManager {
         let mut removed = false;
         if let Some(rows) = self.source_details.get_mut(transfer_id) {
             rows.retain(|s| {
-                let is_expired_placeholder = s.ip == peer_ip
-                    && s.port == peer_port
-                    && Self::is_callback_placeholder_row(s);
+                let is_expired_placeholder =
+                    s.ip == peer_ip && s.port == peer_port && Self::is_callback_placeholder_row(s);
                 if is_expired_placeholder {
                     removed = true;
                     false
@@ -845,7 +880,10 @@ impl TransferManager {
         let mut freed_active_download_slot = false;
         if let Some(transfer) = self.active.get_mut(id) {
             freed_active_download_slot = transfer.direction == TransferDirection::Download
-                && !matches!(transfer.status, TransferStatus::Paused | TransferStatus::Stopped);
+                && !matches!(
+                    transfer.status,
+                    TransferStatus::Paused | TransferStatus::Stopped
+                );
         }
         self.pause(id);
         if freed_active_download_slot {
@@ -1015,7 +1053,13 @@ impl TransferManager {
         } else {
             None
         };
-        if previous == (transfer.health.clone(), transfer.health_reason.clone(), transfer.stalled_since) {
+        if previous
+            == (
+                transfer.health.clone(),
+                transfer.health_reason.clone(),
+                transfer.stalled_since,
+            )
+        {
             return None;
         }
         Some(TransferHealthUpdate {
@@ -1140,7 +1184,8 @@ impl TransferManager {
     }
 
     pub fn get_transfer(&self, id: &str) -> Option<&Transfer> {
-        self.active.get(id)
+        self.active
+            .get(id)
             .or_else(|| self.queue.iter().find(|t| t.id == id))
             .or_else(|| self.completed.iter().find(|t| t.id == id))
     }
@@ -1160,7 +1205,9 @@ impl TransferManager {
             if self.active_download_count() >= self.max_concurrent as usize {
                 break;
             }
-            let next_idx = self.queue.iter()
+            let next_idx = self
+                .queue
+                .iter()
                 .enumerate()
                 .filter(|(_, t)| Self::can_auto_run(t))
                 .max_by(|(i_a, a), (i_b, b)| {

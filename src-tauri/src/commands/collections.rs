@@ -1,8 +1,8 @@
-use tauri::Emitter;
 use crate::app_state::AppState;
 use crate::commands::errors::{coded, coded_ctx};
 use crate::network::ed2k::collection::{Collection, CollectionFile};
-use crate::types::{Transfer, TransferStatus, TransferDirection};
+use crate::types::{Transfer, TransferDirection, TransferStatus};
+use tauri::Emitter;
 
 #[tauri::command]
 pub async fn load_collection(
@@ -10,12 +10,23 @@ pub async fn load_collection(
     path: String,
 ) -> Result<Collection, String> {
     let p = std::path::PathBuf::from(&path);
-    if p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
-        return Err(coded("collections_path_no_parent_dir", "Path must not contain '..' components"));
+    if p.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(coded(
+            "collections_path_no_parent_dir",
+            "Path must not contain '..' components",
+        ));
     }
-    let ext = p.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase());
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase());
     if !matches!(ext.as_deref(), Some("emulecollection") | Some("txt")) {
-        return Err(coded("collections_invalid_file_extension", "File must be a .emulecollection or .txt file"));
+        return Err(coded(
+            "collections_invalid_file_extension",
+            "File must be a .emulecollection or .txt file",
+        ));
     }
     if !p.exists() {
         return Err(coded("collections_file_not_found", "File does not exist"));
@@ -24,7 +35,13 @@ pub async fn load_collection(
     let p2 = p.clone();
     let canonical = tokio::task::spawn_blocking(move || std::fs::canonicalize(&p2))
         .await
-        .map_err(|e| coded_ctx("collections_canonicalize_task_failed", "Canonicalize task failed", e))?
+        .map_err(|e| {
+            coded_ctx(
+                "collections_canonicalize_task_failed",
+                "Canonicalize task failed",
+                e,
+            )
+        })?
         .map_err(|e| coded_ctx("collections_cannot_resolve_path", "Cannot resolve path", e))?;
     let config = state.config.read().await;
     let download_root = std::path::PathBuf::from(&config.settings.download_folder);
@@ -35,10 +52,16 @@ pub async fn load_collection(
     drop(config);
 
     if allowed_dirs.is_empty() {
-        return Err(coded("collections_no_folders_configured", "No shared or download folders configured"));
+        return Err(coded(
+            "collections_no_folders_configured",
+            "No shared or download folders configured",
+        ));
     }
     if !crate::security::is_path_within_dirs(&canonical, &allowed_dirs) {
-        return Err(coded("collections_file_outside_allowed_dirs", "Collection file must be inside a shared or download folder"));
+        return Err(coded(
+            "collections_file_outside_allowed_dirs",
+            "Collection file must be inside a shared or download folder",
+        ));
     }
 
     // Cap the on-disk size before `Collection::load` reads the whole file into
@@ -50,11 +73,15 @@ pub async fn load_collection(
         .await
         .map_err(|e| coded_ctx("collections_stat_failed", "Cannot stat collection file", e))?;
     if meta.len() > MAX_COLLECTION_BYTES {
-        return Err(coded("collections_file_too_large", "Collection file too large (max 32 MiB)"));
+        return Err(coded(
+            "collections_file_too_large",
+            "Collection file too large (max 32 MiB)",
+        ));
     }
 
     tokio::task::spawn_blocking(move || {
-        Collection::load(&canonical).map_err(|e| coded_ctx("collections_load_failed", "Failed to load collection", e))
+        Collection::load(&canonical)
+            .map_err(|e| coded_ctx("collections_load_failed", "Failed to load collection", e))
     })
     .await
     .map_err(|e| coded_ctx("collections_load_task_failed", "Load task failed", e))?
@@ -97,9 +124,14 @@ pub async fn create_collection(
         tokio::task::spawn_blocking(move || {
             path.canonicalize().or_else(|_| {
                 if let Some(parent) = path.parent() {
-                    parent.canonicalize().map(|p| p.join(path.file_name().unwrap_or_default()))
+                    parent
+                        .canonicalize()
+                        .map(|p| p.join(path.file_name().unwrap_or_default()))
                 } else {
-                    Err(std::io::Error::new(std::io::ErrorKind::NotFound, "invalid path"))
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "invalid path",
+                    ))
                 }
             })
         })
@@ -108,41 +140,69 @@ pub async fn create_collection(
         .map_err(|e| coded_ctx("collections_invalid_output_path", "Invalid output path", e))?
     };
 
-    if canonical.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
-        return Err(coded("collections_output_path_no_parent_dir", "Output path must not contain '..' components"));
+    if canonical
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(coded(
+            "collections_output_path_no_parent_dir",
+            "Output path must not contain '..' components",
+        ));
     }
 
     let config = state.config.read().await;
     let mut allowed_dirs: Vec<String> = config.settings.shared_folders.clone();
     if !config.settings.download_folder.is_empty() {
-        allowed_dirs.push(std::path::PathBuf::from(&config.settings.download_folder)
-            .to_string_lossy().into_owned());
+        allowed_dirs.push(
+            std::path::PathBuf::from(&config.settings.download_folder)
+                .to_string_lossy()
+                .into_owned(),
+        );
     }
     drop(config);
 
     if allowed_dirs.is_empty() {
-        return Err(coded("collections_no_folders_configured", "No shared or download folders configured"));
+        return Err(coded(
+            "collections_no_folders_configured",
+            "No shared or download folders configured",
+        ));
     }
     if !crate::security::is_path_within_dirs(&canonical, &allowed_dirs) {
-        return Err(coded("collections_output_outside_allowed_dirs", "Output path must be inside a shared or download folder"));
+        return Err(coded(
+            "collections_output_outside_allowed_dirs",
+            "Output path must be inside a shared or download folder",
+        ));
     }
 
-    let ext = canonical.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase());
+    let ext = canonical
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase());
     if !matches!(ext.as_deref(), Some("emulecollection") | Some("txt")) {
-        return Err(coded("collections_output_invalid_extension", "Output file must have .emulecollection or .txt extension"));
+        return Err(coded(
+            "collections_output_invalid_extension",
+            "Output file must have .emulecollection or .txt extension",
+        ));
     }
     let write_path = canonical.clone();
     tokio::task::spawn_blocking(move || {
         if binary {
-            collection.save_binary(&write_path).map_err(|e| coded_ctx("collections_save_failed", "Failed to save", e))?;
+            collection
+                .save_binary(&write_path)
+                .map_err(|e| coded_ctx("collections_save_failed", "Failed to save", e))?;
         } else {
-            collection.save_text(&write_path).map_err(|e| coded_ctx("collections_save_failed", "Failed to save", e))?;
+            collection
+                .save_text(&write_path)
+                .map_err(|e| coded_ctx("collections_save_failed", "Failed to save", e))?;
         }
         Ok::<_, String>(())
     })
     .await
     .map_err(|e| coded_ctx("collections_save_task_failed", "Save task failed", e))??;
-    Ok(format!("Created collection '{name}' at {}", canonical.display()))
+    Ok(format!(
+        "Created collection '{name}' at {}",
+        canonical.display()
+    ))
 }
 
 #[tauri::command]
@@ -152,7 +212,10 @@ pub async fn download_collection_files(
     files: Vec<CollectionFile>,
 ) -> Result<String, String> {
     if files.len() > 200 {
-        return Err(coded("collections_too_many_files", "Collection too large (max 200 files)"));
+        return Err(coded(
+            "collections_too_many_files",
+            "Collection too large (max 200 files)",
+        ));
     }
     // Mirror `start_download` (D16): reject collection entries that
     // exceed the user's `max_download_file_size_gib` cap up front, so
@@ -188,7 +251,9 @@ pub async fn download_collection_files(
             oversize_count += 1;
             tracing::debug!(
                 "Skipping collection entry '{}': size {} exceeds configured cap {}",
-                file.name, file.size, max_dl_bytes
+                file.name,
+                file.size,
+                max_dl_bytes
             );
             continue;
         }
@@ -206,7 +271,11 @@ pub async fn download_collection_files(
             peer_id: String::new(),
             peer_name: String::new(),
             direction: TransferDirection::Download,
-            status: if add_paused { TransferStatus::Paused } else { TransferStatus::Searching },
+            status: if add_paused {
+                TransferStatus::Paused
+            } else {
+                TransferStatus::Searching
+            },
             progress: 0.0,
             speed: 0,
             total_size: file.size,
@@ -248,10 +317,7 @@ pub async fn download_collection_files(
             }
             let active_now = mgr.enqueue(transfer.clone());
             mgr.register_control(&transfer_id, control.clone());
-            let persisted = mgr
-                .get_transfer(&transfer_id)
-                .cloned()
-                .unwrap_or(transfer);
+            let persisted = mgr.get_transfer(&transfer_id).cloned().unwrap_or(transfer);
             (active_now, persisted)
         };
         queued_count += 1;
@@ -277,7 +343,10 @@ pub async fn download_collection_files(
                 })
                 .await
             {
-                tracing::warn!("Failed to send StartDownload for collection entry '{}': {e}", file.name);
+                tracing::warn!(
+                    "Failed to send StartDownload for collection entry '{}': {e}",
+                    file.name
+                );
                 // Roll the just-enqueued (now active) transfer back to Failed
                 // so it doesn't pin a download slot forever once the network
                 // channel is gone. Persist + emit so the DB row and UI match
