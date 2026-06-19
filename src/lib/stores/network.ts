@@ -196,9 +196,12 @@ export async function initNetworkStore() {
       };
 
       if (lastUpnpMapped === null) {
-        // First report this session establishes the baseline. A failure here
-        // is also where the backend auto-disables UPnP, so the message tells
-        // the user it's been turned off and how to re-enable it.
+        // First report this session establishes the baseline. On a failure
+        // UPnP stays enabled and the backend keeps retrying the mapping in the
+        // background (the `maintain` tick), so the message points the user at
+        // manual port forwarding as a fallback rather than claiming UPnP was
+        // turned off. If a later retry succeeds, the recovery branch below
+        // retracts this warning.
         if (!mapped) {
           showStickyWarning(
             gateway_found

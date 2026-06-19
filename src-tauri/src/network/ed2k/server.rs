@@ -105,6 +105,9 @@ enum ServerTransport {
 pub struct Ed2kServerConnection {
     transport: ServerTransport,
     pub session: Option<ServerSession>,
+    /// Connected server's soft per-client file limit (`GetSoftFiles()` in
+    /// eMule). 0 = unknown. Used to cap `OP_OFFERFILES` like eMule does.
+    soft_files: u32,
 }
 
 #[derive(Debug)]
@@ -156,6 +159,7 @@ impl Ed2kServerConnection {
                 writer: tokio::io::BufWriter::new(writer),
             },
             session: None,
+            soft_files: 0,
         })
     }
 
@@ -164,7 +168,14 @@ impl Ed2kServerConnection {
         Ok(Self {
             transport: ServerTransport::Encrypted(stream),
             session: None,
+            soft_files: 0,
         })
+    }
+
+    /// Record the connected server's soft per-client file limit so
+    /// `offer_files` can cap each OP_OFFERFILES the way eMule does.
+    pub fn set_soft_files(&mut self, soft_files: u32) {
+        self.soft_files = soft_files;
     }
 
     pub async fn login(
@@ -501,7 +512,9 @@ impl Ed2kServerConnection {
     }
 
     /// Send a source request to the server (eMule DownloadQueue.cpp format).
-    /// Uses OP_GETSOURCES_OBFU when server supports TCP obfuscation.
+    /// Uses OP_GETSOURCES_OBFU only when our connection is encrypted (so our
+    /// login advertised crypt) AND the server supports it; otherwise plain
+    /// OP_GETSOURCES — see the opcode selection below for why.
     /// Returns the number of bytes sent on the wire (header + opcode +
     /// payload) so callers can attribute the cost to source-exchange
     /// overhead in the Statistics panel. Returns 0 when the request was
@@ -511,21 +524,47 @@ impl Ed2kServerConnection {
         payload.extend_from_slice(file_hash);
         let srv_flags = self.session.as_ref().map(|s| s.server_flags).unwrap_or(0);
         let supports_large = (srv_flags & SRV_TCPFLG_LARGEFILES) != 0;
-        if file_size > 0xFFFF_FFFF && !supports_large {
-            debug!("Skipping source query for >4 GiB file — server does not support LARGEFILES");
+        // Match eMule's `CPartFile::IsLargeFile()` boundary (OLD_MAX_EMULE_FILE_SIZE),
+        // NOT u32::MAX. Files in the (OLD_MAX_EMULE_FILE_SIZE, u32::MAX] window are
+        // large on the wire (uploaders offer them with the 64-bit encoding), so a
+        // 32-bit source request won't match the server's large-file index.
+        let is_large = file_size > OLD_MAX_EMULE_FILE_SIZE;
+        if is_large && !supports_large {
+            debug!("Skipping source query for large file — server does not support LARGEFILES");
             return Ok(0);
         }
-        if file_size > 0xFFFF_FFFF {
+        if is_large {
             payload.extend_from_slice(&0u32.to_le_bytes());
             payload.extend_from_slice(&file_size.to_le_bytes());
         } else {
             payload.extend_from_slice(&(file_size as u32).to_le_bytes());
         }
-        let opcode = if (srv_flags & SRV_TCPFLG_TCPOBFUSCATION) != 0 {
+        // Only request the *obfuscated* source variant when our login actually
+        // advertised crypt support to this server. `login()` only sets
+        // SRVCAP_SUPPORTCRYPT/REQUESTCRYPT on an encrypted connection (plain
+        // Lugdunum connections that claim crypt get dropped), so on a plain
+        // connection we announced "no crypt". Sending OP_GETSOURCES_OBFU there
+        // is inconsistent with that login — the server sees a non-crypt client
+        // asking for obfuscated sources and silently ignores the request,
+        // returning no OP_FOUNDSOURCES at all. eMule keeps these in lockstep
+        // (it only emits OP_GETSOURCES_OBFU when its crypt layer is enabled,
+        // which is also when its login advertises crypt). Mirror that: use the
+        // OBFU opcode only when this connection is encrypted AND the server
+        // supports it; otherwise send the plain OP_GETSOURCES.
+        let is_encrypted = matches!(self.transport, ServerTransport::Encrypted(_));
+        let opcode = if is_encrypted && (srv_flags & SRV_TCPFLG_TCPOBFUSCATION) != 0 {
             OP_GETSOURCES_OBFU
         } else {
             OP_GETSOURCES
         };
+        debug!(
+            "OP_GETSOURCES: opcode={} (0x{:02X}), file_size={}, conn_encrypted={}, srv_obfu={}",
+            if opcode == OP_GETSOURCES_OBFU { "OBFU" } else { "PLAIN" },
+            opcode,
+            file_size,
+            is_encrypted,
+            (srv_flags & SRV_TCPFLG_TCPOBFUSCATION) != 0,
+        );
         self.write_packet(opcode, &payload).await?;
         // Wire framing: 1 protocol + 4 length + 1 opcode + payload.
         Ok(6 + payload.len() as u64)
@@ -561,9 +600,45 @@ impl Ed2kServerConnection {
         Ok(())
     }
 
-    /// Send OP_OFFERFILES to the server matching eMule SharedFileList.cpp.
-    /// Uses magic client ID/port values when server supports SRV_TCPFLG_COMPRESSION.
+    /// Send OP_OFFERFILES to the server, capping each packet at the server's
+    /// soft per-client file limit exactly like eMule's
+    /// `CSharedFileList::SendListToServer`:
+    ///
+    /// ```text
+    /// limit = GetSoftFiles(); if (limit == 0 || limit > 200) limit = 200;
+    /// ```
+    ///
+    /// A strict server can ignore/penalize a client that offers more files
+    /// than its limit in one packet (which then withholds source replies), so
+    /// we chunk the offer into ≤`limit`-file `OP_OFFERFILES` packets rather
+    /// than blasting all shares at once.
     pub async fn offer_files(&mut self, files: &[OfferFile], tcp_port: u16) -> anyhow::Result<()> {
+        let limit = if self.soft_files == 0 || self.soft_files > 200 {
+            200
+        } else {
+            self.soft_files as usize
+        };
+        if files.is_empty() {
+            // Preserve the empty (count=0) offer some callers may rely on.
+            return self.offer_files_chunk(files, tcp_port).await;
+        }
+        let total = files.len();
+        if total > limit {
+            info!(
+                "OP_OFFERFILES: {total} files exceeds server soft limit {limit}; sending in {} chunks",
+                (total + limit - 1) / limit
+            );
+        }
+        for chunk in files.chunks(limit) {
+            self.offer_files_chunk(chunk, tcp_port).await?;
+        }
+        Ok(())
+    }
+
+    /// Send a single OP_OFFERFILES packet (one chunk). Matches eMule
+    /// SharedFileList.cpp's per-file encoding; uses magic client ID/port
+    /// values when the server supports SRV_TCPFLG_COMPRESSION.
+    async fn offer_files_chunk(&mut self, files: &[OfferFile], tcp_port: u16) -> anyhow::Result<()> {
         let real_client_id = self.our_client_id().unwrap_or(0);
         let srv_flags = self.session.as_ref().map(|s| s.server_flags).unwrap_or(0);
         let use_magic_ids = (srv_flags & SRV_TCPFLG_COMPRESSION) != 0;
@@ -590,7 +665,11 @@ impl Ed2kServerConnection {
             let mut tags = Vec::new();
             write_string_tag(&mut tags, 0x01, &file.name); // FT_FILENAME
             tag_count += 1;
-            if file.size > u32::MAX as u64 {
+            // eMule offers files above OLD_MAX_EMULE_FILE_SIZE (not u32::MAX) as
+            // large: FT_FILESIZE (low 32) + FT_FILESIZE_HI (high 32, may be 0).
+            // Using the same boundary keeps the server's large-file index aligned
+            // with our later OP_GETSOURCES so source lookups for ~4 GiB files match.
+            if file.size > OLD_MAX_EMULE_FILE_SIZE {
                 write_uint32_tag(&mut tags, 0x02, file.size as u32);
                 tag_count += 1;
                 write_uint32_tag(&mut tags, 0x3A, (file.size >> 32) as u32);
