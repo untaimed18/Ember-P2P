@@ -65,7 +65,8 @@ impl BandwidthLimiter {
             self.total_uploaded.fetch_add(bytes, Ordering::Relaxed);
             return;
         }
-        self.drain_tokens(&self.upload_tokens, bytes, &self.max_upload_rate).await;
+        self.drain_tokens(&self.upload_tokens, bytes, &self.max_upload_rate)
+            .await;
         self.total_uploaded.fetch_add(bytes, Ordering::Relaxed);
     }
 
@@ -77,7 +78,8 @@ impl BandwidthLimiter {
             self.total_downloaded.fetch_add(bytes, Ordering::Relaxed);
             return;
         }
-        self.drain_tokens(&self.download_tokens, bytes, &self.max_download_rate).await;
+        self.drain_tokens(&self.download_tokens, bytes, &self.max_download_rate)
+            .await;
         self.total_downloaded.fetch_add(bytes, Ordering::Relaxed);
     }
 
@@ -120,10 +122,9 @@ impl BandwidthLimiter {
                 // to 25 ms keeps worst-case extra latency near the
                 // refill cadence (REFILL_INTERVAL_MS = 100 ms / 4 ticks)
                 // instead of an order of magnitude slower.
-                tokio::time::timeout(
-                    Duration::from_millis(25),
-                    self.refill_notify.notified(),
-                ).await.ok();
+                tokio::time::timeout(Duration::from_millis(25), self.refill_notify.notified())
+                    .await
+                    .ok();
                 if !warned_slow && start.elapsed() > Duration::from_secs(60) {
                     warned_slow = true;
                     tracing::warn!(
@@ -152,7 +153,9 @@ impl BandwidthLimiter {
     /// Add a fraction of the rate limit worth of tokens (called at sub-second intervals).
     /// Tokens are capped at 2x the max rate to allow short bursts (eMule behavior).
     pub fn refill_tokens_incremental(&self, fraction: u64, divisor: u64) {
-        if divisor == 0 { return; }
+        if divisor == 0 {
+            return;
+        }
         let max_up = self.max_upload_rate.load(Ordering::Relaxed);
         let max_down = self.max_download_rate.load(Ordering::Relaxed);
 
@@ -165,7 +168,8 @@ impl BandwidthLimiter {
             let prev_rem = self.upload_refill_rem.load(Ordering::Relaxed);
             let numer = max_up.saturating_mul(fraction).saturating_add(prev_rem);
             let add = numer / divisor;
-            self.upload_refill_rem.store(numer % divisor, Ordering::Relaxed);
+            self.upload_refill_rem
+                .store(numer % divisor, Ordering::Relaxed);
             let cap = max_up.saturating_mul(2);
             loop {
                 let current = self.upload_tokens.load(Ordering::Relaxed);
@@ -185,7 +189,8 @@ impl BandwidthLimiter {
             let prev_rem = self.download_refill_rem.load(Ordering::Relaxed);
             let numer = max_down.saturating_mul(fraction).saturating_add(prev_rem);
             let add = numer / divisor;
-            self.download_refill_rem.store(numer % divisor, Ordering::Relaxed);
+            self.download_refill_rem
+                .store(numer % divisor, Ordering::Relaxed);
             let cap = max_down.saturating_mul(2);
             loop {
                 let current = self.download_tokens.load(Ordering::Relaxed);
@@ -367,17 +372,23 @@ impl BandwidthLimiter {
 
     pub fn update_speeds(&self, uploaded_delta: u64, downloaded_delta: u64) {
         self.upload_speed.store(uploaded_delta, Ordering::Relaxed);
-        self.download_speed.store(downloaded_delta, Ordering::Relaxed);
+        self.download_speed
+            .store(downloaded_delta, Ordering::Relaxed);
 
         let prev_up = self.smoothed_upload.load(Ordering::Relaxed);
-        let smoothed_up = uploaded_delta.saturating_mul(30)
-            .saturating_add(prev_up.saturating_mul(70)) / 100;
+        let smoothed_up = uploaded_delta
+            .saturating_mul(30)
+            .saturating_add(prev_up.saturating_mul(70))
+            / 100;
         self.smoothed_upload.store(smoothed_up, Ordering::Relaxed);
 
         let prev_down = self.smoothed_download.load(Ordering::Relaxed);
-        let smoothed_down = downloaded_delta.saturating_mul(30)
-            .saturating_add(prev_down.saturating_mul(70)) / 100;
-        self.smoothed_download.store(smoothed_down, Ordering::Relaxed);
+        let smoothed_down = downloaded_delta
+            .saturating_mul(30)
+            .saturating_add(prev_down.saturating_mul(70))
+            / 100;
+        self.smoothed_download
+            .store(smoothed_down, Ordering::Relaxed);
     }
 
     pub fn smoothed_upload_speed(&self) -> u64 {
@@ -423,8 +434,8 @@ pub async fn start_token_refill(
         }
 
         // Sync USS enabled state from user settings
-        let want_enabled = uss_enabled_flag.load(Ordering::Relaxed)
-            && limiter.configured_upload_rate() > 0;
+        let want_enabled =
+            uss_enabled_flag.load(Ordering::Relaxed) && limiter.configured_upload_rate() > 0;
         if want_enabled && !uss.is_enabled() {
             let max = limiter.configured_upload_rate();
             uss.set_limits(1024, max);
@@ -433,7 +444,9 @@ pub async fn start_token_refill(
         } else if !want_enabled && uss.is_enabled() {
             uss.disable();
             limiter.set_uss_active(false);
-            limiter.max_upload_rate.store(limiter.configured_upload_rate(), Ordering::Relaxed);
+            limiter
+                .max_upload_rate
+                .store(limiter.configured_upload_rate(), Ordering::Relaxed);
         }
 
         speed_tick_count += 1;
@@ -503,7 +516,7 @@ mod tests {
         let bw = BandwidthLimiter::new(100, 100);
         bw.set_uss_active(true);
         bw.set_upload_limit(30); // USS throttle
-        // User lowers the hard cap below the current throttle: must win now.
+                                 // User lowers the hard cap below the current throttle: must win now.
         bw.set_configured_limits(20, 100);
         assert_eq!(bw.effective_upload_rate(), 20);
     }
@@ -532,7 +545,10 @@ mod tests {
             bw2.acquire_upload(10_000).await;
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!handle.is_finished(), "acquire should be parked on empty bucket");
+        assert!(
+            !handle.is_finished(),
+            "acquire should be parked on empty bucket"
+        );
 
         // Switch the upload rate to unlimited (0). The in-flight drain must
         // observe this and return instead of waiting forever.

@@ -50,7 +50,9 @@ impl AppConfig {
                         );
                         corrupt_backup = Some(bak);
                     } else {
-                        tracing::warn!("config.json corrupt ({e}); reset to defaults (backup attempt failed)");
+                        tracing::warn!(
+                            "config.json corrupt ({e}); reset to defaults (backup attempt failed)"
+                        );
                     }
                     AppSettings::default()
                 }
@@ -76,9 +78,18 @@ impl AppConfig {
                 .and_then(|u| u.download_dir().map(|d| d.to_path_buf()))
                 .map(|d| dl == d.as_path())
                 .unwrap_or(false);
-            if is_default && dl.file_name().map(|n| !n.eq_ignore_ascii_case("Ember")).unwrap_or(false) {
+            if is_default
+                && dl
+                    .file_name()
+                    .map(|n| !n.eq_ignore_ascii_case("Ember"))
+                    .unwrap_or(false)
+            {
                 let migrated = dl.join("Ember").to_string_lossy().to_string();
-                tracing::info!("Migrating download_folder: {} -> {}", settings.download_folder, migrated);
+                tracing::info!(
+                    "Migrating download_folder: {} -> {}",
+                    settings.download_folder,
+                    migrated
+                );
                 settings.download_folder = migrated;
                 let _ = std::fs::create_dir_all(&settings.download_folder);
                 config_changed = true;
@@ -91,7 +102,11 @@ impl AppConfig {
             let already_shared = settings.shared_folders.iter().any(|f| {
                 let a = std::path::Path::new(f);
                 let b = &completed_path;
-                a == b || a.canonicalize().ok().zip(b.canonicalize().ok()).map_or(false, |(ca, cb)| ca == cb)
+                a == b
+                    || a.canonicalize()
+                        .ok()
+                        .zip(b.canonicalize().ok())
+                        .map_or(false, |(ca, cb)| ca == cb)
             });
             if !already_shared {
                 tracing::info!("Adding default shared folder: {completed_dir}");
@@ -125,7 +140,11 @@ impl AppConfig {
     /// Blocking file write -- call this OUTSIDE of the RwLock.
     /// `_tmp_path` is retained for back-compat but ignored; `atomic_write`
     /// generates a unique temp path internally.
-    pub fn write_to_disk(data: &str, _tmp_path: &std::path::Path, final_path: &std::path::Path) -> anyhow::Result<()> {
+    pub fn write_to_disk(
+        data: &str,
+        _tmp_path: &std::path::Path,
+        final_path: &std::path::Path,
+    ) -> anyhow::Result<()> {
         crate::security::atomic_write(final_path, data.as_bytes(), true)?;
         info!("Config saved");
         Ok(())

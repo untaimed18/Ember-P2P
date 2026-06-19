@@ -8,6 +8,8 @@ use super::types::*;
 
 const REPUBLISH_KEYWORD_SECS: i64 = 24 * 3600;
 const REPUBLISH_SOURCE_SECS: i64 = 5 * 3600;
+const MAX_FILES_PER_KEYWORD_PUBLISH: usize = 150;
+const MAX_FILES_PER_KEYWORD_PACKET: usize = 50;
 
 /// Bit set in the `"ember"` source-publish tag when this client speaks
 /// the v1 LowID-to-LowID protocol (rendezvous hole-punch + WebSocket
@@ -30,19 +32,37 @@ pub struct PublishableFile {
     pub file_size: u64,
     pub file_type: String,
     pub complete_sources: u32,
+    /// eMule only publishes complete shared files under keywords. Part files
+    /// still source-publish by file hash, but must not appear in keyword
+    /// search results.
+    pub keyword_publishable: bool,
+    /// Persisted eMule `FT_KADLASTPUBLISHSRC` timestamp. Used to avoid
+    /// republishing every source immediately after a restart.
+    pub last_source_publish: i64,
 }
 
 #[derive(Debug)]
 struct PublishRecord {
     pub file: PublishableFile,
-    pub last_keyword_publish: i64,
     pub last_source_publish: i64,
-    /// K15: exponential backoff shift for keyword republishing. The
-    /// effective republish interval is `REPUBLISH_KEYWORD_SECS <<
-    /// keyword_backoff_shift`. Grows when peers return load=100 (hot
-    /// file / full bucket) and resets on a successful publish.
-    pub keyword_backoff_shift: u32,
-    pub source_backoff_shift: u32,
+}
+
+#[derive(Debug)]
+struct KeywordRecord {
+    keyword: String,
+    last_publish: i64,
+    /// eMule tracks hot keyword targets separately from files. Keep the
+    /// backoff on the keyword hash so one popular word does not suppress
+    /// unrelated keywords from the same file.
+    backoff_shift: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct KeywordPublishBatch {
+    pub keyword_hash: KadId,
+    pub keyword: String,
+    pub messages: Vec<KadMessage>,
+    pub file_hashes: Vec<KadId>,
 }
 
 /// Manages publishing files to the KAD network.
@@ -67,6 +87,7 @@ pub struct PublishManager {
     pub buddy_port: u16,
     pub buddy_id: Option<KadId>,
     records: HashMap<KadId, PublishRecord>,
+    keyword_records: HashMap<KadId, KeywordRecord>,
 }
 
 impl PublishManager {
@@ -85,11 +106,13 @@ impl PublishManager {
             buddy_port: 0,
             buddy_id: None,
             records: HashMap::new(),
+            keyword_records: HashMap::new(),
         }
     }
 
     /// Register a file for publishing.
     pub fn add_file(&mut self, file: PublishableFile) {
+        self.ensure_keyword_records_for_file(&file);
         self.records
             .entry(file.file_hash)
             .and_modify(|record| {
@@ -97,13 +120,16 @@ impl PublishManager {
                 record.file.file_size = file.file_size;
                 record.file.file_type = file.file_type.clone();
                 record.file.complete_sources = file.complete_sources;
+                record.file.keyword_publishable = file.keyword_publishable;
+                record.file.last_source_publish = file.last_source_publish;
+                if file.last_source_publish > 0 {
+                    record.last_source_publish =
+                        record.last_source_publish.max(file.last_source_publish);
+                }
             })
             .or_insert_with(|| PublishRecord {
+                last_source_publish: file.last_source_publish,
                 file,
-                last_keyword_publish: 0,
-                last_source_publish: 0,
-                keyword_backoff_shift: 0,
-                source_backoff_shift: 0,
             });
     }
 
@@ -115,6 +141,7 @@ impl PublishManager {
     /// Clear all records and re-add files (for re-indexing).
     pub fn clear_all(&mut self) {
         self.records.clear();
+        self.keyword_records.clear();
     }
 
     /// Add a batch of files for publishing.
@@ -124,22 +151,18 @@ impl PublishManager {
         }
     }
 
-    /// Get files that need keyword republishing.
-    pub fn files_needing_keyword_publish(&self) -> Vec<&PublishableFile> {
+    /// Number of keyword targets that are currently due for publishing.
+    pub fn keywords_needing_publish_count(&self) -> usize {
         let now = chrono::Utc::now().timestamp();
-        self.records
+        self.keyword_records
             .values()
-            .filter(|r| {
-                // K15: honour per-file exponential backoff. Cap the shift
-                // at 4 so the interval never exceeds 16x the base (24h) —
-                // a ceiling of ~16 days for a keyword that reports
-                // saturation on every receiver.
-                let shift = r.keyword_backoff_shift.min(4);
+            .filter(|record| {
+                let shift = record.backoff_shift.min(4);
                 let interval = REPUBLISH_KEYWORD_SECS.saturating_mul(1_i64 << shift);
-                now.saturating_sub(r.last_keyword_publish) > interval
+                now.saturating_sub(record.last_publish) > interval
+                    && self.keyword_has_publishable_files(&record.keyword)
             })
-            .map(|r| &r.file)
-            .collect()
+            .count()
     }
 
     /// Get files that need source republishing.
@@ -147,19 +170,74 @@ impl PublishManager {
         let now = chrono::Utc::now().timestamp();
         self.records
             .values()
-            .filter(|r| {
-                let shift = r.source_backoff_shift.min(4);
-                let interval = REPUBLISH_SOURCE_SECS.saturating_mul(1_i64 << shift);
-                now.saturating_sub(r.last_source_publish) > interval
-            })
+            .filter(|r| now.saturating_sub(r.last_source_publish) > REPUBLISH_SOURCE_SECS)
             .map(|r| &r.file)
             .collect()
     }
 
-    /// Mark a file's keywords as published.
-    pub fn mark_keyword_published(&mut self, file_hash: &KadId) {
-        if let Some(record) = self.records.get_mut(file_hash) {
-            record.last_keyword_publish = chrono::Utc::now().timestamp();
+    /// Build eMule-style keyword publishes: one store search per keyword,
+    /// carrying up to 150 complete shared files and split into 50-entry
+    /// `PublishKeyReq` packets.
+    pub fn keyword_batches_needing_publish(&self, max_keywords: usize) -> Vec<KeywordPublishBatch> {
+        let now = chrono::Utc::now().timestamp();
+        let mut batches = Vec::new();
+
+        for (keyword_hash, keyword_record) in &self.keyword_records {
+            if batches.len() >= max_keywords {
+                break;
+            }
+            let shift = keyword_record.backoff_shift.min(4);
+            let interval = REPUBLISH_KEYWORD_SECS.saturating_mul(1_i64 << shift);
+            if now.saturating_sub(keyword_record.last_publish) <= interval {
+                continue;
+            }
+
+            let mut entries = Vec::new();
+            let mut file_hashes = Vec::new();
+            for record in self.records.values() {
+                if !record.file.keyword_publishable {
+                    continue;
+                }
+                if !extract_keywords(&record.file.file_name)
+                    .into_iter()
+                    .any(|kw| kw == keyword_record.keyword)
+                {
+                    continue;
+                }
+                entries.push(Self::build_keyword_entry(&record.file));
+                file_hashes.push(record.file.file_hash);
+                if entries.len() >= MAX_FILES_PER_KEYWORD_PUBLISH {
+                    break;
+                }
+            }
+
+            if entries.is_empty() {
+                continue;
+            }
+
+            let messages = entries
+                .chunks(MAX_FILES_PER_KEYWORD_PACKET)
+                .map(|chunk| KadMessage::PublishKeyReq {
+                    target: *keyword_hash,
+                    entries: chunk.to_vec(),
+                })
+                .collect();
+
+            batches.push(KeywordPublishBatch {
+                keyword_hash: *keyword_hash,
+                keyword: keyword_record.keyword.clone(),
+                messages,
+                file_hashes,
+            });
+        }
+
+        batches
+    }
+
+    /// Mark a keyword target as published.
+    pub fn mark_keyword_published(&mut self, keyword_hash: &KadId) {
+        if let Some(record) = self.keyword_records.get_mut(keyword_hash) {
+            record.last_publish = chrono::Utc::now().timestamp();
         }
     }
 
@@ -174,23 +252,12 @@ impl PublishManager {
     /// our keyword publish. Load >= 90 means the peer's keyword bucket
     /// is effectively full — don't hammer it. Load < 50 means we have
     /// headroom and we can reset backoff.
-    pub fn record_keyword_publish_load(&mut self, file_hash: &KadId, load: u8) {
-        if let Some(record) = self.records.get_mut(file_hash) {
+    pub fn record_keyword_publish_load(&mut self, keyword_hash: &KadId, load: u8) {
+        if let Some(record) = self.keyword_records.get_mut(keyword_hash) {
             if load >= 90 {
-                record.keyword_backoff_shift = (record.keyword_backoff_shift + 1).min(4);
+                record.backoff_shift = (record.backoff_shift + 1).min(4);
             } else if load < 50 {
-                record.keyword_backoff_shift = 0;
-            }
-        }
-    }
-
-    /// Counterpart to `record_keyword_publish_load` for source publishes.
-    pub fn record_source_publish_load(&mut self, file_hash: &KadId, load: u8) {
-        if let Some(record) = self.records.get_mut(file_hash) {
-            if load >= 90 {
-                record.source_backoff_shift = (record.source_backoff_shift + 1).min(4);
-            } else if load < 50 {
-                record.source_backoff_shift = 0;
+                record.backoff_shift = 0;
             }
         }
     }
@@ -221,7 +288,11 @@ impl PublishManager {
             } else if self.buddy_id.is_some() {
                 // eMule source types:
                 // 3 = firewalled with buddy, 5 = same for >4GB files.
-                let st = if file.file_size > u32::MAX as u64 { 5 } else { 3 };
+                let st = if file.file_size > u32::MAX as u64 {
+                    5
+                } else {
+                    3
+                };
                 tags.push(KadTag {
                     name: TagName::Id(TAG_SOURCETYPE),
                     value: TagValue::Uint8(st),
@@ -249,7 +320,11 @@ impl PublishManager {
         } else {
             // eMule direct source types:
             // 1 = direct high-ID, 4 = same for >4GB files.
-            let st = if file.file_size > u32::MAX as u64 { 4 } else { 1 };
+            let st = if file.file_size > u32::MAX as u64 {
+                4
+            } else {
+                1
+            };
             tags.push(KadTag {
                 name: TagName::Id(TAG_SOURCETYPE),
                 value: TagValue::Uint8(st),
@@ -310,50 +385,33 @@ impl PublishManager {
         })
     }
 
-    /// Build keyword publish data for a file.
-    /// Keywords are extracted from the filename, each hashed with MD4 to get a KAD target.
-    pub fn build_keyword_publishes(&self, file: &PublishableFile) -> Vec<(KadId, KadMessage)> {
-        let keywords = extract_keywords(&file.file_name);
-        let mut messages = Vec::new();
-
-        for keyword in keywords {
-            let keyword_hash = keyword_to_kad_id(&keyword);
-
-            let entry = PublishEntry {
-                id: file.file_hash,
-                tags: vec![
-                    KadTag {
-                        name: TagName::Id(TAG_FILENAME),
-                        value: TagValue::String(file.file_name.clone()),
-                    },
-                    KadTag {
-                        name: TagName::Id(TAG_FILESIZE),
-                        value: TagValue::Uint64(file.file_size),
-                    },
-                    KadTag {
-                        name: TagName::Id(TAG_FILETYPE),
-                        value: TagValue::String(file.file_type.clone()),
-                    },
-                    KadTag {
-                        name: TagName::Id(TAG_SOURCES),
-                        value: TagValue::Uint32(1),
-                    },
-                    KadTag {
-                        name: TagName::Id(TAG_COMPLETE_SOURCES),
-                        value: TagValue::Uint32(file.complete_sources.max(1)),
-                    },
-                ],
-            };
-
-            let msg = KadMessage::PublishKeyReq {
-                target: keyword_hash,
-                entries: vec![entry],
-            };
-
-            messages.push((keyword_hash, msg));
+    fn build_keyword_entry(file: &PublishableFile) -> PublishEntry {
+        let complete_sources = file.complete_sources.max(1);
+        PublishEntry {
+            id: file.file_hash,
+            tags: vec![
+                KadTag {
+                    name: TagName::Id(TAG_FILENAME),
+                    value: TagValue::String(file.file_name.clone()),
+                },
+                KadTag {
+                    name: TagName::Id(TAG_FILESIZE),
+                    value: TagValue::Uint64(file.file_size),
+                },
+                KadTag {
+                    name: TagName::Id(TAG_FILETYPE),
+                    value: TagValue::String(file.file_type.clone()),
+                },
+                KadTag {
+                    name: TagName::Id(TAG_SOURCES),
+                    value: TagValue::Uint32(complete_sources),
+                },
+                KadTag {
+                    name: TagName::Id(TAG_COMPLETE_SOURCES),
+                    value: TagValue::Uint32(complete_sources),
+                },
+            ],
         }
-
-        messages
     }
 
     pub fn file_count(&self) -> usize {
@@ -367,9 +425,47 @@ impl PublishManager {
     }
 
     pub fn reset_keyword_publish(&mut self, file_hash: &KadId) {
-        if let Some(record) = self.records.get_mut(file_hash) {
-            record.last_keyword_publish = 0;
+        if let Some(record) = self.records.get(file_hash) {
+            for keyword in extract_keywords(&record.file.file_name) {
+                let keyword_hash = keyword_to_kad_id(&keyword);
+                if let Some(keyword_record) = self.keyword_records.get_mut(&keyword_hash) {
+                    keyword_record.last_publish = 0;
+                    keyword_record.backoff_shift = 0;
+                }
+            }
         }
+    }
+
+    pub fn reset_keyword_target_publish(&mut self, keyword_hash: &KadId) {
+        if let Some(keyword_record) = self.keyword_records.get_mut(keyword_hash) {
+            keyword_record.last_publish = 0;
+            keyword_record.backoff_shift = 0;
+        }
+    }
+
+    fn ensure_keyword_records_for_file(&mut self, file: &PublishableFile) {
+        if !file.keyword_publishable {
+            return;
+        }
+        for keyword in extract_keywords(&file.file_name) {
+            let keyword_hash = keyword_to_kad_id(&keyword);
+            self.keyword_records
+                .entry(keyword_hash)
+                .or_insert(KeywordRecord {
+                    keyword,
+                    last_publish: 0,
+                    backoff_shift: 0,
+                });
+        }
+    }
+
+    fn keyword_has_publishable_files(&self, keyword: &str) -> bool {
+        self.records.values().any(|record| {
+            record.file.keyword_publishable
+                && extract_keywords(&record.file.file_name)
+                    .into_iter()
+                    .any(|kw| kw == keyword)
+        })
     }
 }
 
@@ -386,7 +482,10 @@ pub fn keyword_to_kad_id(keyword: &str) -> KadId {
 /// Convert raw MD4 output bytes to a KadId matching eMule's CUInt128 wire format.
 /// Each 32-bit word has its bytes reversed (big-endian interpretation written as LE).
 pub fn md4_bytes_to_kad_id(hash: &[u8]) -> KadId {
-    debug_assert!(hash.len() >= 16, "md4_bytes_to_kad_id expects a 16-byte digest");
+    debug_assert!(
+        hash.len() >= 16,
+        "md4_bytes_to_kad_id expects a 16-byte digest"
+    );
     let mut id = [0u8; 16];
     let len = hash.len().min(16);
     let src = &hash[..len];
@@ -424,8 +523,27 @@ pub fn kad_id_to_md4_bytes(id: &KadId) -> [u8; 16] {
 /// - Remove last word if it's exactly 3 chars and 3 bytes (strips file extensions)
 pub fn extract_keywords(filename: &str) -> Vec<String> {
     let separator_chars = |c: char| -> bool {
-        matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | '.' | '_' | '-' | '!' | '?' | ':' | ';' | '\\' | '/' | '"')
-        || c.is_whitespace()
+        matches!(
+            c,
+            '(' | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '<'
+                | '>'
+                | ','
+                | '.'
+                | '_'
+                | '-'
+                | '!'
+                | '?'
+                | ':'
+                | ';'
+                | '\\'
+                | '/'
+                | '"'
+        ) || c.is_whitespace()
     };
 
     let mut seen = std::collections::HashSet::new();
@@ -465,6 +583,8 @@ mod tests {
             file_size: 1024,
             file_type: "Pro".to_string(),
             complete_sources: 0,
+            keyword_publishable: true,
+            last_source_publish: 0,
         }
     }
 

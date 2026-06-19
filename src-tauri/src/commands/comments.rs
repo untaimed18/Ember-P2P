@@ -1,7 +1,7 @@
 use crate::app_state::AppState;
 use crate::commands::errors::{await_reply, coded, coded_ctx};
-use crate::network::NetworkCommand;
 use crate::network::ed2k::comments::FileCommentInfo;
+use crate::network::NetworkCommand;
 
 #[tauri::command]
 pub async fn set_file_comment(
@@ -11,13 +11,22 @@ pub async fn set_file_comment(
     comment: String,
 ) -> Result<(), String> {
     if rating > 5 {
-        return Err(coded("comments_invalid_rating", "Rating must be between 0 and 5"));
+        return Err(coded(
+            "comments_invalid_rating",
+            "Rating must be between 0 and 5",
+        ));
     }
     if file_hash.len() != 32 || !file_hash.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(coded("comments_invalid_file_hash", "Invalid file hash: expected 32 hex characters"));
+        return Err(coded(
+            "comments_invalid_file_hash",
+            "Invalid file hash: expected 32 hex characters",
+        ));
     }
     if comment.len() > 4096 {
-        return Err(coded("comments_comment_too_long", "Comment too long (max 4096 bytes, matching eMule limit)"));
+        return Err(coded(
+            "comments_comment_too_long",
+            "Comment too long (max 4096 bytes, matching eMule limit)",
+        ));
     }
     state
         .network_tx
@@ -36,7 +45,10 @@ pub async fn get_file_comments(
     file_hash: String,
 ) -> Result<Option<FileCommentInfo>, String> {
     if file_hash.len() != 32 || !file_hash.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(coded("comments_invalid_file_hash", "Invalid file hash: expected 32 hex characters"));
+        return Err(coded(
+            "comments_invalid_file_hash",
+            "Invalid file hash: expected 32 hex characters",
+        ));
     }
     let (tx, rx) = tokio::sync::oneshot::channel();
     state

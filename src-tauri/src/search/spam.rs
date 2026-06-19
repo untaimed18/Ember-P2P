@@ -90,14 +90,11 @@ const STRONG_FAKE_FILENAME_TOKENS: &[&str] = &[
 
 /// Ambiguous tokens that *also* appear in plenty of legitimate filenames.
 /// Weighted low; meant to corroborate, not convict on their own.
-const WEAK_FAKE_FILENAME_TOKENS: &[&str] = &[
-    "password", "serial", "keygen", "crack", "patch", "codec",
-];
+const WEAK_FAKE_FILENAME_TOKENS: &[&str] =
+    &["password", "serial", "keygen", "crack", "patch", "codec"];
 
 /// Suspicious URL-like patterns in filenames (case-insensitive substring match).
-const FAKE_URL_PATTERNS: &[&str] = &[
-    "www.", "http:", "https:", ".com/", ".net/", ".org/",
-];
+const FAKE_URL_PATTERNS: &[&str] = &["www.", "http:", "https:", ".com/", ".net/", ".org/"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpamFilterProfile {
@@ -163,7 +160,10 @@ impl BatchSpamContext {
             let name_norm = normalize_filename(&r.file.name);
             let hash = normalize_hash(&r.file.hash);
             if !name_norm.is_empty() && !hash.is_empty() {
-                name_hashes.entry(name_norm.clone()).or_default().insert(hash.clone());
+                name_hashes
+                    .entry(name_norm.clone())
+                    .or_default()
+                    .insert(hash.clone());
                 hash_names.entry(hash).or_default().insert(name_norm);
             }
             // Count each distinct source IP at most once per result so a single
@@ -178,14 +178,8 @@ impl BatchSpamContext {
             }
         }
 
-        let name_hash_counts = name_hashes
-            .into_iter()
-            .map(|(k, v)| (k, v.len()))
-            .collect();
-        let hash_name_counts = hash_names
-            .into_iter()
-            .map(|(k, v)| (k, v.len()))
-            .collect();
+        let name_hash_counts = name_hashes.into_iter().map(|(k, v)| (k, v.len())).collect();
+        let hash_name_counts = hash_names.into_iter().map(|(k, v)| (k, v.len())).collect();
 
         let threshold = ((total as f64) * BATCH_SOURCE_HOT_SHARE).ceil() as usize;
         let min_hits = threshold.max(BATCH_SOURCE_MIN_HITS);
@@ -205,11 +199,7 @@ impl BatchSpamContext {
 
     fn name_collision(&self, name_norm: &str) -> bool {
         name_norm.chars().count() >= BATCH_MIN_NAME_LEN_FOR_COLLISION
-            && self
-                .name_hash_counts
-                .get(name_norm)
-                .copied()
-                .unwrap_or(0)
+            && self.name_hash_counts.get(name_norm).copied().unwrap_or(0)
                 >= BATCH_NAME_DISTINCT_HASHES_MIN
     }
 
@@ -409,8 +399,10 @@ impl SpamFilter {
                             // count-based truncation so a hand-edited file
                             // can't load megabyte-sized names that bog down
                             // every search's similarity scan.
-                            db.spam_filenames.retain(|s| s.len() <= MAX_NAME_ENTRY_BYTES);
-                            db.spam_similar_names.retain(|s| s.len() <= MAX_NAME_ENTRY_BYTES);
+                            db.spam_filenames
+                                .retain(|s| s.len() <= MAX_NAME_ENTRY_BYTES);
+                            db.spam_similar_names
+                                .retain(|s| s.len() <= MAX_NAME_ENTRY_BYTES);
                             if db.spam_filenames.len() > MAX_SPAM_FILENAMES {
                                 db.spam_filenames.truncate(MAX_SPAM_FILENAMES);
                             }
@@ -475,7 +467,10 @@ impl SpamFilter {
         }
         let data = match serde_json::to_string_pretty(&self.db) {
             Ok(d) => d,
-            Err(e) => { warn!("Failed to serialize spam filter: {e}"); return; }
+            Err(e) => {
+                warn!("Failed to serialize spam filter: {e}");
+                return;
+            }
         };
         match crate::security::atomic_write(&self.data_path, data.as_bytes(), false) {
             Ok(()) => {
@@ -495,9 +490,7 @@ impl SpamFilter {
             return None;
         }
         match serde_json::to_string_pretty(&self.db) {
-            Ok(data) => {
-                Some((data, self.data_path.clone(), self.gen))
-            }
+            Ok(data) => Some((data, self.data_path.clone(), self.gen)),
             Err(e) => {
                 warn!("Failed to serialize spam filter: {e}");
                 None
@@ -617,11 +610,17 @@ impl SpamFilter {
                 };
                 if sim > 0.95 {
                     score += SPAM_SIMILARNAME_HIT;
-                    reasons.push(format!("Very similar spam pattern ({:.0}% match, +{SPAM_SIMILARNAME_HIT})", sim * 100.0));
+                    reasons.push(format!(
+                        "Very similar spam pattern ({:.0}% match, +{SPAM_SIMILARNAME_HIT})",
+                        sim * 100.0
+                    ));
                     break;
                 } else if sim > 0.85 {
                     score += SPAM_SIMILARNAME_NEARHIT;
-                    reasons.push(format!("Similar spam pattern ({:.0}% match, +{SPAM_SIMILARNAME_NEARHIT})", sim * 100.0));
+                    reasons.push(format!(
+                        "Similar spam pattern ({:.0}% match, +{SPAM_SIMILARNAME_NEARHIT})",
+                        sim * 100.0
+                    ));
                     break;
                 } else {
                     let jac = jaccard(&stripped_tokens, &token_set(similar));
@@ -644,7 +643,9 @@ impl SpamFilter {
                 && (spam_size == 0 || (diff as f64 / spam_size as f64) < SIZE_TOLERANCE_PERCENT)
             {
                 score += SPAM_SIMILARSIZE_HIT;
-                reasons.push(format!("Matches known spam size signature (+{SPAM_SIMILARSIZE_HIT})"));
+                reasons.push(format!(
+                    "Matches known spam size signature (+{SPAM_SIMILARSIZE_HIT})"
+                ));
                 break;
             }
         }
@@ -652,7 +653,9 @@ impl SpamFilter {
         let pattern_score = fake_pattern_score(name);
         if pattern_score > 0 {
             score += pattern_score;
-            reasons.push(format!("Contains known fake/suspicious pattern (+{pattern_score})"));
+            reasons.push(format!(
+                "Contains known fake/suspicious pattern (+{pattern_score})"
+            ));
         }
 
         // Community verdict: a file the network has voted "fake".
@@ -710,26 +713,36 @@ impl SpamFilter {
 
         if let Some(sip) = server_ip.and_then(|s| extract_ip(s)) {
             if self.db.spam_server_ips.contains(&sip) {
-                let total_sources = result.source_addresses.iter()
+                let total_sources = result
+                    .source_addresses
+                    .iter()
                     .filter(|a| extract_ip(a).is_some())
                     .count();
-                let all_sources_spam = total_sources > 0
-                    && total_sources as u32 == spam_source_count;
+                let all_sources_spam =
+                    total_sources > 0 && total_sources as u32 == spam_source_count;
                 if all_sources_spam || total_sources == 0 {
                     score += SPAM_UDPSERVERRES_HIT;
                     reasons.push(format!("Result from spam-heavy server, all sources spam (+{SPAM_UDPSERVERRES_HIT})"));
                 } else {
                     score += SPAM_UDPSERVERRES_NEARHIT;
-                    reasons.push(format!("Result influenced by spam server (+{SPAM_UDPSERVERRES_NEARHIT})"));
+                    reasons.push(format!(
+                        "Result influenced by spam server (+{SPAM_UDPSERVERRES_NEARHIT})"
+                    ));
                 }
             }
             if let Some(&ratio) = self.db.udp_server_spam_ratios.get(&sip) {
                 if ratio > 0.5 {
                     score += SPAM_ONLYUDPSPAMSERVERS_HIT;
-                    reasons.push(format!("Server spam ratio is high ({:.0}%, +{SPAM_ONLYUDPSPAMSERVERS_HIT})", ratio * 100.0));
+                    reasons.push(format!(
+                        "Server spam ratio is high ({:.0}%, +{SPAM_ONLYUDPSPAMSERVERS_HIT})",
+                        ratio * 100.0
+                    ));
                 } else if ratio > 0.3 {
                     score += SPAM_UDPSERVERRES_FARHIT;
-                    reasons.push(format!("Server spam ratio is elevated ({:.0}%, +{SPAM_UDPSERVERRES_FARHIT})", ratio * 100.0));
+                    reasons.push(format!(
+                        "Server spam ratio is elevated ({:.0}%, +{SPAM_UDPSERVERRES_FARHIT})",
+                        ratio * 100.0
+                    ));
                 }
             }
         }
@@ -737,7 +750,10 @@ impl SpamFilter {
         if profile == SpamFilterProfile::Aggressive {
             let boosted = (score as f32 * 1.2).round() as u32;
             if boosted > score {
-                reasons.push(format!("Aggressive profile sensitivity boost (+{})", boosted - score));
+                reasons.push(format!(
+                    "Aggressive profile sensitivity boost (+{})",
+                    boosted - score
+                ));
                 score = boosted;
             }
         }
@@ -764,14 +780,28 @@ impl SpamFilter {
         community: CommunityRating,
         batch: &BatchSpamContext,
     ) -> u32 {
-        self.explain_result(result, search_keywords, server_ip, profile, community, batch)
-            .score
+        self.explain_result(
+            result,
+            search_keywords,
+            server_ip,
+            profile,
+            community,
+            batch,
+        )
+        .score
     }
 
-    pub fn mark_spam(&mut self, result: &SearchResult, search_keywords: &[String], server_ip: Option<&str>) {
+    pub fn mark_spam(
+        &mut self,
+        result: &SearchResult,
+        search_keywords: &[String],
+        server_ip: Option<&str>,
+    ) {
         let file_hash = normalize_hash(&result.file.hash);
         if !file_hash.is_empty() {
-            self.db.spam_hashes.insert(file_hash.clone(), MAX_SPAM_HASHES);
+            self.db
+                .spam_hashes
+                .insert(file_hash.clone(), MAX_SPAM_HASHES);
             self.db.not_spam_hashes.remove(&file_hash);
         }
 
@@ -785,7 +815,10 @@ impl SpamFilter {
         }
 
         let stripped = name_without_keywords(name, search_keywords);
-        if stripped.len() >= MIN_SIMILAR_NAME_LEN && stripped.len() <= MAX_LEVENSHTEIN_LEN && !self.db.spam_similar_names.contains(&stripped) {
+        if stripped.len() >= MIN_SIMILAR_NAME_LEN
+            && stripped.len() <= MAX_LEVENSHTEIN_LEN
+            && !self.db.spam_similar_names.contains(&stripped)
+        {
             if self.db.spam_similar_names.len() >= MAX_SPAM_SIMILAR_NAMES {
                 self.db.spam_similar_names.remove(0);
             }
@@ -799,19 +832,28 @@ impl SpamFilter {
             self.db.spam_sizes.push_back(result.file.size);
         }
 
-        for addr in result.source_addresses.iter().take(MAX_SOURCE_IPS_PER_RESULT) {
+        for addr in result
+            .source_addresses
+            .iter()
+            .take(MAX_SOURCE_IPS_PER_RESULT)
+        {
             if let Some(ip) = extract_ip(addr) {
                 self.db.spam_source_ips.insert(ip, MAX_SPAM_SOURCE_IPS);
             }
         }
 
         if let Some(sip) = server_ip.and_then(|s| extract_ip(s)) {
-            self.db.spam_server_ips.insert(sip.clone(), MAX_SPAM_SERVER_IPS);
+            self.db
+                .spam_server_ips
+                .insert(sip.clone(), MAX_SPAM_SERVER_IPS);
 
             let entry = self.db.udp_server_spam_ratios.entry(sip).or_insert(0.0);
             *entry = (*entry * 0.9 + 0.1).min(1.0);
             if self.db.udp_server_spam_ratios.len() > MAX_SERVER_RATIOS {
-                if let Some(lowest_key) = self.db.udp_server_spam_ratios.iter()
+                if let Some(lowest_key) = self
+                    .db
+                    .udp_server_spam_ratios
+                    .iter()
                     .min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                     .map(|(k, _)| k.clone())
                 {
@@ -826,7 +868,9 @@ impl SpamFilter {
 
     pub fn mark_not_spam(&mut self, file_hash: &str) {
         let file_hash = normalize_hash(file_hash);
-        self.db.not_spam_hashes.insert(file_hash.clone(), NOT_SPAM_HASHES_CAP);
+        self.db
+            .not_spam_hashes
+            .insert(file_hash.clone(), NOT_SPAM_HASHES_CAP);
         self.db.spam_hashes.remove(&file_hash);
         self.mark_dirty();
         info!("Marked as not spam: {file_hash}");
@@ -839,7 +883,9 @@ impl SpamFilter {
         if file_hash.is_empty() || self.db.not_spam_hashes.contains(&file_hash) {
             return;
         }
-        self.db.not_spam_hashes.insert(file_hash.clone(), NOT_SPAM_HASHES_CAP);
+        self.db
+            .not_spam_hashes
+            .insert(file_hash.clone(), NOT_SPAM_HASHES_CAP);
         self.db.spam_hashes.remove(&file_hash);
         self.mark_dirty();
         debug!("Auto-marked completed download as not spam: {file_hash}");
@@ -998,12 +1044,26 @@ fn fold_char(c: char) -> char {
     };
     match c {
         // Cyrillic look-alikes (lowercase, post to_lowercase()).
-        'а' => 'a', 'е' => 'e', 'о' => 'o', 'р' => 'p', 'с' => 'c',
-        'х' => 'x', 'у' => 'y', 'к' => 'k', 'м' => 'm', 'т' => 't',
-        'в' => 'b', 'н' => 'h',
+        'а' => 'a',
+        'е' => 'e',
+        'о' => 'o',
+        'р' => 'p',
+        'с' => 'c',
+        'х' => 'x',
+        'у' => 'y',
+        'к' => 'k',
+        'м' => 'm',
+        'т' => 't',
+        'в' => 'b',
+        'н' => 'h',
         // Greek look-alikes.
-        'ο' => 'o', 'α' => 'a', 'ρ' => 'p', 'ν' => 'v', 'τ' => 't',
-        'ι' => 'i', 'κ' => 'k',
+        'ο' => 'o',
+        'α' => 'a',
+        'ρ' => 'p',
+        'ν' => 'v',
+        'τ' => 't',
+        'ι' => 'i',
+        'κ' => 'k',
         _ => c,
     }
 }
@@ -1236,7 +1296,10 @@ mod tests {
             &[],
             None,
             SpamFilterProfile::Balanced,
-            CommunityRating { fake_votes: 4, total_votes: 5 },
+            CommunityRating {
+                fake_votes: 4,
+                total_votes: 5,
+            },
             &BatchSpamContext::default(),
         );
         assert!(explanation.score >= SPAM_FAKE_RATING_HIT);
@@ -1250,7 +1313,12 @@ mod tests {
         let mut results = Vec::new();
         for i in 0..10 {
             let hash = format!("{:032x}", i);
-            results.push(sized_result(&hash, "Popular Movie 2026 1080p BluRay.mkv", 1000 + i, &[]));
+            results.push(sized_result(
+                &hash,
+                "Popular Movie 2026 1080p BluRay.mkv",
+                1000 + i,
+                &[],
+            ));
         }
         let ctx = BatchSpamContext::analyze(&results);
         let dir = temp_dir("relaxed-skip");
@@ -1261,10 +1329,16 @@ mod tests {
             &[],
             None,
             SpamFilterProfile::Relaxed,
-            CommunityRating { fake_votes: 9, total_votes: 10 },
+            CommunityRating {
+                fake_votes: 9,
+                total_votes: 10,
+            },
             &ctx,
         );
-        assert_eq!(batch_score, 0, "relaxed should ignore batch + community signals");
+        assert_eq!(
+            batch_score, 0,
+            "relaxed should ignore batch + community signals"
+        );
 
         // Same inputs under balanced must score (sanity check the gate, not
         // the absence of any DB entries).
@@ -1273,7 +1347,10 @@ mod tests {
             &[],
             None,
             SpamFilterProfile::Balanced,
-            CommunityRating { fake_votes: 9, total_votes: 10 },
+            CommunityRating {
+                fake_votes: 9,
+                total_votes: 10,
+            },
             &ctx,
         );
         assert!(balanced_score > 0, "balanced should apply network signals");
@@ -1288,7 +1365,12 @@ mod tests {
         let mut results = Vec::new();
         for i in 0..10 {
             let hash = format!("{:032x}", i);
-            results.push(sized_result(&hash, "Popular Movie 2026 1080p BluRay.mkv", 1000 + i, &[]));
+            results.push(sized_result(
+                &hash,
+                "Popular Movie 2026 1080p BluRay.mkv",
+                1000 + i,
+                &[],
+            ));
         }
         let ctx = BatchSpamContext::analyze(&results);
         let dir = temp_dir("batch-name");
@@ -1301,7 +1383,10 @@ mod tests {
             CommunityRating::default(),
             &ctx,
         );
-        assert!(score >= SPAM_BATCH_NAME_MANY_HASHES_HIT, "batch score {score}");
+        assert!(
+            score >= SPAM_BATCH_NAME_MANY_HASHES_HIT,
+            "batch score {score}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

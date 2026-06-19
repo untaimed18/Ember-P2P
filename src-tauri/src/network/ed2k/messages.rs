@@ -47,7 +47,7 @@ pub const OP_PORTTEST: u8 = 0xFE;
 pub const OP_HASHSETREQ: u8 = 0x51;
 pub const OP_HASHSETANSWER: u8 = 0x52;
 pub const OP_HASHSETREQUEST2: u8 = 0xB1; // OP_EMULEPROT
-pub const OP_HASHSETANSWER2: u8 = 0xB2;  // OP_EMULEPROT
+pub const OP_HASHSETANSWER2: u8 = 0xB2; // OP_EMULEPROT
 
 // Legacy opcodes (OP_EDONKEYHEADER)
 pub const OP_QUEUERANK: u8 = 0x5C;
@@ -243,7 +243,10 @@ impl FileIdentifier {
         let has_aich = (desc & 0x04) != 0;
         let mandatory_opts = (desc >> 3) & 0x03;
         if mandatory_opts != 0 || !has_md4 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid file identifier"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid file identifier",
+            ));
         }
         let mut md4_hash = [0u8; 16];
         cursor.read_exact(&mut md4_hash)?;
@@ -259,7 +262,11 @@ impl FileIdentifier {
         } else {
             None
         };
-        Ok(Self { md4_hash, file_size, aich_hash })
+        Ok(Self {
+            md4_hash,
+            file_size,
+            aich_hash,
+        })
     }
 }
 
@@ -355,7 +362,14 @@ pub struct PeerCapabilities {
 }
 
 /// Build Hello with buddy info tags.
-pub fn build_hello_with_buddy(user_hash: &[u8; 16], client_id: u32, tcp_port: u16, udp_port: u16, nickname: &str, buddy: Option<BuddyInfo>) -> Vec<u8> {
+pub fn build_hello_with_buddy(
+    user_hash: &[u8; 16],
+    client_id: u32,
+    tcp_port: u16,
+    udp_port: u16,
+    nickname: &str,
+    buddy: Option<BuddyInfo>,
+) -> Vec<u8> {
     build_hello_inner(
         user_hash,
         client_id,
@@ -375,7 +389,9 @@ pub fn build_hello_with_buddy_opts(
     buddy: Option<BuddyInfo>,
     options: &HelloOptions,
 ) -> Vec<u8> {
-    build_hello_inner(user_hash, client_id, tcp_port, nickname, true, buddy, options)
+    build_hello_inner(
+        user_hash, client_id, tcp_port, nickname, true, buddy, options,
+    )
 }
 
 pub fn build_hello_answer_with_buddy_opts(
@@ -386,7 +402,9 @@ pub fn build_hello_answer_with_buddy_opts(
     buddy: Option<BuddyInfo>,
     options: &HelloOptions,
 ) -> Vec<u8> {
-    build_hello_inner(user_hash, client_id, tcp_port, nickname, false, buddy, options)
+    build_hello_inner(
+        user_hash, client_id, tcp_port, nickname, false, buddy, options,
+    )
 }
 
 // NOTE: Ember used to advertise a `COMPAT_CLIENT_EMBER = 0xC5` byte in the
@@ -405,7 +423,7 @@ pub fn build_hello_answer_with_buddy_opts(
 
 /// Compute CT_EMULE_MISCOPTIONS1 matching eMule BaseClient.cpp SendHelloTypePacket.
 pub fn build_misc_options1() -> u32 {
-      (1u32 << 29)   // AICH ver 1
+    (1u32 << 29)   // AICH ver 1
     | (1u32 << 28)   // Unicode
     | (4u32 << 24)   // UDP ver 4
     | (1u32 << 20)   // Compression ver 1
@@ -416,7 +434,7 @@ pub fn build_misc_options1() -> u32 {
     | (0u32 << 3)    // No peer cache
     | (1u32 << 2)    // No view shared files
     | (1u32 << 1)    // Multi-packet support
-    | (0u32 << 0)    // Preview support
+    | (0u32 << 0) // Preview support
 }
 
 /// Compute CT_EMULE_MISCOPTIONS2 matching eMule BaseClient.cpp SendHelloTypePacket.
@@ -425,7 +443,7 @@ pub fn build_misc_options1() -> u32 {
 /// detection in eMule mods that reject unknown bits in reserved positions.
 pub fn build_misc_options2(options: &HelloOptions) -> u32 {
     let kad_version = options.kad_version as u32;
-      (1u32 << 13)       // uFileIdentifiers
+    (1u32 << 13)       // uFileIdentifiers
     | ((options.supports_direct_udp_callback as u32) << 12)
     | ((options.supports_captcha as u32) << 11)
     | (1u32 << 10)       // uSupportsSourceEx2
@@ -473,7 +491,11 @@ fn build_hello_inner(
     // Tag 4: CT_EMULE_MISCOPTIONS1 (0xFA)
     write_ed2k_tag(&mut buf, 0xFA, &Ed2kTagValue::Uint32(build_misc_options1()));
     // Tag 5: CT_EMULE_MISCOPTIONS2 (0xFE)
-    write_ed2k_tag(&mut buf, 0xFE, &Ed2kTagValue::Uint32(build_misc_options2(options)));
+    write_ed2k_tag(
+        &mut buf,
+        0xFE,
+        &Ed2kTagValue::Uint32(build_misc_options2(options)),
+    );
     // Tag 6: CT_EMULE_VERSION (0xFB).
     // Layout from BaseClient.cpp: (compat << 24) | (major << 17) | (minor << 10) | (update << 7).
     // Match eMule exactly — `BaseClient.cpp` SendHelloTypePacket explicitly
@@ -546,7 +568,12 @@ fn write_ed2k_tag(buf: &mut Vec<u8>, name_id: u8, value: &Ed2kTagValue) {
 /// exchanged in a separate `OP_EMBER_HELLO` opcode that vanilla peers
 /// silently ignore. Callers that need Ember peer identification should
 /// also send `build_ember_hello(...)` after their EmuleInfoAnswer.
-pub fn build_emule_info(udp_port: u16, obfuscation_enabled: bool, _ember_hash: Option<&[u8; 16]>, _ed25519_pubkey: Option<&[u8; 32]>) -> Vec<u8> {
+pub fn build_emule_info(
+    udp_port: u16,
+    obfuscation_enabled: bool,
+    _ember_hash: Option<&[u8; 16]>,
+    _ed25519_pubkey: Option<&[u8; 32]>,
+) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
 
     // m_uCurVersionShort (eMule writes its short version byte here; 0x32 = 50)
@@ -576,7 +603,7 @@ pub fn build_emule_info(udp_port: u16, obfuscation_enabled: bool, _ember_hash: O
         | (0 << 2)              // no preview
         | ((obfuscation_enabled as u8) << 3)  // SupportsCryptLayer — must match Hello MISCOPTIONS2
         | ((obfuscation_enabled as u8) << 4)  // RequestsCryptLayer — must match Hello MISCOPTIONS2
-        | (0 << 5);             // no RequiresCryptLayer
+        | (0 << 5); // no RequiresCryptLayer
     write_ed2k_tag(&mut buf, 0x27, &Ed2kTagValue::Uint8(features));
 
     buf
@@ -598,19 +625,28 @@ pub fn build_emule_info(udp_port: u16, obfuscation_enabled: bool, _ember_hash: O
 /// - mod_version_len(u16) + mod_version_utf8(...)
 /// - nickname_len(u16) + nickname_utf8(...)
 /// - if flags & 0x01: ed25519_pubkey(32)
-pub fn build_ember_hello(ember_hash: &[u8; 16], nickname: &str, ed25519_pubkey: Option<&[u8; 32]>) -> Vec<u8> {
+pub fn build_ember_hello(
+    ember_hash: &[u8; 16],
+    nickname: &str,
+    ed25519_pubkey: Option<&[u8; 32]>,
+) -> Vec<u8> {
     let mod_version = format!("Ember {}", env!("CARGO_PKG_VERSION"));
     let mod_bytes = mod_version.as_bytes();
     let nick_bytes = nickname.as_bytes();
     let mut buf = Vec::with_capacity(2 + 16 + 2 + mod_bytes.len() + 2 + nick_bytes.len() + 32);
 
     buf.write_u8(0x01).unwrap(); // version
-    buf.write_u8(if ed25519_pubkey.is_some() { 0x01 } else { 0x00 }).unwrap();
+    buf.write_u8(if ed25519_pubkey.is_some() { 0x01 } else { 0x00 })
+        .unwrap();
     buf.write_all(ember_hash).unwrap();
-    buf.write_u16::<LittleEndian>(mod_bytes.len().min(u16::MAX as usize) as u16).unwrap();
-    buf.write_all(&mod_bytes[..mod_bytes.len().min(u16::MAX as usize)]).unwrap();
-    buf.write_u16::<LittleEndian>(nick_bytes.len().min(u16::MAX as usize) as u16).unwrap();
-    buf.write_all(&nick_bytes[..nick_bytes.len().min(u16::MAX as usize)]).unwrap();
+    buf.write_u16::<LittleEndian>(mod_bytes.len().min(u16::MAX as usize) as u16)
+        .unwrap();
+    buf.write_all(&mod_bytes[..mod_bytes.len().min(u16::MAX as usize)])
+        .unwrap();
+    buf.write_u16::<LittleEndian>(nick_bytes.len().min(u16::MAX as usize) as u16)
+        .unwrap();
+    buf.write_all(&nick_bytes[..nick_bytes.len().min(u16::MAX as usize)])
+        .unwrap();
     if let Some(pk) = ed25519_pubkey {
         buf.write_all(pk).unwrap();
     }
@@ -670,7 +706,12 @@ pub fn parse_ember_hello(payload: &[u8]) -> Option<EmberIdentity> {
     } else {
         None
     };
-    Some(EmberIdentity { ember_hash, mod_version, nickname, ed25519_pubkey })
+    Some(EmberIdentity {
+        ember_hash,
+        mod_version,
+        nickname,
+        ed25519_pubkey,
+    })
 }
 
 /// Parse an EmuleInfo or EmuleInfoAnswer payload into peer capabilities.
@@ -678,7 +719,9 @@ pub fn parse_ember_hello(payload: &[u8]) -> Option<EmberIdentity> {
 /// Also handles legacy format without protocol byte (version(1) + tag_count(u32) + tags).
 pub fn parse_emule_info(payload: &[u8]) -> PeerCapabilities {
     let mut caps = PeerCapabilities::default();
-    if payload.len() < 6 { return caps; }
+    if payload.len() < 6 {
+        return caps;
+    }
     let mut cursor = Cursor::new(payload);
     let _version = cursor.read_u8().unwrap_or(0);
     let protocol_or_tag_count_byte = cursor.read_u8().unwrap_or(0);
@@ -694,27 +737,38 @@ pub fn parse_emule_info(payload: &[u8]) -> PeerCapabilities {
 
     for _ in 0..tag_count.min(20) {
         let pos = cursor.position() as usize;
-        if pos >= payload.len() { break; }
+        if pos >= payload.len() {
+            break;
+        }
 
         let tag_type = cursor.read_u8().unwrap_or(0);
         let name_len = match cursor.read_u16::<LittleEndian>() {
             Ok(n) => n as usize,
             Err(_) => break,
         };
-        if pos + 3 + name_len > payload.len() { break; }
+        if pos + 3 + name_len > payload.len() {
+            break;
+        }
         // Tag names in eMule are single-byte identifiers; cap defensively
         // to avoid amplifying a malicious payload into megabytes of allocations.
         const MAX_TAG_NAME_LEN: usize = 256;
-        if name_len > MAX_TAG_NAME_LEN { break; }
+        if name_len > MAX_TAG_NAME_LEN {
+            break;
+        }
         let mut name_buf = vec![0u8; name_len];
-        if cursor.read_exact(&mut name_buf).is_err() { break; }
+        if cursor.read_exact(&mut name_buf).is_err() {
+            break;
+        }
         let name_id = if name_len == 1 { name_buf[0] } else { 0 };
 
         let int_val = match tag_type {
             0x03 => cursor.read_u32::<LittleEndian>().unwrap_or(0),
             0x08 => cursor.read_u16::<LittleEndian>().unwrap_or(0) as u32,
             0x09 => cursor.read_u8().unwrap_or(0) as u32,
-            0x0B => { cursor.read_u64::<LittleEndian>().unwrap_or(0); continue; } // UINT64 — skip
+            0x0B => {
+                cursor.read_u64::<LittleEndian>().unwrap_or(0);
+                continue;
+            } // UINT64 — skip
             0x02 => {
                 // String tag. We used to harvest `ET_MOD_VERSION (0x55)` here
                 // and treat any value starting with "Ember" as authoritative
@@ -727,7 +781,9 @@ pub fn parse_emule_info(payload: &[u8]) -> PeerCapabilities {
                 // tag-loop stays in sync.
                 let slen = cursor.read_u16::<LittleEndian>().unwrap_or(0) as usize;
                 let p = cursor.position() as usize;
-                if p + slen > payload.len() { break; }
+                if p + slen > payload.len() {
+                    break;
+                }
                 if name_id == 0x55 {
                     // Record mod_version for diagnostics only; never use it
                     // to drive `is_ember` (see `OP_EMBER_HELLO` for that).
@@ -737,26 +793,39 @@ pub fn parse_emule_info(payload: &[u8]) -> PeerCapabilities {
                 cursor.set_position((p + slen) as u64);
                 continue;
             }
-            0x01 => { // HASH — 16 bytes; eMule never emits hash-typed tags
+            0x01 => {
+                // HASH — 16 bytes; eMule never emits hash-typed tags
                 // here so we just advance the cursor. The old `ET_EMBER_HASH
                 // (0x56)` harvest is gone — `ember_hash` is now learned via
                 // `OP_EMBER_HELLO` exclusively.
                 let p = cursor.position() as usize;
-                if p + 16 > payload.len() { break; }
+                if p + 16 > payload.len() {
+                    break;
+                }
                 cursor.set_position((p + 16) as u64);
                 continue;
             }
-            0x04 => { cursor.read_u32::<LittleEndian>().unwrap_or(0); continue; } // FLOAT32
-            0x05 => { cursor.read_u8().unwrap_or(0); continue; } // BOOL
-            0x06 => { // BOOLARRAY
+            0x04 => {
+                cursor.read_u32::<LittleEndian>().unwrap_or(0);
+                continue;
+            } // FLOAT32
+            0x05 => {
+                cursor.read_u8().unwrap_or(0);
+                continue;
+            } // BOOL
+            0x06 => {
+                // BOOLARRAY
                 let count = cursor.read_u16::<LittleEndian>().unwrap_or(0) as usize;
                 let byte_count = (count + 7) / 8;
                 let p = cursor.position() as usize;
-                if p + byte_count > payload.len() { break; }
+                if p + byte_count > payload.len() {
+                    break;
+                }
                 cursor.set_position((p + byte_count) as u64);
                 continue;
             }
-            0x07 => { // BLOB (BSob with u32 length prefix). Same migration as
+            0x07 => {
+                // BLOB (BSob with u32 length prefix). Same migration as
                 // the hash and string tag arms: vanilla eMule never emits
                 // a blob in EmuleInfo, and the old `ET_EMBER_PUBKEY (0x57)`
                 // harvest moved to `OP_EMBER_HELLO`. Just skip the bytes
@@ -764,21 +833,29 @@ pub fn parse_emule_info(payload: &[u8]) -> PeerCapabilities {
                 // desync our tag loop.
                 let blen = cursor.read_u32::<LittleEndian>().unwrap_or(0) as usize;
                 let p = cursor.position() as usize;
-                if blen > payload.len() || p > payload.len() - blen { break; }
+                if blen > payload.len() || p > payload.len() - blen {
+                    break;
+                }
                 cursor.set_position((p + blen) as u64);
                 continue;
             }
-            0x0A => { // BSOB
+            0x0A => {
+                // BSOB
                 let blen = cursor.read_u8().unwrap_or(0) as usize;
                 let p = cursor.position() as usize;
-                if p + blen > payload.len() { break; }
+                if p + blen > payload.len() {
+                    break;
+                }
                 cursor.set_position((p + blen) as u64);
                 continue;
             }
-            t if (0x11..=0x26).contains(&t) => { // STR1..STR22 (STR17-22 are legacy eMule 0.42f compat)
+            t if (0x11..=0x26).contains(&t) => {
+                // STR1..STR22 (STR17-22 are legacy eMule 0.42f compat)
                 let slen = (t - 0x11 + 1) as usize;
                 let p = cursor.position() as usize;
-                if p + slen > payload.len() { break; }
+                if p + slen > payload.len() {
+                    break;
+                }
                 cursor.set_position((p + slen) as u64);
                 continue;
             }
@@ -789,14 +866,15 @@ pub fn parse_emule_info(payload: &[u8]) -> PeerCapabilities {
         };
 
         match name_id {
-            0x20 => caps.compression_ver = int_val as u8,   // ET_COMPRESSION
-            0x21 => caps.udp_port = int_val as u16,         // ET_UDPPORT
-            0x22 => caps.udp_ver = int_val as u8,           // ET_UDPVER
+            0x20 => caps.compression_ver = int_val as u8, // ET_COMPRESSION
+            0x21 => caps.udp_port = int_val as u16,       // ET_UDPPORT
+            0x22 => caps.udp_ver = int_val as u8,         // ET_UDPVER
             0x23 => caps.source_exchange_ver = int_val as u8, // ET_SOURCEEXCHANGE
-            0x24 => caps.comments_ver = int_val as u8,      // ET_COMMENTS
+            0x24 => caps.comments_ver = int_val as u8,    // ET_COMMENTS
             0x25 => caps.extended_requests_ver = int_val as u8, // ET_EXTENDEDREQUEST
-            0x26 => caps.compatible_client = int_val as u8,  // ET_COMPATIBLECLIENT
-            0x27 => {                                         // ET_FEATURES
+            0x26 => caps.compatible_client = int_val as u8, // ET_COMPATIBLECLIENT
+            0x27 => {
+                // ET_FEATURES
                 caps.secure_ident_level = (int_val & 0x03) as u8;
                 caps.supports_secure_ident = caps.secure_ident_level != 0;
                 // eMule BaseClient.cpp: bit 2 = preview, bits 3-5 = crypt layer
@@ -815,7 +893,10 @@ pub fn parse_emule_info(payload: &[u8]) -> PeerCapabilities {
 /// hello tag layout from BaseClient.cpp.
 pub fn parse_hello_answer(payload: &[u8]) -> io::Result<([u8; 16], PeerCapabilities)> {
     if payload.len() < 16 + 4 + 2 + 4 + 4 + 2 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "helloanswer too short"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "helloanswer too short",
+        ));
     }
     let mut cursor = Cursor::new(payload);
     let mut user_hash = [0u8; 16];
@@ -868,7 +949,10 @@ pub fn parse_hello_answer(payload: &[u8]) -> io::Result<([u8; 16], PeerCapabilit
             0x03 => cursor.read_u32::<LittleEndian>().unwrap_or(0),
             0x08 => cursor.read_u16::<LittleEndian>().unwrap_or(0) as u32,
             0x09 => cursor.read_u8().unwrap_or(0) as u32,
-            0x0B => { cursor.read_u64::<LittleEndian>().unwrap_or(0); continue; }
+            0x0B => {
+                cursor.read_u64::<LittleEndian>().unwrap_or(0);
+                continue;
+            }
             0x02 => {
                 let slen = cursor.read_u16::<LittleEndian>().unwrap_or(0) as usize;
                 let pos = cursor.position() as usize;
@@ -881,14 +965,62 @@ pub fn parse_hello_answer(payload: &[u8]) -> io::Result<([u8; 16], PeerCapabilit
                 cursor.set_position((pos + slen) as u64);
                 continue;
             }
-            0x01 => { let p = cursor.position() as usize; if p + 16 > payload.len() { break; } cursor.set_position((p + 16) as u64); continue; }
-            0x04 => { cursor.read_u32::<LittleEndian>().unwrap_or(0); continue; }
-            0x05 => { cursor.read_u8().unwrap_or(0); continue; }
-            0x06 => { let count = cursor.read_u16::<LittleEndian>().unwrap_or(0) as usize; let bc = (count + 7) / 8; let p = cursor.position() as usize; if p + bc > payload.len() { break; } cursor.set_position((p + bc) as u64); continue; }
-            0x07 => { let blen = cursor.read_u32::<LittleEndian>().unwrap_or(0) as usize; let p = cursor.position() as usize; if blen > payload.len() || p > payload.len() - blen { break; } cursor.set_position((p + blen) as u64); continue; }
-            0x0A => { let blen = cursor.read_u8().unwrap_or(0) as usize; let p = cursor.position() as usize; if p + blen > payload.len() { break; } cursor.set_position((p + blen) as u64); continue; }
-            t if (0x11..=0x26).contains(&t) => { let slen = (t - 0x11 + 1) as usize; let p = cursor.position() as usize; if p + slen > payload.len() { break; } cursor.set_position((p + slen) as u64); continue; }
-            _ => { break; }
+            0x01 => {
+                let p = cursor.position() as usize;
+                if p + 16 > payload.len() {
+                    break;
+                }
+                cursor.set_position((p + 16) as u64);
+                continue;
+            }
+            0x04 => {
+                cursor.read_u32::<LittleEndian>().unwrap_or(0);
+                continue;
+            }
+            0x05 => {
+                cursor.read_u8().unwrap_or(0);
+                continue;
+            }
+            0x06 => {
+                let count = cursor.read_u16::<LittleEndian>().unwrap_or(0) as usize;
+                let bc = (count + 7) / 8;
+                let p = cursor.position() as usize;
+                if p + bc > payload.len() {
+                    break;
+                }
+                cursor.set_position((p + bc) as u64);
+                continue;
+            }
+            0x07 => {
+                let blen = cursor.read_u32::<LittleEndian>().unwrap_or(0) as usize;
+                let p = cursor.position() as usize;
+                if blen > payload.len() || p > payload.len() - blen {
+                    break;
+                }
+                cursor.set_position((p + blen) as u64);
+                continue;
+            }
+            0x0A => {
+                let blen = cursor.read_u8().unwrap_or(0) as usize;
+                let p = cursor.position() as usize;
+                if p + blen > payload.len() {
+                    break;
+                }
+                cursor.set_position((p + blen) as u64);
+                continue;
+            }
+            t if (0x11..=0x26).contains(&t) => {
+                let slen = (t - 0x11 + 1) as usize;
+                let p = cursor.position() as usize;
+                if p + slen > payload.len() {
+                    break;
+                }
+                cursor.set_position((p + slen) as u64);
+                continue;
+            }
+            _ => {
+                break;
+            }
         };
 
         match name_id {
@@ -1013,7 +1145,10 @@ pub fn build_request_parts(file_hash: &[u8; 16], offsets: &[(u64, u64)]) -> Vec<
     buf.write_all(file_hash).unwrap();
     for i in 0..3 {
         if i < offsets.len() {
-            debug_assert!(offsets[i].0 <= u32::MAX as u64, "caller must filter >4GiB offsets");
+            debug_assert!(
+                offsets[i].0 <= u32::MAX as u64,
+                "caller must filter >4GiB offsets"
+            );
             let v = offsets[i].0.min(u32::MAX as u64) as u32;
             buf.write_u32::<LittleEndian>(v).unwrap();
         } else {
@@ -1022,7 +1157,10 @@ pub fn build_request_parts(file_hash: &[u8; 16], offsets: &[(u64, u64)]) -> Vec<
     }
     for i in 0..3 {
         if i < offsets.len() {
-            debug_assert!(offsets[i].1 <= u32::MAX as u64, "caller must filter >4GiB offsets");
+            debug_assert!(
+                offsets[i].1 <= u32::MAX as u64,
+                "caller must filter >4GiB offsets"
+            );
             let v = offsets[i].1.min(u32::MAX as u64) as u32;
             buf.write_u32::<LittleEndian>(v).unwrap();
         } else {
@@ -1059,7 +1197,10 @@ pub fn build_request_parts_i64(file_hash: &[u8; 16], offsets: &[(u64, u64)]) -> 
 /// Parse a SendingPart_I64 payload.
 pub fn parse_sending_part_i64(payload: &[u8]) -> io::Result<([u8; 16], u64, u64, &[u8])> {
     if payload.len() < 32 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "sending part too short"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "sending part too short",
+        ));
     }
     let mut cursor = Cursor::new(payload);
     let mut hash = [0u8; 16];
@@ -1076,7 +1217,10 @@ pub fn parse_sending_part_i64(payload: &[u8]) -> io::Result<([u8; 16], u64, u64,
 /// (eMule may split compressed data across multiple packets of up to 10240 bytes each).
 pub fn parse_compressed_part_i64(payload: &[u8]) -> io::Result<([u8; 16], u64, u32, &[u8])> {
     if payload.len() < 28 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "compressed part i64 too short"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "compressed part i64 too short",
+        ));
     }
     let mut cursor = Cursor::new(payload);
     let mut hash = [0u8; 16];
@@ -1093,7 +1237,10 @@ pub fn parse_compressed_part_i64(payload: &[u8]) -> io::Result<([u8; 16], u64, u
 /// (eMule may split compressed data across multiple packets of up to 10240 bytes each).
 pub fn parse_compressed_part_32(payload: &[u8]) -> io::Result<([u8; 16], u64, u32, &[u8])> {
     if payload.len() < 24 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "compressed part 32 too short"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "compressed part 32 too short",
+        ));
     }
     let mut cursor = Cursor::new(payload);
     let mut hash = [0u8; 16];
@@ -1112,7 +1259,10 @@ pub fn build_hashset_request(file_hash: &[u8; 16]) -> Vec<u8> {
 /// Parse a HashSetAnswer payload. Returns (file_hash, part_hashes).
 pub fn parse_hashset_answer(payload: &[u8]) -> io::Result<([u8; 16], Vec<[u8; 16]>)> {
     if payload.len() < 18 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "hashset answer too short"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "hashset answer too short",
+        ));
     }
     let mut cursor = Cursor::new(payload);
     let mut hash = [0u8; 16];
@@ -1178,8 +1328,12 @@ pub struct Hashset2Response {
 }
 
 pub fn merge_caps(base: &mut PeerCapabilities, update: PeerCapabilities) {
-    if update.udp_port != 0 { base.udp_port = update.udp_port; }
-    if update.kad_port != 0 { base.kad_port = update.kad_port; }
+    if update.udp_port != 0 {
+        base.udp_port = update.udp_port;
+    }
+    if update.kad_port != 0 {
+        base.kad_port = update.kad_port;
+    }
     base.compression_ver = base.compression_ver.max(update.compression_ver);
     base.udp_ver = base.udp_ver.max(update.udp_ver);
     base.source_exchange_ver = base.source_exchange_ver.max(update.source_exchange_ver);
@@ -1203,16 +1357,32 @@ pub fn merge_caps(base: &mut PeerCapabilities, update: PeerCapabilities) {
     base.secure_ident_level = base.secure_ident_level.max(update.secure_ident_level);
     base.supports_preview |= update.supports_preview;
     base.supports_multi_packet |= update.supports_multi_packet;
-    if update.compatible_client != 0 { base.compatible_client = update.compatible_client; }
-    if update.version_major != 0 { base.version_major = update.version_major; }
-    if update.emule_version_min != 0 { base.emule_version_min = update.emule_version_min; }
-    if update.version_update != 0 { base.version_update = update.version_update; }
-    if !update.mod_version.is_empty() { base.mod_version = update.mod_version; }
-    if !update.peer_name.is_empty() { base.peer_name = update.peer_name; }
+    if update.compatible_client != 0 {
+        base.compatible_client = update.compatible_client;
+    }
+    if update.version_major != 0 {
+        base.version_major = update.version_major;
+    }
+    if update.emule_version_min != 0 {
+        base.emule_version_min = update.emule_version_min;
+    }
+    if update.version_update != 0 {
+        base.version_update = update.version_update;
+    }
+    if !update.mod_version.is_empty() {
+        base.mod_version = update.mod_version;
+    }
+    if !update.peer_name.is_empty() {
+        base.peer_name = update.peer_name;
+    }
     base.is_ember |= update.is_ember;
     base.epx_version = base.epx_version.max(update.epx_version);
-    if update.ember_hash.is_some() { base.ember_hash = update.ember_hash; }
-    if update.ember_pubkey.is_some() { base.ember_pubkey = update.ember_pubkey; }
+    if update.ember_hash.is_some() {
+        base.ember_hash = update.ember_hash;
+    }
+    if update.ember_pubkey.is_some() {
+        base.ember_pubkey = update.ember_pubkey;
+    }
 
     // No `is_ember` corroboration check needed anymore — `parse_hello_*`
     // and `parse_emule_info` no longer set `is_ember` from bit-20 or
@@ -1248,7 +1418,10 @@ pub fn client_software_from_caps(caps: &PeerCapabilities) -> String {
     };
     if caps.version_major != 0 || caps.emule_version_min != 0 {
         if caps.version_update != 0 {
-            format!("{name} {}.{}.{}", caps.version_major, caps.emule_version_min, caps.version_update)
+            format!(
+                "{name} {}.{}.{}",
+                caps.version_major, caps.emule_version_min, caps.version_update
+            )
         } else {
             format!("{name} {}.{}", caps.version_major, caps.emule_version_min)
         }
@@ -1269,15 +1442,24 @@ pub fn parse_hashset_answer2(payload: &[u8]) -> io::Result<Hashset2Response> {
         let mut md4_hash = [0u8; 16];
         cursor.read_exact(&mut md4_hash)?;
         if md4_hash != ident.md4_hash {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "hashset2 md4 header mismatch"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "hashset2 md4 header mismatch",
+            ));
         }
         let count = cursor.read_u16::<LittleEndian>()? as usize;
         if count > MAX_HASHSET2_PARTS {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("hashset2 md4 count {count} exceeds maximum")));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("hashset2 md4 count {count} exceeds maximum"),
+            ));
         }
         let remaining = payload.len().saturating_sub(cursor.position() as usize);
         if remaining < count * 16 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("hashset2 md4 claims {count} hashes but only {remaining} bytes remain")));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("hashset2 md4 claims {count} hashes but only {remaining} bytes remain"),
+            ));
         }
         let mut hashes = Vec::with_capacity(count);
         for _ in 0..count {
@@ -1292,11 +1474,17 @@ pub fn parse_hashset_answer2(payload: &[u8]) -> io::Result<Hashset2Response> {
         cursor.read_exact(&mut master)?;
         let count = cursor.read_u16::<LittleEndian>()? as usize;
         if count > MAX_HASHSET2_PARTS {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("hashset2 aich count {count} exceeds maximum")));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("hashset2 aich count {count} exceeds maximum"),
+            ));
         }
         let remaining = payload.len().saturating_sub(cursor.position() as usize);
         if remaining < count * 20 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("hashset2 aich claims {count} hashes but only {remaining} bytes remain")));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("hashset2 aich claims {count} hashes but only {remaining} bytes remain"),
+            ));
         }
         let mut hashes = Vec::with_capacity(count);
         for _ in 0..count {
@@ -1345,9 +1533,14 @@ pub struct SourceExchange2Entry {
 ///   v1: 4 + 2 + 4 + 2
 ///   v2/v3: v1 + 16-byte user hash
 ///   v4: v2/v3 + 1-byte crypt options
-pub fn parse_answer_sources2(payload: &[u8]) -> io::Result<(u8, [u8; 16], Vec<SourceExchange2Entry>)> {
+pub fn parse_answer_sources2(
+    payload: &[u8],
+) -> io::Result<(u8, [u8; 16], Vec<SourceExchange2Entry>)> {
     if payload.len() < 19 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "answersources2 too short"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "answersources2 too short",
+        ));
     }
 
     let version = payload[0];
@@ -1443,7 +1636,11 @@ pub fn parse_answer_sources(
     let packet_version = if count * 12 == data_size {
         1
     } else if count * 28 == data_size {
-        if client_sx_version == 2 { 2 } else { 3 }
+        if client_sx_version == 2 {
+            2
+        } else {
+            3
+        }
     } else if count * 29 == data_size {
         4
     } else {
@@ -1557,7 +1754,10 @@ pub struct MultiPacketRequest {
 ///   OP_SETREQFILEID    (0x4F) - no extra data
 pub fn parse_multipacket(payload: &[u8], opcode: u8) -> io::Result<MultiPacketRequest> {
     if payload.len() < 17 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "multipacket too short"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "multipacket too short",
+        ));
     }
     let mut cursor = Cursor::new(payload);
     let mut file_hash = [0u8; 16];
@@ -1593,7 +1793,10 @@ pub fn parse_multipacket(payload: &[u8], opcode: u8) -> io::Result<MultiPacketRe
                     let part_count = cursor.read_u16::<LittleEndian>()? as usize;
                     let bitmap_bytes = (part_count + 7) / 8;
                     let pos = cursor.position() as usize;
-                    if pos.checked_add(bitmap_bytes).is_some_and(|end| end <= payload.len()) {
+                    if pos
+                        .checked_add(bitmap_bytes)
+                        .is_some_and(|end| end <= payload.len())
+                    {
                         cursor.set_position((pos + bitmap_bytes) as u64);
                         // v2: complete sources count. Only consume it if it does not
                         // look like the next byte is already another sub-opcode.
@@ -1631,13 +1834,18 @@ pub fn parse_multipacket(payload: &[u8], opcode: u8) -> io::Result<MultiPacketRe
             OP_REQUESTSOURCES2 => {
                 let version = cursor.read_u8()?;
                 let options = cursor.read_u16::<LittleEndian>()?;
-                sub_opcodes.push(MultiPacketSubReq::RequestSources2 { version, _options: options });
+                sub_opcodes.push(MultiPacketSubReq::RequestSources2 {
+                    version,
+                    _options: options,
+                });
             }
             OP_AICHFILEHASHREQ => {
                 sub_opcodes.push(MultiPacketSubReq::AichFileHashReq);
             }
             unknown => {
-                tracing::debug!("parse_multipacket: unknown sub-opcode 0x{unknown:02X}, stopping parse");
+                tracing::debug!(
+                    "parse_multipacket: unknown sub-opcode 0x{unknown:02X}, stopping parse"
+                );
                 break;
             }
         }
@@ -1718,8 +1926,7 @@ pub fn build_multipacket_answer(
                     }
                 }
             }
-            MultiPacketSubReq::RequestSources
-            | MultiPacketSubReq::RequestSources2 { .. } => {}
+            MultiPacketSubReq::RequestSources | MultiPacketSubReq::RequestSources2 { .. } => {}
             MultiPacketSubReq::AichFileHashReq => {
                 if let Some(aich_hash) = aich_hash {
                     buf.write_u8(OP_AICHFILEHASHANS).unwrap();
@@ -1837,7 +2044,10 @@ pub fn parse_multipacket_answer(payload: &[u8], opcode: u8) -> io::Result<MultiP
 /// Parse a FileStatus response.
 pub fn parse_file_status(payload: &[u8]) -> io::Result<([u8; 16], Vec<bool>)> {
     if payload.len() < 18 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "file status too short"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file status too short",
+        ));
     }
     let mut cursor = Cursor::new(payload);
     let mut hash = [0u8; 16];
@@ -1848,7 +2058,9 @@ pub fn parse_file_status(payload: &[u8]) -> io::Result<([u8; 16], Vec<bool>)> {
     if part_count > MAX_FILE_STATUS_PARTS {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("file status claims {part_count} parts, exceeds maximum {MAX_FILE_STATUS_PARTS}"),
+            format!(
+                "file status claims {part_count} parts, exceeds maximum {MAX_FILE_STATUS_PARTS}"
+            ),
         ));
     }
 
@@ -1942,14 +2154,8 @@ mod tests {
             kad_version: 0x09,
         };
 
-        let payload = build_hello_with_buddy_opts(
-            &user_hash,
-            0x7F00_0001,
-            4662,
-            "ember",
-            None,
-            &opts,
-        );
+        let payload =
+            build_hello_with_buddy_opts(&user_hash, 0x7F00_0001, 4662, "ember", None, &opts);
         let (parsed_hash, caps) = parse_hello_packet(&payload).unwrap();
 
         assert_eq!(parsed_hash, user_hash);
@@ -1988,7 +2194,7 @@ mod tests {
         buf.write_u8(0x32).unwrap();
         buf.write_u8(0x01).unwrap();
         buf.write_u32::<LittleEndian>(1).unwrap(); // 1 tag
-        // tag: type=0x02 (string), name_len=1, name_id=0x55 (ET_MOD_VERSION)
+                                                   // tag: type=0x02 (string), name_len=1, name_id=0x55 (ET_MOD_VERSION)
         buf.write_u8(0x02).unwrap();
         buf.write_u16::<LittleEndian>(1).unwrap();
         buf.write_u8(0x55).unwrap();
@@ -1997,8 +2203,14 @@ mod tests {
         buf.write_all(s).unwrap();
 
         let caps = parse_emule_info(&buf);
-        assert_eq!(caps.mod_version, "Ember 9.9.9", "mod_version is recorded for diagnostics");
-        assert!(!caps.is_ember, "is_ember must come from OP_EMBER_HELLO, not ET_MOD_VERSION");
+        assert_eq!(
+            caps.mod_version, "Ember 9.9.9",
+            "mod_version is recorded for diagnostics"
+        );
+        assert!(
+            !caps.is_ember,
+            "is_ember must come from OP_EMBER_HELLO, not ET_MOD_VERSION"
+        );
     }
 
     /// `OP_EMBER_HELLO` round-trip: the builder + parser must agree on the
@@ -2012,7 +2224,11 @@ mod tests {
         let parsed = parse_ember_hello(&payload).expect("must parse");
         assert_eq!(parsed.ember_hash, hash);
         assert_eq!(parsed.nickname, "alice");
-        assert!(parsed.mod_version.starts_with("Ember "), "mod_version='{}'", parsed.mod_version);
+        assert!(
+            parsed.mod_version.starts_with("Ember "),
+            "mod_version='{}'",
+            parsed.mod_version
+        );
         assert_eq!(parsed.ed25519_pubkey, Some(pk));
 
         let payload_nopk = build_ember_hello(&hash, "bob", None);
@@ -2031,13 +2247,19 @@ mod tests {
     fn hello_ct_emule_version_high_byte_is_zero() {
         let user_hash = [0x33; 16];
         let opts = HelloOptions {
-            udp_port: 4672, kad_port: 4672,
-            supports_crypt_layer: true, requests_crypt_layer: true,
-            requires_crypt_layer: false, supports_direct_udp_callback: false,
-            supports_captcha: false, server_ip: 0, server_port: 0,
+            udp_port: 4672,
+            kad_port: 4672,
+            supports_crypt_layer: true,
+            requests_crypt_layer: true,
+            requires_crypt_layer: false,
+            supports_direct_udp_callback: false,
+            supports_captcha: false,
+            server_ip: 0,
+            server_port: 0,
             kad_version: 0x09,
         };
-        let payload = build_hello_with_buddy_opts(&user_hash, 0x1234_5678, 4662, "ember", None, &opts);
+        let payload =
+            build_hello_with_buddy_opts(&user_hash, 0x1234_5678, 4662, "ember", None, &opts);
         let (_hash, caps) = parse_hello_packet(&payload).unwrap();
         assert_eq!(
             caps.compatible_client, 0,

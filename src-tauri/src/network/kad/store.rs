@@ -71,7 +71,10 @@ impl DhtStore {
         self.total_count = self.total_count.saturating_sub(len_before - bucket.len());
 
         for entry in entries {
-            if let Some(pos) = bucket.iter().position(|e| e.id == entry.id && e.source_id == *sender_id) {
+            if let Some(pos) = bucket
+                .iter()
+                .position(|e| e.id == entry.id && e.source_id == *sender_id)
+            {
                 bucket[pos].tags = entry.tags;
                 bucket[pos].stored_at = now;
             } else {
@@ -123,9 +126,13 @@ impl DhtStore {
 
         const MAX_SOURCES_PER_IP: usize = 3;
         let ip_u32 = u32::from_be_bytes(sender_ip.octets());
-        let ip_count = bucket.iter()
+        let ip_count = bucket
+            .iter()
             .filter(|e| {
-                e.tags.iter().any(|t| matches!(&t.name, TagName::Id(TAG_SOURCEIP)) && matches!(&t.value, TagValue::Uint32(v) if *v == ip_u32))
+                e.tags.iter().any(|t| {
+                    matches!(&t.name, TagName::Id(TAG_SOURCEIP))
+                        && matches!(&t.value, TagValue::Uint32(v) if *v == ip_u32)
+                })
             })
             .count();
         if ip_count >= MAX_SOURCES_PER_IP {
@@ -140,14 +147,18 @@ impl DhtStore {
             name: TagName::Id(TAG_SOURCEIP),
             value: TagValue::Uint32(ip_u32),
         });
-        let has_port = tags.iter().any(|t| matches!(&t.name, TagName::Id(TAG_SOURCEPORT)));
+        let has_port = tags
+            .iter()
+            .any(|t| matches!(&t.name, TagName::Id(TAG_SOURCEPORT)));
         if !has_port {
             tags.push(KadTag {
                 name: TagName::Id(TAG_SOURCEPORT),
                 value: TagValue::Uint16(sender_port),
             });
         }
-        let has_uport = tags.iter().any(|t| matches!(&t.name, TagName::Id(TAG_SOURCEUPORT)));
+        let has_uport = tags
+            .iter()
+            .any(|t| matches!(&t.name, TagName::Id(TAG_SOURCEUPORT)));
         if !has_uport {
             tags.push(KadTag {
                 name: TagName::Id(TAG_SOURCEUPORT),
@@ -201,12 +212,7 @@ impl DhtStore {
             .unwrap_or_default()
     }
 
-    pub fn store_notes_entry(
-        &mut self,
-        target: &KadId,
-        sender_id: KadId,
-        tags: Vec<KadTag>,
-    ) -> u8 {
+    pub fn store_notes_entry(&mut self, target: &KadId, sender_id: KadId, tags: Vec<KadTag>) -> u8 {
         let bucket = self.notes_entries.entry(*target).or_default();
         let now = chrono::Utc::now().timestamp();
 

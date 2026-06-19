@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
-use super::dead_sources::{FILEREASKTIME_SECS, KAD_CALLBACK_REASK_SECS, SOURCECLIENTREASKS_SECS as SOURCECLIENTREASKS_I64};
+use super::dead_sources::{
+    FILEREASKTIME_SECS, KAD_CALLBACK_REASK_SECS, SOURCECLIENTREASKS_SECS as SOURCECLIENTREASKS_I64,
+};
 use super::messages::build_answer_sources1_versioned;
 use super::transfer::is_filtered_source_ip;
 
@@ -43,7 +45,6 @@ pub(crate) fn sx_answer_source_id(src: &SourceEntry) -> u32 {
         u32::from(src.ip)
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Per-file download source list  (eMule CPartFile::srclist equivalent)
@@ -161,9 +162,13 @@ impl DownloadSourceEntry {
         let interval = match &self.state {
             DownloadSourceState::New => return 0,
             DownloadSourceState::NoneNeededParts => (FILEREASKTIME_SECS * 2) as u64,
-            DownloadSourceState::Failed | DownloadSourceState::TooManyConns => FILEREASKTIME_SECS as u64,
+            DownloadSourceState::Failed | DownloadSourceState::TooManyConns => {
+                FILEREASKTIME_SECS as u64
+            }
             DownloadSourceState::OnQueue { .. } => FILEREASKTIME_SECS as u64,
-            DownloadSourceState::WaitCallback | DownloadSourceState::WaitCallbackKad => FILEREASKTIME_SECS as u64,
+            DownloadSourceState::WaitCallback | DownloadSourceState::WaitCallbackKad => {
+                FILEREASKTIME_SECS as u64
+            }
             DownloadSourceState::Connecting | DownloadSourceState::Downloading => {
                 // Watchdog: if a source has been `Connecting` /
                 // `Downloading` far longer than any legitimate handshake
@@ -172,12 +177,16 @@ impl DownloadSourceEntry {
                 // leaves the source permanently "active" and the
                 // scheduler can't pick it up again until the next full
                 // list reset.
-                if now.saturating_duration_since(self.state_changed).as_secs() >= Self::CONNECTING_WATCHDOG_SECS {
+                if now.saturating_duration_since(self.state_changed).as_secs()
+                    >= Self::CONNECTING_WATCHDOG_SECS
+                {
                     return 0;
                 }
                 return u64::MAX;
             }
-            DownloadSourceState::LowToLowIp | DownloadSourceState::EmberRelay | DownloadSourceState::Banned => return u64::MAX,
+            DownloadSourceState::LowToLowIp
+            | DownloadSourceState::EmberRelay
+            | DownloadSourceState::Banned => return u64::MAX,
         };
         let elapsed = now.saturating_duration_since(self.last_asked).as_secs();
         interval.saturating_sub(elapsed)
@@ -196,15 +205,19 @@ impl DownloadSourceEntry {
     /// Whether this source should receive a UDP reask ping
     /// (27 min after last ask, i.e. 2 min before FILEREASKTIME).
     pub fn needs_udp_reask(&self) -> bool {
-        if self.udp_port == 0 { return false; }
+        if self.udp_port == 0 {
+            return false;
+        }
         // Gate on the most recent ask of EITHER kind so we neither spam UDP
         // reasks nor reask right after a TCP ask, while keeping the TCP
         // reconnect gate (`can_try_tcp_at`) keyed only on `last_asked`.
         let last = self.last_asked.max(self.last_udp_reask);
         let elapsed = last.elapsed().as_secs();
         let threshold = (FILEREASKTIME_SECS - 120).max(0) as u64;
-        matches!(self.state, DownloadSourceState::OnQueue { .. } | DownloadSourceState::Failed)
-            && elapsed >= threshold
+        matches!(
+            self.state,
+            DownloadSourceState::OnQueue { .. } | DownloadSourceState::Failed
+        ) && elapsed >= threshold
     }
 }
 
@@ -229,7 +242,9 @@ impl PerFileSourceList {
     }
 
     pub fn has_source(&self, ip: Ipv4Addr, tcp_port: u16) -> bool {
-        self.sources.iter().any(|s| s.ip == ip && s.tcp_port == tcp_port)
+        self.sources
+            .iter()
+            .any(|s| s.ip == ip && s.tcp_port == tcp_port)
     }
 
     pub fn add_source_full(&mut self, ip: Ipv4Addr, tcp_port: u16, udp_port: u16) -> bool {
@@ -462,11 +477,18 @@ impl PerFileSourceList {
 
     #[cfg(test)]
     fn sources_ready_for_reask_at(&self, now: Instant) -> Vec<(Ipv4Addr, u16)> {
-        let mut ready: Vec<&DownloadSourceEntry> = self.sources.iter()
+        let mut ready: Vec<&DownloadSourceEntry> = self
+            .sources
+            .iter()
             .filter(|s| {
                 s.time_until_reask_at(now) == 0
                     && s.can_try_tcp_at(now)
-                    && !matches!(s.state, DownloadSourceState::Banned | DownloadSourceState::LowToLowIp | DownloadSourceState::EmberRelay)
+                    && !matches!(
+                        s.state,
+                        DownloadSourceState::Banned
+                            | DownloadSourceState::LowToLowIp
+                            | DownloadSourceState::EmberRelay
+                    )
             })
             .collect();
         ready.sort_by(|a, b| {
@@ -478,7 +500,9 @@ impl PerFileSourceList {
                 DownloadSourceState::OnQueue { rank } => rank.unwrap_or(u32::MAX),
                 _ => u32::MAX,
             };
-            rank_a.cmp(&rank_b).then_with(|| a.fail_count.cmp(&b.fail_count))
+            rank_a
+                .cmp(&rank_b)
+                .then_with(|| a.fail_count.cmp(&b.fail_count))
         });
         ready.into_iter().map(|s| (s.ip, s.tcp_port)).collect()
     }
@@ -493,11 +517,18 @@ impl PerFileSourceList {
     where
         F: Fn(Ipv4Addr, u16) -> bool,
     {
-        let mut ready: Vec<&DownloadSourceEntry> = self.sources.iter()
+        let mut ready: Vec<&DownloadSourceEntry> = self
+            .sources
+            .iter()
             .filter(|s| {
                 s.time_until_reask() == 0
                     && s.can_try_tcp()
-                    && !matches!(s.state, DownloadSourceState::Banned | DownloadSourceState::LowToLowIp | DownloadSourceState::EmberRelay)
+                    && !matches!(
+                        s.state,
+                        DownloadSourceState::Banned
+                            | DownloadSourceState::LowToLowIp
+                            | DownloadSourceState::EmberRelay
+                    )
                     && !is_banned(s.ip, s.tcp_port)
             })
             .collect();
@@ -510,7 +541,8 @@ impl PerFileSourceList {
                 DownloadSourceState::OnQueue { rank } => rank.unwrap_or(u32::MAX),
                 _ => u32::MAX,
             };
-            rank_a.cmp(&rank_b)
+            rank_a
+                .cmp(&rank_b)
                 .then_with(|| a.fail_count.cmp(&b.fail_count))
                 .then_with(|| {
                     let rep_a = score_fn(a.ip, a.tcp_port);
@@ -523,7 +555,8 @@ impl PerFileSourceList {
 
     /// Sources that need a UDP reask ping (~27 min after last ask).
     pub fn sources_needing_udp_reask(&self) -> Vec<(Ipv4Addr, u16, u16)> {
-        self.sources.iter()
+        self.sources
+            .iter()
             .filter(|s| s.needs_udp_reask())
             .map(|s| (s.ip, s.tcp_port, s.udp_port))
             .collect()
@@ -544,8 +577,14 @@ impl PerFileSourceList {
 
     /// Count sources in OnQueue or Downloading state (eMule: m_nCompleteSourcesCount).
     pub fn complete_source_count(&self) -> u16 {
-        self.sources.iter()
-            .filter(|s| matches!(s.state, DownloadSourceState::OnQueue { .. } | DownloadSourceState::Downloading))
+        self.sources
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.state,
+                    DownloadSourceState::OnQueue { .. } | DownloadSourceState::Downloading
+                )
+            })
             .count()
             .min(u16::MAX as usize) as u16
     }
@@ -561,7 +600,10 @@ impl PerFileSourceList {
     /// permanently unreachable on retry/resume.
     pub fn reset_active_states(&mut self) {
         for s in &mut self.sources {
-            if matches!(s.state, DownloadSourceState::Connecting | DownloadSourceState::Downloading) {
+            if matches!(
+                s.state,
+                DownloadSourceState::Connecting | DownloadSourceState::Downloading
+            ) {
                 s.state = DownloadSourceState::Failed;
                 s.state_changed = std::time::Instant::now();
             }
@@ -569,11 +611,15 @@ impl PerFileSourceList {
     }
 
     fn find(&self, ip: Ipv4Addr, port: u16) -> Option<&DownloadSourceEntry> {
-        self.sources.iter().find(|s| s.ip == ip && s.tcp_port == port)
+        self.sources
+            .iter()
+            .find(|s| s.ip == ip && s.tcp_port == port)
     }
 
     fn find_mut(&mut self, ip: Ipv4Addr, port: u16) -> Option<&mut DownloadSourceEntry> {
-        self.sources.iter_mut().find(|s| s.ip == ip && s.tcp_port == port)
+        self.sources
+            .iter_mut()
+            .find(|s| s.ip == ip && s.tcp_port == port)
     }
 }
 
@@ -605,7 +651,9 @@ pub struct SourceManager {
 }
 
 impl Default for SourceManager {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SourceManager {
@@ -624,11 +672,24 @@ impl SourceManager {
         self.register_source_with_hash(file_hash, ip, tcp_port, [0u8; 16]);
     }
 
-    pub fn register_source_with_hash(&mut self, file_hash: [u8; 16], ip: Ipv4Addr, tcp_port: u16, user_hash: [u8; 16]) {
+    pub fn register_source_with_hash(
+        &mut self,
+        file_hash: [u8; 16],
+        ip: Ipv4Addr,
+        tcp_port: u16,
+        user_hash: [u8; 16],
+    ) {
         self.register_source_full(file_hash, ip, tcp_port, 0, user_hash);
     }
 
-    pub fn register_source_full(&mut self, file_hash: [u8; 16], ip: Ipv4Addr, tcp_port: u16, udp_port: u16, user_hash: [u8; 16]) {
+    pub fn register_source_full(
+        &mut self,
+        file_hash: [u8; 16],
+        ip: Ipv4Addr,
+        tcp_port: u16,
+        udp_port: u16,
+        user_hash: [u8; 16],
+    ) {
         self.register_source_full_opts(file_hash, ip, tcp_port, udp_port, user_hash, 0);
     }
 
@@ -641,7 +702,16 @@ impl SourceManager {
         user_hash: [u8; 16],
         connect_options: u8,
     ) {
-        self.register_source_full_server(file_hash, ip, tcp_port, udp_port, 0, 0, user_hash, connect_options);
+        self.register_source_full_server(
+            file_hash,
+            ip,
+            tcp_port,
+            udp_port,
+            0,
+            0,
+            user_hash,
+            connect_options,
+        );
     }
 
     pub fn register_source_full_server(
@@ -658,7 +728,10 @@ impl SourceManager {
         let now = chrono::Utc::now().timestamp();
         let entries = self.sources.entry(file_hash).or_default();
 
-        if let Some(existing) = entries.iter_mut().find(|e| e.ip == ip && e.tcp_port == tcp_port) {
+        if let Some(existing) = entries
+            .iter_mut()
+            .find(|e| e.ip == ip && e.tcp_port == tcp_port)
+        {
             existing.last_seen = now;
             if user_hash != [0u8; 16] {
                 existing.user_hash = user_hash;
@@ -852,7 +925,9 @@ impl SourceManager {
             .map(|entries| {
                 entries
                     .iter()
-                    .filter(|e| now.saturating_sub(e.last_seen) < SOURCE_EXPIRY_SECS && e.udp_port > 0)
+                    .filter(|e| {
+                        now.saturating_sub(e.last_seen) < SOURCE_EXPIRY_SECS && e.udp_port > 0
+                    })
                     .map(|e| (e.ip, e.tcp_port, e.udp_port))
                     .collect()
             })
@@ -887,7 +962,10 @@ impl SourceManager {
     pub fn mark_asked(&mut self, file_hash: &[u8; 16], ip: Ipv4Addr, port: u16) {
         let now = chrono::Utc::now().timestamp();
         if let Some(entries) = self.sources.get_mut(file_hash) {
-            if let Some(entry) = entries.iter_mut().find(|e| e.ip == ip && e.tcp_port == port) {
+            if let Some(entry) = entries
+                .iter_mut()
+                .find(|e| e.ip == ip && e.tcp_port == port)
+            {
                 entry.last_asked = now;
             }
         }
@@ -899,7 +977,8 @@ impl SourceManager {
         let now = chrono::Utc::now().timestamp();
         if let Some(entries) = self.sources.get(file_hash) {
             if let Some(entry) = entries.iter().find(|e| e.ip == ip && e.tcp_port == port) {
-                return entry.last_sx_sent == 0 || (now - entry.last_sx_sent) >= SOURCECLIENTREASKS_I64;
+                return entry.last_sx_sent == 0
+                    || (now - entry.last_sx_sent) >= SOURCECLIENTREASKS_I64;
             }
         }
         true
@@ -909,7 +988,10 @@ impl SourceManager {
     pub fn mark_sx_sent(&mut self, file_hash: &[u8; 16], ip: Ipv4Addr, port: u16) {
         let now = chrono::Utc::now().timestamp();
         if let Some(entries) = self.sources.get_mut(file_hash) {
-            if let Some(entry) = entries.iter_mut().find(|e| e.ip == ip && e.tcp_port == port) {
+            if let Some(entry) = entries
+                .iter_mut()
+                .find(|e| e.ip == ip && e.tcp_port == port)
+            {
                 entry.last_sx_sent = now;
             }
         }
@@ -923,7 +1005,11 @@ impl SourceManager {
             .map(|entries| {
                 entries
                     .iter()
-                    .filter(|e| now.saturating_sub(e.last_seen) < SOURCE_EXPIRY_SECS && e.client_id == 0 && !e.ip.is_unspecified())
+                    .filter(|e| {
+                        now.saturating_sub(e.last_seen) < SOURCE_EXPIRY_SECS
+                            && e.client_id == 0
+                            && !e.ip.is_unspecified()
+                    })
                     .map(|e| (e.ip, e.tcp_port))
                     .collect()
             })
@@ -933,7 +1019,8 @@ impl SourceManager {
     /// Look up a stored user hash for a specific source by IP:port.
     pub fn get_user_hash(&self, file_hash: &[u8; 16], ip: Ipv4Addr, port: u16) -> Option<[u8; 16]> {
         self.sources.get(file_hash).and_then(|entries| {
-            entries.iter()
+            entries
+                .iter()
                 .find(|e| e.ip == ip && e.tcp_port == port && e.user_hash != [0u8; 16])
                 .map(|e| e.user_hash)
         })
@@ -941,7 +1028,8 @@ impl SourceManager {
 
     pub fn get_connect_options(&self, file_hash: &[u8; 16], ip: Ipv4Addr, port: u16) -> Option<u8> {
         self.sources.get(file_hash).and_then(|entries| {
-            entries.iter()
+            entries
+                .iter()
                 .find(|e| e.ip == ip && e.tcp_port == port)
                 .map(|e| e.connect_options)
         })
@@ -1051,10 +1139,18 @@ impl SourceManager {
         }
         let mut pos = 5usize;
         let read_u16 = |d: &[u8], p: usize| u16::from_le_bytes([d[p], d[p + 1]]);
-        let read_u32 = |d: &[u8], p: usize| u32::from_le_bytes([d[p], d[p + 1], d[p + 2], d[p + 3]]);
+        let read_u32 =
+            |d: &[u8], p: usize| u32::from_le_bytes([d[p], d[p + 1], d[p + 2], d[p + 3]]);
         let read_i64 = |d: &[u8], p: usize| {
             i64::from_le_bytes([
-                d[p], d[p + 1], d[p + 2], d[p + 3], d[p + 4], d[p + 5], d[p + 6], d[p + 7],
+                d[p],
+                d[p + 1],
+                d[p + 2],
+                d[p + 3],
+                d[p + 4],
+                d[p + 5],
+                d[p + 6],
+                d[p + 7],
             ])
         };
 
@@ -1141,7 +1237,10 @@ impl SourceManager {
         let now = chrono::Utc::now().timestamp();
         let entries = self.sources.entry(file_hash).or_default();
 
-        if let Some(existing) = entries.iter_mut().find(|e| e.client_id == client_id && client_id > 0) {
+        if let Some(existing) = entries
+            .iter_mut()
+            .find(|e| e.client_id == client_id && client_id > 0)
+        {
             existing.last_seen = now;
             existing.tcp_port = port;
             existing.server_ip = server_ip;
@@ -1185,7 +1284,9 @@ impl SourceManager {
             .map(|entries| {
                 entries
                     .iter()
-                    .filter(|e| now.saturating_sub(e.last_seen) < SOURCE_EXPIRY_SECS && e.client_id > 0)
+                    .filter(|e| {
+                        now.saturating_sub(e.last_seen) < SOURCE_EXPIRY_SECS && e.client_id > 0
+                    })
                     .map(|e| (e.client_id, e.tcp_port, e.server_ip, e.server_port))
                     .collect()
             })
@@ -1284,11 +1385,16 @@ impl SourceManager {
         let mut grouped: std::collections::HashMap<(u32, u16), Vec<u32>> =
             std::collections::HashMap::new();
         for e in entries {
-            if e.client_id == 0 { continue; }
-            if now.saturating_sub(e.last_seen) >= SOURCE_EXPIRY_SECS { continue; }
-            if e.server_ip == 0 || e.server_port == 0 { continue; }
-            if e.last_callback_at != 0
-                && now.saturating_sub(e.last_callback_at) < min_interval_secs
+            if e.client_id == 0 {
+                continue;
+            }
+            if now.saturating_sub(e.last_seen) >= SOURCE_EXPIRY_SECS {
+                continue;
+            }
+            if e.server_ip == 0 || e.server_port == 0 {
+                continue;
+            }
+            if e.last_callback_at != 0 && now.saturating_sub(e.last_callback_at) < min_interval_secs
             {
                 continue;
             }
@@ -1333,7 +1439,9 @@ impl SourceManager {
                     && entry.server_ip == server_ip
                     && entry.server_port == server_port
                     && now.saturating_sub(entry.last_seen) < SOURCE_EXPIRY_SECS
-                    && (user_hash == [0u8; 16] || entry.user_hash == [0u8; 16] || entry.user_hash == user_hash)
+                    && (user_hash == [0u8; 16]
+                        || entry.user_hash == [0u8; 16]
+                        || entry.user_hash == user_hash)
                 {
                     entry.ip = peer_ip;
                     if user_hash != [0u8; 16] {
@@ -1354,31 +1462,39 @@ impl SourceManager {
         user_hash: Option<[u8; 16]>,
     ) -> Vec<[u8; 16]> {
         let now = chrono::Utc::now().timestamp();
-        let candidates: Vec<[u8; 16]> = self.sources
+        let candidates: Vec<[u8; 16]> = self
+            .sources
             .iter()
             .filter_map(|(file_hash, entries)| {
-                entries.iter().any(|e| {
-                    now.saturating_sub(e.last_seen) < SOURCE_EXPIRY_SECS
-                        && e.client_id > 0
-                        && e.tcp_port == tcp_port
-                        && e.server_ip == server_ip
-                        && e.server_port == server_port
-                }).then_some(*file_hash)
-            })
-            .collect();
-
-        if let Some(hash) = user_hash.filter(|h| *h != [0u8; 16]) {
-            let filtered: Vec<[u8; 16]> = self.sources
-                .iter()
-                .filter_map(|(file_hash, entries)| {
-                    entries.iter().any(|e| {
+                entries
+                    .iter()
+                    .any(|e| {
                         now.saturating_sub(e.last_seen) < SOURCE_EXPIRY_SECS
                             && e.client_id > 0
                             && e.tcp_port == tcp_port
                             && e.server_ip == server_ip
                             && e.server_port == server_port
-                            && e.user_hash == hash
-                    }).then_some(*file_hash)
+                    })
+                    .then_some(*file_hash)
+            })
+            .collect();
+
+        if let Some(hash) = user_hash.filter(|h| *h != [0u8; 16]) {
+            let filtered: Vec<[u8; 16]> = self
+                .sources
+                .iter()
+                .filter_map(|(file_hash, entries)| {
+                    entries
+                        .iter()
+                        .any(|e| {
+                            now.saturating_sub(e.last_seen) < SOURCE_EXPIRY_SECS
+                                && e.client_id > 0
+                                && e.tcp_port == tcp_port
+                                && e.server_ip == server_ip
+                                && e.server_port == server_port
+                                && e.user_hash == hash
+                        })
+                        .then_some(*file_hash)
                 })
                 .collect();
             if !filtered.is_empty() {
@@ -1473,7 +1589,11 @@ mod tests {
             }
         }
 
-        assert_eq!(sm.source_count(&hash), 1, "expired source must not be counted");
+        assert_eq!(
+            sm.source_count(&hash),
+            1,
+            "expired source must not be counted"
+        );
         assert_eq!(
             sm.sources.get(&hash).map(|v| v.len()),
             Some(2),
@@ -1488,15 +1608,7 @@ mod tests {
         let buddy = Ipv4Addr::new(6, 6, 6, 6);
         let mut pfs = PerFileSourceList::new(hash);
         assert!(pfs.add_source_full(ip, 4662, 0));
-        pfs.set_kad_callback_buddy(
-            ip,
-            4662,
-            buddy,
-            4672,
-            [0xAA; 16],
-            Some([0xBB; 16]),
-            true,
-        );
+        pfs.set_kad_callback_buddy(ip, 4662, buddy, 4672, [0xAA; 16], Some([0xBB; 16]), true);
         assert!(pfs.callback_reask_due(ip, 4662));
         pfs.mark_callback_requested(ip, 4662);
         assert!(!pfs.callback_reask_due(ip, 4662));

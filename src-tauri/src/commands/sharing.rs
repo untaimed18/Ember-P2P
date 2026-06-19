@@ -41,17 +41,18 @@ fn paths_equal_ignore_case(a: &str, b: &str) -> bool {
     }
 }
 
-pub(crate) async fn refresh_file_cache(index: &Arc<RwLock<LocalIndex>>, cache: &Arc<RwLock<Vec<FileInfo>>>) {
-    let (snap_raw, previous_flags) = tokio::join!(
-        async { index.read().await.all_files().to_vec() },
-        async {
+pub(crate) async fn refresh_file_cache(
+    index: &Arc<RwLock<LocalIndex>>,
+    cache: &Arc<RwLock<Vec<FileInfo>>>,
+) {
+    let (snap_raw, previous_flags) =
+        tokio::join!(async { index.read().await.all_files().to_vec() }, async {
             let cached = cache.read().await;
             cached
                 .iter()
                 .map(|file| (file.path.clone(), (file.shared_kad, file.shared_ed2k)))
                 .collect::<std::collections::HashMap<_, _>>()
-        },
-    );
+        },);
     let mut snap = snap_raw;
     for file in &mut snap {
         if let Some((shared_kad, shared_ed2k)) = previous_flags.get(&file.path) {
@@ -136,7 +137,11 @@ pub async fn add_shared_folder(
     path: String,
 ) -> Result<(), String> {
     if path.len() > MAX_PATH_LEN {
-        return Err(coded_ctx("sharing_folder_path_too_long", format!("Folder path exceeds {MAX_PATH_LEN} bytes"), MAX_PATH_LEN));
+        return Err(coded_ctx(
+            "sharing_folder_path_too_long",
+            format!("Folder path exceeds {MAX_PATH_LEN} bytes"),
+            MAX_PATH_LEN,
+        ));
     }
     // Run the blocking filesystem checks off the async runtime: on a slow or
     // disconnected network path, exists()/is_dir()/canonicalize() can block a
@@ -146,27 +151,49 @@ pub async fn add_shared_folder(
         move || -> Result<std::path::PathBuf, String> {
             let p = std::path::Path::new(&path);
             if !p.exists() || !p.is_dir() {
-                return Err(coded("sharing_path_not_dir", "Path does not exist or is not a directory"));
+                return Err(coded(
+                    "sharing_path_not_dir",
+                    "Path does not exist or is not a directory",
+                ));
             }
-            p.canonicalize().map_err(|e| coded_ctx("sharing_invalid_path", "Invalid path", e))
+            p.canonicalize()
+                .map_err(|e| coded_ctx("sharing_invalid_path", "Invalid path", e))
         }
     })
     .await
     .map_err(|e| coded_ctx("sharing_task_failed", "Task failed", e))??;
     let blocked_segments: &[&str] = &[
-        "windows", "program files", "program files (x86)",
-        "programdata", ".ssh", ".gnupg",
-        "etc", "usr", "bin", "sbin", "var", "root",
-        "tmp", "temp", "proc", "sys", "dev",
+        "windows",
+        "program files",
+        "program files (x86)",
+        "programdata",
+        ".ssh",
+        ".gnupg",
+        "etc",
+        "usr",
+        "bin",
+        "sbin",
+        "var",
+        "root",
+        "tmp",
+        "temp",
+        "proc",
+        "sys",
+        "dev",
     ];
     for component in canonical.components() {
         if let std::path::Component::Normal(seg) = component {
             let seg_lower = seg.to_string_lossy().to_lowercase();
             if blocked_segments.contains(&seg_lower.as_str()) {
-                return Err(coded_ctx("sharing_cannot_share_system_dir", "Cannot share system directory", canonical.display()));
+                return Err(coded_ctx(
+                    "sharing_cannot_share_system_dir",
+                    "Cannot share system directory",
+                    canonical.display(),
+                ));
             }
             if seg_lower == "appdata" {
-                let rest: String = canonical.components()
+                let rest: String = canonical
+                    .components()
                     .skip_while(|c| {
                         if let std::path::Component::Normal(s) = c {
                             s.to_string_lossy().to_lowercase() != "appdata"
@@ -179,7 +206,11 @@ pub async fn add_shared_folder(
                     .collect::<Vec<_>>()
                     .join("/");
                 if rest.starts_with("local/temp") || rest.starts_with("local\\temp") {
-                    return Err(coded_ctx("sharing_cannot_share_system_dir", "Cannot share system directory", canonical.display()));
+                    return Err(coded_ctx(
+                        "sharing_cannot_share_system_dir",
+                        "Cannot share system directory",
+                        canonical.display(),
+                    ));
                 }
             }
         }
@@ -191,9 +222,18 @@ pub async fn add_shared_folder(
         // Case-insensitive on Windows: `Vec::contains` is case-sensitive, so
         // adding `C:\Media` then `c:\media` would store both, double-scan, and
         // make later unshare/remove (which use paths_equal_ignore_case) inconsistent.
-        if !config.settings.shared_folders.iter().any(|f| paths_equal_ignore_case(f, &canonical_str)) {
+        if !config
+            .settings
+            .shared_folders
+            .iter()
+            .any(|f| paths_equal_ignore_case(f, &canonical_str))
+        {
             config.settings.shared_folders.push(canonical_str.clone());
-            Some(config.prepare_save().map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?)
+            Some(
+                config
+                    .prepare_save()
+                    .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?,
+            )
         } else {
             None
         }
@@ -204,14 +244,20 @@ pub async fn add_shared_folder(
     }
     {
         let mut live = state.upload_shared_folders.write().await;
-        if !live.iter().any(|f| paths_equal_ignore_case(f, &canonical_str)) {
+        if !live
+            .iter()
+            .any(|f| paths_equal_ignore_case(f, &canonical_str))
+        {
             live.push(canonical_str.clone());
         }
     }
     if let Some((data, tmp, final_path)) = save_data {
         tokio::task::spawn_blocking(move || {
             crate::storage::config::AppConfig::write_to_disk(&data, &tmp, &final_path)
-        }).await.map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?.map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?;
+        })
+        .await
+        .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?
+        .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?;
     }
 
     // Start watching the new folder (and anything else currently shared).
@@ -229,7 +275,10 @@ pub async fn add_shared_folder(
 
     let cancel_flag = Arc::new(AtomicBool::new(false));
     let cancel_key = canonical_str.clone();
-    cancel_flags.write().await.insert(cancel_key.clone(), cancel_flag.clone());
+    cancel_flags
+        .write()
+        .await
+        .insert(cancel_key.clone(), cancel_flag.clone());
 
     let scan_handle = tokio::spawn(async move {
         scanning.fetch_add(1, Ordering::Relaxed);
@@ -259,7 +308,10 @@ pub async fn add_shared_folder(
         if cancel_flag.load(Ordering::Relaxed) || !still_shared {
             info!("Hashing cancelled during discovery for {path}");
             cancel_flags.write().await.remove(&cancel_key);
-            let _ = app.emit("file-hash-progress", serde_json::json!({ "done": true, "current": 0, "total": 0, "file_name": "" }));
+            let _ = app.emit(
+                "file-hash-progress",
+                serde_json::json!({ "done": true, "current": 0, "total": 0, "file_name": "" }),
+            );
             return;
         }
 
@@ -278,18 +330,24 @@ pub async fn add_shared_folder(
                 drop(index);
                 info!("Hashing cancelled before indexing for {path}");
                 cancel_flags.write().await.remove(&cancel_key);
-                let _ = app.emit("file-hash-progress", serde_json::json!({ "done": true, "current": 0, "total": 0, "file_name": "" }));
+                let _ = app.emit(
+                    "file-hash-progress",
+                    serde_json::json!({ "done": true, "current": 0, "total": 0, "file_name": "" }),
+                );
                 return;
             }
             index.add_files(discovered);
         }
         refresh_file_cache(&local_index, &file_cache).await;
 
-        let _ = app.emit("shared-files-changed", serde_json::json!({
-            "folder": path,
-            "count": total_files,
-            "phase": "discovered",
-        }));
+        let _ = app.emit(
+            "shared-files-changed",
+            serde_json::json!({
+                "folder": path,
+                "count": total_files,
+                "phase": "discovered",
+            }),
+        );
 
         let total_to_hash = files_to_hash.len();
         let mut hashed_count: usize = 0;
@@ -307,13 +365,21 @@ pub async fn add_shared_folder(
             let file_temp_id = file.id.clone();
             let cf = cancel_flag.clone();
 
-            debug!("Hashing file {}/{}: {}", hashed_count + 1, total_to_hash, file.name);
+            debug!(
+                "Hashing file {}/{}: {}",
+                hashed_count + 1,
+                total_to_hash,
+                file.name
+            );
 
-            let _ = app.emit("file-hash-progress", serde_json::json!({
-                "current": hashed_count + 1,
-                "total": total_to_hash,
-                "file_name": file.name,
-            }));
+            let _ = app.emit(
+                "file-hash-progress",
+                serde_json::json!({
+                    "current": hashed_count + 1,
+                    "total": total_to_hash,
+                    "file_name": file.name,
+                }),
+            );
 
             let hash_result = tokio::time::timeout(
                 std::time::Duration::from_secs(300),
@@ -325,7 +391,11 @@ pub async fn add_shared_folder(
 
             match hash_result {
                 Ok(Ok(Ok((ed2k_hash, aich_hash)))) => {
-                    debug!("Hash complete: {} -> {}", file.name, &ed2k_hash[..ed2k_hash.len().min(8)]);
+                    debug!(
+                        "Hash complete: {} -> {}",
+                        file.name,
+                        &ed2k_hash[..ed2k_hash.len().min(8)]
+                    );
                     let mut updated_file = file.clone();
                     updated_file.id = ed2k_hash.clone();
                     updated_file.hash = ed2k_hash;
@@ -396,13 +466,19 @@ pub async fn add_shared_folder(
         if !was_cancelled {
             let all_files = {
                 let index = local_index.read().await;
-                index.all_files().iter()
-                    .filter(|f| crate::security::path_matches_dir(&f.path, &path) && !f.hash.is_empty())
+                index
+                    .all_files()
+                    .iter()
+                    .filter(|f| {
+                        crate::security::path_matches_dir(&f.path, &path) && !f.hash.is_empty()
+                    })
                     .cloned()
                     .collect::<Vec<_>>()
             };
             if !all_files.is_empty() {
-                if let Err(e) = network_tx.try_send(NetworkCommand::AnnounceFiles { files: all_files }) {
+                if let Err(e) =
+                    network_tx.try_send(NetworkCommand::AnnounceFiles { files: all_files })
+                {
                     warn!("Failed to queue AnnounceFiles: {e}");
                 }
             }
@@ -420,12 +496,15 @@ pub async fn add_shared_folder(
             info!("Background hashing complete: {hashed_count}/{total_to_hash} hashed, {from_known} from known.met ({path})");
         }
 
-        let _ = app.emit("file-hash-progress", serde_json::json!({
-            "current": total_to_hash,
-            "total": total_to_hash,
-            "file_name": "",
-            "done": true,
-        }));
+        let _ = app.emit(
+            "file-hash-progress",
+            serde_json::json!({
+                "current": total_to_hash,
+                "total": total_to_hash,
+                "file_name": "",
+                "done": true,
+            }),
+        );
         drop(_scan_guard);
     });
 
@@ -444,7 +523,11 @@ pub async fn remove_shared_folder(
     path: String,
 ) -> Result<(), String> {
     if path.len() > MAX_PATH_LEN {
-        return Err(coded_ctx("sharing_folder_path_too_long", format!("Folder path exceeds {MAX_PATH_LEN} bytes"), MAX_PATH_LEN));
+        return Err(coded_ctx(
+            "sharing_folder_path_too_long",
+            format!("Folder path exceeds {MAX_PATH_LEN} bytes"),
+            MAX_PATH_LEN,
+        ));
     }
     // Earlier this fell back to the raw `path` string when canonicalize
     // failed. That made the unshare operation silently incomplete: the
@@ -461,7 +544,13 @@ pub async fn remove_shared_folder(
             std::path::Path::new(&path)
                 .canonicalize()
                 .map(|p| p.to_string_lossy().to_string())
-                .map_err(|e| coded_ctx("sharing_invalid_folder_path", format!("Invalid folder path '{path}'"), e))
+                .map_err(|e| {
+                    coded_ctx(
+                        "sharing_invalid_folder_path",
+                        format!("Invalid folder path '{path}'"),
+                        e,
+                    )
+                })
         }
     })
     .await
@@ -485,7 +574,10 @@ pub async fn remove_shared_folder(
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
     loop {
-        let still_active = state.hash_cancel_flags.read().await
+        let still_active = state
+            .hash_cancel_flags
+            .read()
+            .await
             .keys()
             .any(|key| paths_equal_ignore_case(key, &canonical_path));
         if !still_active || std::time::Instant::now() >= deadline {
@@ -496,8 +588,13 @@ pub async fn remove_shared_folder(
 
     let save_data = {
         let mut config = state.config.write().await;
-        config.settings.shared_folders.retain(|f| !paths_equal_ignore_case(f, &canonical_path));
-        config.prepare_save().map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?
+        config
+            .settings
+            .shared_folders
+            .retain(|f| !paths_equal_ignore_case(f, &canonical_path));
+        config
+            .prepare_save()
+            .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?
     };
     {
         let mut live = state.upload_shared_folders.write().await;
@@ -507,7 +604,10 @@ pub async fn remove_shared_folder(
         let (data, tmp, final_path) = save_data;
         tokio::task::spawn_blocking(move || {
             crate::storage::config::AppConfig::write_to_disk(&data, &tmp, &final_path)
-        }).await.map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?.map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?;
+        })
+        .await
+        .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?
+        .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?;
     }
 
     {
@@ -522,18 +622,22 @@ pub async fn remove_shared_folder(
         watcher.sync_paths(&folders);
     }
 
-    if let Err(e) = state.network_tx.try_send(NetworkCommand::SharedFilesChanged) {
+    if let Err(e) = state
+        .network_tx
+        .try_send(NetworkCommand::SharedFilesChanged)
+    {
         warn!("Failed to queue SharedFilesChanged after folder removal: {e}");
     }
-    let _ = app.emit("shared-files-changed", serde_json::json!({ "folder": path, "removed": true }));
+    let _ = app.emit(
+        "shared-files-changed",
+        serde_json::json!({ "folder": path, "removed": true }),
+    );
 
     Ok(())
 }
 
 #[tauri::command]
-pub async fn get_shared_files(
-    state: tauri::State<'_, AppState>,
-) -> Result<Vec<FileInfo>, String> {
+pub async fn get_shared_files(state: tauri::State<'_, AppState>) -> Result<Vec<FileInfo>, String> {
     let cached = state.cached_shared_files.read().await;
     Ok(cached.clone())
 }
@@ -544,17 +648,13 @@ pub async fn get_shared_files(
 /// number so the always-mounted status bar can show "Files Shared" without
 /// shipping the whole `Vec<FileInfo>` over IPC on every refresh.
 #[tauri::command]
-pub async fn get_shared_file_count(
-    state: tauri::State<'_, AppState>,
-) -> Result<usize, String> {
+pub async fn get_shared_file_count(state: tauri::State<'_, AppState>) -> Result<usize, String> {
     let cached = state.cached_shared_files.read().await;
     Ok(cached.iter().filter(|f| f.shared).count())
 }
 
 #[tauri::command]
-pub async fn get_shared_folders(
-    state: tauri::State<'_, AppState>,
-) -> Result<Vec<String>, String> {
+pub async fn get_shared_folders(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
     let config = state.config.read().await;
     Ok(config.settings.shared_folders.clone())
 }
@@ -599,7 +699,10 @@ fn extract_media_metadata(path: &str) -> Option<crate::types::MediaMetadata> {
     media.codec = Some(media_file_type_label(tagged.file_type()));
 
     if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
-        media.artist = tag.artist().map(|c| c.to_string()).filter(|s| !s.is_empty());
+        media.artist = tag
+            .artist()
+            .map(|c| c.to_string())
+            .filter(|s| !s.is_empty());
         media.album = tag.album().map(|c| c.to_string()).filter(|s| !s.is_empty());
         media.title = tag.title().map(|c| c.to_string()).filter(|s| !s.is_empty());
     }
@@ -617,7 +720,11 @@ pub async fn get_file_media_metadata(
     file_path: String,
 ) -> Result<Option<crate::types::MediaMetadata>, String> {
     if file_path.len() > MAX_PATH_LEN {
-        return Err(coded_ctx("sharing_file_path_too_long", format!("File path exceeds {MAX_PATH_LEN} bytes"), MAX_PATH_LEN));
+        return Err(coded_ctx(
+            "sharing_file_path_too_long",
+            format!("File path exceeds {MAX_PATH_LEN} bytes"),
+            MAX_PATH_LEN,
+        ));
     }
     let allowed_dirs = {
         let config = state.config.read().await;
@@ -633,7 +740,10 @@ pub async fn get_file_media_metadata(
             .canonicalize()
             .map_err(|e| coded_ctx("sharing_invalid_path", "Invalid path", e))?;
         if !crate::security::is_path_within_dirs(&canonical, &allowed_dirs) {
-            return Err(coded("sharing_file_not_shared", "File is not in a shared folder"));
+            return Err(coded(
+                "sharing_file_not_shared",
+                "File is not in a shared folder",
+            ));
         }
         let cstr = canonical.to_string_lossy();
         Ok(extract_media_metadata(&cstr))
@@ -665,7 +775,11 @@ pub async fn set_folder_priority(
     if !clearing {
         let valid = ["verylow", "low", "normal", "high", "release", "auto"];
         if !valid.contains(&priority.as_str()) {
-            return Err(coded_ctx("sharing_invalid_priority", "Invalid priority", &priority));
+            return Err(coded_ctx(
+                "sharing_invalid_priority",
+                "Invalid priority",
+                &priority,
+            ));
         }
     }
     {
@@ -676,7 +790,10 @@ pub async fn set_folder_priority(
             .iter()
             .any(|f| paths_equal_ignore_case(f, &folder_path))
         {
-            return Err(coded("sharing_folder_not_shared", "Folder is not a shared folder"));
+            return Err(coded(
+                "sharing_folder_not_shared",
+                "Folder is not a shared folder",
+            ));
         }
     }
     let save_data = {
@@ -735,7 +852,10 @@ pub async fn set_folder_priority(
             }
         }
     }
-    info!("Set folder priority {priority} for {folder_path} ({} files)", changed.len());
+    info!(
+        "Set folder priority {priority} for {folder_path} ({} files)",
+        changed.len()
+    );
     Ok(changed.len() as u32)
 }
 
@@ -765,7 +885,11 @@ pub async fn set_file_priority(
 ) -> Result<(), String> {
     let valid = ["verylow", "low", "normal", "high", "release", "auto"];
     if !valid.contains(&priority.as_str()) {
-        return Err(coded_ctx("sharing_invalid_priority", "Invalid priority", &priority));
+        return Err(coded_ctx(
+            "sharing_invalid_priority",
+            "Invalid priority",
+            &priority,
+        ));
     }
     let file_hash = {
         let mut index = state.local_index.write().await;
@@ -815,7 +939,11 @@ pub async fn batch_set_priority(
     }
     let valid = ["verylow", "low", "normal", "high", "release", "auto"];
     if !valid.contains(&priority.as_str()) {
-        return Err(coded_ctx("sharing_invalid_priority", "Invalid priority", &priority));
+        return Err(coded_ctx(
+            "sharing_invalid_priority",
+            "Invalid priority",
+            &priority,
+        ));
     }
     let (count, hashes) = {
         let mut index = state.local_index.write().await;
@@ -853,7 +981,10 @@ pub async fn batch_set_priority(
                 break;
             }
         }
-        info!("Batch set priority to {priority} for {count}/{} files", file_paths.len());
+        info!(
+            "Batch set priority to {priority} for {count}/{} files",
+            file_paths.len()
+        );
     }
     Ok(count)
 }
@@ -886,10 +1017,16 @@ pub async fn batch_share(
     };
     if count > 0 {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        if let Err(e) = state.network_tx.try_send(NetworkCommand::SharedFilesChanged) {
+        if let Err(e) = state
+            .network_tx
+            .try_send(NetworkCommand::SharedFilesChanged)
+        {
             warn!("Failed to queue SharedFilesChanged after batch share: {e}");
         }
-        let _ = app.emit("shared-files-changed", serde_json::json!({ "shared": count }));
+        let _ = app.emit(
+            "shared-files-changed",
+            serde_json::json!({ "shared": count }),
+        );
         info!("Batch shared {count}/{} files", file_paths.len());
     }
     Ok(count)
@@ -922,10 +1059,16 @@ pub async fn batch_unshare(
     };
     if count > 0 {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        if let Err(e) = state.network_tx.try_send(NetworkCommand::SharedFilesChanged) {
+        if let Err(e) = state
+            .network_tx
+            .try_send(NetworkCommand::SharedFilesChanged)
+        {
             warn!("Failed to queue SharedFilesChanged after batch unshare: {e}");
         }
-        let _ = app.emit("shared-files-changed", serde_json::json!({ "unshared": count }));
+        let _ = app.emit(
+            "shared-files-changed",
+            serde_json::json!({ "unshared": count }),
+        );
         info!("Batch unshared {count}/{} files", file_paths.len());
     }
     Ok(count)
@@ -950,7 +1093,10 @@ pub async fn reload_shared_files(
     let discovery_folders = folders.clone();
 
     let cancel_flag = Arc::new(AtomicBool::new(false));
-    let reload_key = format!("__reload_{}__", RELOAD_COUNTER.fetch_add(1, Ordering::Relaxed));
+    let reload_key = format!(
+        "__reload_{}__",
+        RELOAD_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
     {
         let mut flags = cancel_flags.write().await;
         // Single-flight: signal any reload already in progress to stop before
@@ -995,7 +1141,11 @@ pub async fn reload_shared_files(
         };
         let reloaded_folders = folders
             .iter()
-            .filter(|folder| current_folders.iter().any(|current| paths_equal_ignore_case(current, folder)))
+            .filter(|folder| {
+                current_folders
+                    .iter()
+                    .any(|current| paths_equal_ignore_case(current, folder))
+            })
             .cloned()
             .collect::<Vec<_>>();
         discovered.retain(|file| file_in_shared_folders(&file.path, &reloaded_folders));
@@ -1003,7 +1153,10 @@ pub async fn reload_shared_files(
         if cancel_flag.load(Ordering::Relaxed) {
             info!("Reload cancelled during discovery");
             cancel_flags.write().await.remove(&reload_key);
-            let _ = app.emit("file-hash-progress", serde_json::json!({ "done": true, "current": 0, "total": 0, "file_name": "" }));
+            let _ = app.emit(
+                "file-hash-progress",
+                serde_json::json!({ "done": true, "current": 0, "total": 0, "file_name": "" }),
+            );
             return;
         }
 
@@ -1016,10 +1169,13 @@ pub async fn reload_shared_files(
         }
         refresh_file_cache(&local_index, &file_cache).await;
 
-        let _ = app.emit("shared-files-changed", serde_json::json!({
-            "phase": "discovered",
-            "count": total_files,
-        }));
+        let _ = app.emit(
+            "shared-files-changed",
+            serde_json::json!({
+                "phase": "discovered",
+                "count": total_files,
+            }),
+        );
 
         let total_to_hash = files_to_hash.len();
         let mut hashed_count: usize = 0;
@@ -1037,13 +1193,21 @@ pub async fn reload_shared_files(
             let file_temp_id = file.id.clone();
             let cf = cancel_flag.clone();
 
-            debug!("Reload hashing {}/{}: {}", hashed_count + 1, total_to_hash, file.name);
+            debug!(
+                "Reload hashing {}/{}: {}",
+                hashed_count + 1,
+                total_to_hash,
+                file.name
+            );
 
-            let _ = app.emit("file-hash-progress", serde_json::json!({
-                "current": hashed_count + 1,
-                "total": total_to_hash,
-                "file_name": file.name,
-            }));
+            let _ = app.emit(
+                "file-hash-progress",
+                serde_json::json!({
+                    "current": hashed_count + 1,
+                    "total": total_to_hash,
+                    "file_name": file.name,
+                }),
+            );
 
             let hash_result = tokio::time::timeout(
                 std::time::Duration::from_secs(300),
@@ -1055,7 +1219,11 @@ pub async fn reload_shared_files(
 
             match hash_result {
                 Ok(Ok(Ok((ed2k_hash, aich_hash)))) => {
-                    debug!("Reload hash complete: {} -> {}", file.name, &ed2k_hash[..ed2k_hash.len().min(8)]);
+                    debug!(
+                        "Reload hash complete: {} -> {}",
+                        file.name,
+                        &ed2k_hash[..ed2k_hash.len().min(8)]
+                    );
                     let mut updated_file = file.clone();
                     updated_file.id = ed2k_hash.clone();
                     updated_file.hash = ed2k_hash;
@@ -1125,13 +1293,17 @@ pub async fn reload_shared_files(
         if !was_cancelled {
             let all_files = {
                 let index = local_index.read().await;
-                index.all_files().iter()
+                index
+                    .all_files()
+                    .iter()
                     .filter(|f| !f.hash.is_empty())
                     .cloned()
                     .collect::<Vec<_>>()
             };
             if !all_files.is_empty() {
-                if let Err(e) = network_tx.try_send(NetworkCommand::AnnounceFiles { files: all_files }) {
+                if let Err(e) =
+                    network_tx.try_send(NetworkCommand::AnnounceFiles { files: all_files })
+                {
                     warn!("Failed to queue AnnounceFiles on reload: {e}");
                 }
             }
@@ -1143,14 +1315,20 @@ pub async fn reload_shared_files(
         cancel_flags.write().await.remove(&reload_key);
 
         let from_known = total_files.saturating_sub(total_to_hash);
-        info!("Reload complete: {hashed_count}/{total_to_hash} hashed, {from_known} from known.met{}", if was_cancelled { " (cancelled)" } else { "" });
+        info!(
+            "Reload complete: {hashed_count}/{total_to_hash} hashed, {from_known} from known.met{}",
+            if was_cancelled { " (cancelled)" } else { "" }
+        );
 
-        let _ = app.emit("file-hash-progress", serde_json::json!({
-            "current": total_to_hash,
-            "total": total_to_hash,
-            "file_name": "",
-            "done": true,
-        }));
+        let _ = app.emit(
+            "file-hash-progress",
+            serde_json::json!({
+                "current": total_to_hash,
+                "total": total_to_hash,
+                "file_name": "",
+                "done": true,
+            }),
+        );
         drop(_scan_guard);
     });
 
@@ -1162,16 +1340,12 @@ pub async fn reload_shared_files(
 }
 
 #[tauri::command]
-pub async fn get_scan_status(
-    state: tauri::State<'_, AppState>,
-) -> Result<bool, String> {
+pub async fn get_scan_status(state: tauri::State<'_, AppState>) -> Result<bool, String> {
     Ok(state.scanning_count.load(Ordering::Relaxed) > 0)
 }
 
 #[tauri::command]
-pub async fn stop_hashing(
-    state: tauri::State<'_, AppState>,
-) -> Result<Vec<String>, String> {
+pub async fn stop_hashing(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
     let (shared_folders, index_snap) = tokio::join!(
         async {
             let config = state.config.read().await;
@@ -1185,9 +1359,9 @@ pub async fn stop_hashing(
     let pending_folders = shared_folders
         .iter()
         .filter(|folder| {
-            index_snap
-                .iter()
-                .any(|file| crate::security::path_matches_dir(&file.path, folder) && file.hash.is_empty())
+            index_snap.iter().any(|file| {
+                crate::security::path_matches_dir(&file.path, folder) && file.hash.is_empty()
+            })
         })
         .cloned()
         .collect::<HashSet<_>>();
@@ -1229,7 +1403,10 @@ pub async fn unshare_file(
         if index.get_by_path(&file_path).is_none() {
             // Surface a desync instead of silently reporting success: the UI
             // asked to unshare a path the backend index doesn't know about.
-            return Err(coded("sharing_file_not_in_index", "File not found in shared index"));
+            return Err(coded(
+                "sharing_file_not_in_index",
+                "File not found in shared index",
+            ));
         }
         if index.set_file_shared_by_path(&file_path, false) {
             index.get_by_path(&file_path).cloned()
@@ -1239,7 +1416,10 @@ pub async fn unshare_file(
     };
     if file.is_some() {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        if let Err(e) = state.network_tx.try_send(NetworkCommand::SharedFilesChanged) {
+        if let Err(e) = state
+            .network_tx
+            .try_send(NetworkCommand::SharedFilesChanged)
+        {
             warn!("Failed to queue SharedFilesChanged after unshare: {e}");
         }
         let _ = app.emit("shared-files-changed", serde_json::json!({ "unshared": 1 }));
@@ -1266,14 +1446,20 @@ pub async fn share_file(
         if index.get_by_path(&file_path).is_none() {
             // Surface a desync instead of silently reporting success: the UI
             // asked to share a path the backend index doesn't know about.
-            return Err(coded("sharing_file_not_in_index", "File not found in shared index"));
+            return Err(coded(
+                "sharing_file_not_in_index",
+                "File not found in shared index",
+            ));
         }
         index.set_file_shared_by_path(&file_path, true);
         index.get_by_path(&file_path).cloned()
     };
     if file.is_some() {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        if let Err(e) = state.network_tx.try_send(NetworkCommand::SharedFilesChanged) {
+        if let Err(e) = state
+            .network_tx
+            .try_send(NetworkCommand::SharedFilesChanged)
+        {
             warn!("Failed to queue SharedFilesChanged after share: {e}");
         }
         let _ = app.emit("shared-files-changed", serde_json::json!({ "shared": 1 }));
@@ -1294,10 +1480,16 @@ pub async fn unshare_folder(
     };
     if !affected_hashes.is_empty() {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        if let Err(e) = state.network_tx.try_send(NetworkCommand::SharedFilesChanged) {
+        if let Err(e) = state
+            .network_tx
+            .try_send(NetworkCommand::SharedFilesChanged)
+        {
             warn!("Failed to queue SharedFilesChanged after unshare_folder: {e}");
         }
-        let _ = app.emit("shared-files-changed", serde_json::json!({ "folder": path, "unshared": true }));
+        let _ = app.emit(
+            "shared-files-changed",
+            serde_json::json!({ "folder": path, "unshared": true }),
+        );
     }
     Ok(())
 }
@@ -1328,7 +1520,10 @@ pub async fn delete_shared_file(
                 .canonicalize()
                 .map_err(|e| coded_ctx("sharing_invalid_path", "Invalid path", e))?;
             if !crate::security::is_path_within_dirs(&canonical, &allowed_dirs) {
-                return Err(coded("sharing_file_not_in_shared", "File is not within a shared or download folder"));
+                return Err(coded(
+                    "sharing_file_not_in_shared",
+                    "File is not within a shared or download folder",
+                ));
             }
             Ok(canonical)
         }
@@ -1341,20 +1536,31 @@ pub async fn delete_shared_file(
     let canonical_str = canonical.to_string_lossy().to_string();
     let removed = {
         let mut index = state.local_index.write().await;
-        index.remove_file_by_path(&canonical_str)
+        index
+            .remove_file_by_path(&canonical_str)
             .or_else(|| index.remove_file_by_path(&file_path))
     };
     refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
 
-    if let Err(e) = state.network_tx.try_send(NetworkCommand::SharedFilesChanged) {
+    if let Err(e) = state
+        .network_tx
+        .try_send(NetworkCommand::SharedFilesChanged)
+    {
         warn!("Failed to queue SharedFilesChanged after file deletion: {e}");
     }
-    let _ = app.emit("shared-files-changed", serde_json::json!({ "file_deleted": true }));
+    let _ = app.emit(
+        "shared-files-changed",
+        serde_json::json!({ "file_deleted": true }),
+    );
 
     info!(
         "Deleted shared file {}{}{}",
         canonical.display(),
-        if removed.is_none() { " (not indexed)" } else { "" },
+        if removed.is_none() {
+            " (not indexed)"
+        } else {
+            ""
+        },
         file_hash
             .filter(|hash| !hash.is_empty())
             .map(|hash| format!(" ({hash})"))
@@ -1369,9 +1575,7 @@ pub async fn delete_shared_file(
 /// thousands of files. Callers can then display the count and offer a bulk
 /// "remove missing" action via `remove_missing_files`.
 #[tauri::command]
-pub async fn scan_missing_files(
-    state: tauri::State<'_, AppState>,
-) -> Result<Vec<String>, String> {
+pub async fn scan_missing_files(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
     let paths: Vec<String> = {
         let index = state.local_index.read().await;
         index.all_files().iter().map(|f| f.path.clone()).collect()
@@ -1424,7 +1628,10 @@ pub async fn remove_missing_files(
     }
     if removed > 0 {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        if let Err(e) = state.network_tx.try_send(NetworkCommand::SharedFilesChanged) {
+        if let Err(e) = state
+            .network_tx
+            .try_send(NetworkCommand::SharedFilesChanged)
+        {
             warn!("Failed to queue SharedFilesChanged after remove_missing_files: {e}");
         }
         let _ = app.emit(
@@ -1443,7 +1650,10 @@ pub async fn republish_file(
 ) -> Result<(), String> {
     let cleaned = file_hash.trim().to_lowercase();
     if cleaned.len() != 32 || hex::decode(&cleaned).is_err() {
-        return Err(coded("sharing_invalid_file_hash", "Invalid file hash (expected 32-char hex MD4)"));
+        return Err(coded(
+            "sharing_invalid_file_hash",
+            "Invalid file hash (expected 32-char hex MD4)",
+        ));
     }
     let file_exists = {
         let index = state.local_index.read().await;
@@ -1453,11 +1663,16 @@ pub async fn republish_file(
             .any(|f| !f.hash.is_empty() && f.hash.eq_ignore_ascii_case(&cleaned))
     };
     if !file_exists {
-        return Err(coded("sharing_file_not_in_index", "File not found in shared index"));
+        return Err(coded(
+            "sharing_file_not_in_index",
+            "File not found in shared index",
+        ));
     }
     state
         .network_tx
-        .try_send(NetworkCommand::RepublishFile { file_hash_hex: cleaned })
+        .try_send(NetworkCommand::RepublishFile {
+            file_hash_hex: cleaned,
+        })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
     Ok(())
 }
@@ -1468,7 +1683,11 @@ pub async fn open_shared_file(
     file_path: String,
 ) -> Result<(), String> {
     if file_path.len() > MAX_PATH_LEN {
-        return Err(coded_ctx("sharing_file_path_too_long", format!("File path exceeds {MAX_PATH_LEN} bytes"), MAX_PATH_LEN));
+        return Err(coded_ctx(
+            "sharing_file_path_too_long",
+            format!("File path exceeds {MAX_PATH_LEN} bytes"),
+            MAX_PATH_LEN,
+        ));
     }
     let allowed_dirs = {
         let config = state.config.read().await;
@@ -1480,14 +1699,23 @@ pub async fn open_shared_file(
         if !path.exists() {
             return Err(coded("sharing_file_not_exist", "File does not exist"));
         }
-        let canonical = path.canonicalize().map_err(|e| coded_ctx("sharing_invalid_path", "Invalid path", e))?;
+        let canonical = path
+            .canonicalize()
+            .map_err(|e| coded_ctx("sharing_invalid_path", "Invalid path", e))?;
         if !crate::security::is_path_within_dirs(&canonical, &allowed_dirs) {
-            return Err(coded("sharing_file_not_in_shared", "File is not within a shared or download folder"));
+            return Err(coded(
+                "sharing_file_not_in_shared",
+                "File is not within a shared or download folder",
+            ));
         }
         if crate::security::is_dangerous_extension(&canonical.to_string_lossy()) {
-            return Err(coded("sharing_dangerous_file", "Cannot open potentially dangerous file types"));
+            return Err(coded(
+                "sharing_dangerous_file",
+                "Cannot open potentially dangerous file types",
+            ));
         }
-        opener::open(&canonical).map_err(|e| coded_ctx("sharing_open_file_failed", "Failed to open file", e))?;
+        opener::open(&canonical)
+            .map_err(|e| coded_ctx("sharing_open_file_failed", "Failed to open file", e))?;
         Ok(())
     })
     .await
@@ -1500,7 +1728,11 @@ pub async fn open_shared_folder(
     file_path: String,
 ) -> Result<(), String> {
     if file_path.len() > MAX_PATH_LEN {
-        return Err(coded_ctx("sharing_file_path_too_long", format!("File path exceeds {MAX_PATH_LEN} bytes"), MAX_PATH_LEN));
+        return Err(coded_ctx(
+            "sharing_file_path_too_long",
+            format!("File path exceeds {MAX_PATH_LEN} bytes"),
+            MAX_PATH_LEN,
+        ));
     }
     let allowed_dirs = {
         let config = state.config.read().await;
@@ -1513,14 +1745,19 @@ pub async fn open_shared_folder(
         if !folder.exists() {
             return Err(coded("sharing_folder_not_exist", "Folder does not exist"));
         }
-        let canonical = folder.canonicalize().map_err(|e| coded_ctx("sharing_invalid_path", "Invalid path", e))?;
+        let canonical = folder
+            .canonicalize()
+            .map_err(|e| coded_ctx("sharing_invalid_path", "Invalid path", e))?;
         if !crate::security::is_path_within_dirs(&canonical, &allowed_dirs) {
-            return Err(coded("sharing_folder_not_in_shared", "Folder is not within a shared or download directory"));
+            return Err(coded(
+                "sharing_folder_not_in_shared",
+                "Folder is not within a shared or download directory",
+            ));
         }
-        opener::open(&canonical).map_err(|e| coded_ctx("sharing_open_folder_failed", "Failed to open folder", e))?;
+        opener::open(&canonical)
+            .map_err(|e| coded_ctx("sharing_open_folder_failed", "Failed to open folder", e))?;
         Ok(())
     })
     .await
     .map_err(|e| coded_ctx("sharing_task_failed", "Task failed", e))?
 }
-

@@ -213,7 +213,11 @@ impl IterativeSearch {
             let distance = self.target.distance(&contact.node_id);
 
             // Check if we already have this node
-            if self.shortlist.iter().any(|e| e.contact.node_id == contact.node_id) {
+            if self
+                .shortlist
+                .iter()
+                .any(|e| e.contact.node_id == contact.node_id)
+            {
                 continue;
             }
 
@@ -229,7 +233,8 @@ impl IterativeSearch {
         }
 
         // Re-sort and trim
-        self.shortlist.sort_by(|a, b| a.distance.0.cmp(&b.distance.0));
+        self.shortlist
+            .sort_by(|a, b| a.distance.0.cmp(&b.distance.0));
         self.shortlist.truncate(K_BUCKET_SIZE);
 
         // Check convergence
@@ -275,7 +280,10 @@ impl IterativeSearch {
 
         // Complete if no more nodes to query and nothing in flight
         let has_pending = self.shortlist.iter().any(|e| e.state == NodeState::Pending);
-        let has_in_flight = self.shortlist.iter().any(|e| e.state == NodeState::InFlight);
+        let has_in_flight = self
+            .shortlist
+            .iter()
+            .any(|e| e.state == NodeState::InFlight);
 
         if !has_pending && !has_in_flight {
             self.complete = true;
@@ -338,8 +346,13 @@ impl SearchManager {
     ) -> Option<u32> {
         let initial = routing_table.find_closest(&primary_key, K_BUCKET_SIZE);
         let id = self.alloc_id()?;
-        let search =
-            IterativeSearch::new(id, SearchType::FindValue, primary_key, keyword_hashes, initial);
+        let search = IterativeSearch::new(
+            id,
+            SearchType::FindValue,
+            primary_key,
+            keyword_hashes,
+            initial,
+        );
         trace!(
             "Starting FIND_VALUE search {} for key {} ({} keywords)",
             id,
@@ -590,7 +603,9 @@ mod tests {
         rt.add_contact(make_contact(0x80));
 
         let mut sm = SearchManager::new();
-        let search_id = sm.start_find_value(make_id(0xFF), vec![], &rt).expect("search slot");
+        let search_id = sm
+            .start_find_value(make_id(0xFF), vec![], &rt)
+            .expect("search slot");
 
         let search = sm.get_mut(search_id).unwrap();
         let batch = search.next_to_query();

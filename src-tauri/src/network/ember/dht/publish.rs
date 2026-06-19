@@ -316,7 +316,10 @@ impl PublishOperation {
         for target in &self.targets {
             if self.acked.contains(&target.node_id)
                 || self.failed.contains(&target.node_id)
-                || self.pending_requests.values().any(|id| *id == target.node_id)
+                || self
+                    .pending_requests
+                    .values()
+                    .any(|id| *id == target.node_id)
             {
                 continue;
             }
@@ -467,14 +470,8 @@ mod tests {
     #[test]
     fn signed_keyword_record_round_trip() {
         let sk = SigningKey::generate(&mut OsRng);
-        let record = SignedRecord::keyword(
-            "test",
-            [1u8; 16],
-            [2u8; 32],
-            12345,
-            "test_file.txt",
-            &sk,
-        );
+        let record =
+            SignedRecord::keyword("test", [1u8; 16], [2u8; 32], 12345, "test_file.txt", &sk);
 
         assert!(record.verify());
         assert_eq!(record.record_type, RECORD_TYPE_KEYWORD);
@@ -573,14 +570,8 @@ mod tests {
     #[test]
     fn tampered_record_fails_verification() {
         let sk = SigningKey::generate(&mut OsRng);
-        let record = SignedRecord::keyword(
-            "test",
-            [1u8; 16],
-            [2u8; 32],
-            12345,
-            "test_file.txt",
-            &sk,
-        );
+        let record =
+            SignedRecord::keyword("test", [1u8; 16], [2u8; 32], 12345, "test_file.txt", &sk);
 
         let mut tampered_data = record.data.clone();
         tampered_data[20] ^= 0xFF; // flip a byte

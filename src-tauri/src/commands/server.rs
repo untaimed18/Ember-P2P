@@ -7,7 +7,10 @@ use tracing::info;
 async fn resolve_server_host(input: &str, port: u16) -> Result<String, String> {
     if let Ok(ip) = input.parse::<std::net::Ipv4Addr>() {
         if crate::security::is_special_use_v4(ip) {
-            return Err(coded("server_private_addr", "Cannot connect to private/loopback addresses"));
+            return Err(coded(
+                "server_private_addr",
+                "Cannot connect to private/loopback addresses",
+            ));
         }
         return Ok(input.to_string());
     }
@@ -15,9 +18,17 @@ async fn resolve_server_host(input: &str, port: u16) -> Result<String, String> {
         .await
         .map_err(|_| coded("server_resolve_failed", "Failed to resolve server address"))?
         .find(|addr| addr.is_ipv4())
-        .ok_or_else(|| coded("server_no_ipv4", "No IPv4 address found for the given hostname"))?;
+        .ok_or_else(|| {
+            coded(
+                "server_no_ipv4",
+                "No IPv4 address found for the given hostname",
+            )
+        })?;
     if crate::security::is_private_ip(addr.ip()) {
-        return Err(coded("server_resolves_private", "Server hostname resolves to a private/loopback address"));
+        return Err(coded(
+            "server_resolves_private",
+            "Server hostname resolves to a private/loopback address",
+        ));
     }
     Ok(addr.ip().to_string())
 }
@@ -38,16 +49,17 @@ pub async fn connect_to_server(
 
     state
         .network_tx
-        .try_send(NetworkCommand::ConnectToServer { ip: resolved_ip.clone(), port })
+        .try_send(NetworkCommand::ConnectToServer {
+            ip: resolved_ip.clone(),
+            port,
+        })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
 
     Ok(format!("Connecting to ed2k server {resolved_ip}:{port}..."))
 }
 
 #[tauri::command]
-pub async fn disconnect_server(
-    state: tauri::State<'_, AppState>,
-) -> Result<String, String> {
+pub async fn disconnect_server(state: tauri::State<'_, AppState>) -> Result<String, String> {
     state
         .network_tx
         .try_send(NetworkCommand::DisconnectServer)
@@ -79,7 +91,12 @@ pub async fn add_server(
 
     state
         .network_tx
-        .try_send(NetworkCommand::AddServer { ip: resolved_ip, port, name: label_name, tx })
+        .try_send(NetworkCommand::AddServer {
+            ip: resolved_ip,
+            port,
+            name: label_name,
+            tx,
+        })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
 
     await_reply(rx, "server_add_failed", "Failed to add server").await?
@@ -100,16 +117,18 @@ pub async fn remove_server(
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
         .network_tx
-        .try_send(NetworkCommand::RemoveServer { ip: resolved_ip, port, tx })
+        .try_send(NetworkCommand::RemoveServer {
+            ip: resolved_ip,
+            port,
+            tx,
+        })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
 
     await_reply(rx, "server_remove_failed", "Failed to remove server").await?
 }
 
 #[tauri::command]
-pub async fn get_server_list(
-    state: tauri::State<'_, AppState>,
-) -> Result<Vec<ServerInfo>, String> {
+pub async fn get_server_list(state: tauri::State<'_, AppState>) -> Result<Vec<ServerInfo>, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
         .network_tx
@@ -127,7 +146,12 @@ pub async fn get_connected_server(
         .network_tx
         .try_send(NetworkCommand::GetConnectedServerSnapshot { tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    await_reply(rx, "server_connected_failed", "Failed to get connected server").await
+    await_reply(
+        rx,
+        "server_connected_failed",
+        "Failed to get connected server",
+    )
+    .await
 }
 
 #[tauri::command]
@@ -138,13 +162,17 @@ pub async fn download_server_met(
     info!("Downloading server.met");
 
     const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
-    let response = crate::security::fetch_pinned_get(&url).await
+    let response = crate::security::fetch_pinned_get(&url)
+        .await
         .map_err(|e| coded_ctx("http_request_failed", "HTTP request failed", e))?
         .error_for_status()
         .map_err(|e| coded_ctx("http_error", "HTTP error", e))?;
     if let Some(cl) = response.content_length() {
         if cl > MAX_RESPONSE_BYTES as u64 {
-            return Err(coded("response_too_large", "Response too large (Content-Length exceeds limit)"));
+            return Err(coded(
+                "response_too_large",
+                "Response too large (Content-Length exceeds limit)",
+            ));
         }
     }
 
@@ -153,7 +181,8 @@ pub async fn download_server_met(
         let mut body = Vec::new();
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| coded_ctx("response_read_failed", "Failed to read response", e))?;
+            let chunk = chunk
+                .map_err(|e| coded_ctx("response_read_failed", "Failed to read response", e))?;
             body.extend_from_slice(&chunk);
             if body.len() > MAX_RESPONSE_BYTES {
                 return Err(coded("response_too_large", "Response too large"));
@@ -168,7 +197,8 @@ pub async fn download_server_met(
         let decoder = flate2::read::GzDecoder::new(&bytes[..]);
         let mut limited = decoder.take(MAX_DECOMPRESSED);
         let mut decompressed = Vec::new();
-        limited.read_to_end(&mut decompressed)
+        limited
+            .read_to_end(&mut decompressed)
             .map_err(|e| coded_ctx("gzip_decompress_failed", "Failed to decompress gzip", e))?;
         decompressed
     } else {
@@ -181,7 +211,8 @@ pub async fn download_server_met(
         .try_send(NetworkCommand::MergeServerMet { data, tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
 
-    let stats = await_reply(rx, "server_merge_failed", "Failed to merge servers").await?
+    let stats = await_reply(rx, "server_merge_failed", "Failed to merge servers")
+        .await?
         .map_err(|e| coded_ctx("server_met_parse_failed", "Failed to parse server.met", e))?;
 
     let msg = format!(

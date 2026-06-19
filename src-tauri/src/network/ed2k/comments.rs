@@ -48,7 +48,14 @@ impl CommentManager {
         debug!("Set comment for {}: rating={}", file_hash, entry.our_rating);
     }
 
-    pub fn add_peer_comment(&mut self, file_hash: &str, user_name: String, rating: u8, comment: String, origin: u8) {
+    pub fn add_peer_comment(
+        &mut self,
+        file_hash: &str,
+        user_name: String,
+        rating: u8,
+        comment: String,
+        origin: u8,
+    ) {
         if !self.comments.contains_key(file_hash) && self.comments.len() >= MAX_COMMENT_FILES {
             return;
         }
@@ -63,7 +70,11 @@ impl CommentManager {
             comment
         };
         let entry = self.comments.entry(file_hash.to_string()).or_default();
-        if entry.peer_comments.iter().any(|c| c.user_name == user_name && c.comment == comment) {
+        if entry
+            .peer_comments
+            .iter()
+            .any(|c| c.user_name == user_name && c.comment == comment)
+        {
             return;
         }
         if entry.peer_comments.len() >= MAX_COMMENTS_PER_FILE {
@@ -93,7 +104,9 @@ impl CommentManager {
             Some(i) => i,
             None => return 0.0,
         };
-        let ratings: Vec<u8> = info.peer_comments.iter()
+        let ratings: Vec<u8> = info
+            .peer_comments
+            .iter()
             .map(|c| c.rating)
             .filter(|&r| r > 0)
             .collect();
@@ -104,7 +117,8 @@ impl CommentManager {
     }
 
     pub fn has_fake_rating(&self, file_hash: &str) -> bool {
-        self.comments.get(file_hash)
+        self.comments
+            .get(file_hash)
             .map(|info| info.peer_comments.iter().any(|c| c.rating == RATING_FAKE))
             .unwrap_or(false)
     }

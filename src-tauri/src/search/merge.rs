@@ -74,13 +74,27 @@ fn merge_into(existing: &mut SearchResult, incoming: SearchResult) {
     // Fill any media fields the other origin provided that we lack, so a hit
     // found on both KAD and a server keeps whichever side carried the metadata.
     if let Some(inc_media) = incoming.media {
-        let em = existing.media.get_or_insert_with(crate::types::MediaMetadata::default);
-        if em.duration.is_none() { em.duration = inc_media.duration; }
-        if em.bitrate.is_none() { em.bitrate = inc_media.bitrate; }
-        if em.codec.is_none() { em.codec = inc_media.codec; }
-        if em.artist.is_none() { em.artist = inc_media.artist; }
-        if em.album.is_none() { em.album = inc_media.album; }
-        if em.title.is_none() { em.title = inc_media.title; }
+        let em = existing
+            .media
+            .get_or_insert_with(crate::types::MediaMetadata::default);
+        if em.duration.is_none() {
+            em.duration = inc_media.duration;
+        }
+        if em.bitrate.is_none() {
+            em.bitrate = inc_media.bitrate;
+        }
+        if em.codec.is_none() {
+            em.codec = inc_media.codec;
+        }
+        if em.artist.is_none() {
+            em.artist = inc_media.artist;
+        }
+        if em.album.is_none() {
+            em.album = inc_media.album;
+        }
+        if em.title.is_none() {
+            em.title = inc_media.title;
+        }
     }
     if incoming.file.name.len() > existing.file.name.len() {
         existing.file.name = incoming.file.name;
@@ -88,7 +102,10 @@ fn merge_into(existing: &mut SearchResult, incoming: SearchResult) {
 }
 
 /// Merge two result lists; rows with the same hash are combined. Output is sorted for display.
-pub fn merge_search_vecs(primary: Vec<SearchResult>, secondary: Vec<SearchResult>) -> Vec<SearchResult> {
+pub fn merge_search_vecs(
+    primary: Vec<SearchResult>,
+    secondary: Vec<SearchResult>,
+) -> Vec<SearchResult> {
     let mut map: HashMap<String, SearchResult> = HashMap::new();
     for r in primary.into_iter().chain(secondary) {
         let k = result_key(&r);
@@ -111,8 +128,16 @@ pub fn sort_search_results(v: &mut [SearchResult]) {
             .cmp(&a.file.complete_sources)
             .then_with(|| b.availability.cmp(&a.availability))
             .then_with(|| {
-                let an = if a.clean_name.is_empty() { &a.file.name } else { &a.clean_name };
-                let bn = if b.clean_name.is_empty() { &b.file.name } else { &b.clean_name };
+                let an = if a.clean_name.is_empty() {
+                    &a.file.name
+                } else {
+                    &a.clean_name
+                };
+                let bn = if b.clean_name.is_empty() {
+                    &b.file.name
+                } else {
+                    &b.clean_name
+                };
                 an.to_lowercase().cmp(&bn.to_lowercase())
             })
     });

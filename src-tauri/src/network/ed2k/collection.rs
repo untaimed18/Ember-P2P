@@ -57,7 +57,9 @@ impl Collection {
         // A collection header has a handful of tags; an absurd count means a
         // corrupt/hostile file, so reject it before the skip loop below spins.
         if header_tag_count > 65_536 {
-            return Err(anyhow::anyhow!("Collection header tag count too large: {header_tag_count}"));
+            return Err(anyhow::anyhow!(
+                "Collection header tag count too large: {header_tag_count}"
+            ));
         }
 
         let mut name = String::new();
@@ -91,14 +93,19 @@ impl Collection {
 
         let file_count = cursor.read_u32::<LittleEndian>()? as usize;
         if file_count > 100_000 {
-            return Err(anyhow::anyhow!("Collection too large: {} files (max 100,000)", file_count));
+            return Err(anyhow::anyhow!(
+                "Collection too large: {} files (max 100,000)",
+                file_count
+            ));
         }
         let mut files = Vec::with_capacity(file_count);
 
         for _ in 0..file_count {
             let file_tag_count = cursor.read_u32::<LittleEndian>()? as usize;
             if file_tag_count > 65_536 {
-                return Err(anyhow::anyhow!("Collection file tag count too large: {file_tag_count}"));
+                return Err(anyhow::anyhow!(
+                    "Collection file tag count too large: {file_tag_count}"
+                ));
             }
             let mut fname = String::new();
             let mut fsize: u64 = 0;
@@ -114,13 +121,11 @@ impl Collection {
                             fname = s;
                         }
                     }
-                    FT_FILESIZE => {
-                        match tag_value {
-                            TagValue::Uint32(v) => fsize = v as u64,
-                            TagValue::Uint64(v) => fsize = v,
-                            _ => {}
-                        }
-                    }
+                    FT_FILESIZE => match tag_value {
+                        TagValue::Uint32(v) => fsize = v as u64,
+                        TagValue::Uint64(v) => fsize = v,
+                        _ => {}
+                    },
                     FT_FILEHASH => {
                         if let TagValue::Hash(h) = tag_value {
                             fhash = hex::encode(h);
@@ -146,7 +151,11 @@ impl Collection {
             });
         }
 
-        Ok(Collection { name, author, files })
+        Ok(Collection {
+            name,
+            author,
+            files,
+        })
     }
 
     fn load_text(path: &Path) -> anyhow::Result<Self> {
@@ -169,7 +178,8 @@ impl Collection {
         }
         let content = std::fs::read_to_string(path)?;
         let mut files = Vec::new();
-        let name = path.file_stem()
+        let name = path
+            .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
 
@@ -252,14 +262,20 @@ impl Collection {
         // fsync — on Windows the rename can land before the data
         // pages flush, leaving a zero-length file at the final path.
         crate::security::atomic_write(path, &buf, false)?;
-        info!("Saved collection '{}' with {} files", self.name, self.files.len());
+        info!(
+            "Saved collection '{}' with {} files",
+            self.name,
+            self.files.len()
+        );
         Ok(())
     }
 
     pub fn save_text(&self, path: &Path) -> anyhow::Result<()> {
         let mut content = String::new();
         for file in &self.files {
-            content.push_str(&super::hash::format_ed2k_link(&file.name, file.size, &file.hash));
+            content.push_str(&super::hash::format_ed2k_link(
+                &file.name, file.size, &file.hash,
+            ));
             content.push('\n');
         }
         // Same crash-safety reasoning as `save` above.
@@ -305,7 +321,11 @@ fn read_tag(cursor: &mut Cursor<&Vec<u8>>) -> anyhow::Result<(u8, TagValue)> {
         let name_len = cursor.read_u16::<LittleEndian>()? as usize;
         let mut name_buf = vec![0u8; name_len];
         cursor.read_exact(&mut name_buf)?;
-        if name_len == 1 { name_buf[0] } else { 0 }
+        if name_len == 1 {
+            name_buf[0]
+        } else {
+            0
+        }
     };
 
     let real_type = tag_type & 0x7F;
@@ -317,9 +337,16 @@ fn read_tag(cursor: &mut Cursor<&Vec<u8>>) -> anyhow::Result<(u8, TagValue)> {
             cursor.read_exact(&mut sbuf)?;
             if slen > capped {
                 let skip = (slen - capped) as u64;
-                let new_pos = cursor.position().checked_add(skip)
+                let new_pos = cursor
+                    .position()
+                    .checked_add(skip)
                     .filter(|&p| p <= cursor.get_ref().len() as u64)
-                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "string tag skip out of bounds"))?;
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "string tag skip out of bounds",
+                        )
+                    })?;
                 cursor.set_position(new_pos);
             }
             TagValue::String(String::from_utf8_lossy(&sbuf).to_string())
@@ -340,9 +367,16 @@ fn read_tag(cursor: &mut Cursor<&Vec<u8>>) -> anyhow::Result<(u8, TagValue)> {
             cursor.read_exact(&mut bbuf)?;
             if blen > capped {
                 let skip = (blen - capped) as u64;
-                let new_pos = cursor.position().checked_add(skip)
+                let new_pos = cursor
+                    .position()
+                    .checked_add(skip)
                     .filter(|&p| p <= cursor.get_ref().len() as u64)
-                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "blob tag skip out of bounds"))?;
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "blob tag skip out of bounds",
+                        )
+                    })?;
                 cursor.set_position(new_pos);
             }
             TagValue::Blob(bbuf)
@@ -366,7 +400,10 @@ fn read_tag(cursor: &mut Cursor<&Vec<u8>>) -> anyhow::Result<(u8, TagValue)> {
             TagValue::String(String::from_utf8_lossy(&sbuf).to_string())
         }
         other => {
-            anyhow::bail!("unknown collection tag type 0x{other:02X} at position {}", cursor.position());
+            anyhow::bail!(
+                "unknown collection tag type 0x{other:02X} at position {}",
+                cursor.position()
+            );
         }
     };
 

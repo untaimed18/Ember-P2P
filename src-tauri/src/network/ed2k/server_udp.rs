@@ -64,10 +64,7 @@ fn maybe_obfuscate_packet(
     if server.udp_flags & SRV_UDPFLG_UDPOBFUSCATION == 0 {
         return (packet, plain_addr);
     }
-    let encrypted = super::server_obfuscation::encrypt_send_server(
-        &packet,
-        server.server_udp_key,
-    );
+    let encrypted = super::server_obfuscation::encrypt_send_server(&packet, server.server_udp_key);
     let mut wire_addr = plain_addr;
     if server.obfuscation_port_udp != 0 {
         wire_addr.set_port(server.obfuscation_port_udp);
@@ -102,14 +99,21 @@ impl ServerUdpSocket {
     }
 
     /// Build a single-file get-sources packet. Returns (packet, addr).
-    pub fn build_get_sources_packet(server: &ServerEntry, file_hash: &[u8; 16], file_size: u64) -> Option<(Vec<u8>, SocketAddr)> {
+    pub fn build_get_sources_packet(
+        server: &ServerEntry,
+        file_hash: &[u8; 16],
+        file_size: u64,
+    ) -> Option<(Vec<u8>, SocketAddr)> {
         Self::build_multi_get_sources_packet(server, &[(file_hash, file_size)])
     }
 
     /// Build a multi-file get-sources packet (eMule packs up to MAX_REQUESTS_PER_SERVER
     /// file hashes per UDP packet, max MAX_UDP_PACKET_DATA bytes of payload).
     /// Returns (packet, addr) or None if the server address is invalid.
-    pub fn build_multi_get_sources_packet(server: &ServerEntry, files: &[(&[u8; 16], u64)]) -> Option<(Vec<u8>, SocketAddr)> {
+    pub fn build_multi_get_sources_packet(
+        server: &ServerEntry,
+        files: &[(&[u8; 16], u64)],
+    ) -> Option<(Vec<u8>, SocketAddr)> {
         const MAX_UDP_PACKET_DATA: usize = 510;
         const MAX_REQUESTS_PER_SERVER: usize = 35;
 
@@ -122,7 +126,11 @@ impl ServerUdpSocket {
         let supports_getsources2 = (server.udp_flags & SRV_UDPFLG_EXT_GETSOURCES2) != 0;
         let supports_large = (server.udp_flags & SRV_UDPFLG_LARGEFILES) != 0;
 
-        let opcode = if supports_getsources2 { OP_GLOBGETSOURCES2 } else { OP_GLOBGETSOURCES };
+        let opcode = if supports_getsources2 {
+            OP_GLOBGETSOURCES2
+        } else {
+            OP_GLOBGETSOURCES
+        };
         let mut packet = Vec::with_capacity(2 + MAX_UDP_PACKET_DATA);
         packet.push(OP_EDONKEYPROT);
         packet.push(opcode);
@@ -188,7 +196,10 @@ impl ServerUdpSocket {
     /// keyword search runs (`run_udp` branch). Replies arrive as
     /// `ServerUdpResponse::SearchResult` and merge into the same UI
     /// search-results stream as TCP and KAD results.
-    pub fn build_global_search_packet(server: &ServerEntry, search_expr: &[u8]) -> Option<(Vec<u8>, SocketAddr)> {
+    pub fn build_global_search_packet(
+        server: &ServerEntry,
+        search_expr: &[u8],
+    ) -> Option<(Vec<u8>, SocketAddr)> {
         let udp_port = server.port.checked_add(4)?;
         let addr: SocketAddr = format!("{}:{}", server.ip, udp_port).parse().ok()?;
 
@@ -227,8 +238,9 @@ impl ServerUdpSocket {
     }
 
     pub async fn send_status_ping(&mut self, server: &ServerEntry) -> anyhow::Result<()> {
-        let udp_port = server.port.checked_add(4)
-            .ok_or_else(|| anyhow::anyhow!("Server port {} too high for UDP offset", server.port))?;
+        let udp_port = server.port.checked_add(4).ok_or_else(|| {
+            anyhow::anyhow!("Server port {} too high for UDP offset", server.port)
+        })?;
         // `plain_addr` is the **canonical** server addr (TCP port + 4).
         // We use it as the cooldown / challenge tracking key so the
         // recv path — which canonicalises obfuscated source addrs to
@@ -249,8 +261,8 @@ impl ServerUdpSocket {
         // (`pServer->GetServerKeyUDP() != 0 && pServer->SupportsObfuscationUDP()`).
         // First ping always goes plain (key not yet known); subsequent
         // pings obfuscate.
-        let use_obf = server.server_udp_key != 0
-            && server.udp_flags & SRV_UDPFLG_UDPOBFUSCATION != 0;
+        let use_obf =
+            server.server_udp_key != 0 && server.udp_flags & SRV_UDPFLG_UDPOBFUSCATION != 0;
         let mut wire_addr = plain_addr;
         if use_obf && server.obfuscation_port_udp != 0 {
             wire_addr.set_port(server.obfuscation_port_udp);
@@ -288,9 +300,13 @@ impl ServerUdpSocket {
         if self.last_ping_times.len() > MAX_TRACKED_SERVERS {
             let cutoff = now - STAT_REASK_INTERVAL_SECS;
             self.last_ping_times.retain(|_, &mut ts| ts > cutoff);
-            self.pending_challenges.retain(|a, _| self.last_ping_times.contains_key(a));
+            self.pending_challenges
+                .retain(|a, _| self.last_ping_times.contains_key(a));
         }
-        debug!("Sent status ping to {}:{} (challenge=0x{challenge:08X})", server.ip, server.port);
+        debug!(
+            "Sent status ping to {}:{} (challenge=0x{challenge:08X})",
+            server.ip, server.port
+        );
         Ok(())
     }
 
@@ -546,14 +562,15 @@ fn parse_server_udp_response(data: &[u8], addr: SocketAddr) -> Option<ServerUdpR
                 let _ = cursor.read_u32::<LittleEndian>();
                 udp_obf_port = cursor.read_u16::<LittleEndian>().unwrap_or(0); // offset 32
                 tcp_obf_port = cursor.read_u16::<LittleEndian>().unwrap_or(0); // offset 34
-                // dwServerUDPKey (offset 36, u32 LE) — eMule's
-                // `pServer->SetServerKeyUDP(dwServerUDPKey)` source.
-                // Required as the BaseKey for `EncryptSendServer` /
-                // `DecryptReceivedServer` (see `server_obfuscation.rs`).
-                // Previously this field was skipped, which silently
-                // disabled all UDP obfuscation against this server even
-                // when `SRV_UDPFLG_UDPOBFUSCATION` was set.
-                server_udp_key = cursor.read_u32::<LittleEndian>().unwrap_or(0); // offset 36
+                                                                               // dwServerUDPKey (offset 36, u32 LE) — eMule's
+                                                                               // `pServer->SetServerKeyUDP(dwServerUDPKey)` source.
+                                                                               // Required as the BaseKey for `EncryptSendServer` /
+                                                                               // `DecryptReceivedServer` (see `server_obfuscation.rs`).
+                                                                               // Previously this field was skipped, which silently
+                                                                               // disabled all UDP obfuscation against this server even
+                                                                               // when `SRV_UDPFLG_UDPOBFUSCATION` was set.
+                server_udp_key = cursor.read_u32::<LittleEndian>().unwrap_or(0);
+                // offset 36
             }
             // eMule default: if flag says TCP obfuscation but no port, use the main TCP port
             if tcp_obf_port == 0 && (udp_flags & SRV_UDPFLG_TCPOBFUSCATION) != 0 {
@@ -616,11 +633,17 @@ fn parse_server_udp_response(data: &[u8], addr: SocketAddr) -> Option<ServerUdpR
                 for _ in 0..source_count {
                     let id = match cursor.read_u32::<LittleEndian>() {
                         Ok(v) => v,
-                        Err(_) => { entry_ok = false; break; }
+                        Err(_) => {
+                            entry_ok = false;
+                            break;
+                        }
                     };
                     let port = match cursor.read_u16::<LittleEndian>() {
                         Ok(v) => v,
-                        Err(_) => { entry_ok = false; break; }
+                        Err(_) => {
+                            entry_ok = false;
+                            break;
+                        }
                     };
                     if id < super::server::LOWID_THRESHOLD {
                         sources.push((Ipv4Addr::UNSPECIFIED, port, id));
@@ -642,11 +665,12 @@ fn parse_server_udp_response(data: &[u8], addr: SocketAddr) -> Option<ServerUdpR
             if all_files.is_empty() {
                 return None;
             }
-            Some(ServerUdpResponse::FoundSources { addr, files: all_files })
+            Some(ServerUdpResponse::FoundSources {
+                addr,
+                files: all_files,
+            })
         }
-        OP_GLOBSEARCHRES => {
-            parse_search_results(payload)
-        }
+        OP_GLOBSEARCHRES => parse_search_results(payload),
         _ => None,
     }
 }
@@ -785,17 +809,23 @@ fn parse_search_results(payload: &[u8]) -> Option<ServerUdpResponse> {
                     // ("length"/"bitrate"/"codec"/...) can be matched.
                     let mut name_buf = vec![0u8; name_len];
                     std::io::Read::read_exact(&mut cursor, &mut name_buf).ok()?;
-                    (0u8, raw_type, Some(String::from_utf8_lossy(&name_buf).to_ascii_lowercase()))
+                    (
+                        0u8,
+                        raw_type,
+                        Some(String::from_utf8_lossy(&name_buf).to_ascii_lowercase()),
+                    )
                 }
             };
             let tag_name = tag_name.as_deref();
 
             let ok = match tag_type {
-                0x01 => { // TAGTYPE_HASH
+                0x01 => {
+                    // TAGTYPE_HASH
                     let mut buf = [0u8; 16];
                     std::io::Read::read_exact(&mut cursor, &mut buf).is_ok()
                 }
-                0x02 => { // TAGTYPE_STRING
+                0x02 => {
+                    // TAGTYPE_STRING
                     let slen = cursor.read_u16::<LittleEndian>().ok().unwrap_or(0) as usize;
                     let start = cursor.position() as usize;
                     let end = start.saturating_add(slen);
@@ -806,82 +836,166 @@ fn parse_search_results(payload: &[u8]) -> Option<ServerUdpResponse> {
                         cursor.set_position(end as u64);
                         let keep = &bytes[..bytes.len().min(8192)];
                         let value = String::from_utf8_lossy(keep).to_string();
-                        apply_udp_string_tag(name_id, tag_name, value, &mut file_name, &mut comment, &mut media);
+                        apply_udp_string_tag(
+                            name_id,
+                            tag_name,
+                            value,
+                            &mut file_name,
+                            &mut comment,
+                            &mut media,
+                        );
                         true
                     }
                 }
-                0x03 => { // TAGTYPE_UINT32
+                0x03 => {
+                    // TAGTYPE_UINT32
                     if let Ok(v) = cursor.read_u32::<LittleEndian>() {
                         match name_id {
                             0x02 => file_size = (file_size & 0xFFFF_FFFF_0000_0000) | v as u64,
-                            0x3A => file_size = (file_size & 0x0000_0000_FFFF_FFFF) | ((v as u64) << 32),
-                            _ => apply_udp_uint_tag(name_id, tag_name, v as u64, &mut rating, &mut media),
+                            0x3A => {
+                                file_size = (file_size & 0x0000_0000_FFFF_FFFF) | ((v as u64) << 32)
+                            }
+                            _ => apply_udp_uint_tag(
+                                name_id,
+                                tag_name,
+                                v as u64,
+                                &mut rating,
+                                &mut media,
+                            ),
                         }
                         true
-                    } else { false }
+                    } else {
+                        false
+                    }
                 }
-                0x04 => { let mut b = [0u8; 4]; std::io::Read::read_exact(&mut cursor, &mut b).is_ok() }
-                0x05 => { let _ = cursor.read_u8(); true }
-                0x06 => { // TAGTYPE_BOOLARRAY
+                0x04 => {
+                    let mut b = [0u8; 4];
+                    std::io::Read::read_exact(&mut cursor, &mut b).is_ok()
+                }
+                0x05 => {
+                    let _ = cursor.read_u8();
+                    true
+                }
+                0x06 => {
+                    // TAGTYPE_BOOLARRAY
                     if let Ok(count) = cursor.read_u16::<LittleEndian>() {
                         let bc = (count as usize + 7) / 8;
                         let pos = cursor.position() as usize;
                         if pos + bc <= payload.len() {
                             cursor.set_position((pos + bc) as u64);
                             true
-                        } else { false }
-                    } else { false }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
                 }
-                0x07 => { // TAGTYPE_BLOB
+                0x07 => {
+                    // TAGTYPE_BLOB
                     if let Ok(bl) = cursor.read_u32::<LittleEndian>() {
                         let bl = bl as usize;
                         let pos = cursor.position() as usize;
                         if bl <= 1_000_000 && pos + bl <= payload.len() {
                             cursor.set_position((pos + bl) as u64);
                             true
-                        } else { false }
-                    } else { false }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
                 }
-                0x08 => { // TAGTYPE_UINT16
+                0x08 => {
+                    // TAGTYPE_UINT16
                     if let Ok(v) = cursor.read_u16::<LittleEndian>() {
-                        if name_id == 0x02 { file_size = v as u64; }
-                        else { apply_udp_uint_tag(name_id, tag_name, v as u64, &mut rating, &mut media); }
+                        if name_id == 0x02 {
+                            file_size = v as u64;
+                        } else {
+                            apply_udp_uint_tag(
+                                name_id,
+                                tag_name,
+                                v as u64,
+                                &mut rating,
+                                &mut media,
+                            );
+                        }
                         true
-                    } else { false }
+                    } else {
+                        false
+                    }
                 }
-                0x09 => { // TAGTYPE_UINT8
+                0x09 => {
+                    // TAGTYPE_UINT8
                     if let Ok(v) = cursor.read_u8() {
-                        if name_id == 0x02 { file_size = v as u64; }
-                        else { apply_udp_uint_tag(name_id, tag_name, v as u64, &mut rating, &mut media); }
+                        if name_id == 0x02 {
+                            file_size = v as u64;
+                        } else {
+                            apply_udp_uint_tag(
+                                name_id,
+                                tag_name,
+                                v as u64,
+                                &mut rating,
+                                &mut media,
+                            );
+                        }
                         true
-                    } else { false }
+                    } else {
+                        false
+                    }
                 }
-                0x0A => { // TAGTYPE_BSOB
+                0x0A => {
+                    // TAGTYPE_BSOB
                     if let Ok(bl) = cursor.read_u8() {
                         let pos = cursor.position() as usize + bl as usize;
-                        if pos <= payload.len() { cursor.set_position(pos as u64); true }
-                        else { false }
-                    } else { false }
+                        if pos <= payload.len() {
+                            cursor.set_position(pos as u64);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
                 }
-                0x0B => { // TAGTYPE_UINT64
+                0x0B => {
+                    // TAGTYPE_UINT64
                     if let Ok(v) = cursor.read_u64::<LittleEndian>() {
-                        if name_id == 0x02 { file_size = v; }
-                        else { apply_udp_uint_tag(name_id, tag_name, v, &mut rating, &mut media); }
+                        if name_id == 0x02 {
+                            file_size = v;
+                        } else {
+                            apply_udp_uint_tag(name_id, tag_name, v, &mut rating, &mut media);
+                        }
                         true
-                    } else { false }
+                    } else {
+                        false
+                    }
                 }
-                t if (0x11..=0x20).contains(&t) => { // TAGTYPE_STR1..STR16
+                t if (0x11..=0x20).contains(&t) => {
+                    // TAGTYPE_STR1..STR16
                     let slen = (t - 0x11 + 1) as usize;
                     let mut sbuf = vec![0u8; slen];
                     if std::io::Read::read_exact(&mut cursor, &mut sbuf).is_ok() {
                         let value = String::from_utf8_lossy(&sbuf).to_string();
-                        apply_udp_string_tag(name_id, tag_name, value, &mut file_name, &mut comment, &mut media);
+                        apply_udp_string_tag(
+                            name_id,
+                            tag_name,
+                            value,
+                            &mut file_name,
+                            &mut comment,
+                            &mut media,
+                        );
                         true
-                    } else { false }
+                    } else {
+                        false
+                    }
                 }
                 _ => false,
             };
-            if !ok { tags_in_sync = false; break; }
+            if !ok {
+                tags_in_sync = false;
+                break;
+            }
         }
 
         results.push(ServerSearchResult {
@@ -932,7 +1046,11 @@ mod tests {
         let parsed = parse_server_udp_response(&packet, addr).unwrap();
         match parsed {
             ServerUdpResponse::FoundSources { files, .. } => {
-                assert_eq!(files.len(), 1, "single-file response should produce exactly one entry");
+                assert_eq!(
+                    files.len(),
+                    1,
+                    "single-file response should produce exactly one entry"
+                );
                 let (parsed_hash, sources) = &files[0];
                 assert_eq!(*parsed_hash, file_hash);
                 assert_eq!(sources[0], (Ipv4Addr::new(1, 2, 3, 4), 4662, 0));
@@ -1020,7 +1138,10 @@ mod tests {
         match parsed {
             ServerUdpResponse::FoundSources { files, .. } => {
                 assert_eq!(files.len(), 2, "both blocks must parse");
-                assert_eq!(files[1].0, hash_b, "hash starting with header bytes must parse intact");
+                assert_eq!(
+                    files[1].0, hash_b,
+                    "hash starting with header bytes must parse intact"
+                );
                 assert_eq!(files[1].1[0], (Ipv4Addr::new(9, 9, 9, 9), 4663, 0));
             }
             other => panic!("unexpected response: {other:?}"),
@@ -1054,7 +1175,13 @@ mod tests {
 
         assert!(recv_len >= 14); // 2 header + 12 payload (challenge+users+files)
         match response {
-            ServerUdpResponse::StatusResponse { challenge: parsed, user_count, file_count, obfuscation_port_tcp, .. } => {
+            ServerUdpResponse::StatusResponse {
+                challenge: parsed,
+                user_count,
+                file_count,
+                obfuscation_port_tcp,
+                ..
+            } => {
                 assert_eq!(parsed, challenge);
                 assert_eq!(user_count, 123);
                 assert_eq!(file_count, 456);
@@ -1064,4 +1191,3 @@ mod tests {
         }
     }
 }
-

@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Context;
-use ed25519_dalek::{Signer, Verifier, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -46,12 +46,9 @@ pub async fn open_and_run_friend_session(
     ed25519_pubkey: Option<[u8; 32]>,
     ed25519_secret_key: Option<[u8; 32]>,
 ) -> anyhow::Result<FriendSessionHandle> {
-    let stream = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        TcpStream::connect(addr),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("TCP connect timeout"))??;
+    let stream = tokio::time::timeout(std::time::Duration::from_secs(15), TcpStream::connect(addr))
+        .await
+        .map_err(|_| anyhow::anyhow!("TCP connect timeout"))??;
     super::multi_source::tune_peer_stream(&stream);
 
     let (raw_r, raw_w) = stream.into_split();
@@ -86,11 +83,10 @@ pub async fn open_and_run_friend_session(
     if proto != OP_EDONKEYHEADER || opcode != OP_HELLOANSWER {
         anyhow::bail!("expected HelloAnswer, got proto=0x{proto:02X} op=0x{opcode:02X}");
     }
-    let (_peer_user_hash, mut hello_caps) = parse_hello_answer(&data)
-        .map_err(|e| {
-            tracing::warn!("Failed to parse HelloAnswer from {addr}: {e}");
-            e
-        })?;
+    let (_peer_user_hash, mut hello_caps) = parse_hello_answer(&data).map_err(|e| {
+        tracing::warn!("Failed to parse HelloAnswer from {addr}: {e}");
+        e
+    })?;
 
     let pk_ref = ed25519_pubkey.as_ref();
     let emule_payload = build_emule_info(udp_port, false, Some(&our_ember_hash), pk_ref);
@@ -127,7 +123,8 @@ pub async fn open_and_run_friend_session(
     if !hello_caps.is_ember {
         anyhow::bail!("remote peer is not an Ember client");
     }
-    let peer_ember_hash = hello_caps.ember_hash
+    let peer_ember_hash = hello_caps
+        .ember_hash
         .ok_or_else(|| anyhow::anyhow!("Ember peer has no ember_hash"))?;
 
     // Early duplicate-session check. As soon as we know the peer's
@@ -150,7 +147,9 @@ pub async fn open_and_run_friend_session(
                 "Friend session for {} already exists after Ember-Hello; skipping duplicate handshake",
                 hex::encode(peer_ember_hash)
             );
-            return Ok(FriendSessionHandle { outbound_tx: existing_tx.clone() });
+            return Ok(FriendSessionHandle {
+                outbound_tx: existing_tx.clone(),
+            });
         }
     }
 
@@ -187,7 +186,16 @@ pub async fn open_and_run_friend_session(
     let ember_pop_verified = if our_have_keys {
         let our_pk = ed25519_pubkey.unwrap();
         let our_sk = ed25519_secret_key.unwrap();
-        perform_ember_auth(&mut reader, &mut writer, &our_pk, &our_sk, &peer_pk, Some(&peer_ember_hash), addr).await?;
+        perform_ember_auth(
+            &mut reader,
+            &mut writer,
+            &our_pk,
+            &our_sk,
+            &peer_pk,
+            Some(&peer_ember_hash),
+            addr,
+        )
+        .await?;
         true
     } else {
         // We can't drive the challenge-response without our own
@@ -200,7 +208,10 @@ pub async fn open_and_run_friend_session(
 
     let is_friend = friend_hashes.read().await.contains(&peer_ember_hash);
     if !is_friend {
-        anyhow::bail!("remote peer {} is not in our friend list", hex::encode(peer_ember_hash));
+        anyhow::bail!(
+            "remote peer {} is not in our friend list",
+            hex::encode(peer_ember_hash)
+        );
     }
 
     // Verification flag passed into the spawned reader task below
@@ -225,7 +236,9 @@ pub async fn open_and_run_friend_session(
                 "Friend session for {} already exists (post-auth race); skipping duplicate",
                 hex::encode(peer_ember_hash)
             );
-            return Ok(FriendSessionHandle { outbound_tx: existing_tx.clone() });
+            return Ok(FriendSessionHandle {
+                outbound_tx: existing_tx.clone(),
+            });
         }
         sessions.insert(peer_ember_hash, outbound_tx.clone());
     }
@@ -235,13 +248,17 @@ pub async fn open_and_run_friend_session(
     // otherwise the map leaks an entry whose receiver is about to
     // be dropped, and every subsequent `outbound_tx.send(...)` from
     // lookups on that hash would fail with "channel closed".
-    if let Err(e) =
-        write_packet(&mut writer, OP_EMULEPROT, OP_EMBER_FRIEND_REQ, our_nickname.as_bytes()).await
+    if let Err(e) = write_packet(
+        &mut writer,
+        OP_EMULEPROT,
+        OP_EMBER_FRIEND_REQ,
+        our_nickname.as_bytes(),
+    )
+    .await
     {
         let mut sessions = ember_sessions.write().await;
         sessions.remove(&peer_ember_hash);
-        return Err(anyhow::Error::from(e)
-            .context("failed to send OP_EMBER_FRIEND_REQ"));
+        return Err(anyhow::Error::from(e).context("failed to send OP_EMBER_FRIEND_REQ"));
     }
 
     info!("Friend session handshake with {} complete (hash={}, binding_verified={ember_hash_binding_verified})", addr, hex::encode(peer_ember_hash));
@@ -276,7 +293,8 @@ pub async fn open_and_run_friend_session(
         // stream. Spawning a reader task keeps the framing state private and
         // only surfaces whole packets (or errors) through a channel, which is
         // cancel-safe at the select! site.
-        let (pkt_tx, mut pkt_rx) = tokio::sync::mpsc::channel::<std::io::Result<(u8, u8, Vec<u8>)>>(8);
+        let (pkt_tx, mut pkt_rx) =
+            tokio::sync::mpsc::channel::<std::io::Result<(u8, u8, Vec<u8>)>>(8);
         let reader_task = tokio::spawn(async move {
             loop {
                 let res = read_packet_inner(&mut reader).await;
@@ -429,13 +447,19 @@ pub async fn open_and_run_friend_session(
             let mut sessions = session_ember_sessions.write().await;
             sessions.remove(&peer_ember_hash);
         }
-        let _ = session_ul_event_tx.send(UploadEvent {
-            transfer_id: String::new(),
-            kind: UploadEventKind::EmberFriendDisconnected {
-                ember_hash: peer_ember_hash,
-            },
-        }).await;
-        info!("Friend session to {} ({}) ended", addr, hex::encode(peer_ember_hash));
+        let _ = session_ul_event_tx
+            .send(UploadEvent {
+                transfer_id: String::new(),
+                kind: UploadEventKind::EmberFriendDisconnected {
+                    ember_hash: peer_ember_hash,
+                },
+            })
+            .await;
+        info!(
+            "Friend session to {} ({}) ended",
+            addr,
+            hex::encode(peer_ember_hash)
+        );
     });
 
     Ok(handle)
@@ -536,8 +560,8 @@ where
     let payload = build_ember_hello(our_ember_hash, our_nickname, our_pubkey);
     write_packet(writer, OP_EMULEPROT, OP_EMBER_HELLO, &payload).await?;
 
-    let deadline = tokio::time::Instant::now()
-        + std::time::Duration::from_secs(EMBER_HELLO_TIMEOUT_SECS);
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(EMBER_HELLO_TIMEOUT_SECS);
     for _ in 0..EMBER_HELLO_MAX_LOOKAHEAD {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -563,14 +587,11 @@ where
                             hello_caps.ember_pubkey = Some(pk);
                         }
                         if opcode == OP_EMBER_HELLO {
-                            let answer = build_ember_hello(our_ember_hash, our_nickname, our_pubkey);
-                            let _ = write_packet(
-                                writer,
-                                OP_EMULEPROT,
-                                OP_EMBER_HELLOANSWER,
-                                &answer,
-                            )
-                            .await;
+                            let answer =
+                                build_ember_hello(our_ember_hash, our_nickname, our_pubkey);
+                            let _ =
+                                write_packet(writer, OP_EMULEPROT, OP_EMBER_HELLOANSWER, &answer)
+                                    .await;
                         }
                     }
                     return Ok(());
@@ -710,7 +731,8 @@ where
         if derived_hash != *expected_hash {
             anyhow::bail!(
                 "Ember auth: peer pubkey does not match ember_hash (derived={}, advertised={})",
-                hex::encode(derived_hash), hex::encode(expected_hash)
+                hex::encode(derived_hash),
+                hex::encode(expected_hash)
             );
         }
     }
@@ -775,10 +797,15 @@ where
         .map_err(|e| anyhow::anyhow!("invalid peer Ed25519 pubkey: {e}"))?;
     let sig_bytes: [u8; 64] = peer_response[32..96].try_into().unwrap();
     let peer_sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-    peer_vk.verify(&our_nonce, &peer_sig)
-        .map_err(|e| anyhow::anyhow!("Ember auth: signature verification failed for {addr}: {e}"))?;
+    peer_vk.verify(&our_nonce, &peer_sig).map_err(|e| {
+        anyhow::anyhow!("Ember auth: signature verification failed for {addr}: {e}")
+    })?;
 
-    info!("Ember auth: verified peer {} at {}", hex::encode(&peer_pubkey[..8]), addr);
+    info!(
+        "Ember auth: verified peer {} at {}",
+        hex::encode(&peer_pubkey[..8]),
+        addr
+    );
     Ok(())
 }
 
@@ -867,9 +894,9 @@ where
         .map_err(|e| anyhow::anyhow!("invalid peer Ed25519 pubkey: {e}"))?;
     let sig_bytes: [u8; 64] = peer_response[32..96].try_into().unwrap();
     let peer_sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-    peer_vk
-        .verify(&our_nonce, &peer_sig)
-        .map_err(|e| anyhow::anyhow!("Ember auth: signature verification failed for {addr}: {e}"))?;
+    peer_vk.verify(&our_nonce, &peer_sig).map_err(|e| {
+        anyhow::anyhow!("Ember auth: signature verification failed for {addr}: {e}")
+    })?;
 
     info!(
         "Ember auth (buffered): verified peer {} at {} ({} deferred packet(s) captured)",

@@ -18,8 +18,12 @@ const FT_ATTRANSFERREDHI: u8 = 0x51;
 const FT_ATREQUESTED: u8 = 0x52;
 const FT_ATACCEPTED: u8 = 0x53;
 const FT_ULPRIORITY: u8 = 0x18;
-const FT_KADLASTPUBLISHSRC: u8 = 0x23;
+const FT_KADLASTPUBLISHSRC: u8 = 0x21;
 const FT_LASTSHARED: u8 = 0x24;
+// Older Ember builds accidentally wrote the source-publish timestamp with
+// eMule's `FT_DL_ACTIVE_TIME` id. Read it for migration, but write the real
+// eMule tag above.
+const FT_KADLASTPUBLISHSRC_LEGACY_EMBER: u8 = 0x23;
 
 const TAG_STRING: u8 = 0x02;
 const TAG_UINT32: u8 = 0x03;
@@ -68,7 +72,10 @@ impl KnownFileList {
         const MAX_KNOWN_MET_BYTES: u64 = 256 * 1024 * 1024;
         if let Ok(meta) = std::fs::metadata(path) {
             if meta.len() > MAX_KNOWN_MET_BYTES {
-                warn!("known.met too large ({} bytes), refusing to load", meta.len());
+                warn!(
+                    "known.met too large ({} bytes), refusing to load",
+                    meta.len()
+                );
                 return list;
             }
         }
@@ -180,10 +187,18 @@ impl KnownFileList {
                 let name_len = cursor.read_u16::<LittleEndian>()? as usize;
                 let mut name_buf = vec![0u8; name_len];
                 cursor.read_exact(&mut name_buf)?;
-                if name_len == 1 { name_buf[0] } else { 0 }
+                if name_len == 1 {
+                    name_buf[0]
+                } else {
+                    0
+                }
             };
 
-            let real_type = if tag_type & 0x80 != 0 { tag_type & 0x7F } else { tag_type };
+            let real_type = if tag_type & 0x80 != 0 {
+                tag_type & 0x7F
+            } else {
+                tag_type
+            };
             match real_type {
                 TAG_STRING => {
                     let slen = cursor.read_u16::<LittleEndian>()? as usize;
@@ -214,19 +229,26 @@ impl KnownFileList {
                                 (record.all_time_transferred & 0xFFFF_FFFF_0000_0000) | v as u64;
                         }
                         FT_ATTRANSFERREDHI => {
-                            record.all_time_transferred =
-                                (record.all_time_transferred & 0x0000_0000_FFFF_FFFF) | ((v as u64) << 32);
+                            record.all_time_transferred = (record.all_time_transferred
+                                & 0x0000_0000_FFFF_FFFF)
+                                | ((v as u64) << 32);
                         }
                         FT_ATREQUESTED => record.all_time_requested = v,
                         FT_ATACCEPTED => record.all_time_accepted = v,
                         FT_ULPRIORITY => record.upload_priority = v as u8,
-                        FT_KADLASTPUBLISHSRC => record.last_publish_src = v,
+                        FT_KADLASTPUBLISHSRC | FT_KADLASTPUBLISHSRC_LEGACY_EMBER => {
+                            record.last_publish_src = v;
+                        }
                         FT_LASTSHARED => record.last_shared = v,
                         _ => {}
                     }
                 }
-                0x08 => { cursor.read_u16::<LittleEndian>()?; }
-                0x09 => { cursor.read_u8()?; }
+                0x08 => {
+                    cursor.read_u16::<LittleEndian>()?;
+                }
+                0x09 => {
+                    cursor.read_u8()?;
+                }
                 0x0B => {
                     let v = cursor.read_u64::<LittleEndian>()?;
                     if name_id == FT_FILESIZE {
@@ -237,11 +259,17 @@ impl KnownFileList {
                     let mut skip = [0u8; 16];
                     cursor.read_exact(&mut skip)?;
                 }
-                0x04 => { cursor.read_f32::<LittleEndian>()?; }
-                0x05 => { cursor.read_u8()?; }
+                0x04 => {
+                    cursor.read_f32::<LittleEndian>()?;
+                }
+                0x05 => {
+                    cursor.read_u8()?;
+                }
                 0x07 => {
                     let blen = cursor.read_u32::<LittleEndian>()? as u64;
-                    let new_pos = cursor.position().checked_add(blen)
+                    let new_pos = cursor
+                        .position()
+                        .checked_add(blen)
                         .filter(|&p| p <= cursor.get_ref().len() as u64)
                         .ok_or_else(|| anyhow::anyhow!("blob tag length {blen} exceeds data"))?;
                     cursor.set_position(new_pos);
@@ -276,7 +304,12 @@ impl KnownFileList {
     }
 
     /// Look up a known file by path, size, and mtime to skip re-hashing.
-    pub fn find_by_path_and_meta(&self, path: &str, size: u64, mtime: i64) -> Option<&KnownFileRecord> {
+    pub fn find_by_path_and_meta(
+        &self,
+        path: &str,
+        size: u64,
+        mtime: i64,
+    ) -> Option<&KnownFileRecord> {
         if let Some(hash) = self.path_index.get(&normalize_path_key(path)) {
             if let Some(record) = self.files.get(hash) {
                 if record.file_size == size && record.modified_at == mtime {
@@ -311,15 +344,19 @@ impl KnownFileList {
     /// TODO: persist an inode/NtfsFileID discriminator alongside the record
     /// so ambiguous matches can be resolved without a rehash. Requires a
     /// known.met format-version bump (add a new tag).
-    pub fn find_by_name_and_meta(&self, name: &str, size: u64, mtime: i64) -> Option<&KnownFileRecord> {
-        let mut matches = self.files.values().filter(|r| {
-            r.file_name == name && r.file_size == size && r.modified_at == mtime
-        });
+    pub fn find_by_name_and_meta(
+        &self,
+        name: &str,
+        size: u64,
+        mtime: i64,
+    ) -> Option<&KnownFileRecord> {
+        let mut matches = self
+            .files
+            .values()
+            .filter(|r| r.file_name == name && r.file_size == size && r.modified_at == mtime);
         let first = matches.next()?;
         if matches.next().is_some() {
-            warn!(
-                "known.met: ambiguous match for {name} ({size} bytes, mtime {mtime}); rehashing"
-            );
+            warn!("known.met: ambiguous match for {name} ({size} bytes, mtime {mtime}); rehashing");
             return None;
         }
         Some(first)
@@ -393,7 +430,9 @@ impl KnownFileList {
             let new_key = normalize_path_key(&new_path);
             if let Some(&old_hash) = self.path_index.get(&new_key) {
                 if old_hash != hash {
-                    let other_refs = self.path_index.iter()
+                    let other_refs = self
+                        .path_index
+                        .iter()
                         .any(|(p, h)| *h == old_hash && *p != new_key);
                     if !other_refs {
                         self.files.remove(&old_hash);
@@ -446,11 +485,17 @@ impl KnownFileList {
     pub fn save(&mut self, path: &Path) -> anyhow::Result<()> {
         let needs_i64 = self.files.values().any(|r| r.file_size > u32::MAX as u64);
         let mut buf = Vec::new();
-        buf.write_u8(if needs_i64 { MET_HEADER_I64TAGS } else { MET_HEADER })?;
+        buf.write_u8(if needs_i64 {
+            MET_HEADER_I64TAGS
+        } else {
+            MET_HEADER
+        })?;
         buf.write_u32::<LittleEndian>(self.files.len() as u32)?;
 
         for record in self.files.values() {
-            buf.write_u32::<LittleEndian>((record.modified_at.max(0) as u64).min(u32::MAX as u64) as u32)?;
+            buf.write_u32::<LittleEndian>(
+                (record.modified_at.max(0) as u64).min(u32::MAX as u64) as u32
+            )?;
 
             buf.write_all(&record.file_hash)?;
             let part_count = record.part_hashes.len().min(u16::MAX as usize);
@@ -478,7 +523,11 @@ impl KnownFileList {
                 tag_count += 1;
             }
             if record.all_time_transferred > 0 {
-                write_u32_tag(&mut tags, FT_ATTRANSFERRED, record.all_time_transferred as u32)?;
+                write_u32_tag(
+                    &mut tags,
+                    FT_ATTRANSFERRED,
+                    record.all_time_transferred as u32,
+                )?;
                 tag_count += 1;
                 let hi = (record.all_time_transferred >> 32) as u32;
                 if hi > 0 {

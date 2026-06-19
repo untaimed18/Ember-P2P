@@ -114,10 +114,20 @@ impl DeadSourceList {
     /// Add a source to the global dead list.
     pub fn add_dead_source(&mut self, client_id: u32, ip: u32, port: u16, firewalled: bool) {
         let now = chrono::Utc::now().timestamp();
-        let block_time = if firewalled { BLOCKTIMEFW_SECS } else { BLOCKTIME_SECS };
+        let block_time = if firewalled {
+            BLOCKTIMEFW_SECS
+        } else {
+            BLOCKTIME_SECS
+        };
         let expiry = now + block_time;
 
-        let key = DeadSourceKey { client_id, ip, port, user_hash: None, kad_port: 0 };
+        let key = DeadSourceKey {
+            client_id,
+            ip,
+            port,
+            user_hash: None,
+            kad_port: 0,
+        };
         self.sources.insert(key, expiry);
 
         if now - self.last_cleanup > CLEANUP_INTERVAL_SECS {
@@ -131,7 +141,11 @@ impl DeadSourceList {
         let now = chrono::Utc::now().timestamp();
         let expiry = now + BLOCKTIME_PER_FILE_SECS;
 
-        let key = PerFileDeadKey { file_hash, ip, port };
+        let key = PerFileDeadKey {
+            file_hash,
+            ip,
+            port,
+        };
         self.per_file.insert(key, expiry);
 
         if now - self.last_cleanup > CLEANUP_INTERVAL_SECS {
@@ -145,7 +159,11 @@ impl DeadSourceList {
     /// be eligible for retry sooner than a permanent failure.
     pub fn add_transient_dead_source_for_file(&mut self, file_hash: [u8; 16], ip: u32, port: u16) {
         let now = chrono::Utc::now().timestamp();
-        let key = PerFileDeadKey { file_hash, ip, port };
+        let key = PerFileDeadKey {
+            file_hash,
+            ip,
+            port,
+        };
         let existing = self.per_file.get(&key).copied().unwrap_or(0);
         let expiry = now + BLOCKTIME_TRANSIENT_SECS;
         if expiry > existing {
@@ -164,7 +182,13 @@ impl DeadSourceList {
         if now - self.last_cleanup > CLEANUP_INTERVAL_SECS {
             self.cleanup();
         }
-        let key = DeadSourceKey { client_id, ip, port, user_hash: None, kad_port: 0 };
+        let key = DeadSourceKey {
+            client_id,
+            ip,
+            port,
+            user_hash: None,
+            kad_port: 0,
+        };
         if let Some(&expiry) = self.sources.get(&key) {
             now < expiry
         } else {
@@ -183,7 +207,11 @@ impl DeadSourceList {
             return true;
         }
         let now = chrono::Utc::now().timestamp();
-        let key = PerFileDeadKey { file_hash: *file_hash, ip, port };
+        let key = PerFileDeadKey {
+            file_hash: *file_hash,
+            ip,
+            port,
+        };
         if let Some(&expiry) = self.per_file.get(&key) {
             now < expiry
         } else {
@@ -212,13 +240,23 @@ impl DeadSourceList {
     }
 
     pub fn remove(&mut self, client_id: u32, ip: u32, port: u16) {
-        let key = DeadSourceKey { client_id, ip, port, user_hash: None, kad_port: 0 };
+        let key = DeadSourceKey {
+            client_id,
+            ip,
+            port,
+            user_hash: None,
+            kad_port: 0,
+        };
         self.sources.remove(&key);
     }
 
     /// Remove a source from the per-file dead list (e.g. on successful download).
     pub fn remove_for_file(&mut self, file_hash: &[u8; 16], ip: u32, port: u16) {
-        let key = PerFileDeadKey { file_hash: *file_hash, ip, port };
+        let key = PerFileDeadKey {
+            file_hash: *file_hash,
+            ip,
+            port,
+        };
         self.per_file.remove(&key);
     }
 }
@@ -227,7 +265,9 @@ impl DeadSourceList {
 mod tests {
     use super::*;
 
-    fn file_hash(b: u8) -> [u8; 16] { [b; 16] }
+    fn file_hash(b: u8) -> [u8; 16] {
+        [b; 16]
+    }
 
     /// L6: a freshly added source is seen as dead until its window expires.
     #[test]
