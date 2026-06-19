@@ -2212,6 +2212,59 @@ fn check_disk_space(download_dir: &std::path::Path, needed_bytes: u64) -> bool {
     }
 }
 
+async fn save_registered_part_tracker(state: &NetworkState, transfer_id: &str, reason: &str) {
+    let tracker = match state.tracker_registry.lock() {
+        Ok(reg) => reg.get(transfer_id).cloned(),
+        Err(poisoned) => poisoned.into_inner().get(transfer_id).cloned(),
+    };
+
+    let Some(tracker) = tracker else {
+        return;
+    };
+
+    let read_result = tokio::time::timeout(std::time::Duration::from_secs(2), tracker.read()).await;
+    match read_result {
+        Ok(guard) => {
+            guard.save();
+            debug!("Saved .part.met for {transfer_id} during {reason}");
+        }
+        Err(_) => {
+            warn!("Timed out saving .part.met for {transfer_id} during {reason}");
+        }
+    }
+}
+
+async fn mark_download_insufficient(
+    transfer_manager: &Arc<RwLock<TransferManager>>,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    transfer_id: &str,
+    file_name: &str,
+) {
+    {
+        let mut mgr = transfer_manager.write().await;
+        mgr.update_status(transfer_id, TransferStatus::Insufficient);
+        mgr.set_failure_context(
+            transfer_id,
+            Some("Insufficient disk space".to_string()),
+            Some("insufficient_disk".to_string()),
+            Some("disk_space".to_string()),
+        );
+    }
+    if let Err(e) = db.update_transfer_status(transfer_id, "insufficient") {
+        warn!("DB update_transfer_status('insufficient') failed for {transfer_id}: {e}");
+    }
+    let _ = app_handle.emit(
+        "transfer-status",
+        serde_json::json!({
+            "id": transfer_id,
+            "status": "insufficient",
+            "error": "Insufficient disk space",
+            "file_name": file_name,
+        }),
+    );
+}
+
 struct PendingKeywordSearch {
     tx: oneshot::Sender<Vec<SearchResult>>,
     local_results: Vec<SearchResult>,
@@ -3626,7 +3679,8 @@ async fn upload_queue_snapshot(
     // upload server's mutex while we're awaiting other RwLocks (which
     // could otherwise deadlock against `start_uploading_to_peer`).
     let queue_snapshot: Vec<ed2k::upload::QueueEntry> = {
-        let q = queue.lock().await;
+        let mut q = queue.lock().await;
+        q.retain(|e| e.join_time.elapsed().as_secs() < ed2k::upload::MAX_PURGEQUEUETIME_SECS);
         q.clone()
     };
     if queue_snapshot.is_empty() {
@@ -3714,7 +3768,16 @@ async fn upload_queue_snapshot(
         } else {
             hex::encode(entry.user_hash)
         };
-        let is_friend = entry.user_hash != [0u8; 16] && friends.contains(&entry.user_hash);
+        let is_friend = entry
+            .ember_pubkey
+            .filter(|_| entry.ember_verified)
+            .map(|pk| {
+                let hash = blake3::hash(&pk);
+                let mut ember_id = [0u8; 16];
+                ember_id.copy_from_slice(&hash.as_bytes()[..16]);
+                friends.contains(&ember_id)
+            })
+            .unwrap_or(false);
 
         out.push(crate::types::UploadQueueClient {
             user_hash: user_hash_hex,
@@ -5545,6 +5608,7 @@ pub async fn start_network(
                                 &active_port_tests,
                                 &upload_queue_handle,
                                 &credit_manager,
+                                &transfer_manager,
                             ).await;
                         }
                     }
@@ -5584,6 +5648,7 @@ pub async fn start_network(
                                     &active_port_tests,
                                     &upload_queue_handle,
                                     &credit_manager,
+                                    &transfer_manager,
                                 ).await;
                             }
                         }
@@ -6048,7 +6113,9 @@ pub async fn start_network(
                         let mgr = transfer_manager.read().await;
                         mgr.is_control_cancelled(transfer_id)
                     };
-                    if !is_user_cancel {
+                    let is_terminal_final_hash_failure = *failure_kind == SourceFailureKind::Permanent
+                        && error.to_lowercase().contains("final hash verification failed");
+                    if !is_user_cancel && !is_terminal_final_hash_failure {
                         let transfer_info = {
                             let mgr = transfer_manager.read().await;
                             mgr.get_transfer(transfer_id).cloned()
@@ -6096,6 +6163,9 @@ pub async fn start_network(
                                 priority: priority_str_to_u32(&t.priority),
                             });
                             info!("Re-queued failed download {} for source retry: {}", transfer_id, error);
+                            if let Err(e) = db.update_transfer_status(transfer_id, "searching") {
+                                warn!("DB update_transfer_status('searching') failed for {transfer_id}: {e}");
+                            }
 
                             // Attempt archive recovery if we have significant progress on an archive file
                             let ext = std::path::Path::new(&t.file_name)
@@ -11173,6 +11243,7 @@ pub async fn start_network(
                 }
 
                 let mut to_retry: Vec<(String, u32)> = Vec::new();
+                let mut insufficient_downloads: Vec<(String, String)> = Vec::new();
 
                 let dl_dir = PathBuf::from(&settings.download_folder);
                 for (tid, pd) in &state.pending_downloads {
@@ -11181,12 +11252,24 @@ pub async fn start_network(
                     }
                     if !check_disk_space(&dl_dir, pd.file_size) {
                         debug!("Skipping source retry for {} ({}): insufficient disk space", tid, pd.file_name);
+                        insufficient_downloads.push((tid.clone(), pd.file_name.clone()));
                         continue;
                     }
                     let retry_interval = pending_download_retry_interval(pd.search_count);
                     if now.saturating_sub(pd.last_search_at) >= retry_interval {
                         to_retry.push((tid.clone(), pd.priority));
                     }
+                }
+                for (tid, file_name) in insufficient_downloads {
+                    state.pending_downloads.remove(&tid);
+                    mark_download_insufficient(
+                        &transfer_manager,
+                        &db,
+                        &app_handle,
+                        &tid,
+                        &file_name,
+                    )
+                    .await;
                 }
 
                 // High-priority downloads get processed first
@@ -11301,7 +11384,14 @@ pub async fn start_network(
                         let dl_dir = PathBuf::from(&settings.download_folder);
                         if !check_disk_space(&dl_dir, pending.file_size) {
                             warn!("Skipping download {} ({}): insufficient disk space", tid, pending.file_name);
-                            state.pending_downloads.insert(tid.clone(), pending);
+                            mark_download_insufficient(
+                                &transfer_manager,
+                                &db,
+                                &app_handle,
+                                tid,
+                                &pending.file_name,
+                            )
+                            .await;
                             continue;
                         }
                         let source_count = ready_sources.len() as u32;
@@ -11449,7 +11539,14 @@ pub async fn start_network(
                         let dl_dir = PathBuf::from(&settings.download_folder);
                         if !check_disk_space(&dl_dir, pending.file_size) {
                             warn!("Skipping download {} ({}): insufficient disk space", tid, pending.file_name);
-                            state.pending_downloads.insert(tid.clone(), pending);
+                            mark_download_insufficient(
+                                &transfer_manager,
+                                &db,
+                                &app_handle,
+                                tid,
+                                &pending.file_name,
+                            )
+                            .await;
                             continue;
                         }
                         let source_count = live_sources.len() as u32;
@@ -16305,6 +16402,7 @@ async fn handle_udp_packet(
     active_port_tests: &Arc<tokio::sync::Mutex<HashMap<std::net::IpAddr, mpsc::Sender<()>>>>,
     upload_queue: &ed2k::upload::UploadQueueRef,
     credit_manager: &Arc<RwLock<CreditManager>>,
+    transfer_manager: &Arc<RwLock<TransferManager>>,
 ) {
     if let Err(p) = std::panic::AssertUnwindSafe(handle_udp_packet_inner(
         socket,
@@ -16318,6 +16416,7 @@ async fn handle_udp_packet(
         active_port_tests,
         upload_queue,
         credit_manager,
+        transfer_manager,
     ))
     .catch_unwind()
     .await
@@ -16342,6 +16441,7 @@ async fn handle_udp_packet_inner(
     active_port_tests: &Arc<tokio::sync::Mutex<HashMap<std::net::IpAddr, mpsc::Sender<()>>>>,
     upload_queue: &ed2k::upload::UploadQueueRef,
     credit_manager: &Arc<RwLock<CreditManager>>,
+    transfer_manager: &Arc<RwLock<TransferManager>>,
 ) {
     // Reject oversized packets (max 64 KiB for UDP)
     if data.len() > 65535 {
@@ -16448,6 +16548,20 @@ async fn handle_udp_packet_inner(
                 let has_file = {
                     let idx = local_index.read().await;
                     idx.get_by_hash(&hash_hex).is_some()
+                } || {
+                    let mgr = transfer_manager.read().await;
+                    mgr.active.values().chain(mgr.queue.iter()).any(|t| {
+                        t.direction == TransferDirection::Download
+                            && t.file_hash == hash_hex
+                            && !matches!(
+                                t.status,
+                                TransferStatus::Completed | TransferStatus::Failed
+                            )
+                            && PathBuf::from(&settings.download_folder)
+                                .join("Temp")
+                                .join(format!("{}.part", t.id))
+                                .exists()
+                    })
                 };
 
                 if has_file {
@@ -19059,13 +19173,7 @@ async fn handle_command_inner(
             if let Some(handle) = state.download_handles.remove(&transfer_id) {
                 if cleanup_ack.is_none() {
                     // Stop path: preserve .part.met for resume
-                    if let Ok(reg) = state.tracker_registry.lock() {
-                        if let Some(tracker) = reg.get(&transfer_id) {
-                            if let Ok(t) = tracker.try_read() {
-                                t.save();
-                            }
-                        }
-                    }
+                    save_registered_part_tracker(&state, &transfer_id, "cancel/stop").await;
                 }
                 handle.abort();
                 // Bounded wait: abort() cannot interrupt a task parked in
@@ -19136,13 +19244,7 @@ async fn handle_command_inner(
             // eMule PauseFile: tear down active network state but keep source
             // knowledge so the download can be resumed quickly.
             if let Some(handle) = state.download_handles.remove(&transfer_id) {
-                if let Ok(reg) = state.tracker_registry.lock() {
-                    if let Some(tracker) = reg.get(&transfer_id) {
-                        if let Ok(t) = tracker.try_read() {
-                            t.save();
-                        }
-                    }
-                }
+                save_registered_part_tracker(&state, &transfer_id, "pause").await;
                 handle.abort();
             }
             // Drop KAD-callback placeholder timestamps: the manager
@@ -20450,13 +20552,15 @@ async fn handle_command_inner(
             // is logically disconnected.  Re-queue each as a pending download
             // so they resume automatically when the user reconnects.
             // Save .part.met for in-progress downloads before aborting tasks.
-            if let Ok(reg) = state.tracker_registry.lock() {
-                for (tid, tracker) in reg.iter() {
-                    if let Ok(t) = tracker.try_read() {
-                        t.save();
-                        debug!("Saved .part.met for {tid} before disconnect abort");
-                    }
-                }
+            // Snapshot tracker handles first, then await each lock with a
+            // short bound so a mid-write tracker doesn't silently miss its
+            // resume metadata.
+            let disconnect_trackers: Vec<String> = match state.tracker_registry.lock() {
+                Ok(reg) => reg.keys().cloned().collect(),
+                Err(poisoned) => poisoned.into_inner().keys().cloned().collect(),
+            };
+            for tid in disconnect_trackers {
+                save_registered_part_tracker(&state, &tid, "disconnect").await;
             }
 
             // Cancel each active download's control BEFORE aborting its worker
@@ -22346,7 +22450,8 @@ async fn handle_download_event(
         } => {
             let source_status = match status.as_str() {
                 "connecting" => crate::types::SourceStatus::Connecting,
-                "wait_callback" => crate::types::SourceStatus::WaitCallback,
+                "wait_callback" | "wait_callback_kad" => crate::types::SourceStatus::WaitCallback,
+                "stalled" => crate::types::SourceStatus::Stalled,
                 "queued" => crate::types::SourceStatus::Queued,
                 "queue_full" => crate::types::SourceStatus::QueueFull,
                 "no_needed_parts" => crate::types::SourceStatus::NoNeededParts,

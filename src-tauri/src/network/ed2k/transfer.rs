@@ -3787,71 +3787,21 @@ impl Ed2kDownload {
             })
             .await;
 
-        // Verify the final file hash BEFORE moving the .part file.
-        // Fast path: if all parts were individually hash-verified during download,
-        // compute the file hash from the known part hashes (no disk I/O needed).
-        // Fallback: re-read the entire file from disk.
-        //
-        // The `all_parts_verified()` gate is load-bearing, not just an
-        // optimization guard: `ed2k_hash_from_parts` derives the hash from the
-        // (hashset-verified) part hashes, so it always equals `file_hash` and
-        // never reads the disk. Without the gate, a part that is complete-but-
-        // unverified (e.g. loaded from a resumed `.part`, or filled without a
-        // per-part MD4 check) would be published as verified. When any part is
-        // unverified we fall through to the full on-disk re-read instead.
+        // Verify the final file hash BEFORE moving the .part file. Always
+        // re-read the bytes on disk: a hash derived from known part hashes
+        // cannot detect metadata/data divergence after a crash or external
+        // Temp-file write.
         let expected_hash = hex::encode(self.file_hash);
-        let num_parts =
-            ((self.file_size + super::hash::PARTSIZE - 1) / super::hash::PARTSIZE) as usize;
-        let can_use_fast_verify = self.file_size >= super::hash::PARTSIZE
-            && !part_hashes.is_empty()
-            && part_hashes.len() >= num_parts
-            && tracker.all_parts_verified();
-
-        let verified_ok = if can_use_fast_verify {
-            let actual_hash = super::hash::ed2k_hash_from_parts(&part_hashes, self.file_size);
-            if actual_hash == expected_hash {
-                info!(
-                    "Download verified from part hashes (no re-read): {}",
-                    self.file_name
-                );
-                true
-            } else {
-                warn!(
-                    "Download hash mismatch for {} (from parts): expected={}, got={} — falling back to full rehash",
-                    self.file_name, expected_hash, actual_hash
-                );
-                let verify_path = part_path.clone();
-                match tokio::task::spawn_blocking(move || super::hash::ed2k_hash_file(&verify_path))
-                    .await
-                {
-                    Ok(Ok(h)) if h == expected_hash => {
-                        info!("Full rehash matched for {}", self.file_name);
-                        true
-                    }
-                    Ok(Ok(h)) => {
-                        warn!(
-                            "Full rehash also mismatched for {}: got={}",
-                            self.file_name, h
-                        );
-                        false
-                    }
-                    Ok(Err(e)) => {
-                        warn!("Full rehash failed for {}: {e}", self.file_name);
-                        false
-                    }
-                    Err(e) => {
-                        warn!("Full rehash task failed for {}: {e}", self.file_name);
-                        false
-                    }
-                }
-            }
-        } else {
-            let verify_path = part_path.clone();
+        let verify_path = part_path.clone();
+        let verified_ok =
             match tokio::task::spawn_blocking(move || super::hash::ed2k_hash_file(&verify_path))
                 .await
             {
                 Ok(Ok(actual_hash)) if actual_hash == expected_hash => {
-                    info!("Download complete and verified: {}", self.file_name);
+                    info!(
+                        "Download complete and verified from disk: {}",
+                        self.file_name
+                    );
                     true
                 }
                 Ok(Ok(actual_hash)) => {
@@ -3875,8 +3825,7 @@ impl Ed2kDownload {
                     );
                     false
                 }
-            }
-        };
+            };
 
         if !verified_ok {
             for i in 0..tracker.part_count {

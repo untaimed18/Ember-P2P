@@ -15,38 +15,6 @@ pub const PARTSIZE: u64 = 9_728_000;
 
 const HASH_BUF_SIZE: usize = 1024 * 1024;
 
-/// Compute the ed2k file hash from already-verified part hashes, avoiding
-/// a full re-read of the file. This is valid because the ed2k file hash for
-/// files >= PARTSIZE is defined as MD4(part_hash_1 || ... || part_hash_n [|| MD4("")]).
-/// Each part was already individually MD4-verified during download, so we can
-/// combine them in memory instead of re-reading gigabytes from disk.
-pub fn ed2k_hash_from_parts(part_hashes: &[[u8; 16]], file_size: u64) -> String {
-    // A zero-byte file's ed2k hash is MD4("") directly — NOT a hash-of-hashes.
-    // (`0 % PARTSIZE == 0` would otherwise append MD4("") and hash that,
-    // yielding MD4(MD4("")), which is wrong and breaks interop for empty files.)
-    if file_size == 0 {
-        return hex::encode(Md4::digest([]));
-    }
-    // A single-part file (< PARTSIZE) has exactly one part whose MD4 *is* the
-    // file hash; combining would double-hash it. Callers currently gate this
-    // function on `file_size >= PARTSIZE`, but keep it correct by contract.
-    if file_size < PARTSIZE {
-        return match part_hashes.first() {
-            Some(h) => hex::encode(h),
-            None => hex::encode(Md4::digest([])),
-        };
-    }
-    let mut chunk_hashes = Vec::with_capacity((part_hashes.len() + 1) * 16);
-    for h in part_hashes {
-        chunk_hashes.extend_from_slice(h);
-    }
-    if file_size % PARTSIZE == 0 {
-        let empty_hash = Md4::digest([]);
-        chunk_hashes.extend_from_slice(&empty_hash);
-    }
-    hex::encode(Md4::digest(&chunk_hashes))
-}
-
 /// Non-cancellable version used by download verification (transfer.rs, multi_source.rs).
 pub fn ed2k_hash_file(path: &Path) -> anyhow::Result<String> {
     static NEVER: AtomicBool = AtomicBool::new(false);
