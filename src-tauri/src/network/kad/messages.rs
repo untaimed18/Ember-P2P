@@ -138,6 +138,14 @@ pub enum KadMessage {
     PublishRes {
         target: KadId,
         load: u8,
+        /// Set when the sender included the optional trailing options byte
+        /// with bit0 set, i.e. it explicitly requested a
+        /// `KADEMLIA2_PUBLISH_RES_ACK`. eMule documents this byte as "for
+        /// future use" and never sets it, and we never set it on our own
+        /// outgoing `PublishRes`, so the encoder ignores this field (eMule's
+        /// storage-node response is always a bare 17-byte target+load). It is
+        /// only consulted on the decode/handler path to decide whether to ack.
+        request_ack: bool,
     },
     PublishResAck,
     Ping,
@@ -441,7 +449,18 @@ fn decode_message(opcode: u8, cursor: &mut Cursor<&[u8]>) -> io::Result<KadMessa
         KADEMLIA2_PUBLISH_RES => {
             let target = KadId::read_from(cursor)?;
             let load = cursor.read_u8()?;
-            Ok(KadMessage::PublishRes { target, load })
+            // Optional trailing options byte (eMule `Process_KADEMLIA2_PUBLISH_RES`,
+            // "for future use"): bit0 requests a KADEMLIA2_PUBLISH_RES_ACK.
+            let request_ack = if cursor.position() < cursor.get_ref().len() as u64 {
+                (cursor.read_u8().unwrap_or(0) & 0x01) != 0
+            } else {
+                false
+            };
+            Ok(KadMessage::PublishRes {
+                target,
+                load,
+                request_ack,
+            })
         }
 
         KADEMLIA2_SEARCH_NOTES_REQ => {
@@ -587,7 +606,11 @@ fn decode_message(opcode: u8, cursor: &mut Cursor<&[u8]>) -> io::Result<KadMessa
 
         KADEMLIA_PUBLISH_RES_OLD => {
             let target = KadId::read_from(cursor)?;
-            Ok(KadMessage::PublishRes { target, load: 0 })
+            Ok(KadMessage::PublishRes {
+                target,
+                load: 0,
+                request_ack: false,
+            })
         }
 
         KADEMLIA_HELLO_REQ_OLD
@@ -780,10 +803,13 @@ fn encode_message(msg: &KadMessage, out: &mut Vec<u8>) -> io::Result<()> {
             write_tag_list(out, tags)?;
         }
 
-        KadMessage::PublishRes { target, load } => {
+        KadMessage::PublishRes { target, load, .. } => {
             out.write_u8(KADEMLIA2_PUBLISH_RES)?;
             target.write_to(out)?;
             out.write_u8(*load)?;
+            // No trailing options byte: like eMule's storage-node response
+            // this is always a bare 17-byte target+load and never requests an
+            // ack (`request_ack` is decode-only).
         }
 
         KadMessage::SearchNotesReq { target, file_size } => {
@@ -1235,5 +1261,82 @@ mod search_expr_tests {
             "expected at least 3 AND joints, got {and_pairs}"
         );
         assert!(!out.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod publish_res_tests {
+    use super::*;
+
+    #[test]
+    fn encoded_publish_res_is_bare_target_load() {
+        // Our outgoing PublishRes never carries the optional options byte:
+        // header + opcode + 16-byte target + 1-byte load = 19 bytes on the
+        // wire (eMule's storage-node response is the equivalent 17-byte body).
+        let msg = KadMessage::PublishRes {
+            target: KadId([0x33; 16]),
+            load: 42,
+            request_ack: true, // must be ignored by the encoder
+        };
+        let bytes = encode_packet(&msg).unwrap();
+        assert_eq!(bytes.len(), 1 + 1 + 16 + 1);
+        assert_eq!(bytes[0], OP_KADEMLIAHEADER);
+        assert_eq!(bytes[1], KADEMLIA2_PUBLISH_RES);
+    }
+
+    #[test]
+    fn publish_res_without_options_byte_does_not_request_ack() {
+        let msg = KadMessage::PublishRes {
+            target: KadId([0x33; 16]),
+            load: 42,
+            request_ack: false,
+        };
+        let bytes = encode_packet(&msg).unwrap();
+        match decode_packet(&bytes).unwrap() {
+            KadMessage::PublishRes {
+                target,
+                load,
+                request_ack,
+            } => {
+                assert_eq!(target, KadId([0x33; 16]));
+                assert_eq!(load, 42);
+                assert!(!request_ack, "no trailing options byte => no ack request");
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn publish_res_options_bit0_requests_ack() {
+        // eMule peers may append an options byte; bit0 requests a
+        // KADEMLIA2_PUBLISH_RES_ACK.
+        let mut bytes = encode_packet(&KadMessage::PublishRes {
+            target: KadId([0x44; 16]),
+            load: 7,
+            request_ack: false,
+        })
+        .unwrap();
+        bytes.push(0x01); // options byte, bit0 set
+        match decode_packet(&bytes).unwrap() {
+            KadMessage::PublishRes { request_ack, .. } => {
+                assert!(request_ack, "options bit0 must request an ack");
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+
+        // bit0 clear => still no ack.
+        let mut bytes = encode_packet(&KadMessage::PublishRes {
+            target: KadId([0x44; 16]),
+            load: 7,
+            request_ack: false,
+        })
+        .unwrap();
+        bytes.push(0x02); // some other (non-ack) option bit
+        match decode_packet(&bytes).unwrap() {
+            KadMessage::PublishRes { request_ack, .. } => {
+                assert!(!request_ack, "options without bit0 must not request an ack");
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
     }
 }

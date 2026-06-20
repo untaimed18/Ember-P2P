@@ -537,6 +537,13 @@ pub enum TagValue {
     Float32(f32),
     Bool(bool),
     Blob(Vec<u8>),
+    /// Small binary blob (eMule `TAGTYPE_BSOB`: a single `u8` length prefix
+    /// followed by up to 255 payload bytes). eMule's KAD tag reader
+    /// (`CDataIO::ReadTag`) accepts `BSOB` but throws on the larger `BLOB`
+    /// type, discarding the *entire* tag list. Any small binary value that
+    /// must survive on the vanilla-eMule KAD wire (e.g. the Ember Noise
+    /// pubkey) therefore has to be carried as `Bsob`, never `Blob`.
+    Bsob(Vec<u8>),
 }
 
 #[derive(Debug, Clone)]
@@ -631,7 +638,7 @@ impl KadTag {
                 let len = reader.read_u8()? as usize;
                 let mut buf = vec![0u8; len];
                 reader.read_exact(&mut buf)?;
-                TagValue::Blob(buf)
+                TagValue::Bsob(buf)
             }
             t if (TAGTYPE_STR1..=TAGTYPE_STR22).contains(&t) => {
                 let len = (t - TAGTYPE_STR1 + 1) as usize;
@@ -653,14 +660,18 @@ impl KadTag {
     pub fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         let type_byte = match &self.value {
             TagValue::Hash(_) => TAGTYPE_HASH,
-            TagValue::String(s) => {
-                let len = s.len();
-                if (1..=16).contains(&len) {
-                    TAGTYPE_STR1 + len as u8 - 1
-                } else {
-                    TAGTYPE_STRING
-                }
-            }
+            // KAD strings are ALWAYS serialised as `TAGTYPE_STRING` with a
+            // `u16` length prefix. eMule's KAD `CDataIO::ReadTag`
+            // (kademlia/io/DataIO.cpp) only accepts `TAGTYPE_STRING`,
+            // integer types, float, hash and `BSOB`; the compact
+            // `TAGTYPE_STR1..STR16` forms (which exist in the *ed2k*
+            // client-tag serialiser) are unknown to it and make the whole
+            // tag list throw, so a single short string value (e.g. a file
+            // type like "Audio") would silently drop the entire publish /
+            // search-result packet on a vanilla eMule peer. We still *read*
+            // the STRn forms below for backward compatibility with our own
+            // older publishes and other Ember peers.
+            TagValue::String(_) => TAGTYPE_STRING,
             TagValue::Uint64(_) => TAGTYPE_UINT64,
             TagValue::Uint32(_) => TAGTYPE_UINT32,
             TagValue::Uint16(_) => TAGTYPE_UINT16,
@@ -668,6 +679,7 @@ impl KadTag {
             TagValue::Float32(_) => TAGTYPE_FLOAT32,
             TagValue::Bool(_) => TAGTYPE_BOOL,
             TagValue::Blob(_) => TAGTYPE_BLOB,
+            TagValue::Bsob(_) => TAGTYPE_BSOB,
         };
 
         // eMule `CDataIO::WriteTag` (kademlia/io/DataIO.cpp:300-304):
@@ -711,21 +723,18 @@ impl KadTag {
         match &self.value {
             TagValue::Hash(h) => writer.write_all(h)?,
             TagValue::String(s) => {
-                let len = s.len();
-                if !(1..=16).contains(&len) {
-                    // K23: same reasoning as above for string value
-                    // payloads — never silently truncate.
-                    let wire_len = u16::try_from(len).map_err(|_| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!("tag string value exceeds u16::MAX bytes ({len})"),
-                        )
-                    })?;
-                    writer.write_u16::<LittleEndian>(wire_len)?;
-                    writer.write_all(s.as_bytes())?;
-                } else {
-                    writer.write_all(s.as_bytes())?;
-                }
+                // Always `u16` length + raw UTF-8 bytes (TAGTYPE_STRING),
+                // matching eMule's KAD `CDataIO::ReadStringUTF8`. K23: never
+                // silently truncate a value longer than u16::MAX — surface
+                // it as an error at the source instead.
+                let wire_len = u16::try_from(s.len()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("tag string value exceeds u16::MAX bytes ({})", s.len()),
+                    )
+                })?;
+                writer.write_u16::<LittleEndian>(wire_len)?;
+                writer.write_all(s.as_bytes())?;
             }
             TagValue::Uint64(v) => writer.write_u64::<LittleEndian>(*v)?,
             TagValue::Uint32(v) => writer.write_u32::<LittleEndian>(*v)?,
@@ -735,6 +744,20 @@ impl KadTag {
             TagValue::Bool(v) => writer.write_u8(if *v { 1 } else { 0 })?,
             TagValue::Blob(b) => {
                 writer.write_u32::<LittleEndian>(b.len() as u32)?;
+                writer.write_all(b)?;
+            }
+            TagValue::Bsob(b) => {
+                // eMule `TAGTYPE_BSOB`: a single u8 length prefix then the
+                // payload (≤255 bytes). Longer values cannot be represented
+                // in this type and are surfaced as an error rather than
+                // truncated.
+                let len = u8::try_from(b.len()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("BSOB tag value exceeds u8::MAX bytes ({})", b.len()),
+                    )
+                })?;
+                writer.write_u8(len)?;
                 writer.write_all(b)?;
             }
         }
@@ -785,12 +808,30 @@ impl KadTag {
     }
 
     /// Borrow the tag's payload as a byte blob. Returns `None` for any
-    /// non-`Blob` value type. Used by the Ember Noise-pubkey publish
-    /// path (see `kad::publish::EMBER_NOISE_PUB_TAG`) where the wire
-    /// payload is a raw 32-byte X25519 key carried as `TAGTYPE_BLOB`.
+    /// non-blob value type. Used by the Ember Noise-pubkey publish path
+    /// (see `kad::publish::EMBER_NOISE_PUB_TAG`) where the wire payload is a
+    /// raw 32-byte X25519 key. Accepts both `BLOB` (legacy Ember publishes)
+    /// and `BSOB` (the eMule-compatible encoding we now emit) so the key
+    /// round-trips regardless of which type a peer used on the wire.
     pub fn blob_value(&self) -> Option<&[u8]> {
         match &self.value {
-            TagValue::Blob(b) => Some(b.as_slice()),
+            TagValue::Blob(b) | TagValue::Bsob(b) => Some(b.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// Best-effort unsigned-integer extraction across every integer tag
+    /// width. Mirrors eMule's type-agnostic `CKadTag::GetInt()`: a value
+    /// such as `TAG_SOURCEPORT` may legitimately arrive encoded as any of
+    /// the `UINT8/16/32/64` types depending on the publisher's serialiser,
+    /// so callers that only care about the numeric value should use this
+    /// rather than a single fixed-width accessor.
+    pub fn as_uint(&self) -> Option<u64> {
+        match &self.value {
+            TagValue::Uint8(v) => Some(*v as u64),
+            TagValue::Uint16(v) => Some(*v as u64),
+            TagValue::Uint32(v) => Some(*v as u64),
+            TagValue::Uint64(v) => Some(*v),
             _ => None,
         }
     }
@@ -914,6 +955,84 @@ mod kad_tag_wire_layout_tests {
         assert_eq!(parsed[2].uint8_value(), Some(1));
         assert_eq!(parsed[3].uint64_value(), Some(1_234_567_890));
         assert_eq!(parsed[4].uint8_value(), Some(0x0C));
+    }
+
+    /// Short string values must serialise as `TAGTYPE_STRING` (u16 length +
+    /// bytes), never the compact `TAGTYPE_STR1..STR16` forms that eMule's KAD
+    /// tag reader rejects.
+    #[test]
+    fn short_string_tag_uses_tagtype_string_not_strn() {
+        let tag = KadTag {
+            name: TagName::Id(TAG_FILETYPE),
+            value: TagValue::String("Pro".to_string()), // 3 bytes -> would be STR3
+        };
+        let mut buf = Vec::new();
+        tag.write_to(&mut buf).unwrap();
+
+        assert_eq!(buf[0], TAGTYPE_STRING, "must use TAGTYPE_STRING");
+        // name: u16 length (1) + the single id byte.
+        assert_eq!(&buf[1..3], &[1, 0]);
+        assert_eq!(buf[3], TAG_FILETYPE);
+        // value: u16 length (3) + raw bytes.
+        assert_eq!(&buf[4..6], &[3, 0]);
+        assert_eq!(&buf[6..9], b"Pro");
+
+        let mut cursor = std::io::Cursor::new(&buf);
+        let parsed = KadTag::read_from(&mut cursor).unwrap();
+        assert_eq!(parsed.string_value(), Some("Pro"));
+    }
+
+    /// The compact STRn forms must still *decode* (legacy Ember publishes /
+    /// other Ember peers), even though we never write them anymore.
+    #[test]
+    fn legacy_strn_tag_still_decodes() {
+        // [type=STR3][name u16=1][id][3 bytes]
+        let mut buf = vec![TAGTYPE_STR1 + 2];
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.push(TAG_FILETYPE);
+        buf.extend_from_slice(b"Pro");
+        let mut cursor = std::io::Cursor::new(&buf);
+        let parsed = KadTag::read_from(&mut cursor).unwrap();
+        assert_eq!(parsed.string_value(), Some("Pro"));
+    }
+
+    /// A `Bsob` value serialises as eMule's `TAGTYPE_BSOB` (u8 length) and
+    /// round-trips back through `blob_value()`.
+    #[test]
+    fn bsob_tag_uses_tagtype_bsob_and_roundtrips() {
+        let payload = vec![0xABu8; 32];
+        let tag = KadTag {
+            name: TagName::Str("ember_npub".to_string()),
+            value: TagValue::Bsob(payload.clone()),
+        };
+        let mut buf = Vec::new();
+        tag.write_to(&mut buf).unwrap();
+        assert_eq!(buf[0], TAGTYPE_BSOB, "must use TAGTYPE_BSOB, not BLOB");
+
+        let mut cursor = std::io::Cursor::new(&buf);
+        let parsed = KadTag::read_from(&mut cursor).unwrap();
+        assert!(
+            matches!(parsed.value, TagValue::Bsob(_)),
+            "BSOB must decode to Bsob"
+        );
+        assert_eq!(parsed.blob_value(), Some(payload.as_slice()));
+    }
+
+    /// `blob_value()` accepts both `Blob` (legacy) and `Bsob` (current) so a
+    /// Noise pubkey survives regardless of which wire type a peer used.
+    #[test]
+    fn blob_value_accepts_blob_and_bsob() {
+        let bytes = vec![1u8, 2, 3, 4];
+        let blob = KadTag {
+            name: TagName::Id(1),
+            value: TagValue::Blob(bytes.clone()),
+        };
+        let bsob = KadTag {
+            name: TagName::Id(1),
+            value: TagValue::Bsob(bytes.clone()),
+        };
+        assert_eq!(blob.blob_value(), Some(bytes.as_slice()));
+        assert_eq!(bsob.blob_value(), Some(bytes.as_slice()));
     }
 }
 
