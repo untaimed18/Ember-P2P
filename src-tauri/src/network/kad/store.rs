@@ -112,6 +112,26 @@ impl DhtStore {
         sender_ip: std::net::Ipv4Addr,
         sender_port: u16,
     ) -> u8 {
+        // eMule `Process_KADEMLIA2_PUBLISH_SOURCE_REQ` + `CIndexed::AddSources`
+        // only index a source once it forms a usable record: it must carry a
+        // `TAG_SOURCETYPE` (which sets eMule's `m_bSource`) and a non-zero TCP
+        // port (`TAG_SOURCEPORT`, eMule's `m_uTCPPort`). Records missing either
+        // are dropped by eMule, so storing them here would let us serve
+        // unconnectable / malformed sources back to eMule peers. We reject the
+        // same cases (returning the current bucket load without indexing). The
+        // UDP port may still fall back to the packet's source port below,
+        // mirroring eMule initialising `m_uUDPPort = uUDPPort` before reading
+        // the optional `TAG_SOURCEUPORT`.
+        let has_source_type = tags
+            .iter()
+            .any(|t| matches!(&t.name, TagName::Id(TAG_SOURCETYPE)));
+        let has_tcp_port = tags.iter().any(|t| {
+            matches!(&t.name, TagName::Id(TAG_SOURCEPORT)) && t.as_uint().map_or(false, |p| p > 0)
+        });
+        if !has_source_type || !has_tcp_port {
+            return self.compute_load();
+        }
+
         let bucket = self.source_entries.entry(*target).or_default();
         let now = chrono::Utc::now().timestamp();
 
@@ -147,15 +167,10 @@ impl DhtStore {
             name: TagName::Id(TAG_SOURCEIP),
             value: TagValue::Uint32(ip_u32),
         });
-        let has_port = tags
-            .iter()
-            .any(|t| matches!(&t.name, TagName::Id(TAG_SOURCEPORT)));
-        if !has_port {
-            tags.push(KadTag {
-                name: TagName::Id(TAG_SOURCEPORT),
-                value: TagValue::Uint16(sender_port),
-            });
-        }
+        // A valid, non-zero TCP `TAG_SOURCEPORT` is guaranteed by the
+        // validation at the top of this function, so we never fabricate one
+        // from the UDP source port (which is not a TCP listen port and would
+        // produce an unconnectable source).
         let has_uport = tags
             .iter()
             .any(|t| matches!(&t.name, TagName::Id(TAG_SOURCEUPORT)));
@@ -296,5 +311,97 @@ impl DhtStore {
     fn compute_load(&self) -> u8 {
         let ratio = self.total_count as f64 / MAX_TOTAL_ENTRIES as f64;
         (ratio * 100.0).min(100.0) as u8
+    }
+}
+
+#[cfg(test)]
+mod source_store_tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn id_tag(id: u8, value: TagValue) -> KadTag {
+        KadTag {
+            name: TagName::Id(id),
+            value,
+        }
+    }
+
+    fn target() -> KadId {
+        KadId([0x11; 16])
+    }
+
+    fn sender() -> KadId {
+        KadId([0x22; 16])
+    }
+
+    #[test]
+    fn rejects_source_publish_without_source_type() {
+        let mut store = DhtStore::new();
+        let tags = vec![
+            id_tag(TAG_SOURCEPORT, TagValue::Uint16(4662)),
+            id_tag(TAG_FILESIZE, TagValue::Uint64(1000)),
+        ];
+        store.store_source_entry(&target(), sender(), tags, Ipv4Addr::new(1, 2, 3, 4), 5000);
+        assert!(
+            store.search_sources(&target()).is_empty(),
+            "a source publish without TAG_SOURCETYPE must not be indexed"
+        );
+    }
+
+    #[test]
+    fn rejects_source_publish_without_tcp_port() {
+        let mut store = DhtStore::new();
+        let tags = vec![
+            id_tag(TAG_SOURCETYPE, TagValue::Uint8(1)),
+            id_tag(TAG_FILESIZE, TagValue::Uint64(1000)),
+        ];
+        store.store_source_entry(&target(), sender(), tags, Ipv4Addr::new(1, 2, 3, 4), 5000);
+        assert!(
+            store.search_sources(&target()).is_empty(),
+            "a source publish without TAG_SOURCEPORT must not be indexed"
+        );
+    }
+
+    #[test]
+    fn rejects_source_publish_with_zero_tcp_port() {
+        let mut store = DhtStore::new();
+        let tags = vec![
+            id_tag(TAG_SOURCETYPE, TagValue::Uint8(1)),
+            id_tag(TAG_SOURCEPORT, TagValue::Uint16(0)),
+        ];
+        store.store_source_entry(&target(), sender(), tags, Ipv4Addr::new(1, 2, 3, 4), 5000);
+        assert!(
+            store.search_sources(&target()).is_empty(),
+            "a zero TAG_SOURCEPORT must be treated as missing and rejected"
+        );
+    }
+
+    #[test]
+    fn stores_valid_source_without_fabricating_tcp_port_from_udp() {
+        let mut store = DhtStore::new();
+        let tags = vec![
+            id_tag(TAG_SOURCETYPE, TagValue::Uint8(1)),
+            id_tag(TAG_SOURCEPORT, TagValue::Uint16(4662)),
+            id_tag(TAG_FILESIZE, TagValue::Uint64(1000)),
+        ];
+        // No TAG_SOURCEUPORT -> UDP port falls back to the packet source port
+        // (5000), matching eMule. The TCP port must stay the published 4662
+        // and must never be fabricated from the UDP port.
+        store.store_source_entry(&target(), sender(), tags, Ipv4Addr::new(1, 2, 3, 4), 5000);
+        let results = store.search_sources(&target());
+        assert_eq!(results.len(), 1, "valid source must be indexed");
+        let entry = &results[0];
+        let tcp = entry
+            .tags
+            .iter()
+            .find(|t| matches!(&t.name, TagName::Id(TAG_SOURCEPORT)))
+            .and_then(|t| t.as_uint());
+        let udp = entry
+            .tags
+            .iter()
+            .find(|t| matches!(&t.name, TagName::Id(TAG_SOURCEUPORT)))
+            .and_then(|t| t.as_uint());
+        assert_eq!(tcp, Some(4662), "published TCP port must be preserved");
+        assert_eq!(udp, Some(5000), "UDP port falls back to the packet source");
     }
 }
