@@ -4809,6 +4809,13 @@ pub async fn start_network(
                 }
                 cs
             }
+            // Bootstrap-edition hints are unverified seeds (often fetched from
+            // a bootstrap URL). Load them as-is so they can be *proven* via the
+            // normal Hello/verify handshake, but never promote them to verified
+            // on load — eMule treats them as unproven and trusting them would
+            // make unconfirmed nodes immediately eligible as lookup/publish
+            // targets (routing-poisoning surface).
+            Ok((cs, bootstrap::NodesDatFormat::BootstrapHints)) => cs,
             Ok((cs, bootstrap::NodesDatFormat::WithVerifiedBit)) => cs,
             Err(e) => {
                 warn!("Failed to load nodes.dat: {e}");
@@ -4819,44 +4826,21 @@ pub async fn start_network(
         Vec::new()
     };
 
-    // Load saved peers from database to supplement contacts and extract banned IPs
+    // Load saved peers from the database for nickname / ban-state lookup and
+    // banned-IP extraction. We intentionally do NOT reconstruct KAD
+    // routing-table contacts from this table: its single stored `ip:port` is
+    // ambiguous (different save paths persist the KAD *UDP* port from the
+    // routing snapshot vs. the ed2k *TCP* port from the Hello handler), and a
+    // usable KAD contact also needs the protocol version, UDP key and verified
+    // bit that the table doesn't carry. The previous heuristic guessed
+    // `udp_port = tcp_port + 10`, which is wrong for any non-default port
+    // layout and fired Hellos at the wrong endpoint. `nodes.dat` is the
+    // authoritative KAD-contact store (complete, with the real UDP port) and
+    // `default_bootstrap_contacts()` covers a cold start, so KAD bootstrap no
+    // longer depends on this lossy table.
     let saved_db_peers = db.get_peers().unwrap_or_default();
-    {
-        let peer_count = saved_db_peers.len();
-        for peer in &saved_db_peers {
-            if peer.banned {
-                continue;
-            }
-            if let Some(addr_str) = peer.addresses.first() {
-                if let Some((ip_str, port_str)) = addr_str.rsplit_once(':') {
-                    if let (Ok(ip), Ok(port)) =
-                        (ip_str.parse::<Ipv4Addr>(), port_str.parse::<u16>())
-                    {
-                        if let Some(kad_id) = KadId::from_hex(&peer.id) {
-                            boot_contacts.push(KadContact {
-                                id: kad_id,
-                                ip,
-                                udp_port: port.saturating_add(10),
-                                tcp_port: port,
-                                version: KADEMLIA_VERSION,
-                                last_seen: peer.last_seen,
-                                verified: false,
-                                contact_type: CONTACT_TYPE_NEW,
-                                udp_key: None,
-                                kad_options: 0,
-                                created_at: peer.last_seen,
-                                expires_at: 0,
-                                last_type_set: 0,
-                                received_hello: false,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-        if peer_count > 0 {
-            info!("Loaded {peer_count} peers from database");
-        }
+    if !saved_db_peers.is_empty() {
+        info!("Loaded {} peers from database", saved_db_peers.len());
     }
 
     if boot_contacts.is_empty() {
@@ -9841,6 +9825,13 @@ pub async fn start_network(
                             let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                             let msg = KadMessage::BootstrapReq;
                             if let Ok(packet) = messages::encode_packet(&msg) {
+                                // Track the outgoing request (opcode 0x01) so the
+                                // matching `BootstrapRes` (0x09) passes
+                                // `validate_response`. The sampled-contact path
+                                // below already does this; without it, every
+                                // hardcoded-node bootstrap reply was dropped as
+                                // "unsolicited", stalling cold-start bootstrap.
+                                state.flood_protection.track_request(addr, 0x01);
                                 let _ = udp_socket.send_to(&packet, addr).await;
                             }
                         }
@@ -17208,22 +17199,29 @@ async fn send_kad_response(
                 .unwrap_or(0)
         });
     let target_kad_id = target_id.copied();
+    // Obfuscate the response whenever we hold *any* usable key, not only when
+    // we know the peer's KadID. eMule frequently replies keyed on the sender's
+    // UDP verify key with no target KadID at all, so a peer that contacted us
+    // obfuscated must get an obfuscated reply even when its KadID isn't on
+    // hand. When only the verify key is available we encrypt under a zero
+    // target KadID, which `encrypt_kad_packet` maps to eMule's
+    // ReceiverVerifyKey path (marker 0x02). The previous `target_id.is_some()`
+    // gate meant such peers silently got a plaintext reply.
     let use_obfuscation = state.obfuscation_enabled
-        && target_kad_id.is_some()
         && (receiver_key_val != 0
             || target_id
                 .and_then(|id| state.routing_table.get_contact(id))
                 .map(|c| c.supports_obfuscation())
                 .unwrap_or(false));
     let result = if use_obfuscation {
-        if let Some(kad_id) = target_kad_id {
-            let sender_key = KadUDPKey::generate(state.udp_key_seed, their_ip).key;
-            let encrypted =
-                obfuscation::encrypt_kad_packet(packet, &kad_id, sender_key, receiver_key_val);
-            socket.send_to(&encrypted, addr).await
-        } else {
-            socket.send_to(packet, addr).await
-        }
+        // Zero KadID only ever pairs with a non-zero receiver key here (the
+        // `supports_obfuscation` branch requires `target_id`), so this always
+        // resolves to a valid eMule key path.
+        let kad_id = target_kad_id.unwrap_or_else(KadId::zero);
+        let sender_key = KadUDPKey::generate(state.udp_key_seed, their_ip).key;
+        let encrypted =
+            obfuscation::encrypt_kad_packet(packet, &kad_id, sender_key, receiver_key_val);
+        socket.send_to(&encrypted, addr).await
     } else {
         socket.send_to(packet, addr).await
     };
@@ -19888,46 +19886,61 @@ async fn handle_udp_packet_inner(
                 return;
             }
 
-            // Route response to the specific search that queried this sender,
-            // not all searches sharing the same target (fixes double-counting).
+            // Route the response to EVERY active same-target search that
+            // actually queried this sender. eMule keeps at most one search per
+            // target, but Ember can legitimately run two on the same KadID
+            // (e.g. a `FindSource` download lookup and a `StoreFile` source
+            // publish on the same file hash). Both walk the DHT with
+            // `KADEMLIA2_REQ`; when both queried the same node, only one
+            // identical `KadRes` arrives per request, so handing the contacts
+            // to just the first search would starve the other of convergence
+            // (K13 follow-up). Each search tracks its own lookup state, so
+            // delivering the same validated contacts to several searches is
+            // harmless. We still never route to a search that did NOT query
+            // this sender (eMule's IsOnOutTrackList anti-injection rule).
             let sender_ip_port: Option<(Ipv4Addr, u16)> = match from.ip() {
                 std::net::IpAddr::V4(v4) => Some((v4, from.port())),
                 _ => None,
             };
 
-            let owning_sid: Option<SearchId> = sender_ip_port.and_then(|(ip, port)| {
-                state
-                    .search_manager
-                    .active
-                    .iter()
-                    .filter(|(_, s)| s.target == target && !s.completed)
-                    .find(|(_, s)| s.tried.contains_key(&(ip, port)))
-                    .map(|(id, _)| *id)
-            });
+            let mut search_ids: Vec<SearchId> = sender_ip_port
+                .map(|(ip, port)| {
+                    state
+                        .search_manager
+                        .active
+                        .iter()
+                        .filter(|(_, s)| {
+                            s.target == target && !s.completed && s.tried.contains_key(&(ip, port))
+                        })
+                        .map(|(id, _)| *id)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
 
-            let search_ids: Vec<SearchId> = if let Some(sid) = owning_sid {
-                vec![sid]
-            } else {
+            if search_ids.is_empty() {
                 // No active search queried this sender on the exact (ip, port).
-                // Fall back to a search that queried this sender's *IP* (the
+                // Fall back to searches that queried this sender's *IP* (the
                 // KAD UDP source port can be rewritten by carrier-grade NAT),
                 // matching eMule's by-IP responder lookup. We do NOT fall back
                 // to "any search with this target": accepting routing contacts
                 // from a node no active search ever queried would let an
                 // unsolicited peer inject contacts (eMule's IsOnOutTrackList).
-                sender_ip_port
-                    .and_then(|(ip, _)| {
+                search_ids = sender_ip_port
+                    .map(|(ip, _)| {
                         state
                             .search_manager
                             .active
                             .iter()
-                            .filter(|(_, s)| s.target == target && !s.completed)
-                            .find(|(_, s)| s.tried.keys().any(|(tip, _)| *tip == ip))
+                            .filter(|(_, s)| {
+                                s.target == target
+                                    && !s.completed
+                                    && s.tried.keys().any(|(tip, _)| *tip == ip)
+                            })
                             .map(|(id, _)| *id)
+                            .collect::<Vec<_>>()
                     })
-                    .into_iter()
-                    .collect()
-            };
+                    .unwrap_or_default();
+            }
 
             if search_ids.is_empty() {
                 debug!("  KadRes from {from}: no search queried this sender for target {target}; ignoring unsolicited response");
@@ -20094,43 +20107,58 @@ async fn handle_udp_packet_inner(
                 );
             }
 
-            // Route response to the specific search that queried this sender.
+            // Route the result to active same-target searches that actually
+            // queried this sender AND expect SEARCH_RES — i.e. the
+            // fetch-capable `Find*` kinds. This matters when a `Find*` and a
+            // `Store*` share a target (e.g. FindSource + StoreFile on one file
+            // hash): the `Store*` search never issues a SEARCH_*_REQ, so
+            // delivering a SEARCH_RES to it would silently swallow results the
+            // real `Find*` search needs. We still never route to a search that
+            // did not query this sender (anti-poisoning, eMule's
+            // IsOnOutTrackList), and we deliver to every qualifying search so
+            // duplicate UI searches on the same keyword don't starve.
             let sender_ip_port: Option<(Ipv4Addr, u16)> = match from.ip() {
                 std::net::IpAddr::V4(v4) => Some((v4, from.port())),
                 _ => None,
             };
 
-            let owning_sid: Option<SearchId> = sender_ip_port.and_then(|(ip, port)| {
-                state
-                    .search_manager
-                    .active
-                    .iter()
-                    .filter(|(_, s)| s.target == target && !s.completed)
-                    .find(|(_, s)| s.tried.contains_key(&(ip, port)))
-                    .map(|(id, _)| *id)
-            });
+            let mut search_ids: Vec<SearchId> = sender_ip_port
+                .map(|(ip, port)| {
+                    state
+                        .search_manager
+                        .active
+                        .iter()
+                        .filter(|(_, s)| {
+                            s.target == target
+                                && !s.completed
+                                && s.search_type.accepts_search_results()
+                                && s.tried.contains_key(&(ip, port))
+                        })
+                        .map(|(id, _)| *id)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
 
-            let search_ids: Vec<SearchId> = if let Some(sid) = owning_sid {
-                vec![sid]
-            } else {
-                // Fall back to a search that queried this sender's *IP* (the
-                // source port can be rewritten by carrier-grade NAT). We do
-                // NOT fall back to "any search with this target": accepting
-                // results from a node no active search ever queried would let
-                // an unsolicited peer poison the result set.
-                sender_ip_port
-                    .and_then(|(ip, _)| {
+            if search_ids.is_empty() {
+                // NAT port-rewrite fallback: match by sender IP only. Same
+                // anti-poisoning and fetch-kind constraints as above.
+                search_ids = sender_ip_port
+                    .map(|(ip, _)| {
                         state
                             .search_manager
                             .active
                             .iter()
-                            .filter(|(_, s)| s.target == target && !s.completed)
-                            .find(|(_, s)| s.tried.keys().any(|(tip, _)| *tip == ip))
+                            .filter(|(_, s)| {
+                                s.target == target
+                                    && !s.completed
+                                    && s.search_type.accepts_search_results()
+                                    && s.tried.keys().any(|(tip, _)| *tip == ip)
+                            })
                             .map(|(id, _)| *id)
+                            .collect::<Vec<_>>()
                     })
-                    .into_iter()
-                    .collect()
-            };
+                    .unwrap_or_default();
+            }
 
             if search_ids.is_empty() {
                 debug!("  No active search queried this sender for this target");
@@ -20185,7 +20213,11 @@ async fn handle_udp_packet_inner(
             }
         }
 
-        KadMessage::PublishRes { target, load } => {
+        KadMessage::PublishRes {
+            target,
+            load,
+            request_ack,
+        } => {
             // Diagnostic: count every PublishRes that reaches the
             // handler. If this stays at 0 while Publish cycles show
             // `N outstanding pending ack`, the packets are being
@@ -20197,13 +20229,15 @@ async fn handle_udp_packet_inner(
             // Match on `(target, peer_addr)` first (exact path). If that
             // misses, fall back to `(target, any-entry-with-same-IP)` —
             // peers behind carrier-grade NAT sometimes reply from a
-            // different source *port* than the one we sent to because
-            // the router rewrites the mapping; the IP stays stable. As a
-            // last resort, match on target alone (consume any pending
-            // entry for this target) — this accepts that the publish
-            // was acknowledged even if we can't identify the exact peer,
-            // which is what the counter is really measuring. Without
-            // this, many networks silently show `0 confirmed` forever.
+            // different source *port* than the one we sent to because the
+            // router rewrites the mapping; the IP stays stable. We deliberately
+            // do NOT fall back to matching the target alone: keyword/source
+            // publishes have many distinct peers under one target, so
+            // consuming "any pending entry for this target" would decrement an
+            // unrelated peer's outstanding-ack count (and could remove a
+            // genuinely-pending slot), corrupting the per-peer confirmation
+            // accounting. An ack we cannot attribute to a peer we actually
+            // published to is left unmatched.
             let matched_key: Option<(KadId, SocketAddr)> =
                 if state.publish_pending.contains_key(&(target, from)) {
                     Some((target, from))
@@ -20214,13 +20248,6 @@ async fn handle_udp_packet_inner(
                         .keys()
                         .find(|(t, a)| *t == target && a.ip() == from_ip)
                         .copied()
-                        .or_else(|| {
-                            state
-                                .publish_pending
-                                .keys()
-                                .find(|(t, _)| *t == target)
-                                .copied()
-                        })
                 };
             let matched_pending = matched_key.and_then(|key| {
                 let mut remove_entry = false;
@@ -20258,12 +20285,25 @@ async fn handle_udp_packet_inner(
                     "PublishRes from {from} for {target} matched no pending entry (load={load})"
                 );
             }
-            // KAD v9+: acknowledge the PublishRes
-            let ack = KadMessage::PublishResAck;
-            if let Ok(packet) = messages::encode_packet(&ack) {
-                let _ =
-                    send_kad_response(socket, &packet, from, state, None, packet_sender_udp_key)
-                        .await;
+            // Acknowledge the PublishRes only when the sender explicitly
+            // asked for it (options-byte bit0) AND we hold its UDP key, exactly
+            // mirroring eMule's `Process_KADEMLIA2_PUBLISH_RES`. eMule never
+            // sets that bit (it is "for future use") and neither do we, so in
+            // practice no ack is sent. Emitting one unconditionally — as we
+            // used to — sends vanilla eMule an unrequested KADEMLIA2_PUBLISH_RES_ACK.
+            if request_ack && packet_sender_udp_key.is_some() {
+                let ack = KadMessage::PublishResAck;
+                if let Ok(packet) = messages::encode_packet(&ack) {
+                    let _ = send_kad_response(
+                        socket,
+                        &packet,
+                        from,
+                        state,
+                        None,
+                        packet_sender_udp_key,
+                    )
+                    .await;
+                }
             }
             if load >= 100 {
                 if let std::net::IpAddr::V4(ipv4) = from.ip() {
@@ -20463,7 +20503,11 @@ async fn handle_udp_packet_inner(
                 // firewalled, but silently dropping publishes makes the
                 // publisher retry us forever. Send an explicit reject
                 // with load=100 so they mark us "done" and move on.
-                let res = KadMessage::PublishRes { target, load: 100 };
+                let res = KadMessage::PublishRes {
+                    target,
+                    load: 100,
+                    request_ack: false,
+                };
                 if let Ok(packet) = messages::encode_packet(&res) {
                     let _ = send_kad_response(
                         socket,
@@ -20479,7 +20523,11 @@ async fn handle_udp_packet_inner(
             }
             if !state.dht_store.is_within_tolerance(&target) {
                 debug!("PublishKeyReq for {target} rejected - outside tolerance zone");
-                let res = KadMessage::PublishRes { target, load: 100 };
+                let res = KadMessage::PublishRes {
+                    target,
+                    load: 100,
+                    request_ack: false,
+                };
                 if let Ok(packet) = messages::encode_packet(&res) {
                     let _ = send_kad_response(
                         socket,
@@ -20516,7 +20564,11 @@ async fn handle_udp_packet_inner(
                 let load = state
                     .dht_store
                     .store_keyword_entries(&target, entries, &sender_kad_id);
-                let res = KadMessage::PublishRes { target, load };
+                let res = KadMessage::PublishRes {
+                    target,
+                    load,
+                    request_ack: false,
+                };
                 if let Ok(packet) = messages::encode_packet(&res) {
                     let _ = send_kad_response(
                         socket,
@@ -20539,7 +20591,11 @@ async fn handle_udp_packet_inner(
             if state.udp_firewalled {
                 // K14: see PublishKeyReq for the rationale; also emit a
                 // reject PublishRes so the publisher stops retrying us.
-                let res = KadMessage::PublishRes { target, load: 100 };
+                let res = KadMessage::PublishRes {
+                    target,
+                    load: 100,
+                    request_ack: false,
+                };
                 if let Ok(packet) = messages::encode_packet(&res) {
                     let _ = send_kad_response(
                         socket,
@@ -20561,7 +20617,11 @@ async fn handle_udp_packet_inner(
             let verified_sender_id = resolve_verified_sender_id(state, from, &sender_id);
             if !state.dht_store.is_within_tolerance(&target) {
                 debug!("PublishSourceReq for {target} rejected - outside tolerance zone");
-                let res = KadMessage::PublishRes { target, load: 100 };
+                let res = KadMessage::PublishRes {
+                    target,
+                    load: 100,
+                    request_ack: false,
+                };
                 if let Ok(packet) = messages::encode_packet(&res) {
                     let _ = send_kad_response(
                         socket,
@@ -20585,7 +20645,11 @@ async fn handle_udp_packet_inner(
                     sender_ip,
                     from.port(),
                 );
-                let res = KadMessage::PublishRes { target, load };
+                let res = KadMessage::PublishRes {
+                    target,
+                    load,
+                    request_ack: false,
+                };
                 if let Ok(packet) = messages::encode_packet(&res) {
                     let _ = send_kad_response(
                         socket,
@@ -20607,7 +20671,11 @@ async fn handle_udp_packet_inner(
         } => {
             if state.udp_firewalled {
                 // K14: emit a reject PublishRes so the publisher stops.
-                let res = KadMessage::PublishRes { target, load: 100 };
+                let res = KadMessage::PublishRes {
+                    target,
+                    load: 100,
+                    request_ack: false,
+                };
                 if let Ok(packet) = messages::encode_packet(&res) {
                     let _ = send_kad_response(
                         socket,
@@ -20627,7 +20695,11 @@ async fn handle_udp_packet_inner(
             // peers dump arbitrary per-hash comments into our UI without the
             // tolerance gate makes us a spam/comment-poisoning amplifier.
             if !state.dht_store.is_within_tolerance(&target) {
-                let res = KadMessage::PublishRes { target, load: 100 };
+                let res = KadMessage::PublishRes {
+                    target,
+                    load: 100,
+                    request_ack: false,
+                };
                 if let Ok(packet) = messages::encode_packet(&res) {
                     let _ = send_kad_response(
                         socket,
@@ -20680,7 +20752,11 @@ async fn handle_udp_packet_inner(
             let load = state
                 .dht_store
                 .store_notes_entry(&target, verified_sender_id, tags_owned);
-            let res = KadMessage::PublishRes { target, load };
+            let res = KadMessage::PublishRes {
+                target,
+                load,
+                request_ack: false,
+            };
             if let Ok(packet) = messages::encode_packet(&res) {
                 let _ = send_kad_response(
                     socket,
@@ -26934,10 +27010,15 @@ fn matches_requested_file_size(
     if requested_size == 0 {
         return true;
     }
+    // A specific size was requested. eMule's source/notes search requests
+    // carry the exact file size and the index only returns entries that match
+    // it; an entry with no size tag cannot be confirmed to match, so reject it
+    // rather than leak a possibly-wrong-size source into the requester's
+    // download source selection.
     entry
         .tags
         .iter()
         .find_map(search_entry_tag_u64)
         .map(|size| size == requested_size)
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
