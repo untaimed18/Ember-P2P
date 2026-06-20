@@ -73,6 +73,19 @@ impl SearchType {
             SearchType::StoreNotes => SearchKind::StoreNotes,
         }
     }
+
+    /// Whether this search kind issues `SEARCH_*_REQ` and therefore expects
+    /// `KADEMLIA2_SEARCH_RES` (0x3B) replies. Only the fetch-capable `Find*`
+    /// kinds do; `FindNode`/`FindBuddy` walk with `KADEMLIA2_REQ` and the
+    /// `Store*` kinds publish instead of fetching. Used to keep a
+    /// `SearchRes` from being misrouted to a same-target `Store*` search
+    /// (which would silently starve the real `Find*` search of its results).
+    pub fn accepts_search_results(&self) -> bool {
+        matches!(
+            self,
+            SearchType::FindKeyword | SearchType::FindSource { .. } | SearchType::FindNotes { .. }
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

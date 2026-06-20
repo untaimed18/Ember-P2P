@@ -50,16 +50,24 @@ pub fn default_bootstrap_contacts() -> Vec<KadContact> {
 }
 
 /// Which wire format was parsed from a `nodes.dat`. Carries security-relevant
-/// detail the caller needs for K3: legacy formats (v0, v1, v3-bootstrap)
-/// don't encode a per-contact `verified` bit and were previously
-/// blanket-verified on load, which an attacker-supplied file (URL
-/// bootstrap) could abuse. Callers should only mass-verify legacy-format
-/// contacts when they come from the app's own on-disk `nodes.dat`.
+/// detail the caller needs for K3: legacy formats don't encode a per-contact
+/// `verified` bit and were previously blanket-verified on load, which an
+/// attacker-supplied file (URL bootstrap) could abuse. Callers should only
+/// mass-verify legacy-format contacts when they come from the app's own
+/// on-disk `nodes.dat`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodesDatFormat {
-    /// Pre-verified-bit format: v0 contacts, v1 whole file, or
-    /// v3-bootstrap_edition â€” no `verified` field on the wire.
+    /// Pre-verified-bit format saved by an older client during a live
+    /// session (v0 contacts or a v1 whole file): no `verified` field on the
+    /// wire, but trustworthy because we wrote it ourselves.
     LegacyNoVerified,
+    /// eMule v3 "bootstrap edition" file: a list of *unverified* bootstrap
+    /// hints (typically fetched from a bootstrap URL/server), carrying no
+    /// `verified` field. These contacts must NOT be promoted to verified on
+    /// load — eMule treats them as unproven seeds, and trusting them would
+    /// let an attacker-supplied file inject contacts straight into
+    /// lookup/publish target selection.
+    BootstrapHints,
     /// Modern format where each contact carries its own `verified` byte.
     WithVerifiedBit,
 }
@@ -124,7 +132,7 @@ pub fn load_nodes_dat_with_format(
                     contacts.len()
                 );
                 backup_if_short_load(path, contacts.len(), expected_count);
-                return Ok((contacts, NodesDatFormat::LegacyNoVerified));
+                return Ok((contacts, NodesDatFormat::BootstrapHints));
             }
             // v3 with bootstrap_edition != 1: separate count follows (eMule RoutingZone format)
             format = NodesDatFormat::WithVerifiedBit;

@@ -371,7 +371,11 @@ impl PublishManager {
         if self.noise_pub != [0u8; 32] {
             tags.push(KadTag {
                 name: TagName::Str(EMBER_NOISE_PUB_TAG.to_string()),
-                value: TagValue::Blob(self.noise_pub.to_vec()),
+                // `Bsob` (eMule `TAGTYPE_BSOB`), not `Blob`: the 32-byte key
+                // fits in a u8 length and eMule's KAD tag reader rejects the
+                // larger `TAGTYPE_BLOB`, which would otherwise make a vanilla
+                // eMule peer drop our entire source publish.
+                value: TagValue::Bsob(self.noise_pub.to_vec()),
             });
         }
 
@@ -655,8 +659,9 @@ mod tests {
             .find(|t| matches!(&t.name, TagName::Str(s) if s == EMBER_NOISE_PUB_TAG))
             .expect("ember Noise pubkey tag must be present");
         let blob = match &npub_tag.value {
-            TagValue::Blob(b) => b,
-            _ => panic!("ember_npub tag must be a Blob"),
+            // eMule-compatible small-blob type; see build_source_publish.
+            TagValue::Bsob(b) => b,
+            _ => panic!("ember_npub tag must be a Bsob"),
         };
         assert_eq!(blob.len(), 32, "Noise pubkey wire size");
         assert_eq!(blob.as_slice(), &npub);
