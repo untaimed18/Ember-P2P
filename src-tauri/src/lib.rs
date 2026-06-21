@@ -206,6 +206,19 @@ pub fn run() {
             // user once the webview has mounted (the file is preserved as a .bak).
             let corrupt_backup = config.corrupt_backup.clone();
 
+            // Honour the "launch maximized" preference. The window is
+            // created at its configured size (per `tauri.conf.json`); we
+            // maximize it here, once at startup, when the user has opted in.
+            // It's intentionally a launch-time preference — toggling it in
+            // Settings only changes how the *next* launch opens.
+            if settings.launch_maximized {
+                if let Some(window) = app.get_webview_window("main") {
+                    if let Err(e) = window.maximize() {
+                        tracing::warn!("Failed to apply launch-maximized preference: {e}");
+                    }
+                }
+            }
+
             let spam_data_dir = storage::paths::resolve_data_dir_with_app(&app_handle);
             let spam_filter = Arc::new(RwLock::new(
                 search::spam::SpamFilter::load(&spam_data_dir),
