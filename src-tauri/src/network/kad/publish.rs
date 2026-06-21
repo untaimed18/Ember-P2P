@@ -138,17 +138,39 @@ impl PublishManager {
         self.records.remove(file_hash);
     }
 
-    /// Clear all records and re-add files (for re-indexing).
-    pub fn clear_all(&mut self) {
-        self.records.clear();
-        self.keyword_records.clear();
-    }
-
     /// Add a batch of files for publishing.
     pub fn add_files_batch(&mut self, files: Vec<PublishableFile>) {
         for file in files {
             self.add_file(file);
         }
+    }
+
+    /// Reconcile the registered file set to exactly `keep`, dropping
+    /// records for files that are no longer shared while preserving the
+    /// source AND keyword publish timestamps of files that remain.
+    ///
+    /// This is the non-destructive replacement for `clear_all()` + re-add
+    /// on every shared-file change. `clear_all()` discarded all in-memory
+    /// keyword publish times (`keyword_records`); because keyword times —
+    /// unlike source times — are not persisted to known.met, every change
+    /// (share/unshare, priority edit, a completed download being shared,
+    /// etc.) re-queued the entire keyword set, so keyword publishing never
+    /// settled to its 24h interval and republished continuously. Callers
+    /// should `add_file`/`add_files_batch` the current set first (which
+    /// keeps existing keyword timestamps via `or_insert`), then call this
+    /// to evict anything no longer present.
+    pub fn retain_files(&mut self, keep: &std::collections::HashSet<KadId>) {
+        self.records.retain(|hash, _| keep.contains(hash));
+        // Prune keyword targets that no longer back any keyword-publishable
+        // file so we stop republishing keywords for files that were removed.
+        let live_keywords: std::collections::HashSet<String> = self
+            .records
+            .values()
+            .filter(|record| record.file.keyword_publishable)
+            .flat_map(|record| extract_keywords(&record.file.file_name))
+            .collect();
+        self.keyword_records
+            .retain(|_, record| live_keywords.contains(&record.keyword));
     }
 
     /// Number of keyword targets that are currently due for publishing.
@@ -709,5 +731,73 @@ mod tests {
             "firewalled publish must still advertise ember capability — \
              the broker uses this to decide whether to attempt LowID-to-LowID",
         );
+    }
+
+    /// Reconciling the shared-file set with `retain_files` must keep the
+    /// publish timestamps of files that remain and prune keyword targets
+    /// whose only backing file was removed. Regression guard for the bug
+    /// where every shared-file change wiped keyword publish times and
+    /// caused keywords to republish from scratch indefinitely.
+    #[test]
+    fn retain_files_preserves_kept_keyword_timestamps_and_prunes_removed() {
+        let mut p = PublishManager::new(KadId([0x01; 16]), [0x02; 16], 4662, 4672);
+        let file_a = PublishableFile {
+            file_hash: KadId([0xA1; 16]),
+            file_name: "alpha bravo.dat".to_string(),
+            file_size: 100,
+            file_type: "Pro".to_string(),
+            complete_sources: 0,
+            keyword_publishable: true,
+            last_source_publish: 0,
+        };
+        let file_b = PublishableFile {
+            file_hash: KadId([0xB2; 16]),
+            file_name: "delta echo.dat".to_string(),
+            file_size: 200,
+            file_type: "Pro".to_string(),
+            complete_sources: 0,
+            keyword_publishable: true,
+            last_source_publish: 0,
+        };
+        p.add_file(file_a.clone());
+        p.add_file(file_b.clone());
+
+        // Mark every keyword target as published so we can prove the kept
+        // file's timestamps survive reconciliation.
+        let kw_hashes: Vec<KadId> = p.keyword_records.keys().copied().collect();
+        for h in &kw_hashes {
+            p.mark_keyword_published(h);
+        }
+        assert!(p.keyword_records.values().all(|r| r.last_publish > 0));
+
+        // Reconcile down to just file A (as if file B was unshared).
+        let keep: std::collections::HashSet<KadId> = [file_a.file_hash].into_iter().collect();
+        p.retain_files(&keep);
+
+        assert_eq!(p.file_count(), 1, "only the kept file should remain");
+        assert!(p.records.contains_key(&file_a.file_hash));
+        assert!(!p.records.contains_key(&file_b.file_hash));
+
+        // File A's keyword targets are intact AND keep their publish time
+        // (the bug was these being reset to 0 on every change).
+        for kw in ["alpha", "bravo"] {
+            let kh = keyword_to_kad_id(kw);
+            let rec = p
+                .keyword_records
+                .get(&kh)
+                .unwrap_or_else(|| panic!("kept keyword '{kw}' must survive retain"));
+            assert!(
+                rec.last_publish > 0,
+                "kept keyword '{kw}' lost its publish time on reconcile"
+            );
+        }
+        // File B's keyword targets are pruned (no remaining backing file).
+        for kw in ["delta", "echo"] {
+            let kh = keyword_to_kad_id(kw);
+            assert!(
+                !p.keyword_records.contains_key(&kh),
+                "orphan keyword '{kw}' must be pruned after retain"
+            );
+        }
     }
 }

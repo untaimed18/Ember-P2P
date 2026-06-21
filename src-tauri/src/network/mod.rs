@@ -24315,13 +24315,21 @@ async fn handle_command_inner(
                 })
                 .collect();
             let shared_count = files.len();
-            state.publish_manager.clear_all();
+            // Reconcile rather than wipe. The old `clear_all()` here threw
+            // away every in-memory keyword publish timestamp on each
+            // shared-file change; since keyword times (unlike source times)
+            // are not persisted to known.met, that re-queued the whole
+            // keyword set and keyword publishing never settled to its 24h
+            // interval. `add_files_batch` updates file metadata while
+            // keeping existing keyword timestamps (`or_insert`); the
+            // `retain_files` call after the partials loop then evicts
+            // anything no longer shared. `desired` accumulates every hash
+            // we re-register so retain knows what to keep.
+            let mut desired: std::collections::HashSet<KadId> =
+                files.iter().map(|f| f.file_hash).collect();
             state.publish_manager.add_files_batch(files);
-            // Reset the ack map alongside publish state -- the counters
-            // correspond to the previous set of published hashes.
-            state.source_publish_acks.clear();
 
-            // Re-add active partial downloads to KAD publish after clear
+            // Re-add active partial downloads to KAD publish.
             let mut partial_count = 0u32;
             {
                 let mgr = transfer_manager.read().await;
@@ -24348,8 +24356,10 @@ async fn handle_command_inner(
                         .extension()
                         .map(|e| e.to_string_lossy().to_string())
                         .unwrap_or_default();
+                    let partial_hash = md4_bytes_to_kad_id(&hash_bytes[..16]);
+                    desired.insert(partial_hash);
                     state.publish_manager.add_file(PublishableFile {
-                        file_hash: md4_bytes_to_kad_id(&hash_bytes[..16]),
+                        file_hash: partial_hash,
                         file_name: transfer.file_name.clone(),
                         file_size: transfer.total_size,
                         file_type: crate::search::index::infer_file_type(&ext),
@@ -24367,6 +24377,15 @@ async fn handle_command_inner(
                     partial_count += 1;
                 }
             }
+            // Evict publish records for files no longer shared/downloading
+            // and drop their source-ack counters; orphaned keyword targets
+            // are pruned inside `retain_files`. Retained files keep their
+            // source and keyword publish timestamps, so already-published
+            // work is not needlessly repeated.
+            state.publish_manager.retain_files(&desired);
+            state
+                .source_publish_acks
+                .retain(|hash, _| desired.contains(hash));
             info!("Re-populated publish manager with {shared_count} shared + {partial_count} partial downloads after change");
 
             // eMule: re-send OP_OFFERFILES to the server when shared files change
