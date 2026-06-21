@@ -14,6 +14,7 @@
     unreadCounts as unreadCountsStore,
     friendRequests as friendRequestsStore,
     searchingFriends as searchingFriendsStore,
+    clearFriendSearch,
     isDiscoverable as isDiscoverableStore,
     clearUnread,
   } from '$lib/stores/friends';
@@ -384,6 +385,9 @@
       await removeFriend(f.user_hash);
       onlineFriendsStore.update(s => { const next = new Set(s); next.delete(f.user_hash); return next; });
       clearUnread(f.user_hash);
+      // Drop any in-flight "searching" spinner/timer for the removed friend so
+      // it doesn't keep spinning against a row that's about to disappear.
+      clearFriendSearch(f.user_hash);
       // Close any open chat tab for the removed friend; leaving it
       // open would show a session for someone who is no longer in
       // the user's friend list and silently fail to send.

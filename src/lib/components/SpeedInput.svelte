@@ -89,6 +89,11 @@
       value = 0;
     }
     lastSyncedValue = value;
+    // Refresh the visible field/unit to match the new value. Without this the
+    // `$effect` below skips `syncFromBytes` (because we just set
+    // `lastSyncedValue === value`), leaving the numeric input showing the
+    // stale/empty `displayValue` while the bound value is actually 512 KB/s.
+    syncFromBytes(value);
   }
 </script>
 
