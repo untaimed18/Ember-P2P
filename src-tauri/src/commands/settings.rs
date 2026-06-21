@@ -25,7 +25,7 @@ const MAX_SHARED_FOLDERS: usize = 512;
 const MAX_URL_LEN: usize = 2 * 1024;
 const MAX_FILENAME_CLEANUPS_LEN: usize = 16 * 1024;
 
-fn validate_settings(settings: &AppSettings) -> Result<(), String> {
+pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
     if settings.spam_filter_profile != "relaxed"
         && settings.spam_filter_profile != "balanced"
         && settings.spam_filter_profile != "aggressive"
@@ -355,10 +355,12 @@ pub async fn update_settings(
     let port_changed =
         settings.tcp_port != old_settings.tcp_port || settings.udp_port != old_settings.udp_port;
 
+    // Persist to disk BEFORE mutating the in-memory config so a failed write
+    // can't leave the running session (and the runtime apply below) diverged
+    // from what's on disk. Only commit the new settings once the write succeeds.
     let save_data = {
-        let mut config = state.config.write().await;
-        config.settings = settings.clone();
-        config.prepare_save().map_err(|e| {
+        let config = state.config.read().await;
+        config.prepare_save_settings(&settings).map_err(|e| {
             coded_ctx(
                 "settings_serialize_failed",
                 "Failed to serialize settings",
@@ -374,6 +376,10 @@ pub async fn update_settings(
         .await
         .map_err(|e| coded_ctx("settings_save_failed", "Save failed", e))?
         .map_err(|e| coded_ctx("settings_save_failed", "Save failed", e))?;
+    }
+    {
+        let mut config = state.config.write().await;
+        config.settings = settings.clone();
     }
 
     // Keep the synchronous mirror used by the close-event handler in sync
@@ -741,16 +747,20 @@ pub async fn set_close_behavior(
             "Close behavior must be 'ask', 'tray', or 'exit'",
         ));
     }
-    let save_data = {
-        let mut config = state.config.write().await;
-        config.settings.close_to_tray_behavior = normalized.clone();
-        config.prepare_save().map_err(|e| {
+    // Persist before committing the in-memory change (see update_settings) so
+    // a failed write can't leave the live close-behavior diverged from disk.
+    let (new_settings, save_data) = {
+        let config = state.config.read().await;
+        let mut new_settings = config.settings.clone();
+        new_settings.close_to_tray_behavior = normalized.clone();
+        let data = config.prepare_save_settings(&new_settings).map_err(|e| {
             coded_ctx(
                 "settings_serialize_failed",
                 "Failed to serialize settings",
                 e,
             )
-        })?
+        })?;
+        (new_settings, data)
     };
     let (data, tmp, final_path) = save_data;
     tokio::task::spawn_blocking(move || {
@@ -759,6 +769,25 @@ pub async fn set_close_behavior(
     .await
     .map_err(|e| coded_ctx("settings_save_failed", "Save failed", e))?
     .map_err(|e| coded_ctx("settings_save_failed", "Save failed", e))?;
+    {
+        let mut config = state.config.write().await;
+        config.settings = new_settings;
+    }
     *state.close_behavior.write() = normalized;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_settings_pass_validation() {
+        // Config load now re-validates persisted settings and resets to
+        // defaults on failure. If the defaults themselves failed validation,
+        // every launch would reset the config in a loop — assert they don't.
+        if let Err(e) = validate_settings(&AppSettings::default()) {
+            panic!("AppSettings::default() must satisfy validate_settings, got: {e}");
+        }
+    }
 }

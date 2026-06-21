@@ -13,8 +13,8 @@
     unshareFile,
     shareFile,
     unshareFolder,
-    openSharedFile,
-    openSharedFolder,
+    openSharedFile as openSharedFileCommand,
+    openSharedFolder as openSharedFolderCommand,
     batchSetPriority,
     batchShare,
     batchUnshare,
@@ -129,12 +129,17 @@
     }
   }
 
+  const COLLECTION_PICKER_DISPLAY_LIMIT = 500;
+
   let collectionSearch = $state('');
   let collectionFilteredFiles = $derived.by(() => {
     const q = collectionSearch.trim().toLowerCase();
     if (!q) return hashedLibraryFiles;
     return hashedLibraryFiles.filter(f => f.name.toLowerCase().includes(q));
   });
+  let displayedCollectionFiles = $derived.by(() =>
+    collectionFilteredFiles.slice(0, COLLECTION_PICKER_DISPLAY_LIMIT)
+  );
 
   function openCreateDialog(preselectHashes?: Iterable<string>) {
     newCollName = '';
@@ -421,6 +426,24 @@
 
   function toErr(e: unknown): string {
     return translateError(e, m.error_operation_failed());
+  }
+
+  async function openSharedFile(path: string) {
+    try {
+      await openSharedFileCommand(path);
+    } catch (e: unknown) {
+      error = toErr(e);
+      toastError(error);
+    }
+  }
+
+  async function openSharedFolder(path: string) {
+    try {
+      await openSharedFolderCommand(path);
+    } catch (e: unknown) {
+      error = toErr(e);
+      toastError(error);
+    }
   }
 
   async function copyToClipboard(text: string, label: string) {
@@ -1910,13 +1933,18 @@
           />
         </div>
         <div class="coll-file-picker">
-          {#each collectionFilteredFiles as f (f.path)}
+          {#each displayedCollectionFiles as f (f.path)}
             <label class="coll-pick-row">
               <input type="checkbox" checked={selectedFileHashes.has(f.hash)} onchange={() => toggleFileSelection(f.hash)} />
               <span class="coll-pick-name" title={f.name}>{f.name}</span>
               <span class="coll-pick-size">{formatSize(f.size)}</span>
             </label>
           {/each}
+          {#if collectionFilteredFiles.length > displayedCollectionFiles.length}
+            <div class="coll-pick-empty">
+              {m.library_status_showing({ shown: displayedCollectionFiles.length.toLocaleString(), total: collectionFilteredFiles.length.toLocaleString() })}
+            </div>
+          {/if}
           {#if collectionFilteredFiles.length === 0 && hashedLibraryFiles.length > 0}
             <div class="coll-pick-empty">{m.library_coll_no_matches({ query: collectionSearch })}</div>
           {:else if hashedLibraryFiles.length === 0}

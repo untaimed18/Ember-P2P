@@ -4,6 +4,7 @@ import type { UnlistenFn } from '@tauri-apps/api/event';
 import type { DegradedReason, NetworkStats } from '$lib/types';
 import { getNetworkStats } from '$lib/api/kad';
 import { getSettings, updateSettings } from '$lib/api/settings';
+import { setAppSettings } from '$lib/stores/settings';
 import { addToast, removeToast, toastError, toastSuccess, toastWarning } from '$lib/stores/toast';
 import * as m from '$lib/paraglide/messages';
 
@@ -82,7 +83,9 @@ async function persistUpnpDisabled() {
   try {
     const current = await getSettings();
     if (current.upnp_enabled) {
-      await updateSettings({ ...current, upnp_enabled: false });
+      const updated = { ...current, upnp_enabled: false };
+      await updateSettings(updated);
+      setAppSettings(updated);
     }
   } catch {
     // Let a later event retry — the on-disk setting wasn't changed.

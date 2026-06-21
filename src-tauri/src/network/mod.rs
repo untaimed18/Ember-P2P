@@ -2222,14 +2222,38 @@ async fn save_registered_part_tracker(state: &NetworkState, transfer_id: &str, r
         return;
     };
 
+    save_part_tracker_snapshot(tracker, transfer_id, reason).await;
+}
+
+async fn save_part_tracker_snapshot(
+    tracker: Arc<RwLock<ed2k::part_tracker::PartTracker>>,
+    transfer_id: &str,
+    reason: &str,
+) {
     let read_result = tokio::time::timeout(std::time::Duration::from_secs(2), tracker.read()).await;
-    match read_result {
-        Ok(guard) => {
-            guard.save();
+    let snapshot = match read_result {
+        Ok(guard) => guard.clone(),
+        Err(_) => {
+            warn!("Timed out acquiring tracker lock for {transfer_id}; .part.met not saved during {reason}");
+            return;
+        }
+    };
+
+    let save_result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || snapshot.save()),
+    )
+    .await;
+
+    match save_result {
+        Ok(Ok(())) => {
             debug!("Saved .part.met for {transfer_id} during {reason}");
         }
+        Ok(Err(e)) => {
+            warn!("Failed to join .part.met save for {transfer_id} during {reason}: {e}");
+        }
         Err(_) => {
-            warn!("Timed out saving .part.met for {transfer_id} during {reason}");
+            warn!("Timed out writing .part.met for {transfer_id} during {reason}");
         }
     }
 }
@@ -5554,24 +5578,28 @@ pub async fn start_network(
             result = udp_socket.recv_from(&mut udp_buf) => {
                 match result {
                     Ok((len, from)) => {
-                        // Ember-native UDP is dispatched *above* the KAD
-                        // disconnected gate. The harness explicitly runs
-                        // with `auto_connect_kad = false`, which used to
-                        // mean every received packet got silently dropped
-                        // — including the Ping/Pong frames the dev panel
-                        // is trying to deliver. Ember packets piggyback
-                        // on the KAD UDP socket but are not KAD traffic,
-                        // so they shouldn't be gated by KAD's connect
-                        // state, and they shouldn't roll up into the
-                        // KAD overhead counter either.
                         if settings.ember_native_enabled
                             && ember::transport::EmberTransport::is_ember_packet(&udp_buf[..len])
                         {
-                            handle_ember_native_udp(
+                            // Ember packets are allowed while KAD is
+                            // disconnected (harness/offline Ember-native
+                            // mode), but they must still traverse
+                            // `handle_udp_packet_inner` so the IP filter,
+                            // ban list and global UDP rate gate run before
+                            // the Noise transport sees the packet.
+                            handle_udp_packet(
                                 &udp_socket,
                                 &udp_buf[..len],
                                 from,
                                 &mut state,
+                                &app_handle,
+                                &local_index,
+                                &settings,
+                                &db,
+                                &active_port_tests,
+                                &upload_queue_handle,
+                                &credit_manager,
+                                &transfer_manager,
                             ).await;
                         } else if state.stats.status != NetworkStatus::Disconnected {
                             last_kad_activity_at = chrono::Utc::now().timestamp();
@@ -5607,11 +5635,23 @@ pub async fn start_network(
                             if settings.ember_native_enabled
                                 && ember::transport::EmberTransport::is_ember_packet(&udp_buf[..len])
                             {
-                                handle_ember_native_udp(
+                                // Same fast-path as the first packet in the
+                                // batch: Ember-native traffic bypasses only
+                                // the KAD connected-state gate, never the
+                                // shared UDP security/rate-limit checks.
+                                handle_udp_packet(
                                     &udp_socket,
                                     &udp_buf[..len],
                                     from,
                                     &mut state,
+                                    &app_handle,
+                                    &local_index,
+                                    &settings,
+                                    &db,
+                                    &active_port_tests,
+                                    &upload_queue_handle,
+                                    &credit_manager,
+                                    &transfer_manager,
                                 ).await;
                             } else if state.stats.status != NetworkStatus::Disconnected {
                                 last_kad_activity_at = chrono::Utc::now().timestamp();
@@ -14040,7 +14080,59 @@ pub async fn start_network(
                                 state.download_handles.insert(dl_tid2, handle);
                             }
                         } else {
-                            debug!("No pending download for callback file hash {}", hex::encode(file_hash));
+                            // The buddy can callback after a transfer has
+                            // already left `pending_downloads` and is running
+                            // as a multi-source download. Treat that as a
+                            // normal newly discovered source instead of
+                            // dropping it; this mirrors the KAD/server callback
+                            // receiver path and keeps firewalled sources useful
+                            // throughout the download, not only before the
+                            // first worker starts.
+                            let hash_hex = hex::encode(file_hash);
+                            let matching_ids = {
+                                let mgr = transfer_manager.read().await;
+                                matching_active_transfer_ids_for_hash(&state, &mgr, &hash_hex)
+                            };
+                            if matching_ids.is_empty() {
+                                debug!(
+                                    "No pending or active download for buddy callback file hash {}",
+                                    hash_hex
+                                );
+                            } else if state.dead_sources.is_dead_source_for_file(
+                                &file_hash,
+                                u32::from(dest_ip),
+                                dest_port,
+                            ) {
+                                debug!(
+                                    "Ignoring buddy callback from dead source {}:{} for {}",
+                                    dest_ip, dest_port, hash_hex
+                                );
+                            } else {
+                                {
+                                    let mut sm = source_manager.write().await;
+                                    sm.register_source(file_hash, dest_ip, dest_port);
+                                }
+                                let source = DownloadSource {
+                                    peer_ip: dest_ip.to_string(),
+                                    peer_port: dest_port,
+                                    available_parts: Vec::new(),
+                                    peer_user_hash: None,
+                                    peer_connect_options: None,
+                                };
+                                let stats = inject_source_into_active_transfers(
+                                    &mut state,
+                                    file_hash,
+                                    &matching_ids,
+                                    &source,
+                                    0,
+                                );
+                                if stats.injected > 0 {
+                                    info!(
+                                        "Buddy callback injected {} active source(s) for {}",
+                                        stats.injected, hash_hex
+                                    );
+                                }
+                            }
                         }
                     }
                     Some(BuddyEvent::ReaskCallback { dest_ip, dest_port, file_hash }) => {
@@ -15579,6 +15671,18 @@ pub async fn start_network(
         handle.abort();
     }
 
+    // Close the QUIC endpoint so `run_quic_accept_loop` sees `accept() == None`
+    // and exits, instead of lingering as a detached task (and refusing inbound
+    // relay handshakes) until the process dies. This also tears down in-flight
+    // relay connections gracefully.
+    if let Some(endpoint) = state
+        .connection_broker
+        .as_ref()
+        .and_then(|broker| broker.quic_endpoint())
+    {
+        endpoint.close(0u32.into(), b"shutting down");
+    }
+
     if let Some(handle) = cache_write_handle.take() {
         match tokio::time::timeout(std::time::Duration::from_secs(2), handle).await {
             Ok(Ok(())) => debug!("Cache refresh task finished before shutdown"),
@@ -15597,13 +15701,29 @@ pub async fn start_network(
     }
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-    // Cancel and await all active download tasks
-    for (tid, handle) in state.download_handles.drain() {
+    // Cancel and await all active download tasks. Abort every task first, then
+    // await them *concurrently* under one global deadline. Awaiting each task's
+    // 5s timeout sequentially made total shutdown time scale with the number of
+    // active downloads, which could overrun the bounded window the UI thread
+    // waits on (SHUTDOWN_WAIT in lib.rs) and let the process exit mid-save.
+    let download_handles: Vec<_> = state.download_handles.drain().collect();
+    for (_, handle) in &download_handles {
         handle.abort();
-        match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
-            Ok(Ok(())) => debug!("Download task {tid} shut down cleanly"),
-            Ok(Err(_)) => debug!("Download task {tid} cancelled"),
-            Err(_) => warn!("Download task {tid} did not finish within timeout"),
+    }
+    if !download_handles.is_empty() {
+        let await_all = futures::future::join_all(download_handles.into_iter().map(
+            |(tid, handle)| async move {
+                match handle.await {
+                    Ok(()) => debug!("Download task {tid} shut down cleanly"),
+                    Err(_) => debug!("Download task {tid} cancelled/aborted"),
+                }
+            },
+        ));
+        if tokio::time::timeout(std::time::Duration::from_secs(5), await_all)
+            .await
+            .is_err()
+        {
+            warn!("Some download tasks did not finish within the shutdown abort window");
         }
     }
 
@@ -15630,16 +15750,20 @@ pub async fn start_network(
     };
     if !trackers.is_empty() {
         let count = trackers.len();
-        for (tid, tracker) in trackers {
-            match tokio::time::timeout(std::time::Duration::from_secs(2), tracker.read()).await {
-                Ok(guard) => {
-                    guard.save();
-                    debug!("Saved .part.met for aborted download {tid}");
-                }
-                Err(_) => {
-                    warn!("Timed out acquiring tracker lock for {tid}; .part.met not saved on shutdown");
-                }
-            }
+        // Save every .part.met *concurrently* under one global deadline. Done
+        // sequentially, each tracker's internal 2s+5s timeouts summed across
+        // many active downloads could exceed the UI's shutdown wait and cut a
+        // save off mid-write, losing resume metadata. `save_part_tracker_snapshot`
+        // is self-bounded; the outer timeout is a backstop against a stall.
+        let saves =
+            futures::future::join_all(trackers.into_iter().map(|(tid, tracker)| async move {
+                save_part_tracker_snapshot(tracker, &tid, "shutdown").await;
+            }));
+        if tokio::time::timeout(std::time::Duration::from_secs(8), saves)
+            .await
+            .is_err()
+        {
+            warn!("Timed out saving some .part.met file(s) within the shutdown window");
         }
         info!("Saved {count} download tracker(s) on shutdown");
     }
@@ -18604,6 +18728,40 @@ async fn handle_udp_packet_inner(
                     send_kad_response(socket, &packet, from, state, None, packet_sender_udp_key)
                         .await;
             }
+
+            // Same connect-back guards as KADEMLIA_FIREWALLED_REQ (v1): the TCP
+            // connect-back is expensive and otherwise abusable as a reflective
+            // probe, so reject port 0/53 and special-use destinations and
+            // rate-limit per requester IP (shared cooldown map) before
+            // spending a connection on it.
+            let requester_ip = match from.ip() {
+                std::net::IpAddr::V4(v4) => v4,
+                _ => return,
+            };
+            const FIREWALL2_REQ_COOLDOWN_SECS: i64 = 60;
+            const MAX_FIREWALL2_REQ_COOLDOWN_ENTRIES: usize = 4096;
+            if peer_tcp_port == 0
+                || peer_tcp_port == 53
+                || crate::security::is_special_use_v4(requester_ip)
+            {
+                return;
+            }
+            let now = chrono::Utc::now().timestamp();
+            if state.firewall_req_cooldown.len() >= MAX_FIREWALL2_REQ_COOLDOWN_ENTRIES {
+                state
+                    .firewall_req_cooldown
+                    .retain(|_, ts| now - *ts < FIREWALL2_REQ_COOLDOWN_SECS);
+            }
+            if let Some(prev) = state.firewall_req_cooldown.get(&requester_ip) {
+                if now - *prev < FIREWALL2_REQ_COOLDOWN_SECS {
+                    debug!(
+                        "Skipping Firewalled2 connect-back to {requester_ip}: within {FIREWALL2_REQ_COOLDOWN_SECS}s cooldown"
+                    );
+                    return;
+                }
+            }
+            state.firewall_req_cooldown.insert(requester_ip, now);
+
             if peer_tcp_port > 0 {
                 let peer_ip = match from.ip() {
                     std::net::IpAddr::V4(v4) => v4,

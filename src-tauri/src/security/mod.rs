@@ -398,7 +398,21 @@ pub fn is_path_within_dirs(canonical: &Path, allowed_dirs: &[String]) -> bool {
     allowed_dirs
         .iter()
         .any(|dir| match std::fs::canonicalize(dir) {
-            Ok(canon_dir) => canonical.starts_with(&canon_dir),
+            Ok(canon_dir) => {
+                // Refuse a containment match against a filesystem root (e.g.
+                // "C:\" or "/"): every path on the volume `starts_with` it, so
+                // a root entry in `allowed_dirs` would authorise the entire
+                // disk for open/delete/collection operations. This mirrors the
+                // bare-drive guard in `path_matches_dir`. A concrete shared
+                // folder always has a parent component.
+                if canon_dir.parent().is_none() {
+                    tracing::warn!(
+                        "Ignoring filesystem-root allowed dir {dir:?} in containment check"
+                    );
+                    return false;
+                }
+                canonical.starts_with(&canon_dir)
+            }
             Err(e) => {
                 tracing::debug!("Skipping non-canonicalizable allowed dir {dir:?}: {e}");
                 false
@@ -582,10 +596,32 @@ pub fn atomic_write(final_path: &Path, data: &[u8], restrict: bool) -> std::io::
         }
     }
 
-    #[cfg(unix)]
-    if let Some(parent) = final_path.parent() {
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
+    // Best-effort durability for the rename itself by flushing the parent
+    // directory's metadata. On Unix this is a plain directory fsync. On Windows
+    // a directory handle must be opened with FILE_FLAG_BACKUP_SEMANTICS
+    // (0x0200_0000) before `FlushFileBuffers` (std's `sync_all`) will accept it
+    // — previously this step was skipped entirely on Windows, so a crash right
+    // after the rename could lose the directory entry even though the file
+    // contents were synced. Failures are non-fatal: the file data is already
+    // durable from the `sync_all` above.
+    if let Some(parent) = final_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        #[cfg(unix)]
+        {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            if let Ok(dir) = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(parent)
+            {
+                let _ = dir.sync_all();
+            }
         }
     }
 
