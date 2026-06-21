@@ -374,4 +374,8 @@ export interface AppSettings {
    *  - `'exit'`: fully quit the application.
    */
   close_to_tray_behavior: 'ask' | 'tray' | 'exit';
+  /** Maximize the main window on launch. Applied once at startup (the
+   *  window is created at its configured size), so a change only affects
+   *  the next launch. Off by default. */
+  launch_maximized: boolean;
 }

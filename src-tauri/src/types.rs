@@ -628,6 +628,21 @@ pub struct AppSettings {
     /// users on older configs.
     #[serde(default = "default_close_to_tray_behavior")]
     pub close_to_tray_behavior: String,
+    /// Maximize the main window when Ember launches.
+    ///
+    /// The window is created at its configured size (see `tauri.conf.json`)
+    /// and maximized during startup when this is set — it's a launch-time
+    /// preference, not a live toggle, so changing it only takes effect on
+    /// the next launch. Off by default.
+    ///
+    /// `alias = "launch_fullscreen"` accepts this field's former name (shipped
+    /// in an intermediate build) so an existing `config.json` still
+    /// deserializes — without it, the unknown key would trip
+    /// `deny_unknown_fields`, and the loader would treat the whole config as
+    /// corrupt and reset every setting to defaults. The old boolean carries
+    /// over unchanged; the canonical name is written back on the next save.
+    #[serde(default, alias = "launch_fullscreen")]
+    pub launch_maximized: bool,
     /// Per-shared-folder default upload priority (eMule: directory priority).
     /// Maps a shared folder path to one of the priority strings
     /// (`verylow`/`low`/`normal`/`high`/`release`/`auto`). Files discovered
@@ -933,6 +948,7 @@ impl Default for AppSettings {
             rendezvous_url: default_rendezvous_url(),
             ember_native_enabled: false,
             close_to_tray_behavior: default_close_to_tray_behavior(),
+            launch_maximized: false,
         }
     }
 }
@@ -977,4 +993,55 @@ pub struct TransferSourcesPayload<'a> {
     pub sources: u32,
     pub active_sources: u32,
     pub queued_sources: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `config.json` written by the intermediate build stores the launch
+    /// preference under the old key `launch_fullscreen`. Because `AppSettings`
+    /// is `#[serde(deny_unknown_fields)]`, that key must be accepted via the
+    /// serde alias — otherwise the loader would reject the whole file as
+    /// corrupt and silently reset every setting to defaults. This guards the
+    /// rename so the migration can't regress.
+    #[test]
+    fn legacy_launch_fullscreen_key_maps_to_launch_maximized() {
+        let mut value =
+            serde_json::to_value(AppSettings::default()).expect("serialize default settings");
+        let obj = value
+            .as_object_mut()
+            .expect("AppSettings serializes to a JSON object");
+        // Simulate an on-disk config from the intermediate build: the canonical
+        // key is absent and the former key is present (set to true so the
+        // assertion proves the value carries over, not just that it parses).
+        obj.remove("launch_maximized");
+        obj.insert("launch_fullscreen".to_string(), serde_json::json!(true));
+
+        let parsed: AppSettings = serde_json::from_value(value)
+            .expect("config using the legacy launch_fullscreen key must still deserialize");
+        assert!(
+            parsed.launch_maximized,
+            "the legacy launch_fullscreen value should carry over to launch_maximized"
+        );
+    }
+
+    /// Configs predating the setting entirely (neither key present) must also
+    /// load, defaulting the preference to off.
+    #[test]
+    fn missing_launch_key_defaults_to_off() {
+        let mut value =
+            serde_json::to_value(AppSettings::default()).expect("serialize default settings");
+        value
+            .as_object_mut()
+            .expect("AppSettings serializes to a JSON object")
+            .remove("launch_maximized");
+
+        let parsed: AppSettings = serde_json::from_value(value)
+            .expect("config without the launch key must deserialize");
+        assert!(
+            !parsed.launch_maximized,
+            "launch_maximized should default to false when absent"
+        );
+    }
 }

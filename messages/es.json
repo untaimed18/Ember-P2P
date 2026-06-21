@@ -1478,6 +1478,8 @@
   "settings_theme_dark": "Oscuro",
   "settings_nickname_label": "Apodo",
   "settings_nickname_placeholder": "Tu nombre para mostrar",
+  "settings_launch_maximized_label": "Iniciar maximizado",
+  "settings_launch_maximized_hint": "Abre Ember maximizado para llenar la pantalla al iniciar. Se aplica la pr\u00f3xima vez que inicies la aplicaci\u00f3n.",
   "settings_close_behavior_label": "Al cerrar la ventana",
   "settings_close_behavior_hint": "Elige qu\u00e9 sucede cuando pulsas la X de la barra de t\u00edtulo. El icono de la bandeja del sistema sigue disponible en cualquier caso para que puedas reabrir Ember desde ah\u00ed.",
   "settings_close_behavior_ask": "Preguntar cada vez",
