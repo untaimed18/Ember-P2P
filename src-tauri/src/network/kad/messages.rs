@@ -297,9 +297,13 @@ fn decode_message(opcode: u8, cursor: &mut Cursor<&[u8]>) -> io::Result<KadMessa
             let version = cursor.read_u8()?;
             // Cap the parsed count at 200 (sanity bound + allocation cap), then
             // read exactly that many fixed-size contacts, failing on truncation
-            // rather than silently accepting a partial list as complete.
+            // rather than silently accepting a partial list as complete. eMule
+            // sends at most 20, so an over-cap count means a malformed packet.
             let count = cursor.read_u16::<LittleEndian>()? as usize;
             let take = count.min(200);
+            if count > 200 {
+                tracing::warn!("KAD BOOTSTRAP_RES declared {count} contacts, capping parse to 200");
+            }
             let mut contacts = Vec::with_capacity(take);
             for _ in 0..take {
                 contacts.push(KadContact::read_from(cursor)?);
@@ -426,8 +430,19 @@ fn decode_message(opcode: u8, cursor: &mut Cursor<&[u8]>) -> io::Result<KadMessa
         KADEMLIA2_PUBLISH_KEY_REQ => {
             let target = KadId::read_from(cursor)?;
             let count = cursor.read_u16::<LittleEndian>()? as usize;
-            let mut entries = Vec::with_capacity(count.min(50));
-            for _ in 0..count.min(50) {
+            // eMule indexes every keyword entry the packet physically carries
+            // (Process_KADEMLIA2_PUBLISH_KEY_REQ loops the full declared count).
+            // The previous hard cap of 50 silently dropped — yet still ACKed —
+            // legitimately-published entries from a busy publisher. Use the same
+            // generous bound as SEARCH_RES and warn instead of dropping quietly.
+            let capped = count.min(300);
+            if count > 300 {
+                tracing::warn!(
+                    "KAD PUBLISH_KEY_REQ declared {count} entries, capping parse to 300"
+                );
+            }
+            let mut entries = Vec::with_capacity(capped);
+            for _ in 0..capped {
                 let id = KadId::read_from(cursor)?;
                 let tags = read_tag_list(cursor)?;
                 entries.push(PublishEntry { id, tags });
@@ -504,8 +519,13 @@ fn decode_message(opcode: u8, cursor: &mut Cursor<&[u8]>) -> io::Result<KadMessa
 
         KADEMLIA_FIREWALLED2_REQ => {
             let tcp_port = cursor.read_u16::<LittleEndian>()?;
-            let mut user_hash = [0u8; 16];
-            cursor.read_exact(&mut user_hash)?;
+            let mut user_hash_wire = [0u8; 16];
+            cursor.read_exact(&mut user_hash_wire)?;
+            // eMule carries the client hash as a CUInt128 (WriteUInt128), i.e.
+            // the raw ed2k user hash byte-swapped within each 4-byte group.
+            // Convert back to the raw hash so downstream consumers (e.g. the
+            // RC4 obfuscation seed used for the TCP connect-back) match eMule.
+            let user_hash = cuint128_swap(&user_hash_wire);
             let connect_options = cursor.read_u8()?;
             Ok(KadMessage::Firewalled2Req {
                 tcp_port,
@@ -541,8 +561,10 @@ fn decode_message(opcode: u8, cursor: &mut Cursor<&[u8]>) -> io::Result<KadMessa
 
         KADEMLIA_FINDBUDDY_RES => {
             let buddy_id = KadId::read_from(cursor)?;
-            let mut user_hash = [0u8; 16];
-            cursor.read_exact(&mut user_hash)?;
+            let mut user_hash_wire = [0u8; 16];
+            cursor.read_exact(&mut user_hash_wire)?;
+            // CUInt128 wire form -> raw ed2k user hash (see Firewalled2Req).
+            let user_hash = cuint128_swap(&user_hash_wire);
             let tcp_port = cursor.read_u16::<LittleEndian>()?;
             let connect_options = if cursor.position() < cursor.get_ref().len() as u64 {
                 cursor.read_u8().unwrap_or(0)
@@ -575,6 +597,11 @@ fn decode_message(opcode: u8, cursor: &mut Cursor<&[u8]>) -> io::Result<KadMessa
         KADEMLIA_BOOTSTRAP_RES_OLD => {
             let count = cursor.read_u16::<LittleEndian>()? as usize;
             let take = count.min(200);
+            if count > 200 {
+                tracing::warn!(
+                    "KAD BOOTSTRAP_RES (old) declared {count} contacts, capping parse to 200"
+                );
+            }
             let mut contacts = Vec::with_capacity(take);
             for _ in 0..take {
                 contacts.push(KadContact::read_from(cursor)?);
@@ -591,8 +618,14 @@ fn decode_message(opcode: u8, cursor: &mut Cursor<&[u8]>) -> io::Result<KadMessa
         KADEMLIA_SEARCH_RES_OLD | KADEMLIA_SEARCH_NOTES_RES_OLD => {
             let target = KadId::read_from(cursor)?;
             let count = cursor.read_u16::<LittleEndian>()? as usize;
-            let mut results = Vec::with_capacity(count.min(300));
-            for _ in 0..count.min(300) {
+            let capped = count.min(300);
+            if count > 300 {
+                tracing::warn!(
+                    "KAD legacy SEARCH_RES declared {count} results, capping parse to 300"
+                );
+            }
+            let mut results = Vec::with_capacity(capped);
+            for _ in 0..capped {
                 let id = KadId::read_from(cursor)?;
                 let tags = read_tag_list(cursor)?;
                 results.push(SearchResultEntry { id, tags });
@@ -854,7 +887,11 @@ fn encode_message(msg: &KadMessage, out: &mut Vec<u8>) -> io::Result<()> {
         } => {
             out.write_u8(KADEMLIA_FIREWALLED2_REQ)?;
             out.write_u16::<LittleEndian>(*tcp_port)?;
-            out.write_all(user_hash)?;
+            // eMule serialises the client hash as a CUInt128 (WriteUInt128),
+            // i.e. the raw ed2k user hash byte-swapped within each 4-byte
+            // group. `user_hash` is stored raw in-memory, so swap on the way
+            // out to stay wire-compatible with real eMule peers.
+            out.write_all(&cuint128_swap(user_hash))?;
             out.write_u8(*connect_options)?;
         }
 
@@ -891,7 +928,8 @@ fn encode_message(msg: &KadMessage, out: &mut Vec<u8>) -> io::Result<()> {
         } => {
             out.write_u8(KADEMLIA_FINDBUDDY_RES)?;
             buddy_id.write_to(out)?;
-            out.write_all(user_hash)?;
+            // CUInt128 wire form of the raw ed2k user hash (see Firewalled2Req).
+            out.write_all(&cuint128_swap(user_hash))?;
             out.write_u16::<LittleEndian>(*tcp_port)?;
             out.write_u8(*connect_options)?;
         }
@@ -1335,6 +1373,56 @@ mod publish_res_tests {
         match decode_packet(&bytes).unwrap() {
             KadMessage::PublishRes { request_ack, .. } => {
                 assert!(!request_ack, "options without bit0 must not request an ack");
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod buddy_hash_wire_tests {
+    use super::*;
+
+    // Distinctive hash where the per-4-byte CUInt128 swap is observable.
+    const RAW: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+    const WIRE: [u8; 16] = [3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12];
+
+    #[test]
+    fn firewalled2_req_user_hash_is_cuint128_on_wire() {
+        // eMule's KADEMLIA_FIREWALLED2_REQ writes the client hash via
+        // WriteUInt128, i.e. the raw ed2k hash byte-swapped within each
+        // 4-byte group. Header + opcode + tcp_port(2) => hash at [4..20].
+        let bytes = encode_packet(&KadMessage::Firewalled2Req {
+            tcp_port: 4662,
+            user_hash: RAW,
+            connect_options: 0,
+        })
+        .unwrap();
+        assert_eq!(&bytes[4..20], &WIRE, "wire hash must be CUInt128-swapped");
+
+        match decode_packet(&bytes).unwrap() {
+            KadMessage::Firewalled2Req { user_hash, .. } => {
+                assert_eq!(user_hash, RAW, "decode must restore the raw ed2k hash");
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn findbuddy_res_user_hash_is_cuint128_on_wire() {
+        // Header + opcode + buddy_id(16) => hash at [18..34].
+        let bytes = encode_packet(&KadMessage::FindBuddyRes {
+            buddy_id: KadId([0xAB; 16]),
+            user_hash: RAW,
+            tcp_port: 4662,
+            connect_options: 0,
+        })
+        .unwrap();
+        assert_eq!(&bytes[18..34], &WIRE, "wire hash must be CUInt128-swapped");
+
+        match decode_packet(&bytes).unwrap() {
+            KadMessage::FindBuddyRes { user_hash, .. } => {
+                assert_eq!(user_hash, RAW, "decode must restore the raw ed2k hash");
             }
             other => panic!("unexpected message: {other:?}"),
         }
