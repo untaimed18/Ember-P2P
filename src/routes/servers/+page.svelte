@@ -94,6 +94,12 @@
   let ctxMenu: { x: number; y: number; server: ServerInfo } | null = $state(null);
 
   let connecting = $state(false);
+  // Monotonic id bumped whenever the user cancels/disconnects. A connect
+  // attempt captures the current value and, if it has changed by the time the
+  // (non-abortable) `connectToServer` IPC resolves, treats itself as cancelled
+  // — suppressing its success/error UI and tearing down any connection that
+  // landed after the user already hit Cancel.
+  let connectGen = 0;
   let refreshInProgress = false;
   let pendingRefresh = false;
   let mounted = false;
@@ -227,6 +233,7 @@
       flash(m.servers_already_connected({ name: target.name || target.ip, port: target.port }));
       return;
     }
+    const gen = ++connectGen;
     connecting = true;
     error = null;
     try {
@@ -234,17 +241,36 @@
         log(m.servers_log_switching({ from_ip: connectedServer.ip, from_port: connectedServer.port, to_ip: target.ip, to_port: target.port }));
       }
       await connectToServer(target.ip, target.port);
+      if (gen !== connectGen) {
+        // The user hit Cancel while this connect was in flight. `connectToServer`
+        // can't be aborted mid-call, so undo any connection that completed after
+        // the cancel and stay quiet (no success log/state for an aborted action).
+        // Skip the teardown if a newer connect is already in progress
+        // (`connecting === true`): that attempt now owns the single server
+        // connection, and disconnecting here would kill the one it's
+        // establishing.
+        if (!connecting) {
+          try { await disconnectServer(); } catch { /* best-effort cleanup */ }
+        }
+        return;
+      }
     } catch (e: unknown) {
+      if (gen !== connectGen) return; // cancelled — suppress the stale error
       const msg = toErrorMsg(e);
       error = msg;
       log(m.servers_log_connection_failed({ error: msg }));
     } finally {
-      connecting = false;
+      if (gen === connectGen) connecting = false;
     }
   }
 
   async function handleDisconnect() {
     error = null;
+    // Invalidate any in-flight connect so its result is undone/ignored, and
+    // reflect the cancellation in the UI immediately rather than waiting for
+    // the connect IPC to resolve.
+    connectGen++;
+    connecting = false;
     const prev = connectedServer;
     try {
       const msg = await disconnectServer();

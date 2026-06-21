@@ -53,6 +53,7 @@
   async function refreshLocalSettings() {
     try {
       const s = await getSettings();
+      if (unmounted) return;
       localUdpPort = s.udp_port;
     } catch {
       // Non-fatal — the form still works, just without the port hint.
@@ -1064,7 +1065,7 @@
       <div class="result {pingResult.success ? 'result-ok' : 'result-fail'}">
         {#if pingResult.success}
           <strong>OK</strong>
-          {#if pingResult.rtt_ms !== undefined && pingResult.rtt_ms !== null}
+          {#if pingResult.rtt_ms !== undefined && pingResult.rtt_ms !== null && Number.isFinite(pingResult.rtt_ms)}
             <span class="rtt">{pingResult.rtt_ms.toFixed(2)} ms</span>
           {/if}
         {:else}

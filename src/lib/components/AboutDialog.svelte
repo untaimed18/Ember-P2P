@@ -11,10 +11,12 @@
 
   import { fade, scale } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
+  import { inertBackground } from '$lib/a11y';
 
   let { open = $bindable(false) }: { open?: boolean } = $props();
 
   let panelEl: HTMLDivElement | undefined = $state(undefined);
+  let overlayEl: HTMLDivElement | undefined = $state(undefined);
   const instanceId = Math.random().toString(36).slice(2, 10);
 
   function close() {
@@ -51,12 +53,19 @@
       });
     }
   });
+
+  // Keep background content out of the AT/Tab order while the dialog is open.
+  $effect(() => {
+    if (!open || !overlayEl) return;
+    return inertBackground(overlayEl);
+  });
 </script>
 
 {#if open}
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <div
     class="about-overlay"
+    bind:this={overlayEl}
     role="dialog"
     aria-modal="true"
     aria-labelledby="about-title-{instanceId}"

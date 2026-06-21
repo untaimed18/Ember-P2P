@@ -7,6 +7,7 @@
   import IconX from './IconX.svelte';
   import { fade, scale } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
+  import { inertBackground, trapTabKey } from '$lib/a11y';
 
   type Shortcut = { keys: string[]; label: () => string };
   type Group = { title: () => string; shortcuts: Shortcut[] };
@@ -14,6 +15,7 @@
   let { open = $bindable(false) }: { open?: boolean } = $props();
 
   let panelEl: HTMLDivElement | undefined = $state();
+  let overlayEl: HTMLDivElement | undefined = $state();
 
   // Auto-focus the panel when it opens so Escape works without the
   // user having to click inside first. Matches AboutDialog's pattern.
@@ -23,6 +25,12 @@
         panelEl?.focus();
       });
     }
+  });
+
+  // Keep background content out of the AT/Tab order while the dialog is open.
+  $effect(() => {
+    if (!open || !overlayEl) return;
+    return inertBackground(overlayEl);
   });
 
   // Group/shortcut labels are stored as thunks so the table re-
@@ -72,13 +80,17 @@
     if (e.key === 'Escape') {
       e.preventDefault();
       open = false;
+      return;
     }
+    // Trap Tab within the panel so focus can't escape to the (inert)
+    // background while the cheat-sheet is open.
+    trapTabKey(e, panelEl);
   }
 </script>
 
 {#if open}
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
-  <div class="shortcut-overlay" onclick={() => (open = false)} onkeydown={onKeydown} transition:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}>
+  <div class="shortcut-overlay" bind:this={overlayEl} onclick={() => (open = false)} onkeydown={onKeydown} transition:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}>
     <div
       class="shortcut-panel"
       role="dialog"

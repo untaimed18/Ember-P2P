@@ -400,6 +400,11 @@
     if (!settings || !originalSettings) return;
     try {
       settings = JSON.parse(originalSettings) as AppSettings;
+      // The anti-leech pattern textarea is edited via its own `antileechDraft`
+      // state (saved with a dedicated button), so a plain settings revert
+      // wouldn't touch it. Revert it to the last loaded/saved snapshot too so
+      // "Discard" reverts everything the user sees as pending.
+      if (antileechSnapshot) antileechDraft = antileechSnapshot.patterns.join('\n');
       showSaveMsg(m.settings_changes_reverted(), false, 2000);
     } catch (e) {
       // `originalSettings` should always be valid JSON we serialized
@@ -571,6 +576,18 @@
       // stop so a slow earlier response can't clobber the latest state.
       if (gen !== antileechToggleGen) return;
       if (settings) settings.antileech_enabled = checked;
+      // The toggle is applied + persisted independently of the Save button, so
+      // fold it into the saved baseline too. Otherwise `hasUnsavedChanges` (a
+      // JSON diff against `originalSettings`) reports a phantom unsaved change
+      // — and the beforeunload guard fires — for a change already on disk.
+      // Patch only this one field so other genuinely-unsaved edits stay flagged.
+      if (originalSettings) {
+        try {
+          const base = JSON.parse(originalSettings) as AppSettings;
+          base.antileech_enabled = checked;
+          originalSettings = JSON.stringify(base);
+        } catch { /* malformed baseline; leave as-is */ }
+      }
       // Also refresh the snapshot so the on-disk badge stays in sync.
       if (antileechLoaded) {
         const snap = await getAntileechPatterns();

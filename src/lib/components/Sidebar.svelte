@@ -123,6 +123,13 @@
   }
 
   function onShortcutKey(e: KeyboardEvent) {
+    // Don't fire global navigation/toggle shortcuts while a modal dialog is
+    // open. `inert` on `.app-shell` (set by ConfirmDialog/CloseAppDialog/etc.)
+    // doesn't stop a window-level listener, so without this guard a keystroke
+    // could navigate away behind a confirm/close prompt or stack the shortcuts
+    // sheet under it. The chat dock uses role="complementary" (not a modal),
+    // so shortcuts intentionally keep working alongside it.
+    if (typeof document !== 'undefined' && document.querySelector('[aria-modal="true"]')) return;
     // "?" or F1 — open the keyboard shortcuts cheat-sheet. F1 is the
     // legacy desktop help key; "?" matches GitHub/Slack/Linear
     // conventions. Blocked while typing so users can still type "?"
