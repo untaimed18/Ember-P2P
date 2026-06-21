@@ -1511,6 +1511,8 @@
   "settings_theme_dark": "Dark",
   "settings_nickname_label": "Nickname",
   "settings_nickname_placeholder": "Your display name",
+  "settings_launch_maximized_label": "Launch maximized",
+  "settings_launch_maximized_hint": "Open Ember maximized to fill the screen when it starts. Takes effect the next time you launch the app.",
   "settings_close_behavior_label": "When closing the window",
   "settings_close_behavior_hint": "Choose what happens when you click the title-bar X. The system tray icon stays available either way so you can reopen Ember from there.",
   "settings_close_behavior_ask": "Ask each time",

@@ -910,6 +910,13 @@
             <label for="nickname">{m.settings_nickname_label()}</label>
             <input id="nickname" bind:value={settings.nickname} placeholder={m.settings_nickname_placeholder()} />
           </div>
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">{m.settings_launch_maximized_label()}</span>
+              <span class="hint">{m.settings_launch_maximized_hint()}</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.launch_maximized} ariaLabel={m.settings_launch_maximized_label()} />
+          </div>
           <div class="field">
             <span class="field-label">{m.settings_close_behavior_label()}</span>
             <span class="hint">
