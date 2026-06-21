@@ -145,17 +145,17 @@ impl KnownFileList {
         let mut file_hash = [0u8; 16];
         cursor.read_exact(&mut file_hash)?;
 
+        // Part-hash count is a u16 on disk (max 65535 ≈ 608 GiB at PARTSIZE),
+        // matching eMule's known.met layout and our own writer, which persists
+        // up to u16::MAX hashes. Read the full set: an earlier 1000-hash clamp
+        // silently dropped trailing part hashes for files larger than ~9.06 GiB
+        // on reload, desyncing the in-memory hashset from what was saved.
         let part_count = cursor.read_u16::<LittleEndian>()? as usize;
-        let clamped_parts = part_count.min(1000);
-        let mut part_hashes = Vec::with_capacity(clamped_parts);
-        for _ in 0..clamped_parts {
+        let mut part_hashes = Vec::with_capacity(part_count);
+        for _ in 0..part_count {
             let mut ph = [0u8; 16];
             cursor.read_exact(&mut ph)?;
             part_hashes.push(ph);
-        }
-        for _ in clamped_parts..part_count {
-            let mut skip = [0u8; 16];
-            cursor.read_exact(&mut skip)?;
         }
 
         let tag_count = cursor.read_u32::<LittleEndian>()? as usize;

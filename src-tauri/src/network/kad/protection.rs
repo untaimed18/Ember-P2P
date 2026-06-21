@@ -12,6 +12,11 @@ const DEFAULT_OPCODE_LIMIT: u32 = 5;
 /// phase for >60s before the matching response arrives).
 const TRACKER_EXPIRY_SECS: u64 = 180;
 const MAX_OUTGOING_PER_IP_PER_SEC: u32 = 30;
+/// Maximum `KADEMLIA2_SEARCH_RES` batches accepted for one outgoing
+/// SearchKey/Source/Notes request. eMule may split results across multiple
+/// packets, so one response per request is too strict; leaving the request as
+/// an unlimited pass until the 180s expiry is too loose.
+const SEARCH_RES_BUDGET_PER_REQUEST: u32 = 8;
 
 /// Per-IP global cap (second-level, matching eMule's "massive flood" detection).
 const MAX_PACKETS_PER_SEC_UNKNOWN: u32 = 20;
@@ -83,6 +88,9 @@ pub struct FloodProtection {
     /// NAT sometimes reply from a different source port than we sent to,
     /// and eMule allows that.
     outgoing_requests: HashMap<(IpAddr, u8), u32>,
+    /// Bounded SearchRes batches per outstanding Search* request. SearchRes is
+    /// the one response type that is legitimately multi-packet per request.
+    search_response_budgets: HashMap<(IpAddr, u8), u32>,
     request_times: HashMap<(IpAddr, u8), Instant>,
     outgoing_counters: HashMap<IpAddr, (u32, Instant)>,
     recent_ips: HashMap<IpAddr, Instant>,
@@ -99,6 +107,7 @@ impl FloodProtection {
             ip_counters: HashMap::new(),
             opcode_counters: HashMap::new(),
             outgoing_requests: HashMap::new(),
+            search_response_budgets: HashMap::new(),
             request_times: HashMap::new(),
             outgoing_counters: HashMap::new(),
             recent_ips: HashMap::new(),
@@ -279,6 +288,10 @@ impl FloodProtection {
         let key = (addr.ip(), opcode);
         let count = self.outgoing_requests.entry(key).or_insert(0);
         *count = count.saturating_add(1);
+        if matches!(opcode, 0x33 | 0x34 | 0x35) {
+            let budget = self.search_response_budgets.entry(key).or_insert(0);
+            *budget = budget.saturating_add(SEARCH_RES_BUDGET_PER_REQUEST);
+        }
         // `request_times` is dual-purpose:
         //   1. `cleanup()` expires (ip, opcode) entries whose most
         //      recent send is older than `TRACKER_EXPIRY_SECS` — this
@@ -312,6 +325,7 @@ impl FloodProtection {
                 *count -= 1;
                 if *count == 0 {
                     self.outgoing_requests.remove(key);
+                    self.search_response_budgets.remove(key);
                     self.request_times.remove(key);
                 }
                 return true;
@@ -340,15 +354,23 @@ impl FloodProtection {
 
         if let Some(req_op) = request_opcode {
             if response_opcode == 0x3B {
-                // KAD peers send multiple SearchRes packets per SearchKeyReq
-                // (one per batch of results). Do NOT decrement on any single
-                // response; just check presence so subsequent batches still
-                // validate. The entry will expire via `TRACKER_EXPIRY_SECS`.
-                if self.outgoing_requests.contains_key(&(ip, req_op))
-                    || self.outgoing_requests.contains_key(&(ip, 0x34))
-                    || self.outgoing_requests.contains_key(&(ip, 0x35))
-                {
-                    return true;
+                // KAD peers send multiple SearchRes packets per Search*Req
+                // (result batches). Consume a bounded per-request budget so
+                // legitimate multi-packet replies still pass while unsolicited
+                // floods do not get a 180-second unlimited window.
+                for cand in [req_op, 0x34, 0x35] {
+                    let key = (ip, cand);
+                    if let Some(budget) = self.search_response_budgets.get_mut(&key) {
+                        if *budget > 0 {
+                            *budget -= 1;
+                            if *budget == 0 {
+                                self.search_response_budgets.remove(&key);
+                                self.outgoing_requests.remove(&key);
+                                self.request_times.remove(&key);
+                            }
+                            return true;
+                        }
+                    }
                 }
                 return false;
             }
@@ -424,6 +446,7 @@ impl FloodProtection {
             .collect();
         for key in stale {
             self.outgoing_requests.remove(&key);
+            self.search_response_budgets.remove(&key);
             self.request_times.remove(&key);
         }
 
@@ -522,6 +545,27 @@ mod kad_protection_tests {
         assert!(
             fp.validate_response(reply_from, 0x4B),
             "reply from a different source port on the same IP must still validate"
+        );
+    }
+
+    /// SearchRes is legitimately multi-packet per one Search* request, but the
+    /// tracker must not leave an unlimited 180-second response window open.
+    #[test]
+    fn search_response_budget_allows_batches_but_caps_floods() {
+        let mut fp = FloodProtection::new();
+        let addr: SocketAddr = "203.0.113.11:4672".parse().unwrap();
+        fp.track_request(addr, 0x34);
+
+        for i in 0..SEARCH_RES_BUDGET_PER_REQUEST {
+            assert!(
+                fp.validate_response(addr, 0x3B),
+                "SearchRes batch {} should consume the request budget",
+                i + 1
+            );
+        }
+        assert!(
+            !fp.validate_response(addr, 0x3B),
+            "SearchRes beyond the per-request budget must be rejected"
         );
     }
 

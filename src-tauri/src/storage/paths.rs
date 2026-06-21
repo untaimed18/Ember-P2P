@@ -158,6 +158,15 @@ fn paths_equivalent(a: &Path, b: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes tests that mutate the process-global `EMBER_DATA_DIR_ENV`.
+    /// Cargo runs tests on parallel threads in one process, so without this a
+    /// second test's `set_var`/`remove_var` can clobber the variable between
+    /// another test's own `set_var` and its `resolve_data_dir()` read, making
+    /// the assertion fail nondeterministically. Recover from poisoning so one
+    /// failing test doesn't cascade into the other.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// `env_override` must respect the `EMBER_DATA_DIR_ENV` constant by
     /// name — that's what every documented harness invocation references.
@@ -165,6 +174,7 @@ mod tests {
     /// downstream callers see the override.
     #[test]
     fn env_override_takes_priority_when_set() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let original = std::env::var(EMBER_DATA_DIR_ENV).ok();
 
         let tmp = std::env::temp_dir().join("ember-paths-test-override");
@@ -179,6 +189,7 @@ mod tests {
 
     #[test]
     fn empty_env_value_is_treated_as_unset() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let original = std::env::var(EMBER_DATA_DIR_ENV).ok();
 
         std::env::set_var(EMBER_DATA_DIR_ENV, "   ");

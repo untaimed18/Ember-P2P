@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Bump the app version across the three files that MUST stay in lockstep:
 //   - package.json
-//   - src-tauri/tauri.conf.json
+//   - src-tauri/tauri.conf.json (including Windows WiX's 4-part MSI version)
 //   - src-tauri/Cargo.toml  ([package] version only)
 //
 // The Tauri updater compares the running app's version (baked in from
@@ -34,6 +34,10 @@ updateJson('package.json', (j) => {
 });
 updateJson('src-tauri/tauri.conf.json', (j) => {
   j.version = version;
+  j.bundle ??= {};
+  j.bundle.windows ??= {};
+  j.bundle.windows.wix ??= {};
+  j.bundle.windows.wix.version = `${version}.0`;
 });
 
 // Cargo.toml: replace only the [package] `version = "x.y.z"` line (anchored to
