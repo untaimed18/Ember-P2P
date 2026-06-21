@@ -85,6 +85,10 @@ function toMessage(e: unknown): string {
  * Returns true when an update is available.
  */
 export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<boolean> {
+  // Never run while a download/install is in progress: `disposePending()`
+  // below would `close()` the very `Update` resource `installUpdate()` is
+  // mid-way through streaming, aborting it. A check during install is a no-op.
+  if (installInFlight) return false;
   await disposePending();
   updater.update((s) => ({ ...s, phase: 'checking', error: null }));
   try {

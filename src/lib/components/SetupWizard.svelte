@@ -515,7 +515,7 @@
 
     <!-- Footer -->
     <div class="wizard-footer">
-      {#if step > 1 && !saving}
+      {#if step > 1 && !saving && !downloading}
         <button type="button" class="btn-back" onclick={goBack}>{m.common_back()}</button>
       {:else}
         <div></div>

@@ -60,7 +60,16 @@
   }
 
   function removeRecent(q: string) {
+    const removedIdx = recent.findIndex((r) => r === q);
     recent = recent.filter((r) => r !== q);
+    // Keep the keyboard highlight pointing at the same logical row. Without
+    // this, removing an item at/above `activeIndex` leaves the highlight on
+    // the wrong entry (or past the end of the now-shorter list).
+    if (removedIdx !== -1 && activeIndex >= 0) {
+      if (removedIdx < activeIndex) activeIndex -= 1;
+      else if (removedIdx === activeIndex) activeIndex = -1;
+      if (activeIndex >= recent.length) activeIndex = recent.length - 1;
+    }
     saveRecent();
   }
 
