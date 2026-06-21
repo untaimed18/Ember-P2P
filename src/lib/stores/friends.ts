@@ -66,6 +66,16 @@ export const activeChatHash = writable<string | null>(null);
 let activeChatHashSnapshot: string | null = null;
 activeChatHash.subscribe((v) => { activeChatHashSnapshot = v; });
 
+// Dedup window for inbound `ember:chat-message` events. The backend can deliver
+// the same logical message twice in quick succession (the download- and
+// upload-side session loops both surface it), which would otherwise double-bump
+// the unread badge. The signature includes the message timestamp, so two
+// genuinely-distinct messages (different timestamps) are never collapsed — only
+// true re-emits of the same `(hash, timestamp, body)` tuple are suppressed.
+// `ChatConversation` applies an equivalent dedup to the rendered bubble list.
+const recentChatSigs = new Map<string, number>();
+const CHAT_SIG_TTL_MS = 10_000;
+
 // Best-effort hash → nickname map, used only to name a friend in the
 // "came online" toast. Populated from `get_friends` on init and refreshed when
 // a friendship is confirmed. A rename made elsewhere may briefly show a stale
@@ -154,17 +164,27 @@ export async function initFriendsStore() {
       }),
     );
     registered.push(
-      await listen<{ user_hash: string; direction: string }>('ember:chat-message', (event) => {
-        if (event.payload.direction !== 'received') return;
+      await listen<{ user_hash: string; direction: string; message?: string; timestamp?: number }>('ember:chat-message', (event) => {
+        const p = event.payload;
+        if (p.direction !== 'received') return;
+        // Suppress backend double-emits so the unread badge counts each
+        // inbound message once (see `recentChatSigs` above).
+        const now = Date.now();
+        for (const [k, exp] of recentChatSigs) {
+          if (exp <= now) recentChatSigs.delete(k);
+        }
+        const sig = `${p.user_hash}|${p.timestamp ?? ''}|${p.message ?? ''}`;
+        if (recentChatSigs.has(sig)) return;
+        recentChatSigs.set(sig, now + CHAT_SIG_TTL_MS);
         // If the chat with this friend is open and focused, the
         // user is reading the message in real time — incrementing
         // `unreadCounts` would leave a phantom badge until the
         // tab loses focus and is reactivated. `ChatConversation`
         // separately marks the message read on the backend.
-        if (activeChatHashSnapshot === event.payload.user_hash) return;
+        if (activeChatHashSnapshot === p.user_hash) return;
         unreadCounts.update((m) => {
           const next = new Map(m);
-          next.set(event.payload.user_hash, (next.get(event.payload.user_hash) || 0) + 1);
+          next.set(p.user_hash, (next.get(p.user_hash) || 0) + 1);
           return next;
         });
       }),
@@ -259,7 +279,18 @@ export async function initFriendsStore() {
 
   try {
     const counts = await getUnreadMessageCounts();
-    unreadCounts.set(new Map(counts));
+    // Merge rather than replace: the `ember:chat-message` listener is
+    // registered above, so an inbound message that lands during init has
+    // already bumped `unreadCounts`. A blind `set` would drop that live
+    // increment. Take the max per friend so we neither lose a bump that the
+    // DB snapshot hasn't captured yet nor double-count one it already has.
+    unreadCounts.update((cur) => {
+      const next = new Map<string, number>(counts);
+      for (const [hash, n] of cur) {
+        next.set(hash, Math.max(next.get(hash) ?? 0, n));
+      }
+      return next;
+    });
   } catch { /* backend not ready yet */ }
 
   // M6: previously `isDiscoverable` only flipped when the backend
@@ -292,6 +323,22 @@ export function clearUnread(friendHash: string) {
   unreadCounts.update((m) => { const next = new Map(m); next.delete(friendHash); return next; });
 }
 
+/**
+ * Clear any in-progress search state (spinner) and its auto-clear timer for a
+ * friend. Called when a friend is removed from the list so a search that was
+ * mid-flight doesn't leave a spinner spinning against a now-gone row (and so
+ * the TTL timer doesn't fire later against stale state).
+ */
+export function clearFriendSearch(friendHash: string) {
+  clearSearchTimer(friendHash);
+  searchingFriends.update((s) => {
+    if (!s.has(friendHash)) return s;
+    const next = new Set(s);
+    next.delete(friendHash);
+    return next;
+  });
+}
+
 export function cleanupFriendsStore() {
   for (const unlisten of unlisteners) unlisten();
   unlisteners = [];
@@ -304,6 +351,7 @@ export function cleanupFriendsStore() {
   // a re-init would re-arm them on top of stale state.
   for (const t of searchTimers.values()) clearTimeout(t);
   searchTimers.clear();
+  recentChatSigs.clear();
   onlineFriends.set(new Set());
   unreadCounts.set(new Map());
   friendRequests.set([]);

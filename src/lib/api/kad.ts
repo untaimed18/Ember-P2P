@@ -61,10 +61,14 @@ export async function kadBootstrapIp(ip: string, port: number): Promise<string> 
  *  throws with a concrete failure reason. */
 export async function kadBootstrapUrl(url: string): Promise<string> {
   // URL bootstrap includes an HTTP download; give it a longer ceiling.
+  // Must be >= the backend's own 90s deadline (`kad_bootstrap_url` in
+  // peers.rs awaits the worker with a 90s timeout); a shorter client
+  // ceiling would surface a false "timed out" toast while the backend is
+  // still legitimately downloading and may yet succeed.
   return withTimeout(
     invoke<string>('kad_bootstrap_url', { url }),
     'KAD URL bootstrap',
-    60_000,
+    90_000,
   );
 }
 

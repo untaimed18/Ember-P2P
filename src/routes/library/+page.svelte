@@ -194,7 +194,12 @@
   }
 
   async function handleCreateCollection() {
+    // Guard re-entry (double Enter / double click). `creatingCollection` is
+    // set before the first `await` so a second call bails immediately rather
+    // than opening a second save dialog and writing the collection twice.
+    if (creatingCollection) return;
     if (!newCollName.trim() || selectedFileHashes.size === 0) return;
+    creatingCollection = true;
     try {
       const { save: saveDialog } = await import('@tauri-apps/plugin-dialog');
       const isBinary = newCollFormat === 'binary';
@@ -206,10 +211,16 @@
         filters: [{ name: filterName, extensions: [ext] }],
       });
       if (!outputPath) return;
-      creatingCollection = true;
-      const collFiles: CollectionFile[] = hashedLibraryFiles
-        .filter((f) => selectedFileHashes.has(f.hash))
-        .map((f) => ({ name: f.name, size: f.size, hash: f.hash, aich_hash: f.aich_hash }));
+      // De-dupe by hash: two distinct library paths can share one ed2k hash
+      // (the same file shared from two locations), and a collection keyed by
+      // hash should list each file once. Keep first occurrence.
+      const seenHashes = new Set<string>();
+      const collFiles: CollectionFile[] = [];
+      for (const f of hashedLibraryFiles) {
+        if (!selectedFileHashes.has(f.hash) || seenHashes.has(f.hash)) continue;
+        seenHashes.add(f.hash);
+        collFiles.push({ name: f.name, size: f.size, hash: f.hash, aich_hash: f.aich_hash });
+      }
       const msg = await createCollection(newCollName.trim(), newCollAuthor.trim(), collFiles, outputPath, isBinary);
       toastSuccess(msg || m.library_collection_created({ name: newCollName.trim(), count: collFiles.length }));
       createCollectionOpen = false;
@@ -411,6 +422,24 @@
       if (!stoppedByUser) scanning = isScanning;
       files = newFiles;
       folderPriorities = newPriorities;
+      // Drop selection entries whose file no longer exists in the library
+      // (deleted on disk, folder unshared, etc.). `newFiles` is the full
+      // library — not the filtered view — so this only prunes truly-gone
+      // paths, never rows merely hidden by an active filter. Without this the
+      // bulk-bar count and later bulk ops could reference ghost paths.
+      if (checkedPaths.size > 0) {
+        const present = new Set(newFiles.map((f) => f.path));
+        let removed = false;
+        const nextChecked = new Set<string>();
+        for (const p of checkedPaths) {
+          if (present.has(p)) nextChecked.add(p);
+          else removed = true;
+        }
+        if (removed) {
+          checkedPaths = nextChecked;
+          if (lastClickedPath && !present.has(lastClickedPath)) lastClickedPath = null;
+        }
+      }
     } catch (e) {
       if (mounted && e instanceof Error && e.message !== 'timeout')
         console.error('Failed to load shared files:', e);
@@ -466,7 +495,13 @@
       await addSharedFolder(selected as string);
       if (mounted) await refresh();
     } catch (e: unknown) {
-      if (mounted) error = toErr(e);
+      // On success the scanning banner is cleared by the background
+      // hash-progress "done" event; on an `addSharedFolder` failure no such
+      // event fires, so clear it here or the banner sticks until the 3s poll.
+      if (mounted) {
+        scanning = false;
+        error = toErr(e);
+      }
     }
   }
 
@@ -551,10 +586,12 @@
     stoppedByUser = true;
     try {
       await stopHashing();
-      if (mounted) {
-        stoppedByUser = false;
-        await refresh();
-      }
+      // Keep `stoppedByUser` true: it's exactly what gates the "Resume
+      // hashing" banner. Clearing it here (the old behaviour) meant the
+      // banner never appeared after a successful stop, so a half-hashed
+      // library could only be resumed via a full reload. It's cleared on
+      // the next explicit user action (Resume / Reload / Add folder).
+      if (mounted) await refresh();
     } catch (e: unknown) {
       if (mounted) error = toErr(e);
     }
@@ -628,6 +665,11 @@
   // --- Multi-select ---
   let checkedPaths: Set<string> = $state(new Set());
   let lastClickedPath: string | null = $state(null);
+  // Serialises bulk operations: each awaits an IPC then a `refresh()`, so a
+  // double-click (or a second action before the first settles) could fire
+  // overlapping mutations against the same selection. Bulk buttons are
+  // disabled while this is true.
+  let bulkBusy = $state(false);
   let checkedCount = $derived.by(() => {
     let n = 0;
     for (const f of sortedFiles) if (checkedPaths.has(f.path)) n++;
@@ -681,9 +723,16 @@
 
   function toggleCheckAll() {
     if (allFilteredChecked) {
-      checkedPaths = new Set();
+      // Deselect only the currently-visible (filtered) rows. Selections hidden
+      // by the active filter persist by design (see `checkedHiddenCount`), so
+      // a blanket `new Set()` would wrongly drop them.
+      const next = new Set(checkedPaths);
+      for (const f of sortedFiles) next.delete(f.path);
+      checkedPaths = next;
     } else {
-      checkedPaths = new Set(sortedFiles.map(f => f.path));
+      // Merge the visible rows into the existing selection rather than
+      // replacing it, so rows checked under a different filter aren't lost.
+      checkedPaths = new Set([...checkedPaths, ...sortedFiles.map(f => f.path)]);
     }
     lastClickedPath = null;
   }
@@ -693,8 +742,10 @@
   }
 
   async function bulkSetPriority(priority: FileInfo['priority']) {
+    if (bulkBusy) return;
     const targets = getCheckedFiles().filter(f => !!f.hash);
     if (targets.length === 0) return;
+    bulkBusy = true;
     try {
       const count = await batchSetPriority(targets.map(f => f.path), priority);
       await refresh();
@@ -702,32 +753,41 @@
         ? m.library_set_priority_one({ priority: priorityLabel(priority) })
         : m.library_set_priority_other({ priority: priorityLabel(priority), count }));
     } catch (e: unknown) { error = toErr(e); }
+    finally { bulkBusy = false; }
   }
 
   async function bulkShare() {
+    if (bulkBusy) return;
     const targets = getCheckedFiles().filter(f => !!f.hash && !f.shared);
     if (targets.length === 0) return;
+    bulkBusy = true;
     try {
       const count = await batchShare(targets.map(f => f.path));
       await refresh();
       toastSuccess(count === 1 ? m.library_shared_one() : m.library_shared_other({ count }));
     } catch (e: unknown) { error = toErr(e); }
+    finally { bulkBusy = false; }
   }
 
   async function bulkUnshare() {
+    if (bulkBusy) return;
     const targets = getCheckedFiles().filter(f => !!f.hash && f.shared);
     if (targets.length === 0) return;
+    bulkBusy = true;
     try {
       const count = await batchUnshare(targets.map(f => f.path));
       await refresh();
       toastSuccess(count === 1 ? m.library_unshared_one() : m.library_unshared_other({ count }));
     } catch (e: unknown) { error = toErr(e); }
+    finally { bulkBusy = false; }
   }
 
   async function bulkDelete() {
+    if (bulkBusy) return;
     const targets = getCheckedFiles();
     if (targets.length === 0) return;
     const totalBytes = targets.reduce((sum, f) => sum + f.size, 0);
+    bulkBusy = true;
     try {
       const { confirm } = await import('@tauri-apps/plugin-dialog');
       const confirmed = await confirm(
@@ -760,6 +820,7 @@
         toastError(failures[0]);
       }
     } catch (e: unknown) { error = toErr(e); }
+    finally { bulkBusy = false; }
   }
 
   async function bulkCopyLinks() {
@@ -1314,9 +1375,15 @@
         const next = sortedFiles[nextIdx];
         selectedPath = next.path;
         if (e.shiftKey) {
-          // Extending selection — toggle along the path the way the
-          // mouse Shift+click code does, but row-by-row.
-          toggleCheck(next.path, false);
+          // Extend the selection to span the row we moved from and the row we
+          // moved onto. Use add (not toggle) so sweeping back over an
+          // already-checked row doesn't uncheck it — the old `toggleCheck`
+          // call flipped each row, turning a reverse pass into a deselect.
+          const nextChecked = new Set(checkedPaths);
+          if (currentIdx >= 0) nextChecked.add(sortedFiles[currentIdx].path);
+          nextChecked.add(next.path);
+          checkedPaths = nextChecked;
+          lastClickedPath = next.path;
         }
         libraryTableRef?.scrollRowIntoView(nextIdx);
       }
@@ -2279,17 +2346,17 @@
           <span class="bulk-label">{m.library_bulk_priority_label()}</span>
           <div class="bulk-prio-seg">
             {#each ['verylow', 'low', 'normal', 'high', 'release', 'auto'] as p}
-              <button class="bulk-prio-btn" onclick={() => bulkSetPriority(p as FileInfo['priority'])} title={m.library_set_priority_title({ priority: priorityLabel(p) })}>{priorityLabel(p)}</button>
+              <button class="bulk-prio-btn" disabled={bulkBusy} onclick={() => bulkSetPriority(p as FileInfo['priority'])} title={m.library_set_priority_title({ priority: priorityLabel(p) })}>{priorityLabel(p)}</button>
             {/each}
           </div>
         </div>
         <span class="bulk-sep" aria-hidden="true"></span>
-        <button class="tb-btn" onclick={bulkShare} title={m.library_bulk_share_title()}>{m.library_bulk_share()}</button>
-        <button class="tb-btn" onclick={bulkUnshare} title={m.library_bulk_unshare_title()}>{m.library_bulk_unshare()}</button>
+        <button class="tb-btn" disabled={bulkBusy} onclick={bulkShare} title={m.library_bulk_share_title()}>{m.library_bulk_share()}</button>
+        <button class="tb-btn" disabled={bulkBusy} onclick={bulkUnshare} title={m.library_bulk_unshare_title()}>{m.library_bulk_unshare()}</button>
         <button class="tb-btn" onclick={bulkCopyLinks} title={m.library_bulk_copy_links_title()}>{m.library_copy_links()}</button>
         <button class="tb-btn" onclick={openCreateDialogFromSelection} title={m.library_bulk_new_collection_title()}>{m.library_bulk_new_collection()}</button>
         <span class="bulk-spacer"></span>
-        <button class="tb-btn tb-danger" onclick={bulkDelete} title={m.library_bulk_delete_title()}>{m.common_delete()}</button>
+        <button class="tb-btn tb-danger" disabled={bulkBusy} onclick={bulkDelete} title={m.library_bulk_delete_title()}>{m.common_delete()}</button>
         <button class="tb-btn" onclick={clearChecked} title={m.library_bulk_clear_title()}>{m.common_clear()}</button>
       </div>
     {/if}

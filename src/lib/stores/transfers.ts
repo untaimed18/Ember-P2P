@@ -143,6 +143,10 @@ interface PendingProgress {
 const pendingProgress = new Map<string, PendingProgress>();
 const ORPHAN_PROGRESS_TTL_MS = 5000;
 let progressFlushScheduled = false;
+// Handles for the pending flush so `cleanupTransferStore` can cancel a frame
+// that would otherwise fire after teardown.
+let flushRaf: number | null = null;
+let flushTimeout: ReturnType<typeof setTimeout> | null = null;
 
 /** Upload IDs we've explicitly removed via terminal events (complete/fail).
  *  Tracked with an expiry timestamp so the polling refresh below can
@@ -176,9 +180,15 @@ function scheduleProgressFlush() {
   if (progressFlushScheduled) return;
   progressFlushScheduled = true;
   if (typeof requestAnimationFrame === 'function' && document.visibilityState === 'visible') {
-    requestAnimationFrame(flushProgress);
+    flushRaf = requestAnimationFrame(() => {
+      flushRaf = null;
+      flushProgress();
+    });
   } else {
-    setTimeout(flushProgress, 32);
+    flushTimeout = setTimeout(() => {
+      flushTimeout = null;
+      flushProgress();
+    }, 32);
   }
 }
 
@@ -602,6 +612,16 @@ export function cleanupTransferStore() {
   pendingProgress.clear();
   recentlyRemovedUploads.clear();
   missingFromApiSince.clear();
+  // Cancel any flush queued for the next frame/tick so it can't run against a
+  // store we've just reset (or a subsequently re-initialised one).
+  if (flushRaf !== null) {
+    cancelAnimationFrame(flushRaf);
+    flushRaf = null;
+  }
+  if (flushTimeout !== null) {
+    clearTimeout(flushTimeout);
+    flushTimeout = null;
+  }
   progressFlushScheduled = false;
   initialized = false;
   transfers.set([]);

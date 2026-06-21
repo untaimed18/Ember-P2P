@@ -620,7 +620,7 @@
     switch (t.status) {
       case 'searching': return m.search_dl_searching();
       case 'queued': return m.transfer_status_queued();
-      case 'active': return `${Math.round(t.progress)}%`;
+      case 'active': return `${Math.max(0, Math.min(100, Math.round(t.progress || 0)))}%`;
       case 'paused': return m.transfer_status_paused();
       case 'stopped': return m.transfer_status_stopped();
       case 'verifying': return m.transfer_status_verifying();
