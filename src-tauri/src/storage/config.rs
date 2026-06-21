@@ -1,9 +1,33 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tracing::info;
 
 use crate::storage::paths;
 use crate::types::AppSettings;
+
+/// Move a corrupt or semantically-invalid `config.json` aside so the user's
+/// original settings stay recoverable, returning the backup path on success.
+/// Uses a timestamp + counter so repeated failures within the same wall-clock
+/// second don't clobber a previous backup.
+fn backup_corrupt_config(config_path: &Path, reason: &str) -> Option<PathBuf> {
+    let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
+    let mut bak = config_path.with_extension(format!("json.{ts}.bak"));
+    let mut n = 1u32;
+    while bak.exists() && n < 1000 {
+        bak = config_path.with_extension(format!("json.{ts}.{n}.bak"));
+        n += 1;
+    }
+    if std::fs::rename(config_path, &bak).is_ok() {
+        tracing::warn!(
+            "config.json {reason}; reset to defaults. Original preserved at {}",
+            bak.display()
+        );
+        Some(bak)
+    } else {
+        tracing::warn!("config.json {reason}; reset to defaults (backup attempt failed)");
+        None
+    }
+}
 
 pub struct AppConfig {
     pub settings: AppSettings,
@@ -25,35 +49,25 @@ impl AppConfig {
         let mut corrupt_backup: Option<PathBuf> = None;
         let mut settings = if config_existed {
             let data = std::fs::read_to_string(&config_path)?;
-            match serde_json::from_str(&data) {
-                Ok(s) => s,
+            match serde_json::from_str::<AppSettings>(&data) {
+                // Parsed cleanly *and* passes the same validation enforced on
+                // every save. Re-validating here stops a hand-edited or
+                // downgraded config.json with out-of-range values (e.g.
+                // `tcp_port: 0`) from reaching bind/connection logic. App-written
+                // configs always pass, so this only trips on foreign input —
+                // which we treat like corruption: preserve and reset.
+                Ok(s) => match crate::commands::settings::validate_settings(&s) {
+                    Ok(()) => s,
+                    Err(e) => {
+                        corrupt_backup = backup_corrupt_config(
+                            &config_path,
+                            &format!("has invalid settings ({e})"),
+                        );
+                        AppSettings::default()
+                    }
+                },
                 Err(e) => {
-                    let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
-                    // Pick a backup name that doesn't already exist. The old
-                    // fallback reused a fixed `json.bak`, so a second corruption
-                    // within the same wall-clock second clobbered the previous
-                    // backup; disambiguate with a counter so every corrupt
-                    // config is preserved.
-                    let mut bak = config_path.with_extension(format!("json.{ts}.bak"));
-                    let mut n = 1u32;
-                    while bak.exists() && n < 1000 {
-                        bak = config_path.with_extension(format!("json.{ts}.{n}.bak"));
-                        n += 1;
-                    }
-                    // Don't silently discard the user's settings: preserve the
-                    // corrupt file and log (and later surface) exactly where it
-                    // went so shared folders / download location can be recovered.
-                    if std::fs::rename(&config_path, &bak).is_ok() {
-                        tracing::warn!(
-                            "config.json corrupt ({e}); reset to defaults. Original preserved at {}",
-                            bak.display()
-                        );
-                        corrupt_backup = Some(bak);
-                    } else {
-                        tracing::warn!(
-                            "config.json corrupt ({e}); reset to defaults (backup attempt failed)"
-                        );
-                    }
+                    corrupt_backup = backup_corrupt_config(&config_path, &format!("corrupt ({e})"));
                     AppSettings::default()
                 }
             }
@@ -128,12 +142,18 @@ impl AppConfig {
         })
     }
 
-    /// Serialize settings to JSON and return the data + path for async writing.
-    /// This lets the caller drop the RwLock before doing file I/O.
-    /// The tmp path is a placeholder for back-compat; the actual temp path is
-    /// generated uniquely per write inside `write_to_disk`.
-    pub fn prepare_save(&self) -> anyhow::Result<(String, std::path::PathBuf, std::path::PathBuf)> {
-        let data = serde_json::to_string_pretty(&self.settings)?;
+    /// Serialize the *given* settings to JSON and return the data + path for
+    /// async writing, without touching the in-memory config. This lets the
+    /// caller drop the RwLock before doing file I/O, and lets it persist to
+    /// disk first and only commit the new settings to `self.settings` after the
+    /// write succeeds, so a failed write can't leave the running config diverged
+    /// from disk. The tmp path is a placeholder for back-compat; the actual temp
+    /// path is generated uniquely per write inside `write_to_disk`.
+    pub fn prepare_save_settings(
+        &self,
+        settings: &AppSettings,
+    ) -> anyhow::Result<(String, std::path::PathBuf, std::path::PathBuf)> {
+        let data = serde_json::to_string_pretty(settings)?;
         Ok((data, self.config_path.clone(), self.config_path.clone()))
     }
 

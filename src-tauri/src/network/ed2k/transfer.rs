@@ -2946,17 +2946,25 @@ impl Ed2kDownload {
                                 );
                                 got_any_data = true;
                             }
+                            // Count only bytes that actually filled a gap toward the
+                            // displayed progress and per-source speed. A duplicate or
+                            // overlapping block (empty `fill_subranges`) consumes wire
+                            // bandwidth but adds no new data, so charging `downloaded`
+                            // and speed the full piece would over-report until the next
+                            // `tracker.completed_bytes()` correction. `total_received`
+                            // still tracks wire bytes — the round's exit condition
+                            // compares it against what the peer announced it would send.
+                            let newly_written: u64 =
+                                fill_subranges.iter().map(|(gs, ge)| ge - gs).sum();
                             total_received += piece_len;
-                            downloaded += piece_len;
+                            downloaded += newly_written;
                             blocks_received_in_current_req += 1;
-                            speed_measure_bytes += piece_len;
+                            speed_measure_bytes += newly_written;
 
                             // D12: defer credit until the part verifies. Credit only
                             // the bytes actually written (gap-overlap sub-ranges), not
                             // the full wire piece — a duplicate/overlapping block adds
                             // no new data and must not inflate the peer's credit.
-                            let newly_written: u64 =
-                                fill_subranges.iter().map(|(gs, ge)| ge - gs).sum();
                             pending_credit_bytes =
                                 pending_credit_bytes.saturating_add(newly_written);
 
@@ -3065,17 +3073,21 @@ impl Ed2kDownload {
                                 info!("Source {} first compressed data received for part {} ({} bytes)", self.source_addr, part_idx, piece_len);
                                 got_any_data = true;
                             }
+                            // See the uncompressed branch: only gap-filling bytes
+                            // advance displayed progress and speed; duplicate/overlap
+                            // blocks add wire bytes (counted in `total_received` for
+                            // the round-exit check) but no new data.
+                            let newly_written: u64 =
+                                fill_subranges.iter().map(|(gs, ge)| ge - gs).sum();
                             total_received += piece_len;
-                            downloaded += piece_len;
+                            downloaded += newly_written;
                             blocks_received_in_current_req += 1;
-                            speed_measure_bytes += piece_len;
+                            speed_measure_bytes += newly_written;
 
                             // D12: defer credit until the part verifies. Credit only
                             // the bytes actually written (gap-overlap sub-ranges), not
                             // the full wire piece — a duplicate/overlapping block adds
                             // no new data and must not inflate the peer's credit.
-                            let newly_written: u64 =
-                                fill_subranges.iter().map(|(gs, ge)| ge - gs).sum();
                             pending_credit_bytes =
                                 pending_credit_bytes.saturating_add(newly_written);
 

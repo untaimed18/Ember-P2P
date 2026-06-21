@@ -14,6 +14,10 @@ const MAX_PATH_LEN: usize = 4 * 1024;
 /// Maximum file-id count in a single batch sharing operation. Bounds
 /// the IPC payload and the per-call DB transaction size.
 const MAX_BATCH_IDS: usize = 10_000;
+/// Upper bound on the number of paths accepted by `remove_missing_files` in a
+/// single IPC call. Generous enough for any realistic library while bounding a
+/// compromised-webview payload (and the per-call stat loop / index lock hold).
+const MAX_REMOVE_MISSING_PATHS: usize = 200_000;
 
 struct ScanGuard(Arc<AtomicUsize>);
 impl Drop for ScanGuard {
@@ -162,6 +166,23 @@ pub async fn add_shared_folder(
     })
     .await
     .map_err(|e| coded_ctx("sharing_task_failed", "Task failed", e))??;
+
+    // Reject sharing a filesystem root (e.g. "C:\" or "/"). Sharing a root
+    // would index the entire volume and make every path on it pass
+    // `is_path_within_dirs`, defeating shared-folder containment. A real
+    // shared folder always has at least one named path component.
+    if canonical.parent().is_none()
+        || !canonical
+            .components()
+            .any(|c| matches!(c, std::path::Component::Normal(_)))
+    {
+        return Err(coded_ctx(
+            "sharing_cannot_share_root",
+            "Cannot share a filesystem root",
+            canonical.display(),
+        ));
+    }
+
     let blocked_segments: &[&str] = &[
         "windows",
         "program files",
@@ -217,11 +238,46 @@ pub async fn add_shared_folder(
     }
 
     let canonical_str = canonical.to_string_lossy().to_string();
+    // Build (but don't yet commit) the settings we intend to save. Persisting to
+    // disk before mutating the in-memory config and the live upload list ensures
+    // a failed write can't leave them advertising a folder that isn't saved.
+    // Case-insensitive on Windows: `Vec::contains` is case-sensitive, so adding
+    // `C:\Media` then `c:\media` would store both, double-scan, and make later
+    // unshare/remove (which use paths_equal_ignore_case) inconsistent.
     let save_data = {
+        let config = state.config.read().await;
+        if config
+            .settings
+            .shared_folders
+            .iter()
+            .any(|f| paths_equal_ignore_case(f, &canonical_str))
+        {
+            None
+        } else {
+            let mut new_settings = config.settings.clone();
+            new_settings.shared_folders.push(canonical_str.clone());
+            Some(
+                config
+                    .prepare_save_settings(&new_settings)
+                    .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?,
+            )
+        }
+    };
+    let Some((data, tmp, final_path)) = save_data else {
+        info!("Folder {canonical_str} is already shared, skipping duplicate scan");
+        return Ok(());
+    };
+    tokio::task::spawn_blocking(move || {
+        crate::storage::config::AppConfig::write_to_disk(&data, &tmp, &final_path)
+    })
+    .await
+    .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?
+    .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?;
+    // The addition is durable on disk now; commit it in-memory and to the live
+    // upload list. Both re-checks stay idempotent against a concurrent add of
+    // the same path.
+    {
         let mut config = state.config.write().await;
-        // Case-insensitive on Windows: `Vec::contains` is case-sensitive, so
-        // adding `C:\Media` then `c:\media` would store both, double-scan, and
-        // make later unshare/remove (which use paths_equal_ignore_case) inconsistent.
         if !config
             .settings
             .shared_folders
@@ -229,18 +285,7 @@ pub async fn add_shared_folder(
             .any(|f| paths_equal_ignore_case(f, &canonical_str))
         {
             config.settings.shared_folders.push(canonical_str.clone());
-            Some(
-                config
-                    .prepare_save()
-                    .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?,
-            )
-        } else {
-            None
         }
-    };
-    if save_data.is_none() {
-        info!("Folder {canonical_str} is already shared, skipping duplicate scan");
-        return Ok(());
     }
     {
         let mut live = state.upload_shared_folders.write().await;
@@ -250,14 +295,6 @@ pub async fn add_shared_folder(
         {
             live.push(canonical_str.clone());
         }
-    }
-    if let Some((data, tmp, final_path)) = save_data {
-        tokio::task::spawn_blocking(move || {
-            crate::storage::config::AppConfig::write_to_disk(&data, &tmp, &final_path)
-        })
-        .await
-        .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?
-        .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?;
     }
 
     // Start watching the new folder (and anything else currently shared).
@@ -586,20 +623,18 @@ pub async fn remove_shared_folder(
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
+    // Persist the removal to disk before committing it in-memory or to the live
+    // upload list, so a failed write can't drop a folder that's still saved.
     let save_data = {
-        let mut config = state.config.write().await;
-        config
-            .settings
+        let config = state.config.read().await;
+        let mut new_settings = config.settings.clone();
+        new_settings
             .shared_folders
             .retain(|f| !paths_equal_ignore_case(f, &canonical_path));
         config
-            .prepare_save()
+            .prepare_save_settings(&new_settings)
             .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?
     };
-    {
-        let mut live = state.upload_shared_folders.write().await;
-        live.retain(|f| !paths_equal_ignore_case(f, &canonical_path));
-    }
     {
         let (data, tmp, final_path) = save_data;
         tokio::task::spawn_blocking(move || {
@@ -608,6 +643,17 @@ pub async fn remove_shared_folder(
         .await
         .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?
         .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?;
+    }
+    {
+        let mut config = state.config.write().await;
+        config
+            .settings
+            .shared_folders
+            .retain(|f| !paths_equal_ignore_case(f, &canonical_path));
+    }
+    {
+        let mut live = state.upload_shared_folders.write().await;
+        live.retain(|f| !paths_equal_ignore_case(f, &canonical_path));
     }
 
     {
@@ -796,21 +842,22 @@ pub async fn set_folder_priority(
             ));
         }
     }
+    // Persist before committing in-memory so a failed write can't leave the
+    // live folder-priority map diverged from disk.
     let save_data = {
-        let mut config = state.config.write().await;
+        let config = state.config.read().await;
+        let mut new_settings = config.settings.clone();
         // Drop any case-variant key first so the map never accumulates dupes.
-        config
-            .settings
+        new_settings
             .folder_priorities
             .retain(|k, _| !paths_equal_ignore_case(k, &folder_path));
         if !clearing {
-            config
-                .settings
+            new_settings
                 .folder_priorities
                 .insert(folder_path.clone(), priority.clone());
         }
         config
-            .prepare_save()
+            .prepare_save_settings(&new_settings)
             .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?
     };
     {
@@ -821,6 +868,19 @@ pub async fn set_folder_priority(
         .await
         .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?
         .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?;
+    }
+    {
+        let mut config = state.config.write().await;
+        config
+            .settings
+            .folder_priorities
+            .retain(|k, _| !paths_equal_ignore_case(k, &folder_path));
+        if !clearing {
+            config
+                .settings
+                .folder_priorities
+                .insert(folder_path.clone(), priority.clone());
+        }
     }
     // Clearing only stops the default from being re-applied; existing files
     // keep whatever priority they currently have.
@@ -1501,6 +1561,13 @@ pub async fn delete_shared_file(
     file_path: String,
     file_hash: Option<String>,
 ) -> Result<(), String> {
+    if file_path.len() > MAX_PATH_LEN {
+        return Err(coded_ctx(
+            "sharing_file_path_too_long",
+            format!("File path exceeds {MAX_PATH_LEN} bytes"),
+            MAX_PATH_LEN,
+        ));
+    }
     let allowed_dirs = {
         let config = state.config.read().await;
         shared_access_dirs(&config)
@@ -1607,7 +1674,22 @@ pub async fn remove_missing_files(
     if paths.is_empty() {
         return Ok(0);
     }
-    let to_check = paths.clone();
+    if paths.len() > MAX_REMOVE_MISSING_PATHS {
+        return Err(coded_ctx(
+            "sharing_too_many_paths",
+            format!("Too many paths in one call (max {MAX_REMOVE_MISSING_PATHS})"),
+            MAX_REMOVE_MISSING_PATHS,
+        ));
+    }
+    // Drop empty / over-long entries up front: they can't name a real shared
+    // file and we don't want to spend a stat() syscall on an attacker-sized path.
+    let to_check: Vec<String> = paths
+        .into_iter()
+        .filter(|p| !p.is_empty() && p.len() <= MAX_PATH_LEN)
+        .collect();
+    if to_check.is_empty() {
+        return Ok(0);
+    }
     let really_missing = tokio::task::spawn_blocking(move || {
         to_check
             .into_iter()

@@ -70,6 +70,7 @@ pub struct BuddyManager {
 
     serving_buddy_for: Option<KadId>,
     serving_callback_check: Option<KadId>,
+    serving_callback_budget: u32,
     serving_writer: Option<BuddyWriteStream>,
     serving_reader_handle: Option<tokio::task::JoinHandle<()>>,
 
@@ -100,6 +101,7 @@ impl BuddyManager {
             buddy_reader_handle: None,
             serving_buddy_for: None,
             serving_callback_check: None,
+            serving_callback_budget: 0,
             serving_writer: None,
             serving_reader_handle: None,
             pending_buddy_hashes,
@@ -122,6 +124,7 @@ impl BuddyManager {
         self.serving_writer = None;
         self.serving_buddy_for = None;
         self.serving_callback_check = None;
+        self.serving_callback_budget = 0;
         if let Ok(mut guard) = self.pending_buddy_hashes.try_lock() {
             guard.clear();
         }
@@ -398,6 +401,7 @@ impl BuddyManager {
 
         self.serving_buddy_for = Some(requester_id);
         self.serving_callback_check = Some(callback_check);
+        self.serving_callback_budget = 64;
         self.serving_writer = Some(Box::new(writer));
         self.serving_reader_handle = Some(handle);
         info!("Now serving as buddy for {}", requester_id);
@@ -458,15 +462,28 @@ impl BuddyManager {
     /// check_hash = buddy's KadID XOR'd with 0xFF..FF mask (eMule verification)
     pub async fn send_callback_relay(
         &mut self,
-        _buddy_kad_id: &KadId,
+        buddy_kad_id: &KadId,
         client_ip: Ipv4Addr,
         client_port: u16,
         file_hash: [u8; 16],
     ) -> bool {
+        let Some(check_id) = self.serving_callback_check else {
+            return false;
+        };
+        if *buddy_kad_id != check_id {
+            debug!(
+                "Rejecting CallbackReq relay: request check {} does not match served buddy check {}",
+                buddy_kad_id, check_id
+            );
+            return false;
+        }
+        if self.serving_callback_budget == 0 {
+            debug!("Rejecting CallbackReq relay: per-session budget exhausted");
+            return false;
+        }
+        self.serving_callback_budget -= 1;
+
         if let Some(ref mut w) = self.serving_writer {
-            let Some(check_id) = self.serving_callback_check else {
-                return false;
-            };
             let mut payload = Vec::with_capacity(38);
             payload.extend_from_slice(&check_id.0);
             payload.extend_from_slice(&file_hash);
@@ -576,6 +593,7 @@ impl BuddyManager {
         // stale token behind would let a later relay path validate against a
         // peer we are no longer serving.
         self.serving_callback_check = None;
+        self.serving_callback_budget = 0;
         info!("Stopped serving as buddy");
     }
 
@@ -681,6 +699,13 @@ async fn run_buddy_reader(
     // K9: per-session OP_REASKCALLBACKTCP budget. A legit buddy using
     // queue reasks for our downloads will need a handful of these; a
     // malicious buddy trying to reflect UDP traffic runs out quickly.
+    //
+    // OP_CALLBACK carries a cryptographic check token, so only our current
+    // buddy should be able to send it successfully, but the destination IP is
+    // still buddy-provided. Keep a separate generous budget and apply the same
+    // destination safety gate used for reask callbacks so a compromised buddy
+    // cannot steer us at loopback/private/reserved hosts.
+    let mut callback_budget: u32 = 64;
     let mut reask_callback_budget: u32 = 64;
     loop {
         match read_ed2k_packet(&mut reader).await {
@@ -710,17 +735,33 @@ async fn run_buddy_reader(
                                         [payload[32], payload[33], payload[34], payload[35]];
                                     let dest_ip = Ipv4Addr::from(u32::from_le_bytes(ip_bytes));
                                     let dest_port = u16::from_le_bytes([payload[36], payload[37]]);
-                                    debug!(
-                                        "Received OP_CALLBACK: {}:{} file={}",
-                                        dest_ip,
-                                        dest_port,
-                                        hex::encode(file_hash)
-                                    );
-                                    Some(BuddyEvent::Callback {
-                                        file_hash,
-                                        dest_ip,
-                                        dest_port,
-                                    })
+                                    if dest_port == 0 || crate::security::is_special_use_v4(dest_ip)
+                                    {
+                                        debug!(
+                                            "Rejecting OP_CALLBACK: bad dest {}:{}",
+                                            dest_ip, dest_port
+                                        );
+                                        None
+                                    } else if callback_budget == 0 {
+                                        debug!(
+                                            "Rejecting OP_CALLBACK: per-session budget exhausted"
+                                        );
+                                        None
+                                    } else {
+                                        callback_budget -= 1;
+                                        debug!(
+                                            "Received OP_CALLBACK: {}:{} file={} (budget remaining {})",
+                                            dest_ip,
+                                            dest_port,
+                                            hex::encode(file_hash),
+                                            callback_budget
+                                        );
+                                        Some(BuddyEvent::Callback {
+                                            file_hash,
+                                            dest_ip,
+                                            dest_port,
+                                        })
+                                    }
                                 }
                             } else {
                                 debug!("Rejecting OP_CALLBACK: no expected check token set");

@@ -953,9 +953,21 @@ pub fn run() {
 
                     let flag = state.shutdown_complete.clone();
                     let start = std::time::Instant::now();
+                    // Must exceed the network task's bounded teardown budget so
+                    // we don't return (and let the process exit) while .part.met
+                    // saves are still in flight: the teardown caps its variable
+                    // phases at ~5s (await aborted downloads) + ~8s (concurrent
+                    // tracker saves) plus a few seconds of fixed saves
+                    // (nodes.dat/known.met/stats). The common case sets the flag
+                    // in well under a second, so this ceiling only bites if the
+                    // network is genuinely stuck.
+                    const SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
                     while !flag.load(std::sync::atomic::Ordering::Acquire) {
-                        if start.elapsed() > std::time::Duration::from_secs(12) {
-                            tracing::warn!("Network shutdown timed out after 12s");
+                        if start.elapsed() > SHUTDOWN_WAIT {
+                            tracing::warn!(
+                                "Network shutdown timed out after {}s",
+                                SHUTDOWN_WAIT.as_secs()
+                            );
                             break;
                         }
                         std::thread::sleep(std::time::Duration::from_millis(200));
