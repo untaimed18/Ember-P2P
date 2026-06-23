@@ -29,7 +29,13 @@ pub struct IpFilterSnapshot {
     pub ranges: Vec<(u32, u32)>,
     pub enabled: bool,
     pub block_private: bool,
+    /// Hits from range-based (ipfilter.dat) matches.
     pub hit_counter: AtomicU64,
+    /// Hits from always-blocked bogus IPs and (when `block_private`) LAN/CGNAT
+    /// space. Kept separate from `hit_counter` so [`IpFilter::collect_shared_hits`]
+    /// can attribute them to the right bucket in the stats UI rather than
+    /// folding every upload-path block into the range total.
+    pub special_hit_counter: AtomicU64,
 }
 
 impl std::fmt::Debug for IpFilterSnapshot {
@@ -43,12 +49,14 @@ impl std::fmt::Debug for IpFilterSnapshot {
 
 impl IpFilterSnapshot {
     pub fn is_blocked(&self, ip: Ipv4Addr) -> bool {
-        if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() || ip.is_loopback() {
-            self.hit_counter.fetch_add(1, Ordering::Relaxed);
+        // Always-unroutable space is rejected regardless of any toggle.
+        if crate::security::is_bogus_v4(ip) {
+            self.special_hit_counter.fetch_add(1, Ordering::Relaxed);
             return true;
         }
-        if self.block_private && is_private_or_reserved(ip) {
-            self.hit_counter.fetch_add(1, Ordering::Relaxed);
+        // RFC1918 / link-local / CGNAT only when the user opted in.
+        if self.block_private && crate::security::is_lan_or_cgnat_v4(ip) {
+            self.special_hit_counter.fetch_add(1, Ordering::Relaxed);
             return true;
         }
         if self.enabled {
@@ -242,11 +250,11 @@ impl IpFilter {
     }
 
     pub fn is_blocked(&mut self, ip: Ipv4Addr) -> bool {
-        if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() || ip.is_loopback() {
+        if crate::security::is_bogus_v4(ip) {
             self.total_special_hits.fetch_add(1, Ordering::Relaxed);
             return true;
         }
-        if self.block_private && is_private_or_reserved(ip) {
+        if self.block_private && crate::security::is_lan_or_cgnat_v4(ip) {
             self.total_special_hits.fetch_add(1, Ordering::Relaxed);
             return true;
         }
@@ -272,11 +280,11 @@ impl IpFilter {
     /// Check if an IP is blocked without requiring &mut self.
     /// Increments the atomic total hit counter but not per-range counters.
     pub fn is_blocked_readonly(&self, ip: Ipv4Addr) -> bool {
-        if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() || ip.is_loopback() {
+        if crate::security::is_bogus_v4(ip) {
             self.total_special_hits.fetch_add(1, Ordering::Relaxed);
             return true;
         }
-        if self.block_private && is_private_or_reserved(ip) {
+        if self.block_private && crate::security::is_lan_or_cgnat_v4(ip) {
             self.total_special_hits.fetch_add(1, Ordering::Relaxed);
             return true;
         }
@@ -333,10 +341,13 @@ impl IpFilter {
             enabled: self.enabled,
             block_private: self.block_private,
             hit_counter: AtomicU64::new(0),
+            special_hit_counter: AtomicU64::new(0),
         }))
     }
 
-    /// Update an existing shared snapshot with current filter state, preserving its hit counter.
+    /// Update an existing shared snapshot with current filter state, preserving
+    /// its live hit counters (range and special) so an in-flight settings
+    /// change or reload doesn't drop pending upload-path hits.
     pub fn update_shared_snapshot(&self, shared: &SharedIpFilter) {
         if let Ok(mut snap) = shared.write() {
             snap.ranges = self
@@ -349,12 +360,19 @@ impl IpFilter {
         }
     }
 
-    /// Collect hits from the shared snapshot into the total counter.
+    /// Collect hits from the shared snapshot into the totals, preserving the
+    /// range-vs-special split (the upload handler is the only writer of the
+    /// snapshot counters).
     pub fn collect_shared_hits(&self, shared: &SharedIpFilter) {
         if let Ok(snap) = shared.read() {
-            let hits = snap.hit_counter.swap(0, Ordering::Relaxed);
-            if hits > 0 {
-                self.total_range_hits.fetch_add(hits, Ordering::Relaxed);
+            let range_hits = snap.hit_counter.swap(0, Ordering::Relaxed);
+            if range_hits > 0 {
+                self.total_range_hits.fetch_add(range_hits, Ordering::Relaxed);
+            }
+            let special_hits = snap.special_hit_counter.swap(0, Ordering::Relaxed);
+            if special_hits > 0 {
+                self.total_special_hits
+                    .fetch_add(special_hits, Ordering::Relaxed);
             }
         }
     }
@@ -558,59 +576,33 @@ impl IpFilter {
     }
 }
 
-/// Returns true if the IP is private (RFC1918), loopback, link-local, or reserved.
+/// Returns true if the IP is private (RFC1918), loopback, link-local, or any
+/// other special-use / reserved range.
+///
+/// Thin alias over the crate-wide [`crate::security::is_special_use_v4`]
+/// classifier so every code path agrees on what "private or reserved" means.
+/// Kept as a named export for the KAD callback-source and routing call sites.
 pub fn is_private_or_reserved(ip: Ipv4Addr) -> bool {
-    let octets = ip.octets();
-
-    if ip.is_unspecified() || ip.is_broadcast() || ip.is_loopback() || ip.is_multicast() {
-        return true;
-    }
-    if octets[0] == 10 {
-        return true;
-    }
-    if octets[0] == 172 && (16..=31).contains(&octets[1]) {
-        return true;
-    }
-    if octets[0] == 192 && octets[1] == 168 {
-        return true;
-    }
-    if octets[0] == 169 && octets[1] == 254 {
-        return true;
-    }
-    if octets[0] == 100 && (64..=127).contains(&octets[1]) {
-        return true;
-    }
-    if octets[0] == 0 {
-        return true;
-    }
-    if octets[0] >= 240 {
-        return true;
-    }
-    if octets[0] == 198 && (octets[1] == 18 || octets[1] == 19) {
-        return true;
-    }
-    if octets[0] == 192 && octets[1] == 0 && (octets[2] == 0 || octets[2] == 2) {
-        return true;
-    }
-    if octets[0] == 198 && octets[1] == 51 && octets[2] == 100 {
-        return true;
-    }
-    if octets[0] == 203 && octets[1] == 0 && octets[2] == 113 {
-        return true;
-    }
-
-    false
+    crate::security::is_special_use_v4(ip)
 }
 
 pub fn is_lan_ip(ip: Ipv4Addr) -> bool {
     ip.is_private() || ip.is_loopback() || ip.is_link_local()
 }
 
+/// Whether `ip` is acceptable as a KAD contact / download source.
+///
+/// Always rejects truly-unroutable space ([`crate::security::is_bogus_v4`]):
+/// `0.0.0.0/8`, class-E, broadcast, multicast, documentation / benchmarking,
+/// etc. — none of which can be a real peer regardless of settings. RFC1918 /
+/// link-local / CGNAT space is rejected only when `block_private` is set, so a
+/// user who deliberately turns the toggle off to reach LAN peers still doesn't
+/// admit obvious garbage into the routing table.
 pub fn is_valid_contact_ip(ip: Ipv4Addr, block_private: bool) -> bool {
-    if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() || ip.is_loopback() {
+    if crate::security::is_bogus_v4(ip) {
         return false;
     }
-    if block_private && is_private_or_reserved(ip) {
+    if block_private && crate::security::is_lan_or_cgnat_v4(ip) {
         return false;
     }
     true
@@ -660,6 +652,13 @@ fn parse_ip_lenient(s: &str) -> Option<Ipv4Addr> {
     stripped.parse().ok()
 }
 
+/// eMule's default IP-filter level. An ipfilter.dat entry blocks only when its
+/// access level is *below* this value; `level >= 127` means "permitted" (kept
+/// in the file for reference, not enforced). We expose no user-facing filter
+/// level, so we hard-code eMule's documented default rather than the off-by-one
+/// `>= 128` cutoff this used to apply (which wrongly blocked level-127 entries).
+const IPFILTER_BLOCK_LEVEL: u32 = 127;
+
 fn parse_ipfilter_line(line: &str) -> Option<IpRange> {
     let parts: Vec<&str> = line.splitn(3, ',').collect();
     if parts.len() < 2 {
@@ -667,7 +666,7 @@ fn parse_ipfilter_line(line: &str) -> Option<IpRange> {
     }
 
     let access_level: u32 = parts[1].trim().parse().ok()?;
-    if access_level >= 128 {
+    if access_level >= IPFILTER_BLOCK_LEVEL {
         return None;
     }
 
@@ -677,14 +676,15 @@ fn parse_ipfilter_line(line: &str) -> Option<IpRange> {
         String::new()
     };
 
+    // Range form is "start - end"; a bare single IP (no dash) is a /32 host.
     let ip_range_part = parts[0].trim();
-    let ip_parts: Vec<&str> = ip_range_part.splitn(2, '-').collect();
-    if ip_parts.len() != 2 {
-        return None;
-    }
-
-    let start_ip = parse_ip_lenient(ip_parts[0])?;
-    let end_ip = parse_ip_lenient(ip_parts[1])?;
+    let (start_ip, end_ip) = match ip_range_part.split_once('-') {
+        Some((s, e)) => (parse_ip_lenient(s)?, parse_ip_lenient(e)?),
+        None => {
+            let single = parse_ip_lenient(ip_range_part)?;
+            (single, single)
+        }
+    };
     let start = u32::from(start_ip);
     let end = u32::from(end_ip);
     if start > end {
@@ -712,6 +712,10 @@ mod tests {
         assert!(is_private_or_reserved(Ipv4Addr::new(0, 0, 0, 0)));
         assert!(is_private_or_reserved(Ipv4Addr::new(169, 254, 1, 1)));
         assert!(is_private_or_reserved(Ipv4Addr::new(255, 255, 255, 255)));
+        assert!(is_private_or_reserved(Ipv4Addr::new(100, 64, 0, 1))); // CGNAT
+        assert!(is_private_or_reserved(Ipv4Addr::new(198, 18, 0, 1))); // benchmarking
+        assert!(is_private_or_reserved(Ipv4Addr::new(192, 88, 99, 1))); // 6to4 anycast
+        assert!(is_private_or_reserved(Ipv4Addr::new(224, 0, 0, 1))); // multicast
         assert!(!is_private_or_reserved(Ipv4Addr::new(8, 8, 8, 8)));
         assert!(!is_private_or_reserved(Ipv4Addr::new(93, 184, 216, 34)));
     }
@@ -757,6 +761,48 @@ mod tests {
         assert!(is_valid_contact_ip(Ipv4Addr::new(192, 168, 1, 1), false));
         assert!(!is_valid_contact_ip(Ipv4Addr::UNSPECIFIED, false));
         assert!(!is_valid_contact_ip(Ipv4Addr::LOCALHOST, false));
+    }
+
+    #[test]
+    fn test_valid_contact_ip_rejects_bogus_even_when_private_allowed() {
+        // With block_private = false a user may want LAN peers, but bogus /
+        // unroutable space must still be refused — this is the regression that
+        // motivated splitting "bogus (always)" from "LAN (gated)".
+        for ip in [
+            Ipv4Addr::new(0, 1, 2, 3),        // 0.0.0.0/8 "this network"
+            Ipv4Addr::new(240, 0, 0, 1),      // class E / reserved
+            Ipv4Addr::new(255, 255, 255, 255), // limited broadcast
+            Ipv4Addr::new(224, 0, 0, 1),      // multicast
+            Ipv4Addr::new(192, 0, 2, 5),      // TEST-NET-1 (documentation)
+            Ipv4Addr::new(198, 51, 100, 7),   // TEST-NET-2
+            Ipv4Addr::new(203, 0, 113, 9),    // TEST-NET-3
+            Ipv4Addr::new(198, 18, 0, 1),     // benchmarking
+            Ipv4Addr::new(192, 0, 0, 1),      // protocol assignments
+            Ipv4Addr::new(192, 88, 99, 1),    // 6to4 relay anycast
+        ] {
+            assert!(
+                !is_valid_contact_ip(ip, false),
+                "{ip} must be rejected even with block_private = false"
+            );
+        }
+        // LAN space, by contrast, is admitted only when block_private is off.
+        assert!(is_valid_contact_ip(Ipv4Addr::new(10, 0, 0, 5), false));
+        assert!(!is_valid_contact_ip(Ipv4Addr::new(10, 0, 0, 5), true));
+        // A normal public address is always fine.
+        assert!(is_valid_contact_ip(Ipv4Addr::new(1, 1, 1, 1), false));
+    }
+
+    #[test]
+    fn test_is_blocked_rejects_bogus_when_filter_off_and_private_allowed() {
+        // Filter disabled AND private allowed: still must drop unroutable IPs.
+        let mut filter = IpFilter::new(false, false);
+        assert!(filter.is_blocked(Ipv4Addr::new(0, 1, 2, 3)));
+        assert!(filter.is_blocked(Ipv4Addr::new(240, 0, 0, 1)));
+        assert!(filter.is_blocked(Ipv4Addr::new(192, 0, 2, 5)));
+        // ...but a genuine public IP passes when the filter is off.
+        assert!(!filter.is_blocked(Ipv4Addr::new(8, 8, 8, 8)));
+        // LAN is allowed through when block_private is off.
+        assert!(!filter.is_blocked(Ipv4Addr::new(192, 168, 1, 1)));
     }
 
     #[test]
@@ -820,16 +866,56 @@ mod tests {
             "Failed to parse ipfilter.dat line without leading zeros"
         );
 
-        // Access level >= 128 should be skipped
-        let line4 = "1.0.0.0 - 1.0.0.255 , 128 , Allowed";
+        // Access level boundary: eMule blocks `level < 127`, permits `>= 127`.
         assert!(
-            parse_ipfilter_line(line4).is_none(),
-            "Should skip access level >= 128"
+            parse_ipfilter_line("1.0.0.0 - 1.0.0.255 , 128 , Allowed").is_none(),
+            "Should skip access level 128"
         );
+        assert!(
+            parse_ipfilter_line("1.0.0.0 - 1.0.0.255 , 127 , Allowed").is_none(),
+            "Level 127 is permitted in eMule and must be skipped"
+        );
+        assert!(
+            parse_ipfilter_line("1.0.0.0 - 1.0.0.255 , 126 , Blocked").is_some(),
+            "Level 126 is below the filter level and must be kept"
+        );
+
+        // Single-host entry (no dash) is treated as a /32.
+        let host = parse_ipfilter_line("1.2.3.4 , 0 , Single host");
+        assert!(host.is_some(), "Failed to parse single-host ipfilter entry");
+        let host = host.unwrap();
+        assert_eq!(host.start, u32::from(Ipv4Addr::new(1, 2, 3, 4)));
+        assert_eq!(host.end, u32::from(Ipv4Addr::new(1, 2, 3, 4)));
 
         // P2P format
         let p2p = "Test Range:1.0.0.0-1.0.0.255";
         let rp = parse_p2p_line(p2p);
         assert!(rp.is_some(), "Failed to parse P2P line");
+    }
+
+    #[test]
+    fn test_snapshot_hit_accounting() {
+        // Range hits and special/bogus hits must land in separate buckets so
+        // the stats UI doesn't report private/bogus blocks as range matches.
+        let mut filter = IpFilter::new(true, true);
+        filter.add_range(
+            Ipv4Addr::new(5, 0, 0, 0),
+            Ipv4Addr::new(5, 0, 0, 255),
+            "range".to_string(),
+        );
+        let shared = filter.create_shared_snapshot();
+        {
+            let snap = shared.read().unwrap();
+            assert!(snap.is_blocked(Ipv4Addr::new(5, 0, 0, 1))); // range hit
+            assert!(snap.is_blocked(Ipv4Addr::new(192, 168, 0, 1))); // LAN (gated) hit
+            assert!(snap.is_blocked(Ipv4Addr::new(240, 0, 0, 1))); // bogus hit
+            assert!(!snap.is_blocked(Ipv4Addr::new(8, 8, 8, 8))); // public, allowed
+            assert_eq!(snap.hit_counter.load(Ordering::Relaxed), 1);
+            assert_eq!(snap.special_hit_counter.load(Ordering::Relaxed), 2);
+        }
+        filter.collect_shared_hits(&shared);
+        let stats = filter.get_stats();
+        // 1 range hit + 2 special hits, none double-counted.
+        assert_eq!(stats.total_hits, 3);
     }
 }

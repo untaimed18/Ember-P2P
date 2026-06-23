@@ -119,15 +119,60 @@ pub fn is_dangerous_extension(filename: &str) -> bool {
     false
 }
 
+/// True for every IPv4 address that can never be a legitimate, globally
+/// routable peer: loopback, RFC1918 private space, link-local, the
+/// unspecified and limited-broadcast addresses, multicast, RFC1122 "this
+/// network" (`0.0.0.0/8`), reserved class-E (`240.0.0.0/4`), RFC6598 CGNAT,
+/// the RFC5737 documentation ranges, RFC2544 benchmarking, the RFC6890 IETF
+/// protocol-assignment block (`192.0.0.0/24`) and the deprecated 6to4 relay
+/// anycast prefix (`192.88.99.0/24`).
+///
+/// This is the single source of truth for "special-use" v4 classification;
+/// `ip_filter` builds its `block_private` / always-reject split on top of it
+/// (see [`is_lan_or_cgnat_v4`] and [`is_bogus_v4`]).
 pub(crate) fn is_special_use_v4(v4: std::net::Ipv4Addr) -> bool {
     v4.is_loopback()
         || v4.is_private()
         || v4.is_link_local()
         || v4.is_unspecified()
         || v4.is_broadcast()
+        || v4.is_multicast()
+        || is_this_network_v4(v4)
+        || is_reserved_future_v4(v4)
         || is_shared_address(v4)
         || is_documentation_v4(v4)
         || is_benchmarking_v4(v4)
+        || is_protocol_assignment_v4(v4)
+        || is_6to4_relay_anycast_v4(v4)
+}
+
+/// RFC1918 private space, RFC3927 link-local, and RFC6598 CGNAT — the
+/// "LAN-ish" addresses a user on a local/segmented network might legitimately
+/// want to reach. These are the *only* special-use ranges gated behind the
+/// `block_private_ips` setting; everything else in [`is_special_use_v4`] is
+/// always unroutable (see [`is_bogus_v4`]).
+pub(crate) fn is_lan_or_cgnat_v4(v4: std::net::Ipv4Addr) -> bool {
+    v4.is_private() || v4.is_link_local() || is_shared_address(v4)
+}
+
+/// Special-use addresses that are *never* a valid public peer regardless of
+/// any user setting (loopback, broadcast, multicast, `0.0.0.0/8`,
+/// `240.0.0.0/4`, documentation / benchmarking / protocol / 6to4 blocks).
+/// This is exactly [`is_special_use_v4`] minus the LAN ranges in
+/// [`is_lan_or_cgnat_v4`], so it stays correct automatically as the
+/// special-use set grows.
+pub(crate) fn is_bogus_v4(v4: std::net::Ipv4Addr) -> bool {
+    is_special_use_v4(v4) && !is_lan_or_cgnat_v4(v4)
+}
+
+/// RFC 1122 "this network" (0.0.0.0/8)
+fn is_this_network_v4(v4: std::net::Ipv4Addr) -> bool {
+    v4.octets()[0] == 0
+}
+
+/// Reserved for future use / class E (240.0.0.0/4, includes 255.255.255.255)
+fn is_reserved_future_v4(v4: std::net::Ipv4Addr) -> bool {
+    v4.octets()[0] >= 240
 }
 
 /// RFC 6598 Carrier-Grade NAT shared address space (100.64.0.0/10)
@@ -148,6 +193,18 @@ fn is_documentation_v4(v4: std::net::Ipv4Addr) -> bool {
 fn is_benchmarking_v4(v4: std::net::Ipv4Addr) -> bool {
     let o = v4.octets();
     o[0] == 198 && (o[1] & 0xFE) == 18
+}
+
+/// RFC 6890 IETF protocol assignments (192.0.0.0/24)
+fn is_protocol_assignment_v4(v4: std::net::Ipv4Addr) -> bool {
+    let o = v4.octets();
+    o[0] == 192 && o[1] == 0 && o[2] == 0
+}
+
+/// RFC 7526 deprecated 6to4 relay anycast (192.88.99.0/24)
+fn is_6to4_relay_anycast_v4(v4: std::net::Ipv4Addr) -> bool {
+    let o = v4.octets();
+    o[0] == 192 && o[1] == 88 && o[2] == 99
 }
 
 pub(crate) fn is_private_ip(ip: std::net::IpAddr) -> bool {

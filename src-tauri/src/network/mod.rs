@@ -1106,6 +1106,93 @@ async fn try_connect_server(
     Ok((conn, addr))
 }
 
+/// Handle an inbound Ember friend request, shared by the download-side and
+/// upload-side session event loops so the approval / auto-confirm / queue
+/// policy can't drift between the two ingress paths (it previously lived as two
+/// hand-maintained copies, which is how earlier divergences crept in).
+///
+/// `verified` carries the strongest identity signal the emitting session had:
+///   - multi-source download: the offline BLAKE3 binding check (advertised
+///     pubkey matches advertised ember_hash); the full challenge-response can't
+///     safely run inline in that loop because the uploader's proactive SecIdent
+///     / EPX traffic queues ahead of its CHALLENGE response.
+///   - friend-connect / upload sessions: full Ed25519 PoP over a fresh nonce.
+///
+/// It only drives the DB row + UI verification badge. We never auto-promote to
+/// "mutual" based on it: an already-mutual sender is ignored, an already-added
+/// (non-mutual) friend is auto-confirmed only when the user disabled approval,
+/// and a stranger always routes through the approval queue.
+async fn process_inbound_friend_request(
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    online_friends: &mut HashMap<[u8; 16], i64>,
+    require_approval: bool,
+    req_hash: [u8; 16],
+    nickname: &str,
+    peer_ip: &str,
+    peer_port: u16,
+    verified: bool,
+) {
+    let hash_hex = hex::encode(req_hash);
+    info!(
+        "Processing inbound friend request from {} (nick='{}', ip={}:{}, verified={verified})",
+        hash_hex, nickname, peer_ip, peer_port
+    );
+    let db_q = db.clone();
+    let h_q = hash_hex.clone();
+    let (is_friend, already_mutual) = tokio::task::spawn_blocking(move || {
+        db_q.get_friends_full()
+            .ok()
+            .and_then(|rows| {
+                rows.into_iter()
+                    .find(|(h, ..)| h == &h_q)
+                    .map(|(_, _, _, _, _, _, mutual)| (true, mutual))
+            })
+            .unwrap_or((false, false))
+    })
+    .await
+    .unwrap_or((false, false));
+    if already_mutual {
+        info!("Friend {} already mutual — ignoring redundant EmberFriendRequest", hash_hex);
+    } else if is_friend && !require_approval {
+        // Auto-confirm: the user already added this peer and disabled "require
+        // approval", so a reciprocal request upgrades the friendship to mutual
+        // without prompting. Strangers (not already in our list) still fall
+        // through to the approval queue — we never auto-add an unknown peer.
+        info!("Auto-confirming friend {} (already added; approval not required)", hash_hex);
+        let db2 = db.clone();
+        let h2 = hash_hex.clone();
+        let ip2 = peer_ip.to_string();
+        let promoted = tokio::task::spawn_blocking(move || db2.set_friend_mutual(&h2, &ip2, peer_port))
+            .await
+            .unwrap_or(Ok(0))
+            .unwrap_or(0);
+        if promoted > 0 {
+            if !online_friends.contains_key(&req_hash) {
+                online_friends.insert(req_hash, chrono::Utc::now().timestamp());
+                let _ = app_handle.emit("ember:friend-online", serde_json::json!({
+                    "user_hash": hash_hex,
+                }));
+            }
+            let _ = app_handle.emit("ember:friend-confirmed", serde_json::json!({
+                "user_hash": hash_hex,
+            }));
+        }
+    } else {
+        info!("Queuing friend request from {} for user approval", hash_hex);
+        let db2 = db.clone();
+        let h2 = hash_hex.clone();
+        let n2 = nickname.to_string();
+        let ip2 = peer_ip.to_string();
+        let _ = tokio::task::spawn_blocking(move || db2.add_friend_request(&h2, &n2, &ip2, peer_port, verified));
+        let _ = app_handle.emit("ember:friend-request", serde_json::json!({
+            "sender_hash": hash_hex,
+            "nickname": nickname,
+            "verified": verified,
+        }));
+    }
+}
+
 /// Spawn a rendezvous lookup for a single friend and attempt to connect if found.
 fn spawn_rendezvous_friend_lookup(
     settings: &AppSettings,
@@ -1206,6 +1293,7 @@ fn spawn_rendezvous_friend_lookup(
                     );
                     match ed2k::friend_connect::open_and_run_friend_session(
                         addr,
+                        target_hash,
                         our_uh,
                         our_eh,
                         nick,
@@ -2614,7 +2702,13 @@ async fn mark_download_insufficient(
 struct PendingKeywordSearch {
     tx: oneshot::Sender<Vec<SearchResult>>,
     local_results: Vec<SearchResult>,
+    /// Positive (non-negated) keywords, used for spam scoring of streamed
+    /// results. The full boolean tree lives in `query_expr`.
     keywords: Vec<String>,
+    /// Parsed boolean query tree. Drives local re-filtering of Kad results
+    /// (which are looked up by a single keyword hash, so the responding node
+    /// can only partially apply OR/NOT branches it doesn't store).
+    query_expr: crate::search::query::QueryExpr,
     request_id: u64,
     last_streamed_count: usize,
     file_type_filter: Option<String>,
@@ -7089,6 +7183,13 @@ pub async fn start_network(
                 }
 
                 if let DownloadEvent::FriendSeen { ember_hash: friend_eh, ip, port } = event {
+                    // FriendSeen is only emitted post-PoP for a peer that was a
+                    // friend at emit time, but a concurrent removal can race the
+                    // event. Don't resurrect a just-removed friend as "online"
+                    // or proactively re-dial them.
+                    if !friend_hashes.read().await.contains(&friend_eh) {
+                        continue;
+                    }
                     let hash_hex = hex::encode(friend_eh);
                     let now = chrono::Utc::now().timestamp();
                     state.online_friends.insert(friend_eh, now);
@@ -7123,7 +7224,7 @@ pub async fn start_network(
                             let ultx2 = ul_event_tx.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = ed2k::friend_connect::open_and_run_friend_session(
-                                    friend_addr, our_uh, our_eh, nick,
+                                    friend_addr, friend_eh, our_uh, our_eh, nick,
                                     cid, tcp, udp, obfs, sess, ultx, fh,
                                     Some(ed25519_pubkey), Some(ed25519_secret_key),
                                 ).await {
@@ -7140,85 +7241,18 @@ pub async fn start_network(
                 }
 
                 if let DownloadEvent::EmberFriendRequest { ember_hash: req_hash, ref nickname, ref peer_ip, peer_port, verified } = event {
-                    let hash_hex = hex::encode(req_hash);
-                    info!("Processing download-side friend request from {} (nick='{}', ip={}:{}, verified={verified})", hash_hex, nickname, peer_ip, peer_port);
-                    // `verified` carries the strongest identity
-                    // signal available on the session that emitted
-                    // this event:
-                    //   - `multi_source.rs` download: offline BLAKE3
-                    //     binding check (advertised pubkey matches
-                    //     advertised ember_hash). The full
-                    //     challenge-response can't safely run inline
-                    //     in that loop because the uploader's
-                    //     proactive SecIdent / EPX traffic queues
-                    //     ahead of its CHALLENGE response.
-                    //   - friend-connect dial sessions: full PoP
-                    //     via `perform_ember_auth` (signature over
-                    //     a fresh nonce). This is the path that
-                    //     fires when the user accepts a request.
-                    //
-                    // Either way, `verified` propagates to the DB
-                    // row + UI badge. Never auto-promote to
-                    // "mutual" based on it. If the sender is
-                    // already mutual, ignore; if they are in our
-                    // list but not mutual, route through the
-                    // request queue so the user sees "<nick> wants
-                    // to confirm friendship" and must explicitly
-                    // accept.
-                    let db_q = db.clone();
-                    let h_q = hash_hex.clone();
-                    let (is_friend, already_mutual) = tokio::task::spawn_blocking(move || {
-                        db_q.get_friends_full()
-                            .ok()
-                            .and_then(|rows| rows.into_iter()
-                                .find(|(h, ..)| h == &h_q)
-                                .map(|(_, _, _, _, _, _, mutual)| (true, mutual)))
-                            .unwrap_or((false, false))
-                    })
-                    .await
-                    .unwrap_or((false, false));
-                    if already_mutual {
-                        info!("Friend {} already mutual — ignoring redundant EmberFriendRequest", hash_hex);
-                    } else if is_friend && !settings.friend_require_approval {
-                        // Auto-confirm: the user already added this peer and has
-                        // turned off "require approval", so a reciprocal request
-                        // upgrades the friendship to mutual without prompting.
-                        // Strangers (not already in our list) still fall through
-                        // to the approval queue below — we never auto-add an
-                        // unknown peer regardless of this setting.
-                        info!("Auto-confirming friend {} (already added; approval not required)", hash_hex);
-                        let db2 = db.clone();
-                        let h2 = hash_hex.clone();
-                        let ip2 = peer_ip.clone();
-                        let promoted = tokio::task::spawn_blocking(move || db2.set_friend_mutual(&h2, &ip2, peer_port))
-                            .await
-                            .unwrap_or(Ok(0))
-                            .unwrap_or(0);
-                        if promoted > 0 {
-                            if !state.online_friends.contains_key(&req_hash) {
-                                state.online_friends.insert(req_hash, chrono::Utc::now().timestamp());
-                                let _ = app_handle.emit("ember:friend-online", serde_json::json!({
-                                    "user_hash": hash_hex,
-                                }));
-                            }
-                            let _ = app_handle.emit("ember:friend-confirmed", serde_json::json!({
-                                "user_hash": hash_hex,
-                            }));
-                        }
-                    } else {
-                        info!("Queuing friend request from {} for user approval", hash_hex);
-                        let db2 = db.clone();
-                        let h2 = hash_hex.clone();
-                        let n2 = nickname.clone();
-                        let ip2 = peer_ip.clone();
-                        let verified_copy = verified;
-                        let _ = tokio::task::spawn_blocking(move || db2.add_friend_request(&h2, &n2, &ip2, peer_port, verified_copy));
-                        let _ = app_handle.emit("ember:friend-request", serde_json::json!({
-                            "sender_hash": hash_hex,
-                            "nickname": nickname,
-                            "verified": verified,
-                        }));
-                    }
+                    process_inbound_friend_request(
+                        &db,
+                        &app_handle,
+                        &mut state.online_friends,
+                        settings.friend_require_approval,
+                        req_hash,
+                        nickname,
+                        peer_ip,
+                        peer_port,
+                        verified,
+                    )
+                    .await;
                     continue;
                 }
 
@@ -7778,80 +7812,45 @@ pub async fn start_network(
                 }
 
                 if let UploadEventKind::FriendSeen { ember_hash, ip, port } = event.kind {
-                    let hash_hex = hex::encode(ember_hash);
-                    let now = chrono::Utc::now().timestamp();
-                    state.online_friends.insert(ember_hash, now);
-                    let ip_str = match ip { std::net::IpAddr::V4(v4) => v4.to_string(), std::net::IpAddr::V6(v6) => v6.to_string() };
-                    let db2 = db.clone();
-                    let h2 = hash_hex.clone();
-                    let ip2 = ip_str.clone();
-                    let _ = tokio::task::spawn_blocking(move || db2.update_friend_address(&h2, &ip2, port));
-                    let _ = app_handle.emit("ember:friend-online", serde_json::json!({
-                        "user_hash": hash_hex,
-                        "ip": ip_str,
-                        "port": port,
-                    }));
+                    // Gate on current membership: FriendSeen fires post-PoP for a
+                    // peer that was a friend at emit time, but a concurrent
+                    // removal can still race it. Without this a just-removed
+                    // friend could be resurrected as "online" in the UI until the
+                    // 5-minute sweep.
+                    if friend_hashes.read().await.contains(&ember_hash) {
+                        let hash_hex = hex::encode(ember_hash);
+                        let now = chrono::Utc::now().timestamp();
+                        state.online_friends.insert(ember_hash, now);
+                        // Mirror the download-side FriendSeen handler: clear any
+                        // reconnect backoff so a later disconnect can re-dial
+                        // promptly instead of waiting out the cooldown.
+                        state.friend_reconnect_last.remove(&ember_hash);
+                        let ip_str = match ip { std::net::IpAddr::V4(v4) => v4.to_string(), std::net::IpAddr::V6(v6) => v6.to_string() };
+                        let db2 = db.clone();
+                        let h2 = hash_hex.clone();
+                        let ip2 = ip_str.clone();
+                        let _ = tokio::task::spawn_blocking(move || db2.update_friend_address(&h2, &ip2, port));
+                        let _ = app_handle.emit("ember:friend-online", serde_json::json!({
+                            "user_hash": hash_hex,
+                            "ip": ip_str,
+                            "port": port,
+                        }));
+                    }
                 }
 
                 if let UploadEventKind::EmberFriendRequest { ember_hash: req_hash, ref nickname, ref peer_ip, peer_port, verified } = event.kind {
-                    let hash_hex = hex::encode(req_hash);
-                    info!("Processing upload-side friend request from {} (nick='{}', ip={}:{}, verified={verified})", hash_hex, nickname, peer_ip, peer_port);
-                    // See the download-side handler above. `verified` is
-                    // forwarded into the request's DB row so the UI can
-                    // render a verification badge; user approval is
-                    // still required regardless.
-                    let db_q = db.clone();
-                    let h_q = hash_hex.clone();
-                    let (is_friend, already_mutual) = tokio::task::spawn_blocking(move || {
-                        db_q.get_friends_full()
-                            .ok()
-                            .and_then(|rows| rows.into_iter()
-                                .find(|(h, ..)| h == &h_q)
-                                .map(|(_, _, _, _, _, _, mutual)| (true, mutual)))
-                            .unwrap_or((false, false))
-                    })
-                    .await
-                    .unwrap_or((false, false));
-                    if already_mutual {
-                        info!("Friend {} already mutual — ignoring redundant EmberFriendRequest", hash_hex);
-                    } else if is_friend && !settings.friend_require_approval {
-                        // Auto-confirm (see the download-side handler): a
-                        // reciprocal request from a peer we already added is
-                        // promoted to mutual without prompting when the user has
-                        // disabled "require approval". Strangers still queue.
-                        info!("Auto-confirming friend {} (already added; approval not required)", hash_hex);
-                        let db2 = db.clone();
-                        let h2 = hash_hex.clone();
-                        let ip2 = peer_ip.clone();
-                        let promoted = tokio::task::spawn_blocking(move || db2.set_friend_mutual(&h2, &ip2, peer_port))
-                            .await
-                            .unwrap_or(Ok(0))
-                            .unwrap_or(0);
-                        if promoted > 0 {
-                            if !state.online_friends.contains_key(&req_hash) {
-                                state.online_friends.insert(req_hash, chrono::Utc::now().timestamp());
-                                let _ = app_handle.emit("ember:friend-online", serde_json::json!({
-                                    "user_hash": hash_hex,
-                                }));
-                            }
-                            let _ = app_handle.emit("ember:friend-confirmed", serde_json::json!({
-                                "user_hash": hash_hex,
-                            }));
-                        }
-                    } else {
-                        info!("Queuing friend request from {} for user approval", hash_hex);
-                        let db2 = db.clone();
-                        let h2 = hash_hex.clone();
-                        let n2 = nickname.clone();
-                        let ip2 = peer_ip.clone();
-                        let verified_copy = verified;
-                        let _ = tokio::task::spawn_blocking(move || db2.add_friend_request(&h2, &n2, &ip2, peer_port, verified_copy));
-                        let _ = app_handle.emit("ember:friend-request", serde_json::json!({
-                            "sender_hash": hash_hex,
-                            "nickname": nickname,
-                            "verified": verified,
-                        }));
-                    }
+                    process_inbound_friend_request(
+                        &db,
+                        &app_handle,
+                        &mut state.online_friends,
+                        settings.friend_require_approval,
+                        req_hash,
+                        nickname,
+                        peer_ip,
+                        peer_port,
+                        verified,
+                    )
+                    .await;
                 }
 
                 if let UploadEventKind::EmberChatMessage { ember_hash: chat_eh, ref message } = event.kind {
@@ -8302,11 +8301,15 @@ pub async fn start_network(
                             let pending_request_id = pending.request_id;
                             let pending_file_type_filter = pending.file_type_filter.clone();
                             let pending_keywords = pending.keywords.clone();
-                            if pending_keywords.len() > 1 {
-                                batch.retain(|r| {
-                                    let name_lower = r.file.name.to_lowercase();
-                                    pending_keywords.iter().all(|kw| name_lower.contains(kw))
-                                });
+                            // Re-apply the full boolean query locally: a Kad
+                            // lookup only matches a single keyword hash, so
+                            // OR/NOT branches the responding node doesn't store
+                            // can slip through. Skipped for a single bare
+                            // keyword (already exact). `pending_keywords` still
+                            // seeds the spam scorer in the enrich call below.
+                            let pending_expr = pending.query_expr.clone();
+                            if !pending_expr.is_trivial() {
+                                batch.retain(|r| pending_expr.matches(&r.file.name.to_lowercase()));
                             }
                             if !batch.is_empty() {
                                 enrich_and_emit_search_results(
@@ -8329,7 +8332,7 @@ pub async fn start_network(
                 }
 
                 for sid in completed_ids {
-                    if let Some(PendingKeywordSearch { tx, mut local_results, keywords, request_id, file_type_filter, .. }) = state.pending_keyword_searches.remove(&sid) {
+                    if let Some(PendingKeywordSearch { tx, mut local_results, query_expr, request_id, file_type_filter, .. }) = state.pending_keyword_searches.remove(&sid) {
                         let network_results = if let Some(search) = state.search_manager.get(&sid) {
                             let unique: std::collections::HashSet<&kad::types::KadId> =
                                 search.results.iter().map(|r| &r.id).collect();
@@ -8338,13 +8341,16 @@ pub async fn start_network(
                                 sid.0, unique.len(), search.results.len(), local_results.len()
                             );
                             let all_results = convert_search_results(&search.results);
-                            if keywords.len() > 1 {
+                            if !query_expr.is_trivial() {
                                 let before = all_results.len();
-                                let filtered: Vec<SearchResult> = all_results.into_iter().filter(|r| {
-                                    let name_lower = r.file.name.to_lowercase();
-                                    keywords.iter().all(|kw| name_lower.contains(kw))
-                                }).collect();
-                                info!("Keyword filter: {before} -> {} results (matched all {} keywords)", filtered.len(), keywords.len());
+                                let filtered: Vec<SearchResult> = all_results
+                                    .into_iter()
+                                    .filter(|r| query_expr.matches(&r.file.name.to_lowercase()))
+                                    .collect();
+                                info!(
+                                    "Keyword filter: {before} -> {} results (boolean query)",
+                                    filtered.len()
+                                );
                                 filtered
                             } else {
                                 all_results
@@ -21582,7 +21588,18 @@ async fn handle_command_inner(
                 server_ip: state.server_addr.map(|a| a.ip().to_string()),
             };
 
-            let keywords = kad::publish::extract_keywords(&query);
+            // Parse the raw query into a boolean keyword tree (implicit AND,
+            // explicit AND/OR/NOT, `-` negation, "quoted phrases", and
+            // parentheses). Operator-free queries still tokenize exactly like
+            // before (byte-identical wire expression). `positive_terms`
+            // (negated terms excluded) drive the Kad lookup keyword and spam
+            // scoring; the full tree drives the wire expression and the local
+            // Kad result filter.
+            let query_expr = crate::search::query::parse(&query);
+            let keywords: Vec<String> = query_expr
+                .as_ref()
+                .map(|e| e.positive_terms())
+                .unwrap_or_default();
             if keywords.is_empty() {
                 if let Some(tx) = tx.take() {
                     let _ = tx.send(local_results.take().unwrap_or_default());
@@ -21590,6 +21607,8 @@ async fn handle_command_inner(
                 let _ = app_handle.emit("search-complete", SearchCompleteEvent { request_id });
                 return;
             }
+            let query_expr =
+                query_expr.expect("non-empty positive_terms implies a parsed expression");
             active_request.keywords = keywords.clone();
 
             // Build the search expression once, reuse for KAD + TCP + UDP.
@@ -21608,8 +21627,10 @@ async fn handle_command_inner(
                 max_size: search_filters.as_ref().and_then(|f| f.max_size),
                 min_availability: search_filters.as_ref().and_then(|f| f.min_availability),
             };
-            let search_expr =
-                kad::messages::build_search_expression(&keywords, &search_constraints);
+            let search_expr = kad::messages::build_search_expression_with_node(
+                Some(query_expr.to_wire_bytes()),
+                &search_constraints,
+            );
 
             // --- TCP server search ---
             let run_server = matches!(method, SearchMethod::Global | SearchMethod::Server);
@@ -21722,6 +21743,7 @@ async fn handle_command_inner(
                         tx: search_tx,
                         local_results: local_results.take().unwrap_or_default(),
                         keywords,
+                        query_expr,
                         request_id,
                         last_streamed_count: 0,
                         file_type_filter,
@@ -24665,6 +24687,7 @@ async fn handle_command_inner(
                                 tokio::spawn(async move {
                                     match ed2k::friend_connect::open_and_run_friend_session(
                                         addr,
+                                        friend_eh,
                                         our_user_hash,
                                         our_ember_hash,
                                         nickname,
@@ -24797,6 +24820,7 @@ async fn handle_command_inner(
                                         let addr = std::net::SocketAddr::new(ip.into(), port);
                                         match ed2k::friend_connect::open_and_run_friend_session(
                                             addr,
+                                            friend_eh,
                                             our_uh,
                                             our_eh,
                                             nick,
@@ -24958,6 +24982,7 @@ async fn handle_command_inner(
                                 tokio::spawn(async move {
                                     match ed2k::friend_connect::open_and_run_friend_session(
                                         addr,
+                                        friend_eh,
                                         our_user_hash,
                                         our_ember_hash,
                                         nickname,
@@ -25066,6 +25091,7 @@ async fn handle_command_inner(
                                         let addr = std::net::SocketAddr::new(ip.into(), port);
                                         match ed2k::friend_connect::open_and_run_friend_session(
                                             addr,
+                                            friend_eh,
                                             our_uh,
                                             our_eh,
                                             nick,
