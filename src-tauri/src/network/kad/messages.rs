@@ -1023,6 +1023,12 @@ const FT_FILEFORMAT: u8 = 0x04;
 ///   0x01           = String leaf  (u16-len UTF-8 string)
 ///   0x02           = Meta-string  (u16-len value, u16-len tag-name, tag id)
 ///   0x03 / 0x08    = Numeric u32/u64 (value, 1-byte op, u16-len tag-name, tag id)
+// Retained as the canonical flat-keyword builder and wire-format reference
+// (locked down by `search_expr_tests`). The live search path now routes through
+// `build_search_expression_with_node` so it can emit boolean keyword trees from
+// the query parser; `network` being a private module makes this otherwise-public
+// helper read as dead code without the allow.
+#[allow(dead_code)]
 pub fn build_search_expression(keywords: &[String], constraints: &SearchConstraints) -> Vec<u8> {
     fn write_string_leaf(buf: &mut Vec<u8>, s: &str) {
         buf.push(0x01);
@@ -1031,6 +1037,46 @@ pub fn build_search_expression(keywords: &[String], constraints: &SearchConstrai
         buf.extend_from_slice(bytes);
     }
 
+    fn write_keyword_tree(buf: &mut Vec<u8>, keywords: &[String], end: usize) {
+        if end == 1 {
+            write_string_leaf(buf, &keywords[0]);
+            return;
+        }
+        buf.push(0x00); // operator
+        buf.push(0x00); // AND
+        if end == 2 {
+            write_string_leaf(buf, &keywords[0]);
+            write_string_leaf(buf, &keywords[1]);
+        } else {
+            write_keyword_tree(buf, keywords, end - 1);
+            write_string_leaf(buf, &keywords[end - 1]);
+        }
+    }
+
+    let keyword_node = if keywords.is_empty() {
+        None
+    } else {
+        let mut kw = Vec::with_capacity(32);
+        write_keyword_tree(&mut kw, keywords, keywords.len());
+        Some(kw)
+    };
+
+    build_search_expression_with_node(keyword_node, constraints)
+}
+
+/// Like [`build_search_expression`] but takes a pre-serialized keyword
+/// sub-expression (already in wire form) instead of a flat keyword list.
+///
+/// This lets callers emit a full boolean keyword tree (AND/OR/NOT, quoted
+/// phrases, parentheses — see [`crate::search::query`]) while reusing the exact
+/// constraint folding used by the simple keyword path. Passing the AND-tree
+/// produced for a flat keyword list yields byte-identical output to
+/// `build_search_expression`. Returns empty only when there is neither a
+/// keyword node nor any constraint.
+pub fn build_search_expression_with_node(
+    keyword_node: Option<Vec<u8>>,
+    constraints: &SearchConstraints,
+) -> Vec<u8> {
     fn write_meta_string(buf: &mut Vec<u8>, value: &str, tag_id: u8) {
         buf.push(0x02); // META_STRING
         let bytes = value.as_bytes();
@@ -1057,30 +1103,14 @@ pub fn build_search_expression(keywords: &[String], constraints: &SearchConstrai
         buf.push(tag_id);
     }
 
-    fn write_keyword_tree(buf: &mut Vec<u8>, keywords: &[String], end: usize) {
-        if end == 1 {
-            write_string_leaf(buf, &keywords[0]);
-            return;
-        }
-        buf.push(0x00); // operator
-        buf.push(0x00); // AND
-        if end == 2 {
-            write_string_leaf(buf, &keywords[0]);
-            write_string_leaf(buf, &keywords[1]);
-        } else {
-            write_keyword_tree(buf, keywords, end - 1);
-            write_string_leaf(buf, &keywords[end - 1]);
-        }
-    }
-
     // Each operand of the top-level AND is serialized independently, then
     // folded into a right-leaning AND chain below.
     let mut nodes: Vec<Vec<u8>> = Vec::new();
 
-    if !keywords.is_empty() {
-        let mut kw = Vec::with_capacity(32);
-        write_keyword_tree(&mut kw, keywords, keywords.len());
-        nodes.push(kw);
+    if let Some(node) = keyword_node {
+        if !node.is_empty() {
+            nodes.push(node);
+        }
     }
 
     if let Some(ft) = constraints.file_type.filter(|t| !t.is_empty()) {
