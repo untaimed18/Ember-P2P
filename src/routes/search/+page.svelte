@@ -225,6 +225,11 @@
   let filterMaxUnit = $state(1024 * 1024 * 1024);
   let filterExtension = $state('');
   let filterMinSources = $state('');
+  // Client-side "complete sources" minimum. Unlike Min Sources (sent to the
+  // remote node as a FT_SOURCES constraint), there is no standard eD2k search
+  // tag for complete-source counts, so this filters the results we already
+  // received (the count arrives on each hit as `file.complete_sources`).
+  let filterMinComplete = $state('');
   let hideSpam = $state(true);
   /** True when the hit is only from the shared library (not merged with KAD/Server/UDP/Notes). */
   function isLocalOnlySearchResult(r: SearchResult): boolean {
@@ -271,6 +276,32 @@
     { value: 'hash', get label() { return m.search_col_hash(); } },
     { value: 'all', get label() { return m.search_col_all_fields(); } },
   ];
+
+  // Optional, user-toggleable media-metadata columns (eMule FT_MEDIA_*). Length
+  // and bitrate are shown by default (the two classic eMule media columns); the
+  // rest — plus the complete-source count — are available from the Columns menu.
+  type MediaColumn = 'length' | 'bitrate' | 'codec' | 'artist' | 'album' | 'title' | 'complete';
+  const MEDIA_COLUMNS: { key: MediaColumn; readonly label: string }[] = [
+    { key: 'length', get label() { return m.search_col_length(); } },
+    { key: 'bitrate', get label() { return m.search_col_bitrate(); } },
+    { key: 'codec', get label() { return m.search_col_codec(); } },
+    { key: 'artist', get label() { return m.search_col_artist(); } },
+    { key: 'album', get label() { return m.search_col_album(); } },
+    { key: 'title', get label() { return m.search_col_title(); } },
+    { key: 'complete', get label() { return m.search_col_complete_sources(); } },
+  ];
+  const DEFAULT_COLUMN_VIS: Record<MediaColumn, boolean> = {
+    length: true, bitrate: true, codec: true,
+    artist: false, album: false, title: false, complete: false,
+  };
+  let columnVis = $state<Record<MediaColumn, boolean>>({ ...DEFAULT_COLUMN_VIS });
+  let showColumnMenu = $state(false);
+
+  function toggleColumn(key: MediaColumn) {
+    // Reassign (rather than mutate in place) so the persistence $effect, which
+    // tracks `columnVis` by reference, re-runs and saves the change.
+    columnVis = { ...columnVis, [key]: !columnVis[key] };
+  }
 
   let destroyed = false;
   const miscTimers = new Set<ReturnType<typeof setTimeout>>();
@@ -353,7 +384,8 @@
     return false;
   }
 
-  type SortField = 'name' | 'size' | 'type' | 'sources' | 'origin';
+  type SortField = 'name' | 'size' | 'type' | 'sources' | 'origin'
+    | 'length' | 'bitrate' | 'codec' | 'artist' | 'album' | 'title' | 'complete';
   type SortDir = 'asc' | 'desc';
   let sortField: SortField = $state('sources');
   let sortDir: SortDir = $state('desc');
@@ -366,7 +398,10 @@
   const VALID_FILTER_COLUMNS = new Set<FilterColumn>([
     'name', 'size', 'type', 'sources', 'origin', 'hash', 'all',
   ]);
-  const VALID_SORT_FIELDS = new Set<SortField>(['name', 'size', 'type', 'sources', 'origin']);
+  const VALID_SORT_FIELDS = new Set<SortField>([
+    'name', 'size', 'type', 'sources', 'origin',
+    'length', 'bitrate', 'codec', 'artist', 'album', 'title', 'complete',
+  ]);
   const VALID_SIZE_UNITS = new Set<number>(SIZE_UNITS.map((u) => u.value));
   const VALID_FILE_TYPES = new Set<string>(FILE_TYPES.map((t) => t.value));
   let prefsRestored = false;
@@ -407,6 +442,16 @@
       if (typeof p.filterMinSources === 'string' && p.filterMinSources.length <= 8) {
         filterMinSources = p.filterMinSources;
       }
+      if (typeof p.filterMinComplete === 'string' && p.filterMinComplete.length <= 8) {
+        filterMinComplete = p.filterMinComplete;
+      }
+      if (p.columnVis && typeof p.columnVis === 'object') {
+        const next = { ...columnVis };
+        for (const c of MEDIA_COLUMNS) {
+          if (typeof p.columnVis[c.key] === 'boolean') next[c.key] = p.columnVis[c.key];
+        }
+        columnVis = next;
+      }
       if (typeof p.hideSpam === 'boolean') hideSpam = p.hideSpam;
       if (typeof p.showAdvancedFilters === 'boolean') showAdvancedFilters = p.showAdvancedFilters;
       if (typeof p.sortField === 'string' && VALID_SORT_FIELDS.has(p.sortField as SortField)) {
@@ -433,6 +478,8 @@
         filterMinUnit,
         filterMaxUnit,
         filterMinSources,
+        filterMinComplete,
+        columnVis,
         hideSpam,
         showAdvancedFilters,
         sortField,
@@ -448,7 +495,8 @@
     void searchMethod; void searchFileType;
     void filterType; void filterColumn; void filterExtension;
     void filterMinSize; void filterMaxSize; void filterMinUnit; void filterMaxUnit;
-    void filterMinSources; void hideSpam; void showAdvancedFilters;
+    void filterMinSources; void filterMinComplete; void columnVis;
+    void hideSpam; void showAdvancedFilters;
     void sortField; void sortDir;
     persistPrefs();
   });
@@ -458,7 +506,9 @@
       sortDir = sortDir === 'asc' ? 'desc' : 'asc';
     } else {
       sortField = field;
-      sortDir = field === 'name' || field === 'type' || field === 'origin' ? 'asc' : 'desc';
+      const ascByDefault = field === 'name' || field === 'type' || field === 'origin'
+        || field === 'codec' || field === 'artist' || field === 'album' || field === 'title';
+      sortDir = ascByDefault ? 'asc' : 'desc';
     }
   }
 
@@ -684,6 +734,8 @@
     const maxBytes = Number.isFinite(maxParsed) && maxParsed > 0 ? maxParsed : 0;
     const minSrcParsed = filterMinSources !== '' ? parseInt(filterMinSources, 10) : NaN;
     const minSrc = Number.isFinite(minSrcParsed) && minSrcParsed > 0 ? minSrcParsed : 0;
+    const minCompleteParsed = filterMinComplete !== '' ? parseInt(filterMinComplete, 10) : NaN;
+    const minComplete = Number.isFinite(minCompleteParsed) && minCompleteParsed > 0 ? minCompleteParsed : 0;
     const hasType = !!filterType;
     const spamHidden = hideSpam;
 
@@ -696,6 +748,7 @@
       if (minBytes > 0 && r.file.size < minBytes) continue;
       if (maxBytes > 0 && r.file.size > maxBytes) continue;
       if (minSrc > 0 && r.availability < minSrc) continue;
+      if (minComplete > 0 && (r.file.complete_sources ?? 0) < minComplete) continue;
       if (isFilteredByText(r)) continue;
       out.push(r);
     }
@@ -717,6 +770,27 @@
           break;
         case 'origin':
           cmp = (a.result_origin || '').localeCompare(b.result_origin || '');
+          break;
+        case 'length':
+          cmp = (a.media?.duration ?? 0) - (b.media?.duration ?? 0);
+          break;
+        case 'bitrate':
+          cmp = (a.media?.bitrate ?? 0) - (b.media?.bitrate ?? 0);
+          break;
+        case 'complete':
+          cmp = (a.file.complete_sources ?? 0) - (b.file.complete_sources ?? 0);
+          break;
+        case 'codec':
+          cmp = (a.media?.codec ?? '').localeCompare(b.media?.codec ?? '');
+          break;
+        case 'artist':
+          cmp = (a.media?.artist ?? '').localeCompare(b.media?.artist ?? '');
+          break;
+        case 'album':
+          cmp = (a.media?.album ?? '').localeCompare(b.media?.album ?? '');
+          break;
+        case 'title':
+          cmp = (a.media?.title ?? '').localeCompare(b.media?.title ?? '');
           break;
       }
       return sortDir === 'asc' ? cmp : -cmp;
@@ -1242,6 +1316,7 @@
     filterMaxSize = '';
     filterExtension = '';
     filterMinSources = '';
+    filterMinComplete = '';
     filterColumn = 'all';
     clearFilterText();
   }
@@ -1539,6 +1614,7 @@
     filterMaxSize !== '' ||
     filterExtension !== '' ||
     filterMinSources !== '' ||
+    filterMinComplete !== '' ||
     filterText !== ''
   );
 
@@ -1555,7 +1631,8 @@
     (filterMinSize !== '' ? 1 : 0) +
     (filterMaxSize !== '' ? 1 : 0) +
     (filterExtension !== '' ? 1 : 0) +
-    (filterMinSources !== '' ? 1 : 0)
+    (filterMinSources !== '' ? 1 : 0) +
+    (filterMinComplete !== '' ? 1 : 0)
   );
 
 </script>
@@ -1597,6 +1674,7 @@
     <button onclick={() => handleSearch(barQuery)}>{m.search_title()}</button>
   {/if}
 </div>
+<p class="search-syntax-hint">{m.search_query_syntax_hint()}</p>
 
 {#if $searchTabs.length > 0}
   <div class="search-tabs" role="tablist" aria-label={m.search_sessions_aria()}>
@@ -1812,6 +1890,19 @@
           class="sources-input"
         />
       </div>
+
+      <div class="filter-group">
+        <label for="filter-complete">{m.search_min_complete_sources()}</label>
+        <input
+          id="filter-complete"
+          type="number"
+          min="1"
+          step="1"
+          placeholder="—"
+          bind:value={filterMinComplete}
+          class="sources-input"
+        />
+      </div>
     </div>
   {/if}
 
@@ -1896,7 +1987,27 @@
           {m.search_zero_results()}
         {/if}
       </span>
-      <button class="ghost clear-results-btn" onclick={requestClearResults}>{m.search_clear_results()}</button>
+      <div class="results-info-actions">
+        <details class="column-menu" bind:open={showColumnMenu}>
+          <summary class="column-menu-summary" title={m.search_columns_aria()}>
+            <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+              <rect x="2" y="2.5" width="12" height="11" rx="1.5"/>
+              <line x1="6.5" y1="2.5" x2="6.5" y2="13.5"/>
+              <line x1="10.5" y1="2.5" x2="10.5" y2="13.5"/>
+            </svg>
+            {m.search_columns_button()}
+          </summary>
+          <div class="column-menu-panel" role="group" aria-label={m.search_columns_aria()}>
+            {#each MEDIA_COLUMNS as col}
+              <label class="column-menu-item">
+                <input type="checkbox" checked={columnVis[col.key]} onchange={() => toggleColumn(col.key)} />
+                <span>{col.label}</span>
+              </label>
+            {/each}
+          </div>
+        </details>
+        <button class="ghost clear-results-btn" onclick={requestClearResults}>{m.search_clear_results()}</button>
+      </div>
     </div>
     {#if checkedCount > 0}
       <div class="bulk-actions" role="toolbar" aria-label={m.search_bulk_actions_aria()}>
@@ -1938,6 +2049,41 @@
           <th class="sortable col-sources" role="columnheader" aria-sort={sortField === 'sources' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'} tabindex="0" onclick={() => toggleSort('sources')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggleSort('sources'))}>
             {m.search_col_sources()}{sortIndicator('sources')}
           </th>
+          {#if columnVis.complete}
+            <th class="sortable col-complete" role="columnheader" aria-sort={sortField === 'complete' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'} tabindex="0" onclick={() => toggleSort('complete')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggleSort('complete'))}>
+              {m.search_col_complete_sources()}{sortIndicator('complete')}
+            </th>
+          {/if}
+          {#if columnVis.length}
+            <th class="sortable col-length" role="columnheader" aria-sort={sortField === 'length' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'} tabindex="0" onclick={() => toggleSort('length')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggleSort('length'))}>
+              {m.search_col_length()}{sortIndicator('length')}
+            </th>
+          {/if}
+          {#if columnVis.bitrate}
+            <th class="sortable col-bitrate" role="columnheader" aria-sort={sortField === 'bitrate' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'} tabindex="0" onclick={() => toggleSort('bitrate')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggleSort('bitrate'))}>
+              {m.search_col_bitrate()}{sortIndicator('bitrate')}
+            </th>
+          {/if}
+          {#if columnVis.codec}
+            <th class="sortable col-codec" role="columnheader" aria-sort={sortField === 'codec' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'} tabindex="0" onclick={() => toggleSort('codec')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggleSort('codec'))}>
+              {m.search_col_codec()}{sortIndicator('codec')}
+            </th>
+          {/if}
+          {#if columnVis.artist}
+            <th class="sortable col-artist" role="columnheader" aria-sort={sortField === 'artist' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'} tabindex="0" onclick={() => toggleSort('artist')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggleSort('artist'))}>
+              {m.search_col_artist()}{sortIndicator('artist')}
+            </th>
+          {/if}
+          {#if columnVis.album}
+            <th class="sortable col-album" role="columnheader" aria-sort={sortField === 'album' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'} tabindex="0" onclick={() => toggleSort('album')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggleSort('album'))}>
+              {m.search_col_album()}{sortIndicator('album')}
+            </th>
+          {/if}
+          {#if columnVis.title}
+            <th class="sortable col-title" role="columnheader" aria-sort={sortField === 'title' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'} tabindex="0" onclick={() => toggleSort('title')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggleSort('title'))}>
+              {m.search_col_title()}{sortIndicator('title')}
+            </th>
+          {/if}
           <th class="col-history">{m.search_th_history()}</th>
           <th class="col-action" aria-label={m.search_th_actions_aria()}></th>
         </tr>
@@ -2016,6 +2162,27 @@
                 {result.availability}
               </span>
             </td>
+            {#if columnVis.complete}
+              <td class="col-complete">{result.file.complete_sources ? result.file.complete_sources : '\u2014'}</td>
+            {/if}
+            {#if columnVis.length}
+              <td class="col-length">{result.media?.duration ? formatMediaLength(result.media.duration) : '\u2014'}</td>
+            {/if}
+            {#if columnVis.bitrate}
+              <td class="col-bitrate">{result.media?.bitrate ? m.search_bitrate_value({ kbps: result.media.bitrate }) : '\u2014'}</td>
+            {/if}
+            {#if columnVis.codec}
+              <td class="col-codec" title={result.media?.codec || ''}>{result.media?.codec || '\u2014'}</td>
+            {/if}
+            {#if columnVis.artist}
+              <td class="col-artist" title={result.media?.artist || ''}>{result.media?.artist || '\u2014'}</td>
+            {/if}
+            {#if columnVis.album}
+              <td class="col-album" title={result.media?.album || ''}>{result.media?.album || '\u2014'}</td>
+            {/if}
+            {#if columnVis.title}
+              <td class="col-title" title={result.media?.title || ''}>{result.media?.title || '\u2014'}</td>
+            {/if}
             <td class="col-history">
               {#if isInLibraryOnly(result)}
                 <span class="history-badge in-library" title={m.search_history_in_library_title()}>{m.search_history_in_library()}</span>
@@ -2623,6 +2790,12 @@
     padding: 0 4px;
   }
 
+  .search-syntax-hint {
+    margin: 6px 2px 0;
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+
   .results-info {
     padding: 10px 20px;
     font-size: 12px;
@@ -2637,6 +2810,81 @@
   .clear-results-btn {
     font-size: 12px;
     padding: 4px 10px;
+  }
+
+  .results-info-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .column-menu {
+    position: relative;
+  }
+
+  .column-menu-summary {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    padding: 4px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-surface);
+    color: var(--text-secondary);
+    cursor: pointer;
+    list-style: none;
+    user-select: none;
+  }
+
+  .column-menu-summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .column-menu-summary:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+
+  .column-menu[open] .column-menu-summary {
+    border-color: var(--accent);
+    color: var(--text-primary);
+  }
+
+  .column-menu-panel {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    z-index: 50;
+    min-width: 180px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-md);
+    padding: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .column-menu-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+    color: var(--text-primary);
+    cursor: pointer;
+  }
+
+  .column-menu-item:hover {
+    background: var(--bg-hover);
+  }
+
+  .column-menu-item input[type="checkbox"] {
+    margin: 0;
+    cursor: pointer;
   }
 
   .bulk-actions {
@@ -2742,6 +2990,36 @@
     width: 36px;
     text-align: center;
     padding: 0 4px;
+  }
+
+  .col-complete {
+    width: 7%;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .col-length,
+  .col-bitrate {
+    width: 8%;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  .col-codec {
+    width: 7%;
+  }
+
+  .col-artist,
+  .col-album,
+  .col-title {
+    width: 11%;
+    max-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 12px;
+    color: var(--text-secondary);
   }
 
   .row-dl-btn {

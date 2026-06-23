@@ -29,10 +29,20 @@ pub struct FriendSessionHandle {
 /// `ul_event_tx` channel so the network loop can process them identically
 /// to inbound (upload-side) friend packets.
 ///
+/// `expected_ember_hash` is the friend we intend to reach at `addr` (from a
+/// friend row, a rendezvous lookup, or a `FriendSeen` event). If the peer
+/// that actually answers identifies as a *different* Ember peer, the session
+/// is refused. A stale or reused address (or a misbehaving rendezvous) could
+/// otherwise land us in a session with friend B when the caller asked for
+/// friend A — delivering A's outbound chat to B and showing A online when
+/// only B is reachable. The Ed25519 PoP below proves the peer owns whatever
+/// hash it claims, but only this equality check catches the *wrong friend*.
+///
 /// The session automatically unregisters from `ember_sessions` on exit and
 /// emits an `EmberFriendDisconnected` event.
 pub async fn open_and_run_friend_session(
     addr: SocketAddr,
+    expected_ember_hash: [u8; 16],
     our_user_hash: [u8; 16],
     our_ember_hash: [u8; 16],
     our_nickname: String,
@@ -126,6 +136,22 @@ pub async fn open_and_run_friend_session(
     let peer_ember_hash = hello_caps
         .ember_hash
         .ok_or_else(|| anyhow::anyhow!("Ember peer has no ember_hash"))?;
+
+    // Identity guard (see the function doc): refuse a session whose peer
+    // identifies as someone other than the friend the caller asked us to
+    // dial. Runs before the duplicate-session check and the expensive PoP
+    // round trip so a stale/reused address is rejected as cheaply as
+    // possible. PoP below still proves possession of the claimed hash; this
+    // check is what prevents a *wrong but otherwise-valid* friend from
+    // standing in for the one we intended to reach.
+    if peer_ember_hash != expected_ember_hash {
+        anyhow::bail!(
+            "dialed {} expecting friend {} but peer identifies as {}; refusing session",
+            addr,
+            hex::encode(expected_ember_hash),
+            hex::encode(peer_ember_hash)
+        );
+    }
 
     // Early duplicate-session check. As soon as we know the peer's
     // ember_hash (from `exchange_ember_hello` above) we can tell whether
