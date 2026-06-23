@@ -196,6 +196,22 @@ pub async fn search_files(
         )
     };
 
+    // Apply the same boolean query semantics (implicit/explicit AND, OR, NOT,
+    // `-` exclusion, quoted phrases, parentheses) to our own shared-library
+    // hits that the network path applies to KAD/server results, so local
+    // results stay at parity. `LocalIndex::search` scores by any-token match
+    // (OR-ish) and can't express NOT, so without this a query like
+    // `movie -cam` would still surface local `cam` files, and a multi-word
+    // query would surface files matching only one of the words. Trivial
+    // single-keyword queries are left untouched (no behavior change there).
+    let local_hits = match crate::search::query::parse(&query) {
+        Some(expr) if !expr.is_trivial() => local_hits
+            .into_iter()
+            .filter(|r| expr.matches(&r.file.name.to_lowercase()))
+            .collect(),
+        _ => local_hits,
+    };
+
     let file_type_filter = file_type.clone();
     let filters = if min_size.is_some()
         || max_size.is_some()
