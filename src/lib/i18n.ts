@@ -9,7 +9,7 @@
  *
  *  - Reading / changing the active locale at runtime.
  *  - Mapping a backend error code (string identifier) to a
- *    translated message via `translateErrorCode`.
+ *    translated message via `translateError`.
  *  - Listing the available locales so the Settings picker can
  *    render the right options.
  *
@@ -184,24 +184,6 @@ function translateCode(code: string, context: string | undefined): string | unde
 }
 
 /**
- * Map a Tauri command error onto a translated message.
- *
- * Three tiers, in priority order:
- *  1. A coded envelope from `commands::errors` — decode `code`,
- *     interpolate `context`, fall back to the envelope's English
- *     `message` for an unregistered code.
- *  2. A legacy bare code string (`"FriendNotFound"`, etc.) emitted
- *     by older friend/KAD command paths.
- *  3. Any other string — shown verbatim (foreign/underlying errors).
- *
- * Adding new error codes is always non-breaking: an unmapped code
- * degrades to its embedded English message rather than disappearing.
- */
-export function translateErrorCode(input: unknown): string {
-  return translateError(input);
-}
-
-/**
  * Localize a network `degraded_reason` code (see `NetworkStats`). The store
  * keeps a stable code rather than an English string so the reason re-renders
  * in the active locale. Unknown values fall back to the raw string (or empty)
@@ -241,12 +223,25 @@ export function firewallStatusText(status: string | undefined): string {
 }
 
 /**
- * Like {@link translateErrorCode}, but lets the caller supply the
- * message shown when the error carries no usable string (e.g. a
- * thrown non-Error value). Call sites that previously had their own
- * `e instanceof Error ? e.message : … : m.something()` ternary pass
- * their domain-specific fallback here so coded backend errors are
- * still decoded while the bespoke fallback is preserved.
+ * Map a Tauri command error onto a translated message.
+ *
+ * Three tiers, in priority order:
+ *  1. A coded envelope from `commands::errors` — decode `code`,
+ *     interpolate `context`, fall back to the envelope's English
+ *     `message` for an unregistered code.
+ *  2. A legacy bare code string (`"FriendNotFound"`, etc.) emitted
+ *     by older friend/KAD command paths.
+ *  3. Any other string — shown verbatim (foreign/underlying errors).
+ *
+ * Adding new error codes is always non-breaking: an unmapped code
+ * degrades to its embedded English message rather than disappearing.
+ *
+ * The optional `fallback` is the message shown when the error carries
+ * no usable string (e.g. a thrown non-Error value). Call sites that
+ * previously had their own `e instanceof Error ? e.message : … :
+ * m.something()` ternary pass their domain-specific fallback here so
+ * coded backend errors are still decoded while the bespoke fallback
+ * is preserved.
  */
 export function translateError(input: unknown, fallback?: string): string {
   const raw = input instanceof Error

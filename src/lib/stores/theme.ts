@@ -26,14 +26,6 @@ export function applyTheme(t: Theme) {
   if (browser) localStorage.setItem(STORAGE_KEY, t);
 }
 
-export function toggleTheme() {
-  theme.update((current) => {
-    const next: Theme = current === 'light' ? 'dark' : 'light';
-    applyTheme(next);
-    return next;
-  });
-}
-
 let themeCleanup: (() => void) | null = null;
 
 export function initTheme() {
@@ -46,8 +38,8 @@ export function initTheme() {
   // wrote the resolved theme back to localStorage on every init,
   // every user would look like they had explicitly chosen the
   // OS-derived value, and OS dark/light flips after launch would
-  // never propagate. `applyTheme()` (called from `toggleTheme()` and
-  // settings) is the single point that records an explicit choice.
+  // never propagate. `applyTheme()` (called from settings) is the
+  // single point that records an explicit choice.
   // `getInitialTheme()` already validates whatever's in storage and
   // safely falls through to the OS preference if it's garbage, so
   // there's nothing to "self-heal" by writing it back.

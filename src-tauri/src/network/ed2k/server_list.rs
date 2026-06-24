@@ -893,11 +893,6 @@ impl ServerList {
         Ok(stats)
     }
 
-    /// Merge servers from raw server.met bytes without IP filtering.
-    pub fn merge_from_bytes(&mut self, data: &[u8]) -> anyhow::Result<ServerMergeStats> {
-        self.merge_from_bytes_filtered(data, false, None)
-    }
-
     pub fn update_server_stats(
         &mut self,
         ip: &str,
@@ -977,35 +972,6 @@ impl ServerList {
         }
     }
 
-    /// Look up the UDP obfuscation material for a server by `(ip, tcp_port)`.
-    /// Returns `Some((base_key, obf_udp_port))` only when the server has
-    /// advertised a non-zero key AND has the `SRV_UDPFLG_UDPOBFUSCATION`
-    /// flag set. The caller is expected to fall back to plaintext + the
-    /// regular UDP port (`tcp_port + 4`) when this returns `None`.
-    pub fn get_udp_obfuscation(&self, ip: std::net::Ipv4Addr, tcp_port: u16) -> Option<(u32, u16)> {
-        let ip_str = ip.to_string();
-        let entry = self
-            .servers
-            .iter()
-            .find(|s| s.ip == ip_str && s.port == tcp_port)?;
-        if entry.server_udp_key == 0 {
-            return None;
-        }
-        if entry.udp_flags & super::server_udp::SRV_UDPFLG_UDPOBFUSCATION == 0 {
-            return None;
-        }
-        let port = if entry.obfuscation_port_udp != 0 {
-            entry.obfuscation_port_udp
-        } else {
-            // Fall back to the standard UDP port — eMule's
-            // `UDPSocket.cpp` does the same when `nUDPObfuscationPort`
-            // is 0 (`if (!nPort) nPort = pServer->GetObfuscationPortUDP();`,
-            // which then resolves to the standard port).
-            tcp_port.saturating_add(4)
-        };
-        Some((entry.server_udp_key, port))
-    }
-
     /// Inverse lookup: given an inbound UDP `(src_ip, src_port)`, find
     /// which server it belongs to and return:
     ///   * `base_key`  — server's `dwServerUDPKey` for obfuscation,
@@ -1035,22 +1001,6 @@ impl ServerList {
             }
         }
         None
-    }
-
-    /// Backwards-compatible wrapper that returns just the BaseKey when
-    /// the caller doesn't need the canonical TCP port. The canonical-
-    /// port consumer ([`try_recv_with`]) uses [`lookup_for_udp_addr`]
-    /// directly; this thinner wrapper is kept around for any future
-    /// caller that just wants "do we have a key for this address?".
-    /// Returns `None` when no server matches OR when the matching
-    /// server has no key yet.
-    #[allow(dead_code)]
-    pub fn server_udp_key_for_addr(&self, ip: std::net::Ipv4Addr, src_port: u16) -> Option<u32> {
-        let (key, _) = self.lookup_for_udp_addr(ip, src_port)?;
-        if key == 0 {
-            return None;
-        }
-        Some(key)
     }
 
     /// Store per-server UDP capability flags from status ping responses.

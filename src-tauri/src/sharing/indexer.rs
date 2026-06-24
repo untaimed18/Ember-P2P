@@ -4,8 +4,7 @@ use std::sync::atomic::AtomicBool;
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
-use crate::network::ed2k::aich::compute_aich_root;
-use crate::network::ed2k::hash::{ed2k_hash_file, hash_file_combined_cancellable};
+use crate::network::ed2k::hash::hash_file_combined_cancellable;
 use crate::types::FileInfo;
 
 pub struct FileIndexer;
@@ -138,18 +137,6 @@ impl FileIndexer {
             shared_kad: false,
             shared_ed2k: false,
         })
-    }
-
-    #[allow(dead_code)]
-    pub fn hash_file(path: &Path) -> anyhow::Result<(String, String)> {
-        let ed2k = ed2k_hash_file(path)?;
-        // AICH failures must propagate: an empty AICH hex would look like a
-        // legitimate (empty-file) hash to callers and be served to peers as
-        // authoritative recovery data, which is dangerous.
-        let aich = compute_aich_root(path)
-            .map(hex::encode)
-            .map_err(|e| anyhow::anyhow!("AICH hash failed for {}: {e}", path.display()))?;
-        Ok((ed2k, aich))
     }
 
     /// Cancellable version -- computes both hashes in a single pass.

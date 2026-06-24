@@ -1275,24 +1275,6 @@ impl SourceManager {
         });
     }
 
-    /// Return non-expired LowID sources that need server callbacks.
-    #[allow(dead_code)]
-    pub fn get_lowid_sources(&self, file_hash: &[u8; 16]) -> Vec<(u32, u16, u32, u16)> {
-        let now = chrono::Utc::now().timestamp();
-        self.sources
-            .get(file_hash)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter(|e| {
-                        now.saturating_sub(e.last_seen) < SOURCE_EXPIRY_SECS && e.client_id > 0
-                    })
-                    .map(|e| (e.client_id, e.tcp_port, e.server_ip, e.server_port))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
     /// Return non-expired LowID sources that haven't had a callback requested
     /// within `min_interval_secs` (eMule: FILEREASKTIME ≈ 29 min).
     /// Only returns sources on the specified server.
@@ -1362,51 +1344,6 @@ impl SourceManager {
             }
         }
         out
-    }
-
-    /// D11: return LowID sources for a file that are eligible for a
-    /// callback, grouped by the server they were announced through. Lets
-    /// the caller switch eMule servers on the fly (or talk to multiple
-    /// servers) without losing track of a LowID source that was only ever
-    /// seen through a different server.
-    ///
-    /// Returns `Vec<(server_ip, server_port, Vec<client_id>)>`.
-    #[allow(dead_code)]
-    pub fn get_lowid_sources_by_server(
-        &self,
-        file_hash: &[u8; 16],
-        min_interval_secs: i64,
-    ) -> Vec<(u32, u16, Vec<u32>)> {
-        let now = chrono::Utc::now().timestamp();
-        let entries = match self.sources.get(file_hash) {
-            Some(e) => e,
-            None => return Vec::new(),
-        };
-        let mut grouped: std::collections::HashMap<(u32, u16), Vec<u32>> =
-            std::collections::HashMap::new();
-        for e in entries {
-            if e.client_id == 0 {
-                continue;
-            }
-            if now.saturating_sub(e.last_seen) >= SOURCE_EXPIRY_SECS {
-                continue;
-            }
-            if e.server_ip == 0 || e.server_port == 0 {
-                continue;
-            }
-            if e.last_callback_at != 0 && now.saturating_sub(e.last_callback_at) < min_interval_secs
-            {
-                continue;
-            }
-            grouped
-                .entry((e.server_ip, e.server_port))
-                .or_default()
-                .push(e.client_id);
-        }
-        grouped
-            .into_iter()
-            .map(|((ip, port), ids)| (ip, port, ids))
-            .collect()
     }
 
     /// Record that OP_CALLBACKREQUEST was sent for a LowID source.
