@@ -9,8 +9,6 @@ pub mod relay;
 #[allow(dead_code)]
 pub mod reputation;
 #[allow(dead_code)]
-pub mod transfer;
-#[allow(dead_code)]
 pub mod transport;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
