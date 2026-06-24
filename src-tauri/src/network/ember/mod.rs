@@ -7,8 +7,6 @@ pub mod relay;
 // Ember-native modules below are still dormant. `reputation` is the exception:
 // it is persisted and consulted by the live eD2K/EPX paths in network/mod.rs.
 #[allow(dead_code)]
-pub mod dht;
-#[allow(dead_code)]
 pub mod reputation;
 #[allow(dead_code)]
 pub mod transfer;
