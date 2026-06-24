@@ -82,15 +82,6 @@ pub const OP_PUBLICIP_ANSWER: u8 = 0x98;
 pub const OP_CALLBACK: u8 = 0x99;
 pub const OP_REASKCALLBACKTCP: u8 = 0x9A;
 
-// Server-protocol callback opcodes (OP_EDONKEYHEADER, sent to/from the server).
-// See also: ed2k::server::{OP_CALLBACKREQUEST, OP_CALLBACKREQUESTED, OP_CALLBACK_FAIL}
-#[allow(dead_code)]
-pub const OP_CALLBACKREQUEST_SERVER: u8 = 0x1C;
-#[allow(dead_code)]
-pub const OP_CALLBACKREQUESTED_SERVER: u8 = 0x35;
-#[allow(dead_code)]
-pub const OP_CALLBACK_FAIL_SERVER: u8 = 0x36;
-
 // Buddy keepalive (OP_EMULEPROT)
 pub const OP_BUDDYPING: u8 = 0x9F;
 pub const OP_BUDDYPONG: u8 = 0xA0;

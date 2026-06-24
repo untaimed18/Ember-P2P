@@ -14800,8 +14800,8 @@ pub async fn start_network(
             // bans and apply the hourly score decay). `maybe_decay`
             // self-gates on DECAY_INTERVAL (1h), so calling it each minute
             // is cheap and is what actually drives decay in production —
-            // nothing on the hot path calls `get_score` (the only other
-            // decay trigger), so without this scores never decayed.
+            // this timer is the only decay trigger, so without it scores
+            // would never decay.
             _ = reputation_timer.tick() => {
                 state.reputation.lift_expired_bans();
                 state.reputation.maybe_decay();

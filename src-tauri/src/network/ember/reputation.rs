@@ -163,14 +163,6 @@ impl ReputationManager {
         !was_banned && now_banned
     }
 
-    /// Get a peer's current score, applying decay first.
-    pub fn get_score(&mut self, node_id: &[u8; 16]) -> i32 {
-        self.maybe_decay();
-        self.peers
-            .get(node_id)
-            .map_or(DEFAULT_REPUTATION, |p| p.score)
-    }
-
     /// Get a peer's score without triggering decay (for use in immutable contexts).
     pub fn score(&self, node_id: &[u8; 16]) -> i32 {
         self.peers
@@ -331,9 +323,9 @@ mod tests {
 
     #[test]
     fn default_reputation() {
-        let mut mgr = ReputationManager::new();
+        let mgr = ReputationManager::new();
         let id = [1u8; 16];
-        assert_eq!(mgr.get_score(&id), DEFAULT_REPUTATION);
+        assert_eq!(mgr.score(&id), DEFAULT_REPUTATION);
     }
 
     #[test]
@@ -343,7 +335,7 @@ mod tests {
         mgr.record_event(&id, ReputationEvent::SuccessfulChunk);
         mgr.record_event(&id, ReputationEvent::SuccessfulChunk);
         mgr.record_event(&id, ReputationEvent::SuccessfulChunk);
-        assert!(mgr.get_score(&id) > 0);
+        assert!(mgr.score(&id) > 0);
     }
 
     #[test]
@@ -351,7 +343,7 @@ mod tests {
         let mut mgr = ReputationManager::new();
         let id = [3u8; 16];
         mgr.record_event(&id, ReputationEvent::CorruptData);
-        assert!(mgr.get_score(&id) < 0);
+        assert!(mgr.score(&id) < 0);
     }
 
     #[test]
@@ -371,13 +363,13 @@ mod tests {
         for _ in 0..2000 {
             mgr.record_event(&id, ReputationEvent::SuccessfulChunk);
         }
-        assert_eq!(mgr.get_score(&id), MAX_REPUTATION);
+        assert_eq!(mgr.score(&id), MAX_REPUTATION);
 
         let id2 = [6u8; 16];
         for _ in 0..200 {
             mgr.record_event(&id2, ReputationEvent::CorruptData);
         }
-        assert_eq!(mgr.get_score(&id2), MIN_REPUTATION);
+        assert_eq!(mgr.score(&id2), MIN_REPUTATION);
     }
 
     #[test]
