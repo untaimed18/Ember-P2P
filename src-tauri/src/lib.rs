@@ -719,7 +719,6 @@ pub fn run() {
             commands::search::cancel_search,
             commands::search::find_notes,
             commands::search::find_sources,
-            commands::search::compute_ed2k_hash,
             commands::search::publish_note,
             commands::search::format_ed2k_link,
             commands::search::build_ed2k_link,

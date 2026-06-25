@@ -261,8 +261,6 @@ pub enum DownloadEvent {
         start: u64,
         end: u64,
         sender_ip: std::net::Ipv4Addr,
-        #[allow(dead_code)]
-        sender_user_hash: Option<[u8; 16]>,
     },
     /// A part passed its MD4 hash check.
     PartVerified {
@@ -2933,7 +2931,6 @@ impl Ed2kDownload {
                                             start,
                                             end,
                                             sender_ip: v4,
-                                            sender_user_hash: Some(peer_user_hash),
                                         })
                                         .await;
                                 }
@@ -3063,7 +3060,6 @@ impl Ed2kDownload {
                                             start,
                                             end: start + piece_len,
                                             sender_ip: v4,
-                                            sender_user_hash: Some(peer_user_hash),
                                         })
                                         .await;
                                 }

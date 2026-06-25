@@ -1,6 +1,5 @@
 use std::io::Read;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use digest::Digest;
 use sha1::Sha1;
@@ -20,42 +19,6 @@ const BLOCKS_PER_FULL_PART: usize = (PARTSIZE + AICH_BLOCK_SIZE - 1) / AICH_BLOC
 /// with megabytes of junk that we'd otherwise copy and hold for the full
 /// AICH wait window.
 pub const MAX_AICH_RECOVERY_BYTES: usize = 256 * 1024;
-
-pub fn compute_aich_root(path: &Path) -> anyhow::Result<[u8; 20]> {
-    static NEVER: AtomicBool = AtomicBool::new(false);
-    compute_aich_root_cancellable(path, &NEVER)
-}
-
-pub fn compute_aich_root_cancellable(
-    path: &Path,
-    cancelled: &AtomicBool,
-) -> anyhow::Result<[u8; 20]> {
-    let mut file = std::fs::File::open(path)?;
-    let file_size = file.metadata()?.len();
-
-    if file_size == 0 {
-        return Ok(Sha1::digest([]).into());
-    }
-
-    let block_size_u64 = AICH_BLOCK_SIZE as u64;
-    let num_blocks = ((file_size + block_size_u64 - 1) / block_size_u64) as usize;
-    let mut leaf_hashes: Vec<[u8; 20]> = Vec::with_capacity(num_blocks);
-    let mut buf = vec![0u8; AICH_BLOCK_SIZE];
-    let mut remaining = file_size;
-
-    for _ in 0..num_blocks {
-        if cancelled.load(Ordering::Relaxed) {
-            anyhow::bail!("cancelled");
-        }
-        let block_size = remaining.min(block_size_u64) as usize;
-        let buf_slice = &mut buf[..block_size];
-        file.read_exact(buf_slice)?;
-        leaf_hashes.push(hash_leaf(buf_slice));
-        remaining -= block_size as u64;
-    }
-
-    Ok(hierarchical_root(&leaf_hashes, file_size))
-}
 
 /// Compute the AICH hash for a single part (for verification).
 pub fn compute_aich_part(data: &[u8]) -> [u8; 20] {

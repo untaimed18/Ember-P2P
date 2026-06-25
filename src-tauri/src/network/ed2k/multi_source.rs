@@ -6639,7 +6639,6 @@ async fn download_parts_from_source(
                                         start,
                                         end,
                                         sender_ip: v4,
-                                        sender_user_hash: Some(peer_user_hash),
                                     })
                                     .await;
                             }
@@ -6780,7 +6779,6 @@ async fn download_parts_from_source(
                                         start,
                                         end: start + piece_len,
                                         sender_ip: v4,
-                                        sender_user_hash: Some(peer_user_hash),
                                     })
                                     .await;
                             }

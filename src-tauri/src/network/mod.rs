@@ -6651,7 +6651,7 @@ pub async fn start_network(
                         }
                     }
                 }
-                if let DownloadEvent::DataReceived { ref file_hash, start, end, sender_ip, .. } = event {
+                if let DownloadEvent::DataReceived { ref file_hash, start, end, sender_ip } = event {
                     state.corruption_blackbox.record_data(*file_hash, start, end, sender_ip);
                 }
                 if let DownloadEvent::PartVerified { ref file_hash, part_start, part_end, ref sender_user_hash, .. } = event {

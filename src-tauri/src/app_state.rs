@@ -63,10 +63,9 @@ pub struct AppState {
     /// the app still works but users must reload manually after changes.
     pub shared_folder_watcher: Option<Arc<SharedFoldersWatcher>>,
     /// JoinHandles for long-running background scan tasks (directory discovery
-    /// and hashing). Tracked so `await_background_scans` can wait for them on
-    /// shutdown or `reload_shared_files`, preventing races where a still-running
-    /// scan writes into `local_index`/`known_files` after we've started tearing
-    /// down. Tasks self-remove from this map on completion.
+    /// and hashing), registered via `register_background_scan`. Finished
+    /// handles are reaped on the next registration so the map can't grow
+    /// unbounded across a long session of folder adds / reloads.
     pub background_scans: Arc<RwLock<HashMap<u64, tokio::task::JoinHandle<()>>>>,
     /// Monotonic counter for assigning unique ids in `background_scans`.
     #[allow(dead_code)]
@@ -110,74 +109,5 @@ impl AppState {
         map.retain(|_, h| !h.is_finished());
         map.insert(id, handle);
         id
-    }
-
-    /// Remove a background scan entry once it finishes; does not await.
-    #[allow(dead_code)]
-    pub async fn deregister_background_scan(&self, id: u64) {
-        self.background_scans.write().await.remove(&id);
-    }
-
-    /// Await all currently-tracked background scans. Aborts any still running
-    /// after a grace period so shutdown can't hang on a frozen hasher.
-    ///
-    /// Earlier this just dropped the `JoinHandle`s when the grace timer
-    /// fired and "continued shutdown" — which technically lets the
-    /// shutdown sequence proceed but leaves the task running and still
-    /// touching shared state (`local_index`, `known_files`, the
-    /// in-flight `KnownFileList` we're about to flush). The on-disk
-    /// flush could then race against a writer that's still alive in a
-    /// detached task, producing a half-written `known.met`. Snapshotting
-    /// `abort_handle()` for every scan up front and calling `.abort()`
-    /// on each one when the grace window elapses guarantees no further
-    /// writes after this method returns.
-    #[allow(dead_code)]
-    pub async fn await_background_scans(&self, grace: std::time::Duration) {
-        let handles: Vec<_> = {
-            let mut map = self.background_scans.write().await;
-            map.drain().map(|(_, h)| h).collect()
-        };
-        if handles.is_empty() {
-            return;
-        }
-        let abort_handles: Vec<_> = handles.iter().map(|h| h.abort_handle()).collect();
-        let count = handles.len();
-        let fut = async move {
-            for h in handles {
-                let _ = h.await;
-            }
-        };
-        if tokio::time::timeout(grace, fut).await.is_err() {
-            tracing::warn!(
-                "background scans still running after {:?}; aborting {} task(s)",
-                grace,
-                count,
-            );
-            for ah in abort_handles {
-                ah.abort();
-            }
-        }
-    }
-
-    /// Wait until `scanning_count` reaches zero or `grace` elapses. Used on
-    /// shutdown paths that don't own JoinHandles directly (e.g. the startup
-    /// scan spawned from `tauri::setup`).
-    #[allow(dead_code)]
-    pub async fn wait_scans_idle(&self, grace: std::time::Duration) {
-        let deadline = std::time::Instant::now() + grace;
-        while self
-            .scanning_count
-            .load(std::sync::atomic::Ordering::Relaxed)
-            > 0
-        {
-            if std::time::Instant::now() >= deadline {
-                tracing::warn!(
-                    "scan workers still active after {:?}; continuing shutdown",
-                    grace
-                );
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
     }
 }
