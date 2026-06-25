@@ -180,10 +180,10 @@ pub fn hash_file_combined_cancellable(
     Ok((ed2k_hash, aich_hash))
 }
 
-/// In-memory equivalent of [`ed2k_hash_file`]. Used by the
-/// `compute_ed2k_hash` Tauri command (for UI-side hashing of
-/// arbitrary byte buffers — clipboard paste, drag-drop, etc.) and by
-/// transfer-verification unit tests.
+/// Test-only in-memory equivalent of [`ed2k_hash_file`]: hashes an
+/// arbitrary byte buffer without a round-trip through the filesystem.
+/// Used by the transfer-verification unit tests.
+#[cfg(test)]
 pub fn ed2k_hash_bytes(data: &[u8]) -> String {
     let file_size = data.len() as u64;
 
