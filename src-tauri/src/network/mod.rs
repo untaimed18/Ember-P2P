@@ -9112,7 +9112,6 @@ pub async fn start_network(
                             let _ = send_kad_packet(
                                 &udp_socket, &packet, addr, &state, &contact.id,
                             ).await;
-                            state.firewall_checker.record_udp_port_probe_sent();
                         }
                     }
                     // Eagerly dispatch UDP firewall probes now. If a previous
@@ -21215,7 +21214,6 @@ async fn handle_command_inner(
                 if let Ok(packet) = messages::encode_packet(&msg) {
                     state.flood_protection.track_request(addr, 0x60);
                     let _ = send_kad_packet(socket, &packet, addr, &state, &contact.id).await;
-                    state.firewall_checker.record_udp_port_probe_sent();
                 }
             }
 

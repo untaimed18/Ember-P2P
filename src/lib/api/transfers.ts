@@ -91,18 +91,6 @@ export async function pauseAllTransfers(): Promise<void> {
   return invoke('pause_all_transfers');
 }
 
-export async function pauseTransfersBatch(transferIds: string[]): Promise<void> {
-  return invoke('pause_transfers_batch', { transferIds });
-}
-
-export async function resumeTransfersBatch(transferIds: string[]): Promise<void> {
-  return invoke('resume_transfers_batch', { transferIds });
-}
-
-export async function stopTransfersBatch(transferIds: string[]): Promise<void> {
-  return invoke('stop_transfers_batch', { transferIds });
-}
-
 export async function cancelTransfersBatch(transferIds: string[]): Promise<void> {
   return invoke('cancel_transfers_batch', { transferIds });
 }

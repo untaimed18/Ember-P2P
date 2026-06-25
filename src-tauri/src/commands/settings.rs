@@ -700,26 +700,6 @@ pub async fn hide_to_tray(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn show_main_window(app: tauri::AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("main") {
-        // Unminimize first — `show()` doesn't restore from minimized on
-        // Windows, only from the hidden state. Without this the tray-icon
-        // double-click would be a no-op for users who minimized through
-        // the title-bar instead of closing.
-        let _ = window.unminimize();
-        window.show().map_err(|e| {
-            coded_ctx(
-                "settings_show_window_failed",
-                "Failed to show main window",
-                e,
-            )
-        })?;
-        let _ = window.set_focus();
-    }
-    Ok(())
-}
-
-#[tauri::command]
 pub async fn quit_app(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
