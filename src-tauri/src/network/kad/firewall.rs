@@ -122,10 +122,6 @@ impl FirewallChecker {
         self.pending_udp_check_ips.insert(peer_ip);
     }
 
-    /// Pings are only used to learn the external UDP port. They do not prove
-    /// whether we are UDP-firewalled.
-    pub fn record_udp_port_probe_sent(&mut self) {}
-
     pub fn is_udp_firewall_check_ip(&self, ip: Ipv4Addr) -> bool {
         self.pending_udp_check_ips.contains(&ip)
     }

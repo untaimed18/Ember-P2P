@@ -6,7 +6,7 @@
   import {
     pauseTransfer, stopTransfer, resumeTransfer, cancelTransfer, removeTransfer,
     clearCompleted, setTransferPriority, setTransferCategory, setPreviewPriority, pauseAllTransfers, resumeAllTransfers,
-    pauseTransfersBatch, resumeTransfersBatch, stopTransfersBatch, cancelTransfersBatch,
+    cancelTransfersBatch,
     getTransferSources, openFile, openTransferFileLocation, recoverArchive, startDownload,
     getUploadQueue, getKnownClients,
   } from '$lib/api/transfers';
