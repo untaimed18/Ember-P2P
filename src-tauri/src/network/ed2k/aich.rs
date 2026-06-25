@@ -285,8 +285,13 @@ fn parse_emule_aich_tree(data: &[u8]) -> Option<Vec<[u8; 20]>> {
         .map(|&(pos, _)| (pos.saturating_sub(leftmost_at_depth)) as usize)
         .max()
         .unwrap_or(0);
-    const MAX_AICH_LEAF_ENTRIES: usize = 524_288; // ~10 MB cap
-    if max_idx >= MAX_AICH_LEAF_ENTRIES {
+    // A single OP_AICHANSWER covers exactly one part, whose block-hash subtree
+    // has at most BLOCKS_PER_FULL_PART (53) leaves. A larger derived leaf index
+    // means either a malformed tree or a peer trying to amplify a tiny (<=256
+    // KiB) payload into a large sparse zero-filled allocation — reject it before
+    // sizing `result`. Mirrors the flat-format `block_count > BLOCKS_PER_FULL_PART`
+    // guard in `read_recovery_data`.
+    if max_idx >= BLOCKS_PER_FULL_PART {
         return None;
     }
     let mut result = vec![[0u8; 20]; max_idx + 1];
@@ -602,7 +607,22 @@ pub fn load_known2_met(path: &std::path::Path) -> std::io::Result<Vec<([u8; 20],
             data[offset + 3],
         ]) as usize;
         offset += 4;
-        if offset + count * 20 > data.len() {
+        // `count` is attacker-controlled only via local file tampering, but
+        // compute the record end with checked arithmetic so a corrupt count can
+        // never wrap `usize` (32-bit) and slip past the truncation guard into an
+        // over-sized read/allocation.
+        let record_end = match count.checked_mul(20).and_then(|n| offset.checked_add(n)) {
+            Some(end) => end,
+            None => {
+                tracing::warn!(
+                    "known2_64.met record at offset {} claims an overflowing leaf count {}",
+                    offset - 24,
+                    count
+                );
+                break;
+            }
+        };
+        if record_end > data.len() {
             tracing::warn!(
                 "known2_64.met truncated: record at offset {} claims {} leaves but only {} bytes remain",
                 offset - 24, count, data.len() - offset
