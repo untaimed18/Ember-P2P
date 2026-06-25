@@ -66,6 +66,34 @@ struct ServerConnectResult {
     result: Result<(Ed2kServerConnection, ServerSession), String>,
 }
 
+struct KnownMetSaveResult {
+    generation: u64,
+    result: anyhow::Result<bool>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PeriodicSaveJob {
+    Stats,
+    Reputation,
+    Known2,
+}
+
+struct PeriodicSaveResult {
+    job: PeriodicSaveJob,
+    result: Result<(), String>,
+}
+
+struct UpnpMaintainResult {
+    revision: u64,
+    mappings: upnp::UpnpMappings,
+    mapped: bool,
+}
+
+struct RendezvousRegisterResult {
+    initial: bool,
+    result: Result<(), String>,
+}
+
 /// Try to connect to a server, attempting the DH-encrypted connection first (for HighID),
 /// then falling back to plain text (for LowID).
 ///
@@ -5239,6 +5267,20 @@ pub async fn start_network(
     source_count_sync_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     let mut cache_write_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let (known_met_save_result_tx, mut known_met_save_result_rx) =
+        mpsc::unbounded_channel::<KnownMetSaveResult>();
+    let (periodic_save_result_tx, mut periodic_save_result_rx) =
+        mpsc::unbounded_channel::<PeriodicSaveResult>();
+    let (upnp_maintain_result_tx, mut upnp_maintain_result_rx) =
+        mpsc::unbounded_channel::<UpnpMaintainResult>();
+    let (rendezvous_register_result_tx, mut rendezvous_register_result_rx) =
+        mpsc::unbounded_channel::<RendezvousRegisterResult>();
+    let mut known_met_save_in_flight = false;
+    let mut stats_save_in_flight = false;
+    let mut reputation_save_in_flight = false;
+    let mut known2_save_in_flight = false;
+    let mut upnp_maintain_in_flight = false;
+    let mut rendezvous_register_in_flight = false;
     let mut last_server_activity_at = chrono::Utc::now().timestamp();
     let mut last_kad_activity_at = chrono::Utc::now().timestamp();
     let mut last_cache_refresh_started_at = 0i64;
@@ -9391,9 +9433,8 @@ pub async fn start_network(
                 // confirmed external IP so other Ember clients can find us.
                 if !state.friend_presence_initial_done
                     && state.external_ip.is_some()
+                    && !rendezvous_register_in_flight
                 {
-                    state.friend_presence_initial_done = true;
-
                     // Initialize the LowID-to-LowID connection broker
                     // **before** registering with rendezvous. Rendezvous
                     // advertises the port other clients should QUIC-dial,
@@ -9510,25 +9551,17 @@ pub async fn start_network(
                     if let Some(rv_ip) = state.external_ip {
                         let rv_pubkey = ed25519_pubkey;
                         let rv_secret = ed25519_secret_key;
-                        let app_rv = app_handle.clone();
+                        let tx = rendezvous_register_result_tx.clone();
+                        rendezvous_register_in_flight = true;
                         tokio::spawn(async move {
-                            match rendezvous::register(&rv_url, &rv_hash, rv_port, rv_ip, &rv_pubkey, &rv_secret).await {
-                                Ok(()) => {
-                                    let _ = app_rv.emit("ember:friend-discoverable", serde_json::json!({
-                                        "discoverable": true,
-                                    }));
-                                }
-                                Err(e) => {
-                                    warn!("Initial rendezvous register failed: {e}");
-                                    let _ = app_rv.emit("ember:friend-discoverable", serde_json::json!({
-                                        "discoverable": false,
-                                        "reason": "rendezvous_error",
-                                    }));
-                                }
-                            }
+                            let result =
+                                rendezvous::register(&rv_url, &rv_hash, rv_port, rv_ip, &rv_pubkey, &rv_secret)
+                                    .await;
+                            let _ = tx.send(RendezvousRegisterResult {
+                                initial: true,
+                                result,
+                            });
                         });
-                        state.rendezvous_registered = true;
-                        state.rendezvous_last_register = Some(std::time::Instant::now());
                     } else {
                         warn!("Initial rendezvous register skipped: external_ip unexpectedly None");
                     }
@@ -9608,13 +9641,12 @@ pub async fn start_network(
                 // `external_ip` without resetting the registered flag we
                 // would otherwise hit `register()`'s required-IP contract
                 // and panic the spawned task.
-                if state.rendezvous_registered {
+                if state.rendezvous_registered && !rendezvous_register_in_flight {
                     let needs_heartbeat = state.rendezvous_last_register
                         .map(|t| t.elapsed() >= std::time::Duration::from_secs(120))
                         .unwrap_or(true);
                     if needs_heartbeat {
                         if let Some(rv_ip) = state.external_ip {
-                            state.rendezvous_last_register = Some(std::time::Instant::now());
                             let rv_url = settings.rendezvous_url.clone();
                             // Heartbeat must advertise the same port we
                             // registered with — see the friend-dial
@@ -9625,18 +9657,16 @@ pub async fn start_network(
                             let rv_hash = ember_hash;
                             let rv_pubkey = ed25519_pubkey;
                             let rv_secret = ed25519_secret_key;
-                            let app_rv = app_handle.clone();
+                            let tx = rendezvous_register_result_tx.clone();
+                            rendezvous_register_in_flight = true;
                             tokio::spawn(async move {
-                                match rendezvous::register(&rv_url, &rv_hash, rv_port, rv_ip, &rv_pubkey, &rv_secret).await {
-                                    Ok(()) => {
-                                        let _ = app_rv.emit("ember:friend-discoverable", serde_json::json!({
-                                            "discoverable": true,
-                                        }));
-                                    }
-                                    Err(e) => {
-                                        warn!("Rendezvous heartbeat failed: {e}");
-                                    }
-                                }
+                                let result =
+                                    rendezvous::register(&rv_url, &rv_hash, rv_port, rv_ip, &rv_pubkey, &rv_secret)
+                                        .await;
+                                let _ = tx.send(RendezvousRegisterResult {
+                                    initial: false,
+                                    result,
+                                });
                             });
                         } else {
                             debug!(
@@ -9677,7 +9707,9 @@ pub async fn start_network(
                                                         emule_info_done: false,
                                                         peer_caps: Default::default(),
                                                     };
-                                                    let _ = cb_tx.send(parts).await;
+                                                    if let Err(e) = cb_tx.try_send(parts) {
+                                                        tracing::debug!("Dropping relay callback parts: {e}");
+                                                    }
                                                 }
                                                 Err(e) => {
                                                     tracing::debug!("Relay invite connect failed for session: {e}");
@@ -10395,11 +10427,18 @@ pub async fn start_network(
                                     // bug we just hit (every session_id ended in
                                     // `-0000000000000000-` and collided again).
                                     let peer_tag = &target_id[target_id.len().saturating_sub(12)..];
+                                    let relay_nonce = {
+                                        use rand::RngCore;
+                                        let mut nonce = [0u8; 16];
+                                        rand::rngs::OsRng.fill_bytes(&mut nonce);
+                                        hex::encode(nonce)
+                                    };
                                     let session_id = format!(
-                                        "{}-{}-{}",
+                                        "{}-{}-{}-{}",
                                         hex::encode(ember_hash),
                                         peer_tag,
                                         hex::encode(file_hash),
+                                        relay_nonce,
                                     );
                                     let transfer_id = attempt_transfer_id;
 
@@ -14691,9 +14730,28 @@ pub async fn start_network(
             // the dashboard doesn't show a stale value for the rest of the
             // session.
             _ = upnp_renew_timer.tick() => {
-                if upnp_enabled {
+                if upnp_enabled && !upnp_maintain_in_flight {
+                    let revision = upnp_mappings.revision();
+                    let mut mappings = upnp_mappings.clone();
+                    let tx = upnp_maintain_result_tx.clone();
+                    upnp_maintain_in_flight = true;
+                    tokio::spawn(async move {
+                        let mapped = mappings.maintain().await;
+                        let _ = tx.send(UpnpMaintainResult {
+                            revision,
+                            mappings,
+                            mapped,
+                        });
+                    });
+                }
+            }
+
+            Some(result) = upnp_maintain_result_rx.recv() => {
+                upnp_maintain_in_flight = false;
+                if result.revision == upnp_mappings.revision() {
                     let was_mapped = state.upnp_mapped;
-                    let mapped = upnp_mappings.maintain().await;
+                    upnp_mappings = result.mappings;
+                    let mapped = result.mapped;
                     if mapped != was_mapped {
                         state.upnp_mapped = mapped;
                         state.stats.upnp_mapped = mapped;
@@ -14721,6 +14779,41 @@ pub async fn start_network(
                                 "auto_disabled": false,
                                 "tcp_port": state.tcp_port,
                                 "udp_port": state.udp_port,
+                            }),
+                        );
+                    }
+                } else {
+                    debug!("Discarding stale UPnP maintenance result after mapping state changed");
+                }
+            }
+
+            Some(result) = rendezvous_register_result_rx.recv() => {
+                rendezvous_register_in_flight = false;
+                match result.result {
+                    Ok(()) => {
+                        state.rendezvous_registered = true;
+                        state.rendezvous_last_register = Some(std::time::Instant::now());
+                        if result.initial {
+                            state.friend_presence_initial_done = true;
+                        }
+                        let _ = app_handle.emit(
+                            "ember:friend-discoverable",
+                            serde_json::json!({ "discoverable": true }),
+                        );
+                    }
+                    Err(e) => {
+                        if result.initial {
+                            warn!("Initial rendezvous register failed: {e}");
+                        } else {
+                            warn!("Rendezvous heartbeat failed: {e}");
+                        }
+                        state.rendezvous_registered = false;
+                        state.rendezvous_last_register = None;
+                        let _ = app_handle.emit(
+                            "ember:friend-discoverable",
+                            serde_json::json!({
+                                "discoverable": false,
+                                "reason": "rendezvous_error",
                             }),
                         );
                     }
@@ -14766,9 +14859,61 @@ pub async fn start_network(
                 }
             }
 
+            Some(result) = known_met_save_result_rx.recv() => {
+                known_met_save_in_flight = false;
+                match result.result {
+                    Ok(true) => known_files.mark_saved_if_generation(result.generation),
+                    Ok(false) => {
+                        known_files.mark_save_failed();
+                        warn!("known.met save completed but companion known_paths.dat was not durable; will retry");
+                    }
+                    Err(e) => {
+                        known_files.mark_save_failed();
+                        error!("Failed to save known.met: {e}");
+                    }
+                }
+            }
+
+            Some(result) = periodic_save_result_rx.recv() => {
+                let job_name = match result.job {
+                    PeriodicSaveJob::Stats => {
+                        stats_save_in_flight = false;
+                        "statistics"
+                    }
+                    PeriodicSaveJob::Reputation => {
+                        reputation_save_in_flight = false;
+                        "reputation.json"
+                    }
+                    PeriodicSaveJob::Known2 => {
+                        known2_save_in_flight = false;
+                        "known2_64.met"
+                    }
+                };
+                if let Err(e) = result.result {
+                    error!("Failed to save {job_name}: {e}");
+                }
+            }
+
             // Periodic statistics save (every 60s — see stats_save_timer)
             _ = stats_save_timer.tick() => {
-                stats_manager.save_cumulative(&db);
+                if !stats_save_in_flight {
+                    let pairs = stats_manager.cumulative_save_pairs();
+                    let db_for_save = db.clone();
+                    let tx = periodic_save_result_tx.clone();
+                    stats_save_in_flight = true;
+                    tokio::spawn(async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            db_for_save.save_statistics(&pairs).map_err(|e| e.to_string())
+                        })
+                        .await
+                        .map_err(|e| format!("statistics save task failed: {e}"))
+                        .and_then(|r| r);
+                        let _ = tx.send(PeriodicSaveResult {
+                            job: PeriodicSaveJob::Stats,
+                            result,
+                        });
+                    });
+                }
 
                 // Flush the spam filter's learned signals on the same cadence.
                 // `auto_mark_not_spam` (completed downloads) and
@@ -14808,19 +14953,43 @@ pub async fn start_network(
 
             // Periodic reputation save (every 5 minutes)
             _ = reputation_save_timer.tick() => {
-                let rep_path = state.data_dir.join("reputation.json");
-                if let Err(e) = state.reputation.save(&rep_path) {
-                    error!("Failed to save reputation.json: {e}");
+                if !reputation_save_in_flight {
+                    let rep_path = state.data_dir.join("reputation.json");
+                    let reputation_snapshot = state.reputation.clone();
+                    let tx = periodic_save_result_tx.clone();
+                    reputation_save_in_flight = true;
+                    tokio::spawn(async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            reputation_snapshot.save(&rep_path)
+                        })
+                        .await
+                        .map_err(|e| format!("reputation save task failed: {e}"))
+                        .and_then(|r| r);
+                        let _ = tx.send(PeriodicSaveResult {
+                            job: PeriodicSaveJob::Reputation,
+                            result,
+                        });
+                    });
                 }
             }
 
             // Periodic known.met save (every 11 minutes, matching eMule)
             _ = known_met_save_timer.tick() => {
-                if known_files.is_dirty() {
+                if known_files.is_dirty() && !known_met_save_in_flight {
                     let known_path = state.data_dir.join("known.met");
-                    if let Err(e) = known_files.save(&known_path) {
-                        error!("Failed to save known.met: {e}");
-                    }
+                    let generation = known_files.dirty_generation();
+                    let mut snapshot = known_files.clone();
+                    let tx = known_met_save_result_tx.clone();
+                    known_met_save_in_flight = true;
+                    tokio::spawn(async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            snapshot.save(&known_path).map(|_| !snapshot.is_dirty())
+                        })
+                        .await
+                        .map_err(|e| anyhow::anyhow!("known.met save task failed: {e}"))
+                        .and_then(|r| r);
+                        let _ = tx.send(KnownMetSaveResult { generation, result });
+                    });
                 }
                 while let Ok(hs) = aich_set_rx.try_recv() {
                     // Cap aich_hash_sets to a sane upper bound. The
@@ -14844,11 +15013,24 @@ pub async fn start_network(
                     }
                     state.aich_hash_sets.push(hs);
                 }
-                if !state.aich_hash_sets.is_empty() {
+                if !state.aich_hash_sets.is_empty() && !known2_save_in_flight {
                     let known2_path = state.data_dir.join("known2_64.met");
-                    if let Err(e) = ed2k::aich::save_known2_met(&known2_path, &state.aich_hash_sets) {
-                        error!("Failed to save known2_64.met: {e}");
-                    }
+                    let hash_sets = state.aich_hash_sets.clone();
+                    let tx = periodic_save_result_tx.clone();
+                    known2_save_in_flight = true;
+                    tokio::spawn(async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            ed2k::aich::save_known2_met(&known2_path, &hash_sets)
+                                .map_err(|e| e.to_string())
+                        })
+                        .await
+                        .map_err(|e| format!("known2_64.met save task failed: {e}"))
+                        .and_then(|r| r);
+                        let _ = tx.send(PeriodicSaveResult {
+                            job: PeriodicSaveJob::Known2,
+                            result,
+                        });
+                    });
                 }
 
                 // Visibility for the other AICH cache. Same eviction-is-
@@ -16658,7 +16840,7 @@ async fn handle_udp_packet_inner(
                     waiters.get(&std::net::IpAddr::V4(from_ipv4)).cloned()
                 };
                 if let Some(tx) = maybe_tx {
-                    let _ = tx.send(()).await;
+                    let _ = tx.try_send(());
                 }
                 return;
             }
@@ -20723,6 +20905,7 @@ async fn handle_command_inner(
 
         NetworkCommand::KadDisconnect => {
             info!("KAD disconnect requested");
+            let rendezvous_was_registered = state.rendezvous_registered;
 
             // Save routing table before clearing (eMule saves on Stop)
             let contacts = state.routing_table.export_bootstrap_contacts(200);
@@ -20790,6 +20973,23 @@ async fn handle_command_inner(
             state.friend_search_started_at = None;
             state.rendezvous_registered = false;
             state.rendezvous_last_register = None;
+            if rendezvous_was_registered {
+                let rv_url = settings.rendezvous_url.clone();
+                let rv_hash = ember_hash;
+                let rv_secret = ed25519_secret_key;
+                tokio::spawn(async move {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(3),
+                        rendezvous::unregister(&rv_url, &rv_hash, &rv_secret),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => warn!("Failed to unregister from rendezvous server on disconnect: {e}"),
+                        Err(_) => warn!("Rendezvous unregister timed out on disconnect; skipping"),
+                    }
+                });
+            }
             // Emit offline for all previously-online friends
             for eh in state.online_friends.keys() {
                 let _ = app_handle.emit(
@@ -20810,12 +21010,28 @@ async fn handle_command_inner(
             // Snapshot tracker handles first, then await each lock with a
             // short bound so a mid-write tracker doesn't silently miss its
             // resume metadata.
-            let disconnect_trackers: Vec<String> = match state.tracker_registry.lock() {
-                Ok(reg) => reg.keys().cloned().collect(),
-                Err(poisoned) => poisoned.into_inner().keys().cloned().collect(),
+            let disconnect_trackers: Vec<_> = match state.tracker_registry.lock() {
+                Ok(reg) => reg
+                    .iter()
+                    .map(|(tid, tracker)| (tid.clone(), tracker.clone()))
+                    .collect(),
+                Err(poisoned) => poisoned
+                    .into_inner()
+                    .iter()
+                    .map(|(tid, tracker)| (tid.clone(), tracker.clone()))
+                    .collect(),
             };
-            for tid in disconnect_trackers {
-                save_registered_part_tracker(&state, &tid, "disconnect").await;
+            let tracker_saves =
+                futures::future::join_all(disconnect_trackers.into_iter().map(|(tid, tracker)| {
+                    async move {
+                        save_part_tracker_snapshot(tracker, &tid, "disconnect").await;
+                    }
+                }));
+            if tokio::time::timeout(std::time::Duration::from_secs(8), tracker_saves)
+                .await
+                .is_err()
+            {
+                warn!("Timed out saving some .part.met file(s) during disconnect");
             }
 
             // Cancel each active download's control BEFORE aborting its worker
@@ -20839,10 +21055,10 @@ async fn handle_command_inner(
 
             for (tid, handle) in state.download_handles.drain() {
                 handle.abort();
-                // Bounded wait so one download stuck in blocking I/O cannot
-                // freeze the network loop during a (user-visible) disconnect.
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
-                debug!("Aborted download task {tid} on KAD disconnect");
+                tokio::spawn(async move {
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+                    debug!("Aborted download task {tid} on KAD disconnect");
+                });
             }
 
             // Clear the registry — tasks are gone, trackers are saved.

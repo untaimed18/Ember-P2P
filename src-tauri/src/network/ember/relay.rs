@@ -992,7 +992,9 @@ pub async fn run_quic_accept_loop(
                     emule_info_done: false,
                     peer_caps: Default::default(),
                 };
-                let _ = cb_tx.send(parts).await;
+                if let Err(e) = cb_tx.try_send(parts) {
+                    debug!("QUIC accept: dropping relay-target callback from {remote}: {e}");
+                }
             } else {
                 // === Hole-punch or other direct connection ===
                 let peer_ip = match remote.ip() {
@@ -1019,7 +1021,9 @@ pub async fn run_quic_accept_loop(
                     emule_info_done: false,
                     peer_caps: Default::default(),
                 };
-                let _ = cb_tx.send(parts).await;
+                if let Err(e) = cb_tx.try_send(parts) {
+                    debug!("QUIC accept: dropping direct callback from {remote}: {e}");
+                }
             }
         });
     }
