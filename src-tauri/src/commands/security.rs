@@ -884,33 +884,28 @@ pub async fn set_antileech_enabled(
     state: tauri::State<'_, AppState>,
     enabled: bool,
 ) -> Result<(), String> {
-    let (tx, rx) = oneshot::channel();
-    state
-        .network_tx
-        .try_send(NetworkCommand::SetAntiLeechEnabled { enabled, tx })
-        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    await_reply(
-        rx,
-        "security_failed_to_toggle_antileech",
-        "Failed to toggle anti-leech filter",
-    )
-    .await??;
-
-    // Persist the toggle to the config file so a restart preserves it. The
-    // runtime flip was already confirmed by the network task above; persist to
-    // disk BEFORE committing the in-memory flag (see set_ip_filter_enabled) so
-    // a failed write can't leave the saved config diverged from disk.
-    let (new_settings, save_data) = {
+    // Persist the toggle before applying the runtime change. Unlike the older
+    // one-way IP-filter command, this command has an ack, so we can avoid
+    // returning an error after the live filter has already changed.
+    let (new_settings, old_save_data, new_save_data) = {
         let cfg = state.config.read().await;
+        let old_settings = cfg.settings.clone();
         let mut new_settings = cfg.settings.clone();
         new_settings.antileech_enabled = enabled;
-        let data = cfg
+        let old_data = cfg
+            .prepare_save_settings(&old_settings)
+            .map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?;
+        let new_data = cfg
             .prepare_save_settings(&new_settings)
             .map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?;
-        (new_settings, data)
+        (new_settings, old_data, new_data)
     };
     tokio::task::spawn_blocking(move || {
-        crate::storage::config::AppConfig::write_to_disk(&save_data.0, &save_data.1, &save_data.2)
+        crate::storage::config::AppConfig::write_to_disk(
+            &new_save_data.0,
+            &new_save_data.1,
+            &new_save_data.2,
+        )
     })
     .await
     .map_err(|e| {
@@ -927,6 +922,41 @@ pub async fn set_antileech_enabled(
             e,
         )
     })?;
+
+    let (tx, rx) = oneshot::channel();
+    if let Err(e) = state
+        .network_tx
+        .try_send(NetworkCommand::SetAntiLeechEnabled { enabled, tx })
+    {
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::storage::config::AppConfig::write_to_disk(
+                &old_save_data.0,
+                &old_save_data.1,
+                &old_save_data.2,
+            )
+        })
+        .await;
+        return Err(coded_ctx("network_busy", "Network busy", e));
+    }
+
+    if let Err(e) = await_reply(
+        rx,
+        "security_failed_to_toggle_antileech",
+        "Failed to toggle anti-leech filter",
+    )
+    .await?
+    {
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::storage::config::AppConfig::write_to_disk(
+                &old_save_data.0,
+                &old_save_data.1,
+                &old_save_data.2,
+            )
+        })
+        .await;
+        return Err(e);
+    }
+
     {
         let mut cfg = state.config.write().await;
         cfg.settings = new_settings;

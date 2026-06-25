@@ -45,10 +45,12 @@ pub struct KnownFileRecord {
     pub last_shared: u32,
 }
 
+#[derive(Clone)]
 pub struct KnownFileList {
     files: HashMap<[u8; 16], KnownFileRecord>,
     path_index: HashMap<String, [u8; 16]>,
     dirty: bool,
+    dirty_generation: u64,
 }
 
 impl KnownFileList {
@@ -57,6 +59,7 @@ impl KnownFileList {
             files: HashMap::new(),
             path_index: HashMap::new(),
             dirty: false,
+            dirty_generation: 0,
         }
     }
 
@@ -381,7 +384,12 @@ impl KnownFileList {
     /// that mutate a record via `find_by_hash_mut`).
     #[allow(dead_code)]
     pub fn mark_dirty(&mut self) {
+        self.touch_dirty();
+    }
+
+    fn touch_dirty(&mut self) {
         self.dirty = true;
+        self.dirty_generation = self.dirty_generation.saturating_add(1);
     }
 
     /// Decide whether the on-disk known-file record matches what we just
@@ -452,7 +460,7 @@ impl KnownFileList {
             self.path_index.insert(new_key, hash);
         }
         self.files.insert(hash, record);
-        self.dirty = true;
+        self.touch_dirty();
     }
 
     /// Increment all-time request/accept counters (eMule-style per-file upload interest).
@@ -463,7 +471,7 @@ impl KnownFileList {
         if let Some(record) = self.files.get_mut(hash) {
             record.all_time_requested = record.all_time_requested.saturating_add(requested);
             record.all_time_accepted = record.all_time_accepted.saturating_add(accepted);
-            self.dirty = true;
+            self.touch_dirty();
         }
     }
 
@@ -474,12 +482,28 @@ impl KnownFileList {
         }
         if let Some(record) = self.files.get_mut(hash) {
             record.all_time_transferred = record.all_time_transferred.saturating_add(bytes);
-            self.dirty = true;
+            self.touch_dirty();
         }
     }
 
     pub fn is_dirty(&self) -> bool {
         self.dirty
+    }
+
+    pub fn dirty_generation(&self) -> u64 {
+        self.dirty_generation
+    }
+
+    /// Mark a background snapshot save as durable if no newer mutation happened.
+    pub fn mark_saved_if_generation(&mut self, generation: u64) {
+        if self.dirty_generation == generation {
+            self.dirty = false;
+        }
+    }
+
+    /// Keep the next timer save eligible after a failed background write.
+    pub fn mark_save_failed(&mut self) {
+        self.dirty = true;
     }
 
     pub fn save(&mut self, path: &Path) -> anyhow::Result<()> {

@@ -351,6 +351,14 @@ fn validate_hex_id(id: &str) -> bool {
     id.len() == 64 && id.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+fn validate_relay_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 async fn register(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -742,7 +750,7 @@ async fn relay_invite_post(
     headers: HeaderMap,
     Json(body): Json<RelayInviteRequest>,
 ) -> StatusCode {
-    if !validate_hex_id(&body.target_id) || body.session_id.is_empty() || body.session_id.len() > 128 {
+    if !validate_hex_id(&body.target_id) || !validate_relay_session_id(&body.session_id) {
         return StatusCode::BAD_REQUEST;
     }
     // NOTE: relay-invite POSTs are intentionally NOT signed. The
@@ -834,8 +842,12 @@ async fn relay_ws(
     headers: HeaderMap,
     Path(session_id): Path<String>,
 ) -> impl IntoResponse {
+    if !validate_relay_session_id(&session_id) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let client_ip = extract_client_ip(&headers, addr);
     ws.on_upgrade(move |socket| handle_relay_ws(socket, state, session_id, client_ip))
+        .into_response()
 }
 
 async fn handle_relay_ws(

@@ -15,6 +15,7 @@ const RENEW_AFTER: Duration = Duration::from_secs(45 * 60);
 /// during `maintain` re-discovery it stalls the select loop while it waits.
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[derive(Clone)]
 pub struct UpnpMappings {
     gateway: Option<Gw>,
     tcp_port: u16,
@@ -35,6 +36,7 @@ pub struct UpnpMappings {
     discovery_failures: u32,
     /// Don't retry discovery before this instant.
     next_discovery_at: Option<Instant>,
+    revision: u64,
 }
 
 impl UpnpMappings {
@@ -50,6 +52,7 @@ impl UpnpMappings {
             last_map_attempt: None,
             discovery_failures: 0,
             next_discovery_at: None,
+            revision: 0,
         }
     }
 
@@ -164,6 +167,9 @@ impl UpnpMappings {
             };
             (tcp_ok, udp_ok, quic_ok)
         };
+        if self.tcp_mapped != tcp_ok || self.udp_mapped != udp_ok || self.quic_mapped != quic_ok {
+            self.revision = self.revision.saturating_add(1);
+        }
         self.tcp_mapped = tcp_ok;
         self.udp_mapped = udp_ok;
         self.quic_mapped = quic_ok;
@@ -180,9 +186,15 @@ impl UpnpMappings {
         if self.quic_port == Some(quic_port) && self.quic_mapped {
             return true;
         }
-        self.quic_port = Some(quic_port);
+        if self.quic_port != Some(quic_port) {
+            self.quic_port = Some(quic_port);
+            self.revision = self.revision.saturating_add(1);
+        }
         if quic_port == self.udp_port {
-            self.quic_mapped = self.udp_mapped;
+            if self.quic_mapped != self.udp_mapped {
+                self.quic_mapped = self.udp_mapped;
+                self.revision = self.revision.saturating_add(1);
+            }
             return self.udp_mapped;
         }
         let ok = {
@@ -201,7 +213,10 @@ impl UpnpMappings {
             )
             .await
         };
-        self.quic_mapped = ok;
+        if self.quic_mapped != ok {
+            self.quic_mapped = ok;
+            self.revision = self.revision.saturating_add(1);
+        }
         ok
     }
 
@@ -227,6 +242,7 @@ impl UpnpMappings {
         self.discovery_failures = 0;
         self.next_discovery_at = None;
         self.gateway = Some(gateway);
+        self.revision = self.revision.saturating_add(1);
         self.map_all().await
     }
 
@@ -298,6 +314,7 @@ impl UpnpMappings {
         self.quic_mapped = false;
         self.last_map_attempt = None;
         self.next_discovery_at = None;
+        self.revision = self.revision.saturating_add(1);
     }
 
     pub fn is_mapped(&self) -> bool {
@@ -310,6 +327,10 @@ impl UpnpMappings {
     /// the two cases need different remediation advice.
     pub fn has_gateway(&self) -> bool {
         self.gateway.is_some()
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 }
 
