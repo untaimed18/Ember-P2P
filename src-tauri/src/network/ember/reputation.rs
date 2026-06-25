@@ -131,6 +131,7 @@ impl PeerReputation {
 }
 
 /// Manages reputation scores for all known peers.
+#[derive(Clone)]
 pub struct ReputationManager {
     peers: HashMap<[u8; 16], PeerReputation>,
     last_decay: u64,

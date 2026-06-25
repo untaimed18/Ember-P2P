@@ -154,7 +154,7 @@ impl StatsManager {
         }
     }
 
-    pub fn save_cumulative(&self, db: &Database) {
+    pub fn cumulative_save_pairs(&self) -> Vec<(&'static str, i64)> {
         let safe_add = |a: u64, b: u64| -> i64 {
             let sum = a.saturating_add(b);
             if sum > i64::MAX as u64 {
@@ -164,7 +164,7 @@ impl StatsManager {
             }
         };
         let safe_add32 = |a: u32, b: u32| -> i64 { (a as i64).saturating_add(b as i64) };
-        let pairs = vec![
+        vec![
             (
                 "cum_downloaded",
                 safe_add(self.stats.cum_downloaded, self.stats.session_downloaded),
@@ -202,7 +202,11 @@ impl StatsManager {
                 safe_add32(self.stats.cum_completed_up, self.stats.session_completed_up),
             ),
             ("stat_last_reset", self.stats.stat_last_reset),
-        ];
+        ]
+    }
+
+    pub fn save_cumulative(&self, db: &Database) {
+        let pairs = self.cumulative_save_pairs();
         if let Err(e) = db.save_statistics(&pairs) {
             tracing::warn!("Failed to save statistics: {e}");
         }

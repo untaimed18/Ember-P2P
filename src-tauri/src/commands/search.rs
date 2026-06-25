@@ -13,6 +13,7 @@ use std::collections::HashMap;
 
 const SEARCH_TIMEOUT_MIN: u64 = 30;
 const SEARCH_TIMEOUT_MAX: u64 = 600;
+const LINK_STATS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Maximum query length accepted from the frontend. eMule keyword
 /// searches have hard wire limits well under this; the cap is a
@@ -500,13 +501,21 @@ pub async fn build_ed2k_link(
             .network_tx
             .try_send(NetworkCommand::GetNetworkStatsSnapshot { tx })
             .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-        let stats = rx.await.map_err(|e| {
-            coded_ctx(
-                "search_link_sources_failed",
-                "Failed to read network state",
-                e,
-            )
-        })?;
+        let stats = tokio::time::timeout(LINK_STATS_TIMEOUT, rx)
+            .await
+            .map_err(|_| {
+                coded(
+                    "search_link_sources_timeout",
+                    "Timed out reading network state",
+                )
+            })?
+            .map_err(|e| {
+                coded_ctx(
+                    "search_link_sources_failed",
+                    "Failed to read network state",
+                    e,
+                )
+            })?;
         if stats.firewalled {
             return Err(coded(
                 "search_link_firewalled",

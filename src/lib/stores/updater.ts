@@ -156,7 +156,11 @@ export async function installUpdate(): Promise<void> {
 
 /** Restart the app to apply an installed update. */
 export async function restartToUpdate(): Promise<void> {
-  await relaunch();
+  try {
+    await relaunch();
+  } catch (e) {
+    updater.update((s) => ({ ...s, phase: 'error', error: toMessage(e) }));
+  }
 }
 
 /** Hide the banner for the current version without cancelling anything. */

@@ -309,7 +309,7 @@
     } catch {
       // Non-fatal: leave previous set in place.
     } finally {
-      missingScanInFlight = false;
+      if (mounted) missingScanInFlight = false;
     }
   }
 
@@ -444,10 +444,12 @@
       if (mounted && e instanceof Error && e.message !== 'timeout')
         console.error('Failed to load shared files:', e);
     } finally {
-      busy = false;
-      if (pendingRefresh && mounted) {
-        pendingRefresh = false;
-        debouncedRefresh();
+      if (mounted) {
+        busy = false;
+        if (pendingRefresh) {
+          pendingRefresh = false;
+          debouncedRefresh();
+        }
       }
     }
     if (mounted) void refreshMissingSet();
