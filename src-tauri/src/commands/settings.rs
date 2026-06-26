@@ -345,7 +345,12 @@ pub async fn update_settings(
         .collect::<String>()
         .trim()
         .to_string();
-    validate_settings(&settings)?;
+    {
+        let settings_for_validation = settings.clone();
+        tokio::task::spawn_blocking(move || validate_settings(&settings_for_validation))
+            .await
+            .map_err(|e| coded_ctx("settings_validation_task_failed", "Validation failed", e))??;
+    }
 
     let old_settings = {
         let config = state.config.read().await;
@@ -417,19 +422,20 @@ pub async fn update_settings(
         watcher.sync_paths(&settings.shared_folders);
     }
 
-    // Settings are already persisted to disk above; the network task
-    // only needs the new values to apply them at runtime. If the
-    // command channel is briefly saturated we'd rather log a warning
-    // than fail the whole save — the user's choices are already on
-    // disk and the network will pick them up at the next restart (or
-    // the next `UpdateSettings` push). Returning `Err` here used to
-    // make the UI show "save failed" even though the save succeeded.
+    // Settings are already persisted to disk above; if the runtime update
+    // cannot be queued, report partial success instead of silently leaving the
+    // live network task on old values until restart.
     if let Err(e) = state.network_tx.try_send(NetworkCommand::UpdateSettings {
         settings: settings.clone(),
     }) {
         tracing::warn!(
             "Settings saved to disk, but live network update was dropped (channel full): {e}"
         );
+        return Err(coded_ctx(
+            "settings_saved_live_update_failed",
+            "Settings were saved, but the live network update failed; restart or retry to apply them now",
+            e,
+        ));
     }
 
     if port_changed {

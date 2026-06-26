@@ -295,17 +295,18 @@ fn decode_message(opcode: u8, cursor: &mut Cursor<&[u8]>) -> io::Result<KadMessa
             let sender_id = KadId::read_from(cursor)?;
             let tcp_port = cursor.read_u16::<LittleEndian>()?;
             let version = cursor.read_u8()?;
-            // Cap the parsed count at 200 (sanity bound + allocation cap), then
-            // read exactly that many fixed-size contacts, failing on truncation
-            // rather than silently accepting a partial list as complete. eMule
-            // sends at most 20, so an over-cap count means a malformed packet.
+            // Bound the parsed count before allocation. eMule sends at most 20,
+            // so an over-cap count is malformed rather than a valid truncated
+            // response.
             let count = cursor.read_u16::<LittleEndian>()? as usize;
-            let take = count.min(200);
             if count > 200 {
-                tracing::warn!("KAD BOOTSTRAP_RES declared {count} contacts, capping parse to 200");
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("KAD BOOTSTRAP_RES declares too many contacts: {count}"),
+                ));
             }
-            let mut contacts = Vec::with_capacity(take);
-            for _ in 0..take {
+            let mut contacts = Vec::with_capacity(count);
+            for _ in 0..count {
                 contacts.push(KadContact::read_from(cursor)?);
             }
             Ok(KadMessage::BootstrapRes {

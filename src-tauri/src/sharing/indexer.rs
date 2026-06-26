@@ -10,6 +10,8 @@ use crate::types::FileInfo;
 
 pub struct FileIndexer;
 
+const MAX_DISCOVERED_FILES: usize = 100_000;
+
 impl FileIndexer {
     /// Quickly discover files in a directory -- metadata only, no hashing.
     /// Files are returned with empty hash/aich_hash so they can be shown in the
@@ -71,6 +73,12 @@ impl FileIndexer {
                     Ok(info) => {
                         debug!("Discovered: {}", info.name);
                         files.push(info);
+                        if files.len() >= MAX_DISCOVERED_FILES {
+                            warn!(
+                                "Stopping discovery in {dir}: reached file cap {MAX_DISCOVERED_FILES}"
+                            );
+                            break;
+                        }
                     }
                     Err(e) => {
                         warn!("Failed to discover {}: {e}", entry.path().display());

@@ -367,7 +367,8 @@ impl IpFilter {
         if let Ok(snap) = shared.read() {
             let range_hits = snap.hit_counter.swap(0, Ordering::Relaxed);
             if range_hits > 0 {
-                self.total_range_hits.fetch_add(range_hits, Ordering::Relaxed);
+                self.total_range_hits
+                    .fetch_add(range_hits, Ordering::Relaxed);
             }
             let special_hits = snap.special_hit_counter.swap(0, Ordering::Relaxed);
             if special_hits > 0 {
@@ -769,16 +770,16 @@ mod tests {
         // unroutable space must still be refused — this is the regression that
         // motivated splitting "bogus (always)" from "LAN (gated)".
         for ip in [
-            Ipv4Addr::new(0, 1, 2, 3),        // 0.0.0.0/8 "this network"
-            Ipv4Addr::new(240, 0, 0, 1),      // class E / reserved
+            Ipv4Addr::new(0, 1, 2, 3),         // 0.0.0.0/8 "this network"
+            Ipv4Addr::new(240, 0, 0, 1),       // class E / reserved
             Ipv4Addr::new(255, 255, 255, 255), // limited broadcast
-            Ipv4Addr::new(224, 0, 0, 1),      // multicast
-            Ipv4Addr::new(192, 0, 2, 5),      // TEST-NET-1 (documentation)
-            Ipv4Addr::new(198, 51, 100, 7),   // TEST-NET-2
-            Ipv4Addr::new(203, 0, 113, 9),    // TEST-NET-3
-            Ipv4Addr::new(198, 18, 0, 1),     // benchmarking
-            Ipv4Addr::new(192, 0, 0, 1),      // protocol assignments
-            Ipv4Addr::new(192, 88, 99, 1),    // 6to4 relay anycast
+            Ipv4Addr::new(224, 0, 0, 1),       // multicast
+            Ipv4Addr::new(192, 0, 2, 5),       // TEST-NET-1 (documentation)
+            Ipv4Addr::new(198, 51, 100, 7),    // TEST-NET-2
+            Ipv4Addr::new(203, 0, 113, 9),     // TEST-NET-3
+            Ipv4Addr::new(198, 18, 0, 1),      // benchmarking
+            Ipv4Addr::new(192, 0, 0, 1),       // protocol assignments
+            Ipv4Addr::new(192, 88, 99, 1),     // 6to4 relay anycast
         ] {
             assert!(
                 !is_valid_contact_ip(ip, false),

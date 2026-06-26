@@ -51,6 +51,8 @@ const OP_UNREGISTER: u8 = 0x02;
 /// in a signed request. 5 minutes covers normal NTP-skewed clients
 /// without giving an attacker a useful replay window.
 const MAX_TIMESTAMP_SKEW_SECS: i64 = 300;
+const REPLAY_CACHE_TTL: Duration = Duration::from_secs((MAX_TIMESTAMP_SKEW_SECS as u64) * 2);
+const MAX_REPLAY_CACHE_ENTRIES: usize = 100_000;
 
 fn now_unix_secs() -> i64 {
     std::time::SystemTime::now()
@@ -119,6 +121,13 @@ fn build_unregister_msg(id_raw: &[u8; 32], ts: i64) -> Vec<u8> {
     m.extend_from_slice(id_raw);
     m.extend_from_slice(&ts.to_le_bytes());
     m
+}
+
+fn signed_request_replay_key(message: &[u8], sig: &[u8; 64]) -> [u8; 32] {
+    let mut sha = Sha256::new();
+    sha.update(message);
+    sha.update(sig);
+    sha.finalize().into()
 }
 
 const ENTRY_TTL: Duration = Duration::from_secs(300);
@@ -282,6 +291,10 @@ struct AppState {
     relay_sessions: Arc<RwLock<HashMap<String, RelaySessionEntry>>>,
     relay_ip_counts: Arc<RwLock<HashMap<IpAddr, usize>>>,
     relay_invites: Arc<RwLock<HashMap<String, Vec<RelayInvite>>>>,
+    /// Recently accepted signed mutating requests. Timestamps keep messages
+    /// fresh; this cache prevents replaying a captured fresh register or
+    /// unregister within that allowed skew window.
+    replay_cache: Arc<RwLock<HashMap<[u8; 32], Instant>>>,
     started_at: Instant,
 }
 
@@ -375,6 +388,28 @@ async fn check_rate_limit(state: &AppState, ip: IpAddr) -> bool {
         entry.count += 1;
         entry.count <= MAX_REQUESTS_PER_MINUTE
     }
+}
+
+async fn remember_signed_request(state: &AppState, key: [u8; 32]) -> bool {
+    let now = Instant::now();
+    let mut cache = state.replay_cache.write().await;
+    cache.retain(|_, seen_at| now.duration_since(*seen_at) < REPLAY_CACHE_TTL);
+    if cache.contains_key(&key) {
+        return false;
+    }
+    if cache.len() >= MAX_REPLAY_CACHE_ENTRIES {
+        if let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, seen_at)| *seen_at)
+            .map(|(k, _)| *k)
+        {
+            cache.remove(&oldest);
+        } else {
+            return false;
+        }
+    }
+    cache.insert(key, now);
+    true
 }
 
 fn validate_hex_id(id: &str) -> bool {
@@ -497,6 +532,9 @@ async fn register(
     if !ed25519_verify(&pubkey, &msg, &sig_bytes) {
         return StatusCode::FORBIDDEN;
     }
+    if !remember_signed_request(&state, signed_request_replay_key(&msg, &sig_bytes)).await {
+        return StatusCode::CONFLICT;
+    }
 
     // Optional DHT Noise key — decoded best-effort. A malformed value is
     // simply dropped (the entry just won't be bootstrap-eligible) rather
@@ -606,6 +644,10 @@ async fn unregister(
         // the only authority that survives address churn.
         let msg = build_unregister_msg(&id_raw, body.ts);
         if ed25519_verify(&entry.pubkey, &msg, &sig_bytes) {
+            if !remember_signed_request(&state, signed_request_replay_key(&msg, &sig_bytes)).await
+            {
+                return StatusCode::CONFLICT;
+            }
             store.remove(&body.id.to_lowercase());
             debug!("unregistered {} from {}", &body.id[..8], client_ip);
             return StatusCode::OK;
@@ -1285,6 +1327,11 @@ async fn sweep_expired(state: AppState) {
             limits.retain(|_, entry| now.duration_since(entry.window_start) < RATE_WINDOW * 2);
         }
 
+        {
+            let mut replay = state.replay_cache.write().await;
+            replay.retain(|_, seen_at| now.duration_since(*seen_at) < REPLAY_CACHE_TTL);
+        }
+
         // Sweep expired punch requests
         {
             let mut punches = state.punch_requests.write().await;
@@ -1352,6 +1399,7 @@ async fn main() {
         relay_sessions: Arc::new(RwLock::new(HashMap::new())),
         relay_ip_counts: Arc::new(RwLock::new(HashMap::new())),
         relay_invites: Arc::new(RwLock::new(HashMap::new())),
+        replay_cache: Arc::new(RwLock::new(HashMap::new())),
         started_at: Instant::now(),
     };
 

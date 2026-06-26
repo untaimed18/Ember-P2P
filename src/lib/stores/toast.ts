@@ -26,6 +26,12 @@ export function removeToast(id: number) {
   toasts.update((t) => t.filter((x) => x.id !== id));
 }
 
+export function clearAllToasts() {
+  for (const timer of toastTimers.values()) clearTimeout(timer);
+  toastTimers.clear();
+  toasts.set([]);
+}
+
 export function toast(message: string) { addToast('info', message); }
 export function toastSuccess(message: string) { addToast('success', message); }
 export function toastError(message: string) { addToast('error', message, 8000); }

@@ -180,6 +180,7 @@ impl RelaySession {
 /// Manages relay sessions when this node acts as a relay for others.
 pub struct RelayManager {
     sessions: HashMap<u32, RelaySession>,
+    attestation_hashes: HashMap<[u8; 32], u64>,
     next_session_id: u32,
     total_bytes_relayed: u64,
 }
@@ -188,9 +189,24 @@ impl RelayManager {
     pub fn new() -> Self {
         Self {
             sessions: HashMap::new(),
+            attestation_hashes: HashMap::new(),
             next_session_id: 1,
             total_bytes_relayed: 0,
         }
+    }
+
+    pub fn set_current_attestation_hash(&mut self, hash: [u8; 32], expires_at_unix: u64) {
+        self.attestation_hashes.clear();
+        self.attestation_hashes.insert(hash, expires_at_unix);
+    }
+
+    fn accepts_attestation_hash(&mut self, hash: &[u8; 32]) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.attestation_hashes.retain(|_, exp| *exp > now);
+        self.attestation_hashes.contains_key(hash)
     }
 
     /// Create a new relay session if capacity allows.
@@ -329,16 +345,30 @@ pub fn decode_relay_header(data: &[u8]) -> Option<(u8, u32, u16)> {
 }
 
 /// Build a RELAY_REQUEST message.
+#[allow(dead_code)]
 pub fn build_relay_request(
     session_id: u32,
     target_ip: Ipv4Addr,
     target_port: u16,
     file_hash: &[u8; 16],
 ) -> Vec<u8> {
+    build_relay_request_with_attestation_hash(session_id, target_ip, target_port, file_hash, None)
+}
+
+pub fn build_relay_request_with_attestation_hash(
+    session_id: u32,
+    target_ip: Ipv4Addr,
+    target_port: u16,
+    file_hash: &[u8; 16],
+    attestation_hash: Option<[u8; 32]>,
+) -> Vec<u8> {
     let mut payload = Vec::with_capacity(22);
     payload.extend_from_slice(&target_ip.octets());
     payload.extend_from_slice(&target_port.to_le_bytes());
     payload.extend_from_slice(file_hash);
+    if let Some(hash) = attestation_hash {
+        payload.extend_from_slice(&hash);
+    }
     encode_relay_message(MSG_RELAY_REQUEST, session_id, &payload)
 }
 
@@ -371,7 +401,14 @@ pub fn build_relay_close(session_id: u32) -> Vec<u8> {
 }
 
 /// Parse a RELAY_REQUEST payload.
+#[allow(dead_code)]
 pub fn parse_relay_request(payload: &[u8]) -> Option<(Ipv4Addr, u16, [u8; 16])> {
+    parse_relay_request_with_attestation_hash(payload).map(|r| (r.0, r.1, r.2))
+}
+
+pub fn parse_relay_request_with_attestation_hash(
+    payload: &[u8],
+) -> Option<(Ipv4Addr, u16, [u8; 16], Option<[u8; 32]>)> {
     if payload.len() < 22 {
         return None;
     }
@@ -379,7 +416,14 @@ pub fn parse_relay_request(payload: &[u8]) -> Option<(Ipv4Addr, u16, [u8; 16])> 
     let port = u16::from_le_bytes([payload[4], payload[5]]);
     let mut hash = [0u8; 16];
     hash.copy_from_slice(&payload[6..22]);
-    Some((ip, port, hash))
+    let attestation_hash = if payload.len() >= 54 {
+        let mut h = [0u8; 32];
+        h.copy_from_slice(&payload[22..54]);
+        Some(h)
+    } else {
+        None
+    };
+    Some((ip, port, hash, attestation_hash))
 }
 
 /// Client-side helper: register a hole-punch coordination request.
@@ -470,6 +514,7 @@ pub async fn connect_to_peer_relay(
     target_ip: Ipv4Addr,
     target_port: u16,
     file_hash: &[u8; 16],
+    attestation_hash: Option<[u8; 32]>,
 ) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
     info!("Relay: connecting to peer relay at {relay_addr}");
 
@@ -485,7 +530,13 @@ pub async fn connect_to_peer_relay(
         .map_err(|e| format!("relay open_bi failed: {e}"))?;
 
     let session_id = rand::random::<u32>();
-    let request = build_relay_request(session_id, target_ip, target_port, file_hash);
+    let request = build_relay_request_with_attestation_hash(
+        session_id,
+        target_ip,
+        target_port,
+        file_hash,
+        attestation_hash,
+    );
 
     send.write_all(&request)
         .await
@@ -624,10 +675,15 @@ impl AsyncWrite for WsStream {
     ) -> Poll<std::io::Result<usize>> {
         use tokio_tungstenite::tungstenite::Message;
 
-        let msg = Message::Binary(buf.to_vec().into());
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        const MAX_WS_WRITE_FRAME: usize = 16 * 1024;
+        let write_len = buf.len().min(MAX_WS_WRITE_FRAME);
+        let msg = Message::Binary(buf[..write_len].to_vec().into());
         match Sink::poll_ready(Pin::new(&mut self.inner), cx) {
             Poll::Ready(Ok(())) => match Sink::start_send(Pin::new(&mut self.inner), msg) {
-                Ok(()) => Poll::Ready(Ok(buf.len())),
+                Ok(()) => Poll::Ready(Ok(write_len)),
                 Err(e) => Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e))),
             },
             Poll::Ready(Err(e)) => {
@@ -791,26 +847,27 @@ pub async fn run_quic_accept_loop(
                         return;
                     }
                 };
-                if payload_len as usize != 22 {
+                if !matches!(payload_len as usize, 22 | 54) {
                     debug!(
-                        "QUIC accept: RELAY_REQUEST from {remote} has unexpected payload_len {payload_len} (want 22)"
+                        "QUIC accept: RELAY_REQUEST from {remote} has unexpected payload_len {payload_len} (want 22 or 54)"
                     );
                     return;
                 }
 
-                let mut payload_buf = [0u8; 22];
+                let mut payload_buf = vec![0u8; payload_len as usize];
                 if let Err(e) = init_recv.read_exact(&mut payload_buf).await {
                     debug!("QUIC accept: failed to read request payload from {remote}: {e}");
                     return;
                 }
 
-                let (target_ip, target_port, file_hash) = match parse_relay_request(&payload_buf) {
-                    Some(parsed) => parsed,
-                    None => {
-                        debug!("QUIC accept: invalid relay request payload from {remote}");
-                        return;
-                    }
-                };
+                let (target_ip, target_port, file_hash, attestation_hash) =
+                    match parse_relay_request_with_attestation_hash(&payload_buf) {
+                        Some(parsed) => parsed,
+                        None => {
+                            debug!("QUIC accept: invalid relay request payload from {remote}");
+                            return;
+                        }
+                    };
 
                 // Refuse to relay to non-public destinations (SSRF/scan guard).
                 if target_port == 0 || !is_public_relay_target(target_ip) {
@@ -820,6 +877,24 @@ pub async fn run_quic_accept_loop(
                     let reject = build_relay_reject(peer_session_id, 0x02);
                     let _ = init_send.write_all(&reject).await;
                     return;
+                }
+
+                let Some(attestation_hash) = attestation_hash else {
+                    debug!(
+                        "QUIC accept: refusing unauthenticated peer relay request from {remote}"
+                    );
+                    let reject = build_relay_reject(peer_session_id, 0x03);
+                    let _ = init_send.write_all(&reject).await;
+                    return;
+                };
+                {
+                    let mut mgr_lock = mgr.lock().await;
+                    if !mgr_lock.accepts_attestation_hash(&attestation_hash) {
+                        debug!("QUIC accept: refusing relay request from {remote}: unknown or expired attestation hash");
+                        let reject = build_relay_reject(peer_session_id, 0x03);
+                        let _ = init_send.write_all(&reject).await;
+                        return;
+                    }
                 }
 
                 let initiator_ip = match remote.ip() {
@@ -953,8 +1028,10 @@ pub async fn run_quic_accept_loop(
             } else if msg_type == MSG_RELAY_CONNECT {
                 // === Relay target: a relay node is forwarding a client to us ===
                 let payload_len = u16::from_le_bytes([header[5], header[6]]) as usize;
-                if payload_len < 16 {
-                    debug!("QUIC accept: RELAY_CONNECT payload too short ({payload_len}) from {remote}");
+                if payload_len != 16 {
+                    debug!(
+                        "QUIC accept: RELAY_CONNECT payload length {payload_len} from {remote} (expected 16)"
+                    );
                     return;
                 }
                 let mut file_hash = [0u8; 16];
@@ -963,10 +1040,6 @@ pub async fn run_quic_accept_loop(
                         "QUIC accept: failed to read RELAY_CONNECT file hash from {remote}: {e}"
                     );
                     return;
-                }
-                if payload_len > 16 {
-                    let mut drain = vec![0u8; payload_len - 16];
-                    let _ = init_recv.read_exact(&mut drain).await;
                 }
 
                 let peer_ip = match remote.ip() {
@@ -1196,6 +1269,45 @@ mod tests {
         assert_eq!(parsed_ip, ip);
         assert_eq!(parsed_port, port);
         assert_eq!(parsed_hash, hash);
+    }
+
+    #[test]
+    fn relay_request_with_attestation_hash_round_trip() {
+        let ip = Ipv4Addr::new(1, 2, 3, 4);
+        let port = 4662u16;
+        let file_hash = [0xAA; 16];
+        let attestation_hash = [0xBB; 32];
+        let msg = build_relay_request_with_attestation_hash(
+            1,
+            ip,
+            port,
+            &file_hash,
+            Some(attestation_hash),
+        );
+        let (msg_type, sid, payload) = decode_relay_message(&msg).unwrap();
+        assert_eq!(msg_type, MSG_RELAY_REQUEST);
+        assert_eq!(sid, 1);
+        let (parsed_ip, parsed_port, parsed_file_hash, parsed_attestation_hash) =
+            parse_relay_request_with_attestation_hash(payload).unwrap();
+        assert_eq!(parsed_ip, ip);
+        assert_eq!(parsed_port, port);
+        assert_eq!(parsed_file_hash, file_hash);
+        assert_eq!(parsed_attestation_hash, Some(attestation_hash));
+    }
+
+    #[test]
+    fn relay_manager_accepts_only_current_attestation_hash() {
+        let mut mgr = RelayManager::new();
+        let current = [1u8; 32];
+        let other = [2u8; 32];
+        let expires = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 60;
+        mgr.set_current_attestation_hash(current, expires);
+        assert!(mgr.accepts_attestation_hash(&current));
+        assert!(!mgr.accepts_attestation_hash(&other));
     }
 
     #[test]
