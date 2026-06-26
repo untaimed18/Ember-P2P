@@ -24,6 +24,7 @@ const MAX_PATH_LEN: usize = 4 * 1024;
 const MAX_SHARED_FOLDERS: usize = 512;
 const MAX_URL_LEN: usize = 2 * 1024;
 const MAX_FILENAME_CLEANUPS_LEN: usize = 16 * 1024;
+const MAX_CONFIGURED_SPEED_BPS: u64 = 100 * 1024 * 1024 * 1024;
 
 pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
     if settings.spam_filter_profile != "relaxed"
@@ -120,6 +121,20 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
         return Err(coded(
             "settings_max_concurrent_uploads_invalid",
             "Max concurrent uploads must be between 1 and 50",
+        ));
+    }
+    if settings.max_upload_speed > MAX_CONFIGURED_SPEED_BPS {
+        return Err(coded_ctx(
+            "settings_max_upload_speed_invalid",
+            format!("Max upload speed must be 0 or at most {MAX_CONFIGURED_SPEED_BPS} B/s"),
+            MAX_CONFIGURED_SPEED_BPS,
+        ));
+    }
+    if settings.max_download_speed > MAX_CONFIGURED_SPEED_BPS {
+        return Err(coded_ctx(
+            "settings_max_download_speed_invalid",
+            format!("Max download speed must be 0 or at most {MAX_CONFIGURED_SPEED_BPS} B/s"),
+            MAX_CONFIGURED_SPEED_BPS,
         ));
     }
     if !(60..=14400).contains(&settings.download_queue_wait_secs) {

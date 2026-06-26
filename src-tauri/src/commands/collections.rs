@@ -4,6 +4,8 @@ use crate::network::ed2k::collection::{Collection, CollectionFile};
 use crate::types::{Transfer, TransferDirection, TransferStatus};
 use tauri::Emitter;
 
+const MAX_COLLECTION_FIELD_LEN: usize = 1024;
+
 #[tauri::command]
 pub async fn load_collection(
     state: tauri::State<'_, AppState>,
@@ -107,6 +109,20 @@ pub async fn create_collection(
     output_path: String,
     binary: bool,
 ) -> Result<String, String> {
+    if name.len() > MAX_COLLECTION_FIELD_LEN {
+        return Err(coded_ctx(
+            "collections_name_too_long",
+            format!("Collection name exceeds {MAX_COLLECTION_FIELD_LEN} bytes"),
+            MAX_COLLECTION_FIELD_LEN,
+        ));
+    }
+    if author.len() > MAX_COLLECTION_FIELD_LEN {
+        return Err(coded_ctx(
+            "collections_author_too_long",
+            format!("Collection author exceeds {MAX_COLLECTION_FIELD_LEN} bytes"),
+            MAX_COLLECTION_FIELD_LEN,
+        ));
+    }
     // Mirror the cap on the binary loader (100k entries) and the
     // download-batch cap (200 entries) — the IPC create path was
     // unbounded, so a frontend bug or malicious bundle could push a

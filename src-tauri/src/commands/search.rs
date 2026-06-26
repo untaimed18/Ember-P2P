@@ -19,6 +19,8 @@ const LINK_STATS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2
 /// searches have hard wire limits well under this; the cap is a
 /// memory/IPC bound, not a UX limit.
 pub(crate) const MAX_SEARCH_QUERY_LEN: usize = 1024;
+const MAX_SEARCH_FILTER_LEN: usize = 128;
+const MAX_ED2K_LINK_LEN: usize = 8 * 1024;
 /// Maximum source-address strings accepted in a `mark_spam` payload.
 /// Each is at most 21 bytes ("xxx.xxx.xxx.xxx:port").
 const MAX_MARK_SPAM_SOURCES: usize = 64;
@@ -177,6 +179,26 @@ pub async fn search_files(
             "search_query_too_long",
             format!("Search query exceeds {MAX_SEARCH_QUERY_LEN} bytes; shorten it"),
             MAX_SEARCH_QUERY_LEN,
+        ));
+    }
+    if file_type
+        .as_deref()
+        .is_some_and(|s| s.len() > MAX_SEARCH_FILTER_LEN)
+    {
+        return Err(coded_ctx(
+            "search_file_type_too_long",
+            format!("file_type exceeds {MAX_SEARCH_FILTER_LEN} bytes"),
+            MAX_SEARCH_FILTER_LEN,
+        ));
+    }
+    if file_extension
+        .as_deref()
+        .is_some_and(|s| s.len() > MAX_SEARCH_FILTER_LEN)
+    {
+        return Err(coded_ctx(
+            "search_file_extension_too_long",
+            format!("file_extension exceeds {MAX_SEARCH_FILTER_LEN} bytes"),
+            MAX_SEARCH_FILTER_LEN,
         ));
     }
     let (tx, rx) = oneshot::channel();
@@ -451,6 +473,13 @@ pub struct Ed2kLinkInfo {
 
 #[tauri::command]
 pub fn parse_ed2k_link(link: String) -> Result<Ed2kLinkInfo, String> {
+    if link.len() > MAX_ED2K_LINK_LEN {
+        return Err(coded_ctx(
+            "search_ed2k_link_too_long",
+            format!("ed2k link exceeds {MAX_ED2K_LINK_LEN} bytes"),
+            MAX_ED2K_LINK_LEN,
+        ));
+    }
     hash::parse_ed2k_link(&link)
         .map(|(name, size, hash, aich)| Ed2kLinkInfo {
             name,
@@ -793,7 +822,7 @@ pub async fn get_download_history(
     tokio::task::spawn_blocking(move || db.get_download_history_batch(&hashes))
         .await
         .map_err(|e| coded_ctx("search_task_failed", "Task failed", e))?
-        .map_err(|e| e.to_string())
+        .map_err(|e| coded_ctx("search_history_fetch_failed", "Failed to fetch history", e))
 }
 
 /// Download history row counts for the settings page summary.
@@ -823,7 +852,13 @@ pub async fn get_download_history_stats(
     })
     .await
     .map_err(|e| coded_ctx("search_task_failed", "Task failed", e))?
-    .map_err(|e| e.to_string())
+    .map_err(|e| {
+        coded_ctx(
+            "search_history_stats_failed",
+            "Failed to fetch history stats",
+            e,
+        )
+    })
 }
 
 /// Clear download history entries by status ("completed", "cancelled", or "all").
@@ -852,7 +887,7 @@ pub async fn clear_download_history(
     })
     .await
     .map_err(|e| coded_ctx("search_task_failed", "Task failed", e))?
-    .map_err(|e| e.to_string())
+    .map_err(|e| coded_ctx("search_history_clear_failed", "Failed to clear history", e))
 }
 
 /// Remove a single download-history row by file hash.
@@ -867,9 +902,16 @@ pub async fn remove_download_history_entry(
     state: tauri::State<'_, AppState>,
     file_hash: String,
 ) -> Result<(), String> {
+    let _ = parse_exact_file_hash(&file_hash)?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.remove_download_history(&file_hash))
         .await
         .map_err(|e| coded_ctx("search_task_failed", "Task failed", e))?
-        .map_err(|e| e.to_string())
+        .map_err(|e| {
+            coded_ctx(
+                "search_history_remove_failed",
+                "Failed to remove history entry",
+                e,
+            )
+        })
 }

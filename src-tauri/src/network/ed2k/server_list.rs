@@ -12,6 +12,7 @@ use tracing::{debug, info};
 /// server name/description strings are short in practice.
 const MAX_SERVER_TAG_NAME_LEN: usize = 256;
 const MAX_SERVER_TAG_STR_LEN: usize = 4096;
+const MAX_SERVER_MET_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default)]
 pub struct ServerMergeStats {
@@ -549,6 +550,13 @@ impl ServerList {
 
     /// Load servers from eMule server.met format.
     pub fn load_server_met(path: &Path) -> io::Result<Self> {
+        let meta = std::fs::metadata(path)?;
+        if meta.len() > MAX_SERVER_MET_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("server.met too large (max {MAX_SERVER_MET_BYTES} bytes)"),
+            ));
+        }
         let data = std::fs::read(path)?;
         if data.len() < 5 {
             return Ok(Self::new());

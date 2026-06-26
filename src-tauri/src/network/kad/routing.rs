@@ -940,8 +940,10 @@ impl RoutingTable {
     }
 
     fn track_ip_add(&mut self, ip: Ipv4Addr) {
-        *self.global_ip_count.entry(ip).or_insert(0) += 1;
-        *self.global_subnet_count.entry(subnet_key(ip)).or_insert(0) += 1;
+        let ip_count = self.global_ip_count.entry(ip).or_insert(0);
+        *ip_count = ip_count.saturating_add(1);
+        let subnet_count = self.global_subnet_count.entry(subnet_key(ip)).or_insert(0);
+        *subnet_count = subnet_count.saturating_add(1);
     }
 
     fn track_ip_remove(&mut self, ip: Ipv4Addr) {
