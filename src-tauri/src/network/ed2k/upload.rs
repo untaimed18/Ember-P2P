@@ -449,6 +449,7 @@ pub enum UploadEventKind {
         entries: Vec<([u8; 16], Vec<(std::net::Ipv4Addr, u16, u16, u8)>)>,
         aich_roots: Vec<([u8; 16], [u8; 20])>,
         ember_peers: Vec<(std::net::Ipv4Addr, u16)>,
+        relay_attestations: Vec<crate::network::ember::RelayAttestation>,
     },
     /// An Ember peer was detected (for peer discovery mesh bootstrap).
     EmberPeerDiscovered {
@@ -5723,13 +5724,18 @@ impl UploadHandler {
                     } else {
                         epx_packets_received += 1;
                         match crate::network::ember::parse_exchange_payload(&payload) {
-                            Ok(result) if !result.files.is_empty() || !result.peers.is_empty() => {
-                                info!("Received Ember Peer Exchange from uploading peer {peer_addr} ({} files, {} peers)", result.files.len(), result.peers.len());
+                            Ok(result)
+                                if !result.files.is_empty()
+                                    || !result.peers.is_empty()
+                                    || !result.relay_attestations.is_empty() =>
+                            {
+                                info!("Received Ember Peer Exchange from uploading peer {peer_addr} ({} files, {} peers, {} relay attestations)", result.files.len(), result.peers.len(), result.relay_attestations.len());
                                 let (epx_entries, aich_roots) = super::transfer::epx_result_to_entries(&result);
+                                let relay_attestations = result.relay_attestations.clone();
                                 let ember_peers = result.peers.into_iter().map(|p| (p.ip, p.tcp_port)).collect();
                                 let _ = self.upload_event_tx.send(UploadEvent {
                                     transfer_id: transfer_id.clone().unwrap_or_default(),
-                                    kind: UploadEventKind::EmberSources { entries: epx_entries, aich_roots, ember_peers },
+                                    kind: UploadEventKind::EmberSources { entries: epx_entries, aich_roots, ember_peers, relay_attestations },
                                 }).await;
                             }
                             Ok(_) => {}

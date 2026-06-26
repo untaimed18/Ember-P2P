@@ -560,6 +560,11 @@ pub fn corrupt_blocks_from_aich_recovery(
 
 /// eMule known2_64.met file format version
 const KNOWN2_MET_VERSION: u8 = 0x02;
+/// Upper bound for app-managed known2_64.met before reading it into memory.
+/// 64 MiB is enough for roughly 3.3M AICH leaves (~600 GiB of shared data at
+/// 180 KiB per leaf), while preventing a corrupt local file from being slurped
+/// wholesale into RAM.
+const MAX_KNOWN2_MET_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Save AICH hash sets to known2_64.met (eMule SHAHashSet.cpp format).
 /// Format: version(u8) + repeated [master_hash(20) + hash_count(u32) + hashes(20*count)]
@@ -583,6 +588,18 @@ pub fn save_known2_met(
 
 /// Load AICH hash sets from known2_64.met.
 pub fn load_known2_met(path: &std::path::Path) -> std::io::Result<Vec<([u8; 20], Vec<[u8; 20]>)>> {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > MAX_KNOWN2_MET_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "known2_64.met too large ({} bytes, max {})",
+                    meta.len(),
+                    MAX_KNOWN2_MET_BYTES
+                ),
+            ));
+        }
+    }
     let data = std::fs::read(path)?;
     if data.is_empty() {
         return Ok(Vec::new());

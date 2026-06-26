@@ -84,7 +84,7 @@ struct ConnectionAttempt {
     phase_started: Instant,
     our_nat: NatType,
     attempt_count: u32,
-    relay_candidate: Option<(Ipv4Addr, u16)>,
+    relay_candidate: Option<(Ipv4Addr, u16, [u8; 32])>,
 }
 
 impl ConnectionAttempt {
@@ -102,6 +102,7 @@ impl ConnectionAttempt {
 pub struct RelayCandidate {
     pub ip: Ipv4Addr,
     pub port: u16,
+    pub attestation_hash: [u8; 32],
     pub last_seen: Instant,
     pub relay_sessions: u32,
 }
@@ -169,6 +170,7 @@ pub enum BrokerEvent {
         source_port: u16,
         file_hash: [u8; 16],
         relay_addr: Option<(Ipv4Addr, u16)>,
+        relay_attestation_hash: Option<[u8; 32]>,
     },
     /// Hole-punch or relay succeeded -- connection ready for download.
     ConnectionReady(BrokerConnection),
@@ -325,7 +327,9 @@ impl ConnectionBroker {
                 }
             }
             AttemptPhase::FindRelay => {
-                let relay_addr = self.pick_relay_candidate();
+                let relay_candidate = self.pick_relay_candidate();
+                let relay_addr = relay_candidate.map(|(ip, port, _)| (ip, port));
+                let relay_attestation_hash = relay_candidate.map(|(_, _, hash)| hash);
                 self.stats.relay_attempts = self.stats.relay_attempts.saturating_add(1);
                 emit_event(
                     &self.event_tx,
@@ -335,6 +339,7 @@ impl ConnectionBroker {
                         source_port,
                         file_hash,
                         relay_addr,
+                        relay_attestation_hash,
                     },
                 );
             }
@@ -353,7 +358,9 @@ impl ConnectionBroker {
     /// duplicate is ignored so we never emit a second `StartRelay` or
     /// double-count a punch failure.
     pub async fn punch_failed(&mut self, attempt_key: &str, reason: &str) {
-        let relay_addr = self.pick_relay_candidate();
+        let relay_candidate = self.pick_relay_candidate();
+        let relay_addr = relay_candidate.map(|(ip, port, _)| (ip, port));
+        let relay_attestation_hash = relay_candidate.map(|(_, _, hash)| hash);
         if let Some(attempt) = self.attempts.get_mut(attempt_key) {
             if attempt.phase != AttemptPhase::HolePunch {
                 debug!(
@@ -366,7 +373,7 @@ impl ConnectionBroker {
             self.stats.punch_failures = self.stats.punch_failures.saturating_add(1);
             attempt.phase = AttemptPhase::FindRelay;
             attempt.phase_started = Instant::now();
-            attempt.relay_candidate = relay_addr;
+            attempt.relay_candidate = relay_candidate;
 
             self.stats.relay_attempts = self.stats.relay_attempts.saturating_add(1);
             emit_event(
@@ -377,6 +384,7 @@ impl ConnectionBroker {
                     source_port: attempt.source_port,
                     file_hash: attempt.file_hash,
                     relay_addr,
+                    relay_attestation_hash,
                 },
             );
         }
@@ -417,12 +425,13 @@ impl ConnectionBroker {
     }
 
     /// Add a relay-capable peer discovered via EPX.
-    pub fn add_relay_candidate(&mut self, ip: Ipv4Addr, port: u16) {
+    pub fn add_relay_candidate(&mut self, ip: Ipv4Addr, port: u16, attestation_hash: [u8; 32]) {
         if let Some(existing) = self
             .relay_candidates
             .iter_mut()
             .find(|c| c.ip == ip && c.port == port)
         {
+            existing.attestation_hash = attestation_hash;
             existing.last_seen = Instant::now();
             return;
         }
@@ -442,13 +451,14 @@ impl ConnectionBroker {
         self.relay_candidates.push(RelayCandidate {
             ip,
             port,
+            attestation_hash,
             last_seen: Instant::now(),
             relay_sessions: 0,
         });
     }
 
     /// Pick the best available relay candidate (fewest sessions, most recent).
-    fn pick_relay_candidate(&self) -> Option<(Ipv4Addr, u16)> {
+    fn pick_relay_candidate(&self) -> Option<(Ipv4Addr, u16, [u8; 32])> {
         let stale_threshold = Duration::from_secs(600);
         self.relay_candidates
             .iter()
@@ -459,7 +469,7 @@ impl ConnectionBroker {
                     std::cmp::Reverse(c.last_seen.elapsed().as_secs()),
                 )
             })
-            .map(|c| (c.ip, c.port))
+            .map(|c| (c.ip, c.port, c.attestation_hash))
     }
 
     /// Clean up expired attempts. Called periodically from the main loop.
@@ -628,13 +638,21 @@ mod tests {
         let (tx, _rx) = mpsc::channel(16);
         let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
 
-        broker.add_relay_candidate(Ipv4Addr::new(1, 1, 1, 1), 4662);
-        broker.add_relay_candidate(Ipv4Addr::new(2, 2, 2, 2), 4663);
+        broker.add_relay_candidate(Ipv4Addr::new(1, 1, 1, 1), 4662, [1u8; 32]);
+        broker.add_relay_candidate(Ipv4Addr::new(2, 2, 2, 2), 4663, [2u8; 32]);
         assert_eq!(broker.relay_candidate_count(), 2);
 
         // Duplicate is deduplicated
-        broker.add_relay_candidate(Ipv4Addr::new(1, 1, 1, 1), 4662);
+        broker.add_relay_candidate(Ipv4Addr::new(1, 1, 1, 1), 4662, [3u8; 32]);
         assert_eq!(broker.relay_candidate_count(), 2);
+        assert_eq!(
+            broker
+                .relay_candidates
+                .iter()
+                .find(|c| c.ip == Ipv4Addr::new(1, 1, 1, 1) && c.port == 4662)
+                .map(|c| c.attestation_hash),
+            Some([3u8; 32])
+        );
 
         let picked = broker.pick_relay_candidate();
         assert!(picked.is_some());

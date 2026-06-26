@@ -191,6 +191,7 @@
 
   "toast_default_title": "Notificación",
   "toast_close_aria": "Cerrar notificación",
+  "toast_network_stopped": "Red detenida: {message}",
 
   "confirm_default_title": "Confirmar",
   "confirm_default_message": "¿Estás seguro?",

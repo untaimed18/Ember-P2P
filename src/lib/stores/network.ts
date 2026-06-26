@@ -243,7 +243,7 @@ export async function initNetworkStore() {
       networkError.set(message);
       // Long duration (15 s) — fatal failures deserve more than the
       // default 8 s of a regular error toast.
-      toastError(`Network stopped: ${message}`);
+      toastError(m.toast_network_stopped({ message }));
     }));
     // Non-fatal warnings from network start-up / ongoing operation (e.g.
     // UDP port already in use → auto-rebound to a different port). These

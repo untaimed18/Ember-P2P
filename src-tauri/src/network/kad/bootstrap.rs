@@ -7,6 +7,11 @@ use tracing::{debug, info, warn};
 
 use super::types::*;
 
+/// Upper bound for local `nodes.dat` before reading it into memory. Valid eMule
+/// contact records are tiny; 16 MiB still allows hundreds of thousands of
+/// contacts, far beyond what the routing table can use.
+const MAX_NODES_DAT_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Well-known bootstrap nodes for the eMule KAD network.
 /// These are long-running public nodes that help new clients join.
 pub fn default_bootstrap_contacts() -> Vec<KadContact> {
@@ -77,6 +82,15 @@ pub enum NodesDatFormat {
 pub fn load_nodes_dat_with_format(
     path: &Path,
 ) -> anyhow::Result<(Vec<KadContact>, NodesDatFormat)> {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > MAX_NODES_DAT_BYTES {
+            anyhow::bail!(
+                "nodes.dat too large ({} bytes, max {})",
+                meta.len(),
+                MAX_NODES_DAT_BYTES
+            );
+        }
+    }
     let data = std::fs::read(path)?;
     if data.len() < 6 {
         anyhow::bail!("nodes.dat too small");
