@@ -4,6 +4,8 @@ use crate::network::NetworkCommand;
 use crate::types::ServerInfo;
 use tracing::info;
 
+const MAX_SERVER_NAME_LEN: usize = 256;
+
 async fn resolve_server_host(input: &str, port: u16) -> Result<String, String> {
     if let Ok(ip) = input.parse::<std::net::Ipv4Addr>() {
         if crate::security::is_special_use_v4(ip) {
@@ -80,6 +82,13 @@ pub async fn add_server(
     }
     if port == 0 {
         return Err(coded("server_port_invalid", "Port must be greater than 0"));
+    }
+    if name.len() > MAX_SERVER_NAME_LEN {
+        return Err(coded_ctx(
+            "server_name_too_long",
+            format!("Server name exceeds {MAX_SERVER_NAME_LEN} bytes"),
+            MAX_SERVER_NAME_LEN,
+        ));
     }
     let resolved_ip = resolve_server_host(&ip, port).await?;
     let label_name = if name.trim().is_empty() {
