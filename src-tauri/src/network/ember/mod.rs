@@ -12,6 +12,7 @@ pub mod reputation;
 pub mod transport;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use ed25519_dalek::SigningKey;
 use std::io::{Cursor, Read, Write};
 use std::net::Ipv4Addr;
 use std::sync::atomic::AtomicU64;
@@ -37,6 +38,14 @@ pub const SOURCE_FLAG_FIREWALLED: u8 = 0x01;
 pub const SOURCE_FLAG_OBFUSCATION: u8 = 0x02;
 /// Peer is willing to act as a relay for LowID-to-LowID transfers (v4+).
 pub const SOURCE_FLAG_RELAY_CAPABLE: u8 = 0x04;
+
+pub const RELAY_ATTESTATION_CAP_RELAY_V1: u32 = 0x01;
+pub const RELAY_ATTESTATION_MAX_TTL_SECS: u64 = 60 * 60;
+pub const MAX_RELAY_ATTESTATIONS: usize = 16;
+const RELAY_ATTESTATION_MAGIC: &[u8; 4] = b"ERAT";
+const RELAY_ATTESTATION_TRAILER_VERSION: u8 = 1;
+const RELAY_ATTESTATION_DOMAIN: &[u8] = b"ember-epx-relay-attestation-v1";
+const RELAY_ATTESTATION_FIXED_SIZE: usize = 32 + 4 + 2 + 8 + 4 + 2 + 64;
 
 // v2 wire sizes (backward compat parsing)
 const V2_FILE_ENTRY_HEADER_SIZE: usize = 16 + 8 + 2;
@@ -68,11 +77,22 @@ pub struct EmberPeer {
     pub tcp_port: u16,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayAttestation {
+    pub ed25519_pubkey: [u8; 32],
+    pub relay_ip: Ipv4Addr,
+    pub relay_port: u16,
+    pub expires_at_unix: u64,
+    pub capability_bits: u32,
+    pub signature: [u8; 64],
+}
+
 /// Result of parsing an EPX payload.
 #[derive(Debug, Clone)]
 pub struct ExchangeResult {
     pub files: Vec<EmberFileEntry>,
     pub peers: Vec<EmberPeer>,
+    pub relay_attestations: Vec<RelayAttestation>,
 }
 
 /// Pre-serialized exchange payload shared across download/upload tasks.
@@ -99,7 +119,16 @@ pub type EmberPayloadGeneration = Arc<AtomicU64>;
 ///       for each source: ipv4(4) + tcp_port(u16 LE) + udp_port(u16 LE) + flags(u8)
 ///   + ember_peer_count(u16 LE) +
 ///     for each peer: ipv4(4) + tcp_port(u16 LE)
+#[allow(dead_code)]
 pub fn build_exchange_payload(entries: &[EmberFileEntry], peers: &[EmberPeer]) -> Vec<u8> {
+    build_exchange_payload_with_relay_attestations(entries, peers, &[])
+}
+
+pub fn build_exchange_payload_with_relay_attestations(
+    entries: &[EmberFileEntry],
+    peers: &[EmberPeer],
+    relay_attestations: &[RelayAttestation],
+) -> Vec<u8> {
     let file_count = entries.len().min(MAX_EPX_FILES);
     let mut buf = Vec::with_capacity(3 + file_count * V3_FILE_ENTRY_HEADER_SIZE);
     buf.write_u8(EPX_VERSION).unwrap();
@@ -156,7 +185,121 @@ pub fn build_exchange_payload(entries: &[EmberFileEntry], peers: &[EmberPeer]) -
         buf.write_u16::<LittleEndian>(0).unwrap();
     }
 
+    append_relay_attestations(&mut buf, relay_attestations);
     buf
+}
+
+pub fn build_relay_attestation_payload(
+    ed25519_pubkey: &[u8; 32],
+    relay_ip: Ipv4Addr,
+    relay_port: u16,
+    expires_at_unix: u64,
+    capability_bits: u32,
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(RELAY_ATTESTATION_DOMAIN.len() + 32 + 4 + 2 + 8 + 4);
+    payload.extend_from_slice(RELAY_ATTESTATION_DOMAIN);
+    payload.extend_from_slice(ed25519_pubkey);
+    payload.extend_from_slice(&relay_ip.octets());
+    payload.extend_from_slice(&relay_port.to_le_bytes());
+    payload.extend_from_slice(&expires_at_unix.to_le_bytes());
+    payload.extend_from_slice(&capability_bits.to_le_bytes());
+    payload
+}
+
+pub fn sign_relay_attestation(
+    signing_key: &SigningKey,
+    ed25519_pubkey: [u8; 32],
+    relay_ip: Ipv4Addr,
+    relay_port: u16,
+    expires_at_unix: u64,
+    capability_bits: u32,
+) -> RelayAttestation {
+    let payload = build_relay_attestation_payload(
+        &ed25519_pubkey,
+        relay_ip,
+        relay_port,
+        expires_at_unix,
+        capability_bits,
+    );
+    let signature = crypto::sign(signing_key, &payload);
+    RelayAttestation {
+        ed25519_pubkey,
+        relay_ip,
+        relay_port,
+        expires_at_unix,
+        capability_bits,
+        signature,
+    }
+}
+
+pub fn relay_attestation_hash(attestation: &RelayAttestation) -> [u8; 32] {
+    let mut buf = Vec::with_capacity(RELAY_ATTESTATION_FIXED_SIZE);
+    encode_relay_attestation(&mut buf, attestation);
+    *blake3::hash(&buf).as_bytes()
+}
+
+pub fn verify_relay_attestation(attestation: &RelayAttestation, now_unix: u64) -> bool {
+    if attestation.relay_port == 0
+        || attestation.relay_ip.is_multicast()
+        || crate::security::is_special_use_v4(attestation.relay_ip)
+    {
+        return false;
+    }
+    if attestation.capability_bits & RELAY_ATTESTATION_CAP_RELAY_V1 == 0 {
+        return false;
+    }
+    if attestation.expires_at_unix <= now_unix {
+        return false;
+    }
+    if attestation.expires_at_unix.saturating_sub(now_unix) > RELAY_ATTESTATION_MAX_TTL_SECS {
+        return false;
+    }
+    let Some(vk) = crypto::verifying_key_from_bytes(&attestation.ed25519_pubkey) else {
+        return false;
+    };
+    let ember_hash = crypto::node_id_from_public_key(&vk);
+    if !crypto::verify_ember_hash_binding(&attestation.ed25519_pubkey, &ember_hash) {
+        return false;
+    }
+    let payload = build_relay_attestation_payload(
+        &attestation.ed25519_pubkey,
+        attestation.relay_ip,
+        attestation.relay_port,
+        attestation.expires_at_unix,
+        attestation.capability_bits,
+    );
+    crypto::verify(&vk, &payload, &attestation.signature)
+}
+
+fn append_relay_attestations(buf: &mut Vec<u8>, attestations: &[RelayAttestation]) {
+    let count = attestations.len().min(MAX_RELAY_ATTESTATIONS);
+    if count == 0 {
+        return;
+    }
+    let trailer_size = 4 + 1 + 2 + count * RELAY_ATTESTATION_FIXED_SIZE;
+    if buf.len() + trailer_size > MAX_EPX_PAYLOAD {
+        return;
+    }
+    buf.extend_from_slice(RELAY_ATTESTATION_MAGIC);
+    buf.write_u8(RELAY_ATTESTATION_TRAILER_VERSION).unwrap();
+    buf.write_u16::<LittleEndian>(count as u16).unwrap();
+    for attestation in attestations.iter().take(count) {
+        encode_relay_attestation(buf, attestation);
+    }
+}
+
+fn encode_relay_attestation(buf: &mut Vec<u8>, attestation: &RelayAttestation) {
+    buf.extend_from_slice(&attestation.ed25519_pubkey);
+    buf.extend_from_slice(&attestation.relay_ip.octets());
+    buf.write_u16::<LittleEndian>(attestation.relay_port)
+        .unwrap();
+    buf.write_u64::<LittleEndian>(attestation.expires_at_unix)
+        .unwrap();
+    buf.write_u32::<LittleEndian>(attestation.capability_bits)
+        .unwrap();
+    buf.write_u16::<LittleEndian>(attestation.signature.len() as u16)
+        .unwrap();
+    buf.extend_from_slice(&attestation.signature);
 }
 
 /// Parse a received exchange payload (v2 or v3).
@@ -334,16 +477,96 @@ pub fn parse_exchange_payload(data: &[u8]) -> anyhow::Result<ExchangeResult> {
             }
         }
     }
+    let relay_attestations = if version >= 4 && files_fully_parsed {
+        parse_relay_attestation_trailer(data, cursor.position() as usize)
+    } else {
+        Vec::new()
+    };
 
     Ok(ExchangeResult {
         files: entries,
         peers,
+        relay_attestations,
     })
+}
+
+fn parse_relay_attestation_trailer(data: &[u8], offset: usize) -> Vec<RelayAttestation> {
+    if offset >= data.len() {
+        return Vec::new();
+    }
+    let remaining = &data[offset..];
+    if remaining.len() < 7 || &remaining[..4] != RELAY_ATTESTATION_MAGIC {
+        return Vec::new();
+    }
+    let mut cursor = Cursor::new(remaining);
+    let mut magic = [0u8; 4];
+    if cursor.read_exact(&mut magic).is_err() {
+        return Vec::new();
+    }
+    let Ok(version) = cursor.read_u8() else {
+        return Vec::new();
+    };
+    if version != RELAY_ATTESTATION_TRAILER_VERSION {
+        return Vec::new();
+    }
+    let Ok(declared_count) = cursor.read_u16::<LittleEndian>() else {
+        return Vec::new();
+    };
+    let declared_count = declared_count as usize;
+    if declared_count > MAX_RELAY_ATTESTATIONS {
+        return Vec::new();
+    }
+
+    let mut attestations = Vec::with_capacity(declared_count);
+    for _ in 0..declared_count {
+        let pos = cursor.position() as usize;
+        if remaining.len().saturating_sub(pos) < RELAY_ATTESTATION_FIXED_SIZE {
+            return Vec::new();
+        }
+        let mut pubkey = [0u8; 32];
+        if cursor.read_exact(&mut pubkey).is_err() {
+            return Vec::new();
+        }
+        let mut ip_bytes = [0u8; 4];
+        if cursor.read_exact(&mut ip_bytes).is_err() {
+            return Vec::new();
+        }
+        let Ok(relay_port) = cursor.read_u16::<LittleEndian>() else {
+            return Vec::new();
+        };
+        let Ok(expires_at_unix) = cursor.read_u64::<LittleEndian>() else {
+            return Vec::new();
+        };
+        let Ok(capability_bits) = cursor.read_u32::<LittleEndian>() else {
+            return Vec::new();
+        };
+        let Ok(signature_len) = cursor.read_u16::<LittleEndian>() else {
+            return Vec::new();
+        };
+        if signature_len != 64 {
+            return Vec::new();
+        }
+        let mut signature = [0u8; 64];
+        if cursor.read_exact(&mut signature).is_err() {
+            return Vec::new();
+        }
+        attestations.push(RelayAttestation {
+            ed25519_pubkey: pubkey,
+            relay_ip: Ipv4Addr::from(ip_bytes),
+            relay_port,
+            expires_at_unix,
+            capability_bits,
+            signature,
+        });
+    }
+    attestations
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
 
     fn make_source(a: u8, b: u8, c: u8, d: u8, tcp: u16) -> EmberSource {
         EmberSource {
@@ -352,6 +575,95 @@ mod tests {
             udp_port: tcp + 10,
             flags: 0,
         }
+    }
+
+    fn make_attestation(expires_at_unix: u64) -> RelayAttestation {
+        let sk = SigningKey::generate(&mut OsRng);
+        sign_relay_attestation(
+            &sk,
+            sk.verifying_key().to_bytes(),
+            Ipv4Addr::new(8, 8, 8, 8),
+            4662,
+            expires_at_unix,
+            RELAY_ATTESTATION_CAP_RELAY_V1,
+        )
+    }
+
+    #[test]
+    fn relay_attestation_round_trip_and_verifies() {
+        let now: u64 = 1_700_000_000;
+        let att = make_attestation(now + 600);
+        let payload = build_exchange_payload_with_relay_attestations(&[], &[], &[att.clone()]);
+        let result = parse_exchange_payload(&payload).unwrap();
+        assert_eq!(result.relay_attestations, vec![att.clone()]);
+        assert!(verify_relay_attestation(&att, now));
+        assert_ne!(relay_attestation_hash(&att), [0u8; 32]);
+    }
+
+    #[test]
+    fn relay_attestation_rejects_bad_signature() {
+        let now: u64 = 1_700_000_000;
+        let mut att = make_attestation(now + 600);
+        att.signature[0] ^= 0x80;
+        assert!(!verify_relay_attestation(&att, now));
+    }
+
+    #[test]
+    fn relay_attestation_rejects_expired_or_too_long_ttl() {
+        let now: u64 = 1_700_000_000;
+        assert!(!verify_relay_attestation(
+            &make_attestation(now.saturating_sub(1)),
+            now
+        ));
+        assert!(!verify_relay_attestation(
+            &make_attestation(now + RELAY_ATTESTATION_MAX_TTL_SECS + 1),
+            now
+        ));
+    }
+
+    #[test]
+    fn relay_attestation_rejects_special_use_ip() {
+        let now: u64 = 1_700_000_000;
+        let sk = SigningKey::generate(&mut OsRng);
+        let att = sign_relay_attestation(
+            &sk,
+            sk.verifying_key().to_bytes(),
+            Ipv4Addr::new(127, 0, 0, 1),
+            4662,
+            now + 600,
+            RELAY_ATTESTATION_CAP_RELAY_V1,
+        );
+        assert!(!verify_relay_attestation(&att, now));
+    }
+
+    #[test]
+    fn oversized_attestation_count_is_ignored() {
+        let mut payload = build_exchange_payload(&[], &[]);
+        payload.extend_from_slice(RELAY_ATTESTATION_MAGIC);
+        payload.write_u8(RELAY_ATTESTATION_TRAILER_VERSION).unwrap();
+        payload
+            .write_u16::<LittleEndian>((MAX_RELAY_ATTESTATIONS + 1) as u16)
+            .unwrap();
+        let result = parse_exchange_payload(&payload).unwrap();
+        assert!(result.relay_attestations.is_empty());
+    }
+
+    #[test]
+    fn relay_flag_without_attestation_does_not_create_attestation() {
+        let entries = vec![EmberFileEntry {
+            file_hash: [9u8; 16],
+            file_size: 10,
+            aich_root: None,
+            sources: vec![EmberSource {
+                ip: Ipv4Addr::new(8, 8, 4, 4),
+                tcp_port: 4662,
+                udp_port: 4672,
+                flags: SOURCE_FLAG_RELAY_CAPABLE,
+            }],
+        }];
+        let result = parse_exchange_payload(&build_exchange_payload(&entries, &[])).unwrap();
+        assert_eq!(result.files[0].sources[0].flags, SOURCE_FLAG_RELAY_CAPABLE);
+        assert!(result.relay_attestations.is_empty());
     }
 
     #[test]

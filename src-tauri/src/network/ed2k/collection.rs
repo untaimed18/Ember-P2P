@@ -319,6 +319,14 @@ fn read_tag(cursor: &mut Cursor<&Vec<u8>>) -> anyhow::Result<(u8, TagValue)> {
         cursor.read_u8()?
     } else {
         let name_len = cursor.read_u16::<LittleEndian>()? as usize;
+        const MAX_TAG_NAME_LEN: usize = 256;
+        if name_len > MAX_TAG_NAME_LEN {
+            anyhow::bail!("collection tag name too long: {name_len}");
+        }
+        let pos = cursor.position() as usize;
+        if name_len > cursor.get_ref().len().saturating_sub(pos) {
+            anyhow::bail!("collection tag name exceeds remaining input");
+        }
         let mut name_buf = vec![0u8; name_len];
         cursor.read_exact(&mut name_buf)?;
         if name_len == 1 {

@@ -99,6 +99,14 @@ pub async fn take_pending_deep_links(
 /// instead lean on extension, regular-file, and size validation.
 #[tauri::command]
 pub async fn open_collection_file(path: String) -> Result<Collection, String> {
+    const MAX_PATH_LEN: usize = 4 * 1024;
+    if path.len() > MAX_PATH_LEN {
+        return Err(coded_ctx(
+            "collections_path_too_long",
+            format!("Path exceeds {MAX_PATH_LEN} bytes"),
+            MAX_PATH_LEN,
+        ));
+    }
     let p = std::path::PathBuf::from(&path);
 
     let ext = p

@@ -359,12 +359,22 @@ impl Parser {
             Some(Tok::Word(w)) => {
                 let raw = w.clone();
                 self.advance();
-                fold_and(tokenize_term(&raw).into_iter().map(QueryExpr::Term).collect())
+                fold_and(
+                    tokenize_term(&raw)
+                        .into_iter()
+                        .map(QueryExpr::Term)
+                        .collect(),
+                )
             }
             Some(Tok::Phrase(p)) => {
                 let raw = p.clone();
                 self.advance();
-                fold_and(tokenize_term(&raw).into_iter().map(QueryExpr::Term).collect())
+                fold_and(
+                    tokenize_term(&raw)
+                        .into_iter()
+                        .map(QueryExpr::Term)
+                        .collect(),
+                )
             }
             _ => None,
         }
@@ -404,7 +414,10 @@ mod tests {
     fn plain_query_wire_matches_flat_keyword_tree() {
         // The boolean path must not change the bytes for operator-free queries.
         let expr = parse("alpha bravo charlie").unwrap();
-        assert_eq!(expr.to_wire_bytes(), flat_wire(&["alpha", "bravo", "charlie"]));
+        assert_eq!(
+            expr.to_wire_bytes(),
+            flat_wire(&["alpha", "bravo", "charlie"])
+        );
     }
 
     #[test]
@@ -464,7 +477,10 @@ mod tests {
             expr,
             QueryExpr::And(
                 Box::new(term("movie")),
-                Box::new(QueryExpr::Or(Box::new(term("1080p")), Box::new(term("720p"))))
+                Box::new(QueryExpr::Or(
+                    Box::new(term("1080p")),
+                    Box::new(term("720p"))
+                ))
             )
         );
         assert!(expr.matches("movie 1080p x264"));

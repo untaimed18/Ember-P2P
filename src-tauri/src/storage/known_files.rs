@@ -154,6 +154,14 @@ impl KnownFileList {
         // silently dropped trailing part hashes for files larger than ~9.06 GiB
         // on reload, desyncing the in-memory hashset from what was saved.
         let part_count = cursor.read_u16::<LittleEndian>()? as usize;
+        let pos = cursor.position() as usize;
+        let remaining = cursor.get_ref().len().saturating_sub(pos);
+        let max_parts_from_remaining = remaining / 16;
+        if part_count > max_parts_from_remaining {
+            anyhow::bail!(
+                "known.met record claims {part_count} part hashes but only {max_parts_from_remaining} fit in remaining input"
+            );
+        }
         let mut part_hashes = Vec::with_capacity(part_count);
         for _ in 0..part_count {
             let mut ph = [0u8; 16];
@@ -693,6 +701,11 @@ impl KnownFileList {
 
     fn save_path_index(&self, path: &Path, known_mtime_ns: u64) -> anyhow::Result<()> {
         if self.path_index.is_empty() {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
             return Ok(());
         }
         let mut buf = Vec::with_capacity(17 + self.path_index.len() * 40);

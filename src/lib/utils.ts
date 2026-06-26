@@ -58,6 +58,10 @@ const LEDGER_DATE_FORMATTER = new Intl.DateTimeFormat(undefined, {
   month: 'short',
   day: 'numeric',
 });
+const RELATIVE_TIME_FORMATTER = new Intl.RelativeTimeFormat(undefined, {
+  numeric: 'auto',
+  style: 'short',
+});
 
 /** Format a unix timestamp as a short date string. */
 export function formatDate(ts: number): string {
@@ -78,8 +82,7 @@ export function formatDateWithYear(ts: number): string {
 }
 
 /**
- * Format a unix timestamp as a short relative duration vs `now`
- * ("just now", "5m ago", "3h ago", "2d ago", "4w ago", "1y ago").
+ * Format a unix timestamp as a localized short relative duration vs `now`.
  *
  * Intended for ledger views where what matters is "how stale is this
  * row" rather than the exact wall-clock date. Pair with a tooltip
@@ -91,30 +94,29 @@ export function formatRelativeTime(ts: number, nowSecs: number = Math.floor(Date
   if (!ts || ts <= 0) return '\u2014';
   const diff = nowSecs - ts;
   if (!Number.isFinite(diff)) return '\u2014';
-  if (diff < 0) return 'just now';
-  if (diff < 45) return 'just now';
+  if (diff < 45) return RELATIVE_TIME_FORMATTER.format(0, 'second');
   if (diff < 3600) {
     const m = Math.round(diff / 60);
-    return `${m}m ago`;
+    return RELATIVE_TIME_FORMATTER.format(-m, 'minute');
   }
   if (diff < 86400) {
     const h = Math.round(diff / 3600);
-    return `${h}h ago`;
+    return RELATIVE_TIME_FORMATTER.format(-h, 'hour');
   }
   if (diff < 7 * 86400) {
     const d = Math.round(diff / 86400);
-    return `${d}d ago`;
+    return RELATIVE_TIME_FORMATTER.format(-d, 'day');
   }
   if (diff < 30 * 86400) {
     const w = Math.round(diff / (7 * 86400));
-    return `${w}w ago`;
+    return RELATIVE_TIME_FORMATTER.format(-w, 'week');
   }
   if (diff < 365 * 86400) {
     const mo = Math.round(diff / (30 * 86400));
-    return `${mo}mo ago`;
+    return RELATIVE_TIME_FORMATTER.format(-mo, 'month');
   }
   const y = Math.round(diff / (365 * 86400));
-  return `${y}y ago`;
+  return RELATIVE_TIME_FORMATTER.format(-y, 'year');
 }
 
 /**

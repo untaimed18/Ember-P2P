@@ -22,6 +22,7 @@ const OP_EMULEINFO: u8 = 0x01;
 const OP_EMULEINFOANSWER: u8 = 0x02;
 
 const BUDDY_EVENT_CHANNEL_SIZE: usize = 32;
+const REASK_CALLBACK_BUDGET_PER_SESSION: u32 = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuddyState {
@@ -697,8 +698,10 @@ async fn run_buddy_reader(
 ) {
     let mut reader = reader;
     // K9: per-session OP_REASKCALLBACKTCP budget. A legit buddy using
-    // queue reasks for our downloads will need a handful of these; a
-    // malicious buddy trying to reflect UDP traffic runs out quickly.
+    // queue reasks for our downloads should need only a handful of these; a
+    // malicious buddy trying to reflect UDP traffic runs out quickly. Keep this
+    // lower than the authenticated OP_CALLBACK budget because this eMule wire
+    // opcode has no check token.
     //
     // OP_CALLBACK carries a cryptographic check token, so only our current
     // buddy should be able to send it successfully, but the destination IP is
@@ -706,7 +709,7 @@ async fn run_buddy_reader(
     // destination safety gate used for reask callbacks so a compromised buddy
     // cannot steer us at loopback/private/reserved hosts.
     let mut callback_budget: u32 = 64;
-    let mut reask_callback_budget: u32 = 64;
+    let mut reask_callback_budget: u32 = REASK_CALLBACK_BUDGET_PER_SESSION;
     loop {
         match read_ed2k_packet(&mut reader).await {
             Ok((proto, opcode, payload)) => {

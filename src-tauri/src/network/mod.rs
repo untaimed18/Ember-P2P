@@ -94,6 +94,48 @@ struct RendezvousRegisterResult {
     result: Result<(), String>,
 }
 
+struct NatProbeResult {
+    reason: &'static str,
+    info: ember::nat::NatInfo,
+}
+
+fn spawn_nat_probe(
+    udp_socket: Arc<UdpSocket>,
+    result_tx: mpsc::UnboundedSender<NatProbeResult>,
+    reason: &'static str,
+) -> mpsc::Sender<(Vec<u8>, SocketAddr)> {
+    let (packet_tx, packet_rx) = mpsc::channel(32);
+    tokio::spawn(async move {
+        let info = ember::nat::probe_nat_with_replies(udp_socket, packet_rx).await;
+        let _ = result_tx.send(NatProbeResult { reason, info });
+    });
+    packet_tx
+}
+
+fn route_nat_probe_packet(
+    packet_tx: &mut Option<mpsc::Sender<(Vec<u8>, SocketAddr)>>,
+    data: &[u8],
+    from: SocketAddr,
+) -> bool {
+    if !ember::nat::is_stun_binding_response(data) {
+        return false;
+    }
+    let Some(tx) = packet_tx.as_ref() else {
+        return true;
+    };
+    match tx.try_send((data.to_vec(), from)) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            debug!("Dropping STUN response from {from}: NAT probe channel full");
+            true
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            *packet_tx = None;
+            true
+        }
+    }
+}
+
 /// Try to connect to a server, attempting the DH-encrypted connection first (for HighID),
 /// then falling back to plain text (for LowID).
 ///
@@ -340,6 +382,7 @@ async fn handle_epx_sources(
     entries: &[([u8; 16], Vec<(Ipv4Addr, u16, u16, u8)>)],
     aich_roots: &[([u8; 16], [u8; 20])],
     ember_peers: &[(Ipv4Addr, u16)],
+    relay_attestations: &[ember::RelayAttestation],
     label: &str,
 ) -> usize {
     state.ember_diagnostics.epx_events_received = state
@@ -350,6 +393,24 @@ async fn handle_epx_sources(
     let mut total_injected = 0usize;
     let mut total_sources_this_event = 0usize;
     let mut per_hash_persisted: HashMap<String, u32> = HashMap::new();
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    for attestation in relay_attestations {
+        if !ember::verify_relay_attestation(attestation, now_unix) {
+            debug!(
+                "EPX {label}: rejected invalid relay attestation for {}:{}",
+                attestation.relay_ip, attestation.relay_port
+            );
+            continue;
+        }
+        if let Some(ref mut broker) = state.connection_broker {
+            let hash = ember::relay_attestation_hash(attestation);
+            broker.add_relay_candidate(attestation.relay_ip, attestation.relay_port, hash);
+        }
+    }
 
     for (file_hash, sources) in entries {
         let matching_ids = {
@@ -364,11 +425,10 @@ async fn handle_epx_sources(
             if total_sources_this_event >= ember::MAX_EPX_TOTAL_SOURCES {
                 break;
             }
-            // Collect relay-capable peers for LowID-to-LowID broker
             if flags & ember::SOURCE_FLAG_RELAY_CAPABLE != 0 {
-                if let Some(ref mut broker) = state.connection_broker {
-                    broker.add_relay_candidate(ip, port);
-                }
+                debug!(
+                    "Ignoring EPX relay-capable source hint from {ip}:{port}; relay candidates require a verified attestation trailer"
+                );
             }
             if flags & ember::SOURCE_FLAG_FIREWALLED != 0 && (state.firewalled || state.low_id) {
                 continue;
@@ -1153,30 +1213,43 @@ async fn process_inbound_friend_request(
     .await
     .unwrap_or((false, false));
     if already_mutual {
-        info!("Friend {} already mutual — ignoring redundant EmberFriendRequest", hash_hex);
+        info!(
+            "Friend {} already mutual — ignoring redundant EmberFriendRequest",
+            hash_hex
+        );
     } else if is_friend && !require_approval {
         // Auto-confirm: the user already added this peer and disabled "require
         // approval", so a reciprocal request upgrades the friendship to mutual
         // without prompting. Strangers (not already in our list) still fall
         // through to the approval queue — we never auto-add an unknown peer.
-        info!("Auto-confirming friend {} (already added; approval not required)", hash_hex);
+        info!(
+            "Auto-confirming friend {} (already added; approval not required)",
+            hash_hex
+        );
         let db2 = db.clone();
         let h2 = hash_hex.clone();
         let ip2 = peer_ip.to_string();
-        let promoted = tokio::task::spawn_blocking(move || db2.set_friend_mutual(&h2, &ip2, peer_port))
-            .await
-            .unwrap_or(Ok(0))
-            .unwrap_or(0);
+        let promoted =
+            tokio::task::spawn_blocking(move || db2.set_friend_mutual(&h2, &ip2, peer_port))
+                .await
+                .unwrap_or(Ok(0))
+                .unwrap_or(0);
         if promoted > 0 {
             if !online_friends.contains_key(&req_hash) {
                 online_friends.insert(req_hash, chrono::Utc::now().timestamp());
-                let _ = app_handle.emit("ember:friend-online", serde_json::json!({
-                    "user_hash": hash_hex,
-                }));
+                let _ = app_handle.emit(
+                    "ember:friend-online",
+                    serde_json::json!({
+                        "user_hash": hash_hex,
+                    }),
+                );
             }
-            let _ = app_handle.emit("ember:friend-confirmed", serde_json::json!({
-                "user_hash": hash_hex,
-            }));
+            let _ = app_handle.emit(
+                "ember:friend-confirmed",
+                serde_json::json!({
+                    "user_hash": hash_hex,
+                }),
+            );
         }
     } else {
         info!("Queuing friend request from {} for user approval", hash_hex);
@@ -1184,12 +1257,17 @@ async fn process_inbound_friend_request(
         let h2 = hash_hex.clone();
         let n2 = nickname.to_string();
         let ip2 = peer_ip.to_string();
-        let _ = tokio::task::spawn_blocking(move || db2.add_friend_request(&h2, &n2, &ip2, peer_port, verified));
-        let _ = app_handle.emit("ember:friend-request", serde_json::json!({
-            "sender_hash": hash_hex,
-            "nickname": nickname,
-            "verified": verified,
-        }));
+        let _ = tokio::task::spawn_blocking(move || {
+            db2.add_friend_request(&h2, &n2, &ip2, peer_port, verified)
+        });
+        let _ = app_handle.emit(
+            "ember:friend-request",
+            serde_json::json!({
+                "sender_hash": hash_hex,
+                "nickname": nickname,
+                "verified": verified,
+            }),
+        );
     }
 }
 
@@ -4170,6 +4248,7 @@ pub async fn start_network(
             anyhow::bail!("{msg}");
         }
     };
+    let udp_socket = Arc::new(udp_socket);
     let udp_port = bound_udp_port;
     if udp_port != settings.udp_port {
         warn!(
@@ -5275,12 +5354,17 @@ pub async fn start_network(
         mpsc::unbounded_channel::<UpnpMaintainResult>();
     let (rendezvous_register_result_tx, mut rendezvous_register_result_rx) =
         mpsc::unbounded_channel::<RendezvousRegisterResult>();
+    let (nat_probe_result_tx, mut nat_probe_result_rx) =
+        mpsc::unbounded_channel::<NatProbeResult>();
+    let mut nat_probe_packet_tx: Option<mpsc::Sender<(Vec<u8>, SocketAddr)>> = None;
     let mut known_met_save_in_flight = false;
     let mut stats_save_in_flight = false;
     let mut reputation_save_in_flight = false;
     let mut known2_save_in_flight = false;
     let mut upnp_maintain_in_flight = false;
     let mut rendezvous_register_in_flight = false;
+    let mut nat_probe_in_flight = false;
+    let mut nat_probe_backoff_until: Option<tokio::time::Instant> = None;
     let mut last_server_activity_at = chrono::Utc::now().timestamp();
     let mut last_kad_activity_at = chrono::Utc::now().timestamp();
     let mut last_cache_refresh_started_at = 0i64;
@@ -5708,13 +5792,37 @@ pub async fn start_network(
             break;
         }
 
+        if state.external_ip.is_some()
+            && state.nat_info.nat_type == ember::nat::NatType::Unknown
+            && !nat_probe_in_flight
+            && nat_probe_backoff_until.map_or(true, |deadline| {
+                tokio::time::Instant::now() >= deadline
+            })
+        {
+            nat_probe_in_flight = true;
+            nat_probe_packet_tx = Some(spawn_nat_probe(
+                udp_socket.clone(),
+                nat_probe_result_tx.clone(),
+                "external IP available",
+            ));
+        }
+
         tokio::select! {
             // Incoming UDP packets: batch up to 20 per iteration so we re-check
             // commands and timers between batches
             result = udp_socket.recv_from(&mut udp_buf) => {
                 match result {
                     Ok((len, from)) => {
-                        if settings.ember_native_enabled
+                        if route_nat_probe_packet(
+                            &mut nat_probe_packet_tx,
+                            &udp_buf[..len],
+                            from,
+                        ) {
+                            // STUN replies are consumed by the background NAT
+                            // probe; keep the main loop as the only UDP
+                            // receiver so normal KAD/Ember packets cannot be
+                            // stolen by a concurrent recv task.
+                        } else if settings.ember_native_enabled
                             && ember::transport::EmberTransport::is_ember_packet(&udp_buf[..len])
                         {
                             // Ember packets are allowed while KAD is
@@ -5768,7 +5876,13 @@ pub async fn start_network(
                 for _ in 0..19 {
                     match udp_socket.try_recv_from(&mut udp_buf) {
                         Ok((len, from)) => {
-                            if settings.ember_native_enabled
+                            if route_nat_probe_packet(
+                                &mut nat_probe_packet_tx,
+                                &udp_buf[..len],
+                                from,
+                            ) {
+                                // Routed to the active NAT probe.
+                            } else if settings.ember_native_enabled
                                 && ember::transport::EmberTransport::is_ember_packet(&udp_buf[..len])
                             {
                                 // Same fast-path as the first packet in the
@@ -6180,8 +6294,8 @@ pub async fn start_network(
                                                     f.write_all(entry.as_bytes())
                                                 });
                                             tracing::info!("Computed AICH root for completed download: {aich_hex}");
-                                            if let Err(e) = aich_tx.blocking_send(hs) {
-                                                tracing::warn!("AICH channel closed, hash set not stored: {e}");
+                                            if let Err(e) = aich_tx.try_send(hs) {
+                                                tracing::warn!("AICH hash-set queue full/closed, hash set not stored: {e}");
                                             }
                                         }
                                         Err(e) => {
@@ -6408,8 +6522,8 @@ pub async fn start_network(
                     }
                 }
                 // Inject Ember Peer Exchange sources into matching active downloads
-                if let DownloadEvent::EmberSources { ref transfer_id, ref entries, ref aich_roots, ref ember_peers } = event {
-                    handle_epx_sources(&mut state, &transfer_manager, &source_manager, entries, aich_roots, ember_peers, &format!("download {transfer_id}")).await;
+                if let DownloadEvent::EmberSources { ref transfer_id, ref entries, ref aich_roots, ref ember_peers, ref relay_attestations } = event {
+                    handle_epx_sources(&mut state, &transfer_manager, &source_manager, entries, aich_roots, ember_peers, relay_attestations, &format!("download {transfer_id}")).await;
                 }
 
                 if let DownloadEvent::EmberPeerDiscovered { ip, tcp_port } = event {
@@ -7017,8 +7131,8 @@ pub async fn start_network(
                 }
 
                 // Inject Ember Peer Exchange sources from upload-side peers
-                if let UploadEventKind::EmberSources { ref entries, ref aich_roots, ref ember_peers } = event.kind {
-                    handle_epx_sources(&mut state, &transfer_manager, &source_manager, entries, aich_roots, ember_peers, "upload").await;
+                if let UploadEventKind::EmberSources { ref entries, ref aich_roots, ref ember_peers, ref relay_attestations } = event.kind {
+                    handle_epx_sources(&mut state, &transfer_manager, &source_manager, entries, aich_roots, ember_peers, relay_attestations, "upload").await;
                 }
 
                 if let UploadEventKind::EmberPeerDiscovered { ip, tcp_port } = event.kind {
@@ -8989,6 +9103,26 @@ pub async fn start_network(
                         }
                     }
 
+                    let store_publish_pending = state
+                        .search_manager
+                        .get(&sid)
+                        .map(|search| {
+                            matches!(
+                                search.search_type,
+                                kad::search::SearchType::StoreFile
+                                    | kad::search::SearchType::StoreKeyword
+                                    | kad::search::SearchType::StoreNotes
+                            ) && state.publish_pending.iter().any(
+                                |((target, _), (file_hash, _, _, _))| {
+                                    *target == search.target || *file_hash == search.target
+                                },
+                            )
+                        })
+                        .unwrap_or(false);
+                    if store_publish_pending {
+                        continue;
+                    }
+
                     if let Some(removed) = state.search_manager.remove(&sid) {
                         state.routing_table.release_contacts_in_use(&removed.in_use_ids);
                     }
@@ -9189,37 +9323,14 @@ pub async fn start_network(
                         tcp_status, udp_status, state.tcp_port, state.udp_port);
                     // Initial NAT probe as soon as we learn our external IP
                     if !had_ip && state.external_ip.is_some() && state.nat_info.nat_type == ember::nat::NatType::Unknown {
-                        info!("External IP discovered via firewall check — running initial NAT probe");
-                        state.nat_info = match tokio::time::timeout(
-                            ember::nat::PROBE_NAT_OVERALL_TIMEOUT,
-                            ember::nat::probe_nat(&udp_socket),
-                        ).await {
-                            Ok(info) => info,
-                            Err(_) => {
-                                tracing::warn!(
-                                    "NAT probe timed out after {:?} on the main network task; keeping existing NatInfo",
-                                    ember::nat::PROBE_NAT_OVERALL_TIMEOUT,
-                                );
-                                state.nat_info.clone()
-                            }
-                        };
-                        // Same HighID fallback as the KAD-discovery and
-                        // server-HighID paths: STUN can fail wholesale
-                        // even when we know our external IP. Without
-                        // this, `nat_info.nat_type` stays `Unknown`,
-                        // `is_punchable()` returns false, and every
-                        // LowID-to-LowID attempt is forced into the
-                        // relay path instead of trying hole-punch first.
-                        if let Some(ext_ip) = state.external_ip {
-                            if state.nat_info.apply_highid_fallback(
-                                std::net::IpAddr::V4(ext_ip),
-                                state.udp_port,
-                            ) {
-                                info!(
-                                    "NAT probe failed but firewall check confirmed external IP {} — assuming PortRestricted (mapped {}:{})",
-                                    ext_ip, ext_ip, state.udp_port,
-                                );
-                            }
+                        if !nat_probe_in_flight {
+                            info!("External IP discovered via firewall check — scheduling initial NAT probe");
+                            nat_probe_in_flight = true;
+                            nat_probe_packet_tx = Some(spawn_nat_probe(
+                                udp_socket.clone(),
+                                nat_probe_result_tx.clone(),
+                                "firewall check",
+                            ));
                         }
                     }
                     let status_changed = was_udp_fw != state.udp_firewalled
@@ -10088,28 +10199,13 @@ pub async fn start_network(
 
                 // Periodic NAT reprobe (every 5 minutes)
                 if state.nat_info.needs_reprobe() && state.external_ip.is_some() {
-                    let nat_info = match tokio::time::timeout(
-                        ember::nat::PROBE_NAT_OVERALL_TIMEOUT,
-                        ember::nat::probe_nat(&udp_socket),
-                    ).await {
-                        Ok(info) => info,
-                        Err(_) => {
-                            tracing::warn!(
-                                "Periodic NAT reprobe timed out after {:?}; keeping existing NatInfo",
-                                ember::nat::PROBE_NAT_OVERALL_TIMEOUT,
-                            );
-                            state.nat_info.clone()
-                        }
-                    };
-                    state.nat_info = nat_info;
-                    // Same HighID fallback as the initial probe: if STUN
-                    // is still down but we know our external IP, don't
-                    // regress to `Unknown` / no-punch.
-                    if let Some(ext_ip) = state.external_ip {
-                        let _ = state.nat_info.apply_highid_fallback(
-                            std::net::IpAddr::V4(ext_ip),
-                            state.udp_port,
-                        );
+                    if !nat_probe_in_flight {
+                        nat_probe_in_flight = true;
+                        nat_probe_packet_tx = Some(spawn_nat_probe(
+                            udp_socket.clone(),
+                            nat_probe_result_tx.clone(),
+                            "periodic reprobe",
+                        ));
                     }
                 }
 
@@ -10268,10 +10364,12 @@ pub async fn start_network(
                                         &rv_url, &our_id, &target_id, port, nat_type_val,
                                     ).await {
                                         tracing::warn!("Broker: punch register failed for {attempt_key_owned}: {e}");
-                                        let _ = broker_tx.send(ember::broker::BrokerEvent::PunchFailed {
+                                        if let Err(send_err) = broker_tx.try_send(ember::broker::BrokerEvent::PunchFailed {
                                             attempt_key: attempt_key_owned,
                                             reason: format!("register failed: {e}"),
-                                        }).await;
+                                        }) {
+                                            tracing::debug!("Broker: dropping punch failure event (queue full/closed): {send_err}");
+                                        }
                                         return;
                                     }
 
@@ -10294,19 +10392,23 @@ pub async fn start_network(
 
                                     let Some(addr) = remote_addr else {
                                         tracing::info!("Broker: punch timed out waiting for peer {attempt_key_owned}");
-                                        let _ = broker_tx.send(ember::broker::BrokerEvent::PunchFailed {
+                                        if let Err(send_err) = broker_tx.try_send(ember::broker::BrokerEvent::PunchFailed {
                                             attempt_key: attempt_key_owned,
                                             reason: "peer not found via rendezvous".into(),
-                                        }).await;
+                                        }) {
+                                            tracing::debug!("Broker: dropping punch failure event (queue full/closed): {send_err}");
+                                        }
                                         return;
                                     };
 
                                     let Some(endpoint) = quic_ep else {
                                         tracing::warn!("Broker: no QUIC endpoint for punch {attempt_key_owned}");
-                                        let _ = broker_tx.send(ember::broker::BrokerEvent::PunchFailed {
+                                        if let Err(send_err) = broker_tx.try_send(ember::broker::BrokerEvent::PunchFailed {
                                             attempt_key: attempt_key_owned,
                                             reason: "no QUIC endpoint".into(),
-                                        }).await;
+                                        }) {
+                                            tracing::debug!("Broker: dropping punch failure event (queue full/closed): {send_err}");
+                                        }
                                         return;
                                     };
 
@@ -10329,15 +10431,17 @@ pub async fn start_network(
                                         }
                                         Err(e) => {
                                             tracing::warn!("Broker: QUIC punch failed for {attempt_key_owned}: {e}");
-                                            let _ = broker_tx.send(ember::broker::BrokerEvent::PunchFailed {
+                                            if let Err(send_err) = broker_tx.try_send(ember::broker::BrokerEvent::PunchFailed {
                                                 attempt_key: attempt_key_owned,
                                                 reason: e,
-                                            }).await;
+                                            }) {
+                                                tracing::debug!("Broker: dropping punch failure event (queue full/closed): {send_err}");
+                                            }
                                         }
                                     }
                                 });
                             }
-                            ember::broker::BrokerEvent::StartRelay { ref attempt_key, source_ip, source_port, file_hash, relay_addr, .. } => {
+                            ember::broker::BrokerEvent::StartRelay { ref attempt_key, source_ip, source_port, file_hash, relay_addr, relay_attestation_hash, .. } => {
                                 tracing::info!("Broker: initiating relay for {} -> {}:{} (relay={:?})", attempt_key, source_ip, source_port, relay_addr);
 
                                 let attempt_key_owned = attempt_key.clone();
@@ -10364,10 +10468,12 @@ pub async fn start_network(
                                         let Some(broker_tx) = broker_tx else { return; };
                                         let Some(endpoint) = quic_ep else {
                                             tracing::warn!("Broker: no QUIC endpoint for relay {attempt_key_owned}");
-                                            let _ = broker_tx.send(ember::broker::BrokerEvent::RelayFailed {
+                                            if let Err(send_err) = broker_tx.try_send(ember::broker::BrokerEvent::RelayFailed {
                                                 attempt_key: attempt_key_owned,
                                                 reason: "no QUIC endpoint".into(),
-                                            }).await;
+                                            }) {
+                                                tracing::debug!("Broker: dropping relay failure event (queue full/closed): {send_err}");
+                                            }
                                             return;
                                         };
 
@@ -10376,7 +10482,7 @@ pub async fn start_network(
                                         );
 
                                         match ember::relay::connect_to_peer_relay(
-                                            &endpoint, relay_addr, source_ip, source_port, &file_hash,
+                                            &endpoint, relay_addr, source_ip, source_port, &file_hash, relay_attestation_hash,
                                         ).await {
                                             Ok((send, recv)) => {
                                                 tracing::info!("Broker: peer relay connected via {relay_addr}");
@@ -10395,10 +10501,12 @@ pub async fn start_network(
                                             }
                                             Err(e) => {
                                                 tracing::warn!("Broker: peer relay failed: {e}");
-                                                let _ = broker_tx.send(ember::broker::BrokerEvent::RelayFailed {
+                                                if let Err(send_err) = broker_tx.try_send(ember::broker::BrokerEvent::RelayFailed {
                                                     attempt_key: attempt_key_owned,
                                                     reason: e,
-                                                }).await;
+                                                }) {
+                                                    tracing::debug!("Broker: dropping relay failure event (queue full/closed): {send_err}");
+                                                }
                                             }
                                         }
                                     });
@@ -10488,10 +10596,12 @@ pub async fn start_network(
                                             }
                                             Ok(Err(e)) => {
                                                 tracing::warn!("Broker: server relay failed: {e}");
-                                                let _ = broker_tx.send(ember::broker::BrokerEvent::RelayFailed {
+                                                if let Err(send_err) = broker_tx.try_send(ember::broker::BrokerEvent::RelayFailed {
                                                     attempt_key: attempt_key_owned,
                                                     reason: e,
-                                                }).await;
+                                                }) {
+                                                    tracing::debug!("Broker: dropping relay failure event (queue full/closed): {send_err}");
+                                                }
                                             }
                                             Err(panic) => {
                                                 let msg = if let Some(s) = panic.downcast_ref::<&'static str>() {
@@ -10502,10 +10612,12 @@ pub async fn start_network(
                                                     "non-string panic payload".to_string()
                                                 };
                                                 tracing::error!("Broker: server relay panicked: {msg}");
-                                                let _ = broker_tx.send(ember::broker::BrokerEvent::RelayFailed {
+                                                if let Err(send_err) = broker_tx.try_send(ember::broker::BrokerEvent::RelayFailed {
                                                     attempt_key: attempt_key_owned,
                                                     reason: format!("panic: {msg}"),
-                                                }).await;
+                                                }) {
+                                                    tracing::debug!("Broker: dropping relay failure event (queue full/closed): {send_err}");
+                                                }
                                             }
                                         }
                                     });
@@ -10513,10 +10625,12 @@ pub async fn start_network(
                                     tracing::warn!("Broker: no peer relay candidate and no rendezvous URL for {attempt_key_owned}");
                                     tokio::spawn(async move {
                                         let Some(broker_tx) = broker_tx else { return; };
-                                        let _ = broker_tx.send(ember::broker::BrokerEvent::RelayFailed {
+                                        if let Err(send_err) = broker_tx.try_send(ember::broker::BrokerEvent::RelayFailed {
                                             attempt_key: attempt_key_owned,
                                             reason: "no relay candidate and no rendezvous URL".into(),
-                                        }).await;
+                                        }) {
+                                            tracing::debug!("Broker: dropping relay failure event (queue full/closed): {send_err}");
+                                        }
                                     });
                                 }
                             }
@@ -13738,35 +13852,14 @@ pub async fn start_network(
                                 // for distinct-/24 sybil protection).
                                 state.firewall_checker.handle_server_highid_response(ext_ip);
                                 if was_none && state.nat_info.nat_type == ember::nat::NatType::Unknown {
-                                    info!("External IP discovered via server HighID — running initial NAT probe");
-                                    state.nat_info = match tokio::time::timeout(
-                                        ember::nat::PROBE_NAT_OVERALL_TIMEOUT,
-                                        ember::nat::probe_nat(&udp_socket),
-                                    ).await {
-                                        Ok(info) => info,
-                                        Err(_) => {
-                                            tracing::warn!(
-                                                "NAT probe (post-HighID) timed out after {:?}; keeping existing NatInfo",
-                                                ember::nat::PROBE_NAT_OVERALL_TIMEOUT,
-                                            );
-                                            state.nat_info.clone()
-                                        }
-                                    };
-                                    // STUN can fail (firewall, DNS, blocked egress)
-                                    // even when the host is perfectly punchable.
-                                    // HighID + a successful TCP connect-back is
-                                    // strong evidence we sit behind a cone NAT (or
-                                    // none), so promote `Unknown` to
-                                    // `PortRestricted` rather than disabling
-                                    // hole-punch outright.
-                                    if state.nat_info.apply_highid_fallback(
-                                        std::net::IpAddr::V4(ext_ip),
-                                        state.udp_port,
-                                    ) {
-                                        info!(
-                                            "NAT probe failed but HighID confirmed external IP {} — assuming PortRestricted (mapped {}:{})",
-                                            ext_ip, ext_ip, state.udp_port,
-                                        );
+                                    if !nat_probe_in_flight {
+                                        info!("External IP discovered via server HighID — scheduling initial NAT probe");
+                                        nat_probe_in_flight = true;
+                                        nat_probe_packet_tx = Some(spawn_nat_probe(
+                                            udp_socket.clone(),
+                                            nat_probe_result_tx.clone(),
+                                            "server HighID",
+                                        ));
                                     }
                                 }
                             }
@@ -14787,6 +14880,30 @@ pub async fn start_network(
                 }
             }
 
+            Some(result) = nat_probe_result_rx.recv() => {
+                nat_probe_in_flight = false;
+                nat_probe_packet_tx = None;
+                state.nat_info = result.info;
+                if state.nat_info.nat_type == ember::nat::NatType::Unknown {
+                    nat_probe_backoff_until = Some(
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(300),
+                    );
+                } else {
+                    nat_probe_backoff_until = None;
+                }
+                if let Some(ext_ip) = state.external_ip {
+                    if state.nat_info.apply_highid_fallback(
+                        std::net::IpAddr::V4(ext_ip),
+                        state.udp_port,
+                    ) {
+                        info!(
+                            "NAT probe ({}) failed but external IP {} is confirmed — assuming PortRestricted (mapped {}:{})",
+                            result.reason, ext_ip, ext_ip, state.udp_port,
+                        );
+                    }
+                }
+            }
+
             Some(result) = rendezvous_register_result_rx.recv() => {
                 rendezvous_register_in_flight = false;
                 match result.result {
@@ -15089,6 +15206,40 @@ pub async fn start_network(
                     }
                 }
 
+                let local_relay_attestation = if let (Some(relay_ip), Some(relay_port), Some(_)) = (
+                    state.external_ip,
+                    state.quic_port,
+                    state
+                        .connection_broker
+                        .as_ref()
+                        .and_then(|b| b.quic_endpoint()),
+                ) {
+                    if relay_port != 0
+                        && !relay_ip.is_multicast()
+                        && !crate::security::is_special_use_v4(relay_ip)
+                    {
+                        let now_unix = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let signing_key =
+                            ember::crypto::signing_key_from_bytes(&ed25519_secret_key);
+                        Some(ember::sign_relay_attestation(
+                            &signing_key,
+                            ed25519_pubkey,
+                            relay_ip,
+                            relay_port,
+                            now_unix + ember::RELAY_ATTESTATION_MAX_TTL_SECS,
+                            ember::RELAY_ATTESTATION_CAP_RELAY_V1,
+                        ))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let local_relay_ip = local_relay_attestation.as_ref().map(|a| a.relay_ip);
+
                 let entries = {
                     let mgr = transfer_manager.read().await;
                     let sm = source_manager.read().await;
@@ -15133,7 +15284,8 @@ pub async fn start_network(
                                             | ed2k::sources::DownloadSourceState::LowToLowIp
                                         ) {
                                             flags |= ember::SOURCE_FLAG_FIREWALLED;
-                                        } else if !s.ip.is_private() {
+                                        }
+                                        if local_relay_ip == Some(s.ip) {
                                             flags |= ember::SOURCE_FLAG_RELAY_CAPABLE;
                                         }
                                         if sm.get_connect_options(&hash_bytes, s.ip, s.tcp_port).map_or(false, |co| co & 0x07 != 0) {
@@ -15197,7 +15349,8 @@ pub async fn start_network(
                                             | ed2k::sources::DownloadSourceState::LowToLowIp
                                         ) {
                                             flags |= ember::SOURCE_FLAG_FIREWALLED;
-                                        } else if !s.ip.is_private() {
+                                        }
+                                        if local_relay_ip == Some(s.ip) {
                                             flags |= ember::SOURCE_FLAG_RELAY_CAPABLE;
                                         }
                                         if sm.get_connect_options(&hash_bytes, s.ip, s.tcp_port).map_or(false, |co| co & 0x07 != 0) {
@@ -15271,7 +15424,24 @@ pub async fn start_network(
                         .collect()
                 };
 
-                let payload = ember::build_exchange_payload(&entries, &ember_peers);
+                let relay_attestations = local_relay_attestation
+                    .as_ref()
+                    .map(|a| vec![a.clone()])
+                    .unwrap_or_default();
+                if let Some(attestation) = local_relay_attestation.as_ref() {
+                    let hash = ember::relay_attestation_hash(attestation);
+                    state
+                        .relay_manager
+                        .lock()
+                        .await
+                        .set_current_attestation_hash(hash, attestation.expires_at_unix);
+                }
+
+                let payload = ember::build_exchange_payload_with_relay_attestations(
+                    &entries,
+                    &ember_peers,
+                    &relay_attestations,
+                );
                 *shared_ember_payload.write().await = Arc::new(payload);
                 ember_payload_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 state.ember_payload_dirty = false;
@@ -18848,41 +19018,9 @@ async fn handle_udp_packet_inner(
                 && state.external_ip.is_some()
                 && state.nat_info.nat_type == ember::nat::NatType::Unknown
             {
-                info!("External IP discovered via KAD — running initial NAT probe");
-                state.nat_info = match tokio::time::timeout(
-                    ember::nat::PROBE_NAT_OVERALL_TIMEOUT,
-                    ember::nat::probe_nat(socket),
-                )
-                .await
-                {
-                    Ok(info) => info,
-                    Err(_) => {
-                        tracing::warn!(
-                            "NAT probe (post-KAD-confirm) timed out after {:?}; keeping existing NatInfo",
-                            ember::nat::PROBE_NAT_OVERALL_TIMEOUT,
-                        );
-                        state.nat_info.clone()
-                    }
-                };
-                // STUN can fail wholesale (firewall, DNS, blocked egress).
-                // We still know our external IP from KAD votes, so fall
-                // back to `PortRestricted` rather than leaving `Unknown`,
-                // which would force every subsequent LowID-to-LowID
-                // attempt straight into the relay path (see
-                // `attempt_low_to_low()` — `is_punchable()` is false for
-                // `Unknown`). Mirrors the same fallback already in the
-                // server-HighID branch above.
-                if let Some(ext_ip) = state.external_ip {
-                    if state
-                        .nat_info
-                        .apply_highid_fallback(std::net::IpAddr::V4(ext_ip), state.udp_port)
-                    {
-                        info!(
-                            "NAT probe failed but KAD confirmed external IP {} — assuming PortRestricted (mapped {}:{})",
-                            ext_ip, ext_ip, state.udp_port,
-                        );
-                    }
-                }
+                info!(
+                    "External IP discovered via KAD; NAT probe will be scheduled by the main UDP loop"
+                );
             }
 
             if state.external_ip.is_some() {
@@ -20985,7 +21123,9 @@ async fn handle_command_inner(
                     .await
                     {
                         Ok(Ok(())) => {}
-                        Ok(Err(e)) => warn!("Failed to unregister from rendezvous server on disconnect: {e}"),
+                        Ok(Err(e)) => {
+                            warn!("Failed to unregister from rendezvous server on disconnect: {e}")
+                        }
                         Err(_) => warn!("Rendezvous unregister timed out on disconnect; skipping"),
                     }
                 });
@@ -21021,12 +21161,11 @@ async fn handle_command_inner(
                     .map(|(tid, tracker)| (tid.clone(), tracker.clone()))
                     .collect(),
             };
-            let tracker_saves =
-                futures::future::join_all(disconnect_trackers.into_iter().map(|(tid, tracker)| {
-                    async move {
-                        save_part_tracker_snapshot(tracker, &tid, "disconnect").await;
-                    }
-                }));
+            let tracker_saves = futures::future::join_all(disconnect_trackers.into_iter().map(
+                |(tid, tracker)| async move {
+                    save_part_tracker_snapshot(tracker, &tid, "disconnect").await;
+                },
+            ));
             if tokio::time::timeout(std::time::Duration::from_secs(8), tracker_saves)
                 .await
                 .is_err()
@@ -22823,11 +22962,20 @@ async fn handle_download_event(
                 Some(last) => last.elapsed() >= db_progress_persist_interval,
             };
             if should_persist_db {
-                if let Err(e) =
-                    db.update_transfer_progress(&transfer_id, capped_downloaded, progress, speed)
-                {
-                    warn!("DB update_transfer_progress failed for {transfer_id}: {e}");
-                }
+                let db_for_progress = db.clone();
+                let transfer_id_for_progress = transfer_id.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) = db_for_progress.update_transfer_progress(
+                        &transfer_id_for_progress,
+                        capped_downloaded,
+                        progress,
+                        speed,
+                    ) {
+                        warn!(
+                            "DB update_transfer_progress failed for {transfer_id_for_progress}: {e}"
+                        );
+                    }
+                });
                 db_progress_last_persist.insert(transfer_id.clone(), std::time::Instant::now());
             }
             let _ = app_handle.emit(

@@ -28,21 +28,32 @@ pub async fn load_collection(
             "File must be a .emulecollection or .txt file",
         ));
     }
-    if !p.exists() {
-        return Err(coded("collections_file_not_found", "File does not exist"));
-    }
-
     let p2 = p.clone();
-    let canonical = tokio::task::spawn_blocking(move || std::fs::canonicalize(&p2))
-        .await
-        .map_err(|e| {
-            coded_ctx(
-                "collections_canonicalize_task_failed",
-                "Canonicalize task failed",
-                e,
-            )
-        })?
-        .map_err(|e| coded_ctx("collections_cannot_resolve_path", "Cannot resolve path", e))?;
+    let canonical = tokio::task::spawn_blocking(move || {
+        if !p2.exists() {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "file does not exist",
+            ))
+        } else {
+            std::fs::canonicalize(&p2)
+        }
+    })
+    .await
+    .map_err(|e| {
+        coded_ctx(
+            "collections_canonicalize_task_failed",
+            "Canonicalize task failed",
+            e,
+        )
+    })?
+    .map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            coded("collections_file_not_found", "File does not exist")
+        } else {
+            coded_ctx("collections_cannot_resolve_path", "Cannot resolve path", e)
+        }
+    })?;
     let config = state.config.read().await;
     let download_root = std::path::PathBuf::from(&config.settings.download_folder);
     let mut allowed_dirs: Vec<String> = config.settings.shared_folders.clone();

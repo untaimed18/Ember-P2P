@@ -6,6 +6,9 @@ use tracing::info;
 use crate::storage::paths;
 use crate::types::*;
 
+const MAX_PEERS_ROWS: i64 = 10_000;
+const MAX_DOWNLOAD_HISTORY_ROWS: i64 = 5_000;
+
 pub struct Database {
     conn: Mutex<Connection>,
 }
@@ -509,17 +512,28 @@ impl Database {
                 peer.banned as i32,
             ],
         )?;
+        conn.execute(
+            "DELETE FROM peers WHERE id IN (
+                SELECT id FROM peers
+                ORDER BY last_seen DESC
+                LIMIT -1 OFFSET ?1
+            )",
+            params![MAX_PEERS_ROWS],
+        )?;
         Ok(())
     }
 
     pub fn get_peers(&self) -> anyhow::Result<Vec<PeerInfo>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, addresses, nickname, last_seen, files_shared, banned FROM peers",
+            "SELECT id, addresses, nickname, last_seen, files_shared, banned
+             FROM peers
+             ORDER BY last_seen DESC
+             LIMIT ?1",
         )?;
 
         let peers = stmt
-            .query_map([], |row| {
+            .query_map(params![MAX_PEERS_ROWS], |row| {
                 let addresses_str: String = row.get(1)?;
                 let addresses: Vec<String> =
                     serde_json::from_str(&addresses_str).unwrap_or_default();
@@ -1393,8 +1407,9 @@ impl Database {
         sender_port: u16,
         verified: bool,
     ) -> anyhow::Result<()> {
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
         let now = chrono::Utc::now().timestamp();
+        let tx = conn.transaction()?;
 
         // M2: cap total inbound `friend_requests` rows. Per-sender
         // UPSERT below already prevents same-hash flooding, but an
@@ -1411,7 +1426,7 @@ impl Database {
         // the cap — it just refreshes the existing row via the
         // UPSERT.
         const MAX_FRIEND_REQUESTS: i64 = 100;
-        let already_present: i64 = conn
+        let already_present: i64 = tx
             .query_row(
                 "SELECT COUNT(*) FROM friend_requests WHERE sender_hash = ?1",
                 params![sender_hash],
@@ -1419,12 +1434,12 @@ impl Database {
             )
             .unwrap_or(0);
         if already_present == 0 {
-            let total: i64 = conn
+            let total: i64 = tx
                 .query_row("SELECT COUNT(*) FROM friend_requests", [], |row| row.get(0))
                 .unwrap_or(0);
             if total >= MAX_FRIEND_REQUESTS {
                 let to_evict = (total - MAX_FRIEND_REQUESTS + 1).max(1);
-                let evicted_unverified = conn.execute(
+                let evicted_unverified = tx.execute(
                     "DELETE FROM friend_requests WHERE sender_hash IN (
                         SELECT sender_hash FROM friend_requests
                         WHERE COALESCE(verified, 0) = 0
@@ -1435,14 +1450,14 @@ impl Database {
                 )? as i64;
                 let remaining = to_evict - evicted_unverified;
                 if remaining > 0 {
-                    let _ = conn.execute(
+                    tx.execute(
                         "DELETE FROM friend_requests WHERE sender_hash IN (
                             SELECT sender_hash FROM friend_requests
                             ORDER BY received_at ASC
                             LIMIT ?1
                         )",
                         params![remaining],
-                    );
+                    )?;
                 }
             }
         }
@@ -1457,7 +1472,7 @@ impl Database {
         // unverified requests from another channel — a legitimate
         // re-request from the real user always raises the flag or
         // leaves it unchanged, never lowers it.
-        conn.execute(
+        tx.execute(
             "INSERT INTO friend_requests (sender_hash, sender_nickname, received_at, sender_ip, sender_port, verified)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(sender_hash) DO UPDATE SET sender_nickname = excluded.sender_nickname,
@@ -1465,6 +1480,7 @@ impl Database {
              verified = MAX(friend_requests.verified, excluded.verified)",
             params![sender_hash, nickname, now, sender_ip, sender_port as i64, verified as i64],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1785,6 +1801,14 @@ impl Database {
                 status,
                 now
             ],
+        )?;
+        conn.execute(
+            "DELETE FROM download_history WHERE file_hash IN (
+                SELECT file_hash FROM download_history
+                ORDER BY timestamp DESC
+                LIMIT -1 OFFSET ?1
+            )",
+            params![MAX_DOWNLOAD_HISTORY_ROWS],
         )?;
         Ok(())
     }
