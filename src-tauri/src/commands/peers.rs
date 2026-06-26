@@ -1191,8 +1191,13 @@ pub async fn ember_ping_peer(
 
 /// Parse a 64-char hex string into a 32-byte key (Ed25519 / X25519).
 fn parse_key32(label: &str, hex_str: &str) -> Result<[u8; 32], String> {
-    let bytes = hex::decode(hex_str)
-        .map_err(|e| coded_ctx("peers_pubkey_invalid_hex", format!("{label} is not valid hex"), e))?;
+    let bytes = hex::decode(hex_str).map_err(|e| {
+        coded_ctx(
+            "peers_pubkey_invalid_hex",
+            format!("{label} is not valid hex"),
+            e,
+        )
+    })?;
     if bytes.len() != 32 {
         return Err(coded_ctx(
             "peers_pubkey_wrong_length",
@@ -1208,8 +1213,13 @@ fn parse_key32(label: &str, hex_str: &str) -> Result<[u8; 32], String> {
 /// Parse a 32-char hex string into a 16-byte Ember node ID / lookup
 /// target.
 fn parse_node_id16(label: &str, hex_str: &str) -> Result<[u8; 16], String> {
-    let bytes = hex::decode(hex_str)
-        .map_err(|e| coded_ctx("peers_target_invalid_hex", format!("{label} is not valid hex"), e))?;
+    let bytes = hex::decode(hex_str).map_err(|e| {
+        coded_ctx(
+            "peers_target_invalid_hex",
+            format!("{label} is not valid hex"),
+            e,
+        )
+    })?;
     if bytes.len() != 16 {
         return Err(coded_ctx(
             "peers_target_wrong_length",
@@ -1251,11 +1261,18 @@ pub async fn add_ember_dht_contact(
     noise_pubkey_hex: String,
 ) -> Result<(), String> {
     if peer_port == 0 {
-        return Err(coded("peers_peer_port_must_be_positive", "peer_port must be > 0"));
+        return Err(coded(
+            "peers_peer_port_must_be_positive",
+            "peer_port must be > 0",
+        ));
     }
-    let ip: IpAddr = peer_ip
-        .parse()
-        .map_err(|e| coded_ctx("peers_invalid_peer_ip", format!("Invalid peer_ip '{peer_ip}'"), e))?;
+    let ip: IpAddr = peer_ip.parse().map_err(|e| {
+        coded_ctx(
+            "peers_invalid_peer_ip",
+            format!("Invalid peer_ip '{peer_ip}'"),
+            e,
+        )
+    })?;
     let ed25519_pub = parse_key32("ed25519_pubkey_hex", ed25519_pubkey_hex.trim())?;
     let noise_pub = parse_key32("noise_pubkey_hex", noise_pubkey_hex.trim())?;
 
@@ -1290,12 +1307,19 @@ pub async fn ember_dht_ping_peer(
         .clamp(MIN_EMBER_PING_TIMEOUT_MS, MAX_EMBER_PING_TIMEOUT_MS);
 
     if peer_port == 0 {
-        return Err(coded("peers_peer_port_must_be_positive", "peer_port must be > 0"));
+        return Err(coded(
+            "peers_peer_port_must_be_positive",
+            "peer_port must be > 0",
+        ));
     }
 
-    let ip: IpAddr = peer_ip
-        .parse()
-        .map_err(|e| coded_ctx("peers_invalid_peer_ip", format!("Invalid peer_ip '{peer_ip}'"), e))?;
+    let ip: IpAddr = peer_ip.parse().map_err(|e| {
+        coded_ctx(
+            "peers_invalid_peer_ip",
+            format!("Invalid peer_ip '{peer_ip}'"),
+            e,
+        )
+    })?;
     let addr = SocketAddr::new(ip, peer_port);
 
     let peer_pubkey: Option<[u8; 32]> = match peer_pubkey_hex.as_deref() {
@@ -1313,7 +1337,13 @@ pub async fn ember_dht_ping_peer(
         })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
 
-    let scheduled = match await_reply(rx, "peers_no_response_from_network", "No response from network").await? {
+    let scheduled = match await_reply(
+        rx,
+        "peers_no_response_from_network",
+        "No response from network",
+    )
+    .await?
+    {
         Ok(p) => p,
         Err(e) => {
             return Ok(EmberPingResult {
@@ -1324,12 +1354,7 @@ pub async fn ember_dht_ping_peer(
         }
     };
 
-    match tokio::time::timeout(
-        std::time::Duration::from_millis(timeout),
-        scheduled.pong_rx,
-    )
-    .await
-    {
+    match tokio::time::timeout(std::time::Duration::from_millis(timeout), scheduled.pong_rx).await {
         Ok(Ok(rtt)) => Ok(EmberPingResult {
             success: true,
             rtt_ms: Some(rtt.as_secs_f64() * 1_000.0),
@@ -1370,12 +1395,19 @@ pub async fn ember_dht_find_node(
         .clamp(MIN_EMBER_PING_TIMEOUT_MS, MAX_EMBER_PING_TIMEOUT_MS);
 
     if peer_port == 0 {
-        return Err(coded("peers_peer_port_must_be_positive", "peer_port must be > 0"));
+        return Err(coded(
+            "peers_peer_port_must_be_positive",
+            "peer_port must be > 0",
+        ));
     }
 
-    let ip: IpAddr = peer_ip
-        .parse()
-        .map_err(|e| coded_ctx("peers_invalid_peer_ip", format!("Invalid peer_ip '{peer_ip}'"), e))?;
+    let ip: IpAddr = peer_ip.parse().map_err(|e| {
+        coded_ctx(
+            "peers_invalid_peer_ip",
+            format!("Invalid peer_ip '{peer_ip}'"),
+            e,
+        )
+    })?;
     let addr = SocketAddr::new(ip, peer_port);
 
     let peer_pubkey: Option<[u8; 32]> = match peer_pubkey_hex.as_deref() {
@@ -1400,7 +1432,13 @@ pub async fn ember_dht_find_node(
         })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
 
-    let scheduled = match await_reply(rx, "peers_no_response_from_network", "No response from network").await? {
+    let scheduled = match await_reply(
+        rx,
+        "peers_no_response_from_network",
+        "No response from network",
+    )
+    .await?
+    {
         Ok(p) => p,
         Err(e) => {
             return Ok(EmberDhtFindResult {
@@ -1469,7 +1507,13 @@ pub async fn ember_dht_iterative_find_node(
         .try_send(NetworkCommand::SendEmberDhtIterativeFindNode { target, tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
 
-    let scheduled = match await_reply(rx, "peers_no_response_from_network", "No response from network").await? {
+    let scheduled = match await_reply(
+        rx,
+        "peers_no_response_from_network",
+        "No response from network",
+    )
+    .await?
+    {
         Ok(p) => p,
         Err(e) => {
             return Ok(EmberDhtFindResult {
@@ -1549,7 +1593,13 @@ pub async fn ember_dht_publish_keyword(
         })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
 
-    let scheduled = match await_reply(rx, "peers_no_response_from_network", "No response from network").await? {
+    let scheduled = match await_reply(
+        rx,
+        "peers_no_response_from_network",
+        "No response from network",
+    )
+    .await?
+    {
         Ok(p) => p,
         Err(e) => {
             return Ok(EmberDhtPublishResult {
@@ -1624,7 +1674,13 @@ pub async fn ember_dht_find_value(
         .try_send(NetworkCommand::FindEmberValue { keyword, tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
 
-    let scheduled = match await_reply(rx, "peers_no_response_from_network", "No response from network").await? {
+    let scheduled = match await_reply(
+        rx,
+        "peers_no_response_from_network",
+        "No response from network",
+    )
+    .await?
+    {
         Ok(p) => p,
         Err(e) => {
             return Ok(EmberDhtFindValueResult {
@@ -1702,7 +1758,13 @@ pub async fn ember_dht_run_maintenance(
         .try_send(NetworkCommand::RunEmberMaintenance { tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
 
-    match await_reply(rx, "peers_no_response_from_network", "No response from network").await? {
+    match await_reply(
+        rx,
+        "peers_no_response_from_network",
+        "No response from network",
+    )
+    .await?
+    {
         Ok(EmberMaintenanceResult {
             buckets_refreshed,
             liveness_pings_sent,

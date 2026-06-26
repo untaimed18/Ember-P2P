@@ -354,8 +354,9 @@ mod tests {
         // on-curve check).
         let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let ed_pub = sk.verifying_key().to_bytes();
-        let expected_id =
-            EmberNodeId(crate::network::ember::crypto::node_id_from_public_key(&sk.verifying_key()));
+        let expected_id = EmberNodeId(crate::network::ember::crypto::node_id_from_public_key(
+            &sk.verifying_key(),
+        ));
 
         let bn = BootstrapNode {
             addr: "1.2.3.4:4662".to_string(),
