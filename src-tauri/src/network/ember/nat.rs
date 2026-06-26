@@ -1,7 +1,9 @@
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 /// STUN reflectors used for NAT detection. Listed in attempt order; the
@@ -120,58 +122,38 @@ impl NatInfo {
     /// 1:1 for cone NATs, so it's the best guess we can make without
     /// a real STUN reply.
     ///
-    /// We *do not* gate on `external_addr.is_some()`: a previous STUN
-    /// probe may have written an external mapping but failed to
-    /// classify the NAT (e.g. only one server responded, before the
-    /// `probe_nat` optimistic-PortRestricted patch landed, or any
-    /// future regression). In that situation we still need to upgrade
-    /// `nat_type` away from `Unknown` so the broker is willing to
-    /// attempt a hole-punch. We preserve the existing `external_addr`
-    /// when it's present so we don't clobber the real mapped port
-    /// returned by STUN.
+    /// We only apply this when STUN did not discover any mapped
+    /// address. A single STUN reply proves an external mapping but not
+    /// whether the NAT is symmetric; upgrading that case here would
+    /// undo the conservative single-vantage classification and make
+    /// doomed punches run before relay fallback.
     pub fn apply_highid_fallback(&mut self, external_ip: IpAddr, local_udp_port: u16) -> bool {
         if self.nat_type != NatType::Unknown {
             return false;
         }
-        self.nat_type = NatType::PortRestricted;
-        if self.external_addr.is_none() {
-            self.external_addr = Some(SocketAddr::new(external_ip, local_udp_port));
+        if self.external_addr.is_some() {
+            return false;
         }
+        self.nat_type = NatType::PortRestricted;
+        self.external_addr = Some(SocketAddr::new(external_ip, local_udp_port));
         self.last_probed = Instant::now();
         true
     }
 }
 
-/// Hard ceiling on how long the main network task is willing to block
-/// inside a `probe_nat` call. Each STUN server attempt is itself
-/// `STUN_MAX_RETRIES * STUN_TIMEOUT = 10s`; with 5 servers in
-/// `DEFAULT_STUN_SERVERS` an all-fail run could otherwise stall the
-/// main `select!` loop for ~50s, blocking downloads, broker ticks,
-/// and friend reconnects. The probe early-exits at 2 successful
-/// results so most successful runs finish well under this cap.
-pub const PROBE_NAT_OVERALL_TIMEOUT: Duration = Duration::from_secs(6);
-
-/// Probe STUN servers to discover our external address and infer NAT type.
-///
-/// Stops after two successful results (enough to disambiguate symmetric
-/// vs port-restricted by comparing mapped ports). Walks the entire
-/// server list before giving up so a transient outage on one provider
-/// doesn't poison the result. Per-server failures are surfaced in the
-/// final WARN message — they used to be `debug!` only, which made
-/// "all STUN servers failed" essentially undebuggable in `info`-level
-/// logs.
-///
-/// Callers on the main network event loop should wrap this in
-/// `tokio::time::timeout(PROBE_NAT_OVERALL_TIMEOUT, ...)` to bound the
-/// worst-case stall. Spawning the probe onto its own task is not
-/// currently safe — `local_socket` is the shared KAD UDP socket and
-/// concurrent `recv_from` calls would steal each other's packets.
-pub async fn probe_nat(local_socket: &UdpSocket) -> NatInfo {
+/// Probe NAT using the caller-owned UDP socket for sends while receiving STUN
+/// replies from the main network loop. This keeps the main loop as the only
+/// `recv_from` owner, avoiding packet stealing between a background probe and
+/// normal KAD/Ember processing.
+pub(crate) async fn probe_nat_with_replies(
+    local_socket: Arc<UdpSocket>,
+    mut replies: mpsc::Receiver<(Vec<u8>, SocketAddr)>,
+) -> NatInfo {
     let mut results = Vec::new();
     let mut failures: Vec<String> = Vec::new();
 
     for server_str in DEFAULT_STUN_SERVERS.iter() {
-        match try_stun_server(local_socket, server_str).await {
+        match try_stun_server_with_replies(&local_socket, &mut replies, server_str).await {
             Ok(addr) => {
                 results.push(addr);
                 if results.len() >= 2 {
@@ -185,10 +167,15 @@ pub async fn probe_nat(local_socket: &UdpSocket) -> NatInfo {
         }
     }
 
+    build_nat_info_from_results(&local_socket, results, failures)
+}
+
+fn build_nat_info_from_results(
+    local_socket: &UdpSocket,
+    results: Vec<SocketAddr>,
+    failures: Vec<String>,
+) -> NatInfo {
     if results.is_empty() {
-        // Surface the first two failures in the WARN so the user can
-        // tell DNS/blocked-egress/timeout apart without having to flip
-        // the whole logger to debug.
         let detail = failures
             .iter()
             .take(2)
@@ -217,7 +204,6 @@ pub async fn probe_nat(local_socket: &UdpSocket) -> NatInfo {
         {
             NatType::Open
         } else if results.len() >= 2 && results[0].port() != results[1].port() {
-            // Different external ports from different servers = symmetric NAT
             info!(
                 "NAT probe: symmetric NAT detected (ports {} vs {})",
                 results[0].port(),
@@ -225,27 +211,17 @@ pub async fn probe_nat(local_socket: &UdpSocket) -> NatInfo {
             );
             NatType::Symmetric
         } else if results.len() >= 2 {
-            // Same external port from different servers = at least port-restricted cone
             info!(
                 "NAT probe: port-restricted or better NAT (consistent port {})",
                 external_addr.port()
             );
             NatType::PortRestricted
         } else {
-            // Only one STUN reply made it back — usually the other servers
-            // are blocked, slow, or timing out. We can't disambiguate
-            // symmetric vs cone with a single mapped port, but leaving
-            // `nat_type = Unknown` is worse: `is_punchable()` returns
-            // false and the broker will skip every hole-punch attempt
-            // even on a perfectly punchable link. Optimistically assume
-            // PortRestricted (the common case for residential NATs); if
-            // we're actually behind a symmetric NAT the punch will fail
-            // and the broker falls back to relay anyway.
             info!(
-                "NAT probe: only 1 STUN reply (mapped {}), optimistically assuming PortRestricted",
+                "NAT probe: only 1 STUN reply (mapped {}), leaving NAT type Unknown",
                 external_addr,
             );
-            NatType::PortRestricted
+            NatType::Unknown
         }
     } else {
         NatType::Unknown
@@ -260,13 +236,19 @@ pub async fn probe_nat(local_socket: &UdpSocket) -> NatInfo {
     }
 }
 
-async fn try_stun_server(socket: &UdpSocket, server: &str) -> Result<SocketAddr, String> {
-    // Filter to IPv4 explicitly. The KAD UDP socket is bound IPv4-only
-    // (`socket2::Domain::IPV4` in `start_network`), and on a dual-stack
-    // resolver `lookup_host(...).next()` can return an IPv6 entry first
-    // — `send_to` would then fail with EAFNOSUPPORT and the whole
-    // attempt would silently time out. Picking the first v4 result
-    // matches what every other UDP path in this codebase expects.
+pub(crate) fn is_stun_binding_response(data: &[u8]) -> bool {
+    if data.len() < 20 {
+        return false;
+    }
+    u16::from_be_bytes([data[0], data[1]]) == STUN_BINDING_RESPONSE
+        && u32::from_be_bytes([data[4], data[5], data[6], data[7]]) == STUN_MAGIC_COOKIE
+}
+
+async fn try_stun_server_with_replies(
+    socket: &UdpSocket,
+    replies: &mut mpsc::Receiver<(Vec<u8>, SocketAddr)>,
+    server: &str,
+) -> Result<SocketAddr, String> {
     let server_addr: SocketAddr = tokio::net::lookup_host(server)
         .await
         .map_err(|e| format!("DNS resolve {server}: {e}"))?
@@ -282,14 +264,6 @@ async fn try_stun_server(socket: &UdpSocket, server: &str) -> Result<SocketAddr,
             .await
             .map_err(|e| format!("send: {e}"))?;
 
-        // Inner read loop: unrelated packets on the shared KAD socket
-        // (a reply from a previous STUN probe, a late KAD packet,
-        // etc.) must NOT consume a retry. We keep draining packets
-        // until one matches {server IP, expected txn_id}, the overall
-        // STUN timeout elapses, or the socket errors. Previously a
-        // single stray packet would `continue` back to the outer
-        // retry loop and re-send the request, burning one of the two
-        // retries for no reason.
         let deadline = tokio::time::Instant::now() + STUN_TIMEOUT;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -297,34 +271,20 @@ async fn try_stun_server(socket: &UdpSocket, server: &str) -> Result<SocketAddr,
                 debug!("STUN timeout from {server} (attempt {attempt})");
                 break;
             }
-            let mut buf = [0u8; 256];
-            match tokio::time::timeout(remaining, socket.recv_from(&mut buf)).await {
-                Ok(Ok((len, from))) => {
+            match tokio::time::timeout(remaining, replies.recv()).await {
+                Ok(Some((data, from))) => {
                     if from.ip() != server_addr.ip() {
-                        // Unrelated packet on the shared socket; keep
-                        // reading until we see a reply from this
-                        // server or the deadline fires.
                         continue;
                     }
-                    match parse_binding_response(&buf[..len], &txn_id) {
+                    match parse_binding_response(&data, &txn_id) {
                         Ok(external_addr) => return Ok(external_addr),
                         Err(e) => {
-                            // Valid server IP but wrong txn_id /
-                            // malformed / out-of-order reply from a
-                            // prior probe. Keep reading within the
-                            // same attempt.
                             debug!("STUN parse error from {server}: {e}");
                             continue;
                         }
                     }
                 }
-                Ok(Err(e)) => {
-                    debug!("STUN recv error from {server}: {e}");
-                    // Hard socket error — don't keep spinning on it
-                    // inside this attempt; drop out and let the
-                    // outer retry loop either resend or fail.
-                    break;
-                }
+                Ok(None) => return Err("STUN reply channel closed".into()),
                 Err(_) => {
                     debug!("STUN timeout from {server} (attempt {attempt})");
                     break;
@@ -488,11 +448,11 @@ mod tests {
     }
 
     #[test]
-    fn highid_fallback_upgrades_unknown_but_preserves_existing_addr() {
+    fn highid_fallback_skips_when_stun_already_found_addr() {
         // Pre-existing external_addr (e.g. STUN got one reply but
-        // couldn't classify) must NOT be clobbered by the fallback —
-        // we still want to upgrade `nat_type` so the broker is willing
-        // to attempt a hole-punch, while keeping the real mapped port.
+        // couldn't classify) must not be upgraded by the HighID
+        // fallback; a single STUN vantage point doesn't prove the NAT
+        // is non-symmetric.
         let mut info = NatInfo {
             nat_type: NatType::Unknown,
             external_addr: Some("1.2.3.4:9999".parse().unwrap()),
@@ -500,12 +460,12 @@ mod tests {
         };
         let applied =
             info.apply_highid_fallback(IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)), 4242);
-        assert!(applied);
-        assert_eq!(info.nat_type, NatType::PortRestricted);
+        assert!(!applied);
+        assert_eq!(info.nat_type, NatType::Unknown);
         assert_eq!(
             info.external_addr,
             Some("1.2.3.4:9999".parse().unwrap()),
-            "fallback must not overwrite an addr STUN already discovered",
+            "fallback must preserve the addr STUN already discovered",
         );
     }
 

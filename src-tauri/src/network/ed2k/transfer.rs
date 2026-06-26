@@ -204,6 +204,7 @@ pub enum DownloadEvent {
         entries: Vec<([u8; 16], Vec<(std::net::Ipv4Addr, u16, u16, u8)>)>,
         aich_roots: Vec<([u8; 16], [u8; 20])>,
         ember_peers: Vec<(std::net::Ipv4Addr, u16)>,
+        relay_attestations: Vec<crate::network::ember::RelayAttestation>,
     },
     /// An Ember peer was detected (for peer discovery mesh bootstrap).
     EmberPeerDiscovered {
@@ -1177,8 +1178,13 @@ impl Ed2kDownload {
                         pl.len()
                     );
                     match crate::network::ember::parse_exchange_payload(&pl) {
-                        Ok(result) if !result.files.is_empty() || !result.peers.is_empty() => {
+                        Ok(result)
+                            if !result.files.is_empty()
+                                || !result.peers.is_empty()
+                                || !result.relay_attestations.is_empty() =>
+                        {
                             let (epx_entries, aich_roots) = epx_result_to_entries(&result);
+                            let relay_attestations = result.relay_attestations.clone();
                             let epx_peers = result
                                 .peers
                                 .into_iter()
@@ -1190,6 +1196,7 @@ impl Ed2kDownload {
                                     entries: epx_entries,
                                     aich_roots,
                                     ember_peers: epx_peers,
+                                    relay_attestations,
                                 })
                                 .await;
                         }
@@ -1785,14 +1792,20 @@ impl Ed2kDownload {
                     } else {
                         epx_packets_received += 1;
                         match crate::network::ember::parse_exchange_payload(&payload) {
-                            Ok(result) if !result.files.is_empty() || !result.peers.is_empty() => {
+                            Ok(result)
+                                if !result.files.is_empty()
+                                    || !result.peers.is_empty()
+                                    || !result.relay_attestations.is_empty() =>
+                            {
                                 info!(
-                                    "Received Ember Peer Exchange from {} ({} files, {} peers)",
+                                    "Received Ember Peer Exchange from {} ({} files, {} peers, {} relay attestations)",
                                     self.source_addr,
                                     result.files.len(),
-                                    result.peers.len()
+                                    result.peers.len(),
+                                    result.relay_attestations.len()
                                 );
                                 let (epx_entries, aich_roots) = epx_result_to_entries(&result);
+                                let relay_attestations = result.relay_attestations.clone();
                                 let ember_peers = result
                                     .peers
                                     .into_iter()
@@ -1804,6 +1817,7 @@ impl Ed2kDownload {
                                         entries: epx_entries,
                                         aich_roots,
                                         ember_peers,
+                                        relay_attestations,
                                     })
                                     .await;
                             }
@@ -3286,11 +3300,14 @@ impl Ed2kDownload {
                                 epx_packets_received += 1;
                                 match crate::network::ember::parse_exchange_payload(&payload) {
                                     Ok(result)
-                                        if !result.files.is_empty() || !result.peers.is_empty() =>
+                                        if !result.files.is_empty()
+                                            || !result.peers.is_empty()
+                                            || !result.relay_attestations.is_empty() =>
                                     {
-                                        info!("Received Ember Peer Exchange during download from {} ({} files, {} peers)", self.source_addr, result.files.len(), result.peers.len());
+                                        info!("Received Ember Peer Exchange during download from {} ({} files, {} peers, {} relay attestations)", self.source_addr, result.files.len(), result.peers.len(), result.relay_attestations.len());
                                         let (epx_entries, aich_roots) =
                                             epx_result_to_entries(&result);
+                                        let relay_attestations = result.relay_attestations.clone();
                                         let ember_peers = result
                                             .peers
                                             .into_iter()
@@ -3302,6 +3319,7 @@ impl Ed2kDownload {
                                                 entries: epx_entries,
                                                 aich_roots,
                                                 ember_peers,
+                                                relay_attestations,
                                             })
                                             .await;
                                     }

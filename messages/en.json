@@ -159,6 +159,7 @@
 
   "toast_default_title": "Notification",
   "toast_close_aria": "Close notification",
+  "toast_network_stopped": "Network stopped: {message}",
 
   "confirm_default_title": "Confirm",
   "confirm_default_message": "Are you sure?",

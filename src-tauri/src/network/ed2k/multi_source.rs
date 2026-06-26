@@ -166,6 +166,14 @@ fn spawn_save_snapshot(snap: super::part_tracker::SaveSnapshot) {
     });
 }
 
+async fn save_snapshot_now(snap: super::part_tracker::SaveSnapshot, context: &'static str) {
+    match tokio::task::spawn_blocking(move || snap.write_to_disk()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!("{context} part.met save failed: {e}"),
+        Err(e) => tracing::warn!("{context} part.met save task failed: {e}"),
+    }
+}
+
 /// Per-download cap on simultaneously *held* source connections
 /// (connecting + actively-queued + transferring). The permit is held for
 /// the whole `download_parts_from_source` lifetime — EXCEPT that a source
@@ -1756,9 +1764,35 @@ impl MultiSourceDownload {
                             pending_futs.next().await
                         }
                     } => {
-                        let _ = result;
+                        match result {
+                            Some(Ok((src_idx, parts, Ok(())))) => {
+                                tracing::debug!(
+                                    "source task {src_idx} completed for parts {:?}",
+                                    parts
+                                );
+                            }
+                            Some(Ok((src_idx, parts, Err(e)))) => {
+                                tracing::warn!(
+                                    "source task {src_idx} for parts {:?} ended with error: {e}",
+                                    parts
+                                );
+                            }
+                            Some(Err(e)) if e.is_cancelled() => {
+                                tracing::debug!("source task cancelled: {e}");
+                            }
+                            Some(Err(e)) => {
+                                tracing::warn!("source task join failed: {e}");
+                            }
+                            None => {}
+                        }
                     }
                     _ = self.control.wait_cancelled() => {
+                        for ah in &abort_handles {
+                            ah.abort();
+                        }
+                        for ah in &injected_abort_handles {
+                            ah.abort();
+                        }
                         anyhow::bail!("cancelled by user");
                     }
                     // Accept new source from the injection channel
@@ -2199,7 +2233,28 @@ impl MultiSourceDownload {
                     ah.abort();
                 }
             }
-            while let Some(_) = pending_futs.next().await {}
+            while let Some(joined) = pending_futs.next().await {
+                match joined {
+                    Ok((src_idx, parts, Ok(()))) => {
+                        tracing::debug!(
+                            "source task {src_idx} completed during drain for parts {:?}",
+                            parts
+                        );
+                    }
+                    Ok((src_idx, parts, Err(e))) => {
+                        tracing::warn!(
+                            "source task {src_idx} for parts {:?} ended with error during drain: {e}",
+                            parts
+                        );
+                    }
+                    Err(e) if e.is_cancelled() => {
+                        tracing::debug!("source task cancelled during drain: {e}");
+                    }
+                    Err(e) => {
+                        tracing::warn!("source task join failed during drain: {e}");
+                    }
+                }
+            }
 
             // Hand the still-open injection channel back to the outer
             // scope so the retry-rounds loop below can keep accepting
@@ -4336,9 +4391,14 @@ async fn download_parts_from_source(
                     payload.len()
                 );
                 match crate::network::ember::parse_exchange_payload(&payload) {
-                    Ok(result) if !result.files.is_empty() || !result.peers.is_empty() => {
+                    Ok(result)
+                        if !result.files.is_empty()
+                            || !result.peers.is_empty()
+                            || !result.relay_attestations.is_empty() =>
+                    {
                         let (epx_entries, aich_roots) =
                             super::transfer::epx_result_to_entries(&result);
+                        let relay_attestations = result.relay_attestations.clone();
                         let epx_peers = result
                             .peers
                             .into_iter()
@@ -4351,6 +4411,7 @@ async fn download_parts_from_source(
                                     entries: epx_entries,
                                     aich_roots,
                                     ember_peers: epx_peers,
+                                    relay_attestations,
                                 })
                                 .await;
                         }
@@ -4988,8 +5049,13 @@ async fn download_parts_from_source(
                 _payload.len()
             );
             match crate::network::ember::parse_exchange_payload(&_payload) {
-                Ok(result) if !result.files.is_empty() || !result.peers.is_empty() => {
+                Ok(result)
+                    if !result.files.is_empty()
+                        || !result.peers.is_empty()
+                        || !result.relay_attestations.is_empty() =>
+                {
                     let (epx_entries, aich_roots) = super::transfer::epx_result_to_entries(&result);
+                    let relay_attestations = result.relay_attestations.clone();
                     let epx_peers = result
                         .peers
                         .into_iter()
@@ -5002,6 +5068,7 @@ async fn download_parts_from_source(
                                 entries: epx_entries,
                                 aich_roots,
                                 ember_peers: epx_peers,
+                                relay_attestations,
                             })
                             .await;
                     }
@@ -6620,27 +6687,39 @@ async fn download_parts_from_source(
                                 }
                             }
                             if !write_ok {
+                                consecutive_bad_blocks += 1;
+                                if consecutive_bad_blocks >= MAX_CONSECUTIVE_BAD_BLOCKS {
+                                    anyhow::bail!(
+                                        "source {_src_idx} had {consecutive_bad_blocks} consecutive disk write failures, disconnecting"
+                                    );
+                                }
                                 continue;
                             }
+
+                            consecutive_bad_blocks = 0;
 
                             // Update byte-level gap tracker for mid-part resume.
                             // Only reached when the disk write succeeded.
                             {
                                 let mut t = tracker.write().await;
-                                t.fill_range(start, end);
+                                for &(gs, ge) in &fill_subranges {
+                                    t.fill_range(gs, ge);
+                                }
                             }
 
                             if let (Some(ref etx), std::net::IpAddr::V4(v4)) =
                                 (&event_tx, addr.ip())
                             {
-                                let _ = etx
-                                    .send(DownloadEvent::DataReceived {
-                                        file_hash: *file_hash,
-                                        start,
-                                        end,
-                                        sender_ip: v4,
-                                    })
-                                    .await;
+                                for &(gs, ge) in &fill_subranges {
+                                    let _ = etx
+                                        .send(DownloadEvent::DataReceived {
+                                            file_hash: *file_hash,
+                                            start: gs,
+                                            end: ge,
+                                            sender_ip: v4,
+                                        })
+                                        .await;
+                                }
                             }
                         } else {
                             tracing::trace!(
@@ -6762,25 +6841,37 @@ async fn download_parts_from_source(
                                 }
                             }
                             if !write_ok {
+                                consecutive_bad_blocks += 1;
+                                if consecutive_bad_blocks >= MAX_CONSECUTIVE_BAD_BLOCKS {
+                                    anyhow::bail!(
+                                        "source {_src_idx} had {consecutive_bad_blocks} consecutive compressed disk write failures, disconnecting"
+                                    );
+                                }
                                 continue;
                             }
 
+                            consecutive_bad_blocks = 0;
+
                             {
                                 let mut t = tracker.write().await;
-                                t.fill_range(start, start + piece_len);
+                                for &(gs, ge) in &fill_subranges {
+                                    t.fill_range(gs, ge);
+                                }
                             }
 
                             if let (Some(ref etx), std::net::IpAddr::V4(v4)) =
                                 (&event_tx, addr.ip())
                             {
-                                let _ = etx
-                                    .send(DownloadEvent::DataReceived {
-                                        file_hash: *file_hash,
-                                        start,
-                                        end: start + piece_len,
-                                        sender_ip: v4,
-                                    })
-                                    .await;
+                                for &(gs, ge) in &fill_subranges {
+                                    let _ = etx
+                                        .send(DownloadEvent::DataReceived {
+                                            file_hash: *file_hash,
+                                            start: gs,
+                                            end: ge,
+                                            sender_ip: v4,
+                                        })
+                                        .await;
+                                }
                             }
                         } else {
                             tracing::trace!(
@@ -7092,11 +7183,14 @@ async fn download_parts_from_source(
                             epx_packets_received += 1;
                             match crate::network::ember::parse_exchange_payload(&payload) {
                                 Ok(result)
-                                    if !result.files.is_empty() || !result.peers.is_empty() =>
+                                    if !result.files.is_empty()
+                                        || !result.peers.is_empty()
+                                        || !result.relay_attestations.is_empty() =>
                                 {
-                                    info!("Received Ember Peer Exchange from multi-source peer {} ({} files, {} peers)", _src_idx, result.files.len(), result.peers.len());
+                                    info!("Received Ember Peer Exchange from multi-source peer {} ({} files, {} peers, {} relay attestations)", _src_idx, result.files.len(), result.peers.len(), result.relay_attestations.len());
                                     let (epx_entries, aich_roots) =
                                         super::transfer::epx_result_to_entries(&result);
+                                    let relay_attestations = result.relay_attestations.clone();
                                     let ember_peers = result
                                         .peers
                                         .into_iter()
@@ -7109,6 +7203,7 @@ async fn download_parts_from_source(
                                                 entries: epx_entries,
                                                 aich_roots,
                                                 ember_peers,
+                                                relay_attestations,
                                             })
                                             .await;
                                     }
@@ -7553,7 +7648,7 @@ async fn download_parts_from_source(
                         t.set_in_progress(part_idx, false);
                         t.snapshot_for_save()
                     };
-                    spawn_save_snapshot(snap);
+                    save_snapshot_now(snap, "mismatched part").await;
                     ip_guard.unmark(part_idx);
                     continue;
                 }
@@ -7670,7 +7765,7 @@ async fn download_parts_from_source(
                                             }
                                             t.snapshot_for_save()
                                         };
-                                        spawn_save_snapshot(snap);
+                                        save_snapshot_now(snap, "AICH narrowed").await;
                                         let _ = progress_tx
                                             .send((_src_idx, -(invalidated as i64)))
                                             .await;
@@ -7729,7 +7824,7 @@ async fn download_parts_from_source(
                         t.set_in_progress(part_idx, false);
                         t.snapshot_for_save()
                     };
-                    spawn_save_snapshot(snap);
+                    save_snapshot_now(snap, "AICH narrowed completion").await;
                     ip_guard.unmark(part_idx);
                     continue;
                 }
@@ -7744,7 +7839,7 @@ async fn download_parts_from_source(
                         t.set_in_progress(part_idx, false);
                         (ps, pe, t.snapshot_for_save())
                     };
-                    spawn_save_snapshot(snap);
+                    save_snapshot_now(snap, "verified part").await;
                     ip_guard.unmark(part_idx);
                     // D12: flush accumulated bytes to the credit ledger now
                     // that this peer's contribution went into a verified part.

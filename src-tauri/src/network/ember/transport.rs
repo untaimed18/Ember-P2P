@@ -34,6 +34,11 @@ const MAX_SESSIONS: usize = 4096;
 /// Maximum concurrent pending handshakes.
 const MAX_PENDING: usize = 512;
 
+/// Largest Ember UDP datagram we will parse. Valid Noise handshake and
+/// transport packets are far smaller than this; the cap prevents an oversized
+/// UDP datagram from driving proportional allocation during handshake parsing.
+const MAX_EMBER_DATAGRAM_BYTES: usize = 4096;
+
 /// An established encrypted session with a remote peer.
 struct NoiseSession {
     transport: snow::TransportState,
@@ -339,6 +344,14 @@ impl EmberTransport {
     /// loopback UDP without constructing a full `NetworkState`.
     pub fn dispatch_incoming(&mut self, data: &[u8], from: SocketAddr) -> DispatchOutcome {
         let mut outcome = DispatchOutcome::default();
+        if data.len() > MAX_EMBER_DATAGRAM_BYTES {
+            debug!(
+                "dropping oversized Ember UDP datagram from {from}: {} bytes",
+                data.len()
+            );
+            outcome.rejected = true;
+            return outcome;
+        }
         let result = self.process_incoming(data, from);
 
         let payload = match result {

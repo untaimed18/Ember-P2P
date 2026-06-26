@@ -1,4 +1,4 @@
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
 /// Derive a 16-byte Ember node ID from an Ed25519 public key.
 ///
@@ -49,7 +49,7 @@ pub fn sign(signing_key: &SigningKey, message: &[u8]) -> [u8; 64] {
 #[allow(dead_code)]
 pub fn verify(public_key: &VerifyingKey, message: &[u8], signature: &[u8; 64]) -> bool {
     let sig = Signature::from_bytes(signature);
-    public_key.verify(message, &sig).is_ok()
+    public_key.verify_strict(message, &sig).is_ok()
 }
 
 /// Reconstruct a [`VerifyingKey`] from raw 32-byte public key material.

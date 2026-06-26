@@ -250,10 +250,17 @@ impl FirewallChecker {
             .udp_port_votes
             .iter()
             .max_by_key(|(_, nets)| nets.len())
-            .map(|(&port, _)| port);
+            .map(|(&port, nets)| (port, nets.len()));
 
-        if let Some(port) = best_port {
-            self.external_udp_port = Some(port);
+        if let Some((port, distinct_nets)) = best_port {
+            if distinct_nets >= MIN_IP_VOTES {
+                if self.external_udp_port != Some(port) {
+                    info!(
+                        "External UDP port confirmed: {port} ({distinct_nets} distinct-/24 votes)"
+                    );
+                }
+                self.external_udp_port = Some(port);
+            }
         }
     }
 

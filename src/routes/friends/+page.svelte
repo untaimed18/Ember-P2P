@@ -43,10 +43,10 @@
   let copiedHash: string | null = $state(null);
   let copyTimer: ReturnType<typeof setTimeout> | undefined;
 
-  let onlineFriends: Set<string> = $state(new Set());
-  let unreadCounts: Map<string, number> = $state(new Map());
+  let onlineFriends: Set<string> = $derived($onlineFriendsStore);
+  let unreadCounts: Map<string, number> = $derived($unreadCountsStore);
 
-  let friendRequests: FriendRequestInfo[] = $state([]);
+  let friendRequests: FriendRequestInfo[] = $derived($friendRequestsStore);
   let failedSearchToastsShown = new Set<string>();
 
   // Whenever a friend comes online, reset our "we already toasted for this
@@ -55,7 +55,7 @@
   $effect(() => {
     for (const hash of onlineFriends) failedSearchToastsShown.delete(hash);
   });
-  let searchingFriends: Set<string> = $state(new Set());
+  let searchingFriends: Set<string> = $derived($searchingFriendsStore);
   let isFirewalled = $state(false);
   let recheckingFirewall = $state(false);
   let recheckError: string | null = $state(null);
@@ -66,26 +66,13 @@
   let browseFriendIp = $state('');
   let browseFriendPort = $state(0);
 
-  let isDiscoverable = $state(false);
+  let isDiscoverable = $derived($isDiscoverableStore);
   let processingRequests: Set<string> = $state(new Set());
   let adding = $state(false);
 
   // Module-scoped lifecycle flag used by async loaders below so they don't
   // patch state after navigation.
   let destroyed = false;
-
-  // Sync global friend stores into local reactive state so the template
-  // picks up events even if they arrived before this page mounted.
-  onMount(() => {
-    const unsubs = [
-      onlineFriendsStore.subscribe(v => { onlineFriends = v; }),
-      unreadCountsStore.subscribe(v => { unreadCounts = v; }),
-      friendRequestsStore.subscribe(v => { friendRequests = v; }),
-      searchingFriendsStore.subscribe(v => { searchingFriends = v; }),
-      isDiscoverableStore.subscribe(v => { isDiscoverable = v; }),
-    ];
-    return () => unsubs.forEach(u => u());
-  });
 
   function autoFocus(node: HTMLElement) {
     node.focus();

@@ -951,7 +951,10 @@ pub fn parse_hello_answer(payload: &[u8]) -> io::Result<([u8; 16], PeerCapabilit
                     break;
                 }
                 if name_id == 0x01 {
-                    caps.peer_name = String::from_utf8_lossy(&payload[pos..pos + slen]).to_string();
+                    const MAX_HELLO_STRING_LEN: usize = 8192;
+                    let capped = slen.min(MAX_HELLO_STRING_LEN);
+                    caps.peer_name =
+                        String::from_utf8_lossy(&payload[pos..pos + capped]).to_string();
                 }
                 cursor.set_position((pos + slen) as u64);
                 continue;
@@ -1198,7 +1201,23 @@ pub fn parse_sending_part_i64(payload: &[u8]) -> io::Result<([u8; 16], u64, u64,
     cursor.read_exact(&mut hash)?;
     let start = cursor.read_u64::<LittleEndian>()?;
     let end = cursor.read_u64::<LittleEndian>()?;
+    let expected_len_u64 = end
+        .checked_sub(start)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "part end before start"))?;
+    let expected_len = usize::try_from(expected_len_u64).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("sending part length too large: {expected_len_u64}"),
+        )
+    })?;
     let data_start = cursor.position() as usize;
+    let data_len = payload.len() - data_start;
+    if data_len != expected_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("sending part length mismatch: expected {expected_len}, got {data_len}"),
+        ));
+    }
     Ok((hash, start, end, &payload[data_start..]))
 }
 
@@ -1979,6 +1998,15 @@ pub fn parse_multipacket_answer(payload: &[u8], opcode: u8) -> io::Result<MultiP
                 let len = cursor.read_u16::<LittleEndian>()? as usize;
                 if cursor.position() as usize + len > payload.len() {
                     break;
+                }
+                const MAX_MULTIPACKET_FILENAME_LEN: usize = 8192;
+                if len > MAX_MULTIPACKET_FILENAME_LEN {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "multipacket filename length {len} exceeds maximum {MAX_MULTIPACKET_FILENAME_LEN}"
+                        ),
+                    ));
                 }
                 let mut name = vec![0u8; len];
                 cursor.read_exact(&mut name)?;

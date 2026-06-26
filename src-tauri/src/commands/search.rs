@@ -585,20 +585,13 @@ pub async fn mark_spam(
         spam.take_save_data()
     };
     if let Some((data, path, gen)) = save_data {
-        let ok = tokio::task::spawn_blocking(move || {
-            match crate::security::atomic_write(&path, data.as_bytes(), false) {
-                Ok(()) => true,
-                Err(e) => {
-                    tracing::warn!("Failed to save spam filter: {e}");
-                    false
-                }
-            }
+        tokio::task::spawn_blocking(move || {
+            crate::security::atomic_write(&path, data.as_bytes(), false)
         })
         .await
-        .unwrap_or(false);
-        if ok {
-            state.spam_filter.write().await.mark_saved(gen);
-        }
+        .map_err(|e| coded_ctx("spam_filter_save_task_failed", "Spam filter save failed", e))?
+        .map_err(|e| coded_ctx("spam_filter_save_failed", "Spam filter save failed", e))?;
+        state.spam_filter.write().await.mark_saved(gen);
     }
     Ok(())
 }

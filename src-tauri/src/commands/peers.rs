@@ -1024,6 +1024,13 @@ pub async fn ember_ping_peer(
             e,
         )
     })?;
+    let harness_mode = cfg!(debug_assertions) || std::env::var_os("EMBER_DATA_DIR").is_some();
+    if !harness_mode && crate::security::is_private_ip(ip) {
+        return Err(coded(
+            "peers_cannot_ping_private",
+            "Cannot ping private, loopback, or special-use addresses",
+        ));
+    }
     let addr = SocketAddr::new(ip, peer_port);
 
     // Treat both an absent field and an empty string as "look it up

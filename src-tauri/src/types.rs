@@ -1037,8 +1037,8 @@ mod tests {
             .expect("AppSettings serializes to a JSON object")
             .remove("launch_maximized");
 
-        let parsed: AppSettings = serde_json::from_value(value)
-            .expect("config without the launch key must deserialize");
+        let parsed: AppSettings =
+            serde_json::from_value(value).expect("config without the launch key must deserialize");
         assert!(
             !parsed.launch_maximized,
             "launch_maximized should default to false when absent"

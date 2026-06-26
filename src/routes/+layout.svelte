@@ -20,7 +20,7 @@
   import * as m from '$lib/paraglide/messages';
   import { getSettings, hideToTray, quitApp, setCloseBehavior } from '$lib/api/settings';
   import { checkForUpdates } from '$lib/stores/updater';
-  import { toastWarning } from '$lib/stores/toast';
+  import { clearAllToasts, toastWarning } from '$lib/stores/toast';
   import type { AppSettings } from '$lib/types';
   import { onMount } from 'svelte';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
@@ -253,6 +253,7 @@
       cleanupTransferStore();
       cleanupSearchStore();
       cleanupFriendsStore();
+      clearAllToasts();
       clearAppSettings();
       void closeListenerPromise.then((unlisten) => unlisten());
       void configCorruptListenerPromise.then((unlisten) => unlisten());

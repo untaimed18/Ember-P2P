@@ -23,6 +23,13 @@ fn backup_corrupt_config(config_path: &Path, reason: &str) -> Option<PathBuf> {
             bak.display()
         );
         Some(bak)
+    } else if std::fs::copy(config_path, &bak).is_ok() {
+        let _ = std::fs::remove_file(config_path);
+        tracing::warn!(
+            "config.json {reason}; reset to defaults. Original copied to {}",
+            bak.display()
+        );
+        Some(bak)
     } else {
         tracing::warn!("config.json {reason}; reset to defaults (backup attempt failed)");
         None
@@ -47,6 +54,7 @@ impl AppConfig {
 
         let config_existed = config_path.exists();
         let mut corrupt_backup: Option<PathBuf> = None;
+        let mut config_changed = false;
         let mut settings = if config_existed {
             let data = std::fs::read_to_string(&config_path)?;
             match serde_json::from_str::<AppSettings>(&data) {
@@ -63,19 +71,19 @@ impl AppConfig {
                             &config_path,
                             &format!("has invalid settings ({e})"),
                         );
+                        config_changed = true;
                         AppSettings::default()
                     }
                 },
                 Err(e) => {
                     corrupt_backup = backup_corrupt_config(&config_path, &format!("corrupt ({e})"));
+                    config_changed = true;
                     AppSettings::default()
                 }
             }
         } else {
             AppSettings::default()
         };
-
-        let mut config_changed = false;
 
         // Existing users who upgrade to a version with the wizard should skip it.
         // Only applies when a real config file existed on disk (not a fresh install).
