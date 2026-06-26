@@ -535,8 +535,13 @@ impl Database {
         let peers = stmt
             .query_map(params![MAX_PEERS_ROWS], |row| {
                 let addresses_str: String = row.get(1)?;
-                let addresses: Vec<String> =
-                    serde_json::from_str(&addresses_str).unwrap_or_default();
+                let addresses: Vec<String> = serde_json::from_str(&addresses_str).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
                 Ok(PeerInfo {
                     id: row.get(0)?,
                     addresses,

@@ -2,7 +2,7 @@ use std::path::Path;
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use rand::Rng;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -15,9 +15,10 @@ use crate::network::kad::types::KadId;
 /// nodes recognize us in their routing tables and credit systems.
 ///
 /// Security notes:
-/// - On-disk layout is plaintext JSON but written via `security::atomic_write`
-///   with `restrict=true`, which applies mode 0o600 on Unix and a Windows ACL
-///   limiting access to the current user (see `restrict_file_permissions`).
+/// - On-disk layout is a protected JSON payload written via
+///   `security::atomic_write` with `restrict=true`, which applies mode 0o600 on
+///   Unix and a Windows ACL limiting access to the current user (see
+///   `restrict_file_permissions`).
 /// - TODO (release hardening): encrypt at rest using a per-user OS keyring.
 ///   On Windows: DPAPI (`CryptProtectData` / `CryptUnprotectData`) scoped to the
 ///   current user. On macOS: Keychain. On Linux: Secret Service / libsecret.
@@ -61,15 +62,15 @@ impl std::fmt::Debug for NodeIdentity {
 
 impl NodeIdentity {
     fn generate() -> Self {
-        let mut rng = rand::thread_rng();
+        let mut rng = OsRng;
         let mut kad_id = [0u8; 16];
         let mut user_hash = [0u8; 16];
-        rng.fill(&mut kad_id);
-        rng.fill(&mut user_hash);
+        rng.fill_bytes(&mut kad_id);
+        rng.fill_bytes(&mut user_hash);
         if user_hash[0] == 14 {
             user_hash[0] = 15;
         }
-        let udp_key_seed: u32 = rng.gen();
+        let udp_key_seed: u32 = rng.next_u32();
 
         let signing_key = SigningKey::generate(&mut OsRng);
         let public_key = signing_key.verifying_key();
