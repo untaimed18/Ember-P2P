@@ -1606,7 +1606,10 @@ mod tests {
         assert_eq!(a.result_origin, crate::search::merge::ORIGIN_EMBER);
         assert_eq!(a.file.size, 100);
         assert_eq!(a.file.extension, "iso");
-        assert!(a.source_addresses.is_empty(), "keyword hits carry no sources");
+        assert!(
+            a.source_addresses.is_empty(),
+            "keyword hits carry no sources"
+        );
         let b = results
             .iter()
             .find(|r| r.file.hash == hex::encode(hash_b))
@@ -1625,10 +1628,8 @@ mod tests {
             ember_kw_blob(&sk, "ubuntu", hash_a, 1, "ubuntu server amd64"),
             ember_kw_blob(&sk, "ubuntu", hash_b, 1, "ubuntu desktop amd64"),
         ];
-        let results = build_ember_keyword_results(
-            &blobs,
-            &["ubuntu".to_string(), "server".to_string()],
-        );
+        let results =
+            build_ember_keyword_results(&blobs, &["ubuntu".to_string(), "server".to_string()]);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].file.hash, hex::encode(hash_a));
     }
@@ -3304,11 +3305,18 @@ struct NetworkState {
     /// Pending Ember DHT `PING` requests awaiting a `PONG`, keyed by the
     /// wire `request_id`. Mirrors `ember_pending_pings` (the control
     /// ping map) and is bounded by `MAX_EMBER_PENDING_PINGS`.
-    ember_dht_pending_pings: HashMap<u32, (std::time::Instant, oneshot::Sender<std::time::Duration>)>,
+    ember_dht_pending_pings:
+        HashMap<u32, (std::time::Instant, oneshot::Sender<std::time::Duration>)>,
     /// Pending Ember DHT `FIND_NODE` requests awaiting a `FOUND_NODE`,
     /// keyed by `request_id`. The waiter receives the contacts the peer
     /// returned. Bounded by `MAX_EMBER_PENDING_PINGS`.
-    ember_dht_pending_finds: HashMap<u32, (std::time::Instant, oneshot::Sender<Vec<EmberDhtContactInfo>>)>,
+    ember_dht_pending_finds: HashMap<
+        u32,
+        (
+            std::time::Instant,
+            oneshot::Sender<Vec<EmberDhtContactInfo>>,
+        ),
+    >,
     /// Active iterative Ember DHT lookups (slice 4). The state machine
     /// (shortlist, α-parallelism, convergence) lives in `SearchManager`;
     /// the network task drives it by sending `FIND_NODE` frames and
@@ -3736,11 +3744,7 @@ fn maybe_finish_active_search(
     }
 }
 
-fn cancel_search_request(
-    state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
-    request_id: u64,
-) {
+fn cancel_search_request(state: &mut NetworkState, app_handle: &tauri::AppHandle, request_id: u64) {
     // Drop any in-flight Ember DHT keyword lookup bookkeeping and buffered
     // results for this request (slice 10) so a superseded/cancelled search
     // can't later emit stale Ember hits. The underlying `ember_search`
@@ -5519,8 +5523,7 @@ pub async fn start_network(
     // reused when the user flips `ember_native_enabled` on at runtime (see
     // the `UpdateSettings` handlers) so the toggle joins the DHT without a
     // restart.
-    let (ember_boot_tx, mut ember_boot_rx) =
-        mpsc::channel::<Vec<ember::dht::EmberContact>>(1);
+    let (ember_boot_tx, mut ember_boot_rx) = mpsc::channel::<Vec<ember::dht::EmberContact>>(1);
     maybe_spawn_ember_cold_bootstrap(&settings, &state, &ember_boot_tx, "startup");
 
     // Load known files for hash cache
@@ -16636,6 +16639,7 @@ pub async fn start_network(
                         &entries,
                         &[],
                         &[],
+                        &[],
                         "ember-dht",
                     )
                     .await;
@@ -18215,8 +18219,7 @@ async fn handle_ember_native_udp_inner(
     // as the control Ping/Pong but are larger than the 10-byte control
     // frame, so the transport surfaces them here as `app_payload` with
     // the peer's Noise key attached for the reply path.
-    if let (Some(payload), Some(remote_noise_pub)) =
-        (outcome.app_payload, outcome.remote_noise_pub)
+    if let (Some(payload), Some(remote_noise_pub)) = (outcome.app_payload, outcome.remote_noise_pub)
     {
         handle_ember_dht_message(socket, &payload, from, remote_noise_pub, state).await;
     }
@@ -18293,7 +18296,10 @@ async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkState, search
                 match socket.send_to(&packet, contact.addr).await {
                     Ok(_) => true,
                     Err(e) => {
-                        debug!("Ember DHT search {search_id}: send to {} failed: {e}", contact.addr);
+                        debug!(
+                            "Ember DHT search {search_id}: send to {} failed: {e}",
+                            contact.addr
+                        );
                         false
                     }
                 }
@@ -18302,7 +18308,10 @@ async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkState, search
             // queued and will ride out when it completes — treat as sent.
             ember::transport::OutgoingResult::Queued => true,
             ember::transport::OutgoingResult::Error(e) => {
-                debug!("Ember DHT search {search_id}: transport error for {}: {e}", contact.addr);
+                debug!(
+                    "Ember DHT search {search_id}: transport error for {}: {e}",
+                    contact.addr
+                );
                 false
             }
         };
@@ -18317,8 +18326,10 @@ async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkState, search
         }
 
         if search_type == ember::dht::search::SearchType::FindNode {
-            state.ember_diagnostics.ember_dht_find_nodes_sent =
-                state.ember_diagnostics.ember_dht_find_nodes_sent.saturating_add(1);
+            state.ember_diagnostics.ember_dht_find_nodes_sent = state
+                .ember_diagnostics
+                .ember_dht_find_nodes_sent
+                .saturating_add(1);
         }
         state.ember_dht_search_requests.insert(
             wire_req_id,
@@ -18377,8 +18388,12 @@ fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32) {
                 // into connectable sources and queue them for async injection
                 // into the matching download on the next sweep tick.
                 let self_ip = state.external_ip;
-                let sources =
-                    parse_ember_source_records(&records, file_hash, self_ip, &mut state.ember_diagnostics);
+                let sources = parse_ember_source_records(
+                    &records,
+                    file_hash,
+                    self_ip,
+                    &mut state.ember_diagnostics,
+                );
                 if !sources.is_empty() {
                     state
                         .ember_pending_source_injections
@@ -18391,12 +18406,14 @@ fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32) {
                 // + app_handle). Always queued -- even when empty -- so the
                 // sweep clears `ember_pending` and `search-complete` fires.
                 let results = build_ember_keyword_results(&records, &kw.keywords);
-                state.ember_pending_keyword_results.push(EmberKeywordResultBatch {
-                    request_id: kw.request_id,
-                    keywords: kw.keywords,
-                    file_type_filter: kw.file_type_filter,
-                    results,
-                });
+                state
+                    .ember_pending_keyword_results
+                    .push(EmberKeywordResultBatch {
+                        request_id: kw.request_id,
+                        keywords: kw.keywords,
+                        file_type_filter: kw.file_type_filter,
+                        results,
+                    });
             }
         }
     }
@@ -18437,8 +18454,7 @@ fn parse_ember_source_records(
         let Some(sc) = rec.source_contact else {
             continue;
         };
-        diag.ember_dht_source_records_found =
-            diag.ember_dht_source_records_found.saturating_add(1);
+        diag.ember_dht_source_records_found = diag.ember_dht_source_records_found.saturating_add(1);
         // Never inject ourselves, and drop unusable contacts.
         if Some(sc.ip) == self_ip || sc.tcp_port == 0 {
             continue;
@@ -18579,7 +18595,10 @@ async fn drive_ember_publish(socket: &UdpSocket, state: &mut NetworkState, publi
                 match socket.send_to(&packet, contact.addr).await {
                     Ok(_) => true,
                     Err(e) => {
-                        debug!("Ember DHT publish {publish_id}: send to {} failed: {e}", contact.addr);
+                        debug!(
+                            "Ember DHT publish {publish_id}: send to {} failed: {e}",
+                            contact.addr
+                        );
                         false
                     }
                 }
@@ -18587,7 +18606,10 @@ async fn drive_ember_publish(socket: &UdpSocket, state: &mut NetworkState, publi
             // Handshake already in flight; the frame is queued.
             ember::transport::OutgoingResult::Queued => true,
             ember::transport::OutgoingResult::Error(e) => {
-                debug!("Ember DHT publish {publish_id}: transport error for {}: {e}", contact.addr);
+                debug!(
+                    "Ember DHT publish {publish_id}: transport error for {}: {e}",
+                    contact.addr
+                );
                 false
             }
         };
@@ -18741,13 +18763,9 @@ async fn maybe_publish_ember_sources(
         // `ember_file_hash` (content BLAKE3) is deferred for slice 9: discovery
         // keys off the eD2K hash and the c2c transfer verifies integrity, so
         // we publish zeros rather than re-hash the whole library.
-        let record = state.ember_dht.build_source_record(
-            file_hash,
-            [0u8; 32],
-            file_size,
-            &file_name,
-            contact,
-        );
+        let record = state
+            .ember_dht
+            .build_source_record(file_hash, [0u8; 32], file_size, &file_name, contact);
         if let Some(publish_id) = state
             .ember_publish
             .start_publish(record, state.ember_dht.routing())
@@ -18834,13 +18852,9 @@ async fn maybe_publish_ember_keywords(
         for keyword in keywords {
             // `ember_file_hash` (content BLAKE3) is deferred (see
             // `maybe_publish_ember_sources`); keyword lookup doesn't use it.
-            let record = state.ember_dht.build_keyword_record(
-                &keyword,
-                file_hash,
-                [0u8; 32],
-                file_size,
-                &file_name,
-            );
+            let record = state
+                .ember_dht
+                .build_keyword_record(&keyword, file_hash, [0u8; 32], file_size, &file_name);
             if let Some(publish_id) = state
                 .ember_publish
                 .start_publish(record, state.ember_dht.routing())
@@ -18916,11 +18930,10 @@ async fn run_ember_maintenance(
         for (ip, port, noise_pub) in candidates {
             let addr = SocketAddr::new(IpAddr::V4(ip), port);
             let (_wire_req_id, frame) = state.ember_dht.build_ping();
-            let sent = match state.ember_transport.prepare_outgoing(
-                addr,
-                Some(&noise_pub),
-                &frame,
-            ) {
+            let sent = match state
+                .ember_transport
+                .prepare_outgoing(addr, Some(&noise_pub), &frame)
+            {
                 ember::transport::OutgoingResult::Ready { packet }
                 | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
                     match socket.send_to(&packet, addr).await {
@@ -18962,10 +18975,11 @@ async fn run_ember_maintenance(
     //    the table broad and current. The launched searches have no
     //    waiter; their side effect (learning contacts, marking the bucket
     //    active) is the point.
-    let buckets =
-        state
-            .ember_dht
-            .buckets_for_refresh(EMBER_BUCKET_REFRESH_SECS, EMBER_MAINT_MAX_REFRESH, force);
+    let buckets = state.ember_dht.buckets_for_refresh(
+        EMBER_BUCKET_REFRESH_SECS,
+        EMBER_MAINT_MAX_REFRESH,
+        force,
+    );
     for bucket_idx in buckets {
         let target = state.ember_dht.random_target_in_bucket(bucket_idx);
         if let Some(search_id) = state
@@ -19158,27 +19172,27 @@ async fn handle_ember_dht_message(
             continue;
         }
         let (wire_req_id, frame) = state.ember_dht.build_ping();
-        let sent = match state.ember_transport.prepare_outgoing(
-            *oldest_addr,
-            Some(oldest_noise),
-            &frame,
-        ) {
-            ember::transport::OutgoingResult::Ready { packet }
-            | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
-                match socket.send_to(&packet, *oldest_addr).await {
-                    Ok(_) => true,
-                    Err(e) => {
-                        debug!("Ember DHT: bucket-pressure ping to {oldest_addr} failed: {e}");
-                        false
+        let sent =
+            match state
+                .ember_transport
+                .prepare_outgoing(*oldest_addr, Some(oldest_noise), &frame)
+            {
+                ember::transport::OutgoingResult::Ready { packet }
+                | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+                    match socket.send_to(&packet, *oldest_addr).await {
+                        Ok(_) => true,
+                        Err(e) => {
+                            debug!("Ember DHT: bucket-pressure ping to {oldest_addr} failed: {e}");
+                            false
+                        }
                     }
                 }
-            }
-            ember::transport::OutgoingResult::Queued => true,
-            ember::transport::OutgoingResult::Error(e) => {
-                debug!("Ember DHT: transport error pinging oldest {oldest_addr}: {e}");
-                false
-            }
-        };
+                ember::transport::OutgoingResult::Queued => true,
+                ember::transport::OutgoingResult::Error(e) => {
+                    debug!("Ember DHT: transport error pinging oldest {oldest_addr}: {e}");
+                    false
+                }
+            };
         if sent {
             state
                 .ember_dht_maint_pings
@@ -22096,10 +22110,7 @@ async fn handle_command_inner(
             // `search-complete` through `ember_pending`. Uses the longest
             // (most selective) keyword as the DHT key, mirroring KAD; the
             // remaining words are AND-filtered locally at emit time.
-            if run_ember
-                && settings.ember_native_enabled
-                && state.ember_dht.contact_count() > 0
-            {
+            if run_ember && settings.ember_native_enabled && state.ember_dht.contact_count() > 0 {
                 if let Some(primary_keyword) =
                     active_request.keywords.iter().max_by_key(|k| k.len())
                 {
@@ -22131,10 +22142,7 @@ async fn handle_command_inner(
                     && !active_request.udp_pending
                     && !active_request.ember_pending
                 {
-                    let _ = app_handle.emit(
-                        "search-complete",
-                        SearchCompleteEvent { request_id },
-                    );
+                    let _ = app_handle.emit("search-complete", SearchCompleteEvent { request_id });
                     return;
                 }
             }
@@ -22581,13 +22589,12 @@ async fn handle_command_inner(
                 // Mirrors the KAD seed above so the periodic source-retry sweep
                 // schedules the next lookup on the normal backoff instead of
                 // re-firing immediately.
-                let initial_ember_search_started = if settings.ember_native_enabled
-                    && state.ember_dht.contact_count() > 0
-                {
-                    start_ember_source_search(socket, state, &transfer_id, hash_bytes).await
-                } else {
-                    false
-                };
+                let initial_ember_search_started =
+                    if settings.ember_native_enabled && state.ember_dht.contact_count() > 0 {
+                        start_ember_source_search(socket, state, &transfer_id, hash_bytes).await
+                    } else {
+                        false
+                    };
                 state.ember_source_search_state.insert(
                     transfer_id.clone(),
                     (now_ts, if initial_ember_search_started { 1 } else { 0 }),
@@ -23082,8 +23089,7 @@ async fn handle_command_inner(
             diag.local_noise_public_key =
                 hex::encode(state.ember_transport.local_noise_public_key());
             diag.ember_dht_node_id = state.ember_dht.local_id().to_hex();
-            diag.local_ed25519_public_key =
-                hex::encode(state.ember_dht.ed25519_public_key());
+            diag.local_ed25519_public_key = hex::encode(state.ember_dht.ed25519_public_key());
             diag.ember_dht_contacts = state.ember_dht.contact_count() as u32;
             diag.ember_dht_active_searches = state.ember_search.active_count() as u32;
             let (store_keys, store_records) = state.ember_dht.store_stats();
@@ -23200,7 +23206,12 @@ async fn handle_command_inner(
             let _ = tx.send(Ok(EmberPingPending { pong_rx }));
         }
 
-        NetworkCommand::AddEmberDhtContact { addr, ed25519_pub, noise_pub, tx } => {
+        NetworkCommand::AddEmberDhtContact {
+            addr,
+            ed25519_pub,
+            noise_pub,
+            tx,
+        } => {
             // Derive the node ID from the supplied Ed25519 key so the
             // contact is self-consistent (`node_id == BLAKE3(pub)[..16]`)
             // exactly like one learned from a signed frame. A key that
@@ -23240,7 +23251,11 @@ async fn handle_command_inner(
             let _ = tx.send(contacts);
         }
 
-        NetworkCommand::SendEmberDhtPing { addr, peer_pubkey, tx } => {
+        NetworkCommand::SendEmberDhtPing {
+            addr,
+            peer_pubkey,
+            tx,
+        } => {
             // Same feature gate and Noise-key resolution as
             // SendEmberPing, but the frame is a signed DHT PING — so a
             // successful round trip also seeds both routing tables.
@@ -23303,8 +23318,10 @@ async fn handle_command_inner(
                 }
             }
 
-            state.ember_diagnostics.ember_dht_pings_sent =
-                state.ember_diagnostics.ember_dht_pings_sent.saturating_add(1);
+            state.ember_diagnostics.ember_dht_pings_sent = state
+                .ember_diagnostics
+                .ember_dht_pings_sent
+                .saturating_add(1);
 
             let (pong_tx, pong_rx) = oneshot::channel();
             state
@@ -23314,7 +23331,12 @@ async fn handle_command_inner(
             let _ = tx.send(Ok(EmberPingPending { pong_rx }));
         }
 
-        NetworkCommand::SendEmberDhtFindNode { addr, peer_pubkey, target, tx } => {
+        NetworkCommand::SendEmberDhtFindNode {
+            addr,
+            peer_pubkey,
+            target,
+            tx,
+        } => {
             // Single-hop FIND_NODE: ask one peer for the k contacts it
             // knows closest to `target`, and hand the answer back to the
             // dev panel. Same feature gate and Noise-key resolution as
@@ -23383,8 +23405,10 @@ async fn handle_command_inner(
                 }
             }
 
-            state.ember_diagnostics.ember_dht_find_nodes_sent =
-                state.ember_diagnostics.ember_dht_find_nodes_sent.saturating_add(1);
+            state.ember_diagnostics.ember_dht_find_nodes_sent = state
+                .ember_diagnostics
+                .ember_dht_find_nodes_sent
+                .saturating_add(1);
 
             let (contacts_tx, contacts_rx) = oneshot::channel();
             state
@@ -23418,7 +23442,9 @@ async fn handle_command_inner(
             };
 
             let (contacts_tx, contacts_rx) = oneshot::channel();
-            state.ember_dht_pending_lookups.insert(search_id, contacts_tx);
+            state
+                .ember_dht_pending_lookups
+                .insert(search_id, contacts_tx);
             let _ = tx.send(Ok(EmberDhtLookupPending { contacts_rx }));
 
             // Kick off the first round (and resolve immediately if the
@@ -23441,13 +23467,9 @@ async fn handle_command_inner(
             // Sign the record with our DHT identity. `ember_file_hash` is
             // not used by keyword lookup, so a dev-published record leaves
             // it zeroed.
-            let record = state.ember_dht.build_keyword_record(
-                &keyword,
-                file_hash,
-                [0u8; 32],
-                file_size,
-                &file_name,
-            );
+            let record = state
+                .ember_dht
+                .build_keyword_record(&keyword, file_hash, [0u8; 32], file_size, &file_name);
             let key_hex = hex::encode(record.keyword_hash);
 
             let publish_id = match state

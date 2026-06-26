@@ -714,7 +714,10 @@ mod tests {
         // Exactly one StartRelay should have been emitted.
         let first = rx.recv().await;
         assert!(matches!(first, Some(BrokerEvent::StartRelay { .. })));
-        assert!(rx.try_recv().is_err(), "duplicate punch_failed emitted a second event");
+        assert!(
+            rx.try_recv().is_err(),
+            "duplicate punch_failed emitted a second event"
+        );
 
         // And the failure was counted once, with a single relay attempt.
         let stats = broker.stats();
@@ -728,11 +731,11 @@ mod tests {
         let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
 
         let bad_targets = [
-            (Ipv4Addr::new(10, 20, 30, 40), 0u16),     // port 0
-            (Ipv4Addr::UNSPECIFIED, 4662),             // 0.0.0.0
-            (Ipv4Addr::LOCALHOST, 4662),               // 127.0.0.1
-            (Ipv4Addr::BROADCAST, 4662),               // 255.255.255.255
-            (Ipv4Addr::new(224, 0, 0, 1), 4662),       // multicast
+            (Ipv4Addr::new(10, 20, 30, 40), 0u16), // port 0
+            (Ipv4Addr::UNSPECIFIED, 4662),         // 0.0.0.0
+            (Ipv4Addr::LOCALHOST, 4662),           // 127.0.0.1
+            (Ipv4Addr::BROADCAST, 4662),           // 255.255.255.255
+            (Ipv4Addr::new(224, 0, 0, 1), 4662),   // multicast
         ];
 
         for (i, (ip, port)) in bad_targets.iter().enumerate() {

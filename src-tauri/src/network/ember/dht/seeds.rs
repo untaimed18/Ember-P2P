@@ -95,8 +95,10 @@ mod tests {
         let text = format!("{good}\n203.0.113.11:4772 deadbeef tooshort\n");
         let parsed = parse_seeds(&text);
         assert_eq!(parsed.len(), 2);
-        let contacts: Vec<EmberContact> =
-            parsed.iter().filter_map(BootstrapNode::to_contact).collect();
+        let contacts: Vec<EmberContact> = parsed
+            .iter()
+            .filter_map(BootstrapNode::to_contact)
+            .collect();
         assert_eq!(contacts.len(), 1);
         assert_eq!(contacts[0].ed25519_pub, ed);
         assert_eq!(contacts[0].addr, "203.0.113.10:4772".parse().unwrap());

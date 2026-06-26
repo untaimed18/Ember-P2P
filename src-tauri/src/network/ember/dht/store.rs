@@ -346,7 +346,10 @@ mod tests {
 
         // Freshly stored ⇒ not due within a long interval.
         let due = store.take_republish_batch(Duration::from_secs(3600), 10, false);
-        assert!(due.is_empty(), "a just-stored record is not due for republish");
+        assert!(
+            due.is_empty(),
+            "a just-stored record is not due for republish"
+        );
 
         // `force` overrides the interval and returns it.
         let forced = store.take_republish_batch(Duration::from_secs(3600), 10, true);
@@ -380,7 +383,11 @@ mod tests {
 
         // Even with `force`, only the non-source record is handed back.
         let batch = store.take_republish_batch(Duration::from_secs(0), 10, true);
-        assert_eq!(batch.len(), 1, "source records must be excluded from republish");
+        assert_eq!(
+            batch.len(),
+            1,
+            "source records must be excluded from republish"
+        );
         assert_eq!(batch[0].0, kw);
     }
 

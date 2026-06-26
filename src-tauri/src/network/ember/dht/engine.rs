@@ -99,7 +99,9 @@ impl EmberDht {
     /// every Ember subsystem agrees on who we are.
     pub fn new(ed25519_secret_key: [u8; 32]) -> Self {
         let signing_key = crypto::signing_key_from_bytes(&ed25519_secret_key);
-        let local_id = EmberNodeId(crypto::node_id_from_public_key(&signing_key.verifying_key()));
+        let local_id = EmberNodeId(crypto::node_id_from_public_key(
+            &signing_key.verifying_key(),
+        ));
         Self {
             routing: RoutingTable::new(local_id),
             store: DhtStore::new(),
@@ -425,9 +427,10 @@ impl EmberDht {
             }
             DhtPayload::FindNode { target } => {
                 out.find_node_received = true;
-                let closest = self.routing.find_closest(&target, MAX_CONTACTS_PER_RESPONSE);
-                let found =
-                    messages::build_found_node(self.local_id, msg.request_id, closest);
+                let closest = self
+                    .routing
+                    .find_closest(&target, MAX_CONTACTS_PER_RESPONSE);
+                let found = messages::build_found_node(self.local_id, msg.request_id, closest);
                 out.responses
                     .push(messages::encode_message(&found, &self.signing_key, true));
             }
@@ -521,12 +524,8 @@ impl EmberDht {
                                 b
                             })
                             .collect();
-                        let fv = messages::build_found_value(
-                            self.local_id,
-                            msg.request_id,
-                            *key,
-                            blobs,
-                        );
+                        let fv =
+                            messages::build_found_value(self.local_id, msg.request_id, *key, blobs);
                         out.responses
                             .push(messages::encode_message(&fv, &self.signing_key, true));
                         answered = true;
@@ -538,9 +537,10 @@ impl EmberDht {
                         .first()
                         .map(|k| EmberNodeId(*k))
                         .unwrap_or(self.local_id);
-                    let closest = self.routing.find_closest(&target, MAX_CONTACTS_PER_RESPONSE);
-                    let found =
-                        messages::build_found_node(self.local_id, msg.request_id, closest);
+                    let closest = self
+                        .routing
+                        .find_closest(&target, MAX_CONTACTS_PER_RESPONSE);
+                    let found = messages::build_found_node(self.local_id, msg.request_id, closest);
                     out.responses
                         .push(messages::encode_message(&found, &self.signing_key, true));
                 }
@@ -608,7 +608,11 @@ mod tests {
         // B's PONG comes back to A.
         let on_a = a.handle_message(&on_b.responses[0], b_addr, b_noise, 1001);
         assert!(on_a.pong_received, "A should see a PONG");
-        assert_eq!(on_a.pong_request_id, Some(rid), "PONG must echo A's request id");
+        assert_eq!(
+            on_a.pong_request_id,
+            Some(rid),
+            "PONG must echo A's request id"
+        );
         assert!(on_a.learned_contact, "A should learn B");
         assert_eq!(a.contact_count(), 1);
 
@@ -735,7 +739,10 @@ mod tests {
         let key = record.keyword_hash;
         let (_rid, store_bytes) = a.build_store(key, record.data.clone(), record.signature);
         let on_b = b.handle_message(&store_bytes, a_addr, a_noise, 1000);
-        assert!(on_b.stored_record, "B should accept a source record from A's own IP");
+        assert!(
+            on_b.stored_record,
+            "B should accept a source record from A's own IP"
+        );
         assert_eq!(b.store_stats(), (1, 1));
 
         // B serves it back on FIND_VALUE and the embedded contact survives the
@@ -764,8 +771,14 @@ mod tests {
         let key = record.keyword_hash;
         let (_rid, store_bytes) = a.build_store(key, record.data.clone(), record.signature);
         let on_b = b.handle_message(&store_bytes, a_addr, a_noise, 1000);
-        assert!(!on_b.stored_record, "claimed IP != sender IP must be rejected");
-        assert!(on_b.responses.is_empty(), "no STORE_ACK on reflection rejection");
+        assert!(
+            !on_b.stored_record,
+            "claimed IP != sender IP must be rejected"
+        );
+        assert!(
+            on_b.responses.is_empty(),
+            "no STORE_ACK on reflection rejection"
+        );
         assert_eq!(b.store_stats(), (0, 0));
     }
 
@@ -853,7 +866,11 @@ mod tests {
         assert!(on_b.error.is_some(), "signature check must fail");
         assert!(!on_b.ping_received);
         assert!(on_b.responses.is_empty());
-        assert_eq!(b.contact_count(), 0, "a forged frame must not seed the table");
+        assert_eq!(
+            b.contact_count(),
+            0,
+            "a forged frame must not seed the table"
+        );
     }
 
     #[test]

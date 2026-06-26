@@ -97,7 +97,10 @@ impl NoiseSession {
         buf[1] = EMBER_MAGIC[1];
         buf[2] = PKT_TRANSPORT;
         buf[HEADER_LEN..HEADER_LEN + 8].copy_from_slice(&nonce.to_le_bytes());
-        match self.transport.write_message(nonce, message, &mut buf[HEADER_LEN + 8..]) {
+        match self
+            .transport
+            .write_message(nonce, message, &mut buf[HEADER_LEN + 8..])
+        {
             Ok(len) => {
                 self.send_nonce = self.send_nonce.wrapping_add(1);
                 buf.truncate(HEADER_LEN + 8 + len);
@@ -1096,7 +1099,10 @@ impl EmberTransport {
         }
 
         let mut payload_buf = vec![0u8; ciphertext.len()];
-        match session.transport.read_message(nonce, ciphertext, &mut payload_buf) {
+        match session
+            .transport
+            .read_message(nonce, ciphertext, &mut payload_buf)
+        {
             Ok(len) => {
                 // Commit the nonce to the replay window only now that AEAD has
                 // authenticated it.
@@ -1260,7 +1266,9 @@ mod tests {
             _ => panic!("expected HandshakeStarted"),
         };
         let resp = match bob.process_incoming(&init, alice_addr) {
-            IncomingResult::HandshakeComplete { packets_to_send, .. } => packets_to_send,
+            IncomingResult::HandshakeComplete {
+                packets_to_send, ..
+            } => packets_to_send,
             _ => panic!("expected HandshakeComplete (responder)"),
         };
         match alice.process_incoming(&resp[0], bob_addr) {
@@ -1285,11 +1293,7 @@ mod tests {
         let p3 = seal_ready(&mut alice, bob_addr, b"three");
 
         // Deliver out of order: p3, p1, p2 — the sliding window accepts all.
-        for (pkt, expect) in [
-            (&p3, &b"three"[..]),
-            (&p1, &b"one"[..]),
-            (&p2, &b"two"[..]),
-        ] {
+        for (pkt, expect) in [(&p3, &b"three"[..]), (&p1, &b"one"[..]), (&p2, &b"two"[..])] {
             match bob.process_incoming(pkt, alice_addr) {
                 IncomingResult::Message { payload, .. } => assert_eq!(payload, expect),
                 _ => panic!("expected Message for reordered packet"),

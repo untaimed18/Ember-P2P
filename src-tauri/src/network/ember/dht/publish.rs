@@ -134,8 +134,9 @@ impl SignedRecord {
         let name_bytes = file_name.as_bytes();
         let name_len = name_bytes.len().min(u16::MAX as usize);
 
-        let mut data =
-            Vec::with_capacity(1 + 16 + 16 + 32 + 8 + 32 + 8 + 2 + name_len + SOURCE_CONTACT_WIRE_LEN);
+        let mut data = Vec::with_capacity(
+            1 + 16 + 16 + 32 + 8 + 32 + 8 + 2 + name_len + SOURCE_CONTACT_WIRE_LEN,
+        );
         data.push(record_type);
         data.extend_from_slice(&keyword_hash);
         data.extend_from_slice(&file_hash);

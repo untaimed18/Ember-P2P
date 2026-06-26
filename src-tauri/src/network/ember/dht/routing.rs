@@ -218,7 +218,10 @@ impl RoutingTable {
 
         match chosen {
             Some(i) => {
-                let replacement = self.buckets[bucket_idx].replacement_cache.remove(i).unwrap();
+                let replacement = self.buckets[bucket_idx]
+                    .replacement_cache
+                    .remove(i)
+                    .unwrap();
                 let new_subnet = replacement.subnet_key();
                 *self.global_subnet_count.entry(new_subnet).or_insert(0) += 1;
                 debug!(
