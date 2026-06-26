@@ -96,34 +96,13 @@ pub fn hashed_id(ember_hash: &[u8; 16]) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn client() -> reqwest::Client {
-    // L10: previously the failure branch silently fell back to a
-    // bare `reqwest::Client::new()`, dropping `https_only(true)`
-    // and `no_proxy()`. Those flags are the defense-in-depth that
-    // stops a misconfigured proxy from MITM-ing the rendezvous
-    // control plane and a redirect from steering us onto plain
-    // HTTP. The builder ~never fails on supported platforms; if it
-    // ever does, panicking is preferable to a silent downgrade
-    // because the call sites all require the secure posture (the
-    // `require_https` URL check guards the scheme; the client
-    // flags guard redirects + proxies).
+fn client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .no_proxy()
         .https_only(true)
         .build()
-        .unwrap_or_else(|e| {
-            warn!("Failed to build hardened rendezvous HTTP client: {e}; this should be impossible — falling back to a still-https-only default");
-            // Even the fallback enforces https_only via the URL
-            // check at call sites (`require_https`). We keep this
-            // arm only because `unwrap_or_else` requires returning
-            // a `Client`; in practice it is unreachable.
-            reqwest::Client::builder()
-                .timeout(REQUEST_TIMEOUT)
-                .https_only(true)
-                .build()
-                .expect("rendezvous HTTP client builder failed twice")
-        })
+        .map_err(|e| format!("failed to build hardened rendezvous HTTP client: {e}"))
 }
 
 /// Reject non-HTTPS rendezvous URLs before we send any traffic. The
@@ -232,7 +211,7 @@ pub async fn register(
     if let (Some(_), Some(ep)) = (noise_pub, ember_port.filter(|p| *p != 0)) {
         body["ember_port"] = serde_json::Value::from(ep);
     }
-    let resp = client()
+    let resp = client()?
         .post(&url)
         .json(&body)
         .send()
@@ -271,7 +250,7 @@ pub async fn lookup(
     require_https(base_url)?;
     let id = hashed_id(friend_hash);
     let url = format!("{}/lookup/{}", base_url.trim_end_matches('/'), id);
-    let resp = client()
+    let resp = client()?
         .get(&url)
         .send()
         .await
@@ -408,7 +387,7 @@ pub async fn unregister(
     let id_raw = sha256_id_raw(ember_hash);
     let ts = current_timestamp();
     let sig = sign_unregister(secret_key, &id_raw, ts);
-    let resp = client()
+    let resp = client()?
         .delete(&url)
         .json(&serde_json::json!({
             "id": id,

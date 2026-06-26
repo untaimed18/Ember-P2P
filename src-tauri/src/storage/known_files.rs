@@ -530,7 +530,15 @@ impl KnownFileList {
             )?;
 
             buf.write_all(&record.file_hash)?;
-            let part_count = record.part_hashes.len().min(u16::MAX as usize);
+            let part_count = record.part_hashes.len();
+            if part_count > u16::MAX as usize {
+                anyhow::bail!(
+                    "known.met cannot encode {} part hashes for {} (max {})",
+                    part_count,
+                    record.file_path,
+                    u16::MAX
+                );
+            }
             buf.write_u16::<LittleEndian>(part_count as u16)?;
             for ph in &record.part_hashes {
                 buf.write_all(ph)?;

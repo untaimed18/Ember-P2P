@@ -33,6 +33,7 @@ const MAX_ACTIVE_ATTEMPTS: usize = 8;
 const PUNCH_TIMEOUT: Duration = Duration::from_secs(20);
 const RELAY_TIMEOUT: Duration = Duration::from_secs(30);
 const ATTEMPT_COOLDOWN: Duration = Duration::from_secs(120);
+const ATTEMPT_RESET: Duration = Duration::from_secs(600);
 const MAX_ATTEMPTS_PER_SOURCE: u32 = 3;
 
 /// Outcome of a successful broker connection attempt.
@@ -248,20 +249,25 @@ impl ConnectionBroker {
         let source_key = (source_ip, source_port);
 
         // Check cooldown
+        let mut cooldown_count = 0;
         if let Some((last, count)) = self.cooldowns.get(&source_key) {
-            if last.elapsed() < ATTEMPT_COOLDOWN {
+            let elapsed = last.elapsed();
+            if elapsed < ATTEMPT_COOLDOWN {
                 debug!(
                     "Broker: source {}:{} is in cooldown ({} previous attempts)",
                     source_ip, source_port, count
                 );
                 return false;
             }
-            if *count >= MAX_ATTEMPTS_PER_SOURCE {
+            if *count >= MAX_ATTEMPTS_PER_SOURCE && elapsed < ATTEMPT_RESET {
                 debug!(
                     "Broker: source {}:{} exceeded max attempts",
                     source_ip, source_port
                 );
                 return false;
+            }
+            if elapsed < ATTEMPT_RESET {
+                cooldown_count = *count;
             }
         }
 
@@ -276,11 +282,6 @@ impl ConnectionBroker {
         }
 
         let now = Instant::now();
-        let cooldown_count = self
-            .cooldowns
-            .get(&source_key)
-            .map(|(_, c)| *c)
-            .unwrap_or(0);
         self.cooldowns.insert(source_key, (now, cooldown_count + 1));
 
         // Decide starting phase based on NAT type
@@ -503,7 +504,7 @@ impl ConnectionBroker {
 
         // Prune old cooldowns
         self.cooldowns
-            .retain(|_, (ts, _)| ts.elapsed() < Duration::from_secs(600));
+            .retain(|_, (ts, _)| ts.elapsed() < ATTEMPT_RESET);
     }
 
     #[allow(dead_code)]
