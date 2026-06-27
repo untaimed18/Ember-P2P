@@ -13,6 +13,11 @@ use tracing::{debug, info};
 const MAX_SERVER_TAG_NAME_LEN: usize = 256;
 const MAX_SERVER_TAG_STR_LEN: usize = 4096;
 const MAX_SERVER_MET_BYTES: u64 = 64 * 1024 * 1024;
+const ST_UDPFLAGS: u8 = 0x92;
+const ST_UDPKEY: u8 = 0x95;
+const ST_UDPKEYIP: u8 = 0x96;
+const ST_TCPPORTOBFUSCATION: u8 = 0x97;
+const ST_UDPPORTOBFUSCATION: u8 = 0x98;
 
 #[derive(Debug, Clone, Default)]
 pub struct ServerMergeStats {
@@ -21,7 +26,6 @@ pub struct ServerMergeStats {
     pub filtered: usize,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddServerOutcome {
     Added,
@@ -63,6 +67,10 @@ pub struct ServerEntry {
     /// directions (send key uses CLIENTSERVER magic, recv key uses
     /// SERVERCLIENT magic; see `server_obfuscation.rs`).
     pub server_udp_key: u32,
+    /// Public IPv4 the UDP obfuscation key was issued for (ST_UDPKEYIP).
+    /// eMule binds server UDP keys to the current public IP; a key learned
+    /// before an IP change must be discarded instead of reused.
+    pub server_udp_key_ip: u32,
     /// Number of UDP source-discovery queries (`OP_GLOBGETSOURCES` /
     /// `OP_GLOBGETSOURCES2`) we've sent to this server since the last
     /// time it sent us *any* UDP reply. Reset to 0 on any inbound UDP
@@ -107,7 +115,6 @@ pub struct ServerEntry {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerPriority {
-    #[allow(dead_code)]
     Low,
     Normal,
     High,
@@ -134,6 +141,7 @@ impl ServerEntry {
             obfuscation_port_udp: 0,
             udp_flags: 0,
             server_udp_key: 0,
+            server_udp_key_ip: 0,
             udp_consecutive_failures: 0,
             last_udp_reply_at: 0,
             last_udp_source_reply_at: 0,
@@ -142,7 +150,6 @@ impl ServerEntry {
     }
 }
 
-#[allow(dead_code)]
 fn apply_server_int_tag(entry: &mut ServerEntry, name_id: u8, v: u32) {
     match name_id {
         0x0D | 0x85 => entry.fail_count = v,
@@ -161,7 +168,11 @@ fn apply_server_int_tag(entry: &mut ServerEntry, name_id: u8, v: u32) {
         0x88 => entry.soft_files = v,
         0x89 => entry.hard_files = v,
         0x8A => entry.is_static = v != 0,
-        0x97 | 0xF1 => entry.obfuscation_port_tcp = v as u16,
+        ST_UDPFLAGS => entry.udp_flags = v,
+        ST_UDPKEY => entry.server_udp_key = v,
+        ST_UDPKEYIP => entry.server_udp_key_ip = v,
+        ST_TCPPORTOBFUSCATION | 0xF1 => entry.obfuscation_port_tcp = v as u16,
+        ST_UDPPORTOBFUSCATION => entry.obfuscation_port_udp = v as u16,
         // Ember-private tags persisted by `save_server_met` for UDP
         // obfuscation state. Fresh server.met files from eMule won't
         // carry these (so the fields stay 0 until the first status
@@ -187,7 +198,6 @@ pub struct ServerList {
     needs_sort: bool,
 }
 
-#[allow(dead_code)]
 impl ServerList {
     pub fn new() -> Self {
         Self {
@@ -645,10 +655,12 @@ impl ServerList {
                         apply_server_int_tag(&mut entry, name_id, v);
                     }
                     0x08 => {
-                        let _ = cursor.read_u16::<LittleEndian>();
+                        let v = cursor.read_u16::<LittleEndian>()?;
+                        apply_server_int_tag(&mut entry, name_id, v as u32);
                     }
                     0x09 => {
-                        let _ = cursor.read_u8();
+                        let v = cursor.read_u8()?;
+                        apply_server_int_tag(&mut entry, name_id, v as u32);
                     }
                     // Unknown tag type: bail the whole load. The
                     // tag's payload size depends on its type so we
@@ -803,16 +815,24 @@ impl ServerList {
                         apply_server_int_tag(&mut entry, name_id, v);
                     }
                     0x08 => {
-                        if cursor.read_u16::<LittleEndian>().is_err() {
-                            unknown_tag = true;
-                            break;
-                        }
+                        let v = match cursor.read_u16::<LittleEndian>() {
+                            Ok(v) => v,
+                            Err(_) => {
+                                unknown_tag = true;
+                                break;
+                            }
+                        };
+                        apply_server_int_tag(&mut entry, name_id, v as u32);
                     }
                     0x09 => {
-                        if cursor.read_u8().is_err() {
-                            unknown_tag = true;
-                            break;
-                        }
+                        let v = match cursor.read_u8() {
+                            Ok(v) => v,
+                            Err(_) => {
+                                unknown_tag = true;
+                                break;
+                            }
+                        };
+                        apply_server_int_tag(&mut entry, name_id, v as u32);
                     }
                     other => {
                         debug!(
@@ -867,6 +887,9 @@ impl ServerList {
                 }
                 if entry.server_udp_key != 0 {
                     existing.server_udp_key = entry.server_udp_key;
+                }
+                if entry.server_udp_key_ip != 0 {
+                    existing.server_udp_key_ip = entry.server_udp_key_ip;
                 }
                 if entry.udp_flags != 0 {
                     existing.udp_flags = entry.udp_flags;
@@ -967,12 +990,23 @@ impl ServerList {
         port: u16,
         obfuscation_port_udp: u16,
         server_udp_key: u32,
+        public_ip: Option<Ipv4Addr>,
     ) {
         if let Some(entry) = self
             .servers
             .iter_mut()
             .find(|s| s.ip == ip && s.port == port)
         {
+            if let Some(public_ip) = public_ip {
+                let public_ip_u32 = u32::from(public_ip);
+                if entry.server_udp_key_ip != 0 && entry.server_udp_key_ip != public_ip_u32 {
+                    entry.server_udp_key = 0;
+                    tracing::info!(
+                        "Discarded stale UDP obfuscation key for server {ip}:{port} after public IP changed",
+                    );
+                }
+                entry.server_udp_key_ip = public_ip_u32;
+            }
             if obfuscation_port_udp != 0 {
                 entry.obfuscation_port_udp = obfuscation_port_udp;
             }
@@ -981,6 +1015,21 @@ impl ServerList {
                     "Learned UDP obfuscation key for server {ip}:{port} (key={server_udp_key:#x}, obf_port={obfuscation_port_udp})",
                 );
                 entry.server_udp_key = server_udp_key;
+                if let Some(public_ip) = public_ip {
+                    entry.server_udp_key_ip = u32::from(public_ip);
+                }
+            }
+        }
+    }
+
+    pub fn invalidate_udp_keys_for_public_ip(&mut self, public_ip: Option<Ipv4Addr>) {
+        let Some(public_ip) = public_ip else {
+            return;
+        };
+        let public_ip_u32 = u32::from(public_ip);
+        for entry in &mut self.servers {
+            if entry.server_udp_key != 0 && entry.server_udp_key_ip != public_ip_u32 {
+                entry.server_udp_key = 0;
             }
         }
     }
@@ -1187,40 +1236,39 @@ impl ServerList {
                 tag_count += 1;
             }
 
-            // Obfuscation TCP port (0xF1)
+            // ST_TCPPORTOBFUSCATION (0x97) - uint16
             if entry.obfuscation_port_tcp > 0 {
-                write_met_uint32_tag(&mut tag_buf, 0xF1, entry.obfuscation_port_tcp as u32);
+                write_met_uint16_tag(
+                    &mut tag_buf,
+                    ST_TCPPORTOBFUSCATION,
+                    entry.obfuscation_port_tcp,
+                );
                 tag_count += 1;
             }
 
-            // UDP obfuscation port (Ember-private tag 0xF2). Persisted
-            // alongside `server_udp_key` so we don't have to wait for
-            // the next status ping after a restart before we can talk
-            // obfuscated UDP. eMule's stock server.met format doesn't
-            // include this — we use a private tag id in the eMule
-            // private range (0xF0+); other clients ignore it.
+            // ST_UDPPORTOBFUSCATION (0x98) - uint16
             if entry.obfuscation_port_udp > 0 {
-                write_met_uint32_tag(&mut tag_buf, 0xF2, entry.obfuscation_port_udp as u32);
+                write_met_uint16_tag(
+                    &mut tag_buf,
+                    ST_UDPPORTOBFUSCATION,
+                    entry.obfuscation_port_udp,
+                );
                 tag_count += 1;
             }
 
-            // Per-server UDP obfuscation BaseKey (Ember-private 0xF3).
-            // Stored as a u32 tag. Like the port above, persisting
-            // means a fresh-start client can immediately use UDP
-            // obfuscation against servers it has previously talked
-            // to. Without this, every restart silently sends
-            // plaintext for the first 30 seconds (until the next
-            // status ping).
+            // ST_UDPKEY (0x95) and ST_UDPKEYIP (0x96) - uint32
             if entry.server_udp_key != 0 {
-                write_met_uint32_tag(&mut tag_buf, 0xF3, entry.server_udp_key);
+                write_met_uint32_tag(&mut tag_buf, ST_UDPKEY, entry.server_udp_key);
                 tag_count += 1;
+                if entry.server_udp_key_ip != 0 {
+                    write_met_uint32_tag(&mut tag_buf, ST_UDPKEYIP, entry.server_udp_key_ip);
+                    tag_count += 1;
+                }
             }
 
-            // UDP capability flags (Ember-private 0xF4). Same
-            // rationale: avoid losing learned capability bits across
-            // restarts.
+            // ST_UDPFLAGS (0x92) - uint32
             if entry.udp_flags != 0 {
-                write_met_uint32_tag(&mut tag_buf, 0xF4, entry.udp_flags);
+                write_met_uint32_tag(&mut tag_buf, ST_UDPFLAGS, entry.udp_flags);
                 tag_count += 1;
             }
 
@@ -1270,6 +1318,13 @@ fn write_met_string_tag(buf: &mut Vec<u8>, tag_id: u8, value: &str) {
 
 fn write_met_uint32_tag(buf: &mut Vec<u8>, tag_id: u8, value: u32) {
     buf.push(0x03); // TAGTYPE_UINT32
+    buf.extend_from_slice(&1u16.to_le_bytes()); // name length = 1
+    buf.push(tag_id);
+    buf.extend_from_slice(&value.to_le_bytes());
+}
+
+fn write_met_uint16_tag(buf: &mut Vec<u8>, tag_id: u8, value: u16) {
+    buf.push(0x08); // TAGTYPE_UINT16
     buf.extend_from_slice(&1u16.to_le_bytes()); // name length = 1
     buf.push(tag_id);
     buf.extend_from_slice(&value.to_le_bytes());

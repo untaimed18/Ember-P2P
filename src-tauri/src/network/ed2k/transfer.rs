@@ -38,7 +38,7 @@ pub(super) fn is_filtered_source_ip(ip: &std::net::Ipv4Addr) -> bool {
 }
 
 /// Convert parsed EPX result into the flattened vectors used by DownloadEvent.
-pub(super) fn epx_result_to_entries(
+pub(crate) fn epx_result_to_entries(
     result: &crate::network::ember::ExchangeResult,
 ) -> (
     Vec<([u8; 16], Vec<(std::net::Ipv4Addr, u16, u16, u8)>)>,
@@ -66,7 +66,6 @@ pub(super) fn epx_result_to_entries(
 
 #[derive(Debug)]
 struct PendingCompressedBlock {
-    #[allow(dead_code)]
     compressed_total_size: u32,
     compressed: Vec<u8>,
 }
@@ -104,7 +103,6 @@ pub struct Ed2kDownload {
     /// patch that introduces the packet-buffering
     /// `perform_ember_auth` wrapper on the download side can sign
     /// peer challenges without another plumbing pass.
-    #[allow(dead_code)]
     pub ed25519_secret_key: [u8; 32],
     /// Our nickname for friend request messages
     pub our_nickname: String,

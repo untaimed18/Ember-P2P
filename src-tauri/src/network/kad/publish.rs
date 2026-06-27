@@ -71,7 +71,7 @@ pub struct PublishManager {
     local_id: KadId,
     user_hash: [u8; 16],
     tcp_port: u16,
-    udp_port: u16,
+    pub(crate) udp_port: u16,
     /// Local Ember Noise X25519 static public key. Emitted in source
     /// publishes via [`EMBER_NOISE_PUB_TAG`] so other Ember peers can
     /// learn how to dial our Ember-native transport without manual
@@ -294,12 +294,10 @@ impl PublishManager {
             name: TagName::Id(TAG_SOURCEPORT),
             value: TagValue::Uint16(self.tcp_port),
         });
-        if !self.use_extern_kad_port {
-            tags.push(KadTag {
-                name: TagName::Id(TAG_SOURCEUPORT),
-                value: TagValue::Uint16(self.udp_port),
-            });
-        }
+        tags.push(KadTag {
+            name: TagName::Id(TAG_SOURCEUPORT),
+            value: TagValue::Uint16(self.udp_port),
+        });
 
         if self.firewalled {
             if self.direct_udp_callback {

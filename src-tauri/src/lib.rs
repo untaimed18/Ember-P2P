@@ -822,6 +822,7 @@ pub fn run() {
             commands::peers::ember_dht_publish_keyword,
             commands::peers::ember_dht_find_value,
             commands::peers::ember_dht_run_maintenance,
+            commands::peers::ember_request_sources,
             commands::settings::get_settings,
             commands::settings::update_settings,
             commands::settings::download_nodes_dat,

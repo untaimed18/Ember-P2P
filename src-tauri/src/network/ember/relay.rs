@@ -11,12 +11,8 @@ use tracing::{debug, info};
 const MSG_RELAY_REQUEST: u8 = 0x01;
 const MSG_RELAY_ACCEPT: u8 = 0x02;
 const MSG_RELAY_CONNECT: u8 = 0x03;
-#[allow(dead_code)]
-const MSG_RELAY_DATA: u8 = 0x04;
 const MSG_RELAY_CLOSE: u8 = 0x05;
 const MSG_RELAY_REJECT: u8 = 0x06;
-
-const MAX_RELAY_DATA_SIZE: usize = 16384;
 
 /// Build a hardened reqwest client for relay/punch HTTP calls.
 ///
@@ -109,17 +105,11 @@ const RELAY_MAX_DURATION: Duration = Duration::from_secs(7200);
 /// A relay session between two LowID peers through an intermediary.
 #[derive(Debug)]
 pub struct RelaySession {
-    #[allow(dead_code)]
     pub session_id: u32,
-    #[allow(dead_code)]
     pub initiator_ip: Ipv4Addr,
-    #[allow(dead_code)]
     pub initiator_port: u16,
-    #[allow(dead_code)]
     pub target_ip: Ipv4Addr,
-    #[allow(dead_code)]
     pub target_port: u16,
-    #[allow(dead_code)]
     pub file_hash: [u8; 16],
     pub state: RelaySessionState,
     pub created: Instant,
@@ -133,8 +123,6 @@ pub enum RelaySessionState {
     WaitingForTarget,
     /// Both peers connected; actively relaying data.
     Active,
-    #[allow(dead_code)]
-    Closing,
 }
 
 impl RelaySession {
@@ -174,6 +162,22 @@ impl RelaySession {
     pub fn add_relayed_bytes(&mut self, count: usize) {
         self.bytes_relayed += count as u64;
         self.last_activity = Instant::now();
+    }
+
+    /// One-line routing description used in relay lifecycle logs. Reading the
+    /// endpoint/file metadata here is also what keeps these fields live — they
+    /// are the relay's audit trail of which peers a session bridged and for
+    /// which file hash.
+    pub fn describe(&self) -> String {
+        format!(
+            "session {} {}:{} -> {}:{} file {}",
+            self.session_id,
+            self.initiator_ip,
+            self.initiator_port,
+            self.target_ip,
+            self.target_port,
+            hex::encode(self.file_hash),
+        )
     }
 }
 
@@ -229,27 +233,17 @@ impl RelayManager {
         let id = self.next_session_id;
         self.next_session_id = self.next_session_id.wrapping_add(1);
 
-        self.sessions.insert(
+        let session = RelaySession::new(
             id,
-            RelaySession::new(
-                id,
-                initiator_ip,
-                initiator_port,
-                target_ip,
-                target_port,
-                file_hash,
-            ),
+            initiator_ip,
+            initiator_port,
+            target_ip,
+            target_port,
+            file_hash,
         );
-        info!(
-            "RelayManager: created session {} ({} -> {}:{})",
-            id, initiator_ip, target_ip, target_port
-        );
+        info!("RelayManager: created {}", session.describe());
+        self.sessions.insert(id, session);
         Some(id)
-    }
-
-    #[allow(dead_code)]
-    pub fn get_session(&self, id: u32) -> Option<&RelaySession> {
-        self.sessions.get(&id)
     }
 
     pub fn get_session_mut(&mut self, id: u32) -> Option<&mut RelaySession> {
@@ -272,8 +266,9 @@ impl RelayManager {
         for id in &expired {
             if let Some(session) = self.sessions.remove(id) {
                 info!(
-                    "RelayManager: expired session {} ({} bytes relayed)",
-                    id, session.bytes_relayed
+                    "RelayManager: expired {} ({} bytes relayed)",
+                    session.describe(),
+                    session.bytes_relayed
                 );
                 self.total_bytes_relayed += session.bytes_relayed;
             }
@@ -292,11 +287,12 @@ impl RelayManager {
 
 /// Encode a relay protocol message.
 pub fn encode_relay_message(msg_type: u8, session_id: u32, payload: &[u8]) -> Vec<u8> {
-    // The wire framing uses a u16 length prefix. All current callers stay
-    // well under that (RELAY_DATA is capped at MAX_RELAY_DATA_SIZE = 16 KiB,
-    // every other message is a few bytes), but assert it so a future caller
-    // that overflows the prefix — which would silently corrupt the framing —
-    // is caught in debug builds rather than producing undecodable messages.
+    // The wire framing uses a u16 length prefix. Every relay control message
+    // (REQUEST/ACCEPT/CONNECT/CLOSE/REJECT) stays well under that — a few
+    // bytes plus an optional 16-byte file hash and 32-byte attestation hash —
+    // but assert it so a future caller that overflows the prefix (which would
+    // silently corrupt the framing) is caught in debug builds rather than
+    // producing undecodable messages.
     debug_assert!(
         payload.len() <= u16::MAX as usize,
         "relay message payload {} exceeds u16 length prefix",
@@ -345,16 +341,6 @@ pub fn decode_relay_header(data: &[u8]) -> Option<(u8, u32, u16)> {
 }
 
 /// Build a RELAY_REQUEST message.
-#[allow(dead_code)]
-pub fn build_relay_request(
-    session_id: u32,
-    target_ip: Ipv4Addr,
-    target_port: u16,
-    file_hash: &[u8; 16],
-) -> Vec<u8> {
-    build_relay_request_with_attestation_hash(session_id, target_ip, target_port, file_hash, None)
-}
-
 pub fn build_relay_request_with_attestation_hash(
     session_id: u32,
     target_ip: Ipv4Addr,
@@ -388,24 +374,12 @@ pub fn build_relay_connect(session_id: u32, file_hash: &[u8; 16]) -> Vec<u8> {
     encode_relay_message(MSG_RELAY_CONNECT, session_id, file_hash)
 }
 
-/// Build a RELAY_DATA message.
-#[allow(dead_code)]
-pub fn build_relay_data(session_id: u32, data: &[u8]) -> Vec<u8> {
-    let chunk = &data[..data.len().min(MAX_RELAY_DATA_SIZE)];
-    encode_relay_message(MSG_RELAY_DATA, session_id, chunk)
-}
-
 /// Build a RELAY_CLOSE message.
 pub fn build_relay_close(session_id: u32) -> Vec<u8> {
     encode_relay_message(MSG_RELAY_CLOSE, session_id, &[])
 }
 
 /// Parse a RELAY_REQUEST payload.
-#[allow(dead_code)]
-pub fn parse_relay_request(payload: &[u8]) -> Option<(Ipv4Addr, u16, [u8; 16])> {
-    parse_relay_request_with_attestation_hash(payload).map(|r| (r.0, r.1, r.2))
-}
-
 pub fn parse_relay_request_with_attestation_hash(
     payload: &[u8],
 ) -> Option<(Ipv4Addr, u16, [u8; 16], Option<[u8; 32]>)> {
@@ -498,7 +472,6 @@ pub async fn poll_punch(rendezvous_url: &str, our_id: &str) -> Result<Option<Pun
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct PunchInfo {
     pub from_id: String,
     pub ip: String,
@@ -515,12 +488,11 @@ pub async fn connect_to_peer_relay(
     target_port: u16,
     file_hash: &[u8; 16],
     attestation_hash: Option<[u8; 32]>,
+    pin: Option<(&[u8], &[u8], [u8; 16])>,
 ) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
     info!("Relay: connecting to peer relay at {relay_addr}");
 
-    let conn = endpoint
-        .connect(relay_addr, "ember-relay")
-        .map_err(|e| format!("relay connect error: {e}"))?
+    let conn = super::quic::connect_pinned(endpoint, relay_addr, "ember-relay", pin)
         .await
         .map_err(|e| format!("relay QUIC handshake failed: {e}"))?;
 
@@ -1249,26 +1221,11 @@ mod tests {
 
     #[test]
     fn relay_message_round_trip() {
-        let original = encode_relay_message(MSG_RELAY_DATA, 42, b"hello world");
+        let original = encode_relay_message(MSG_RELAY_CONNECT, 42, b"hello world");
         let (msg_type, session_id, payload) = decode_relay_message(&original).unwrap();
-        assert_eq!(msg_type, MSG_RELAY_DATA);
+        assert_eq!(msg_type, MSG_RELAY_CONNECT);
         assert_eq!(session_id, 42);
         assert_eq!(payload, b"hello world");
-    }
-
-    #[test]
-    fn relay_request_round_trip() {
-        let ip = Ipv4Addr::new(1, 2, 3, 4);
-        let port = 4662u16;
-        let hash = [0xAA; 16];
-        let msg = build_relay_request(1, ip, port, &hash);
-        let (msg_type, sid, payload) = decode_relay_message(&msg).unwrap();
-        assert_eq!(msg_type, MSG_RELAY_REQUEST);
-        assert_eq!(sid, 1);
-        let (parsed_ip, parsed_port, parsed_hash) = parse_relay_request(payload).unwrap();
-        assert_eq!(parsed_ip, ip);
-        assert_eq!(parsed_port, port);
-        assert_eq!(parsed_hash, hash);
     }
 
     #[test]
@@ -1335,11 +1292,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(mgr.active_count(), 1);
-        assert!(mgr.get_session(sid).is_some());
+        assert!(mgr.get_session_mut(sid).is_some());
 
         mgr.get_session_mut(sid).unwrap().mark_active();
         mgr.get_session_mut(sid).unwrap().add_relayed_bytes(1000);
-        assert_eq!(mgr.get_session(sid).unwrap().bytes_relayed, 1000);
+        assert_eq!(mgr.get_session_mut(sid).unwrap().bytes_relayed, 1000);
 
         mgr.remove_session(sid);
         assert_eq!(mgr.active_count(), 0);
@@ -1371,13 +1328,5 @@ mod tests {
                 [0xFF; 16],
             )
             .is_none());
-    }
-
-    #[test]
-    fn relay_data_capped() {
-        let big = vec![0u8; MAX_RELAY_DATA_SIZE + 100];
-        let msg = build_relay_data(1, &big);
-        let (_, _, payload) = decode_relay_message(&msg).unwrap();
-        assert_eq!(payload.len(), MAX_RELAY_DATA_SIZE);
     }
 }

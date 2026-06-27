@@ -390,6 +390,18 @@ pub struct EmberDiagnostics {
     pub broker_relay_successes: u32,
     /// LowID broker: relay failures reported this session.
     pub broker_relay_failures: u32,
+    /// LowID broker: connection attempts in flight right now.
+    pub broker_active_attempts: u32,
+    /// LowID broker: relay-capable peers currently cached as candidates.
+    pub broker_relay_candidates: u32,
+    /// Age in seconds of the longest-running in-flight broker attempt
+    /// (0 when idle) — a stuck attempt surfaces as a growing value.
+    pub broker_oldest_attempt_age_secs: u64,
+    /// Relay sessions this node is currently bridging for other peers.
+    pub relay_sessions_active: u32,
+    /// Total bytes this node has relayed for other peers this session
+    /// (in-flight sessions plus completed ones).
+    pub relay_bytes_relayed: u64,
     /// Whether the Ember-native Noise transport is currently routing
     /// UDP packets (mirrors `AppSettings::ember_native_enabled`).
     pub ember_native_enabled: bool,
@@ -403,6 +415,15 @@ pub struct EmberDiagnostics {
     /// `EmberControlMessage::Pong` packets we received in response to
     /// a ping we initiated.
     pub ember_pongs_received: u32,
+    /// `EmberControlMessage::ExchangeRequest` packets we received and
+    /// answered with our current EPX payload over the Noise channel.
+    pub ember_exchange_requests_received: u32,
+    /// `EmberControlMessage::ExchangeData` payloads we sent over the
+    /// Noise channel (replies to a request).
+    pub ember_exchange_sent: u32,
+    /// `EmberControlMessage::ExchangeData` payloads we received over the
+    /// Noise channel and fed into the shared EPX source-ingestion path.
+    pub ember_exchange_received: u32,
     /// Local Noise X25519 public key advertised by `EmberTransport`,
     /// hex-encoded. Surfaces here so the harness can dial this node
     /// without needing a separate identity command.

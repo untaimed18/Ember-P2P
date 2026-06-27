@@ -21,6 +21,19 @@ pub fn ed2k_hash_file(path: &Path) -> anyhow::Result<String> {
     ed2k_hash_file_cancellable(path, &NEVER)
 }
 
+pub fn ed2k_part_hashes_file(path: &Path) -> anyhow::Result<Vec<[u8; 16]>> {
+    static NEVER: AtomicBool = AtomicBool::new(false);
+    ed2k_part_hashes_file_cancellable(path, &NEVER)
+}
+
+pub fn ed2k_known_met_part_hash_count(file_size: u64) -> usize {
+    if file_size < PARTSIZE {
+        0
+    } else {
+        file_size.div_ceil(PARTSIZE) as usize + usize::from(file_size % PARTSIZE == 0)
+    }
+}
+
 pub fn ed2k_hash_file_cancellable(path: &Path, cancelled: &AtomicBool) -> anyhow::Result<String> {
     let mut file = std::fs::File::open(path)?;
     let file_size = file.metadata()?.len();
@@ -86,6 +99,51 @@ pub fn ed2k_hash_file_cancellable(path: &Path, cancelled: &AtomicBool) -> anyhow
 
     let final_hash = Md4::digest(&chunk_hashes);
     Ok(hex::encode(final_hash))
+}
+
+pub fn ed2k_part_hashes_file_cancellable(
+    path: &Path,
+    cancelled: &AtomicBool,
+) -> anyhow::Result<Vec<[u8; 16]>> {
+    let mut file = std::fs::File::open(path)?;
+    let file_size = file.metadata()?.len();
+    if file_size < PARTSIZE {
+        return Ok(Vec::new());
+    }
+
+    let num_chunks = file_size.div_ceil(PARTSIZE);
+    let mut part_hashes = Vec::with_capacity((num_chunks as usize) + 1);
+    let mut remaining = file_size;
+    let mut buf = vec![0u8; HASH_BUF_SIZE];
+
+    for _ in 0..num_chunks {
+        let chunk_size = remaining.min(PARTSIZE);
+        let mut hasher = Md4::new();
+        let mut chunk_remaining = chunk_size;
+        while chunk_remaining > 0 {
+            if cancelled.load(Ordering::Relaxed) {
+                anyhow::bail!("cancelled");
+            }
+            let to_read = (chunk_remaining as usize).min(buf.len());
+            let n = file.read(&mut buf[..to_read])?;
+            if n == 0 {
+                anyhow::bail!(
+                    "unexpected EOF: {} bytes remaining in chunk",
+                    chunk_remaining
+                );
+            }
+            hasher.update(&buf[..n]);
+            chunk_remaining -= n as u64;
+        }
+        part_hashes.push(hasher.finalize().into());
+        remaining -= chunk_size;
+    }
+
+    if file_size % PARTSIZE == 0 {
+        part_hashes.push(Md4::digest([]).into());
+    }
+
+    Ok(part_hashes)
 }
 
 /// Compute both ED2K and AICH hashes in a single pass over the file,

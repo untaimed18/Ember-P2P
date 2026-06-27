@@ -923,6 +923,7 @@ const MAX_FAIL_COUNT_FOR_UDP: u32 = 3;
 /// Re-eligible the moment any inbound UDP reply arrives — the recv
 /// path resets the per-server counter via `record_udp_reply`.
 const MAX_UDP_CONSECUTIVE_FAILURES: u32 = 5;
+const SERVER_UDP_SOURCE_REASK_SECS: i64 = 30 * 60;
 
 fn is_eligible_udp_server(
     server: &ed2k::server_list::ServerEntry,
@@ -946,23 +947,33 @@ fn is_eligible_udp_server(
 
 /// Build UDP GETSOURCES packets for ALL eligible servers (single file).
 fn build_all_getsources_packets(
-    state: &NetworkState,
+    state: &mut NetworkState,
     file_hash: &[u8; 16],
     file_size: u64,
 ) -> Vec<(Vec<u8>, SocketAddr)> {
-    let servers = state.server_list.servers();
+    let servers: Vec<_> = state.server_list.servers().to_vec();
     if servers.is_empty() {
         return Vec::new();
     }
 
     let mut packets = Vec::with_capacity(servers.len());
-    for server in servers {
+    let now = chrono::Utc::now().timestamp();
+    for server in &servers {
         if !is_eligible_udp_server(server, state.server_addr) {
+            continue;
+        }
+        let key = (server.ip.clone(), server.port, *file_hash);
+        if state
+            .server_udp_source_reask_at
+            .get(&key)
+            .is_some_and(|last| now.saturating_sub(*last) < SERVER_UDP_SOURCE_REASK_SECS)
+        {
             continue;
         }
         if let Some(packet) =
             ServerUdpSocket::build_get_sources_packet(server, file_hash, file_size)
         {
+            state.server_udp_source_reask_at.insert(key, now);
             packets.push(packet);
         }
     }
@@ -973,21 +984,42 @@ fn build_all_getsources_packets(
 /// file hashes per packet (eMule: up to 35 per server, max 510 bytes payload).
 /// Used by the periodic sweep when multiple downloads are active.
 fn build_all_getsources_packets_multi(
-    state: &NetworkState,
+    state: &mut NetworkState,
     files: &[([u8; 16], u64)],
 ) -> Vec<(Vec<u8>, SocketAddr)> {
-    let servers = state.server_list.servers();
+    let servers: Vec<_> = state.server_list.servers().to_vec();
     if servers.is_empty() || files.is_empty() {
         return Vec::new();
     }
 
-    let file_refs: Vec<(&[u8; 16], u64)> = files.iter().map(|(h, s)| (h, *s)).collect();
     let mut packets = Vec::with_capacity(servers.len());
-    for server in servers {
+    let now = chrono::Utc::now().timestamp();
+    for server in &servers {
         if !is_eligible_udp_server(server, state.server_addr) {
             continue;
         }
+        let due: Vec<([u8; 16], u64)> = files
+            .iter()
+            .filter(|(fh, _)| {
+                let key = (server.ip.clone(), server.port, *fh);
+                state
+                    .server_udp_source_reask_at
+                    .get(&key)
+                    .map(|last| now.saturating_sub(*last) >= SERVER_UDP_SOURCE_REASK_SECS)
+                    .unwrap_or(true)
+            })
+            .copied()
+            .collect();
+        if due.is_empty() {
+            continue;
+        }
+        let file_refs: Vec<(&[u8; 16], u64)> = due.iter().map(|(h, s)| (h, *s)).collect();
         if let Some(packet) = ServerUdpSocket::build_multi_get_sources_packet(server, &file_refs) {
+            for (fh, _) in due {
+                state
+                    .server_udp_source_reask_at
+                    .insert((server.ip.clone(), server.port, fh), now);
+            }
             packets.push(packet);
         }
     }
@@ -2195,7 +2227,6 @@ pub enum SearchMethod {
 }
 
 #[derive(Debug, Default, Clone)]
-#[allow(dead_code)]
 pub struct SearchFilters {
     pub min_size: Option<u64>,
     pub max_size: Option<u64>,
@@ -2256,6 +2287,8 @@ pub enum NetworkCommand {
     },
     PublishNote {
         file_hash: KadId,
+        file_name: Option<String>,
+        file_size: Option<u64>,
         rating: u8,
         comment: String,
     },
@@ -2387,7 +2420,6 @@ pub enum NetworkCommand {
     AddServer {
         ip: String,
         port: u16,
-        #[allow(dead_code)]
         name: String,
         tx: oneshot::Sender<Result<String, String>>,
     },
@@ -2550,6 +2582,18 @@ pub enum NetworkCommand {
     RunEmberMaintenance {
         tx: oneshot::Sender<Result<EmberMaintenanceResult, String>>,
     },
+    /// Send an Ember-native `ExchangeRequest` over the Noise transport,
+    /// asking the peer to reply with its current EPX source/peer payload
+    /// (which we then ingest via the shared `handle_epx_sources` path).
+    /// Pubkey resolution mirrors `SendEmberPing`: explicit value wins,
+    /// otherwise the KAD-fed Noise-key cache is consulted. The reply is
+    /// delivered asynchronously on the receive loop, so the oneshot only
+    /// reports whether the request was dispatched.
+    SendEmberExchangeRequest {
+        addr: SocketAddr,
+        peer_pubkey: Option<[u8; 32]>,
+        tx: oneshot::Sender<Result<(), String>>,
+    },
     Shutdown,
 }
 
@@ -2690,6 +2734,15 @@ struct PendingDownload {
     last_search_at: i64,
     /// Download priority: 0 = low, 1 = normal, 2 = high
     priority: u32,
+}
+
+async fn udp_reask_completed_parts(state: &NetworkState, transfer_id: &str) -> Option<Vec<bool>> {
+    let tracker = match state.tracker_registry.lock() {
+        Ok(registry) => registry.get(transfer_id).cloned(),
+        Err(_) => None,
+    }?;
+    let parts = tracker.read().await.completed_parts();
+    Some(parts)
 }
 
 fn priority_str_to_u32(s: &str) -> u32 {
@@ -2851,6 +2904,7 @@ struct ActiveSearchRequest {
     /// KAD paths pass `None` because results from those origins don't
     /// uniquely belong to one server / origin IP.
     server_ip: Option<String>,
+    server_result_count: usize,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -2880,6 +2934,8 @@ struct SearchCompleteEvent {
 struct PublishedNote {
     rating: u8,
     comment: String,
+    file_name: Option<String>,
+    file_size: Option<u64>,
     /// Unix timestamp of the most recent (re)publish.
     last_publish: i64,
 }
@@ -2897,8 +2953,9 @@ struct NetworkState {
     /// until poll_messages() delivers OP_SEARCHRESULT.
     pending_server_search: Option<PendingServerSearch>,
     active_search_request: Option<ActiveSearchRequest>,
-    /// eMule OP_QUERY_MORE_RESULT: request more search results from server
+    /// eMule OP_QUERY_MORE_RESULT: capped follow-up requests for more server results.
     server_search_more_needed: bool,
+    server_search_more_requests: u8,
     /// Counter for throttling server keep-alive (sent every N poll ticks)
     server_poll_count: u32,
     /// Counter for pending server search timeout (in poll ticks)
@@ -2978,7 +3035,7 @@ struct NetworkState {
     /// Pending notes searches: search_id -> response sender
     pending_notes_searches: HashMap<SearchId, oneshot::Sender<Vec<SearchResult>>>,
     /// Pending note publishes: search_id -> (file_hash, rating, comment)
-    pending_note_publishes: HashMap<SearchId, (KadId, u8, String)>,
+    pending_note_publishes: HashMap<SearchId, (KadId, u8, String, Option<String>, Option<u64>)>,
     /// Notes we have published to the KAD DHT, keyed by the file's KadId.
     /// Re-published periodically so our comments/ratings don't expire from
     /// the network after ~24h; loaded from the `published_notes` table at
@@ -3052,6 +3109,12 @@ struct NetworkState {
     /// Throttled UDP source-request queue: packets paced at ~1 per second
     /// (eMule sends one per ~1s during its global sweep).
     udp_source_queue: VecDeque<(Vec<u8>, std::net::SocketAddr)>,
+    /// Last UDP source request per `(server_ip, server_tcp_port, file_hash)`.
+    /// Enforces eMule's 30-minute UDP source reask cadence per server/file.
+    server_udp_source_reask_at: HashMap<(String, u16, [u8; 16]), i64>,
+    /// Pending client UDP OP_REASKFILEPING context. OP_REASKACK carries no
+    /// file hash, so correlate by sender endpoint to update only one file list.
+    pending_udp_reasks: HashMap<(Ipv4Addr, u16), [u8; 16]>,
     /// Round-robin cursor for TCP OP_GETSOURCES batching across downloads.
     server_tcp_getsources_cursor: usize,
     /// Unix-seconds timestamp of the most recent successful server login.
@@ -3838,6 +3901,7 @@ async fn handle_server_disconnect(
     }
     state.server_poll_count = 0;
     state.server_search_more_needed = false;
+    state.server_search_more_requests = 0;
     state.udp_search_queue.clear();
     state.server_connected = false;
     state.server_connection = None;
@@ -5333,6 +5397,7 @@ pub async fn start_network(
         pending_server_search: None,
         active_search_request: None,
         server_search_more_needed: false,
+        server_search_more_requests: 0,
         server_poll_count: 0,
         server_search_age: 0,
         server_udp_search_age: 0,
@@ -5387,6 +5452,8 @@ pub async fn start_network(
         server_connection: None,
         server_addr: None,
         udp_source_queue: VecDeque::new(),
+        server_udp_source_reask_at: HashMap::new(),
+        pending_udp_reasks: HashMap::new(),
         server_tcp_getsources_cursor: 0,
         server_connected_at: 0,
         starved_server_reask_at: std::collections::HashMap::new(),
@@ -5634,13 +5701,15 @@ pub async fn start_network(
     // keep them alive on the network across restarts (DHT note entries expire
     // after ~24h).
     if let Ok(rows) = db.load_published_notes() {
-        for (hash_hex, rating, comment, last_publish) in rows {
+        for (hash_hex, rating, comment, last_publish, file_name, file_size) in rows {
             if let Some(kad_id) = KadId::from_hex(&hash_hex) {
                 state.published_notes.insert(
                     kad_id,
                     PublishedNote {
                         rating,
                         comment,
+                        file_name,
+                        file_size,
                         last_publish,
                     },
                 );
@@ -6648,6 +6717,9 @@ pub async fn start_network(
                                     &udp_buf[..len],
                                     from,
                                     &mut state,
+                                    &transfer_manager,
+                                    &source_manager,
+                                    &shared_ember_payload,
                                 ).await;
                             }
                         } else if state.stats.status != NetworkStatus::Disconnected {
@@ -6670,6 +6742,8 @@ pub async fn start_network(
                                 &upload_queue_handle,
                                 &credit_manager,
                                 &transfer_manager,
+                                &source_manager,
+                                &shared_ember_payload,
                             ).await;
                         }
                     }
@@ -6699,6 +6773,9 @@ pub async fn start_network(
                                         &udp_buf[..len],
                                         from,
                                         &mut state,
+                                        &transfer_manager,
+                                        &source_manager,
+                                        &shared_ember_payload,
                                     ).await;
                                 }
                             } else if state.stats.status != NetworkStatus::Disconnected {
@@ -6721,6 +6798,8 @@ pub async fn start_network(
                                     &upload_queue_handle,
                                     &credit_manager,
                                     &transfer_manager,
+                                    &source_manager,
+                                    &shared_ember_payload,
                                 ).await;
                             }
                         }
@@ -6982,9 +7061,12 @@ pub async fn start_network(
                                 fh.copy_from_slice(&hash_bytes);
                                 if known_files.find_by_hash(&fh).is_none() {
                                     use crate::storage::known_files::KnownFileRecord;
+                                    let part_hashes =
+                                        ed2k::hash::ed2k_part_hashes_file(&completed_path)
+                                            .unwrap_or_default();
                                     let record = KnownFileRecord {
                                         file_hash: fh,
-                                        part_hashes: Vec::new(),
+                                        part_hashes,
                                         file_name: file_name.clone(),
                                         file_size,
                                         file_path: completed_path.to_string_lossy().to_string(),
@@ -9798,7 +9880,7 @@ pub async fn start_network(
                                     sid.0, total_published, already_published.len(), sent);
                             }
                         }
-                    } else if let Some((file_hash, rating, comment)) = state.pending_note_publishes.remove(&sid) {
+                    } else if let Some((file_hash, rating, comment, file_name, file_size)) = state.pending_note_publishes.remove(&sid) {
                         // StoreNotes search completed - send PublishNotesReq to closest nodes
                         if let Some(search) = state.search_manager.get(&sid) {
                             let local_note_file = {
@@ -9815,6 +9897,19 @@ pub async fn start_network(
                                     name: TagName::Id(TAG_FILESIZE),
                                     value: TagValue::Uint64(file.size),
                                 });
+                            } else {
+                                if let Some(name) = file_name.filter(|name| !name.is_empty()) {
+                                    note_tags.push(KadTag {
+                                        name: TagName::Id(TAG_FILENAME),
+                                        value: TagValue::String(name),
+                                    });
+                                }
+                                if let Some(size) = file_size.filter(|size| *size > 0) {
+                                    note_tags.push(KadTag {
+                                        name: TagName::Id(TAG_FILESIZE),
+                                        value: TagValue::Uint64(size),
+                                    });
+                                }
                             }
                             if !comment.is_empty() {
                                 note_tags.push(KadTag {
@@ -9882,48 +9977,56 @@ pub async fn start_network(
                     // each responding node during lookup (eMule behavior), but this
                     // final sweep catches any contacts that were discovered but not
                     // yet directly queried.
-                    if let Some(search) = state.search_manager.get(&sid) {
-                        if matches!(search.search_type, SearchType::FindBuddy) {
-                            if state.buddy_manager.state() == BuddyState::FindingBuddy {
-                                let target = search.target;
-                                let already_sent: HashSet<KadId> = search.responded_during_lookup.clone();
-                                let extra_contacts: Vec<KadContact> = search.closest.iter()
-                                    .filter(|c| !already_sent.contains(&c.id))
-                                    .take(20)
+                    if state.buddy_manager.state() == BuddyState::FindingBuddy {
+                        let mut already_sent = 0usize;
+                        let mut contacts_to_send = Vec::new();
+                        let mut target = KadId::zero();
+                        if let Some(search) = state.search_manager.get_mut(&sid) {
+                            if matches!(search.search_type, SearchType::FindBuddy) {
+                                target = search.target;
+                                already_sent = search.find_buddy_requests_sent();
+                                let candidates: Vec<KadContact> = search
+                                    .closest
+                                    .iter()
+                                    .filter(|c| !search.responded_during_lookup.contains(&c.id))
                                     .cloned()
                                     .collect();
-
-                                if !extra_contacts.is_empty() {
-                                    let user_id = KadId(cuint128_swap(&state.user_hash));
-                                    let local_tcp = state.buddy_manager.tcp_port();
-                                    let mut sent = 0;
-                                    for contact in &extra_contacts {
-                                        let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
-                                        let msg = KadMessage::FindBuddyReq {
-                                            buddy_id: target,
-                                            user_id,
-                                            tcp_port: local_tcp,
-                                        };
-                                        if let Ok(packet) = messages::encode_packet(&msg) {
-                                            state.flood_protection.track_request(addr, 0x51);
-                                            let _ = send_kad_packet(&udp_socket, &packet, addr, &state, &contact.id).await;
-                                            sent += 1;
-                                        }
+                                for contact in candidates {
+                                    if search.reserve_find_buddy_request(contact.id) {
+                                        contacts_to_send.push(contact);
                                     }
-                                    info!(
-                                        "FindBuddy search {} converged: sent FindBuddyReq to {} additional contacts (already sent to {} during lookup)",
-                                        sid.0, sent, already_sent.len()
-                                    );
-                                } else if already_sent.is_empty() {
-                                    state.buddy_manager.find_failed();
-                                    info!("FindBuddy search {} completed without finding any reachable contacts", sid.0);
-                                } else {
-                                    info!(
-                                        "FindBuddy search {} converged: already sent FindBuddyReq to {} nodes during lookup",
-                                        sid.0, already_sent.len()
-                                    );
                                 }
                             }
+                        }
+                        if !contacts_to_send.is_empty() {
+                            let user_id = KadId(cuint128_swap(&state.user_hash));
+                            let local_tcp = state.buddy_manager.tcp_port();
+                            let mut sent = 0;
+                            for contact in &contacts_to_send {
+                                let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+                                let msg = KadMessage::FindBuddyReq {
+                                    buddy_id: target,
+                                    user_id,
+                                    tcp_port: local_tcp,
+                                };
+                                if let Ok(packet) = messages::encode_packet(&msg) {
+                                    state.flood_protection.track_request(addr, 0x51);
+                                    let _ = send_kad_packet(&udp_socket, &packet, addr, &state, &contact.id).await;
+                                    sent += 1;
+                                }
+                            }
+                            info!(
+                                "FindBuddy search {} converged: sent FindBuddyReq to {} additional contacts (already sent to {} during lookup)",
+                                sid.0, sent, already_sent
+                            );
+                        } else if already_sent == 0 {
+                            state.buddy_manager.find_failed();
+                            info!("FindBuddy search {} completed without finding any reachable contacts", sid.0);
+                        } else {
+                            info!(
+                                "FindBuddy search {} converged: already sent FindBuddyReq to {} nodes during lookup",
+                                sid.0, already_sent
+                            );
                         }
                     }
 
@@ -10341,7 +10444,7 @@ pub async fn start_network(
                             };
                             if src_count < MAX_SOURCES_FOR_UDP {
                                 let packets = build_all_getsources_packets(
-                                    &state,
+                                    &mut state,
                                     &fh,
                                     file_size,
                                 );
@@ -10826,7 +10929,7 @@ pub async fn start_network(
                     let in_flight: HashSet<KadId> = state
                         .pending_note_publishes
                         .values()
-                        .map(|(h, _, _)| *h)
+                        .map(|(h, _, _, _, _)| *h)
                         .collect();
                     let due_note = state
                         .published_notes
@@ -10835,9 +10938,17 @@ pub async fn start_network(
                             now_ts - note.last_publish > REPUBLISH_NOTE_SECS
                                 && !in_flight.contains(*hash)
                         })
-                        .map(|(hash, note)| (*hash, note.rating, note.comment.clone()));
+                        .map(|(hash, note)| {
+                            (
+                                *hash,
+                                note.rating,
+                                note.comment.clone(),
+                                note.file_name.clone(),
+                                note.file_size,
+                            )
+                        });
 
-                    if let Some((file_hash, rating, comment)) = due_note {
+                    if let Some((file_hash, rating, comment, file_name, file_size)) = due_note {
                         let closest = state
                             .routing_table
                             .find_closest_prefer_verified(&file_hash, SEARCH_INITIAL_CONTACTS);
@@ -10850,12 +10961,18 @@ pub async fn start_network(
                             if sid != SearchId(0) {
                                 state
                                     .pending_note_publishes
-                                    .insert(sid, (file_hash, rating, comment.clone()));
+                                    .insert(sid, (file_hash, rating, comment.clone(), file_name.clone(), file_size));
                                 if let Some(note) = state.published_notes.get_mut(&file_hash) {
                                     note.last_publish = now_ts;
                                 }
-                                if let Err(e) =
-                                    db.save_published_note(&file_hash.to_hex(), rating, &comment, now_ts)
+                                if let Err(e) = db.save_published_note(
+                                    &file_hash.to_hex(),
+                                    rating,
+                                    &comment,
+                                    now_ts,
+                                    file_name.as_deref(),
+                                    file_size,
+                                )
                                 {
                                     warn!("Failed to persist note republish timestamp: {e}");
                                 }
@@ -11277,6 +11394,38 @@ pub async fn start_network(
                                         match ember::relay::poll_punch(&rv_url, &our_id).await {
                                             Ok(Some(info)) => {
                                                 if let Ok(ip) = info.ip.parse::<std::net::IpAddr>() {
+                                                    // Decode the peer's advertised NAT type (carried
+                                                    // through the rendezvous /punch coordination) and
+                                                    // use it to gate the QUIC attempt. Hole-punching
+                                                    // needs at least one side to have a predictable
+                                                    // mapping: our side is already punchable (the broker
+                                                    // only emits StartPunch when it is), but a weak
+                                                    // RestrictedCone/PortRestricted local NAT against a
+                                                    // Symmetric/Unknown peer almost never lands — skip
+                                                    // straight to relay instead of burning the QUIC
+                                                    // handshake timeout.
+                                                    let peer_nat = ember::nat::NatType::from_u8(info.nat_type);
+                                                    tracing::info!(
+                                                        "Broker: punch peer {} responded at {}:{} (peer_nat={:?})",
+                                                        info.from_id, ip, info.port, peer_nat
+                                                    );
+                                                    let punch_viable = matches!(
+                                                        our_nat_type,
+                                                        ember::nat::NatType::Open | ember::nat::NatType::FullCone
+                                                    ) || peer_nat.is_punchable();
+                                                    if !punch_viable {
+                                                        tracing::info!(
+                                                            "Broker: skipping low-probability punch to {}:{} (our_nat={:?}, peer_nat={:?}); escalating to relay",
+                                                            ip, info.port, our_nat_type, peer_nat
+                                                        );
+                                                        if let Err(send_err) = broker_tx.try_send(ember::broker::BrokerEvent::PunchFailed {
+                                                            attempt_key: attempt_key_owned.clone(),
+                                                            reason: format!("both NATs hard to punch (our={our_nat_type:?}, peer={peer_nat:?})"),
+                                                        }) {
+                                                            tracing::debug!("Broker: dropping punch failure event (queue full/closed): {send_err}");
+                                                        }
+                                                        return;
+                                                    }
                                                     remote_addr = Some(SocketAddr::new(ip, info.port));
                                                     break;
                                                 }
@@ -11311,7 +11460,13 @@ pub async fn start_network(
                                     };
 
                                     tracing::info!("Broker: attempting QUIC connect to {addr} for {attempt_key_owned}");
-                                    match ember::broker::punch_quic(&endpoint, addr).await {
+                                    // `None` pin: the punch target is a LowID source known only by
+                                    // IP:port (its KAD record advertises a Noise pubkey, not its
+                                    // ember_hash), so we can't pin the QUIC cert's node id here.
+                                    // The unpinned verifier still requires a well-formed Ember cert
+                                    // + handshake-signature proof; node identity is bound by the
+                                    // subsequent TCP Ed25519 proof-of-possession.
+                                    match ember::broker::punch_quic(&endpoint, addr, None).await {
                                         Ok((send, recv)) => {
                                             tracing::info!("Broker: hole-punch succeeded to {addr}");
                                             let _ = broker_tx.send(ember::broker::BrokerEvent::ConnectionReady(
@@ -11379,8 +11534,12 @@ pub async fn start_network(
                                             std::net::IpAddr::V4(relay_ip), relay_port,
                                         );
 
+                                        // `None` pin: relay candidates arrive via EPX carrying an
+                                        // attestation hash, not the relay peer's ember_hash, so the
+                                        // QUIC cert's node id can't be pinned here; fall back to the
+                                        // unpinned (but still Ember-cert-validated) verifier.
                                         match ember::relay::connect_to_peer_relay(
-                                            &endpoint, relay_addr, source_ip, source_port, &file_hash, relay_attestation_hash,
+                                            &endpoint, relay_addr, source_ip, source_port, &file_hash, relay_attestation_hash, None,
                                         ).await {
                                             Ok((send, recv)) => {
                                                 tracing::info!("Broker: peer relay connected via {relay_addr}");
@@ -11536,37 +11695,76 @@ pub async fn start_network(
                                 tracing::info!("Broker: connection ready for transfer {} from {}:{} via {:?}", conn.transfer_id, conn.source_ip, conn.source_port, conn.method);
                                 let method = conn.method;
                                 let relay_addr = conn.relay_addr;
-                                let parts = upload_server::KadCallbackParts {
-                                    peer_ip: conn.source_ip,
-                                    peer_port: conn.source_port,
-                                    peer_user_hash: [0u8; 16],
-                                    file_hash: conn.file_hash,
-                                    reader: conn.reader,
-                                    writer: conn.writer,
-                                    emule_info_done: true,
-                                    peer_caps: Default::default(),
-                                };
                                 let key = format!("{}:{}:{}", conn.transfer_id, conn.source_ip, conn.source_port);
-                                // `try_send` rather than `send().await`: the
-                                // kad-callback channel is drained by another
-                                // arm of THIS same select! loop, so awaiting
-                                // on a full channel would self-deadlock the
-                                // network task. The connection is dropped
-                                // on overflow; the multi-source scheduler
-                                // re-asks the peer on its next reask cycle.
-                                if let Err(e) = kad_callback_tx.try_send(parts) {
-                                    match e {
-                                        tokio::sync::mpsc::error::TrySendError::Full(_) => {
+
+                                // The broker stream is freshly established and
+                                // NOT yet greeted: WE initiated it (QUIC
+                                // hole-punch / relay), so the peer's upload
+                                // listener is waiting to RECEIVE our eMule Hello
+                                // before it will answer. Greet it here with the
+                                // client Hello (plain — the QUIC/Noise transport
+                                // already encrypts, so eMule RC4 obfuscation is
+                                // redundant), then hand the worker a properly
+                                // greeted stream carrying the peer's real
+                                // capabilities. Without this the worker adopts an
+                                // ungreeted stream with default (ext_ver=0) caps
+                                // and both sides stall — the "stranded callback"
+                                // failure. Done in a spawned task so the Hello
+                                // round-trip never blocks the network event loop;
+                                // `send().await` is safe off-loop (it cannot
+                                // self-deadlock the select! arm that drains the
+                                // channel).
+                                let greet_tx = kad_callback_tx.clone();
+                                let greet_user_hash = state.user_hash;
+                                let greet_client_id = state
+                                    .external_ip
+                                    .map(|ip| u32::from_le_bytes(ip.octets()))
+                                    .unwrap_or(0);
+                                let greet_tcp_port = state.tcp_port;
+                                let greet_udp_port = state.udp_port;
+                                let greet_nickname = settings.nickname.clone();
+                                let greet_peer_ip = conn.source_ip;
+                                let greet_peer_port = conn.source_port;
+                                let greet_file_hash = conn.file_hash;
+                                let mut greet_reader = conn.reader;
+                                let mut greet_writer = conn.writer;
+                                tokio::spawn(async move {
+                                    match ed2k::multi_source::perform_outbound_hello(
+                                        &mut *greet_reader,
+                                        &mut *greet_writer,
+                                        &greet_user_hash,
+                                        greet_client_id,
+                                        greet_tcp_port,
+                                        greet_udp_port,
+                                        &greet_nickname,
+                                    )
+                                    .await
+                                    {
+                                        Ok((peer_user_hash, peer_caps)) => {
+                                            let parts = upload_server::KadCallbackParts {
+                                                peer_ip: greet_peer_ip,
+                                                peer_port: greet_peer_port,
+                                                peer_user_hash,
+                                                file_hash: greet_file_hash,
+                                                reader: greet_reader,
+                                                writer: greet_writer,
+                                                emule_info_done: false,
+                                                peer_caps,
+                                            };
+                                            if let Err(e) = greet_tx.send(parts).await {
+                                                tracing::debug!(
+                                                    "Broker: kad-callback channel closed; dropping greeted connection for {greet_peer_ip}:{greet_peer_port}: {e}"
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
                                             tracing::warn!(
-                                                "Broker: kad-callback channel full; dropping connection for transfer {} from {}:{}",
-                                                conn.transfer_id, conn.source_ip, conn.source_port,
+                                                "Broker: Ember client Hello failed for {greet_peer_ip}:{greet_peer_port}: {e}"
                                             );
                                         }
-                                        tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                                            tracing::debug!("Broker: kad-callback channel closed during shutdown");
-                                        }
                                     }
-                                }
+                                });
+
                                 if let Some(ref mut broker) = state.connection_broker {
                                     broker.mark_succeeded(&key, method);
                                     if method == ember::broker::ConnectionMethod::PeerRelay {
@@ -11830,45 +12028,6 @@ pub async fn start_network(
                     state.buddy_manager.find_failed();
                     info!("Buddy search timed out waiting for FindBuddyRes");
                 }
-                // While in FindingBuddy with no active search, keep probing
-                // fresh random contacts every tick (60s) until timeout.
-                if state.buddy_manager.state() == BuddyState::FindingBuddy
-                    && state.pending_outgoing_buddy.is_none()
-                    && !state.search_manager.active.values().any(|s| matches!(s.search_type, SearchType::FindBuddy) && !s.completed)
-                {
-                    let target = state.buddy_manager.find_buddy_target();
-                    let user_id = KadId(cuint128_swap(&state.user_hash));
-                    let local_tcp = state.buddy_manager.tcp_port();
-                    let resend_contacts: Vec<KadContact> = {
-                        let all_contacts: Vec<_> = state.routing_table.all_contacts()
-                            .filter(|c| c.verified && !c.is_dead() && !c.is_udp_firewalled())
-                            .collect();
-                        use rand::seq::SliceRandom;
-                        let mut rng = rand::thread_rng();
-                        let mut shuffled: Vec<_> = all_contacts.into_iter().collect::<Vec<_>>();
-                        shuffled.shuffle(&mut rng);
-                        shuffled.into_iter().take(20).cloned().collect()
-                    };
-                    let mut resent = 0u32;
-                    for contact in &resend_contacts {
-                        let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
-                        let msg = KadMessage::FindBuddyReq {
-                            buddy_id: target,
-                            user_id,
-                            tcp_port: local_tcp,
-                        };
-                        if let Ok(packet) = messages::encode_packet(&msg) {
-                            state.flood_protection.track_request(addr, 0x51);
-                            let _ = send_kad_packet(
-                                &udp_socket, &packet, addr, &state, &contact.id,
-                            ).await;
-                            resent += 1;
-                        }
-                    }
-                    if resent > 0 {
-                        info!("FindBuddy: still waiting, resent FindBuddyReq to {} random contacts", resent);
-                    }
-                }
                 if state.buddy_manager.should_find_buddy(state.firewall_checker.tcp_status()) {
                     state.buddy_manager.start_finding();
                     let target = state.buddy_manager.find_buddy_target();
@@ -11880,7 +12039,7 @@ pub async fn start_network(
                     );
                     let closest = state.routing_table.find_closest(&target, SEARCH_INITIAL_CONTACTS);
                     if !closest.is_empty() {
-                        let _sid = state.search_manager.start_search(
+                        let sid = state.search_manager.start_search(
                             target,
                             SearchType::FindBuddy,
                             closest,
@@ -11899,6 +12058,14 @@ pub async fn start_network(
                         let mut plain_count = 0u32;
                         for contact in &target_contacts {
                             let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+                            if !state
+                                .search_manager
+                                .get_mut(&sid)
+                                .map(|search| search.reserve_find_buddy_request(contact.id))
+                                .unwrap_or(false)
+                            {
+                                continue;
+                            }
                             let msg = KadMessage::FindBuddyReq {
                                 buddy_id: target,
                                 user_id: user_id_for_buddy,
@@ -11941,6 +12108,14 @@ pub async fn start_network(
                         for contact in &random_contacts {
                             let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                             if sent_addrs.contains(&addr) { continue; }
+                            if !state
+                                .search_manager
+                                .get_mut(&sid)
+                                .map(|search| search.reserve_find_buddy_request(contact.id))
+                                .unwrap_or(false)
+                            {
+                                continue;
+                            }
                             let msg = KadMessage::FindBuddyReq {
                                 buddy_id: target,
                                 user_id: user_id_for_buddy,
@@ -12447,6 +12622,7 @@ pub async fn start_network(
                             }
                         };
                         let sm_guard2 = source_manager.read().await;
+                        let a4af_snap = a4af_shared.read().await;
                         let ready_sources: Vec<(String, u16)> = state.per_file_sources
                             .get(tid)
                             .map(|pfs| pfs.sources_ready_for_reask_with_reputation(
@@ -12460,9 +12636,14 @@ pub async fn start_network(
                                 },
                             ).into_iter()
                                 .filter(|(ip, port)| !state.dead_sources.is_dead_source_for_file(&hash_bytes, u32::from(*ip), *port))
+                                .filter(|(ip, port)| {
+                                    let addr = SocketAddr::new((*ip).into(), *port);
+                                    !a4af_snap.is_swap_candidate(addr, &hash_bytes)
+                                })
                                 .map(|(ip, port)| (ip.to_string(), port))
                                 .collect())
                             .unwrap_or_default();
+                        drop(a4af_snap);
                         drop(sm_guard2);
                         if ready_sources.is_empty() {
                             state.pending_downloads.insert(tid.clone(), pending);
@@ -12844,7 +13025,7 @@ pub async fn start_network(
                                 }
                             }
                             // Immediate UDP OP_GETSOURCES to known servers.
-                            let packets = build_all_getsources_packets(&state, fh, *file_size);
+                            let packets = build_all_getsources_packets(&mut state, fh, *file_size);
                             if !packets.is_empty() {
                                 let room = MAX_UDP_SOURCE_QUEUE
                                     .saturating_sub(state.udp_source_queue.len());
@@ -12902,18 +13083,52 @@ pub async fn start_network(
                     // task (and download workers that share the lock) whenever the
                     // socket applied backpressure or the source list was large.
                     let mut to_send: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
-                    let mut sm = source_manager.write().await;
-                    for tid in &to_retry {
-                        let (fh, file_size) = match state.pending_downloads.get(tid) {
-                            Some(pd) => match hex::decode(&pd.file_hash) {
-                                Ok(b) if b.len() == 16 => {
+                    let mut reask_ids = to_retry.clone();
+                    for tid in state.active_source_senders.keys() {
+                        if !reask_ids.iter().any(|existing| existing == tid) {
+                            reask_ids.push(tid.clone());
+                        }
+                    }
+                    let mut reask_targets: HashMap<String, ([u8; 16], u64)> = HashMap::new();
+                    for tid in &reask_ids {
+                        if let Some(pd) = state.pending_downloads.get(tid) {
+                            if let Ok(b) = hex::decode(&pd.file_hash) {
+                                if b.len() == 16 {
                                     let mut fh = [0u8; 16];
                                     fh.copy_from_slice(&b);
-                                    (fh, pd.file_size)
+                                    reask_targets.insert(tid.clone(), (fh, pd.file_size));
+                                    continue;
                                 }
-                                _ => continue,
-                            },
-                            None => continue,
+                            }
+                        }
+                    }
+                    {
+                        let mgr = transfer_manager.read().await;
+                        for tid in &reask_ids {
+                            if reask_targets.contains_key(tid) {
+                                continue;
+                            }
+                            if let Some(t) = mgr.get_transfer(tid) {
+                                if let Ok(b) = hex::decode(&t.file_hash) {
+                                    if b.len() == 16 {
+                                        let mut fh = [0u8; 16];
+                                        fh.copy_from_slice(&b);
+                                        reask_targets.insert(tid.clone(), (fh, t.total_size));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let mut reask_bitmaps: HashMap<String, Vec<bool>> = HashMap::new();
+                    for tid in &reask_ids {
+                        if let Some(parts) = udp_reask_completed_parts(&state, tid).await {
+                            reask_bitmaps.insert(tid.clone(), parts);
+                        }
+                    }
+                    let mut sm = source_manager.write().await;
+                    for tid in &reask_ids {
+                        let Some((fh, file_size)) = reask_targets.get(tid).copied() else {
+                            continue;
                         };
 
                         let complete_sources = state.per_file_sources
@@ -12922,7 +13137,10 @@ pub async fn start_network(
                             .unwrap_or(0);
 
                         let reask_payload = ed2k::messages::build_reask_file_ping(
-                            &fh, file_size, complete_sources, None,
+                            &fh,
+                            file_size,
+                            complete_sources,
+                            reask_bitmaps.get(tid).map(Vec::as_slice),
                         );
 
                         let total_udp = sm.get_udp_sources(&fh).len();
@@ -12951,6 +13169,7 @@ pub async fn start_network(
                             // Mark optimistically under the lock; the send happens
                             // after the lock is released below.
                             sm.mark_asked(&fh, *ip, *tcp_port);
+                            state.pending_udp_reasks.insert((*ip, *udp_port), fh);
                             to_send.push((addr, pkt));
                             sent_this_tick.insert((*ip, *tcp_port));
                             sent += 1;
@@ -12986,6 +13205,9 @@ pub async fn start_network(
                                 // forever. Marked optimistically under the lock; the
                                 // send happens after the lock is released below.
                                 pfs.mark_udp_reask_sent(*ip, *tcp_port);
+                                state
+                                    .pending_udp_reasks
+                                    .insert((*ip, *udp_port), pfs.file_hash);
                                 to_send.push((addr, pkt));
                                 pfs_sent += 1;
                             }
@@ -13054,7 +13276,7 @@ pub async fn start_network(
                     };
                     if src_count < MAX_SOURCES_FOR_UDP {
                         let packets = build_all_getsources_packets(
-                            &state,
+                            &mut state,
                             &fh,
                             file_size,
                         );
@@ -13478,13 +13700,11 @@ pub async fn start_network(
                         // stalling upload/download tasks that need the source
                         // lock for the duration of each swap.)
                         let (uh, co) = {
-                            let mut sm = source_manager.write().await;
+                            let sm = source_manager.read().await;
                             if let std::net::IpAddr::V4(v4) = swap.peer_addr.ip() {
-                                sm.remove_source(&swap.from_file, &v4, swap.peer_addr.port());
-                                sm.register_source(swap.to_file, v4, swap.peer_addr.port());
                                 (
-                                    sm.get_user_hash(&swap.to_file, v4, swap.peer_addr.port()),
-                                    sm.get_connect_options(&swap.to_file, v4, swap.peer_addr.port()),
+                                    sm.get_user_hash(&swap.from_file, v4, swap.peer_addr.port()),
+                                    sm.get_connect_options(&swap.from_file, v4, swap.peer_addr.port()),
                                 )
                             } else {
                                 (None, None)
@@ -13550,18 +13770,83 @@ pub async fn start_network(
                         // persistent reask state follows the swap.
                         if let std::net::IpAddr::V4(v4) = swap.peer_addr.ip() {
                             let port = swap.peer_addr.port();
+                            let mut moved_udp_port = 0u16;
                             for pfs in state.per_file_sources.values_mut() {
                                 if pfs.file_hash == swap.from_file {
+                                    moved_udp_port = pfs
+                                        .sources
+                                        .iter()
+                                        .find(|s| s.ip == v4 && s.tcp_port == port)
+                                        .map(|s| s.udp_port)
+                                        .unwrap_or(0);
                                     pfs.sources.retain(|s| !(s.ip == v4 && s.tcp_port == port));
                                     break;
                                 }
                             }
+                            let (moved_user_hash, moved_connect_options) = {
+                                let sm = source_manager.read().await;
+                                (
+                                    sm.get_user_hash(&swap.from_file, v4, port),
+                                    sm.get_connect_options(&swap.from_file, v4, port).unwrap_or(0),
+                                )
+                            };
+                            {
+                                let mut sm = source_manager.write().await;
+                                sm.remove_source(&swap.from_file, &v4, port);
+                                if let Some(user_hash) = moved_user_hash {
+                                    sm.register_source_full_opts(
+                                        swap.to_file,
+                                        v4,
+                                        port,
+                                        moved_udp_port,
+                                        user_hash,
+                                        moved_connect_options,
+                                    );
+                                } else {
+                                    sm.register_source_full(
+                                        swap.to_file,
+                                        v4,
+                                        port,
+                                        moved_udp_port,
+                                        [0u8; 16],
+                                    );
+                                }
+                            }
+                            let mut complete_sources = 0u16;
                             for pfs in state.per_file_sources.values_mut() {
                                 if pfs.file_hash == swap.to_file {
-                                    if pfs.add_source_full(v4, port, 0) {
+                                    if pfs.add_source_full(v4, port, moved_udp_port) {
                                         state.ember_payload_dirty = true;
                                     }
+                                    complete_sources = pfs.complete_source_count();
                                     break;
+                                }
+                            }
+                            if moved_udp_port != 0 {
+                                let file_size = state
+                                    .pending_downloads
+                                    .values()
+                                    .find(|pd| pd.file_hash == target_hex)
+                                    .map(|pd| pd.file_size)
+                                    .or_else(|| {
+                                        let mgr = transfer_manager.try_read().ok()?;
+                                        mgr.active
+                                            .values()
+                                            .chain(mgr.queue.iter())
+                                            .find(|t| t.file_hash == target_hex)
+                                            .map(|t| t.total_size)
+                                    })
+                                    .unwrap_or(0);
+                                if file_size > 0 {
+                                    let mut pkt = vec![OP_EMULEPROT, ed2k::messages::OP_REASKFILEPING];
+                                    pkt.extend_from_slice(&ed2k::messages::build_reask_file_ping(
+                                        &swap.to_file,
+                                        file_size,
+                                        complete_sources,
+                                        None,
+                                    ));
+                                    let addr = SocketAddr::new(v4.into(), moved_udp_port);
+                                    let _ = udp_socket.send_to(&pkt, addr).await;
                                 }
                             }
                         }
@@ -13703,10 +13988,19 @@ pub async fn start_network(
                                     if let Some(mut pending) = state.pending_server_search.take() {
                                         let request_id = pending.request_id;
                                         state.server_search_age = 0;
+                                        if let Some(active) = state.active_search_request.as_mut() {
+                                            if active.request_id == request_id {
+                                                active.server_result_count =
+                                                    active.server_result_count.saturating_add(count);
+                                            }
+                                        }
                                         if let Some(tx) = pending.tx.take() {
                                             let mut local = pending.results;
                                             local.extend(search_results);
-                                            if count >= 200 && local.len() < 1000 {
+                                            if count >= 200
+                                                && local.len() < 1000
+                                                && state.server_search_more_requests < 5
+                                            {
                                                 state.server_search_more_needed = true;
                                                 state.pending_server_search = Some(PendingServerSearch {
                                                     tx: Some(tx),
@@ -13739,7 +14033,13 @@ pub async fn start_network(
                                                 &kws,
                                                 srv_ip.as_deref(),
                                             ).await;
-                                            if count >= 200 {
+                                            let under_result_cap = state
+                                                .active_search_request
+                                                .as_ref()
+                                                .filter(|active| active.request_id == request_id)
+                                                .map(|active| active.server_result_count < 1000)
+                                                .unwrap_or(true);
+                                            if count >= 200 && under_result_cap && state.server_search_more_requests < 5 {
                                                 state.server_search_more_needed = true;
                                                 state.pending_server_search = Some(PendingServerSearch {
                                                     tx: None,
@@ -14078,8 +14378,13 @@ pub async fn start_network(
                                 }
                             }
                         }
-                        if server_disconnect_reason.is_none() && state.server_search_more_needed {
+                        if server_disconnect_reason.is_none()
+                            && state.server_search_more_needed
+                            && state.pending_server_search.is_some()
+                            && state.server_search_more_requests < 5
+                        {
                             state.server_search_more_needed = false;
+                            state.server_search_more_requests += 1;
                             let _ = conn.request_more_results().await;
                         }
 
@@ -14385,7 +14690,7 @@ pub async fn start_network(
                                 // they ignore us.
                                 state.server_list.update_udp_obfuscation(
                                     &addr.ip().to_string(), tcp_port,
-                                    obfuscation_port_udp, server_udp_key,
+                                    obfuscation_port_udp, server_udp_key, state.external_ip,
                                 );
                             }
                         }
@@ -15262,18 +15567,27 @@ pub async fn start_network(
                     }
                     Some(BuddyEvent::ReaskCallback { dest_ip, dest_port, file_hash }) => {
                         let hash_hex = hex::encode(file_hash);
-                        let file_size = match state.pending_downloads.values()
-                            .find(|pd| pd.file_hash == hash_hex)
-                            .map(|pd| pd.file_size)
-                        {
-                            Some(fs) => fs,
+                        let pending_match = state
+                            .pending_downloads
+                            .iter()
+                            .find(|(_, pd)| pd.file_hash == hash_hex)
+                            .map(|(tid, pd)| (tid.clone(), pd.file_size));
+                        let (pending_tid, file_size) = match pending_match {
+                            Some((tid, fs)) => (Some(tid), fs),
                             None => {
                                 let mgr = transfer_manager.read().await;
-                                mgr.active.values().chain(mgr.queue.iter())
-                                    .find(|t| t.file_hash == hash_hex)
-                                    .map(|t| t.total_size)
-                                    .unwrap_or(0)
+                                (
+                                    None,
+                                    mgr.active.values().chain(mgr.queue.iter())
+                                        .find(|t| t.file_hash == hash_hex)
+                                        .map(|t| t.total_size)
+                                        .unwrap_or(0),
+                                )
                             }
+                        };
+                        let completed_parts = match pending_tid.as_deref() {
+                            Some(tid) => udp_reask_completed_parts(&state, tid).await,
+                            None => None,
                         };
                         let complete_sources = state.per_file_sources.values()
                             .find(|pfs| pfs.file_hash == file_hash)
@@ -15282,7 +15596,10 @@ pub async fn start_network(
                         let addr = SocketAddr::new(dest_ip.into(), dest_port);
                         let mut pkt = vec![OP_EMULEPROT, ed2k::messages::OP_REASKFILEPING];
                         pkt.extend_from_slice(&ed2k::messages::build_reask_file_ping(
-                            &file_hash, file_size, complete_sources, None,
+                            &file_hash,
+                            file_size,
+                            complete_sources,
+                            completed_parts.as_deref(),
                         ));
                         let _ = udp_socket.send_to(&pkt, addr).await;
                         debug!("Sent UDP reask to {}:{} via buddy relay for file {}", dest_ip, dest_port, hash_hex);
@@ -16927,7 +17244,7 @@ pub async fn start_network(
                 }
                 if !need_sources.is_empty() {
                     // eMule packs multiple file hashes per server packet (up to 35)
-                    let packets = build_all_getsources_packets_multi(&state, &need_sources);
+                    let packets = build_all_getsources_packets_multi(&mut state, &need_sources);
                     if !packets.is_empty() {
                         let room = MAX_UDP_SOURCE_QUEUE.saturating_sub(state.udp_source_queue.len());
                         let queued = packets.len().min(room);
@@ -17779,9 +18096,16 @@ fn build_kad_connect_options(state: &NetworkState) -> u8 {
     let supports_crypt = state.obfuscation_enabled as u8;
     let requests_crypt = state.obfuscation_enabled as u8;
     let requires_crypt = 0u8;
-    let direct_udp_callback =
-        (state.firewalled && !state.udp_firewalled && state.udp_fw_verified) as u8;
+    let direct_udp_callback = can_advertise_direct_udp_callback(state) as u8;
     (direct_udp_callback << 3) | (requires_crypt << 2) | (requests_crypt << 1) | supports_crypt
+}
+
+fn can_advertise_direct_udp_callback(state: &NetworkState) -> bool {
+    state.firewalled
+        && !state.udp_firewalled
+        && state.udp_fw_verified
+        && state.external_ip.is_some()
+        && state.external_udp_port.unwrap_or(state.udp_port) != 0
 }
 
 /// Mutate `state.external_ip` AND publish the change to the shared atomic
@@ -17792,6 +18116,9 @@ fn build_kad_connect_options(state: &NetworkState) -> u8 {
 /// client_id=0 and let the peer's BaseClient auto-heal from the connect IP"
 /// — correct fallback behavior when we don't yet have a trusted public IP.
 fn set_external_ip(state: &mut NetworkState, ip: Option<Ipv4Addr>) {
+    if state.external_ip != ip {
+        state.server_list.invalidate_udp_keys_for_public_ip(ip);
+    }
     state.external_ip = ip;
     let client_id_le = match ip {
         Some(v4) => u32::from_le_bytes(v4.octets()),
@@ -17806,8 +18133,8 @@ fn update_publish_manager_state(state: &mut NetworkState) {
     state.publish_manager.firewalled = state.firewalled;
     state.publish_manager.use_extern_kad_port =
         matches!(state.external_udp_port, Some(port) if port != 0 && port != state.udp_port);
-    state.publish_manager.direct_udp_callback =
-        state.firewalled && !state.udp_firewalled && state.udp_fw_verified;
+    state.publish_manager.udp_port = state.external_udp_port.unwrap_or(state.udp_port);
+    state.publish_manager.direct_udp_callback = can_advertise_direct_udp_callback(state);
     state.publish_manager.connect_options = build_kad_connect_options(state);
 
     if let Some(buddy) = state.buddy_manager.buddy_id().cloned() {
@@ -18181,11 +18508,21 @@ async fn handle_ember_native_udp(
     data: &[u8],
     from: SocketAddr,
     state: &mut NetworkState,
+    transfer_manager: &Arc<RwLock<TransferManager>>,
+    source_manager: &Arc<RwLock<SourceManager>>,
+    shared_ember_payload: &ember::SharedEmberPayload,
 ) {
-    if let Err(p) =
-        std::panic::AssertUnwindSafe(handle_ember_native_udp_inner(socket, data, from, state))
-            .catch_unwind()
-            .await
+    if let Err(p) = std::panic::AssertUnwindSafe(handle_ember_native_udp_inner(
+        socket,
+        data,
+        from,
+        state,
+        transfer_manager,
+        source_manager,
+        shared_ember_payload,
+    ))
+    .catch_unwind()
+    .await
     {
         error!(
             "Ember UDP handler panicked (recovered, network loop continues): {}",
@@ -18199,6 +18536,9 @@ async fn handle_ember_native_udp_inner(
     data: &[u8],
     from: SocketAddr,
     state: &mut NetworkState,
+    transfer_manager: &Arc<RwLock<TransferManager>>,
+    source_manager: &Arc<RwLock<SourceManager>>,
+    shared_ember_payload: &ember::SharedEmberPayload,
 ) {
     use ember::transport::EmberControlMessage;
 
@@ -18243,6 +18583,77 @@ async fn handle_ember_native_udp_inner(
                 debug!(
                     "Ember transport: Pong nonce {nonce} from {from} did not match a pending ping"
                 );
+            }
+        }
+        Some(EmberControlMessage::ExchangeRequest) => {
+            state.ember_diagnostics.ember_exchange_requests_received = state
+                .ember_diagnostics
+                .ember_exchange_requests_received
+                .saturating_add(1);
+
+            // Answer with our current EPX payload over the same encrypted
+            // session. Clone the `Arc` out first so the immutable borrow
+            // of `shared_ember_payload` ends before we touch
+            // `state.ember_transport` mutably.
+            let payload_arc = shared_ember_payload.read().await.clone();
+            let msg = EmberControlMessage::ExchangeData {
+                payload: (*payload_arc).clone(),
+            }
+            .encode();
+            match state.ember_transport.prepare_outgoing(from, None, &msg) {
+                ember::transport::OutgoingResult::Ready { packet } => {
+                    if let Err(e) = socket.send_to(&packet, from).await {
+                        debug!("ember-udp: failed to send ExchangeData reply to {from}: {e}");
+                    } else {
+                        state.ember_diagnostics.ember_exchange_sent =
+                            state.ember_diagnostics.ember_exchange_sent.saturating_add(1);
+                    }
+                }
+                // The session is established (we just decrypted the
+                // request), so anything other than Ready is unexpected —
+                // log and drop rather than queue a stale reply.
+                _ => {
+                    debug!("ember-udp: no ready session to answer ExchangeRequest from {from}");
+                }
+            }
+        }
+        Some(EmberControlMessage::ExchangeData { payload }) => {
+            state.ember_diagnostics.ember_exchange_received = state
+                .ember_diagnostics
+                .ember_exchange_received
+                .saturating_add(1);
+
+            // Reuse the exact eD2K-TCP EPX ingestion path so UDP-delivered
+            // source/peer hints get the same validation, dedup, AICH
+            // pinning, relay-attestation verification and mesh learning.
+            match ember::parse_exchange_payload(&payload) {
+                Ok(result)
+                    if !result.files.is_empty()
+                        || !result.peers.is_empty()
+                        || !result.relay_attestations.is_empty() =>
+                {
+                    let (entries, aich_roots) = ed2k::transfer::epx_result_to_entries(&result);
+                    let ember_peers: Vec<(Ipv4Addr, u16)> =
+                        result.peers.iter().map(|p| (p.ip, p.tcp_port)).collect();
+                    let injected = handle_epx_sources(
+                        state,
+                        transfer_manager,
+                        source_manager,
+                        &entries,
+                        &aich_roots,
+                        &ember_peers,
+                        &result.relay_attestations,
+                        "ember-udp",
+                    )
+                    .await;
+                    debug!("ember-udp: ingested EPX from {from} ({injected} sources injected)");
+                }
+                Ok(_) => {
+                    // Well-formed but empty (peer had nothing to share).
+                }
+                Err(e) => {
+                    debug!("ember-udp: failed to parse EPX payload from {from}: {e}");
+                }
             }
         }
         None => {
@@ -19305,6 +19716,8 @@ async fn handle_udp_packet(
     upload_queue: &ed2k::upload::UploadQueueRef,
     credit_manager: &Arc<RwLock<CreditManager>>,
     transfer_manager: &Arc<RwLock<TransferManager>>,
+    source_manager: &Arc<RwLock<SourceManager>>,
+    shared_ember_payload: &ember::SharedEmberPayload,
 ) {
     if let Err(p) = std::panic::AssertUnwindSafe(handle_udp_packet_inner(
         socket,
@@ -19319,6 +19732,8 @@ async fn handle_udp_packet(
         upload_queue,
         credit_manager,
         transfer_manager,
+        source_manager,
+        shared_ember_payload,
     ))
     .catch_unwind()
     .await
@@ -19344,6 +19759,8 @@ async fn handle_udp_packet_inner(
     upload_queue: &ed2k::upload::UploadQueueRef,
     credit_manager: &Arc<RwLock<CreditManager>>,
     transfer_manager: &Arc<RwLock<TransferManager>>,
+    source_manager: &Arc<RwLock<SourceManager>>,
+    shared_ember_payload: &ember::SharedEmberPayload,
 ) {
     // Reject oversized packets (max 64 KiB for UDP)
     if data.len() > 65535 {
@@ -19398,7 +19815,16 @@ async fn handle_udp_packet_inner(
             // above already ran for KAD's sake; re-running them is two cheap
             // set lookups against a path that's normally unreached.
             if ember_udp_recv_allowed(state, from) {
-                handle_ember_native_udp(socket, data, from, state).await;
+                handle_ember_native_udp(
+                    socket,
+                    data,
+                    from,
+                    state,
+                    transfer_manager,
+                    source_manager,
+                    shared_ember_payload,
+                )
+                .await;
             }
         } else {
             debug!("Dropping Ember-magic UDP packet from {from}: ember_native_enabled=false");
@@ -19430,51 +19856,76 @@ async fn handle_udp_packet_inner(
                 && opcode == ed2k::messages::OP_REASKFILEPING
                 && payload.len() >= 16
             {
-                let mut file_hash = [0u8; 16];
-                file_hash.copy_from_slice(&payload[..16]);
+                let reask = match ed2k::messages::parse_reask_file_ping(payload) {
+                    Ok(reask) => reask,
+                    Err(e) => {
+                        debug!("Ignoring malformed UDP reask from {from}: {e}");
+                        return;
+                    }
+                };
+                let file_hash = reask.file_hash;
                 let hash_hex = hex::encode(file_hash);
 
-                let has_file = {
+                let local_file = {
                     let idx = local_index.read().await;
-                    idx.get_by_hash(&hash_hex).is_some()
-                } || {
+                    idx.get_by_hash(&hash_hex).map(|file| {
+                        (
+                            file.size,
+                            vec![true; ed2k::messages::ed2k_wire_part_count(file.size) as usize],
+                        )
+                    })
+                };
+                let partial_file = if local_file.is_none() {
                     let mgr = transfer_manager.read().await;
-                    mgr.active.values().chain(mgr.queue.iter()).any(|t| {
-                        t.direction == TransferDirection::Download
-                            && t.file_hash == hash_hex
-                            && !matches!(
+                    mgr.active.values().chain(mgr.queue.iter()).find_map(|t| {
+                        if t.direction != TransferDirection::Download
+                            || t.file_hash != hash_hex
+                            || matches!(
                                 t.status,
                                 TransferStatus::Completed | TransferStatus::Failed
                             )
-                            && PathBuf::from(&settings.download_folder)
-                                .join("Temp")
-                                .join(format!("{}.part", t.id))
-                                .exists()
+                        {
+                            return None;
+                        }
+                        let part_path = PathBuf::from(&settings.download_folder)
+                            .join("Temp")
+                            .join(format!("{}.part", t.id));
+                        if !part_path.exists() {
+                            return None;
+                        }
+                        let tracker =
+                            ed2k::part_tracker::PartTracker::new(t.total_size, &part_path);
+                        Some((t.total_size, tracker.serveable_parts()))
                     })
+                } else {
+                    None
                 };
+                let file_state = local_file.or(partial_file);
 
-                if has_file {
-                    // Compute the peer's real queue rank from the shared
-                    // upload queue. If they're not currently queued (e.g.,
-                    // just granted a slot or dropped), fall back to 0 which
-                    // eMule-family clients interpret as "alive, not queued".
+                if let Some((file_size, available_parts)) = file_state {
                     let rank = ed2k::upload::udp_queue_rank_for_peer(
                         upload_queue,
                         credit_manager,
                         local_index,
                         from.ip(),
+                        from.port(),
                         &file_hash,
                     )
                     .await
-                    .unwrap_or(0);
+                    .unwrap_or(u16::MAX);
                     let mut resp = vec![OP_EMULEPROT, ed2k::messages::OP_REASKACK];
-                    resp.extend_from_slice(&rank.to_le_bytes());
+                    let enhanced = reask.completed_parts.is_some();
+                    resp.extend_from_slice(&ed2k::messages::build_reask_ack(
+                        file_size,
+                        Some(rank),
+                        enhanced.then_some(available_parts.as_slice()),
+                    ));
                     let _ = socket.send_to(&resp, from).await;
                     debug!(
                         "Answered UDP reask from {from} for {hash_hex}: file available, rank={rank}"
                     );
                 } else {
-                    let resp = vec![OP_EMULEPROT, ed2k::messages::OP_FILEREQANSNOFIL];
+                    let resp = vec![OP_EMULEPROT, ed2k::messages::OP_FILENOTFOUND_UDP];
                     let _ = socket.send_to(&resp, from).await;
                     debug!("Answered UDP reask from {from} for {hash_hex}: file not found");
                 }
@@ -19483,10 +19934,12 @@ async fn handle_udp_packet_inner(
 
             // eMule UDP reask response: source confirms it has the file.
             if header == OP_EMULEPROT && opcode == ed2k::messages::OP_REASKACK {
-                let rank = if payload.len() >= 2 {
-                    Some(u16::from_le_bytes([payload[0], payload[1]]) as u32)
-                } else {
-                    None
+                let ack = match ed2k::messages::parse_reask_ack(payload) {
+                    Ok(ack) => ack,
+                    Err(e) => {
+                        debug!("Ignoring malformed UDP reask ACK from {from}: {e}");
+                        return;
+                    }
                 };
                 // Accept both native IPv4 and IPv4-mapped IPv6 (::ffff:x.x.x.x)
                 // so hosts that open IPv6 UDP sockets still get their queue
@@ -19496,12 +19949,13 @@ async fn handle_udp_packet_inner(
                     IpAddr::V6(v6) => v6.to_ipv4_mapped(),
                 };
                 if let Some(v4) = v4_opt {
-                    for pfs in state.per_file_sources.values_mut() {
-                        for src in &mut pfs.sources {
-                            if src.ip == v4 && src.udp_port == from.port() {
-                                src.state = ed2k::sources::DownloadSourceState::OnQueue { rank };
-                                src.state_changed = std::time::Instant::now();
-                            }
+                    if let Some(file_hash) = state.pending_udp_reasks.remove(&(v4, from.port())) {
+                        if let Some(pfs) = state
+                            .per_file_sources
+                            .values_mut()
+                            .find(|pfs| pfs.file_hash == file_hash)
+                        {
+                            pfs.apply_udp_reask_ack(v4, from.port(), ack.rank, ack.available_parts);
                         }
                     }
                 }
@@ -20365,14 +20819,19 @@ async fn handle_udp_packet_inner(
             // GetRequestContactCount controls what we *ask for*, not what we accept.
             // Peers commonly return more contacts than requested (e.g. 4 for a
             // FIND_VALUE request asking for 2).
-            if contacts.len() > KADEMLIA_FIND_NODE as usize {
+            let contacts = if contacts.len() > KADEMLIA_FIND_NODE as usize {
                 warn!(
-                    "KadRes from {from}: contact count {} exceeds max {}, ignoring",
+                    "KadRes from {from}: contact count {} exceeds max {}, truncating",
                     contacts.len(),
                     KADEMLIA_FIND_NODE
                 );
-                return;
-            }
+                contacts
+                    .into_iter()
+                    .take(KADEMLIA_FIND_NODE as usize)
+                    .collect()
+            } else {
+                contacts
+            };
 
             // Route the response to EVERY active same-target search that
             // actually queried this sender. eMule keeps at most one search per
@@ -20534,6 +20993,7 @@ async fn handle_udp_packet_inner(
                     if matches!(search.search_type, SearchType::FindBuddy)
                         && search.phase == SearchPhase::Lookup
                         && state.buddy_manager.state() == BuddyState::FindingBuddy
+                        && search.reserve_find_buddy_request(sender_id)
                     {
                         let buddy_target = state.buddy_manager.find_buddy_target();
                         let user_id = KadId(cuint128_swap(&state.user_hash));
@@ -21938,6 +22398,7 @@ async fn handle_command_inner(
                 file_type_filter: file_type_filter.clone(),
                 keywords: Vec::new(),
                 server_ip: state.server_addr.map(|a| a.ip().to_string()),
+                server_result_count: 0,
             };
 
             // Parse the raw query into a boolean keyword tree (implicit AND,
@@ -21952,15 +22413,20 @@ async fn handle_command_inner(
                 .as_ref()
                 .map(|e| e.positive_terms())
                 .unwrap_or_default();
-            if keywords.is_empty() {
+            let has_filter_expression = search_filters.as_ref().is_some_and(|f| {
+                f.file_type.is_some()
+                    || f.file_extension.is_some()
+                    || f.min_size.is_some()
+                    || f.max_size.is_some()
+                    || f.min_availability.is_some()
+            });
+            if keywords.is_empty() && !has_filter_expression {
                 if let Some(tx) = tx.take() {
                     let _ = tx.send(local_results.take().unwrap_or_default());
                 }
                 let _ = app_handle.emit("search-complete", SearchCompleteEvent { request_id });
                 return;
             }
-            let query_expr =
-                query_expr.expect("non-empty positive_terms implies a parsed expression");
             active_request.keywords = keywords.clone();
 
             // Build the search expression once, reuse for KAD + TCP + UDP.
@@ -21980,14 +22446,15 @@ async fn handle_command_inner(
                 min_availability: search_filters.as_ref().and_then(|f| f.min_availability),
             };
             let search_expr = kad::messages::build_search_expression_with_node(
-                Some(query_expr.to_wire_bytes()),
+                query_expr.as_ref().map(|expr| expr.to_wire_bytes()),
                 &search_constraints,
             );
 
             // --- TCP server search ---
             let run_server = matches!(method, SearchMethod::Global | SearchMethod::Server);
             let run_udp = matches!(method, SearchMethod::Global);
-            let run_kad = matches!(method, SearchMethod::Global | SearchMethod::Kad);
+            let run_kad =
+                !keywords.is_empty() && matches!(method, SearchMethod::Global | SearchMethod::Kad);
             let run_ember = matches!(method, SearchMethod::Global | SearchMethod::Ember);
 
             if run_server && state.server_connected {
@@ -21995,6 +22462,8 @@ async fn handle_command_inner(
                     match conn.send_search_expr_bytes(&search_expr).await {
                         Ok(()) => {
                             active_request.server_pending = true;
+                            state.server_search_more_needed = false;
+                            state.server_search_more_requests = 0;
                             state.pending_server_search = Some(PendingServerSearch {
                                 tx: None,
                                 results: Vec::new(),
@@ -22089,6 +22558,9 @@ async fn handle_command_inner(
                     tracing::error!("KAD search: tx already consumed");
                     break 'kad false;
                 };
+                let query_expr = query_expr
+                    .clone()
+                    .expect("KAD search is gated on non-empty positive terms");
                 state.pending_keyword_searches.insert(
                     sid,
                     PendingKeywordSearch {
@@ -22627,7 +23099,7 @@ async fn handle_command_inner(
                 // UDP fan-out to every eligible known server, paced via
                 // `udp_source_queue` so we don't burst-send on add.
                 {
-                    let packets = build_all_getsources_packets(&state, &hash_bytes, file_size);
+                    let packets = build_all_getsources_packets(state, &hash_bytes, file_size);
                     if !packets.is_empty() {
                         let room =
                             MAX_UDP_SOURCE_QUEUE.saturating_sub(state.udp_source_queue.len());
@@ -22822,7 +23294,7 @@ async fn handle_command_inner(
                 {
                     let mut file_hash_arr = [0u8; 16];
                     file_hash_arr.copy_from_slice(&hash_bytes);
-                    let packets = build_all_getsources_packets(&state, &file_hash_arr, file_size);
+                    let packets = build_all_getsources_packets(state, &file_hash_arr, file_size);
                     if !packets.is_empty() {
                         let room =
                             MAX_UDP_SOURCE_QUEUE.saturating_sub(state.udp_source_queue.len());
@@ -22919,6 +23391,8 @@ async fn handle_command_inner(
 
         NetworkCommand::PublishNote {
             file_hash,
+            file_name,
+            file_size,
             rating,
             comment,
         } => {
@@ -22937,9 +23411,16 @@ async fn handle_command_inner(
             if sid == SearchId(0) {
                 warn!("Failed to start StoreNotes search: too many active searches");
             } else {
-                state
-                    .pending_note_publishes
-                    .insert(sid, (file_hash, rating, comment.clone()));
+                state.pending_note_publishes.insert(
+                    sid,
+                    (
+                        file_hash,
+                        rating,
+                        comment.clone(),
+                        file_name.clone(),
+                        file_size,
+                    ),
+                );
                 info!(
                     "Started StoreNotes search {} for file {} (rating={}, comment_len={})",
                     sid.0,
@@ -22960,12 +23441,19 @@ async fn handle_command_inner(
                         PublishedNote {
                             rating,
                             comment: comment.clone(),
+                            file_name: file_name.clone(),
+                            file_size,
                             last_publish: now_ts,
                         },
                     );
-                    if let Err(e) =
-                        db.save_published_note(&file_hash.to_hex(), rating, &comment, now_ts)
-                    {
+                    if let Err(e) = db.save_published_note(
+                        &file_hash.to_hex(),
+                        rating,
+                        &comment,
+                        now_ts,
+                        file_name.as_deref(),
+                        file_size,
+                    ) {
                         warn!("Failed to persist published note for republish: {e}");
                     }
                 }
@@ -23104,6 +23592,15 @@ async fn handle_command_inner(
                 diag.broker_relay_attempts = bs.relay_attempts;
                 diag.broker_relay_successes = bs.relay_successes;
                 diag.broker_relay_failures = bs.relay_failures;
+                diag.broker_active_attempts = broker.active_attempts() as u32;
+                diag.broker_relay_candidates = broker.relay_candidate_count() as u32;
+                diag.broker_oldest_attempt_age_secs =
+                    broker.oldest_attempt_age_secs().unwrap_or(0);
+            }
+            {
+                let rm = state.relay_manager.lock().await;
+                diag.relay_sessions_active = rm.active_count() as u32;
+                diag.relay_bytes_relayed = rm.total_bytes_relayed();
             }
             let _ = tx.send(diag);
         }
@@ -23249,6 +23746,72 @@ async fn handle_command_inner(
                 .map(ember_dht_contact_info)
                 .collect();
             let _ = tx.send(contacts);
+        }
+
+        NetworkCommand::SendEmberExchangeRequest {
+            addr,
+            peer_pubkey,
+            tx,
+        } => {
+            // Feature gate: refuse here so the harness gets a clear
+            // "feature off" string instead of a silent no-op.
+            if !settings.ember_native_enabled {
+                let _ = tx.send(Err("Ember-native transport is disabled".to_string()));
+                return;
+            }
+
+            // Resolve the peer's Noise pubkey the same way SendEmberPing
+            // does: explicit value wins, otherwise the KAD-fed cache.
+            let resolved_pubkey = match peer_pubkey {
+                Some(k) => k,
+                None => match (addr.ip(), addr.port()) {
+                    (std::net::IpAddr::V4(v4), port) => {
+                        match lookup_ember_noise_key(&state.ember_noise_keys, v4, port) {
+                            Some(k) => k,
+                            None => {
+                                let _ = tx.send(Err(format!(
+                                    "No cached Ember Noise pubkey for {addr}; \
+                                     pass peer_pubkey_hex explicitly or wait for \
+                                     a KAD source publish to populate the cache"
+                                )));
+                                return;
+                            }
+                        }
+                    }
+                    _ => {
+                        let _ = tx.send(Err(
+                            "Noise pubkey lookup is IPv4-only — pass peer_pubkey_hex explicitly"
+                                .into(),
+                        ));
+                        return;
+                    }
+                },
+            };
+
+            let payload = ember::transport::EmberControlMessage::ExchangeRequest.encode();
+
+            match state
+                .ember_transport
+                .prepare_outgoing(addr, Some(&resolved_pubkey), &payload)
+            {
+                ember::transport::OutgoingResult::Ready { packet }
+                | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+                    if let Err(e) = socket.send_to(&packet, addr).await {
+                        let _ = tx.send(Err(format!("send_to({addr}) failed: {e}")));
+                        return;
+                    }
+                }
+                ember::transport::OutgoingResult::Queued => {
+                    // Queued behind an in-progress handshake; it flushes
+                    // when the handshake completes, same as the ping path.
+                }
+                ember::transport::OutgoingResult::Error(err) => {
+                    let _ = tx.send(Err(format!("Ember transport error: {err}")));
+                    return;
+                }
+            }
+
+            let _ = tx.send(Ok(()));
         }
 
         NetworkCommand::SendEmberDhtPing {
@@ -24670,10 +25233,18 @@ async fn handle_command_inner(
                                 ),
                                 None => (f.bytes_transferred, f.requests, f.accepted, 0, 0),
                             };
-                            let part_hashes = existing
+                            let mut part_hashes = existing
                                 .as_ref()
                                 .map(|r| r.part_hashes.clone())
                                 .unwrap_or_default();
+                            if part_hashes.len()
+                                != ed2k::hash::ed2k_known_met_part_hash_count(f.size)
+                            {
+                                part_hashes = ed2k::hash::ed2k_part_hashes_file(
+                                    std::path::Path::new(&f.path),
+                                )
+                                .unwrap_or_default();
+                            }
                             known_files.add_or_update(KnownFileRecord {
                                 file_hash: fh,
                                 part_hashes,

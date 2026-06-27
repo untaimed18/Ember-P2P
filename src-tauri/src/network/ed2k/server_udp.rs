@@ -10,11 +10,8 @@ use super::server_list::ServerEntry;
 
 pub const OP_EDONKEYPROT: u8 = 0xE3;
 
-#[allow(dead_code)]
 pub const OP_GLOBSEARCHREQ: u8 = 0x98;
-#[allow(dead_code)]
 pub const OP_GLOBSEARCHREQ2: u8 = 0x92;
-#[allow(dead_code)]
 pub const OP_GLOBSEARCHREQ3: u8 = 0x90;
 pub const OP_GLOBSEARCHRES: u8 = 0x99;
 pub const OP_GLOBGETSOURCES: u8 = 0x9A;

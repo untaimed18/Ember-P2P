@@ -1189,6 +1189,93 @@ pub async fn ember_ping_peer(
     }
 }
 
+/// Send an Ember-native `ExchangeRequest` to a peer over the encrypted
+/// Noise transport, asking it to reply with its current EPX source/peer
+/// payload. The reply (an `ExchangeData` message) is ingested
+/// asynchronously by the network receive loop via the shared
+/// `handle_epx_sources` path, so this command resolves as soon as the
+/// request is dispatched — observe `ember_exchange_received` /
+/// `ember_peers_known` in `get_ember_diagnostics` to confirm the
+/// round-trip.
+///
+/// Pubkey resolution mirrors [`ember_ping_peer`]: an explicit
+/// `peer_pubkey_hex` wins, otherwise the KAD-fed Noise-key cache is
+/// consulted. `peer_ip` is parsed as an IP literal (no DNS).
+#[tauri::command]
+pub async fn ember_request_sources(
+    state: tauri::State<'_, AppState>,
+    peer_ip: String,
+    peer_port: u16,
+    peer_pubkey_hex: Option<String>,
+) -> Result<(), String> {
+    if peer_port == 0 {
+        return Err(coded(
+            "peers_peer_port_must_be_positive",
+            "peer_port must be > 0",
+        ));
+    }
+
+    let ip: IpAddr = peer_ip.parse().map_err(|e| {
+        coded_ctx(
+            "peers_invalid_peer_ip",
+            format!("Invalid peer_ip '{peer_ip}'"),
+            e,
+        )
+    })?;
+    let harness_mode = cfg!(debug_assertions) || std::env::var_os("EMBER_DATA_DIR").is_some();
+    if !harness_mode && crate::security::is_private_ip(ip) {
+        return Err(coded(
+            "peers_cannot_ping_private",
+            "Cannot exchange with private, loopback, or special-use addresses",
+        ));
+    }
+    let addr = SocketAddr::new(ip, peer_port);
+
+    // Same "absent or empty string ⇒ look it up" handling as ember_ping_peer.
+    let peer_pubkey: Option<[u8; 32]> = match peer_pubkey_hex.as_deref() {
+        Some(s) if !s.is_empty() => {
+            let bytes = hex::decode(s).map_err(|e| {
+                coded_ctx(
+                    "peers_pubkey_invalid_hex",
+                    "peer_pubkey_hex is not valid hex",
+                    e,
+                )
+            })?;
+            if bytes.len() != 32 {
+                return Err(coded_ctx(
+                    "peers_pubkey_wrong_length",
+                    format!(
+                        "peer_pubkey_hex must decode to 32 bytes, got {}",
+                        bytes.len()
+                    ),
+                    bytes.len(),
+                ));
+            }
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&bytes);
+            Some(k)
+        }
+        _ => None,
+    };
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state
+        .network_tx
+        .try_send(NetworkCommand::SendEmberExchangeRequest {
+            addr,
+            peer_pubkey,
+            tx,
+        })
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+
+    await_reply(
+        rx,
+        "peers_no_response_from_network",
+        "No response from network",
+    )
+    .await?
+}
+
 /// Parse a 64-char hex string into a 32-byte key (Ed25519 / X25519).
 fn parse_key32(label: &str, hex_str: &str) -> Result<[u8; 32], String> {
     let bytes = hex::decode(hex_str).map_err(|e| {
