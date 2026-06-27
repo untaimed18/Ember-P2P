@@ -11191,10 +11191,43 @@ pub async fn start_network(
             // Buddy system: find a relay buddy if firewalled (always-on, like eMule)
             _ = buddy_timer.tick() => {
                 if state.stats.status == NetworkStatus::Disconnected { continue; }
-                let buddy_state = state.buddy_manager.state();
                 let tcp_fw = state.firewall_checker.tcp_status();
+                let udp_fw = state.firewall_checker.udp_status();
+                // eMule (ClientList.cpp:604-629): a buddy is only useful while we
+                // are firewalled on BOTH TCP and UDP -- a UDP-open client is
+                // reachable via direct UDP callback, so it needs no relay. If our
+                // firewall status improved (TCP or UDP opened), proactively drop
+                // the relay / cancel the in-flight search instead of holding a
+                // buddy slot we no longer need (eMule's `else if (m_pBuddy)` drop).
+                let need_buddy = state.firewall_checker.tcp_firewalled()
+                    && state.firewall_checker.udp_firewalled();
+                if !need_buddy {
+                    match state.buddy_manager.state() {
+                        BuddyState::Connected => {
+                            state.buddy_manager.disconnect_buddy();
+                            state.buddy_event_rx = None;
+                            *state.shared_buddy_info.write().await = None;
+                            info!("Dropped buddy: no longer firewalled on both TCP and UDP");
+                        }
+                        BuddyState::FindingBuddy => {
+                            state.buddy_manager.find_failed();
+                            let findbuddy_sids: Vec<_> = state.search_manager.active.iter()
+                                .filter(|(_, s)| matches!(s.search_type, SearchType::FindBuddy))
+                                .map(|(sid, _)| *sid)
+                                .collect();
+                            for sid in findbuddy_sids {
+                                if let Some(removed) = state.search_manager.remove(&sid) {
+                                    state.routing_table.release_contacts_in_use(&removed.in_use_ids);
+                                }
+                            }
+                            info!("Cancelled buddy search: no longer firewalled on both TCP and UDP");
+                        }
+                        BuddyState::NoBuddy => {}
+                    }
+                }
+                let buddy_state = state.buddy_manager.state();
                 if buddy_state != BuddyState::Connected {
-                    debug!("Buddy tick: state={:?}, tcp_fw={:?}, routing_table={}", buddy_state, tcp_fw, state.routing_table.len());
+                    debug!("Buddy tick: state={:?}, tcp_fw={:?}, udp_fw={:?}, routing_table={}", buddy_state, tcp_fw, udp_fw, state.routing_table.len());
                 }
                 if buddy_state == BuddyState::Connected {
                     state.buddy_manager.send_buddy_ping().await;
@@ -11203,7 +11236,7 @@ pub async fn start_network(
                     state.buddy_manager.find_failed();
                     info!("Buddy search timed out waiting for FindBuddyRes");
                 }
-                if state.buddy_manager.should_find_buddy(state.firewall_checker.tcp_status()) {
+                if state.buddy_manager.should_find_buddy(tcp_fw, udp_fw) {
                     state.buddy_manager.start_finding();
                     let target = state.buddy_manager.find_buddy_target();
                     let local_tcp = state.buddy_manager.tcp_port();
