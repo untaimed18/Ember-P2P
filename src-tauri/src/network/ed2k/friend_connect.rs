@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Context;
-use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -823,7 +823,7 @@ where
         .map_err(|e| anyhow::anyhow!("invalid peer Ed25519 pubkey: {e}"))?;
     let sig_bytes: [u8; 64] = peer_response[32..96].try_into().unwrap();
     let peer_sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-    peer_vk.verify(&our_nonce, &peer_sig).map_err(|e| {
+    peer_vk.verify_strict(&our_nonce, &peer_sig).map_err(|e| {
         anyhow::anyhow!("Ember auth: signature verification failed for {addr}: {e}")
     })?;
 
@@ -920,7 +920,7 @@ where
         .map_err(|e| anyhow::anyhow!("invalid peer Ed25519 pubkey: {e}"))?;
     let sig_bytes: [u8; 64] = peer_response[32..96].try_into().unwrap();
     let peer_sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-    peer_vk.verify(&our_nonce, &peer_sig).map_err(|e| {
+    peer_vk.verify_strict(&our_nonce, &peer_sig).map_err(|e| {
         anyhow::anyhow!("Ember auth: signature verification failed for {addr}: {e}")
     })?;
 
