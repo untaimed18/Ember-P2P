@@ -201,7 +201,6 @@ impl PartTracker {
     }
 
     /// Per-part verified bitmap (diagnostics / tests).
-    #[allow(dead_code)]
     pub fn verified_parts(&self) -> Vec<bool> {
         self.part_verified.clone()
     }

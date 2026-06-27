@@ -17,6 +17,10 @@ const LOOKUP_MAX_QUERIES: usize = 200;
 const LOOKUP_CONTACT_POOL: usize = 200;
 const LOOKUP_FORCE_FETCH_SECS: i64 = 15;
 pub const STORE_PUBLISH_TARGET_TOTAL: usize = 10;
+const SOURCE_SEARCH_STOP_THRESHOLD: usize = 20;
+const NOTES_SEARCH_STOP_THRESHOLD: usize = 50;
+pub const FIND_BUDDY_REQUEST_TOTAL: usize = 10;
+pub const FIND_BUDDY_REQUEST_MAX_SENDS: usize = FIND_BUDDY_REQUEST_TOTAL + 1;
 
 /// eMule seeds searches with 50 contacts (Search.cpp Go() -> GetClosestTo(..., 50, ...))
 pub const SEARCH_INITIAL_CONTACTS: usize = 50;
@@ -179,6 +183,7 @@ pub struct SearchState {
     /// `pending` (which tracks routing KadReq queries) to avoid breaking convergence.
     pub store_pending: HashSet<KadId>,
     store_pending_times: HashMap<KadId, i64>,
+    find_buddy_sent: HashSet<KadId>,
 }
 
 impl SearchState {
@@ -212,6 +217,7 @@ impl SearchState {
             store_sent: HashSet::new(),
             store_pending: HashSet::new(),
             store_pending_times: HashMap::new(),
+            find_buddy_sent: HashSet::new(),
         }
     }
 
@@ -327,14 +333,9 @@ impl SearchState {
             return Vec::new();
         }
 
-        let remaining = STORE_PUBLISH_TARGET_TOTAL.saturating_sub(self.store_sent.len());
-        if remaining == 0 {
-            return Vec::new();
-        }
-
         let mut contacts = Vec::new();
         for contact in &self.closest {
-            if contacts.len() >= ALPHA.min(remaining) {
+            if contacts.len() >= ALPHA {
                 break;
             }
             if self.responded_during_lookup.contains(&contact.id)
@@ -374,9 +375,14 @@ impl SearchState {
             return Vec::new();
         }
 
+        let remaining = STORE_PUBLISH_TARGET_TOTAL.saturating_sub(self.store_sent.len());
+        if remaining == 0 {
+            return Vec::new();
+        }
+
         let mut contacts = Vec::new();
         for contact in &self.closest {
-            if contacts.len() >= ALPHA {
+            if contacts.len() >= ALPHA.min(remaining) {
                 break;
             }
             if self.responded_during_lookup.contains(&contact.id)
@@ -603,7 +609,15 @@ impl SearchState {
 
     pub fn is_expired(&self) -> bool {
         let now = chrono::Utc::now().timestamp();
-        let lifetime = match self.search_type {
+        let lifetime = self.lifetime_secs();
+        // eMule: PrepareToStop fires at the lifetime mark, then a 15s grace
+        // period allows late results to arrive. The overall cap is therefore
+        // search-lifetime + FETCH_TIMEOUT_SECS.
+        now - self.started_at >= lifetime + FETCH_TIMEOUT_SECS
+    }
+
+    fn lifetime_secs(&self) -> i64 {
+        match self.search_type {
             SearchType::FindNode => TIMEOUT_FIND_NODE,
             SearchType::FindKeyword => TIMEOUT_KEYWORD,
             SearchType::FindSource { .. } => TIMEOUT_SOURCE,
@@ -612,11 +626,7 @@ impl SearchState {
             SearchType::StoreKeyword => TIMEOUT_STORE_KEYWORD,
             SearchType::StoreNotes => TIMEOUT_STORE_NOTES,
             SearchType::FindBuddy => TIMEOUT_FIND_BUDDY,
-        };
-        // eMule: PrepareToStop fires at the lifetime mark, then a 15s grace
-        // period allows late results to arrive. The overall cap is therefore
-        // search-lifetime + FETCH_TIMEOUT_SECS.
-        now - self.started_at >= lifetime + FETCH_TIMEOUT_SECS
+        }
     }
 
     /// eMule checks `GetAnswers() >= SEARCHKEYWORD_TOTAL` which counts raw
@@ -624,10 +634,39 @@ impl SearchState {
     /// the threshold is reached eMule calls PrepareToStop(): new queries stop
     /// but late responses from already-queried nodes keep flowing in.
     fn should_stop_querying(&self) -> bool {
-        if !matches!(self.search_type, SearchType::FindKeyword) {
+        let threshold_reached = match self.search_type {
+            SearchType::FindKeyword => self.results.len() >= KEYWORD_SEARCH_STOP_THRESHOLD,
+            SearchType::FindSource { .. } => self.results.len() >= SOURCE_SEARCH_STOP_THRESHOLD,
+            SearchType::FindNotes { .. } => self.results.len() >= NOTES_SEARCH_STOP_THRESHOLD,
+            SearchType::FindBuddy => self.find_buddy_sent.len() >= FIND_BUDDY_REQUEST_MAX_SENDS,
+            _ => false,
+        };
+        let now = chrono::Utc::now().timestamp();
+        let early_lifetime_stop = (self.search_type.accepts_search_results()
+            || matches!(self.search_type, SearchType::FindBuddy))
+            && now.saturating_sub(self.started_at) >= self.lifetime_secs().saturating_sub(20);
+        threshold_reached || early_lifetime_stop
+    }
+
+    pub fn find_buddy_requests_sent(&self) -> usize {
+        self.find_buddy_sent.len()
+    }
+
+    pub fn reserve_find_buddy_request(&mut self, contact_id: KadId) -> bool {
+        if !matches!(self.search_type, SearchType::FindBuddy) {
             return false;
         }
-        self.results.len() >= KEYWORD_SEARCH_STOP_THRESHOLD
+        if self.find_buddy_sent.contains(&contact_id) {
+            return false;
+        }
+        if self.find_buddy_sent.len() >= FIND_BUDDY_REQUEST_MAX_SENDS {
+            return false;
+        }
+        self.find_buddy_sent.insert(contact_id);
+        if self.find_buddy_sent.len() >= FIND_BUDDY_REQUEST_MAX_SENDS {
+            self.stop_querying = true;
+        }
+        true
     }
 
     fn check_phase_transition(&mut self) {
@@ -1177,6 +1216,31 @@ mod tests {
         KadId([byte; KAD_ID_SIZE])
     }
 
+    fn near_kad_id(last_byte: u8) -> KadId {
+        let mut id = [0u8; KAD_ID_SIZE];
+        id[KAD_ID_SIZE - 1] = last_byte;
+        KadId(id)
+    }
+
+    fn contact(id: KadId, host: u8) -> KadContact {
+        KadContact {
+            id,
+            ip: Ipv4Addr::new(203, 0, 113, host),
+            udp_port: 4672 + host as u16,
+            tcp_port: 4662 + host as u16,
+            version: KADEMLIA_VERSION,
+            last_seen: chrono::Utc::now().timestamp(),
+            verified: true,
+            contact_type: CONTACT_TYPE_VERIFIED,
+            udp_key: None,
+            kad_options: 0,
+            created_at: chrono::Utc::now().timestamp(),
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            last_type_set: chrono::Utc::now().timestamp(),
+            received_hello: false,
+        }
+    }
+
     #[test]
     fn expire_pending_uses_relaxed_timeout() {
         let mut state = SearchState::new(SearchId(1), kad_id(1), SearchType::FindKeyword);
@@ -1229,6 +1293,37 @@ mod tests {
                 0,
             ),
             "must not force fetch with 0 responders"
+        );
+    }
+
+    #[test]
+    fn store_publish_candidates_stop_at_emule_total() {
+        let target = near_kad_id(0);
+        let mut state = SearchState::new(SearchId(1), target, SearchType::StoreFile);
+        let contacts: Vec<KadContact> = (1..=20).map(|i| contact(near_kad_id(i), i)).collect();
+        for c in &contacts {
+            state.responded_during_lookup.insert(c.id);
+        }
+        state.closest = contacts;
+
+        let mut published = 0;
+        loop {
+            let batch = state.next_publish_candidates();
+            if batch.is_empty() {
+                break;
+            }
+            assert!(
+                batch.len() <= ALPHA,
+                "lookup-time store publishing should still respect ALPHA batches"
+            );
+            published += batch.len();
+        }
+
+        assert_eq!(published, STORE_PUBLISH_TARGET_TOTAL);
+        assert_eq!(state.store_sent.len(), STORE_PUBLISH_TARGET_TOTAL);
+        assert!(
+            state.next_publish_candidates().is_empty(),
+            "eMule caps store publishes at 10 target nodes per search"
         );
     }
 

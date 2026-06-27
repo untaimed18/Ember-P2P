@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { getEmberDiagnostics, emberPingPeer } from '$lib/api/ember';
+  import { getEmberDiagnostics, emberPingPeer, emberRequestSources } from '$lib/api/ember';
   import { getSettings } from '$lib/api/settings';
   import { translateError } from '$lib/i18n';
   import type { EmberDiagnostics, EmberPingResult } from '$lib/types';
@@ -84,6 +84,34 @@
     } finally {
       pinging = false;
       // Counter changes show up immediately on the next refresh tick.
+      refreshDiag();
+    }
+  }
+
+  // "Request sources" reuses the ping form's IP / port / pubkey fields.
+  let requesting = $state(false);
+  let exchangeResult = $state<{ ok: boolean; message: string } | null>(null);
+
+  async function submitExchangeRequest() {
+    if (requesting) return;
+    if (!formIp.trim()) return;
+    if (formPort === '' || formPort <= 0) return;
+    requesting = true;
+    exchangeResult = null;
+    try {
+      await emberRequestSources({
+        peerIp: formIp.trim(),
+        peerPort: Number(formPort),
+        peerPubkeyHex: formPubkeyHex.trim() || undefined,
+      });
+      exchangeResult = {
+        ok: true,
+        message: 'Request sent — watch "Exchange data received" / "Mesh peers known" above.',
+      };
+    } catch (e) {
+      exchangeResult = { ok: false, message: translateError(e) };
+    } finally {
+      requesting = false;
       refreshDiag();
     }
   }
@@ -207,6 +235,18 @@
           <div class="counter-value">{diag.ember_pongs_received}</div>
         </div>
         <div class="counter">
+          <div class="counter-label">Exchange requests in</div>
+          <div class="counter-value">{diag.ember_exchange_requests_received}</div>
+        </div>
+        <div class="counter">
+          <div class="counter-label">Exchange data sent</div>
+          <div class="counter-value">{diag.ember_exchange_sent}</div>
+        </div>
+        <div class="counter">
+          <div class="counter-label">Exchange data received</div>
+          <div class="counter-value">{diag.ember_exchange_received}</div>
+        </div>
+        <div class="counter">
           <div class="counter-label">Mesh peers known</div>
           <div class="counter-value">{diag.ember_peers_known}</div>
         </div>
@@ -225,6 +265,26 @@
           <div class="counter-value">
             {diag.broker_relay_successes} / {diag.broker_relay_attempts} / {diag.broker_relay_failures}
           </div>
+        </div>
+        <div class="counter">
+          <div class="counter-label">Broker active attempts</div>
+          <div class="counter-value">{diag.broker_active_attempts}</div>
+        </div>
+        <div class="counter">
+          <div class="counter-label">Relay candidates</div>
+          <div class="counter-value">{diag.broker_relay_candidates}</div>
+        </div>
+        <div class="counter">
+          <div class="counter-label">Oldest attempt age (s)</div>
+          <div class="counter-value">{diag.broker_oldest_attempt_age_secs}</div>
+        </div>
+        <div class="counter">
+          <div class="counter-label">Relay sessions (bridging)</div>
+          <div class="counter-value">{diag.relay_sessions_active}</div>
+        </div>
+        <div class="counter">
+          <div class="counter-label">Relay bytes served</div>
+          <div class="counter-value">{diag.relay_bytes_relayed}</div>
         </div>
       </div>
       <p class="hint muted">Auto-refreshes every 2s.</p>
@@ -297,6 +357,15 @@
         />
       </label>
       <div class="form-actions">
+        <button
+          type="button"
+          class="secondary"
+          onclick={submitExchangeRequest}
+          disabled={requesting || !formIp || formPort === ''}
+          title="Send an Ember ExchangeRequest; the peer replies with its EPX source/peer payload"
+        >
+          {requesting ? 'Requesting…' : 'Request Sources'}
+        </button>
         <button type="submit" disabled={pinging || !formIp || formPort === ''}>
           {pinging ? 'Pinging…' : 'Send Ping'}
         </button>
@@ -314,6 +383,13 @@
           <strong>Failed</strong>
           <span class="err">{pingResult.error ?? 'Unknown error'}</span>
         {/if}
+      </div>
+    {/if}
+
+    {#if exchangeResult}
+      <div class="result {exchangeResult.ok ? 'result-ok' : 'result-fail'}">
+        <strong>{exchangeResult.ok ? 'Exchange' : 'Failed'}</strong>
+        <span class="err">{exchangeResult.message}</span>
       </div>
     {/if}
   </section>
@@ -461,7 +537,7 @@
     font-family: inherit;
   }
   .ping-form input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
-  .form-actions { grid-column: 1 / -1; display: flex; justify-content: flex-end; }
+  .form-actions { grid-column: 1 / -1; display: flex; justify-content: flex-end; gap: 10px; }
   .form-actions button {
     background: var(--accent);
     color: #fff;
@@ -472,6 +548,12 @@
     font-weight: 600;
     cursor: pointer;
   }
+  .form-actions button.secondary {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+  }
+  .form-actions button.secondary:hover:not(:disabled) { background: var(--bg-hover); }
   .form-actions button:disabled {
     opacity: 0.5;
     cursor: not-allowed;

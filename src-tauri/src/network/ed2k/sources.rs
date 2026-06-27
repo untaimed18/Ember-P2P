@@ -106,6 +106,9 @@ pub struct DownloadSourceEntry {
     pub callback_buddy_hash: Option<[u8; 16]>,
     /// Publisher's ED2K user hash from the KAD source record.
     pub source_user_hash: Option<[u8; 16]>,
+    /// Latest part availability bitmap learned from TCP file status or UDP
+    /// OP_REASKACK. Used for NNP and complete-source accounting.
+    pub available_parts: Vec<bool>,
 }
 
 impl DownloadSourceEntry {
@@ -124,6 +127,7 @@ impl DownloadSourceEntry {
             callback_buddy_port: None,
             callback_buddy_hash: None,
             source_user_hash: None,
+            available_parts: Vec::new(),
         }
     }
 
@@ -575,18 +579,46 @@ impl PerFileSourceList {
         }
     }
 
-    /// Count sources in OnQueue or Downloading state (eMule: m_nCompleteSourcesCount).
+    /// Count sources with a full availability bitmap (eMule: m_nCompleteSourcesCount).
     pub fn complete_source_count(&self) -> u16 {
         self.sources
             .iter()
-            .filter(|s| {
-                matches!(
-                    s.state,
-                    DownloadSourceState::OnQueue { .. } | DownloadSourceState::Downloading
-                )
-            })
+            .filter(|s| !s.available_parts.is_empty() && s.available_parts.iter().all(|have| *have))
             .count()
             .min(u16::MAX as usize) as u16
+    }
+
+    pub fn apply_udp_reask_ack(
+        &mut self,
+        ip: Ipv4Addr,
+        udp_port: u16,
+        rank: Option<u16>,
+        available_parts: Option<Vec<bool>>,
+    ) {
+        if let Some(s) = self
+            .sources
+            .iter_mut()
+            .find(|s| s.ip == ip && s.udp_port == udp_port)
+        {
+            if let Some(parts) = available_parts {
+                s.available_parts = parts;
+                if rank.is_some() {
+                    s.state = DownloadSourceState::OnQueue {
+                        rank: rank.map(u32::from),
+                    };
+                } else if !s.available_parts.iter().any(|have| *have) {
+                    s.state = DownloadSourceState::NoneNeededParts;
+                } else {
+                    s.state = DownloadSourceState::OnQueue { rank: None };
+                }
+            } else {
+                s.state = DownloadSourceState::OnQueue {
+                    rank: rank.map(u32::from),
+                };
+            }
+            s.state_changed = std::time::Instant::now();
+            s.fail_count = s.fail_count.saturating_sub(1);
+        }
     }
 
     /// Remove persistently bad sources after repeated failures.

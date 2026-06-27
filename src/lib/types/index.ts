@@ -220,11 +220,19 @@ export interface EmberDiagnostics {
   broker_relay_attempts: number;
   broker_relay_successes: number;
   broker_relay_failures: number;
+  broker_active_attempts: number;
+  broker_relay_candidates: number;
+  broker_oldest_attempt_age_secs: number;
+  relay_sessions_active: number;
+  relay_bytes_relayed: number;
   ember_native_enabled: boolean;
   ember_sessions: number;
   ember_pings_sent: number;
   ember_pings_received: number;
   ember_pongs_received: number;
+  ember_exchange_requests_received: number;
+  ember_exchange_sent: number;
+  ember_exchange_received: number;
   local_noise_public_key: string;
 }
 

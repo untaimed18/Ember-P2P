@@ -4,11 +4,7 @@ use std::time::Duration;
 
 use quinn::{ClientConfig, Endpoint, EndpointConfig, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use tracing::{debug, info, warn};
-
-/// Maximum concurrent QUIC connections.
-#[allow(dead_code)]
-const MAX_CONNECTIONS: u32 = 256;
+use tracing::{info, warn};
 
 /// Idle timeout for QUIC connections.
 const IDLE_TIMEOUT_SECS: u64 = 120;
@@ -37,14 +33,6 @@ const SEND_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
 /// (mvfst, msquic) recommend.
 const UDP_RECV_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const UDP_SEND_BUFFER_BYTES: usize = 2 * 1024 * 1024;
-
-/// Configuration for the Ember QUIC transport.
-#[allow(dead_code)]
-pub struct QuicConfig {
-    pub cert_der: Vec<u8>,
-    pub key_der: Vec<u8>,
-    pub ember_node_id: [u8; 16],
-}
 
 /// Generate a self-signed TLS certificate for QUIC using the Ember node ID
 /// as the subject CN.
@@ -342,87 +330,6 @@ impl rustls::server::danger::ClientCertVerifier for EmberClientCertVerifier {
     }
 }
 
-/// An Ember QUIC endpoint that can accept incoming connections and initiate
-/// outgoing ones.
-#[allow(dead_code)]
-pub struct EmberQuicEndpoint {
-    endpoint: Endpoint,
-    client_config: ClientConfig,
-    pub local_addr: SocketAddr,
-}
-
-#[allow(dead_code)]
-impl EmberQuicEndpoint {
-    /// Create and bind a new QUIC endpoint with tuned UDP buffer sizes.
-    pub fn new(bind_addr: SocketAddr, config: &QuicConfig) -> anyhow::Result<Self> {
-        let server_config = build_server_config(&config.cert_der, &config.key_der)?;
-        // Default client config for incoming connections from this
-        // endpoint (no specific peer pin). Use `connect_pinned` for
-        // outbound connections where the target's node_id is known.
-        let client_config = build_client_config(&config.cert_der, &config.key_der, None)?;
-
-        let socket = bind_tuned_udp(bind_addr)?;
-        let endpoint = Endpoint::new(
-            EndpointConfig::default(),
-            Some(server_config),
-            socket,
-            Arc::new(quinn::TokioRuntime),
-        )?;
-        let local_addr = endpoint.local_addr()?;
-        info!("Ember QUIC endpoint bound on {local_addr}");
-
-        Ok(Self {
-            endpoint,
-            client_config,
-            local_addr,
-        })
-    }
-
-    /// Accept the next incoming QUIC connection.
-    pub async fn accept(&self) -> Option<quinn::Incoming> {
-        self.endpoint.accept().await
-    }
-
-    /// Connect to a remote peer.
-    pub async fn connect(&self, addr: SocketAddr) -> anyhow::Result<quinn::Connection> {
-        let conn = self
-            .endpoint
-            .connect_with(self.client_config.clone(), addr, "ember")?
-            .await?;
-        debug!("QUIC connected to {addr}");
-        Ok(conn)
-    }
-
-    /// Close the endpoint gracefully.
-    pub fn close(&self) {
-        self.endpoint.close(0u32.into(), b"shutdown");
-    }
-
-    /// Get number of active connections.
-    pub fn open_connections(&self) -> usize {
-        self.endpoint.open_connections()
-    }
-}
-
-/// Create a client-only QUIC endpoint bound to 0.0.0.0:0 for outgoing connections
-/// (used by the connection broker for hole-punching and relay).
-#[allow(dead_code)]
-pub fn build_client_endpoint(cert_der: &[u8], key_der: &[u8]) -> anyhow::Result<Endpoint> {
-    // Default to the unpinned smoke-test verifier; per-peer pinning
-    // requires knowing the target's node_id at connect time, which
-    // broker/hole-punch sites don't always have.
-    let client_config = build_client_config(cert_der, key_der, None)?;
-    let socket = bind_tuned_udp("0.0.0.0:0".parse::<SocketAddr>()?)?;
-    let mut endpoint = Endpoint::new(
-        EndpointConfig::default(),
-        None,
-        socket,
-        Arc::new(quinn::TokioRuntime),
-    )?;
-    endpoint.set_default_client_config(client_config);
-    Ok(endpoint)
-}
-
 /// Create a QUIC endpoint that can both accept incoming connections (relay server)
 /// and make outgoing ones (hole-punch/relay client). Binds to `0.0.0.0:{bind_port}`
 /// on UDP — this coexists with any TCP listener on the same port number, but
@@ -495,6 +402,37 @@ pub fn build_server_client_endpoint(
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no QUIC bind candidates exhausted")))
 }
 
+/// Connect to a peer over an existing endpoint, optionally pinning the peer's
+/// Ember node id into the TLS verifier.
+///
+/// When `pin` is `Some((cert_der, key_der, node_id))`, a per-connection client
+/// config is built whose verifier requires the peer's certificate to carry the
+/// matching `ember-{hex}` SAN — true MITM-safe per-peer authentication. When
+/// `pin` is `None`, the endpoint's default (unpinned smoke-test) client config
+/// is used. `None` is the graceful fallback for broker/relay candidates
+/// discovered via unauthenticated rendezvous/EPX, where the target's Ember node
+/// id isn't known at QUIC-connect time — the KAD source record advertises the
+/// peer's Noise public key, not its `ember_hash`, and the node↔key binding is
+/// established out-of-band by the eMule/Ember TCP Ed25519 proof-of-possession.
+/// Callers that *do* know the target node id (e.g. a future
+/// `(ip,port)→ember_hash` discovery cache) pass `Some` to upgrade the channel
+/// to authenticated pinning without any change to this transport layer.
+pub async fn connect_pinned(
+    endpoint: &Endpoint,
+    addr: SocketAddr,
+    server_name: &str,
+    pin: Option<(&[u8], &[u8], [u8; 16])>,
+) -> anyhow::Result<quinn::Connection> {
+    let connecting = match pin {
+        Some((cert_der, key_der, node_id)) => {
+            let cfg = build_client_config(cert_der, key_der, Some(node_id))?;
+            endpoint.connect_with(cfg, addr, server_name)?
+        }
+        None => endpoint.connect(addr, server_name)?,
+    };
+    Ok(connecting.await?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,70 +446,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quic_endpoint_binds() {
-        let node_id = [0xBB; 16];
-        let (cert, key) = generate_self_signed_cert(&node_id).unwrap();
-        let config = QuicConfig {
-            cert_der: cert,
-            key_der: key,
-            ember_node_id: node_id,
-        };
-        let endpoint = EmberQuicEndpoint::new("127.0.0.1:0".parse().unwrap(), &config).unwrap();
-        assert_ne!(endpoint.local_addr.port(), 0);
-        endpoint.close();
-    }
-
-    #[tokio::test]
-    async fn quic_connect_round_trip() {
-        let server_id = [0x01; 16];
-        let client_id = [0x02; 16];
-
+    async fn connect_pinned_matches_and_rejects_node_id() {
+        let server_id = [0x11; 16];
+        let client_id = [0x22; 16];
         let (s_cert, s_key) = generate_self_signed_cert(&server_id).unwrap();
-        let server = EmberQuicEndpoint::new(
-            "127.0.0.1:0".parse().unwrap(),
-            &QuicConfig {
-                cert_der: s_cert,
-                key_der: s_key,
-                ember_node_id: server_id,
-            },
-        )
-        .unwrap();
-
         let (c_cert, c_key) = generate_self_signed_cert(&client_id).unwrap();
-        let client = EmberQuicEndpoint::new(
-            "127.0.0.1:0".parse().unwrap(),
-            &QuicConfig {
-                cert_der: c_cert,
-                key_der: c_key,
-                ember_node_id: client_id,
-            },
-        )
-        .unwrap();
 
-        let server_addr = server.local_addr;
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = build_server_client_endpoint(&s_cert, &s_key, 0).unwrap();
+        let client = build_server_client_endpoint(&c_cert, &c_key, 0).unwrap();
+        // The endpoint binds to 0.0.0.0:<port>; quinn refuses to *connect* to an
+        // unspecified address, so dial the loopback with the OS-assigned port.
+        let server_addr = SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            server.local_addr().unwrap().port(),
+        );
 
+        // Accept loop stays alive for both the matching and mismatched
+        // connect attempts; aborted at the end of the test.
         let server_handle = tokio::spawn(async move {
-            let incoming = server.accept().await.unwrap();
-            let conn = incoming.await.unwrap();
-            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
-            let data = recv.read_to_end(1024).await.unwrap();
-            send.write_all(&data).await.unwrap();
-            send.finish().unwrap();
-            // Wait until client signals it's done reading
-            let _ = done_rx.await;
+            while let Some(incoming) = server.accept().await {
+                tokio::spawn(async move {
+                    if let Ok(conn) = incoming.await {
+                        if let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                            if let Ok(data) = recv.read_to_end(64).await {
+                                let _ = send.write_all(&data).await;
+                                let _ = send.finish();
+                            }
+                        }
+                        // Hold the connection open until the client closes it.
+                        // Dropping `conn` here would emit CONNECTION_CLOSE that can
+                        // race ahead of the echoed STREAM frame and surface as a
+                        // spurious ConnectionLost on the client's read_to_end.
+                        conn.closed().await;
+                    }
+                });
+            }
         });
 
-        let conn = client.connect(server_addr).await.unwrap();
+        // Correct pin → the verifier accepts the server cert (its `ember-{hex}`
+        // SAN matches `server_id`) and the round-trip succeeds.
+        let conn = connect_pinned(&client, server_addr, "ember", Some((&c_cert, &c_key, server_id)))
+            .await
+            .expect("pinned connect with correct node id should succeed");
         let (mut send, mut recv) = conn.open_bi().await.unwrap();
-        send.write_all(b"hello ember").await.unwrap();
+        send.write_all(b"ping").await.unwrap();
         send.finish().unwrap();
+        let echoed = recv.read_to_end(64).await.unwrap();
+        assert_eq!(&echoed, b"ping");
+        drop(conn);
 
-        let response = recv.read_to_end(1024).await.unwrap();
-        assert_eq!(&response, b"hello ember");
+        // Wrong pin → the verifier rejects the server cert (node-id mismatch)
+        // and the handshake fails.
+        let bad = connect_pinned(&client, server_addr, "ember", Some((&c_cert, &c_key, [0xFF; 16])))
+            .await;
+        assert!(bad.is_err(), "pinned connect with wrong node id must fail");
 
-        let _ = done_tx.send(());
-        server_handle.await.unwrap();
-        client.close();
+        server_handle.abort();
     }
 }

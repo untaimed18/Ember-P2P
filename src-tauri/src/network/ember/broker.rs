@@ -74,7 +74,6 @@ enum AttemptPhase {
 }
 
 /// Tracks an in-progress LowID-to-LowID connection attempt.
-#[allow(dead_code)]
 struct ConnectionAttempt {
     transfer_id: String,
     file_hash: [u8; 16],
@@ -84,8 +83,6 @@ struct ConnectionAttempt {
     started: Instant,
     phase_started: Instant,
     our_nat: NatType,
-    attempt_count: u32,
-    relay_candidate: Option<(Ipv4Addr, u16, [u8; 32])>,
 }
 
 impl ConnectionAttempt {
@@ -113,10 +110,9 @@ pub struct RelayCandidate {
 pub async fn punch_quic(
     endpoint: &quinn::Endpoint,
     addr: SocketAddr,
+    pin: Option<(&[u8], &[u8], [u8; 16])>,
 ) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
-    let conn = endpoint
-        .connect(addr, "ember-punch")
-        .map_err(|e| format!("quinn connect error: {e}"))?
+    let conn = super::quic::connect_pinned(endpoint, addr, "ember-punch", pin)
         .await
         .map_err(|e| format!("QUIC handshake failed with {addr}: {e}"))?;
 
@@ -282,8 +278,6 @@ impl ConnectionBroker {
             started: now,
             phase_started: now,
             our_nat,
-            attempt_count: cooldown_count + 1,
-            relay_candidate: None,
         };
 
         info!(
@@ -342,7 +336,6 @@ impl ConnectionBroker {
             self.stats.punch_failures = self.stats.punch_failures.saturating_add(1);
             attempt.phase = AttemptPhase::FindRelay;
             attempt.phase_started = Instant::now();
-            attempt.relay_candidate = relay_candidate;
 
             self.stats.relay_attempts = self.stats.relay_attempts.saturating_add(1);
             emit_event(
@@ -454,7 +447,10 @@ impl ConnectionBroker {
             if let Some(attempt) = self.attempts.get(&key) {
                 match attempt.phase {
                     AttemptPhase::HolePunch => {
-                        info!("Broker: punch timed out for {key}, trying relay");
+                        info!(
+                            "Broker: punch timed out for {key} (our_nat={:?}), trying relay",
+                            attempt.our_nat
+                        );
                         self.punch_failed(&key, "timeout").await;
                     }
                     AttemptPhase::FindRelay | AttemptPhase::RelayConnect => {
@@ -475,14 +471,22 @@ impl ConnectionBroker {
             .retain(|_, (ts, _)| ts.elapsed() < ATTEMPT_RESET);
     }
 
-    #[allow(dead_code)]
     pub fn active_attempts(&self) -> usize {
         self.attempts.len()
     }
 
-    #[allow(dead_code)]
     pub fn relay_candidate_count(&self) -> usize {
         self.relay_candidates.len()
+    }
+
+    /// Age in seconds of the longest-running in-flight attempt, if any.
+    /// Surfaced in Ember diagnostics so a broker attempt stuck across both
+    /// the punch and relay phases is observable rather than silent.
+    pub fn oldest_attempt_age_secs(&self) -> Option<u64> {
+        self.attempts
+            .values()
+            .map(|a| a.started.elapsed().as_secs())
+            .max()
     }
 
     /// Look up attempt metadata. Returns (transfer_id, file_hash, source_ip, source_port).

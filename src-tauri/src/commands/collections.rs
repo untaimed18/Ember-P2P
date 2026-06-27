@@ -5,6 +5,7 @@ use crate::types::{Transfer, TransferDirection, TransferStatus};
 use tauri::Emitter;
 
 const MAX_COLLECTION_FIELD_LEN: usize = 1024;
+const MAX_COLLECTION_ENTRY_NAME_LEN: usize = 1024;
 
 #[tauri::command]
 pub async fn load_collection(
@@ -136,6 +137,27 @@ pub async fn create_collection(
             MAX_COLLECTION_FILES,
         ));
     }
+    for file in &files {
+        if file.name.trim().is_empty() {
+            return Err(coded(
+                "collections_empty_file_name",
+                "Collection entries must have non-empty names",
+            ));
+        }
+        if file.name.len() > MAX_COLLECTION_ENTRY_NAME_LEN {
+            return Err(coded_ctx(
+                "collections_file_name_too_long",
+                format!("Collection entry name exceeds {MAX_COLLECTION_ENTRY_NAME_LEN} bytes"),
+                MAX_COLLECTION_ENTRY_NAME_LEN,
+            ));
+        }
+        if file.hash.len() != 32 || !file.hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(coded(
+                "collections_invalid_file_hash",
+                "Collection entries must use 32-character ED2K file hashes",
+            ));
+        }
+    }
     let collection = Collection {
         name: name.clone(),
         author,
@@ -264,9 +286,13 @@ pub async fn download_collection_files(
     let mut skipped_count = 0usize;
     let mut oversize_count = 0usize;
     for file in files {
-        if file.hash.is_empty() || file.name.is_empty() {
+        if file.hash.is_empty()
+            || file.name.trim().is_empty()
+            || file.name.len() > MAX_COLLECTION_ENTRY_NAME_LEN
+            || file.size == 0
+        {
             skipped_count += 1;
-            tracing::debug!("Skipping collection entry: empty hash or name");
+            tracing::debug!("Skipping collection entry: invalid name, hash, or size");
             continue;
         }
         if file.hash.len() != 32 || hex::decode(&file.hash).is_err() {

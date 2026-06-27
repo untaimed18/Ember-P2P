@@ -664,7 +664,6 @@ impl Drop for InProgressGuard {
 
 #[derive(Debug)]
 struct PendingCompressedBlock {
-    #[allow(dead_code)]
     compressed_total_size: u32,
     compressed: Vec<u8>,
 }
@@ -8623,6 +8622,58 @@ async fn write_packet_async_ms<W: AsyncWriteExt + Unpin + ?Sized>(
     writer.write_all(payload).await?;
     writer.flush().await?;
     Ok(())
+}
+
+/// Perform the eMule client-side Hello handshake on an already-connected,
+/// already-encrypted stream, returning the peer's user hash and the
+/// capabilities parsed from its HelloAnswer.
+///
+/// This is the greeting half of a normal outbound dial (see the dial branch
+/// of `try_source`), reused for Ember broker streams (QUIC hole-punch / relay)
+/// that WE initiate. On those streams the remote upload listener is waiting to
+/// RECEIVE our Hello before it will answer, so the stream must be greeted
+/// before it is adopted by the download worker; otherwise both sides stall and
+/// our side falls back to default (ext_ver=0) capabilities — the documented
+/// "stranded callback" failure.
+///
+/// Plain only: the Ember QUIC/Noise transport already encrypts the byte
+/// stream, so layering eMule RC4 obfuscation on top is pointless, and we skip
+/// the obfuscation-retry dance entirely. EmuleInfo is likewise not exchanged
+/// here — Ember peers are modern eMule clients whose HelloAnswer carries the
+/// eMule version tags, so the download path's `peer_is_new_emule` fast path
+/// skips EmuleInfo regardless (callers pass `emule_info_done: false`).
+pub async fn perform_outbound_hello(
+    reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+    writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
+    user_hash: &[u8; 16],
+    our_client_id: u32,
+    tcp_port: u16,
+    udp_port: u16,
+    nickname: &str,
+) -> anyhow::Result<([u8; 16], super::messages::PeerCapabilities)> {
+    use super::messages::*;
+    let mut hello_options = HelloOptions::default_for_udp_port(udp_port);
+    hello_options.supports_crypt_layer = false;
+    hello_options.requests_crypt_layer = false;
+    hello_options.requires_crypt_layer = false;
+    let hello_payload =
+        build_hello_with_buddy_opts(user_hash, our_client_id, tcp_port, nickname, None, &hello_options);
+
+    write_packet_async_ms(writer, OP_EDONKEYHEADER, OP_HELLO, &hello_payload)
+        .await
+        .map_err(|e| anyhow::anyhow!("stage:ember_hello_send {e}"))?;
+
+    let (proto, opcode, data) = read_packet_timeout_ms(reader)
+        .await
+        .context("stage:ember_hello_wait")?;
+    if proto != OP_EDONKEYHEADER || opcode != OP_HELLOANSWER {
+        anyhow::bail!(
+            "ember hello: expected HelloAnswer, got proto=0x{proto:02X} op=0x{opcode:02X}"
+        );
+    }
+
+    let (peer_user_hash, caps) = parse_hello_answer(&data)?;
+    Ok((peer_user_hash, caps))
 }
 
 #[cfg(test)]

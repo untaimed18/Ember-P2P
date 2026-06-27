@@ -32,6 +32,13 @@ const MAX_MARK_SPAM_KEYWORDS: usize = 32;
 /// Maximum keyword length in a `mark_spam` payload.
 const MAX_MARK_SPAM_KEYWORD_LEN: usize = 256;
 
+fn is_allowed_emule_file_type(file_type: &str) -> bool {
+    matches!(
+        file_type,
+        "Audio" | "Video" | "Image" | "Pro" | "Doc" | "Arc" | "Iso" | "EmuleCollection"
+    )
+}
+
 /// Shared input bounds for the spam IPC payloads (`mark_spam` and
 /// `explain_spam_result`). Both accept attacker-influenceable strings from
 /// the renderer, so they must reject oversized inputs identically before
@@ -190,6 +197,15 @@ pub async fn search_files(
             format!("file_type exceeds {MAX_SEARCH_FILTER_LEN} bytes"),
             MAX_SEARCH_FILTER_LEN,
         ));
+    }
+    if let Some(ref ft) = file_type {
+        if !is_allowed_emule_file_type(ft) {
+            return Err(coded_ctx(
+                "search_invalid_file_type",
+                "Unsupported eMule file_type filter",
+                ft,
+            ));
+        }
     }
     if file_extension
         .as_deref()
@@ -365,6 +381,8 @@ pub async fn find_sources(
 pub async fn publish_note(
     state: tauri::State<'_, AppState>,
     file_hash: String,
+    file_name: Option<String>,
+    file_size: Option<u64>,
     rating: u8,
     comment: String,
 ) -> Result<String, String> {
@@ -378,6 +396,12 @@ pub async fn publish_note(
         return Err(coded(
             "search_comment_too_long",
             "Comment too long (max 4096 bytes)",
+        ));
+    }
+    if file_name.as_deref().is_some_and(|name| name.len() > 1024) {
+        return Err(coded(
+            "search_note_file_name_too_long",
+            "File name too long (max 1024 bytes)",
         ));
     }
     if rating == 0 && comment.trim().is_empty() {
@@ -399,6 +423,8 @@ pub async fn publish_note(
         .network_tx
         .try_send(NetworkCommand::PublishNote {
             file_hash: kad_hash,
+            file_name,
+            file_size,
             rating,
             comment,
         })

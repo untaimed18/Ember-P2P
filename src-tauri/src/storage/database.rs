@@ -57,7 +57,7 @@ impl Database {
         // Ember build. Silently running would invite subtle data corruption
         // (missing columns, renamed tables, semantic changes). Bump this
         // when introducing a new migration.
-        const MAX_SUPPORTED_VERSION: i64 = 18;
+        const MAX_SUPPORTED_VERSION: i64 = 19;
         if version > MAX_SUPPORTED_VERSION {
             anyhow::bail!(
                 "Database schema version {version} is newer than this Ember build supports \
@@ -457,6 +457,16 @@ impl Database {
                 );",
             )?;
             set_version(&tx, 18)?;
+            tx.commit()?;
+        }
+
+        if version < 19 {
+            // Preserve the file metadata that KAD note publishes need when
+            // republishing after a restart and the file is not in our library.
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(&tx, "published_notes", "file_name", "TEXT")?;
+            Self::add_column_if_missing(&tx, "published_notes", "file_size", "INTEGER")?;
+            set_version(&tx, 19)?;
             tx.commit()?;
         }
 
@@ -1042,10 +1052,13 @@ impl Database {
     /// timestamp of its last (re)publish. Used at startup to seed the
     /// periodic notes-republish loop so our comments/ratings keep refreshing
     /// after a restart instead of silently expiring from the network.
-    pub fn load_published_notes(&self) -> anyhow::Result<Vec<(String, u8, String, i64)>> {
+    pub fn load_published_notes(
+        &self,
+    ) -> anyhow::Result<Vec<(String, u8, String, i64, Option<String>, Option<u64>)>> {
         let conn = self.conn.lock();
-        let mut stmt =
-            conn.prepare("SELECT file_hash, rating, comment, last_publish FROM published_notes")?;
+        let mut stmt = conn.prepare(
+            "SELECT file_hash, rating, comment, last_publish, file_name, file_size FROM published_notes",
+        )?;
         let rows = stmt
             .query_map([], |row| {
                 Ok((
@@ -1053,6 +1066,8 @@ impl Database {
                     (row.get::<_, i32>(1)?).clamp(0, 5) as u8,
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<u64>>(5)?,
                 ))
             })?
             .filter_map(|r| match r {
@@ -1075,6 +1090,8 @@ impl Database {
         rating: u8,
         comment: &str,
         last_publish: i64,
+        file_name: Option<&str>,
+        file_size: Option<u64>,
     ) -> anyhow::Result<()> {
         const MAX_COMMENT_BYTES: usize = 4096;
         if comment.len() > MAX_COMMENT_BYTES {
@@ -1086,9 +1103,17 @@ impl Database {
         }
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT OR REPLACE INTO published_notes (file_hash, rating, comment, last_publish) \
-             VALUES (?1, ?2, ?3, ?4)",
-            params![file_hash, rating as i32, comment, last_publish],
+            "INSERT OR REPLACE INTO published_notes \
+             (file_hash, rating, comment, last_publish, file_name, file_size) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                file_hash,
+                rating as i32,
+                comment,
+                last_publish,
+                file_name,
+                file_size
+            ],
         )?;
         Ok(())
     }
