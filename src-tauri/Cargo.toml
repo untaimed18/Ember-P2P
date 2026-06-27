@@ -1,6 +1,6 @@
 [package]
 name = "ember"
-version = "1.0.7"
+version = "1.0.8"
 description = "A decentralized P2P file sharing application"
 authors = ["you"]
 license = "GPL-3.0-only"
