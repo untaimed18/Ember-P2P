@@ -560,6 +560,24 @@ impl KadTag {
     /// Maximum allowed tag name length (256 bytes)
     const MAX_TAG_NAME_LEN: usize = 256;
 
+    /// Read exactly `len` bytes without trusting `len` for the initial
+    /// allocation. A malicious tag can declare the maximum permitted length in a
+    /// short datagram; pre-allocating `vec![0u8; len]` would then churn up to
+    /// `MAX_TAG_BLOB_LEN` per tag before `read_exact` fails. Growing the buffer
+    /// as bytes actually arrive bounds the allocation by the real (datagram-sized)
+    /// input instead.
+    fn read_value_bytes<R: Read>(reader: &mut R, len: usize) -> io::Result<Vec<u8>> {
+        let mut buf = Vec::with_capacity(len.min(4096));
+        let read = reader.by_ref().take(len as u64).read_to_end(&mut buf)?;
+        if read != len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "tag value shorter than declared length",
+            ));
+        }
+        Ok(buf)
+    }
+
     pub fn read_from<R: Read>(reader: &mut R) -> io::Result<Self> {
         let tag_type = reader.read_u8()?;
 
@@ -599,8 +617,7 @@ impl KadTag {
                         format!("tag string too long: {len}"),
                     ));
                 }
-                let mut buf = vec![0u8; len];
-                reader.read_exact(&mut buf)?;
+                let buf = Self::read_value_bytes(reader, len)?;
                 TagValue::String(String::from_utf8_lossy(&buf).to_string())
             }
             TAGTYPE_UINT64 => TagValue::Uint64(reader.read_u64::<LittleEndian>()?),
@@ -618,8 +635,7 @@ impl KadTag {
                         format!("boolarray too large: {byte_count}"),
                     ));
                 }
-                let mut buf = vec![0u8; byte_count];
-                reader.read_exact(&mut buf)?;
+                let buf = Self::read_value_bytes(reader, byte_count)?;
                 TagValue::Blob(buf)
             }
             TAGTYPE_BLOB => {
@@ -630,8 +646,7 @@ impl KadTag {
                         format!("blob too large: {len}"),
                     ));
                 }
-                let mut buf = vec![0u8; len];
-                reader.read_exact(&mut buf)?;
+                let buf = Self::read_value_bytes(reader, len)?;
                 TagValue::Blob(buf)
             }
             TAGTYPE_BSOB => {

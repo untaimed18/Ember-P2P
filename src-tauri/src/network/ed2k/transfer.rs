@@ -3231,9 +3231,16 @@ impl Ed2kDownload {
                         // eMule OP_FILEDESC: peer sends comment/rating for the file
                         (OP_EMULEPROT, OP_FILEDESC) if payload.len() >= 5 => {
                             let rating = payload[0];
-                            let comment_len = u32::from_le_bytes([
+                            // The declared comment length is an attacker-controlled
+                            // u32 bounded only by the (multi-MiB) packet size, so
+                            // clamp it before reading/allocating: eMule file comments
+                            // are short, and an unbounded `String` build is a cheap
+                            // per-packet memory-pressure vector.
+                            const MAX_PEER_COMMENT_LEN: usize = 8 * 1024;
+                            let comment_len = (u32::from_le_bytes([
                                 payload[1], payload[2], payload[3], payload[4],
-                            ]) as usize;
+                            ]) as usize)
+                                .min(MAX_PEER_COMMENT_LEN);
                             if comment_len
                                 .checked_add(5)
                                 .map_or(false, |need| payload.len() >= need)
@@ -4196,6 +4203,14 @@ pub(super) fn verify_hashset(
 ) -> bool {
     use md4::{Digest, Md4};
     if part_hashes.is_empty() {
+        return false;
+    }
+    // The on-wire hashset is exactly one MD4 per ed2k part
+    // (GetPartCount = ceil(file_size / PARTSIZE)). Reject any other count up
+    // front: a correct hashset always has this many entries, so this only
+    // rejects sets that would fail the MD4 check anyway, while stopping a peer
+    // from padding the set to force extra allocation/hashing per connection.
+    if part_hashes.len() != super::messages::ed2k_part_count_for_size(file_size) {
         return false;
     }
     if part_hashes.len() == 1 && file_size < super::hash::PARTSIZE {

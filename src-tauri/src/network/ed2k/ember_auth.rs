@@ -57,7 +57,7 @@
 //!   should check `state.is_verified()` at the appropriate gate
 //!   (e.g. friend-slot priority, EmberFriendRequest emit).
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use tracing::warn;
@@ -265,7 +265,9 @@ pub fn handle_response(
     }
 
     let peer_sig = Signature::from_bytes(&sig_bytes);
-    if peer_vk.verify(&our_nonce, &peer_sig).is_err() {
+    // verify_strict rejects non-canonical / small-order signatures (Ed25519
+    // malleability), matching `crypto::verify` used elsewhere in the codebase.
+    if peer_vk.verify_strict(&our_nonce, &peer_sig).is_err() {
         *state = EmberAuthState::Failed;
         return Err(AuthError::BadSignature);
     }
@@ -323,7 +325,7 @@ mod tests {
         let resp_response_sig_bytes: [u8; 64] = resp_response[32..].try_into().unwrap();
         let resp_response_sig = Signature::from_bytes(&resp_response_sig_bytes);
         let resp_vk = VerifyingKey::from_bytes(&resp_response_pk).unwrap();
-        assert!(resp_vk.verify(&init_nonce, &resp_response_sig).is_ok());
+        assert!(resp_vk.verify_strict(&init_nonce, &resp_response_sig).is_ok());
         assert!(crate::network::ember::crypto::verify_ember_hash_binding(
             &resp_response_pk,
             &resp_hash
