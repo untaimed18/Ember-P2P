@@ -165,14 +165,27 @@ impl BuddyManager {
         KadId(target)
     }
 
-    /// Only search for a buddy when TCP has been explicitly confirmed as Firewalled
-    /// by a completed firewall check or server LowID. Don't trigger on the initial
-    /// Unknown state before any check has run -- that produces false buddy searches
-    /// for users who are actually open.
+    /// Only search for a buddy when we are firewalled on BOTH TCP and UDP.
+    ///
+    /// eMule seeks a buddy only when both ports are firewalled
+    /// (`ClientList.cpp`: `IsFirewalled() && IsFirewalledUDP(true)`, with the
+    /// comment "we only need a buddy if direct callback is not available"). A
+    /// TCP-firewalled but UDP-open client is still reachable via direct UDP
+    /// callback (`can_advertise_direct_udp_callback`), so a buddy — a scarce
+    /// relay that serves only one client at a time — would be wasted and would
+    /// deny a slot to a peer that is firewalled on both ports.
+    ///
+    /// Both statuses must be the explicitly-confirmed `Firewalled` value; the
+    /// initial `Unknown` (open assumed, matching eMule's `IsFirewalledUDP`)
+    /// does not trigger a search, so we don't produce false buddy searches for
+    /// users who are actually open or not yet checked.
     ///
     /// Uses escalating backoff: 60s → 120s → 240s → 480s → 600s (max).
-    pub fn should_find_buddy(&self, tcp_status: FirewallStatus) -> bool {
+    pub fn should_find_buddy(&self, tcp_status: FirewallStatus, udp_status: FirewallStatus) -> bool {
         if tcp_status != FirewallStatus::Firewalled {
+            return false;
+        }
+        if udp_status != FirewallStatus::Firewalled {
             return false;
         }
         if self.state == BuddyState::Connected {
@@ -917,4 +930,43 @@ fn build_emule_packet(opcode: u8, payload: &[u8]) -> Vec<u8> {
     pkt.push(opcode);
     pkt.extend_from_slice(payload);
     pkt
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn test_manager() -> BuddyManager {
+        let pending: PendingBuddySet = Arc::new(Mutex::new(HashMap::new()));
+        BuddyManager::new(KadId([1u8; 16]), [2u8; 16], "test".to_string(), 4662, 4672, pending)
+    }
+
+    #[test]
+    fn should_find_buddy_requires_both_ports_firewalled() {
+        let mgr = test_manager();
+        // eMule (ClientList.cpp): a buddy is needed only while firewalled on
+        // BOTH TCP and UDP. A fresh manager has no cooldown, so the only gate
+        // under test here is the firewall-status pair.
+        assert!(mgr.should_find_buddy(FirewallStatus::Firewalled, FirewallStatus::Firewalled));
+        // TCP firewalled but UDP open => reachable via direct UDP callback, so
+        // no relay is needed.
+        assert!(!mgr.should_find_buddy(FirewallStatus::Firewalled, FirewallStatus::Open));
+        // UDP not yet determined => assume open (matches eMule's
+        // IsFirewalledUDP) => don't search.
+        assert!(!mgr.should_find_buddy(FirewallStatus::Firewalled, FirewallStatus::Unknown));
+        // TCP reachable => not firewalled at all => never need a buddy.
+        assert!(!mgr.should_find_buddy(FirewallStatus::Open, FirewallStatus::Firewalled));
+        assert!(!mgr.should_find_buddy(FirewallStatus::Unknown, FirewallStatus::Firewalled));
+        assert!(!mgr.should_find_buddy(FirewallStatus::Open, FirewallStatus::Open));
+    }
+
+    #[test]
+    fn should_find_buddy_false_while_finding() {
+        let mut mgr = test_manager();
+        mgr.start_finding();
+        // A search is already in flight; don't start another even though both
+        // ports are firewalled.
+        assert!(!mgr.should_find_buddy(FirewallStatus::Firewalled, FirewallStatus::Firewalled));
+    }
 }
