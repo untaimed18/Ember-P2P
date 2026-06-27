@@ -3297,6 +3297,20 @@ fn cancel_search_request(state: &mut NetworkState, app_handle: &tauri::AppHandle
                 .routing_table
                 .release_contacts_in_use(&removed.in_use_ids);
         }
+        // Clear any auxiliary per-search bookkeeping keyed by the same sid so a
+        // cancelled search can't leave dangling channels/entries behind. Mirrors
+        // `finalize_removed_searches`; idempotent (each lookup is a no-op when
+        // absent).
+        if let Some(tx) = state.pending_source_searches.remove(sid) {
+            let _ = tx.send(Vec::new());
+        }
+        if let Some(tx) = state.pending_notes_searches.remove(sid) {
+            let _ = tx.send(Vec::new());
+        }
+        state.download_source_searches.remove(sid);
+        state.store_keyword_searches.remove(sid);
+        state.store_source_searches.remove(sid);
+        state.pending_note_publishes.remove(sid);
     }
 
     if state
@@ -6297,9 +6311,16 @@ pub async fn start_network(
                                 fh.copy_from_slice(&hash_bytes);
                                 if known_files.find_by_hash(&fh).is_none() {
                                     use crate::storage::known_files::KnownFileRecord;
-                                    let part_hashes =
-                                        ed2k::hash::ed2k_part_hashes_file(&completed_path)
-                                            .unwrap_or_default();
+                                    // Hash off the runtime: a freshly completed large
+                                    // file would otherwise block the network select loop
+                                    // for the full part-hash read (cf. the restore path).
+                                    let hash_path = completed_path.clone();
+                                    let part_hashes = tokio::task::spawn_blocking(move || {
+                                        ed2k::hash::ed2k_part_hashes_file(&hash_path)
+                                            .unwrap_or_default()
+                                    })
+                                    .await
+                                    .unwrap_or_default();
                                     let record = KnownFileRecord {
                                         file_hash: fh,
                                         part_hashes,
@@ -8480,7 +8501,13 @@ pub async fn start_network(
                                 // significantly lower than eMule's for
                                 // the same file.
                                 let visible_total = (total_found as u32).saturating_add(type6_count as u32);
-                                    let source_count = visible_total.max(sm_known);
+                                let source_count = visible_total.max(sm_known);
+                                // Release this transfer-manager write guard before the
+                                // source_manager locks and the `live_sources.is_empty()`
+                                // branch below: that branch re-acquires
+                                // `transfer_manager.write()`, which is not reentrant, so
+                                // holding the guard across it deadlocks the network task.
+                                {
                                     let mut mgr = transfer_manager.write().await;
                                     mgr.update_status(&transfer_id, TransferStatus::Active);
                                     mgr.update_sources(&transfer_id, source_count, 0, 0);
@@ -8654,6 +8681,7 @@ pub async fn start_network(
                                             now_ts,
                                         );
                                     }
+                                }
                                 let peer_desc = sources.iter()
                                     .map(|(ip, port)| format!("{ip}:{port}"))
                                     .collect::<Vec<_>>()
@@ -10326,6 +10354,18 @@ pub async fn start_network(
                 {
                     let now = std::time::Instant::now();
                     state.outbound_session_tasks.retain(|_, started| now.duration_since(*started).as_secs() < 600);
+                }
+
+                // Prune the server UDP source-reask throttle map. Once an entry is
+                // older than the reask interval it no longer throttles anything
+                // (the next ask just re-inserts it), so dropping it bounds the map
+                // instead of letting it grow one entry per (server, file_hash) for
+                // the entire session.
+                {
+                    let now = chrono::Utc::now().timestamp();
+                    state
+                        .server_udp_source_reask_at
+                        .retain(|_, last| now.saturating_sub(*last) < SERVER_UDP_SOURCE_REASK_SECS);
                 }
 
                 // (broker.tick() and broker event drain are now handled
@@ -20137,6 +20177,13 @@ async fn handle_command_inner(
                 if !run_kad {
                     break 'kad false;
                 }
+                // KAD needs the parsed boolean expression. Positive terms being
+                // present is already what gates `run_kad`, but guard here too —
+                // before any side effects — so future logic drift degrades to a
+                // skipped KAD search instead of panicking the whole network task.
+                let Some(query_expr) = query_expr.clone() else {
+                    break 'kad false;
+                };
                 let Some(primary_keyword) = keywords.iter().max_by_key(|k| k.len()) else {
                     break 'kad false;
                 };
@@ -20179,9 +20226,6 @@ async fn handle_command_inner(
                     tracing::error!("KAD search: tx already consumed");
                     break 'kad false;
                 };
-                let query_expr = query_expr
-                    .clone()
-                    .expect("KAD search is gated on non-empty positive terms");
                 state.pending_keyword_searches.insert(
                     sid,
                     PendingKeywordSearch {
