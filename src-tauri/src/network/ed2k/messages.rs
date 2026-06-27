@@ -1147,6 +1147,13 @@ fn bitmap_len_for_part_count(part_count: usize) -> usize {
     (part_count + 7) / 8
 }
 
+/// Upper bound on a wire-declared part count accepted by the UDP reask parsers.
+/// A 10 000-part file is ~95 GiB (PARTSIZE = 9.28 MiB); a larger count is
+/// malformed or hostile and would only force a pointless `Vec<bool>` allocation
+/// and decode loop on every datagram. Mirrors the `MAX_FILE_STATUS_PARTS` guard
+/// applied to TCP file-status parsing.
+const MAX_REASK_PARTS: usize = 10_000;
+
 fn decode_part_bitmap(part_count: usize, data: &[u8]) -> io::Result<Vec<bool>> {
     let need = bitmap_len_for_part_count(part_count);
     if data.len() < need {
@@ -1206,6 +1213,12 @@ pub fn parse_reask_file_ping(payload: &[u8]) -> io::Result<ReaskFilePing> {
         ));
     }
     let part_count = u16::from_le_bytes([payload[16], payload[17]]) as usize;
+    if part_count > MAX_REASK_PARTS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "OP_REASKFILEPING declares too many parts",
+        ));
+    }
     let bitmap_len = bitmap_len_for_part_count(part_count);
     let complete_sources_at = 18 + bitmap_len;
     if payload.len() < complete_sources_at + 2 {
@@ -1267,6 +1280,12 @@ pub fn parse_reask_ack(payload: &[u8]) -> io::Result<ReaskAck> {
         ));
     }
     let part_count = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+    if part_count > MAX_REASK_PARTS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "OP_REASKACK declares too many parts",
+        ));
+    }
     let bitmap_len = bitmap_len_for_part_count(part_count);
     let rank_at = 2 + bitmap_len;
     if payload.len() < rank_at {
