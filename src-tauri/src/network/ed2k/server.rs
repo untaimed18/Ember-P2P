@@ -18,12 +18,10 @@ pub const OP_SERVERLIST: u8 = 0x32;
 pub const OP_SERVERSTATUS: u8 = 0x34;
 pub const OP_IDCHANGE: u8 = 0x40;
 pub const OP_SERVERIDENT: u8 = 0x41;
-#[allow(dead_code)]
 pub const OP_SEARCHREQUEST: u8 = 0x16;
 pub const OP_SEARCHRESULT: u8 = 0x33;
 pub const OP_GETSOURCES: u8 = 0x19;
 pub const OP_FOUNDSOURCES: u8 = 0x42;
-#[allow(dead_code)]
 pub const OP_GETSERVERLIST: u8 = 0x14;
 pub const OP_REJECT: u8 = 0x05;
 pub const OP_OFFERFILES: u8 = 0x15;
@@ -697,9 +695,22 @@ impl Ed2kServerConnection {
         let srv_flags = self.session.as_ref().map(|s| s.server_flags).unwrap_or(0);
         let use_magic_ids = (srv_flags & SRV_TCPFLG_COMPRESSION) != 0;
 
-        let mut payload = Vec::with_capacity(4 + files.len() * 64);
-        payload.extend_from_slice(&(files.len() as u32).to_le_bytes());
-        for file in files {
+        let filtered_files: Vec<&OfferFile> = files
+            .iter()
+            .filter(|file| {
+                file.size <= OLD_MAX_EMULE_FILE_SIZE || (srv_flags & SRV_TCPFLG_LARGEFILES) != 0
+            })
+            .collect();
+        if filtered_files.len() != files.len() {
+            debug!(
+                "OP_OFFERFILES: omitted {} large file(s) because server lacks LARGEFILES",
+                files.len() - filtered_files.len()
+            );
+        }
+
+        let mut payload = Vec::with_capacity(4 + filtered_files.len() * 64);
+        payload.extend_from_slice(&(filtered_files.len() as u32).to_le_bytes());
+        for file in filtered_files {
             payload.extend_from_slice(&file.hash);
 
             if use_magic_ids {

@@ -583,11 +583,22 @@
     !!serverNoResultsHint && $serverStatus === 'connected' && !serverRetryPending
   );
 
+  function hasSearchFilters(filters: import('$lib/api/search').SearchFilters | undefined, fileType?: string): boolean {
+    return !!(
+      fileType ||
+      filters?.fileType ||
+      filters?.fileExtension ||
+      filters?.minSize !== undefined ||
+      filters?.maxSize !== undefined ||
+      filters?.minAvailability !== undefined
+    );
+  }
+
   async function retryServerSearch() {
     if (!activeTab || serverRetryPending || $serverStatus !== 'connected') return;
     const tabQuery = activeTab.query;
     const tabId = activeTab.id;
-    if (!tabQuery.trim()) return;
+    if (!tabQuery.trim() && !hasSearchFilters(activeTab.filters, activeTab.fileType || undefined)) return;
     serverRetryPending = true;
     // Keep the tab's canonical requestId unchanged so late streaming events
     // for the original search still land in the correct tab. The retry runs
@@ -953,7 +964,6 @@
   }
 
   async function handleSearch(query: string) {
-    if (!query.trim()) return;
     const q = query.trim();
     const method = searchMethod;
     filterType = searchFileType;
@@ -966,6 +976,7 @@
       maxSize: parsedMaxSize !== undefined && !isNaN(parsedMaxSize) ? parsedMaxSize : undefined,
       minAvailability: parsedMinAvail !== undefined && !isNaN(parsedMinAvail) ? parsedMinAvail : undefined,
     };
+    if (!q && !hasSearchFilters(searchFilterSnapshot, searchFileType || undefined)) return;
     const { requestId } = openSearchTab(q, method, searchFileType || undefined, searchFilterSnapshot);
     selectedResultKey = null;
     notes = [];
@@ -1188,7 +1199,13 @@
     publishingNote = true;
     publishMessage = '';
     try {
-      publishMessage = await publishNote(selectedResult.file.hash, noteRating, noteComment);
+      publishMessage = await publishNote(
+        selectedResult.file.hash,
+        noteRating,
+        noteComment,
+        selectedResult.file.name,
+        selectedResult.file.size,
+      );
       publishSuccess = true;
       noteComment = '';
       noteRating = 0;

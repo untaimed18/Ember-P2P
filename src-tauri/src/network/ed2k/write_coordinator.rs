@@ -40,6 +40,7 @@ enum WriteOp {
         data: Vec<u8>,
         ack: oneshot::Sender<io::Result<()>>,
     },
+    #[allow(dead_code)]
     Read {
         offset: u64,
         len: usize,

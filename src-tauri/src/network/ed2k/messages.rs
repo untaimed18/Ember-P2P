@@ -1121,6 +1121,163 @@ pub fn build_reask_file_ping(
     buf
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReaskFilePing {
+    pub file_hash: [u8; 16],
+    pub completed_parts: Option<Vec<bool>>,
+    pub complete_sources: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReaskAck {
+    pub rank: Option<u16>,
+    pub available_parts: Option<Vec<bool>>,
+}
+
+fn bitmap_len_for_part_count(part_count: usize) -> usize {
+    (part_count + 7) / 8
+}
+
+fn decode_part_bitmap(part_count: usize, data: &[u8]) -> io::Result<Vec<bool>> {
+    let need = bitmap_len_for_part_count(part_count);
+    if data.len() < need {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "part bitmap shorter than declared part count",
+        ));
+    }
+    let mut parts = Vec::with_capacity(part_count);
+    for idx in 0..part_count {
+        let byte = data[idx / 8];
+        parts.push((byte & (1 << (idx % 8))) != 0);
+    }
+    Ok(parts)
+}
+
+fn encode_part_bitmap(part_count: usize, parts: Option<&[bool]>, out: &mut Vec<u8>) {
+    let bitmap_bytes = bitmap_len_for_part_count(part_count);
+    for byte_idx in 0..bitmap_bytes {
+        let mut byte = 0u8;
+        if let Some(parts) = parts {
+            for bit in 0..8 {
+                let idx = byte_idx * 8 + bit;
+                if idx < part_count && parts.get(idx).copied().unwrap_or(false) {
+                    byte |= 1 << bit;
+                }
+            }
+        }
+        out.push(byte);
+    }
+}
+
+/// Parse OP_REASKFILEPING UDP payload.
+///
+/// Legacy peers send only the 16-byte file hash. eMule udp_ver > 3 appends
+/// part_count + completed-part bitmap + complete-source count.
+pub fn parse_reask_file_ping(payload: &[u8]) -> io::Result<ReaskFilePing> {
+    if payload.len() < 16 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "OP_REASKFILEPING payload missing file hash",
+        ));
+    }
+    let mut file_hash = [0u8; 16];
+    file_hash.copy_from_slice(&payload[..16]);
+    if payload.len() == 16 {
+        return Ok(ReaskFilePing {
+            file_hash,
+            completed_parts: None,
+            complete_sources: None,
+        });
+    }
+    if payload.len() < 18 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "OP_REASKFILEPING payload has truncated part count",
+        ));
+    }
+    let part_count = u16::from_le_bytes([payload[16], payload[17]]) as usize;
+    let bitmap_len = bitmap_len_for_part_count(part_count);
+    let complete_sources_at = 18 + bitmap_len;
+    if payload.len() < complete_sources_at + 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "OP_REASKFILEPING payload has truncated part bitmap",
+        ));
+    }
+    let completed_parts = decode_part_bitmap(part_count, &payload[18..complete_sources_at])?;
+    let complete_sources = u16::from_le_bytes([
+        payload[complete_sources_at],
+        payload[complete_sources_at + 1],
+    ]);
+    Ok(ReaskFilePing {
+        file_hash,
+        completed_parts: Some(completed_parts),
+        complete_sources: Some(complete_sources),
+    })
+}
+
+/// Build OP_REASKACK payload. Enhanced ACKs mirror OP_FILESTATUS layout
+/// (part_count + bitmap) followed by queue rank.
+pub fn build_reask_ack(
+    file_size: u64,
+    rank: Option<u16>,
+    available_parts: Option<&[bool]>,
+) -> Vec<u8> {
+    let part_count = ed2k_wire_part_count(file_size) as usize;
+    let mut buf = Vec::new();
+    if let Some(parts) = available_parts {
+        buf.extend_from_slice(&(part_count as u16).to_le_bytes());
+        encode_part_bitmap(part_count, Some(parts), &mut buf);
+    }
+    if let Some(rank) = rank {
+        buf.extend_from_slice(&rank.to_le_bytes());
+    }
+    buf
+}
+
+/// Parse OP_REASKACK. A 2-byte payload is legacy rank-only. Enhanced ACKs
+/// carry part_count + bitmap first, with an optional trailing rank.
+pub fn parse_reask_ack(payload: &[u8]) -> io::Result<ReaskAck> {
+    if payload.is_empty() {
+        return Ok(ReaskAck {
+            rank: None,
+            available_parts: None,
+        });
+    }
+    if payload.len() == 2 {
+        return Ok(ReaskAck {
+            rank: Some(u16::from_le_bytes([payload[0], payload[1]])),
+            available_parts: None,
+        });
+    }
+    if payload.len() < 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "OP_REASKACK payload has truncated part count",
+        ));
+    }
+    let part_count = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+    let bitmap_len = bitmap_len_for_part_count(part_count);
+    let rank_at = 2 + bitmap_len;
+    if payload.len() < rank_at {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "OP_REASKACK payload has truncated part bitmap",
+        ));
+    }
+    let available_parts = decode_part_bitmap(part_count, &payload[2..rank_at])?;
+    let rank = if payload.len() >= rank_at + 2 {
+        Some(u16::from_le_bytes([payload[rank_at], payload[rank_at + 1]]))
+    } else {
+        None
+    };
+    Ok(ReaskAck {
+        rank,
+        available_parts: Some(available_parts),
+    })
+}
+
 /// Build a SetReqFileId + RequestFileName packet payload.
 pub fn build_file_request(file_hash: &[u8; 16]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(16);

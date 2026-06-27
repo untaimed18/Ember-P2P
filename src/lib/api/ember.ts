@@ -39,3 +39,29 @@ export async function emberPingPeer(args: {
     timeoutMs: args.timeoutMs,
   });
 }
+
+/**
+ * Ask a peer to send its current EPX source/peer payload over the
+ * encrypted Noise channel via an `ExchangeRequest`. `peerPubkeyHex` is
+ * optional with the same KAD-cache fallback as {@link emberPingPeer}.
+ *
+ * Resolves once the request is dispatched. The peer's reply
+ * (`ExchangeData`) is ingested asynchronously by the network receive
+ * loop, so observe `ember_exchange_received` / `ember_peers_known` in
+ * {@link getEmberDiagnostics} to confirm the round-trip. Rejects (with a
+ * human-readable string) if the transport is disabled or no pubkey can
+ * be resolved.
+ */
+export async function emberRequestSources(args: {
+  peerIp: string;
+  peerPort: number;
+  peerPubkeyHex?: string;
+}): Promise<void> {
+  return invoke<void>('ember_request_sources', {
+    peerIp: args.peerIp,
+    peerPort: args.peerPort,
+    peerPubkeyHex: args.peerPubkeyHex && args.peerPubkeyHex.length > 0
+      ? args.peerPubkeyHex
+      : undefined,
+  });
+}
