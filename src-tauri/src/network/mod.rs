@@ -51,7 +51,7 @@ use self::kad::publish::{
 use self::kad::routing::RoutingTable;
 use self::kad::search::{
     SearchId, SearchManager, SearchPhase, SearchType, SEARCH_INITIAL_CONTACTS,
-    STORE_PUBLISH_TARGET_TOTAL,
+    STOP_GRACE_SECS, STORE_PUBLISH_TARGET_TOTAL,
 };
 use self::kad::store::DhtStore;
 use self::kad::types::*;
@@ -3227,6 +3227,50 @@ fn maybe_finish_active_search(
     }
 }
 
+/// Per-search teardown shared by the periodic `cleanup()` sweep and the
+/// eMule-style fast `prune_stopped()` reap. Releases the removed searches'
+/// in-use contacts back to the routing table and resolves/drops any result
+/// channels and publish bookkeeping keyed by those search ids. Idempotent:
+/// a second call for the same id is a no-op (every lookup returns `None`),
+/// so it's safe for the cleanup sweep and the fast reap to overlap.
+fn finalize_removed_searches(
+    state: &mut NetworkState,
+    app_handle: &tauri::AppHandle,
+    removed_sids: &[SearchId],
+    released_in_use: &[KadId],
+) {
+    if !released_in_use.is_empty() {
+        state.routing_table.release_contacts_in_use(released_in_use);
+    }
+    for sid in removed_sids {
+        if let Some(PendingKeywordSearch {
+            tx,
+            local_results,
+            request_id,
+            ..
+        }) = state.pending_keyword_searches.remove(sid)
+        {
+            let _ = tx.send(local_results);
+            if let Some(active) = state.active_search_request.as_mut() {
+                if active.request_id == request_id {
+                    active.kad_pending = false;
+                }
+            }
+            maybe_finish_active_search(state, app_handle, request_id);
+        }
+        if let Some(tx) = state.pending_source_searches.remove(sid) {
+            let _ = tx.send(Vec::new());
+        }
+        if let Some(tx) = state.pending_notes_searches.remove(sid) {
+            let _ = tx.send(Vec::new());
+        }
+        state.download_source_searches.remove(sid);
+        state.store_keyword_searches.remove(sid);
+        state.store_source_searches.remove(sid);
+        state.pending_note_publishes.remove(sid);
+    }
+}
+
 fn cancel_search_request(state: &mut NetworkState, app_handle: &tauri::AppHandle, request_id: u64) {
     let cancelled: Vec<SearchId> = state
         .pending_keyword_searches
@@ -3237,7 +3281,7 @@ fn cancel_search_request(state: &mut NetworkState, app_handle: &tauri::AppHandle
 
     for sid in &cancelled {
         if let Some(search) = state.search_manager.get_mut(sid) {
-            search.completed = true;
+            search.mark_completed();
         }
     }
 
@@ -9228,6 +9272,20 @@ pub async fn start_network(
                         state.routing_table.release_contacts_in_use(&removed.in_use_ids);
                     }
                 }
+
+                // eMule CSearchManager::JumpStart() reaps "stopping" searches
+                // every second, ~15s after PrepareToStop. The loop above already
+                // removes completed searches once their work is done, but
+                // fire-and-forget Store* publishes stay parked on
+                // `store_publish_pending` while waiting for publish acks that may
+                // never arrive — so without this they sit in the UI as "STOPPING"
+                // until the slow 300s cleanup() sweep. Mirror eMule and reap them
+                // here on the 1s tick (the same teardown the cleanup sweep uses).
+                let (stopped_sids, stopped_in_use) =
+                    state.search_manager.prune_stopped(STOP_GRACE_SECS);
+                if !stopped_sids.is_empty() {
+                    finalize_removed_searches(&mut state, &app_handle, &stopped_sids, &stopped_in_use);
+                }
             }
 
             // Periodic bootstrap (eMule BigTimer style)
@@ -10243,30 +10301,7 @@ pub async fn start_network(
             _ = cleanup_timer.tick() => {
                 if state.stats.status == NetworkStatus::Disconnected { continue; }
                 let (removed_sids, released_in_use) = state.search_manager.cleanup(120);
-                if !released_in_use.is_empty() {
-                    state.routing_table.release_contacts_in_use(&released_in_use);
-                }
-                for sid in &removed_sids {
-                    if let Some(PendingKeywordSearch { tx, local_results, request_id, .. }) = state.pending_keyword_searches.remove(sid) {
-                        let _ = tx.send(local_results);
-                        if let Some(active) = state.active_search_request.as_mut() {
-                            if active.request_id == request_id {
-                                active.kad_pending = false;
-                            }
-                        }
-                        maybe_finish_active_search(&mut state, &app_handle, request_id);
-                    }
-                    if let Some(tx) = state.pending_source_searches.remove(sid) {
-                        let _ = tx.send(Vec::new());
-                    }
-                    if let Some(tx) = state.pending_notes_searches.remove(sid) {
-                        let _ = tx.send(Vec::new());
-                    }
-                    state.download_source_searches.remove(sid);
-                    state.store_keyword_searches.remove(sid);
-                    state.store_source_searches.remove(sid);
-                    state.pending_note_publishes.remove(sid);
-                }
+                finalize_removed_searches(&mut state, &app_handle, &removed_sids, &released_in_use);
                 state.dht_store.cleanup_expired();
 
                 // Prune the DB-progress throttle map so cancelled/removed

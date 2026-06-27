@@ -35,6 +35,14 @@ const TIMEOUT_STORE_NOTES: i64 = 100; // SEARCHSTORENOTES_LIFETIME
 const TIMEOUT_FIND_BUDDY: i64 = 100; // SEARCHFINDBUDDY_LIFETIME
 /// Grace period after entering fetch phase for late results (eMule PrepareToStop gives 15s)
 const FETCH_TIMEOUT_SECS: i64 = 15;
+/// eMule deletes a "stopping" search ~15s after `PrepareToStop()` (Search.cpp
+/// back-dates `m_tCreated` to `now - LIFETIME + SEC(15)`) and runs the prune
+/// every second via `CSearchManager::JumpStart()`. We mirror that: once a
+/// search is `completed` (shown as "STOPPING" in the UI) it is held this long
+/// so late packets/publish acks can still be processed, then reaped by
+/// `SearchManager::prune_stopped` on the 1s poll tick — instead of lingering
+/// until the slow periodic `cleanup()` sweep.
+pub const STOP_GRACE_SECS: i64 = 15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SearchType {
@@ -140,6 +148,11 @@ pub struct SearchState {
     pub results: Vec<SearchResultEntry>,
     pub started_at: i64,
     pub completed: bool,
+    /// Wall-clock time `completed` was first set. Drives the eMule
+    /// PrepareToStop → JumpStart-delete reap in `SearchManager::prune_stopped`
+    /// so a finished ("stopping") search doesn't sit in the active map until
+    /// the slow periodic `cleanup()` sweep. Always set via `mark_completed`.
+    completed_at: Option<i64>,
     /// eMule m_bStoping: set when enough results have been received.
     /// Prevents new queries from being sent but keeps the search alive
     /// so that late responses from already-queried nodes are still accepted.
@@ -202,6 +215,7 @@ impl SearchState {
             results: Vec::new(),
             started_at: chrono::Utc::now().timestamp(),
             completed: false,
+            completed_at: None,
             stop_querying: false,
             fetch_started_at: None,
             lookup_stale_rounds: 0,
@@ -218,6 +232,19 @@ impl SearchState {
             store_pending: HashSet::new(),
             store_pending_times: HashMap::new(),
             find_buddy_sent: HashSet::new(),
+        }
+    }
+
+    /// eMule `PrepareToStop()` entry point: move the search into its terminal
+    /// ("stopping") state and stamp when it happened, so the JumpStart-style
+    /// reap (`SearchManager::prune_stopped`) can remove it after a short grace
+    /// period for late packets. Idempotent: the timestamp is set once so
+    /// re-entering completion logic (e.g. a late result calling
+    /// `check_completion`) doesn't keep pushing the reap deadline out.
+    pub fn mark_completed(&mut self) {
+        if !self.completed {
+            self.completed = true;
+            self.completed_at = Some(chrono::Utc::now().timestamp());
         }
     }
 
@@ -726,7 +753,7 @@ impl SearchState {
             self.pending_times.clear();
             self.fetch_started_at = Some(chrono::Utc::now().timestamp());
             if is_store {
-                self.completed = true;
+                self.mark_completed();
             }
             self.phase = SearchPhase::Fetch;
         }
@@ -761,7 +788,7 @@ impl SearchState {
                         // Strict completion: every contact in `closest` has
                         // been queried (the original eMule rule).
                         if !has_unqueried {
-                            self.completed = true;
+                            self.mark_completed();
                         // Convergence completion: with batch size 1 and
                         // continuous discovery from KadRes responses, the
                         // strict rule above will almost never fire before
@@ -779,7 +806,7 @@ impl SearchState {
                         } else if self.queried.len() >= LOOKUP_MIN_QUERIES
                             && self.lookup_stale_rounds >= LOOKUP_CONVERGE_COUNT
                         {
-                            self.completed = true;
+                            self.mark_completed();
                         }
                     }
                 }
@@ -802,7 +829,7 @@ impl SearchState {
                             .iter()
                             .any(|c| self.is_fetch_candidate(c) && !self.fetched.contains(&c.id));
                     if !has_unfetched {
-                        self.completed = true;
+                        self.mark_completed();
                     }
                 }
             }
@@ -880,7 +907,7 @@ impl SearchState {
             }
             SearchPhase::Fetch => match self.search_type {
                 SearchType::StoreKeyword | SearchType::StoreFile | SearchType::StoreNotes => {
-                    self.completed = true;
+                    self.mark_completed();
                     KadMessage::Ping
                 }
                 SearchType::FindNode | SearchType::FindBuddy => KadMessage::KadReq {
@@ -1122,7 +1149,7 @@ impl SearchManager {
                         state.responded_during_lookup.len(),
                     );
                 }
-                state.completed = true;
+                state.mark_completed();
                 continue;
             }
 
@@ -1158,6 +1185,39 @@ impl SearchManager {
                 let age = now - s.started_at;
                 (s.completed && age > max_age_secs) || age > hard_timeout
             })
+            .map(|(id, _)| *id)
+            .collect();
+        let mut released_ids = Vec::new();
+        for &id in &to_remove {
+            if let Some(state) = self.active.remove(&id) {
+                let k = (state.target, state.search_type.kind());
+                if self.target_map.get(&k) == Some(&id) {
+                    self.target_map.remove(&k);
+                }
+                released_ids.extend(state.in_use_ids);
+            }
+        }
+        (to_remove, released_ids)
+    }
+
+    /// eMule `CSearchManager::JumpStart()` deletion path: reap searches that
+    /// have been in their terminal ("stopping"/`completed`) state for at least
+    /// `grace_secs`. eMule runs this every second (`SEARCH_JUMPSTART`) and the
+    /// stopping → delete delay is ~15s (`PrepareToStop` back-dates `m_tCreated`).
+    ///
+    /// The happy-path removal in the network poll loop already drops a
+    /// completed search as soon as its work is done, but fire-and-forget
+    /// `Store*` publishes stay parked while waiting on publish acks that may
+    /// never arrive (`store_publish_pending`). Without this bounded reap they
+    /// linger in the active map — shown as "STOPPING" in the UI — until the
+    /// slow periodic `cleanup()` sweep. Returns the same
+    /// `(removed_ids, in_use_to_release)` shape as `cleanup`.
+    pub fn prune_stopped(&mut self, grace_secs: i64) -> (Vec<SearchId>, Vec<KadId>) {
+        let now = chrono::Utc::now().timestamp();
+        let to_remove: Vec<SearchId> = self
+            .active
+            .iter()
+            .filter(|(_, s)| s.completed_at.is_some_and(|t| now - t >= grace_secs))
             .map(|(id, _)| *id)
             .collect();
         let mut released_ids = Vec::new();
@@ -1405,5 +1465,35 @@ mod tests {
             expected > 0,
             "keyword search must have nonzero expected response count"
         );
+    }
+
+    #[test]
+    fn prune_stopped_reaps_completed_after_grace() {
+        let mut manager = SearchManager::new();
+        let target = kad_id(5);
+        let sid = manager.start_search(target, SearchType::StoreKeyword, Vec::new());
+
+        // An active (not-yet-completed) search is never reaped, regardless of grace.
+        let (removed, _) = manager.prune_stopped(0);
+        assert!(removed.is_empty(), "active searches must not be pruned");
+        assert!(manager.get(&sid).is_some());
+
+        // Once completed, it is held for the grace period (eMule PrepareToStop),
+        // then reaped. completed_at is "now", so a positive grace keeps it.
+        manager.get_mut(&sid).unwrap().mark_completed();
+        let (removed, _) = manager.prune_stopped(STOP_GRACE_SECS);
+        assert!(
+            removed.is_empty(),
+            "a just-completed search must survive the grace window"
+        );
+        assert!(manager.get(&sid).is_some());
+
+        // With the grace already elapsed (0s) it is reaped, and its in-use
+        // contacts/target mapping are released so the routing table can evict them.
+        let (removed, _released) = manager.prune_stopped(0);
+        assert_eq!(removed, vec![sid]);
+        assert!(manager.get(&sid).is_none());
+        assert!(manager.active.is_empty());
+        assert!(manager.target_map.is_empty());
     }
 }
