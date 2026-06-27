@@ -375,12 +375,12 @@ pub(crate) type UploadQueueRef = Arc<tokio::sync::Mutex<Vec<QueueEntry>>>;
 pub(crate) struct QueueEntry {
     pub(crate) identity: QueueIdentity,
     pub(crate) current_addr: Option<SocketAddr>,
+    pub(crate) udp_port: u16,
     pub(crate) user_hash: [u8; 16],
     pub(crate) file_hash: [u8; 16],
     pub(crate) join_time: std::time::Instant,
     /// eMule m_bAddNextConnect: Low-ID client that scored highest while
     /// disconnected; gets priority slot on reconnect.
-    #[allow(dead_code)]
     pub(crate) add_next_connect: bool,
     /// eMule m_byEmuleVersion from Hello, for legacy client penalty.
     pub(crate) emule_version: u8,
@@ -1019,6 +1019,7 @@ pub(crate) async fn udp_queue_rank_for_peer(
     credit_manager: &Arc<tokio::sync::RwLock<CreditManager>>,
     local_index: &Arc<tokio::sync::RwLock<LocalIndex>>,
     from_ip: IpAddr,
+    from_udp_port: u16,
     file_hash: &[u8; 16],
 ) -> Option<u16> {
     let queue = upload_queue.lock().await;
@@ -1029,11 +1030,15 @@ pub(crate) async fn udp_queue_rank_for_peer(
         if entry.file_hash != *file_hash {
             continue;
         }
+        if entry.udp_port != 0 && entry.udp_port != from_udp_port {
+            continue;
+        }
         let matches = matches!(&entry.identity, QueueIdentity::Ip(ip) if *ip == from_ip)
             || entry
                 .current_addr
                 .map(|a| a.ip() == from_ip)
-                .unwrap_or(false);
+                .unwrap_or(false)
+            || (entry.current_addr.is_none() && entry.udp_port == from_udp_port);
         if matches {
             match best {
                 Some(prev) if prev.join_time <= entry.join_time => {}
@@ -3812,6 +3817,7 @@ impl UploadHandler {
                             queue.iter().position(|e| e.identity == queue_identity)
                         {
                             queue[pos].current_addr = Some(peer_addr);
+                            queue[pos].udp_port = hello_caps.udp_port;
                             queue[pos].user_hash = peer_user_hash;
                             queue[pos].file_hash = current_file_hash.unwrap_or([0u8; 16]);
                             // If the peer has since completed PoP, upgrade
@@ -3878,6 +3884,7 @@ impl UploadHandler {
                                 queue.push(QueueEntry {
                                     identity: queue_identity.clone(),
                                     current_addr: Some(peer_addr),
+                                    udp_port: hello_caps.udp_port,
                                     user_hash: peer_user_hash,
                                     file_hash: new_fh,
                                     join_time,
@@ -3911,6 +3918,7 @@ impl UploadHandler {
                             queue.push(QueueEntry {
                                 identity: queue_identity.clone(),
                                 current_addr: Some(peer_addr),
+                                udp_port: hello_caps.udp_port,
                                 user_hash: peer_user_hash,
                                 file_hash: new_fh,
                                 join_time,
@@ -4910,6 +4918,7 @@ impl UploadHandler {
                                 queue.iter_mut().find(|e| e.identity == queue_identity)
                             {
                                 entry.current_addr = Some(peer_addr);
+                                entry.udp_port = hello_caps.udp_port;
                                 entry.user_hash = peer_user_hash;
                                 entry.file_hash = current_file_hash.unwrap_or([0u8; 16]);
                                 if is_verified_friend {
@@ -4933,6 +4942,7 @@ impl UploadHandler {
                                 queue.push(QueueEntry {
                                     identity: queue_identity.clone(),
                                     current_addr: Some(peer_addr),
+                                    udp_port: hello_caps.udp_port,
                                     user_hash: peer_user_hash,
                                     file_hash: current_file_hash.unwrap_or([0u8; 16]),
                                     join_time: queue_join_time,
@@ -4971,6 +4981,7 @@ impl UploadHandler {
                                     queue.push(QueueEntry {
                                         identity: queue_identity.clone(),
                                         current_addr: Some(peer_addr),
+                                        udp_port: hello_caps.udp_port,
                                         user_hash: peer_user_hash,
                                         file_hash: new_fh,
                                         join_time: queue_join_time,

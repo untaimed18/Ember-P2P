@@ -69,7 +69,6 @@ pub struct AppState {
     /// down. Tasks self-remove from this map on completion.
     pub background_scans: Arc<RwLock<HashMap<u64, tokio::task::JoinHandle<()>>>>,
     /// Monotonic counter for assigning unique ids in `background_scans`.
-    #[allow(dead_code)]
     pub background_scan_seq: Arc<AtomicUsize>,
     /// Set to `true` when the user has explicitly chosen "Exit Ember" (via the
     /// close-confirmation dialog or the tray-menu Quit entry). Read inside the

@@ -34,7 +34,6 @@ const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
 const NAT_REPROBE_INTERVAL: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[allow(dead_code)]
 pub enum NatType {
     Open,
     FullCone,
@@ -44,17 +43,12 @@ pub enum NatType {
     Unknown,
 }
 
-#[allow(dead_code)]
 impl NatType {
     pub fn is_punchable(&self) -> bool {
         matches!(
             self,
             NatType::Open | NatType::FullCone | NatType::RestrictedCone | NatType::PortRestricted
         )
-    }
-
-    pub fn is_relayable(&self) -> bool {
-        true
     }
 
     /// Whether a hole-punch between two NAT types is likely to succeed.
@@ -114,7 +108,6 @@ impl NatInfo {
         self.nat_type == NatType::Unknown || self.last_probed.elapsed() >= NAT_REPROBE_INTERVAL
     }
 
-    #[allow(dead_code)]
     pub fn has_external_addr(&self) -> bool {
         self.external_addr.is_some()
     }
@@ -144,7 +137,7 @@ impl NatInfo {
         if self.nat_type != NatType::Unknown {
             return false;
         }
-        if self.external_addr.is_some() {
+        if self.has_external_addr() {
             return false;
         }
         self.nat_type = NatType::PortRestricted;

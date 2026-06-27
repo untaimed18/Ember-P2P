@@ -24,6 +24,12 @@ const HEADER_LEN: usize = 3;
 const CONTROL_VERSION: u8 = 1;
 const CONTROL_KIND_PING: u8 = 1;
 const CONTROL_KIND_PONG: u8 = 2;
+/// Ask the peer to send its current EPX source/peer payload back over
+/// this encrypted session. Body is empty.
+const CONTROL_KIND_EXCHANGE_REQUEST: u8 = 3;
+/// Carries an EPX payload (variable length); body is the exact wire
+/// format produced by `ember::build_exchange_payload*`.
+const CONTROL_KIND_EXCHANGE_DATA: u8 = 4;
 
 /// Sessions idle longer than this are evicted.
 const SESSION_TIMEOUT: Duration = Duration::from_secs(300);
@@ -242,39 +248,92 @@ pub struct DispatchOutcome {
     pub rejected: bool,
 }
 
-/// Minimal Ember-native control payload used to prove the Noise transport
-/// before routing DHT or file-transfer messages through it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Ember-native control payload carried inside the Noise transport.
+///
+/// Wire framing is `version(1) + kind(1) + body(..)`. `Ping`/`Pong`
+/// keep their original fixed 10-byte shape (body is the 8-byte LE
+/// nonce); the exchange variants carry a variable-length body, so this
+/// type is no longer `Copy`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EmberControlMessage {
     Ping { nonce: u64 },
     Pong { nonce: u64 },
+    /// Ask the peer to reply with its current EPX source/peer payload.
+    /// No body — the request itself is the whole message.
+    ExchangeRequest,
+    /// An EPX exchange payload (same wire format as the eD2K TCP EPX
+    /// path: `ember::build_exchange_payload*` /
+    /// `ember::parse_exchange_payload`). Lets two Ember peers trade
+    /// source and peer hints over the encrypted Noise channel.
+    ExchangeData { payload: Vec<u8> },
 }
 
 impl EmberControlMessage {
-    pub fn encode(self) -> [u8; 10] {
-        let (kind, nonce) = match self {
-            EmberControlMessage::Ping { nonce } => (CONTROL_KIND_PING, nonce),
-            EmberControlMessage::Pong { nonce } => (CONTROL_KIND_PONG, nonce),
-        };
-        let mut out = [0u8; 10];
-        out[0] = CONTROL_VERSION;
-        out[1] = kind;
-        out[2..].copy_from_slice(&nonce.to_le_bytes());
-        out
+    pub fn encode(&self) -> Vec<u8> {
+        match self {
+            EmberControlMessage::Ping { nonce } => {
+                let mut out = Vec::with_capacity(10);
+                out.push(CONTROL_VERSION);
+                out.push(CONTROL_KIND_PING);
+                out.extend_from_slice(&nonce.to_le_bytes());
+                out
+            }
+            EmberControlMessage::Pong { nonce } => {
+                let mut out = Vec::with_capacity(10);
+                out.push(CONTROL_VERSION);
+                out.push(CONTROL_KIND_PONG);
+                out.extend_from_slice(&nonce.to_le_bytes());
+                out
+            }
+            EmberControlMessage::ExchangeRequest => {
+                vec![CONTROL_VERSION, CONTROL_KIND_EXCHANGE_REQUEST]
+            }
+            EmberControlMessage::ExchangeData { payload } => {
+                let mut out = Vec::with_capacity(2 + payload.len());
+                out.push(CONTROL_VERSION);
+                out.push(CONTROL_KIND_EXCHANGE_DATA);
+                out.extend_from_slice(payload);
+                out
+            }
+        }
     }
 
     pub fn decode(data: &[u8]) -> Option<Self> {
-        if data.len() != 10 || data[0] != CONTROL_VERSION {
+        if data.len() < 2 || data[0] != CONTROL_VERSION {
             return None;
         }
 
-        let mut nonce = [0u8; 8];
-        nonce.copy_from_slice(&data[2..]);
-        let nonce = u64::from_le_bytes(nonce);
-
         match data[1] {
-            CONTROL_KIND_PING => Some(EmberControlMessage::Ping { nonce }),
-            CONTROL_KIND_PONG => Some(EmberControlMessage::Pong { nonce }),
+            CONTROL_KIND_PING | CONTROL_KIND_PONG => {
+                // Fixed 10-byte shape: version + kind + 8-byte nonce.
+                if data.len() != 10 {
+                    return None;
+                }
+                let mut nonce = [0u8; 8];
+                nonce.copy_from_slice(&data[2..10]);
+                let nonce = u64::from_le_bytes(nonce);
+                if data[1] == CONTROL_KIND_PING {
+                    Some(EmberControlMessage::Ping { nonce })
+                } else {
+                    Some(EmberControlMessage::Pong { nonce })
+                }
+            }
+            CONTROL_KIND_EXCHANGE_REQUEST => {
+                // The request carries no body; reject trailing bytes so a
+                // malformed/forged frame can't masquerade as a request.
+                if data.len() != 2 {
+                    return None;
+                }
+                Some(EmberControlMessage::ExchangeRequest)
+            }
+            CONTROL_KIND_EXCHANGE_DATA => {
+                // Body is the EPX payload (possibly empty). The datagram
+                // cap in `dispatch_incoming` and `parse_exchange_payload`'s
+                // own length check bound the size; copy the body out here.
+                Some(EmberControlMessage::ExchangeData {
+                    payload: data[2..].to_vec(),
+                })
+            }
             _ => None,
         }
     }
@@ -543,20 +602,20 @@ impl EmberTransport {
             return outcome;
         };
 
-        outcome.control = Some(message);
-
-        if let EmberControlMessage::Ping { nonce } = message {
-            // The session is established by definition (we just
-            // decrypted a payload from it), so `prepare_outgoing`
-            // should hit the fast Ready path. If anything else
-            // happens, surface it via the empty-responses + Some(Ping)
-            // shape and let the caller log the diagnostic miss.
-            let pong = EmberControlMessage::Pong { nonce }.encode();
+        // Auto-answer `Ping` here: it needs no application state, and
+        // the session is established by definition (we just decrypted a
+        // payload from it), so `prepare_outgoing` should hit the fast
+        // Ready path. `Pong` / `ExchangeRequest` / `ExchangeData` are
+        // surfaced to the caller, which owns the EPX payload and the
+        // source/transfer managers required to act on them.
+        if let EmberControlMessage::Ping { nonce } = &message {
+            let pong = EmberControlMessage::Pong { nonce: *nonce }.encode();
             if let OutgoingResult::Ready { packet } = self.prepare_outgoing(from, None, &pong) {
                 outcome.responses.push(packet);
             }
         }
 
+        outcome.control = Some(message);
         outcome
     }
 
@@ -1509,6 +1568,111 @@ mod tests {
         );
         // The IK responder still emits message 2.
         assert_eq!(outcome.responses.len(), 1);
+    }
+
+    #[test]
+    fn control_message_encode_decode_round_trip_all_variants() {
+        let cases = [
+            EmberControlMessage::Ping {
+                nonce: 0x0102_0304_0506_0708,
+            },
+            EmberControlMessage::Pong { nonce: 0 },
+            EmberControlMessage::ExchangeRequest,
+            EmberControlMessage::ExchangeData {
+                payload: vec![1, 2, 3, 4, 5],
+            },
+            // Empty exchange payload must still round-trip (a peer with
+            // nothing to share replies with an empty EPX body).
+            EmberControlMessage::ExchangeData { payload: vec![] },
+        ];
+        for msg in cases {
+            let encoded = msg.encode();
+            assert_eq!(
+                EmberControlMessage::decode(&encoded),
+                Some(msg.clone()),
+                "round trip failed for {msg:?}",
+            );
+        }
+
+        // Ping/Pong keep their original fixed 10-byte wire shape.
+        assert_eq!(EmberControlMessage::Ping { nonce: 7 }.encode().len(), 10);
+        assert_eq!(EmberControlMessage::Pong { nonce: 7 }.encode().len(), 10);
+        // A request is exactly version + kind.
+        assert_eq!(EmberControlMessage::ExchangeRequest.encode(), vec![1, 3]);
+    }
+
+    #[test]
+    fn control_message_decode_rejects_malformed() {
+        // Wrong version.
+        assert_eq!(EmberControlMessage::decode(&[0, 1, 0, 0, 0, 0, 0, 0, 0, 0]), None);
+        // Ping/Pong with wrong length.
+        assert_eq!(EmberControlMessage::decode(&[1, 1, 0, 0]), None);
+        // ExchangeRequest must have no trailing bytes.
+        assert_eq!(EmberControlMessage::decode(&[1, 3, 0xFF]), None);
+        // Unknown kind.
+        assert_eq!(EmberControlMessage::decode(&[1, 0x7F]), None);
+        // Too short to carry version + kind.
+        assert_eq!(EmberControlMessage::decode(&[1]), None);
+    }
+
+    /// `ExchangeRequest` and `ExchangeData` cross an established Noise
+    /// session intact, and `dispatch_incoming` surfaces them as
+    /// `control` (without auto-answering — the caller owns the EPX
+    /// payload needed to respond).
+    #[test]
+    fn exchange_messages_cross_established_session() {
+        let (alice_priv, alice_pub) = make_keypair();
+        let (bob_priv, bob_pub) = make_keypair();
+
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+
+        let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        // Alice opens the session by sending an ExchangeRequest in the
+        // IK handshake's first message.
+        let req = EmberControlMessage::ExchangeRequest.encode();
+        let init = match alice.prepare_outgoing(bob_addr, Some(&bob_pub), &req) {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+
+        // Bob decodes the request; dispatch must NOT auto-respond.
+        let bob_outcome = bob.dispatch_incoming(&init, alice_addr);
+        assert!(!bob_outcome.rejected);
+        assert_eq!(
+            bob_outcome.control,
+            Some(EmberControlMessage::ExchangeRequest)
+        );
+        assert_eq!(
+            bob_outcome.responses.len(),
+            1,
+            "only the IK handshake response, no auto-answer to the exchange request"
+        );
+
+        // Alice completes the handshake.
+        for pkt in &bob_outcome.responses {
+            let _ = alice.dispatch_incoming(pkt, bob_addr);
+        }
+        assert!(alice.has_session(&bob_addr));
+        assert!(bob.has_session(&alice_addr));
+
+        // Bob answers with an ExchangeData payload over the session.
+        let payload = vec![4u8, 0, 0, 0, 0]; // a tiny v4 EPX-shaped body
+        let data = EmberControlMessage::ExchangeData {
+            payload: payload.clone(),
+        }
+        .encode();
+        let pkt = match bob.prepare_outgoing(alice_addr, None, &data) {
+            OutgoingResult::Ready { packet } => packet,
+            other => panic!("expected Ready, got {}", variant_name(&other)),
+        };
+        let alice_outcome = alice.dispatch_incoming(&pkt, bob_addr);
+        assert_eq!(
+            alice_outcome.control,
+            Some(EmberControlMessage::ExchangeData { payload })
+        );
     }
 
     /// Regression: Bob (XX responder) calls `prepare_outgoing` while

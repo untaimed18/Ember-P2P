@@ -64,8 +64,8 @@ export async function findNotes(fileHash: string, fileSize: number): Promise<Sea
   return invoke('find_notes', { fileHash, fileSize });
 }
 
-export async function publishNote(fileHash: string, rating: number, comment: string): Promise<string> {
-  return invoke('publish_note', { fileHash, rating, comment });
+export async function publishNote(fileHash: string, rating: number, comment: string, fileName?: string, fileSize?: number): Promise<string> {
+  return invoke('publish_note', { fileHash, rating, comment, fileName: fileName ?? null, fileSize: fileSize ?? null });
 }
 
 export async function markSpam(

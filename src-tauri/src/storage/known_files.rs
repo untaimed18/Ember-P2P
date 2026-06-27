@@ -27,6 +27,7 @@ const FT_KADLASTPUBLISHSRC_LEGACY_EMBER: u8 = 0x23;
 
 const TAG_STRING: u8 = 0x02;
 const TAG_UINT32: u8 = 0x03;
+const AICH_BASE32_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
 #[derive(Debug, Clone)]
 pub struct KnownFileRecord {
@@ -227,7 +228,7 @@ impl KnownFileList {
                     let s = String::from_utf8_lossy(&sbuf).to_string();
                     match name_id {
                         FT_FILENAME => record.file_name = s,
-                        FT_AICH_HASH => record.aich_hash = s,
+                        FT_AICH_HASH => record.aich_hash = normalize_aich_hash(&s),
                         _ => {}
                     }
                 }
@@ -297,7 +298,7 @@ impl KnownFileList {
                     let s = String::from_utf8_lossy(&sbuf).to_string();
                     match name_id {
                         FT_FILENAME => record.file_name = s,
-                        FT_AICH_HASH => record.aich_hash = s,
+                        FT_AICH_HASH => record.aich_hash = normalize_aich_hash(&s),
                         _ => {}
                     }
                 }
@@ -559,7 +560,9 @@ impl KnownFileList {
             tag_count += 1;
 
             if !record.aich_hash.is_empty() {
-                write_string_tag(&mut tags, FT_AICH_HASH, &record.aich_hash)?;
+                let wire_aich = aich_hex_to_base32(&record.aich_hash)
+                    .unwrap_or_else(|| record.aich_hash.clone());
+                write_string_tag(&mut tags, FT_AICH_HASH, &wire_aich)?;
                 tag_count += 1;
             }
             if record.all_time_transferred > 0 {
@@ -771,6 +774,63 @@ fn write_string_tag(buf: &mut Vec<u8>, name_id: u8, value: &str) -> anyhow::Resu
     buf.write_u16::<LittleEndian>(clamped.len() as u16)?;
     buf.write_all(clamped.as_bytes())?;
     Ok(())
+}
+
+fn normalize_aich_hash(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() == 40 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return trimmed.to_ascii_lowercase();
+    }
+    aich_base32_to_hex(trimmed).unwrap_or_else(|| trimmed.to_string())
+}
+
+fn aich_hex_to_base32(hex_value: &str) -> Option<String> {
+    let bytes = hex::decode(hex_value).ok()?;
+    if bytes.len() != 20 {
+        return None;
+    }
+    let mut out = String::with_capacity(32);
+    let mut buffer: u32 = 0;
+    let mut bits = 0u8;
+    for byte in bytes {
+        buffer = (buffer << 8) | byte as u32;
+        bits += 8;
+        while bits >= 5 {
+            let idx = ((buffer >> (bits - 5)) & 0x1F) as usize;
+            out.push(AICH_BASE32_ALPHABET[idx] as char);
+            bits -= 5;
+        }
+    }
+    if bits > 0 {
+        let idx = ((buffer << (5 - bits)) & 0x1F) as usize;
+        out.push(AICH_BASE32_ALPHABET[idx] as char);
+    }
+    Some(out)
+}
+
+fn aich_base32_to_hex(value: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(20);
+    let mut buffer: u32 = 0;
+    let mut bits = 0u8;
+    for ch in value.bytes().filter(|b| *b != b'=') {
+        let up = ch.to_ascii_uppercase();
+        let val = match up {
+            b'A'..=b'Z' => up - b'A',
+            b'2'..=b'7' => up - b'2' + 26,
+            _ => return None,
+        } as u32;
+        buffer = (buffer << 5) | val;
+        bits += 5;
+        if bits >= 8 {
+            bytes.push(((buffer >> (bits - 8)) & 0xFF) as u8);
+            bits -= 8;
+        }
+    }
+    if bytes.len() == 20 {
+        Some(hex::encode(bytes))
+    } else {
+        None
+    }
 }
 
 fn write_u32_tag(buf: &mut Vec<u8>, name_id: u8, value: u32) -> anyhow::Result<()> {

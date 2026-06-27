@@ -19,6 +19,7 @@ const TAG_STRING: u8 = 0x02;
 const TAG_UINT32: u8 = 0x03;
 const TAG_HASH: u8 = 0x01;
 const TAG_BLOB: u8 = 0x07;
+const AICH_BASE32_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollectionFile {
@@ -133,7 +134,7 @@ impl Collection {
                     }
                     FT_AICH_HASH => {
                         if let TagValue::String(s) = tag_value {
-                            faich = s;
+                            faich = normalize_aich_hash(&s);
                         }
                     }
                     _ => {}
@@ -249,7 +250,9 @@ impl Collection {
                 }
             }
             if !file.aich_hash.is_empty() {
-                write_string_tag(&mut file_buf, FT_AICH_HASH, &file.aich_hash)?;
+                let wire_aich =
+                    aich_hex_to_base32(&file.aich_hash).unwrap_or_else(|| file.aich_hash.clone());
+                write_string_tag(&mut file_buf, FT_AICH_HASH, &wire_aich)?;
                 file_tags += 1;
             }
 
@@ -273,8 +276,17 @@ impl Collection {
     pub fn save_text(&self, path: &Path) -> anyhow::Result<()> {
         let mut content = String::new();
         for file in &self.files {
-            content.push_str(&super::hash::format_ed2k_link(
-                &file.name, file.size, &file.hash,
+            let aich = if file.aich_hash.is_empty() {
+                None
+            } else {
+                Some(file.aich_hash.as_str())
+            };
+            content.push_str(&super::hash::format_ed2k_link_ext(
+                &file.name,
+                file.size,
+                &file.hash,
+                aich,
+                &[],
             ));
             content.push('\n');
         }
@@ -285,22 +297,70 @@ impl Collection {
 }
 
 fn parse_ed2k_link(link: &str) -> Option<CollectionFile> {
-    let parts: Vec<&str> = link.split('|').collect();
-    if parts.len() < 6 || parts[1] != "file" {
-        return None;
-    }
-    let name = super::hash::percent_decode_str(parts[2]);
-    let size: u64 = parts[3].parse().ok()?;
-    let hash = parts[4].to_lowercase();
-    if hash.len() != 32 || hex::decode(&hash).is_err() {
-        return None;
-    }
+    let (name, size, hash, aich) = super::hash::parse_ed2k_link(link)?;
     Some(CollectionFile {
         name,
         size,
         hash,
-        aich_hash: String::new(),
+        aich_hash: aich.unwrap_or_default(),
     })
+}
+
+fn normalize_aich_hash(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() == 40 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return trimmed.to_ascii_lowercase();
+    }
+    aich_base32_to_hex(trimmed).unwrap_or_else(|| trimmed.to_string())
+}
+
+fn aich_hex_to_base32(hex_value: &str) -> Option<String> {
+    let bytes = hex::decode(hex_value).ok()?;
+    if bytes.len() != 20 {
+        return None;
+    }
+    let mut out = String::with_capacity(32);
+    let mut buffer: u32 = 0;
+    let mut bits = 0u8;
+    for byte in bytes {
+        buffer = (buffer << 8) | byte as u32;
+        bits += 8;
+        while bits >= 5 {
+            let idx = ((buffer >> (bits - 5)) & 0x1F) as usize;
+            out.push(AICH_BASE32_ALPHABET[idx] as char);
+            bits -= 5;
+        }
+    }
+    if bits > 0 {
+        let idx = ((buffer << (5 - bits)) & 0x1F) as usize;
+        out.push(AICH_BASE32_ALPHABET[idx] as char);
+    }
+    Some(out)
+}
+
+fn aich_base32_to_hex(value: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(20);
+    let mut buffer: u32 = 0;
+    let mut bits = 0u8;
+    for ch in value.bytes().filter(|b| *b != b'=') {
+        let up = ch.to_ascii_uppercase();
+        let val = match up {
+            b'A'..=b'Z' => up - b'A',
+            b'2'..=b'7' => up - b'2' + 26,
+            _ => return None,
+        } as u32;
+        buffer = (buffer << 5) | val;
+        bits += 5;
+        if bits >= 8 {
+            bytes.push(((buffer >> (bits - 8)) & 0xFF) as u8);
+            bits -= 8;
+        }
+    }
+    if bytes.len() == 20 {
+        Some(hex::encode(bytes))
+    } else {
+        None
+    }
 }
 
 enum TagValue {
@@ -397,9 +457,27 @@ fn read_tag(cursor: &mut Cursor<&Vec<u8>>) -> anyhow::Result<(u8, TagValue)> {
             let _ = cursor.read_u8();
             TagValue::Unknown
         }
+        0x04 => {
+            let _ = cursor.read_f32::<LittleEndian>();
+            TagValue::Unknown
+        }
+        0x05 => {
+            let _ = cursor.read_u8();
+            TagValue::Unknown
+        }
         0x0B => {
             let v = cursor.read_u64::<LittleEndian>()?;
             TagValue::Uint64(v)
+        }
+        0x0A => {
+            let blen = cursor.read_u8()? as usize;
+            let new_pos = cursor
+                .position()
+                .checked_add(blen as u64)
+                .filter(|&p| p <= cursor.get_ref().len() as u64)
+                .ok_or_else(|| anyhow::anyhow!("short blob tag skip out of bounds"))?;
+            cursor.set_position(new_pos);
+            TagValue::Unknown
         }
         t if (0x11..=0x20).contains(&t) => {
             let len = (t - 0x11 + 1) as usize;
