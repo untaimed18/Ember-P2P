@@ -336,21 +336,29 @@
       sendError = m.chat_message_too_long({ max: MAX_MESSAGE_BYTES });
       return;
     }
+    // Capture the target friend up front: `friendHash` is a reactive prop that
+    // can change mid-send (fast tab switching), and re-reading it after the
+    // await would clear the draft / surface the send error on the WRONG
+    // conversation. Mirrors `markAsRead` above.
+    const h = friendHash;
     sending = true;
     sendError = null;
     try {
-      await sendChatMessage(friendHash, text);
-      inputText = '';
-      // The cleanup closure of the main $effect would re-stash the
-      // (now empty) inputText on the next tab change, but if the
-      // user closes the dock or quits the app right after sending
-      // we want the draft slot gone immediately. `clearDraft` is a
-      // no-op when there's no entry, so this is safe to call
-      // unconditionally.
-      clearDraft(friendHash);
+      await sendChatMessage(h, text);
+      // Only clear the live editor if we're still viewing this friend — on a
+      // tab switch the main $effect already stashed/restored drafts, so
+      // touching inputText here would wipe the NEW conversation's draft.
+      if (h === friendHash) inputText = '';
+      // Drop the (now-sent) draft for the friend we actually sent to. The
+      // main $effect's cleanup may have re-stashed it during a tab switch, so
+      // clear it explicitly; `clearDraft` is a no-op when there's no entry.
+      clearDraft(h);
     } catch (e: unknown) {
-      sendError = translateError(e, m.chat_failed_to_send());
+      // Don't surface this send's failure on a different conversation.
+      if (h === friendHash) sendError = translateError(e, m.chat_failed_to_send());
     } finally {
+      // `sending` is the editor's state, not tied to a friend — always release
+      // it so the (possibly newly-active) conversation's input is usable.
       sending = false;
     }
   }

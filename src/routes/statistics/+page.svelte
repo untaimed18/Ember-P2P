@@ -20,12 +20,16 @@
   // misleading when the backend is briefly unreachable).
   let repStats = $state<ReputationStatsInfo | null>(null);
 
-  let statsTimeoutId: ReturnType<typeof setTimeout> | undefined;
-  let repTimeoutId: ReturnType<typeof setTimeout> | undefined;
-
-  async function loadStats() {
-    if (refreshBusy || unmounted) return;
+  async function loadStats(opts: { force?: boolean } = {}) {
+    if (unmounted) return;
+    // A user-initiated retry (the error screen button) bypasses the poll's
+    // in-flight gate so it never silently no-ops while a 2s poll happens to be
+    // mid-flight. Watchdog timers are local to each call so a forced retry
+    // running concurrently with a poll can't clobber the other's timer id.
+    if (refreshBusy && !opts.force) return;
     refreshBusy = true;
+    let statsTimer: ReturnType<typeof setTimeout> | undefined;
+    let repTimer: ReturnType<typeof setTimeout> | undefined;
     try {
       // Fire both fetches concurrently — they hit different backend
       // paths (stats reads a cached snapshot; reputation reads the
@@ -38,7 +42,7 @@
         Promise.race([
           getStatistics(),
           new Promise<TransferStats>((_, reject) => {
-            statsTimeoutId = setTimeout(() => reject(new Error('timeout')), 4000);
+            statsTimer = setTimeout(() => reject(new Error('timeout')), 4000);
           }),
         ]),
         // Reputation rides the same watchdog as stats. Unlike
@@ -51,7 +55,7 @@
         Promise.race([
           getReputationStats(),
           new Promise<ReputationStatsInfo>((_, reject) => {
-            repTimeoutId = setTimeout(() => reject(new Error('timeout')), 4000);
+            repTimer = setTimeout(() => reject(new Error('timeout')), 4000);
           }),
         ]),
       ]);
@@ -70,16 +74,10 @@
       if (unmounted) return;
       if (!stats) error = translateError(e, m.error_operation_failed());
     } finally {
-      // Clear the race watchdog so the loser timer doesn't linger until
-      // it fires (otherwise each poll leaves an orphan timeout pending).
-      if (statsTimeoutId) {
-        clearTimeout(statsTimeoutId);
-        statsTimeoutId = undefined;
-      }
-      if (repTimeoutId) {
-        clearTimeout(repTimeoutId);
-        repTimeoutId = undefined;
-      }
+      // Clear the race watchdogs so the loser timers don't linger until they
+      // fire (otherwise each poll leaves an orphan timeout pending).
+      if (statsTimer) clearTimeout(statsTimer);
+      if (repTimer) clearTimeout(repTimer);
       if (!unmounted) loading = false;
       refreshBusy = false;
     }
@@ -191,7 +189,7 @@
   {:else if error}
     <div class="empty-state">
       <p style="color: var(--danger)">{error}</p>
-      <button onclick={loadStats}>{m.common_retry()}</button>
+      <button onclick={() => loadStats({ force: true })}>{m.common_retry()}</button>
     </div>
   {:else if stats}
 

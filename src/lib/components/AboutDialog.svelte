@@ -17,6 +17,8 @@
 
   let panelEl: HTMLDivElement | undefined = $state(undefined);
   let overlayEl: HTMLDivElement | undefined = $state(undefined);
+  // Element focused before the dialog opened, restored on close.
+  let returnFocusEl: HTMLElement | null = null;
   const instanceId = Math.random().toString(36).slice(2, 10);
 
   function close() {
@@ -48,10 +50,21 @@
 
   $effect(() => {
     if (open) {
+      const active = typeof document !== 'undefined' ? document.activeElement : null;
+      if (active instanceof HTMLElement && active !== document.body) returnFocusEl = active;
       requestAnimationFrame(() => {
         panelEl?.querySelector<HTMLButtonElement>('button')?.focus();
       });
     }
+    return () => {
+      if (!open && returnFocusEl) {
+        const el = returnFocusEl;
+        returnFocusEl = null;
+        requestAnimationFrame(() => {
+          if (typeof document !== 'undefined' && document.contains(el)) el.focus();
+        });
+      }
+    };
   });
 
   // Keep background content out of the AT/Tab order while the dialog is open.

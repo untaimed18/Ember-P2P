@@ -34,6 +34,21 @@
   const inProgress = $derived(
     $updater.phase === 'downloading' || $updater.phase === 'installing',
   );
+
+  // Collapse the release-notes section when the notice hides or the target
+  // version changes, so a stale expanded state doesn't carry across update
+  // cycles (the toggle only renders for `available`, so without this it would
+  // reappear pre-expanded on the next available update).
+  let notesForVersion: string | null = null;
+  $effect(() => {
+    if (!visible) {
+      showNotes = false;
+      notesForVersion = null;
+    } else if ($updater.version !== notesForVersion) {
+      showNotes = false;
+      notesForVersion = $updater.version;
+    }
+  });
 </script>
 
 {#if visible}

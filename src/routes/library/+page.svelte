@@ -2268,7 +2268,7 @@
       <div class="confirm-banner">
         <span class="confirm-text">{m.library_stop_confirm_text()}</span>
         <button class="scan-btn resume-btn" onclick={handleStopCancel}>{m.common_cancel()}</button>
-        <button class="scan-btn stop-btn" onclick={handleStopConfirm}>{m.library_remove_folder()}</button>
+        <button class="scan-btn stop-btn" onclick={handleStopConfirm}>{m.common_stop()}</button>
       </div>
     {/if}
     {#if stoppedByUser && !scanning && !stopConfirmVisible}

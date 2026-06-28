@@ -426,6 +426,12 @@
     expandedTransferId = t.id;
     loadingSources = true;
     sourceLoadError = null;
+    // Switching to a different download: clear the previous file's rows up
+    // front so the table shows the loading spinner instead of rendering the
+    // old peers under the NEW file's name (the file_name column reads from
+    // `expandedTransferId`, which already points at the new download) for the
+    // duration of the fetch.
+    expandedSources = [];
     // Snapshot any push-arrived rows present at fetch start. Keep the
     // reference so we can tell, after the await resolves, whether
     // push events mutated `expandedSources` during the fetch. Svelte

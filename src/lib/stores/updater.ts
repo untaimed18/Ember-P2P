@@ -147,6 +147,12 @@ export async function installUpdate(): Promise<void> {
       }
     });
     updater.update((s) => ({ ...s, phase: 'ready' }));
+    // The update is staged on disk now; the relaunch is driven by
+    // `relaunch()`, not this handle. Release the `Update` resource here
+    // instead of leaking it until the next `checkForUpdates()`. (Only on
+    // success — the error path keeps `pending` so the Retry button can reuse
+    // it.)
+    await disposePending();
   } catch (e) {
     updater.update((s) => ({ ...s, phase: 'error', error: toMessage(e) }));
   } finally {

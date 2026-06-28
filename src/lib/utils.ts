@@ -127,7 +127,7 @@ export function formatRelativeTime(ts: number, nowSecs: number = Math.floor(Date
  *   Callers passing seconds should use {@link formatDurationSecs} instead.
  */
 export function formatDuration(ms: number): string {
-  if (!ms || ms <= 0) return '\u2014';
+  if (!Number.isFinite(ms) || ms <= 0) return '\u2014';
   const totalSecs = Math.floor(ms / 1000);
   const hrs = Math.floor(totalSecs / 3600);
   const mins = Math.floor((totalSecs % 3600) / 60);
@@ -137,7 +137,7 @@ export function formatDuration(ms: number): string {
 
 /** Format seconds as a human-readable duration (e.g. "2h 15m"). */
 export function formatDurationSecs(secs: number): string {
-  if (!secs || secs <= 0) return '\u2014';
+  if (!Number.isFinite(secs) || secs <= 0) return '\u2014';
   const days = Math.floor(secs / 86400);
   const hrs = Math.floor((secs % 86400) / 3600);
   const mins = Math.floor((secs % 3600) / 60);
