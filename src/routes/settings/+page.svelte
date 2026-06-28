@@ -97,11 +97,14 @@
     historyStatsLoading = true;
     historyStatsError = null;
     try {
-      historyStats = await getDownloadHistoryStats();
+      const s = await getDownloadHistoryStats();
+      if (unmounted) return;
+      historyStats = s;
     } catch (e) {
+      if (unmounted) return;
       historyStatsError = translateError(e, m.settings_history_stats_failed());
     } finally {
-      historyStatsLoading = false;
+      if (!unmounted) historyStatsLoading = false;
     }
   }
 
@@ -184,11 +187,13 @@
 
   let hasUnsavedChanges = $derived(settings ? JSON.stringify(settings) !== originalSettings : false);
 
+  let unmounted = false;
   onMount(() => {
     refreshSpamStats();
     refreshHistoryStats();
     getSettings()
       .then((s) => {
+        if (unmounted) return;
         // Seed the antileech toggle baseline BEFORE assigning `settings`
         // so the sync `$effect` below treats the persisted value as
         // already-applied and doesn't fire a redundant
@@ -213,7 +218,7 @@
     };
     window.addEventListener('beforeunload', handleBeforeUnload);
     window.addEventListener('keydown', handleKeyboardSave);
-    return () => { window.removeEventListener('beforeunload', handleBeforeUnload); window.removeEventListener('keydown', handleKeyboardSave); for (const id of activeTimers) clearTimeout(id); };
+    return () => { unmounted = true; window.removeEventListener('beforeunload', handleBeforeUnload); window.removeEventListener('keydown', handleKeyboardSave); for (const id of activeTimers) clearTimeout(id); };
   });
 
   const activeTimers = new Set<ReturnType<typeof setTimeout>>();
@@ -427,11 +432,14 @@
     spamStatsLoading = true;
     spamStatsError = null;
     try {
-      spamStats = await getSpamStats();
+      const s = await getSpamStats();
+      if (unmounted) return;
+      spamStats = s;
     } catch (e: unknown) {
+      if (unmounted) return;
       spamStatsError = translateError(e, m.settings_spam_load_failed());
     } finally {
-      spamStatsLoading = false;
+      if (!unmounted) spamStatsLoading = false;
     }
   }
 
@@ -509,10 +517,12 @@
     antileechMessage = null;
     try {
       const snap = await getAntileechPatterns();
+      if (unmounted) return;
       antileechSnapshot = snap;
       antileechDraft = snap.patterns.join('\n');
       antileechLoaded = true;
     } catch (e: unknown) {
+      if (unmounted) return;
       antileechMessage = {
         kind: 'err',
         text: m.settings_antileech_load_failed({ error: translateError(e) }),
@@ -567,9 +577,10 @@
   async function handleAntileechToggle(checked: boolean, gen: number) {
     try {
       await setAntileechEnabled(checked);
-      // A newer toggle superseded this one while the IPC was in flight —
-      // stop so a slow earlier response can't clobber the latest state.
-      if (gen !== antileechToggleGen) return;
+      // A newer toggle superseded this one while the IPC was in flight, or the
+      // page unmounted — stop so a slow earlier response can't clobber the
+      // latest state (or write to a torn-down page).
+      if (unmounted || gen !== antileechToggleGen) return;
       if (settings) settings.antileech_enabled = checked;
       // The toggle is applied + persisted independently of the Save button, so
       // fold it into the saved baseline too. Otherwise `hasUnsavedChanges` (a
@@ -586,11 +597,11 @@
       // Also refresh the snapshot so the on-disk badge stays in sync.
       if (antileechLoaded) {
         const snap = await getAntileechPatterns();
-        if (gen !== antileechToggleGen) return;
+        if (unmounted || gen !== antileechToggleGen) return;
         antileechSnapshot = snap;
       }
     } catch (e: unknown) {
-      if (gen !== antileechToggleGen) return;
+      if (unmounted || gen !== antileechToggleGen) return;
       const text = m.settings_antileech_toggle_failed({ error: translateError(e) });
       antileechMessage = {
         kind: 'err',

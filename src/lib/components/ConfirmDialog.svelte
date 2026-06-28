@@ -37,6 +37,9 @@
   let confirmBtn: HTMLButtonElement | undefined = $state(undefined);
   let dialogEl: HTMLDivElement | undefined = $state(undefined);
   let overlayEl: HTMLDivElement | undefined = $state(undefined);
+  // Element focused before the dialog opened, restored on close so keyboard
+  // users land back where they were (mirrors ChatDock's return-focus pattern).
+  let returnFocusEl: HTMLElement | null = null;
   const instanceId = Math.random().toString(36).slice(2, 10);
 
   function handleConfirm() {
@@ -78,10 +81,23 @@
 
   $effect(() => {
     if (open) {
+      const active = typeof document !== 'undefined' ? document.activeElement : null;
+      if (active instanceof HTMLElement && active !== document.body) returnFocusEl = active;
       requestAnimationFrame(() => {
         confirmBtn?.focus();
       });
     }
+    return () => {
+      // On close (open → false), return focus to the opener. Guard on !open so
+      // an unmount-while-open doesn't try to refocus a tearing-down element.
+      if (!open && returnFocusEl) {
+        const el = returnFocusEl;
+        returnFocusEl = null;
+        requestAnimationFrame(() => {
+          if (typeof document !== 'undefined' && document.contains(el)) el.focus();
+        });
+      }
+    };
   });
 
   // D32: make background content inert while the dialog is open so

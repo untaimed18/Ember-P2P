@@ -26,6 +26,8 @@
   let dialogEl: HTMLDivElement | undefined = $state(undefined);
   let trayBtn: HTMLButtonElement | undefined = $state(undefined);
   let remember = $state(false);
+  // Element focused before the dialog opened, restored on close.
+  let returnFocusEl: HTMLElement | null = null;
   const instanceId = Math.random().toString(36).slice(2, 10);
 
   function handleHide() {
@@ -72,10 +74,21 @@
       // tick from the previous session doesn't silently flip the saved
       // preference on the next close.
       remember = false;
+      const active = typeof document !== 'undefined' ? document.activeElement : null;
+      if (active instanceof HTMLElement && active !== document.body) returnFocusEl = active;
       requestAnimationFrame(() => {
         trayBtn?.focus();
       });
     }
+    return () => {
+      if (!open && returnFocusEl) {
+        const el = returnFocusEl;
+        returnFocusEl = null;
+        requestAnimationFrame(() => {
+          if (typeof document !== 'undefined' && document.contains(el)) el.focus();
+        });
+      }
+    };
   });
 
   // Make the rest of the page inert while the dialog is up, matching the
