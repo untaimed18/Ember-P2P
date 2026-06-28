@@ -214,8 +214,10 @@
     try {
       await kadRecheckFirewall();
     } catch (e) {
+      if (destroyed) return;
       recheckError = translateError(e, m.error_operation_failed());
     }
+    if (destroyed) return;
     clearTimeout(recheckTimer);
     recheckTimer = setTimeout(() => { recheckingFirewall = false; }, 5000);
   }
@@ -237,15 +239,18 @@
     // `onlineFriends`, and the effect below takes care of the toast-clear
     // side effect. This avoids double event handling when the page is open.
     listen<{ user_hash: string }>('ember:friend-confirmed', () => {
+      if (destroyed) return;
       loadFriends();
     }).then(fn => { if (destroyed) fn(); else unlistenFns.push(fn); });
 
     listen<{ firewalled: boolean }>('firewall-status', (event) => {
+      if (destroyed) return;
       isFirewalled = event.payload.firewalled;
       if (!event.payload.firewalled) recheckingFirewall = false;
     }).then(fn => { if (destroyed) fn(); else unlistenFns.push(fn); });
 
     listen<{ user_hash: string; reason?: string }>('ember:friend-search-failed', (event) => {
+      if (destroyed) return;
       const hash = event.payload.user_hash;
       const reason = event.payload.reason || 'error';
       if (failedSearchToastsShown.has(hash)) return;

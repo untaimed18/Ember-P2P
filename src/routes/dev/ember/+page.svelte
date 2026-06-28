@@ -65,9 +65,12 @@
     if (unmounted || inFlightDiag) return;
     inFlightDiag = true;
     try {
-      diag = await getEmberDiagnostics();
+      const d = await getEmberDiagnostics();
+      if (unmounted) return;
+      diag = d;
       diagError = null;
     } catch (e) {
+      if (unmounted) return;
       diagError = translateError(e);
     } finally {
       inFlightDiag = false;
@@ -100,21 +103,26 @@
     pinging = true;
     pingResult = null;
     try {
-      pingResult = await emberPingPeer({
+      const result = await emberPingPeer({
         peerIp: formIp.trim(),
         peerPort: Number(formPort),
         peerPubkeyHex: formPubkeyHex.trim() || undefined,
         timeoutMs: formTimeoutMs === '' ? undefined : Number(formTimeoutMs),
       });
+      if (unmounted) return;
+      pingResult = result;
     } catch (e) {
+      if (unmounted) return;
       pingResult = {
         success: false,
         error: translateError(e),
       };
     } finally {
-      pinging = false;
-      // Counter changes show up immediately on the next refresh tick.
-      refreshDiag();
+      if (!unmounted) {
+        pinging = false;
+        // Counter changes show up immediately on the next refresh tick.
+        refreshDiag();
+      }
     }
   }
 
@@ -138,15 +146,19 @@
         peerPort: Number(formPort),
         peerPubkeyHex: formPubkeyHex.trim() || undefined,
       });
+      if (unmounted) return;
       exchangeResult = {
         ok: true,
         message: 'Request sent — watch "Exchange data received" / "Mesh peers known" above.',
       };
     } catch (e) {
+      if (unmounted) return;
       exchangeResult = { ok: false, message: translateError(e) };
     } finally {
-      requesting = false;
-      refreshDiag();
+      if (!unmounted) {
+        requesting = false;
+        refreshDiag();
+      }
     }
   }
 

@@ -16,15 +16,31 @@
 
   let panelEl: HTMLDivElement | undefined = $state();
   let overlayEl: HTMLDivElement | undefined = $state();
+  // Element focused before the dialog opened, restored on close.
+  let returnFocusEl: HTMLElement | null = null;
 
-  // Auto-focus the panel when it opens so Escape works without the
-  // user having to click inside first. Matches AboutDialog's pattern.
+  // Auto-focus a real control when it opens so Escape works without the user
+  // having to click inside first. We focus the close BUTTON rather than the
+  // panel: the panel is tabindex="-1" and excluded from `trapTabKey`'s
+  // focusable set, so focusing it would let Shift+Tab escape the trap to the
+  // (inert) background.
   $effect(() => {
     if (open) {
+      const active = typeof document !== 'undefined' ? document.activeElement : null;
+      if (active instanceof HTMLElement && active !== document.body) returnFocusEl = active;
       requestAnimationFrame(() => {
-        panelEl?.focus();
+        (panelEl?.querySelector<HTMLButtonElement>('.shortcut-close') ?? panelEl)?.focus();
       });
     }
+    return () => {
+      if (!open && returnFocusEl) {
+        const el = returnFocusEl;
+        returnFocusEl = null;
+        requestAnimationFrame(() => {
+          if (typeof document !== 'undefined' && document.contains(el)) el.focus();
+        });
+      }
+    };
   });
 
   // Keep background content out of the AT/Tab order while the dialog is open.

@@ -159,20 +159,42 @@
     const seq = ++loadStatsSeq;
     loading = true;
     error = null;
-    try {
-      const result = await getIpFilterStats();
-      if (unmounted || seq !== loadStatsSeq) return;
-      if (togglesInFlight > 0 && stats) {
-        stats = { ...result, enabled: stats.enabled, block_private: stats.block_private };
-      } else {
-        stats = result;
+
+    // The network task only starts serving commands after its full startup,
+    // which runs UPnP gateway discovery (bounded to ~5s) concurrently with the
+    // ipfilter load and then more init before the command loop begins. Opening
+    // this page in that window — most notably the relaunch that finishes the
+    // setup wizard — makes the first `get_ip_filter_stats` race startup and
+    // time out. A one-shot load would then leave the page empty for the whole
+    // session even though the filter is loaded in the backend, until the user
+    // restarts the app. Retry with bounded backoff while we still have no
+    // stats, so the list appears as soon as the network is ready (mirrors the
+    // layout's getSettings startup-retry policy). Refreshes after stats exist
+    // surface a single error immediately — the network is already up by then.
+    const retryDelaysMs = stats ? [] : [300, 600, 1000, 1500, 2500];
+    let lastErr: unknown = null;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const result = await getIpFilterStats();
+        if (unmounted || seq !== loadStatsSeq) return;
+        if (togglesInFlight > 0 && stats) {
+          stats = { ...result, enabled: stats.enabled, block_private: stats.block_private };
+        } else {
+          stats = result;
+        }
+        error = null;
+        loading = false;
+        return;
+      } catch (e: unknown) {
+        if (unmounted || seq !== loadStatsSeq) return;
+        lastErr = e;
+        if (attempt >= retryDelaysMs.length) break;
+        await new Promise((r) => setTimeout(r, retryDelaysMs[attempt]));
+        if (unmounted || seq !== loadStatsSeq) return;
       }
-    } catch (e: unknown) {
-      if (unmounted || seq !== loadStatsSeq) return;
-      error = toErrorMsg(e);
-    } finally {
-      if (!unmounted && seq === loadStatsSeq) loading = false;
     }
+    error = toErrorMsg(lastErr);
+    loading = false;
   }
 
   function toErrorMsg(e: unknown): string {
@@ -221,12 +243,14 @@
     error = null;
     try {
       const msg = await downloadAndLoadIpfilter();
+      if (unmounted) return;
       flash(msg);
       await loadStats();
     } catch (e: unknown) {
+      if (unmounted) return;
       error = toErrorMsg(e);
     } finally {
-      downloading = false;
+      if (!unmounted) downloading = false;
     }
   }
 
@@ -241,13 +265,15 @@
       });
       if (selected) {
         const msg = await importIpfilterFile(selected as string);
+        if (unmounted) return;
         flash(msg);
         await loadStats();
       }
     } catch (e: unknown) {
+      if (unmounted) return;
       error = toErrorMsg(e);
     } finally {
-      importing = false;
+      if (!unmounted) importing = false;
     }
   }
 
@@ -270,6 +296,7 @@
     error = null;
     try {
       const msg = await updateIpfilterFromUrl(trimmed);
+      if (unmounted) return;
       flash(msg);
       await loadStats();
       // Collapse the form on success — saves a click and signals
@@ -278,9 +305,10 @@
       // re-submit without retyping.
       showUrlForm = false;
     } catch (e: unknown) {
+      if (unmounted) return;
       error = toErrorMsg(e);
     } finally {
-      urlFetching = false;
+      if (!unmounted) urlFetching = false;
     }
   }
 
