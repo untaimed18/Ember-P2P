@@ -30,6 +30,19 @@ const STATUS_PRIORITY: Record<string, number> = {
 };
 
 function isMoreAdvancedStatus(eventStatus: string, apiStatus: string): boolean {
+  // `paused` / `stopped` / `insufficient` are reversible, backend-authoritative
+  // side states — not points on the monotonic searching→…→completed pipeline
+  // this priority table models. The API snapshot is read straight from the
+  // transfer manager, so it always reflects the live pause/stop/resume state; a
+  // *stored* row in one of these states must therefore never out-rank a fresh
+  // API status. Without this guard a resumed download stayed visually stuck on
+  // "Paused"/"Stopped"/"Insufficient" forever: all three sit ABOVE
+  // active/searching/queued in STATUS_PRIORITY, so the poll merge kept
+  // preferring the stale stored value over the live status the backend now
+  // reports after the user resumed.
+  if (eventStatus === 'paused' || eventStatus === 'stopped' || eventStatus === 'insufficient') {
+    return false;
+  }
   return (STATUS_PRIORITY[eventStatus] ?? 0) > (STATUS_PRIORITY[apiStatus] ?? 0);
 }
 
@@ -403,6 +416,14 @@ export async function initTransferStore() {
               if (!(isTerminal(t.status) && t.status !== narrowed)) {
                 updated.status = narrowed;
               }
+            }
+            // Paused / stopped rows are not transferring — zero the speed in the
+            // same tick the status flips so an instantly-applied pause/stop
+            // event doesn't leave a stale rate on screen until the next poll
+            // (the speed-decay ticker deliberately skips these states, so
+            // nothing else would clear it).
+            if ((narrowed === 'paused' || narrowed === 'stopped') && updated.status === narrowed) {
+              updated.speed = 0;
             }
             if (peer_id) {
               updated.peer_id = peer_id;

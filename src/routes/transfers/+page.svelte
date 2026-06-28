@@ -1076,6 +1076,13 @@
    *  speedHistory; updates happen in the $effect above. Falls back to the
    *  backend-reported `t.speed` when no EWMA is recorded yet. */
   function liveSpeed(t: Transfer): number {
+    // Non-transferring states never have a live rate. Return 0 directly so the
+    // local EWMA — which lingers for up to SPEED_STALE_MS (12 s) after bytes
+    // stop moving — can't keep painting a stale speed on a row the user just
+    // paused or stopped (or one that finished/failed).
+    if (t.status === 'paused' || t.status === 'stopped' || t.status === 'completed' || t.status === 'failed') {
+      return 0;
+    }
     const entry = speedHistory.get(t.id);
     if (!entry) return t.speed > 0 ? t.speed : 0;
     if (entry.ewma > 0) return entry.ewma;

@@ -923,6 +923,20 @@ impl TransferManager {
                 transfer.status = TransferStatus::Active;
                 Self::clear_failure_context(transfer);
                 Self::clear_runtime_health(transfer);
+            } else if transfer.status == TransferStatus::Insufficient {
+                // eMule ResumeFileInsufficient: clear the insufficient-disk
+                // state and let the download re-drive from discovery. Unlike a
+                // Paused resume we do NOT jump straight to Active — the worker
+                // never started (it was blocked for lack of space), so fall
+                // back to the normal waiting status and let the caller restart
+                // it. Without this, Resume on an "Insufficient disk space" row
+                // was a silent no-op: the row had already been dropped from
+                // pending_downloads when it went Insufficient, so nothing ever
+                // restarted it.
+                let next = Self::queued_wait_status(transfer);
+                transfer.status = next;
+                Self::clear_failure_context(transfer);
+                Self::clear_runtime_health(transfer);
             }
             if let Some(control) = self.controls.get(id) {
                 control.resume();
