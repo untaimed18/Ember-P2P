@@ -37,6 +37,7 @@
       if (lower.startsWith('ed2k://|file|')) {
         const info = await parseEd2kLink(payload);
         const res = await startDownload(info.hash, info.name, info.size, '', 0);
+        if (destroyed) return;
         toastSuccess(
           res.already_queued
             ? m.search_already_queued_name({ name: info.name })
@@ -59,6 +60,7 @@
           console.warn('Deep link: add server failed (continuing to connect):', e);
         }
         const msg = await connectToServer(ip, port);
+        if (destroyed) return;
         toastSuccess(msg);
       } else if (lower.startsWith('ed2k://|serverlist|')) {
         const segs = ed2kSegments(payload); // ['serverlist', url]
@@ -68,16 +70,20 @@
           return;
         }
         const msg = await downloadServerMet(url);
+        if (destroyed) return;
         toastSuccess(msg);
       } else if (lower.endsWith('.emulecollection')) {
         const coll = await openCollectionFile(payload);
+        if (destroyed) return;
         incomingCollection.set(coll);
         await goto('/library');
+        if (destroyed) return;
         toastSuccess(m.library_collection_loaded({ name: coll.name, count: coll.files.length }));
       }
       // Unknown ed2k:// variants (e.g. magnet-style or future opcodes) are
       // ignored silently — the buffer already filtered to our known prefixes.
     } catch (e: unknown) {
+      if (destroyed) return;
       toastError(translateError(e));
     }
   }

@@ -96,34 +96,11 @@
     loadAppSettings(),
   ]);
 
-  // Register the close-requested listener at the top of the module so it's
-  // active before the splash exits — otherwise a fast user pressing X
-  // during init would slip through to a default-exit and skip the dialog.
-  const closeListenerPromise: Promise<UnlistenFn> = listen('close-requested', () => {
-    showCloseDialog = true;
-  }).catch((e) => {
-    console.error('Failed to register close-requested listener:', e);
-    return (() => {}) as UnlistenFn;
-  });
-
-  // Surface a corrupt-config recovery (backend reset settings to defaults and
-  // preserved the original as a .bak). Registered at module scope so it's
-  // active before the backend's delayed emit fires.
-  const configCorruptListenerPromise: Promise<UnlistenFn> = listen<{ backup_path: string }>(
-    'config-corrupt-recovered',
-    (event) => {
-      const path = event.payload?.backup_path ?? '';
-      toastWarning(
-        path
-          ? m.layout_config_corrupt_backup({ path })
-          : m.layout_config_corrupt(),
-      );
-    },
-  ).catch((e) => {
-    console.error('Failed to register config-corrupt listener:', e);
-    return (() => {}) as UnlistenFn;
-  });
-
+  // The `close-requested` and `config-corrupt-recovered` listeners are
+  // registered inside onMount (below) so they're torn down AND re-registered
+  // across remounts. onMount runs before the splash floor (~400ms) lifts and
+  // before the backend's (delayed) corrupt-config emit, so the
+  // "active before the user can act" intent is preserved.
   onMount(() => {
     initTheme();
     const splashStartedAt = performance.now();
@@ -140,6 +117,26 @@
     let revealTimer: number | undefined;
     let hideTimer: number | undefined;
     let updateCheckTimer: number | undefined;
+    let unlistenClose: UnlistenFn | null = null;
+    let unlistenConfigCorrupt: UnlistenFn | null = null;
+
+    // Surface the native close confirmation. The splash masks the first frames
+    // so the window can't be closed before this lands.
+    listen('close-requested', () => {
+      showCloseDialog = true;
+    })
+      .then((fn) => { if (mounted) unlistenClose = fn; else fn(); })
+      .catch((e) => console.error('Failed to register close-requested listener:', e));
+
+    // Surface a corrupt-config recovery (backend reset settings to defaults and
+    // preserved the original as a .bak). The backend's emit is delayed, so
+    // registering here is in time.
+    listen<{ backup_path: string }>('config-corrupt-recovered', (event) => {
+      const path = event.payload?.backup_path ?? '';
+      toastWarning(path ? m.layout_config_corrupt_backup({ path }) : m.layout_config_corrupt());
+    })
+      .then((fn) => { if (mounted) unlistenConfigCorrupt = fn; else fn(); })
+      .catch((e) => console.error('Failed to register config-corrupt listener:', e));
 
     const revealApp = () => {
       if (!mounted || !splashVisible) return;
@@ -259,8 +256,8 @@
       cleanupFriendsStore();
       clearAllToasts();
       clearAppSettings();
-      void closeListenerPromise.then((unlisten) => unlisten());
-      void configCorruptListenerPromise.then((unlisten) => unlisten());
+      if (unlistenClose) unlistenClose();
+      if (unlistenConfigCorrupt) unlistenConfigCorrupt();
     };
   });
 </script>
