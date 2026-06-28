@@ -55,6 +55,21 @@ fn transfer_status_key(status: &TransferStatus) -> &'static str {
     }
 }
 
+/// Emit a `transfer-status` event so the UI reflects a user-initiated
+/// pause/stop/resume immediately, mirroring eMule's synchronous
+/// `NotifyStatusChange()` + `UpdateDisplayedInfo()` on these actions. Without
+/// it the row only updates on the next ~3 s poll, and (before the frontend
+/// merge fix) a resumed download could stay visually stuck on Paused/Stopped.
+fn emit_transfer_status(app: &tauri::AppHandle, transfer_id: &str, status: &TransferStatus) {
+    let _ = app.emit(
+        "transfer-status",
+        serde_json::json!({
+            "id": transfer_id,
+            "status": transfer_status_key(status),
+        }),
+    );
+}
+
 pub(crate) async fn persist_transfer(state: &AppState, transfer: &Transfer) {
     let db = state.db.clone();
     let tid = transfer.id.clone();
@@ -691,6 +706,7 @@ pub async fn cancel_transfers_batch(
 
 #[tauri::command]
 pub async fn pause_transfer(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<(), String> {
@@ -703,8 +719,13 @@ pub async fn pause_transfer(
         let status = manager.get_transfer(&transfer_id).map(|t| t.status.clone());
         (status, promoted)
     };
-    if let Some(status) = status {
-        persist_transfer_status(&state, &transfer_id, &status).await;
+    if let Some(status) = &status {
+        persist_transfer_status(&state, &transfer_id, status).await;
+        // eMule updates the row synchronously on pause (CPartFile::PauseFile ->
+        // NotifyStatusChange). Emit the new status now so the UI flips to
+        // Paused immediately instead of waiting up to one ~3 s poll cycle. The
+        // frontend zeroes the row's speed on a paused/stopped status event.
+        emit_transfer_status(&app, &transfer_id, status);
     }
     let _ = state
         .network_tx
@@ -720,6 +741,7 @@ pub async fn pause_transfer(
 /// Different from Pause - a stopped file won't automatically resume.
 #[tauri::command]
 pub async fn stop_transfer(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<(), String> {
@@ -731,6 +753,9 @@ pub async fn stop_transfer(
         manager.stop(&transfer_id)
     };
     persist_transfer_status(&state, &transfer_id, &TransferStatus::Stopped).await;
+    // Reflect the Stop in the UI immediately (eMule CPartFile::StopFile updates
+    // synchronously); otherwise the row lingers as Active until the next poll.
+    emit_transfer_status(&app, &transfer_id, &TransferStatus::Stopped);
     let _ = state
         .network_tx
         .send(NetworkCommand::CancelDownload {
@@ -952,30 +977,40 @@ pub async fn open_file(
 
 #[tauri::command]
 pub async fn resume_transfer(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<(), String> {
-    let (was_paused_active, promoted) = {
+    let (was_active_resumable, promoted) = {
         let mut manager = state.transfer_manager.write().await;
-        let was_paused_active = manager
+        // An active row in Paused *or* Insufficient won't be returned by
+        // `resume()` as "promoted" (it never left the active map), so the
+        // caller must restart its worker explicitly. Stopped rows live in the
+        // queue, not active, and are handled by the promoted path below.
+        let was_active_resumable = manager
             .active
             .get(&transfer_id)
-            .map(|t| t.status == TransferStatus::Paused)
+            .map(|t| matches!(t.status, TransferStatus::Paused | TransferStatus::Insufficient))
             .unwrap_or(false);
         if manager.get_control(&transfer_id).is_none() {
             manager.register_control(&transfer_id, TransferControl::new());
         }
         let promoted = manager.resume(&transfer_id);
-        (was_paused_active, promoted)
+        (was_active_resumable, promoted)
     };
     let status = {
         let manager = state.transfer_manager.read().await;
         manager.get_transfer(&transfer_id).map(|t| t.status.clone())
     };
-    if let Some(status) = status {
-        persist_transfer_status(&state, &transfer_id, &status).await;
+    if let Some(status) = &status {
+        persist_transfer_status(&state, &transfer_id, status).await;
+        // Flip the row out of Paused/Stopped immediately (eMule
+        // CPartFile::ResumeFile -> NotifyStatusChange). The worker promotes the
+        // row to Active later via its SourcesUpdate event once a source is
+        // actually transferring; this just gets it off the stale state now.
+        emit_transfer_status(&app, &transfer_id, status);
     }
-    if was_paused_active && promoted.is_empty() {
+    if was_active_resumable && promoted.is_empty() {
         let transfer = {
             let manager = state.transfer_manager.read().await;
             manager.get_transfer(&transfer_id).cloned()
@@ -1214,7 +1249,10 @@ pub async fn set_preview_priority(
 /// pause may interleave; last command wins per transfer. Callers should
 /// debounce in the UI rather than expect a transactional guarantee.
 #[tauri::command]
-pub async fn pause_all_transfers(state: tauri::State<'_, AppState>) -> Result<(), String> {
+pub async fn pause_all_transfers(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
     let (statuses, pause_ids) = {
         let mut manager = state.transfer_manager.write().await;
         let active_ids: Vec<String> = manager
@@ -1262,6 +1300,10 @@ pub async fn pause_all_transfers(state: tauri::State<'_, AppState>) -> Result<()
             })
             .await;
     }
+    // Immediate UI feedback for every paused row (see pause_transfer).
+    for (id, status) in &statuses {
+        emit_transfer_status(&app, id, status);
+    }
     futures::future::join_all(statuses.into_iter().map(|(id, status)| {
         let state = &state;
         async move {
@@ -1275,20 +1317,23 @@ pub async fn pause_all_transfers(state: tauri::State<'_, AppState>) -> Result<()
 #[tauri::command]
 /// Resume every paused / stopped download. See pause_all_transfers for the
 /// same eventual-consistency caveat.
-pub async fn resume_all_transfers(state: tauri::State<'_, AppState>) -> Result<(), String> {
+pub async fn resume_all_transfers(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
     let (promoted, restart_ids, statuses) = {
         let mut manager = state.transfer_manager.write().await;
         let active_ids: Vec<String> = manager.active.keys().cloned().collect();
         let mut promoted = Vec::new();
         let mut restart_ids: Vec<String> = Vec::new();
         for id in active_ids {
-            let was_paused = manager
+            let was_active_resumable = manager
                 .active
                 .get(&id)
-                .map(|t| t.status == TransferStatus::Paused)
+                .map(|t| matches!(t.status, TransferStatus::Paused | TransferStatus::Insufficient))
                 .unwrap_or(false);
             let p = manager.resume(&id);
-            if was_paused && p.is_empty() {
+            if was_active_resumable && p.is_empty() {
                 restart_ids.push(id.clone());
             }
             promoted.extend(p);
@@ -1313,6 +1358,16 @@ pub async fn resume_all_transfers(state: tauri::State<'_, AppState>) -> Result<(
             .collect::<Vec<_>>();
         (promoted, restart_ids, statuses)
     };
+    // Immediate UI feedback: flip every resumed row off Paused/Stopped now
+    // (see resume_transfer) rather than waiting for the next poll.
+    for (id, status) in &statuses {
+        if matches!(
+            status,
+            TransferStatus::Searching | TransferStatus::Queued | TransferStatus::Active
+        ) {
+            emit_transfer_status(&app, id, status);
+        }
+    }
     futures::future::join_all(
         statuses
             .into_iter()
