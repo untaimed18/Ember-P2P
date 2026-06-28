@@ -15,6 +15,11 @@
     confirmLabel = m.confirm_default_button(),
     cancelLabel = m.common_cancel(),
     danger = false,
+    // When true, render as a single-button informational alert: the Cancel
+    // button is hidden and the confirm button acts as a plain "dismiss". The
+    // overlay/Escape still close it. Defaults false so existing confirm dialogs
+    // are unchanged.
+    alert = false,
     onconfirm,
     oncancel,
   }: {
@@ -24,6 +29,7 @@
     confirmLabel?: string;
     cancelLabel?: string;
     danger?: boolean;
+    alert?: boolean;
     onconfirm?: () => void;
     oncancel?: () => void;
   } = $props();
@@ -111,7 +117,9 @@
       <h3 id="confirm-title-{instanceId}">{title}</h3>
       <p id="confirm-message-{instanceId}">{message}</p>
       <div class="dialog-actions">
-        <button class="ghost" onclick={handleCancel}>{cancelLabel}</button>
+        {#if !alert}
+          <button class="ghost" onclick={handleCancel}>{cancelLabel}</button>
+        {/if}
         <button bind:this={confirmBtn} class={danger ? 'danger' : ''} onclick={handleConfirm}>{confirmLabel}</button>
       </div>
     </div>
