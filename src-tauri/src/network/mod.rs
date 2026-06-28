@@ -958,7 +958,21 @@ fn build_all_getsources_packets(
 
     let mut packets = Vec::with_capacity(servers.len());
     let now = chrono::Utc::now().timestamp();
+    // Only build (and stamp a 30-min reask time for) as many packets as will
+    // actually fit in the send queue. We record `server_udp_source_reask_at`
+    // the moment a packet is built, but the caller drops any packets past the
+    // queue's remaining room — so stamping past `room` would suppress those
+    // (server, file) pairs for SERVER_UDP_SOURCE_REASK_SECS without ever having
+    // asked. That overflow is reachable when many downloads are added at once
+    // (e.g. opening a large .emulecollection) and the burst exceeds
+    // MAX_UDP_SOURCE_QUEUE. Capping here keeps the stamp in lockstep with what
+    // we enqueue; the skipped servers stay un-stamped and are picked up by the
+    // next sweep.
+    let room = MAX_UDP_SOURCE_QUEUE.saturating_sub(state.udp_source_queue.len());
     for server in &servers {
+        if packets.len() >= room {
+            break;
+        }
         if !is_eligible_udp_server(server, state.server_addr) {
             continue;
         }
@@ -994,7 +1008,15 @@ fn build_all_getsources_packets_multi(
 
     let mut packets = Vec::with_capacity(servers.len());
     let now = chrono::Utc::now().timestamp();
+    // See `build_all_getsources_packets`: cap the number of packets at the
+    // send queue's remaining room so we never stamp a reask time for a packet
+    // the caller would drop (which would suppress those files on that server
+    // for SERVER_UDP_SOURCE_REASK_SECS without ever asking).
+    let room = MAX_UDP_SOURCE_QUEUE.saturating_sub(state.udp_source_queue.len());
     for server in &servers {
+        if packets.len() >= room {
+            break;
+        }
         if !is_eligible_udp_server(server, state.server_addr) {
             continue;
         }
@@ -1014,13 +1036,19 @@ fn build_all_getsources_packets_multi(
             continue;
         }
         let file_refs: Vec<(&[u8; 16], u64)> = due.iter().map(|(h, s)| (h, *s)).collect();
-        if let Some(packet) = ServerUdpSocket::build_multi_get_sources_packet(server, &file_refs) {
-            for (fh, _) in due {
+        if let Some((wire_packet, wire_addr, included)) =
+            ServerUdpSocket::build_multi_get_sources_packet(server, &file_refs)
+        {
+            // Stamp the reask time only for files actually packed into this
+            // packet. A non-EXT_GETSOURCES server takes a single hash per
+            // packet, so `included` can be a strict subset of `due`; stamping
+            // all of `due` would suppress the un-asked files for 30 min.
+            for fh in included {
                 state
                     .server_udp_source_reask_at
                     .insert((server.ip.clone(), server.port, fh), now);
             }
-            packets.push(packet);
+            packets.push((wire_packet, wire_addr));
         }
     }
     packets
