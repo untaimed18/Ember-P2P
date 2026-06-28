@@ -102,15 +102,27 @@ impl ServerUdpSocket {
         file_size: u64,
     ) -> Option<(Vec<u8>, SocketAddr)> {
         Self::build_multi_get_sources_packet(server, &[(file_hash, file_size)])
+            .map(|(packet, addr, _included)| (packet, addr))
     }
 
     /// Build a multi-file get-sources packet (eMule packs up to MAX_REQUESTS_PER_SERVER
     /// file hashes per UDP packet, max MAX_UDP_PACKET_DATA bytes of payload).
-    /// Returns (packet, addr) or None if the server address is invalid.
+    ///
+    /// Returns `(packet, addr, included_hashes)` or `None` if the server
+    /// address is invalid or no file could be included. `included_hashes`
+    /// lists exactly the files written into the packet (in order) so the
+    /// caller records the per-(server, file) reask time only for files that
+    /// were actually asked.
+    ///
+    /// eMule (`CDownloadQueue::IsMaxFilesPerUDPServerPacketReached`) only packs
+    /// multiple hashes for servers advertising `SRV_UDPFLG_EXT_GETSOURCES`;
+    /// every other server — including ones we haven't pinged yet, whose flags
+    /// are still 0 — gets exactly ONE hash per packet (the original eDonkey
+    /// `OP_GLOBGETSOURCES` semantics).
     pub fn build_multi_get_sources_packet(
         server: &ServerEntry,
         files: &[(&[u8; 16], u64)],
-    ) -> Option<(Vec<u8>, SocketAddr)> {
+    ) -> Option<(Vec<u8>, SocketAddr, Vec<[u8; 16]>)> {
         const MAX_UDP_PACKET_DATA: usize = 510;
         const MAX_REQUESTS_PER_SERVER: usize = 35;
 
@@ -120,8 +132,18 @@ impl ServerUdpSocket {
         let udp_port = server.port.checked_add(4)?;
         let addr: SocketAddr = format!("{}:{}", server.ip, udp_port).parse().ok()?;
 
+        let supports_ext_getsources = (server.udp_flags & SRV_UDPFLG_EXT_GETSOURCES) != 0;
         let supports_getsources2 = (server.udp_flags & SRV_UDPFLG_EXT_GETSOURCES2) != 0;
         let supports_large = (server.udp_flags & SRV_UDPFLG_LARGEFILES) != 0;
+
+        // eMule caps non-EXT_GETSOURCES servers at a single hash per packet
+        // (the basic eDonkey query); EXT servers accept the packed multi-file
+        // form up to MAX_REQUESTS_PER_SERVER / MAX_UDP_PACKET_DATA.
+        let max_files = if supports_ext_getsources {
+            MAX_REQUESTS_PER_SERVER
+        } else {
+            1
+        };
 
         let opcode = if supports_getsources2 {
             OP_GLOBGETSOURCES2
@@ -132,9 +154,9 @@ impl ServerUdpSocket {
         packet.push(OP_EDONKEYPROT);
         packet.push(opcode);
 
-        let mut count = 0usize;
+        let mut included: Vec<[u8; 16]> = Vec::new();
         for (hash, size) in files {
-            if count >= MAX_REQUESTS_PER_SERVER {
+            if included.len() >= max_files {
                 break;
             }
             // eMule's IsLargeFile() boundary is OLD_MAX_EMULE_FILE_SIZE, not
@@ -165,10 +187,10 @@ impl ServerUdpSocket {
                     packet.extend_from_slice(&(*size as u32).to_le_bytes());
                 }
             }
-            count += 1;
+            included.push(**hash);
         }
 
-        if count == 0 {
+        if included.is_empty() {
             return None;
         }
         // Apply UDP obfuscation if this server supports it AND we
@@ -179,7 +201,7 @@ impl ServerUdpSocket {
         // so the caller's queue + send loop are unchanged — they just
         // see different bytes for obfuscated servers.
         let (wire_packet, wire_addr) = maybe_obfuscate_packet(packet, addr, server);
-        Some((wire_packet, wire_addr))
+        Some((wire_packet, wire_addr, included))
     }
 
     /// Build a global search packet, selecting the best opcode based on server
