@@ -1,6 +1,6 @@
 <script lang="ts">
   import SearchBar from '$lib/components/SearchBar.svelte';
-  import { searchFiles, cancelSearch, parseEd2kLink, findNotes, publishNote, markSpam, markNotSpam, explainSpamResult, getDownloadHistory, removeDownloadHistoryEntry, type SearchMethod } from '$lib/api/search';
+  import { searchFiles, cancelSearch, findNotes, publishNote, markSpam, markNotSpam, explainSpamResult, getDownloadHistory, removeDownloadHistoryEntry, type SearchMethod } from '$lib/api/search';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import { getSettings } from '$lib/api/settings';
   import { startDownload } from '$lib/api/transfers';
@@ -33,9 +33,6 @@
   let searchMethod: SearchMethod = $state('global');
   let searchFileType: string = $state('');
 
-  let ed2kInput = $state('');
-  let ed2kError = $state('');
-  let ed2kSuccess = $state('');
   let barQuery = $state('');
 
   let activeTab = $derived.by(() => {
@@ -160,6 +157,9 @@
   let confirmOpen = $state(false);
   let confirmTitle = $state('');
   let confirmMessage = $state('');
+
+  // Shown when the user tries to search with no usable network connected.
+  let networkAlertOpen = $state(false);
 
   let selectedResultKey = $state<string | null>(null);
   let checkedKeys = $state(new Set<string>());
@@ -977,6 +977,13 @@
       minAvailability: parsedMinAvail !== undefined && !isNaN(parsedMinAvail) ? parsedMinAvail : undefined,
     };
     if (!q && !hasSearchFilters(searchFilterSnapshot, searchFileType || undefined)) return;
+    // An eD2k search needs either the KAD DHT or a connected server. With
+    // neither, the request would only time out, so prompt the user to connect
+    // first instead of opening a doomed search tab.
+    if ($networkStats.status !== 'connected' && $serverStatus !== 'connected') {
+      networkAlertOpen = true;
+      return;
+    }
     const { requestId } = openSearchTab(q, method, searchFileType || undefined, searchFilterSnapshot);
     selectedResultKey = null;
     notes = [];
@@ -1307,23 +1314,6 @@
       addToast('error', msg);
     } finally {
       downloadPending[key] = false;
-    }
-  }
-
-  async function handleEd2kLink() {
-    const link = ed2kInput.trim();
-    if (!link) return;
-    ed2kError = '';
-    ed2kSuccess = '';
-    try {
-      const info = await parseEd2kLink(link);
-      const res = await startDownload(info.hash, info.name, info.size, '', 0);
-      ed2kSuccess = res.already_queued ? m.search_already_queued_name({ name: info.name }) : m.search_queued_name({ name: info.name });
-      ed2kInput = '';
-      safeTimeout(() => (ed2kSuccess = ''), 5000);
-    } catch (e: unknown) {
-      ed2kError = translateError(e, m.search_invalid_ed2k());
-      safeTimeout(() => (ed2kError = ''), 5000);
     }
   }
 
@@ -1735,23 +1725,6 @@
     {/each}
   </div>
 {/if}
-
-<div class="ed2k-bar">
-  <input
-    type="text"
-    placeholder={m.search_ed2k_placeholder()}
-    bind:value={ed2kInput}
-    onkeydown={(e) => { if (e.key === 'Enter') handleEd2kLink(); }}
-    aria-label={m.search_ed2k_aria()}
-  />
-  <button onclick={handleEd2kLink} disabled={!ed2kInput.trim()}>{m.search_add_link()}</button>
-  {#if ed2kSuccess}
-    <span class="ed2k-success">{ed2kSuccess}</span>
-  {/if}
-  {#if ed2kError}
-    <span class="ed2k-error">{ed2kError}</span>
-  {/if}
-</div>
 
 <div class="filter-bar">
   <div class="filter-primary-row">
@@ -2443,6 +2416,14 @@
   oncancel={handleConfirmCancel}
 />
 
+<ConfirmDialog
+  bind:open={networkAlertOpen}
+  alert
+  title={m.search_no_network_title()}
+  message={m.search_no_network_message()}
+  confirmLabel={m.common_ok()}
+/>
+
 <style>
   .search-area {
     display: flex;
@@ -2450,7 +2431,6 @@
     padding: 14px 20px 12px;
     align-items: stretch;
     background: var(--bg-secondary);
-    border-bottom: 1px solid var(--border);
     flex-wrap: wrap;
   }
 
@@ -2622,36 +2602,6 @@
     }
   }
 
-  .ed2k-bar {
-    display: flex;
-    gap: 8px;
-    padding: 10px 20px 12px;
-    align-items: center;
-    background: var(--bg-secondary);
-    border-bottom: 1px solid var(--border);
-    flex-wrap: wrap;
-  }
-
-  .ed2k-bar input {
-    flex: 1 1 380px;
-    min-width: 260px;
-    font-family: var(--font-mono);
-    font-size: 12px;
-    padding: 5px 8px;
-  }
-
-  .ed2k-success {
-    color: var(--success, #2ecc71);
-    font-size: 12px;
-    white-space: nowrap;
-  }
-
-  .ed2k-error {
-    color: var(--danger, #e74c3c);
-    font-size: 12px;
-    white-space: nowrap;
-  }
-
   .filter-bar {
     display: flex;
     flex-direction: column;
@@ -2808,9 +2758,12 @@
   }
 
   .search-syntax-hint {
-    margin: 6px 2px 0;
+    margin: 0;
+    padding: 0 20px 12px;
     font-size: 11px;
     color: var(--text-muted);
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
   }
 
   .results-info {
