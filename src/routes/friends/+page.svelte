@@ -241,13 +241,15 @@
     listen<{ user_hash: string }>('ember:friend-confirmed', () => {
       if (destroyed) return;
       loadFriends();
-    }).then(fn => { if (destroyed) fn(); else unlistenFns.push(fn); });
+    }).then(fn => { if (destroyed) fn(); else unlistenFns.push(fn); })
+      .catch((e) => console.error('friends: failed to register ember:friend-confirmed listener', e));
 
     listen<{ firewalled: boolean }>('firewall-status', (event) => {
       if (destroyed) return;
       isFirewalled = event.payload.firewalled;
       if (!event.payload.firewalled) recheckingFirewall = false;
-    }).then(fn => { if (destroyed) fn(); else unlistenFns.push(fn); });
+    }).then(fn => { if (destroyed) fn(); else unlistenFns.push(fn); })
+      .catch((e) => console.error('friends: failed to register firewall-status listener', e));
 
     listen<{ user_hash: string; reason?: string }>('ember:friend-search-failed', (event) => {
       if (destroyed) return;
@@ -275,7 +277,8 @@
           msg = m.friends_search_generic({ name });
       }
       toastWarning(msg);
-    }).then(fn => { if (destroyed) fn(); else unlistenFns.push(fn); });
+    }).then(fn => { if (destroyed) fn(); else unlistenFns.push(fn); })
+      .catch((e) => console.error('friends: failed to register ember:friend-search-failed listener', e));
 
     return () => {
       destroyed = true;

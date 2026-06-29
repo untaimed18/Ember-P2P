@@ -46,6 +46,25 @@ function isMoreAdvancedStatus(eventStatus: string, apiStatus: string): boolean {
   return (STATUS_PRIORITY[eventStatus] ?? 0) > (STATUS_PRIORITY[apiStatus] ?? 0);
 }
 
+/**
+ * Reconcile the speed shown after merging an event row with a fresh API
+ * snapshot. Idle/terminal rows always read 0. Otherwise take the larger of the
+ * two sources: the event speed can decay to 0 between progress events while the
+ * API snapshot (read live from the transfer manager) still carries a positive
+ * rate — and vice-versa — so the higher value is the freshest truth.
+ */
+function mergeSpeed(status: string, apiSpeed: number, eventSpeed: number): number {
+  if (
+    status === 'completed' ||
+    status === 'failed' ||
+    status === 'stopped' ||
+    status === 'paused'
+  ) {
+    return 0;
+  }
+  return Math.max(apiSpeed ?? 0, eventSpeed ?? 0);
+}
+
 /** Known backend Transfer statuses. Used to runtime-narrow event payloads
  *  before casting to `Transfer['status']`, so an unexpected backend string
  *  can never silently widen TypeScript's view of truth (D31). */
@@ -302,7 +321,8 @@ export async function initTransferStore() {
       });
     });
     await safeListen<ProgressPayload>('transfer-progress', (event) => {
-      markEventUpdate();
+      // NB: deliberately does NOT markEventUpdate() — see note there. Progress
+      // is a per-byte sub-row update and must not suppress the reconciling poll.
       const p = event.payload;
       const existing = pendingProgress.get(p.id);
       pendingProgress.set(p.id, {
@@ -466,7 +486,8 @@ export async function initTransferStore() {
       },
     );
     await safeListen<TransferEventPayload>('transfer-health', (event) => {
-      markEventUpdate();
+      // Sub-row update (health/stall colour) — not a status transition, so it
+      // must not defer the reconciling poll.
       const { id, error, failure_reason, failure_kind, failure_stage, health, health_reason, stalled_since } = event.payload;
       transfers.update((list) =>
         list.map((t) =>
@@ -490,7 +511,7 @@ export async function initTransferStore() {
       );
     });
     await safeListen<{ id: string; speed: number }>('transfer-speed-decay', (event) => {
-      markEventUpdate();
+      // Sub-row update (speed → 0 on idle) — must not defer the reconciling poll.
       const { id, speed } = event.payload;
       transfers.update((list) =>
         list.map((t) => {
@@ -507,7 +528,7 @@ export async function initTransferStore() {
     await safeListen<{ id: string; sources: number; active_sources: number; queued_sources: number }>(
       'transfer-sources',
       (event) => {
-        markEventUpdate();
+        // Sub-row update (source counts) — must not defer the reconciling poll.
         const { id, sources, active_sources, queued_sources } = event.payload;
         transfers.update((list) =>
           list.map((t) => {
@@ -533,7 +554,7 @@ export async function initTransferStore() {
       (event) => {
         const { transfer_id, queue_rank } = event.payload;
         if (queue_rank === undefined || queue_rank === null) return;
-        markEventUpdate();
+        // Sub-row update (per-source queue rank) — must not defer the poll.
         transfers.update((list) =>
           list.map((t) => (t.id === transfer_id ? { ...t, queue_rank } : t))
         );
@@ -553,10 +574,11 @@ export async function initTransferStore() {
         const eventItem = currentById.get(apiItem.id);
         if (eventItem) {
           const preferEvent = isMoreAdvancedStatus(eventItem.status, apiItem.status);
+          const status = preferEvent ? eventItem.status : apiItem.status;
           return snapCompletedDownload({
             ...apiItem,
-            status: preferEvent ? eventItem.status : apiItem.status,
-            speed: eventItem.speed,
+            status,
+            speed: mergeSpeed(status, apiItem.speed, eventItem.speed),
             progress: Math.max(apiItem.progress, eventItem.progress),
             transferred: Math.max(apiItem.transferred, eventItem.transferred),
             completed_size: Math.max(apiItem.completed_size || 0, eventItem.completed_size || 0),
@@ -669,6 +691,18 @@ function detachPollVisibilityListener() {
 
 let lastEventUpdate = 0;
 
+// Only *status / membership* events (started, complete, failed, status) bump
+// this. The reconciling poll defers for a short window after one of these so
+// it doesn't immediately re-fetch state the event just delivered.
+//
+// Crucially, high-frequency *sub-row* events (progress, speed-decay, sources,
+// source-detail, health) must NOT bump it: `transfer-progress` alone fires
+// many times per second per active download, so if it counted here a single
+// busy transfer would keep `lastEventUpdate` perpetually fresh and starve the
+// poll for *every* row — meaning any status change that lacks its own event
+// (or whose event was missed) would stay stuck on screen until all transfers
+// went quiet. Letting only true status transitions defer the poll keeps the
+// 3 s reconcile alive during active downloading.
 function markEventUpdate() {
   lastEventUpdate = Date.now();
 }
@@ -703,6 +737,11 @@ export function startTransferPoll() {
     if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
       return;
     }
+    // Defer only briefly after a real status/membership event (which already
+    // delivered the change) to avoid a redundant immediate re-fetch. Progress
+    // and other sub-row events no longer bump `lastEventUpdate` (see
+    // markEventUpdate), so an actively transferring download can't keep this
+    // gate shut — the poll still reconciles status every ~3 s.
     if (!pollPumpOnNextVisible && Date.now() - lastEventUpdate < 2000) return;
     pollPumpOnNextVisible = false;
     busy = true;
@@ -730,11 +769,12 @@ export function startTransferPoll() {
             const eventItem = currentById.get(apiItem.id);
             if (!eventItem) return apiItem;
             const preferEvent = isMoreAdvancedStatus(eventItem.status, apiItem.status);
+            const status = preferEvent ? eventItem.status : apiItem.status;
             return {
               ...apiItem,
-              status: preferEvent ? eventItem.status : apiItem.status,
+              status,
               progress: Math.max(apiItem.progress, eventItem.progress),
-              speed: preferEvent ? eventItem.speed : apiItem.speed,
+              speed: mergeSpeed(status, apiItem.speed, eventItem.speed),
               transferred: Math.max(apiItem.transferred, eventItem.transferred),
               completed_size: Math.max(apiItem.completed_size || 0, eventItem.completed_size || 0),
               health: eventItem.health ?? apiItem.health,

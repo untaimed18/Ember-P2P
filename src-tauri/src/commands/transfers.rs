@@ -55,12 +55,17 @@ fn transfer_status_key(status: &TransferStatus) -> &'static str {
     }
 }
 
-/// Emit a `transfer-status` event so the UI reflects a user-initiated
-/// pause/stop/resume immediately, mirroring eMule's synchronous
-/// `NotifyStatusChange()` + `UpdateDisplayedInfo()` on these actions. Without
-/// it the row only updates on the next ~3 s poll, and (before the frontend
-/// merge fix) a resumed download could stay visually stuck on Paused/Stopped.
-fn emit_transfer_status(app: &tauri::AppHandle, transfer_id: &str, status: &TransferStatus) {
+/// Emit a `transfer-status` event so the UI reflects a status change
+/// immediately, mirroring eMule's synchronous `NotifyStatusChange()` +
+/// `UpdateDisplayedInfo()`. Without it the row only updates on the next ~3 s
+/// poll, and (before the frontend merge fix) a resumed download could stay
+/// visually stuck on Paused/Stopped. Also reused by the network loop to
+/// announce queued→active/searching promotions in real time.
+pub(crate) fn emit_transfer_status(
+    app: &tauri::AppHandle,
+    transfer_id: &str,
+    status: &TransferStatus,
+) {
     let _ = app.emit(
         "transfer-status",
         serde_json::json!({
@@ -946,14 +951,28 @@ pub async fn cancel_transfer(
             config.settings.download_folder.clone()
         },
     );
-    let _ = tokio::time::timeout(CMD_REPLY_TIMEOUT, ack_rx).await;
+    // Wait for the network task to confirm it released the file before we
+    // delete the partials. On timeout / closed channel we still proceed
+    // (best-effort cleanup), but log it: deleting while the task may still
+    // hold a handle is the race this ack exists to avoid.
+    match tokio::time::timeout(CMD_REPLY_TIMEOUT, ack_rx).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(_)) => tracing::warn!(
+            "Cancel cleanup ack channel closed without ack for {transfer_id}; proceeding with best-effort cleanup"
+        ),
+        Err(_) => tracing::warn!(
+            "Timed out waiting for cancel cleanup ack for {transfer_id}; proceeding with best-effort cleanup"
+        ),
+    }
     cleanup_partial_files(&dl_folder, &transfer_id).await;
 
     {
         let db = state.db.clone();
         let tid = transfer_id.clone();
         db_blocking(move || {
-            let _ = db.remove_transfer(&tid);
+            if let Err(e) = db.remove_transfer(&tid) {
+                tracing::warn!("Failed to remove transfer {tid} from database: {e}");
+            }
         })
         .await;
     }
@@ -991,12 +1010,26 @@ pub async fn remove_transfer(
             config.settings.download_folder.clone()
         },
     );
-    let _ = tokio::time::timeout(CMD_REPLY_TIMEOUT, ack_rx).await;
+    // Wait for the network task to confirm it released the file before we
+    // delete the partials (best-effort on timeout/closed channel, but log the
+    // race window — deleting while the task may still hold a handle is exactly
+    // what this ack exists to avoid).
+    match tokio::time::timeout(CMD_REPLY_TIMEOUT, ack_rx).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(_)) => tracing::warn!(
+            "Remove cleanup ack channel closed without ack for {transfer_id}; proceeding with best-effort cleanup"
+        ),
+        Err(_) => tracing::warn!(
+            "Timed out waiting for remove cleanup ack for {transfer_id}; proceeding with best-effort cleanup"
+        ),
+    }
     let db = state.db.clone();
     let tid = transfer_id.clone();
     tokio::join!(cleanup_partial_files(&dl_folder, &transfer_id), async {
         db_blocking(move || {
-            let _ = db.remove_transfer(&tid);
+            if let Err(e) = db.remove_transfer(&tid) {
+                tracing::warn!("Failed to remove transfer {tid} from database: {e}");
+            }
         })
         .await;
     },);
@@ -1073,7 +1106,9 @@ pub async fn set_transfer_priority(
     let tid = transfer_id.clone();
     let prio = priority.clone();
     db_blocking(move || {
-        let _ = db.update_transfer_priority(&tid, &prio);
+        if let Err(e) = db.update_transfer_priority(&tid, &prio) {
+            tracing::warn!("Failed to persist transfer priority for {tid}: {e}");
+        }
     })
     .await;
     Ok(())
@@ -1099,7 +1134,9 @@ pub async fn set_transfer_category(
     let tid = transfer_id.clone();
     let cat = category.clone();
     db_blocking(move || {
-        let _ = db.update_transfer_category(&tid, &cat);
+        if let Err(e) = db.update_transfer_category(&tid, &cat) {
+            tracing::warn!("Failed to persist transfer category for {tid}: {e}");
+        }
     })
     .await;
     Ok(())

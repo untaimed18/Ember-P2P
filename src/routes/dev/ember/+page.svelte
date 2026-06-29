@@ -12,10 +12,16 @@
    * optional — when blank the backend looks the peer's pubkey up in
    * the cache populated by KAD source publishes.
    *
-   * Reachable from the sidebar's "Ember Dev" entry. Production users
-   * who land here see the same panel; if `ember_native_enabled` is
-   * false they get a clear banner explaining what to flip.
+   * Reachable from the sidebar's "Ember Dev" entry in development. In a
+   * production build the panel is replaced by a short notice (see `isDev`
+   * below) so the diagnostics tooling and local Noise key are not exposed.
    */
+
+  // Dev diagnostics ship in the bundle but must not be reachable as live
+  // tooling in production: `import.meta.env.DEV` is statically `false` in a
+  // release build, so the panel below renders a notice instead and `onMount`
+  // skips all backend polling / settings reads.
+  const isDev = import.meta.env.DEV;
 
   let diag = $state<EmberDiagnostics | null>(null);
   let diagError = $state<string | null>(null);
@@ -144,6 +150,7 @@
   }
 
   onMount(() => {
+    if (!isDev) return;
     refreshDiag();
     refreshLocalSettings();
     refreshTimer = setInterval(refreshDiag, 2000);
@@ -169,6 +176,14 @@
 
 <svelte:head><title>Ember Dev — Ember</title></svelte:head>
 
+{#if !isDev}
+  <div class="page">
+    <header class="page-header">
+      <div><h1>Ember Dev</h1></div>
+    </header>
+    <p class="subtitle">This diagnostics page is only available in development builds.</p>
+  </div>
+{:else}
 <div class="page">
   <header class="page-header">
     <div>
@@ -405,7 +420,8 @@
       </div>
     {/if}
   </section>
-</div>
+  </div>
+{/if}
 
 <style>
   .page {

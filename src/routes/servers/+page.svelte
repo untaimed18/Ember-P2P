@@ -291,6 +291,22 @@
     }
   }
 
+  // Accept either a dotted-quad IPv4 (with valid 0-255 octets) or a
+  // syntactically-valid DNS hostname. This rejects obvious garbage (spaces,
+  // control chars, empty labels) before the IPC round-trip; the backend still
+  // performs the authoritative resolution/validation.
+  function isValidServerHost(host: string): boolean {
+    if (host.length === 0 || host.length > 253) return false;
+    const octets = host.split('.');
+    if (octets.length === 4 && octets.every(p => {
+      const n = Number(p);
+      return Number.isInteger(n) && n >= 0 && n <= 255 && p === String(n);
+    })) {
+      return true;
+    }
+    return /^(?=.{1,253}$)([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/.test(host);
+  }
+
   async function handleAddServer() {
     const ip = newIp.trim();
     const portStr = newPort.trim();
@@ -299,6 +315,10 @@
 
     if (!ip) {
       error = m.servers_validation_ip_required();
+      return;
+    }
+    if (!isValidServerHost(ip)) {
+      error = m.servers_validation_ip_invalid();
       return;
     }
     if (isNaN(portNum) || portNum < 1 || portNum > 65535) {

@@ -48,6 +48,10 @@
   let files: FileInfo[] = $state([]);
   let scanning = $state(false);
   let error: string | null = $state(null);
+  // Tracks the message last shown by a failed `refresh()` so we can clear
+  // the banner on the next successful load without clobbering an unrelated
+  // error set by a user-initiated action.
+  let lastLoadError: string | null = null;
   let selectedPath: string | null = $state(null);
   // Bound to the virtualized file table; used by arrow-key navigation
   // to scroll the new selection into view (the row may not exist in
@@ -422,6 +426,12 @@
       if (!stoppedByUser) scanning = isScanning;
       files = newFiles;
       folderPriorities = newPriorities;
+      // Successful load: clear a previously-surfaced load error (but leave
+      // any error a user action raised in the meantime untouched).
+      if (lastLoadError !== null) {
+        if (error === lastLoadError) error = null;
+        lastLoadError = null;
+      }
       // Drop selection entries whose file no longer exists in the library
       // (deleted on disk, folder unshared, etc.). `newFiles` is the full
       // library — not the filtered view — so this only prunes truly-gone
@@ -441,8 +451,17 @@
         }
       }
     } catch (e) {
-      if (mounted && e instanceof Error && e.message !== 'timeout')
+      if (mounted && e instanceof Error && e.message !== 'timeout') {
         console.error('Failed to load shared files:', e);
+        // Surface the failure in the UI banner only when there is no data to
+        // show (initial load / fully-empty library); a transient failure of a
+        // background poll while files are already listed stays silent to avoid
+        // flicker. Tracked via `lastLoadError` so the next success can clear it.
+        if (files.length === 0) {
+          lastLoadError = toErr(e);
+          error = lastLoadError;
+        }
+      }
     } finally {
       if (mounted) {
         busy = false;
@@ -1675,22 +1694,40 @@
 
     refresh();
 
-    // Poll every 3s: detect scan completion and refresh data while scanning.
-    // The poll never INITIATES the scanning UI state -- only progress events do that.
-    // This prevents the banner from reappearing after Stop or page re-navigation.
+    // Poll every 3s: detect scan completion. The poll never INITIATES the
+    // scanning UI state -- only progress events do that. This prevents the
+    // banner from reappearing after Stop or page re-navigation.
+    //
+    // While a scan is in progress we deliberately do NOT call full `refresh()`
+    // on every tick: incremental library updates are already driven by the
+    // `shared-files-changed` event (debounced below), so a per-tick reload
+    // just stacks redundant IPC + large derived recomputes during long scans.
+    // We only pull a final snapshot once, when the scan transitions to done.
+    let scanPollFailures = 0;
+    const SCAN_POLL_MAX_FAILURES = 5;
     const scanPoll = setInterval(async () => {
       if (!mounted || stoppedByUser) return;
       try {
         const isScanning = await getScanStatus();
         if (!mounted) return;
+        scanPollFailures = 0;
         if (scanning && !isScanning) {
           scanning = false;
           hashProgress = null;
           await refresh();
-        } else if (scanning && isScanning) {
-          await refresh();
         }
-      } catch {}
+      } catch {
+        // A transient `getScanStatus` failure must not strand the "hashing"
+        // banner forever. After several consecutive failures, clear it.
+        if (!mounted) return;
+        scanPollFailures += 1;
+        if (scanning && scanPollFailures >= SCAN_POLL_MAX_FAILURES) {
+          scanning = false;
+          hashProgress = null;
+          scanPollFailures = 0;
+          console.warn('library: scan-status polling failed repeatedly; clearing scanning state');
+        }
+      }
     }, 3000);
 
     const unlisteners: Array<() => void> = [];

@@ -585,6 +585,22 @@
   let activeDownloads = $derived(downloadPartition.active);
   let completedDownloads = $derived(downloadPartition.completed);
   let hasCompletedDl = $derived(downloadPartition.anyCompleted);
+
+  // Lower-cased hashes of files we're still downloading (have a `.part` for).
+  // An upload whose hash is in this set is the eMule-style partial-file share:
+  // we're serving the already-finished, verified parts of a file we haven't
+  // finished downloading yet. Surfacing it lets the user actually *see*
+  // swarming happen instead of wondering whether partial sharing works.
+  let activeDownloadHashes = $derived.by(() => {
+    const s = new Set<string>();
+    for (const t of activeDownloads) {
+      if (t.file_hash) s.add(t.file_hash.toLowerCase());
+    }
+    return s;
+  });
+  function isPartialSeed(t: Transfer): boolean {
+    return Boolean(t.file_hash) && activeDownloadHashes.has(t.file_hash.toLowerCase());
+  }
   // L14: persist the filter so switching tabs and returning doesn't
   // wipe a user's narrow-down.
   const FILTER_KEY = 'transfers-filter';
@@ -677,11 +693,17 @@
   let knownPollHandle: ReturnType<typeof setInterval> | null = null;
   const QUEUE_POLL_INTERVAL_MS = 3000;
   const KNOWN_POLL_INTERVAL_MS = 8000;
+  // Monotonic sequence guards: an overlapping/slow poll response must not apply
+  // out of order on top of a newer one (last-started wins, regardless of which
+  // request's promise resolves first).
+  let uploadQueueGen = 0;
+  let knownClientsGen = 0;
 
   async function refreshUploadQueue() {
+    const gen = ++uploadQueueGen;
     try {
       const data = await getUploadQueue();
-      if (!mounted) return;
+      if (!mounted || gen !== uploadQueueGen) return;
       uploadQueueClients = data;
       uploadQueueLoaded = true;
     } catch (e) {
@@ -691,9 +713,10 @@
     }
   }
   async function refreshKnownClients() {
+    const gen = ++knownClientsGen;
     try {
       const data = await getKnownClients();
-      if (!mounted) return;
+      if (!mounted || gen !== knownClientsGen) return;
       knownClients = data;
       knownClientsLoaded = true;
       // Kick off reputation refresh for the just-loaded roster. Runs
@@ -1072,9 +1095,10 @@
     }
   });
 
-  /** Read the latest EWMA for a transfer. Pure — does not mutate
-   *  speedHistory; updates happen in the $effect above. Falls back to the
-   *  backend-reported `t.speed` when no EWMA is recorded yet. */
+  /** Resolve the rate to display for a transfer. Pure — does not mutate
+   *  speedHistory; the EWMA is maintained by the $effect above. Prefers the
+   *  backend's live rate and falls back to the local EWMA only when the
+   *  backend momentarily reports 0. */
   function liveSpeed(t: Transfer): number {
     // Non-transferring states never have a live rate. Return 0 directly so the
     // local EWMA — which lingers for up to SPEED_STALE_MS (12 s) after bytes
@@ -1083,10 +1107,16 @@
     if (t.status === 'paused' || t.status === 'stopped' || t.status === 'completed' || t.status === 'failed') {
       return 0;
     }
+    // Prefer the backend's real-time rolling-window rate. It's pushed on every
+    // `transfer-progress` event (and zeroed via `transfer-speed-decay` on
+    // idle), so it tracks throughput live — without the extra smoothing lag and
+    // 12 s stale-linger the local EWMA adds. The EWMA is only a fallback for
+    // the brief windows where the backend reports 0 while bytes are still
+    // moving (e.g. between scheduling ticks, before the first window sample).
+    if (t.speed > 0) return t.speed;
     const entry = speedHistory.get(t.id);
-    if (!entry) return t.speed > 0 ? t.speed : 0;
-    if (entry.ewma > 0) return entry.ewma;
-    return t.speed > 0 ? t.speed : 0;
+    if (entry && entry.ewma > 0) return entry.ewma;
+    return 0;
   }
 
   /** D23: pick the progress-bar fill colour for a download row. Respects
@@ -2257,10 +2287,16 @@
 
   $effect(() => {
     if (expandedTransferId && !visibleActiveDownloadIds.has(expandedTransferId)) {
-      expandedTransferId = null;
-      expandedSources = [];
-      loadingSources = false;
-      sourceDetailRequestId += 1;
+      // Same `untrack` rationale as the paused/stopped effect below: the
+      // `sourceDetailRequestId += 1` read must not subscribe this effect to the
+      // counter it bumps. (This one self-terminates because it nulls
+      // `expandedTransferId`, but keep the pattern consistent and safe.)
+      untrack(() => {
+        expandedTransferId = null;
+        expandedSources = [];
+        loadingSources = false;
+        sourceDetailRequestId += 1;
+      });
     }
   });
 
@@ -2276,12 +2312,19 @@
     const t = activeDownloads.find((x) => x.id === expandedTransferId);
     if (!t) return;
     if (t.status === 'paused' || t.status === 'stopped') {
-      expandedSources = [];
-      // Invalidate any in-flight getTransferSources request so its
-      // late-arriving response doesn't repopulate the list after
-      // we've intentionally cleared it.
-      sourceDetailRequestId += 1;
-      loadingSources = false;
+      // Mutate inside `untrack`. `sourceDetailRequestId += 1` *reads* the
+      // counter, and a tracked read of state this effect also writes would
+      // subscribe the effect to its own write — so it re-runs itself. Because
+      // the guard above (status still paused/stopped) never flips, it re-ran
+      // forever, freezing the UI the instant the source panel of a stopped/
+      // paused download was opened (e.g. stop a download, then double-click
+      // it). The bump still invalidates any in-flight getTransferSources fetch
+      // so a late response can't repopulate the list we just cleared.
+      untrack(() => {
+        expandedSources = [];
+        sourceDetailRequestId += 1;
+        loadingSources = false;
+      });
     }
   });
 
@@ -2557,7 +2600,7 @@
               </td>
               {#each visibleDownloadColumns as column (column.key)}
                 {#if column.key === 'file_name'}
-                  <td class="name-cell" title={t.file_name}>{t.file_name}</td>
+                  <td class="name-cell" title={t.file_name}><bdi>{t.file_name}</bdi></td>
                 {:else if column.key === 'total_size'}
                   <td class="num-cell">{formatSize(t.total_size)}</td>
                 {:else if column.key === 'transferred'}
@@ -2668,7 +2711,7 @@
                       <span class="source-fields">
                         <span class="source-status-dot src-dot-{src.status}" title={src.status}></span>
                         <span class="source-flag" title={src.country_code ?? ''}>{#if countryFlagSrc(src.country_code)}<img src={countryFlagSrc(src.country_code)} alt={src.country_code ?? ''} class="flag-img" />{/if}</span>
-                        <span class="source-client" title={src.peer_name || src.client_software || m.transfers_unknown_client()}>{src.peer_name || src.client_software || m.transfers_unknown_client()}</span>
+                        <span class="source-client" title={src.peer_name || src.client_software || m.transfers_unknown_client()}><bdi>{src.peer_name || src.client_software || m.transfers_unknown_client()}</bdi></span>
                         <span class="source-sep"></span>
                         <span class="source-addr" title="{src.ip}:{src.port}">{src.ip}:{src.port}</span>
                         <span class="source-state src-st-{src.status}">{sourceStatusLabel(src)}</span>
@@ -2710,7 +2753,7 @@
                 <td class="col-dl-check"></td>
                 {#each visibleDownloadColumns as column (column.key)}
                   {#if column.key === 'file_name'}
-                    <td class="name-cell" title={t.file_name}>{t.file_name}</td>
+                    <td class="name-cell" title={t.file_name}><bdi>{t.file_name}</bdi></td>
                   {:else if column.key === 'total_size'}
                     <td class="num-cell">{formatSize(t.total_size)}</td>
                   {:else if column.key === 'transferred'}
@@ -2978,11 +3021,14 @@
                   {#if column.key === 'country'}
                     <td class="flag-cell" title={t.country_code ?? ''}>{#if countryFlagSrc(t.country_code)}<img src={countryFlagSrc(t.country_code)} alt={t.country_code ?? ''} class="flag-img" />{/if}</td>
                   {:else if column.key === 'peer_name'}
-                    <td class="client-cell" title={t.peer_name || t.peer_id}>{t.peer_name || t.peer_id || '\u2014'}</td>
+                    <td class="client-cell" title={t.peer_name || t.peer_id}><bdi>{t.peer_name || t.peer_id || '\u2014'}</bdi></td>
                   {:else if column.key === 'file_name'}
-                    <td class="name-cell" title={t.file_name}>{t.file_name}</td>
+                    <td class="name-cell" title={isPartialSeed(t) ? m.transfers_upload_partial_seed_title({ name: t.file_name }) : t.file_name}>
+                      <span class="ul-name-text"><bdi>{t.file_name}</bdi></span>
+                      {#if isPartialSeed(t)}<span class="partial-seed-badge" title={m.transfers_upload_partial_seed_title({ name: t.file_name })}>{m.transfers_upload_partial_seed_badge()}</span>{/if}
+                    </td>
                   {:else if column.key === 'client_software'}
-                    <td class="sw-cell" title={t.client_software || ''}>{t.client_software || '\u2014'}</td>
+                    <td class="sw-cell" title={t.client_software || ''}><bdi>{t.client_software || '\u2014'}</bdi></td>
                   {:else if column.key === 'speed'}
                     {@const spd = liveSpeed(t)}
                     <td class="num-cell">{spd > 0 ? formatSpeed(spd) : '\u2014'}</td>
@@ -3121,7 +3167,7 @@
                     {@const label = q.user_hash ? q.user_hash.slice(0, 8) + '\u2026' : (q.peer_ip || '\u2014')}
                     <td class="client-cell" title={q.user_hash || q.peer_ip}>{q.is_friend ? '\u2605 ' : ''}{label}</td>
                   {:else if column.key === 'file_name'}
-                    <td class="name-cell" title={q.file_name}>{q.file_name}</td>
+                    <td class="name-cell" title={q.file_name}><bdi>{q.file_name}</bdi></td>
                   {:else if column.key === 'wait_time'}
                     <td class="num-cell">{formatDuration(q.wait_seconds * 1000)}</td>
                   {:else if column.key === 'queue_rank'}
@@ -3426,13 +3472,13 @@
                 <tr class="client-row">
                   {#each visibleClientColumns as column (column.key)}
                     {#if column.key === 'peer_name'}
-                      <td class="client-cell" title={src.peer_name || src.ip}>{src.peer_name || src.ip}</td>
+                      <td class="client-cell" title={src.peer_name || src.ip}><bdi>{src.peer_name || src.ip}</bdi></td>
                     {:else if column.key === 'country'}
                       <td class="flag-cell" title={src.country_code ?? ''}>{#if countryFlagSrc(src.country_code)}<img src={countryFlagSrc(src.country_code)} alt={src.country_code ?? ''} class="flag-img" />{/if}</td>
                     {:else if column.key === 'client_software'}
-                      <td title={src.client_software}>{src.client_software || '\u2014'}</td>
+                      <td title={src.client_software}><bdi>{src.client_software || '\u2014'}</bdi></td>
                     {:else if column.key === 'file_name'}
-                      <td class="name-cell">{allDownloads.find(d => d.id === expandedTransferId)?.file_name || '\u2014'}</td>
+                      <td class="name-cell"><bdi>{allDownloads.find(d => d.id === expandedTransferId)?.file_name || '\u2014'}</bdi></td>
                     {:else if column.key === 'speed'}
                       <td class="num-cell">{src.status === 'transferring' ? formatSpeed(src.speed) : '\u2014'}</td>
                     {:else if column.key === 'downloaded'}
@@ -4022,6 +4068,26 @@
   .name-cell {
     font-weight: 500;
     color: var(--text-primary);
+  }
+  /* Partial-file seeding indicator: an upload row whose file we're still
+     downloading. Keeps the name elliptical while the pill stays pinned. */
+  .name-cell .ul-name-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .partial-seed-badge {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 0 6px;
+    border-radius: 9px;
+    font-size: 10px;
+    font-weight: 600;
+    line-height: 16px;
+    white-space: nowrap;
+    color: var(--accent, #4caf50);
+    background: color-mix(in srgb, var(--accent, #4caf50) 16%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent, #4caf50) 40%, transparent);
+    vertical-align: middle;
   }
   .num-cell {
     text-align: right;

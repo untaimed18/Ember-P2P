@@ -192,10 +192,22 @@ impl NodeIdentity {
 
                         // Migrate: older identities lack Noise static keys
                         if id.noise_private_key == [0u8; 32] {
+                            // Propagate instead of panicking: a parse/RNG failure
+                            // during migration should surface as a clean startup
+                            // error (caught by the caller), never crash the app.
                             let noise_params: snow::params::NoiseParams =
-                                "Noise_XX_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
-                            let noise_keypair =
-                                snow::Builder::new(noise_params).generate_keypair().unwrap();
+                                "Noise_XX_25519_ChaChaPoly_BLAKE2s".parse().map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "invalid Noise params during identity migration: {e:?}"
+                                    )
+                                })?;
+                            let noise_keypair = snow::Builder::new(noise_params)
+                                .generate_keypair()
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "Noise keypair generation failed during identity migration: {e:?}"
+                                    )
+                                })?;
                             id.noise_private_key.copy_from_slice(&noise_keypair.private);
                             id.noise_public_key.copy_from_slice(&noise_keypair.public);
                             migrated = true;

@@ -999,6 +999,17 @@ fn read_emule_tag(cursor: &mut Cursor<&[u8]>, _use_large: bool) -> anyhow::Resul
         0x09 => cursor.read_u8()? as u64,
         TAGTYPE_STRING => {
             let slen = cursor.read_u16::<LittleEndian>()? as usize;
+            // Verify the declared length fits in the remaining buffer before
+            // allocating, so a truncated/corrupt `.part.met` can't make us
+            // allocate for bytes that never arrive (mirrors the blob-tag
+            // boundary check below).
+            let pos = cursor.position() as usize;
+            if pos
+                .checked_add(slen)
+                .map_or(true, |end| end > cursor.get_ref().len())
+            {
+                anyhow::bail!("part.met string tag length exceeds data boundary");
+            }
             let mut sbuf = vec![0u8; slen];
             cursor.read_exact(&mut sbuf)?;
             let s = String::from_utf8_lossy(&sbuf).to_string();
@@ -1258,6 +1269,54 @@ mod tests {
                 assert!(
                     tracker.is_range_safe_to_serve(start, end),
                     "advertised part {p} must be safe to serve [{start}, {end})"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_file(part_path.with_extension("part.met"));
+    }
+
+    /// The verified-part bitmap MUST survive the worker -> `.part.met` ->
+    /// upload-handler round-trip. The download worker flips `set_part_verified`
+    /// in memory and saves; the upload handler reads a *fresh* `PartTracker`
+    /// from disk to decide what to advertise/serve. If the persisted bitmap
+    /// didn't reload, every in-progress download would advertise zero
+    /// serveable parts and partial-file seeding would silently never happen.
+    #[test]
+    fn verified_bitmap_survives_save_reload() {
+        let part_path = temp_part_path("verified-roundtrip");
+        let file_size = PARTSIZE * 3 + 123; // 4 parts: 3 full + a short tail
+        let mut tracker = PartTracker::new(file_size, &part_path);
+        tracker.set_file_hash([0x11; 16]);
+        tracker.set_file_name("seed.bin");
+
+        // Part 0: complete + verified. Part 1: complete but NOT verified.
+        // Part 2: complete + verified. Part 3: left incomplete.
+        tracker.fill_range(0, PARTSIZE);
+        tracker.set_part_verified(0);
+        tracker.fill_range(PARTSIZE, 2 * PARTSIZE);
+        tracker.fill_range(2 * PARTSIZE, 3 * PARTSIZE);
+        tracker.set_part_verified(2);
+        tracker.save();
+
+        let reloaded = PartTracker::new(file_size, &part_path);
+        let serveable = reloaded.serveable_parts();
+        assert_eq!(serveable.len(), 4);
+        assert!(serveable[0], "verified+complete part 0 must reload as serveable");
+        assert!(
+            !serveable[1],
+            "complete-but-unverified part 1 must NOT be serveable after reload"
+        );
+        assert!(serveable[2], "verified+complete part 2 must reload as serveable");
+        assert!(!serveable[3], "incomplete part 3 must NOT be serveable");
+
+        // Advertised (serveable) parts must stay within the serve gate.
+        for p in 0..4 {
+            let (s, e) = reloaded.part_range(p);
+            if serveable[p] {
+                assert!(
+                    reloaded.is_range_safe_to_serve(s, e),
+                    "serveable part {p} must be safe to serve after reload"
                 );
             }
         }
