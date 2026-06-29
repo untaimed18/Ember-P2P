@@ -24,6 +24,7 @@ impl Database {
 
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;\
+             PRAGMA synchronous=NORMAL;\
              PRAGMA foreign_keys=ON;\
              PRAGMA secure_delete=ON;\
              PRAGMA auto_vacuum=INCREMENTAL;\

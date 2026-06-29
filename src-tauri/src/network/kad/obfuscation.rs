@@ -34,9 +34,17 @@ pub struct Rc4State {
 
 impl Rc4State {
     pub fn new(key: &[u8]) -> Self {
+        debug_assert!(!key.is_empty(), "Rc4State::new requires a non-empty key");
         let mut s = [0u8; 256];
         for i in 0..256 {
             s[i] = i as u8;
+        }
+        // Every caller passes a fixed-length key (an MD5 digest), so an empty
+        // key is unreachable in practice — but guard the `% key.len()` below so
+        // a future empty-key caller degrades to an (unused) identity state
+        // rather than panicking with a divide-by-zero in release builds.
+        if key.is_empty() {
+            return Rc4State { s, i: 0, j: 0 };
         }
         let mut j: u8 = 0;
         for i in 0..256 {

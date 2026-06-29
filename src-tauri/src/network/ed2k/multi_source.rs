@@ -8,6 +8,7 @@ use anyhow::Context;
 use digest::Digest;
 use flate2::read::{DeflateDecoder, ZlibDecoder};
 use futures::stream::{FuturesUnordered, StreamExt};
+use futures::FutureExt;
 use md4::Md4;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, RwLock};
@@ -966,7 +967,33 @@ async fn seed_fresh_part_queue_after_requeue(
 
 impl MultiSourceDownload {
     /// Run the multi-source download.
-    pub async fn run(mut self, event_tx: mpsc::Sender<DownloadEvent>) -> anyhow::Result<()> {
+    ///
+    /// Thin panic-isolating wrapper around [`Self::run_inner`]. Download workers
+    /// are spawned detached, so a panic escaping here would silently kill the
+    /// task without emitting a `Failed` event — leaving the transfer stuck
+    /// "active" in the UI and leaking its handle/source state. Converting the
+    /// panic to an `Err` lets each caller's existing failure path clean up.
+    /// Mirrors the upload server's `catch_unwind` in `upload.rs`.
+    pub async fn run(self, event_tx: mpsc::Sender<DownloadEvent>) -> anyhow::Result<()> {
+        match std::panic::AssertUnwindSafe(self.run_inner(event_tx))
+            .catch_unwind()
+            .await
+        {
+            Ok(result) => result,
+            Err(panic) => {
+                let msg = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_string());
+                Err(anyhow::anyhow!(
+                    "multi-source download worker panicked: {msg}"
+                ))
+            }
+        }
+    }
+
+    async fn run_inner(mut self, event_tx: mpsc::Sender<DownloadEvent>) -> anyhow::Result<()> {
         let max_dl = self.ed2k_limits.max_download_bytes;
         if self.file_size > max_dl {
             anyhow::bail!(

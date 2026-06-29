@@ -7412,8 +7412,14 @@ pub async fn start_network(
                                 priority: priority_str_to_u32(&t.priority),
                             });
                             info!("Re-queued failed download {} for source retry: {}", transfer_id, error);
-                            if let Err(e) = db.update_transfer_status(transfer_id, "searching") {
-                                warn!("DB update_transfer_status('searching') failed for {transfer_id}: {e}");
+                            {
+                                let db = db.clone();
+                                let tid = transfer_id.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    if let Err(e) = db.update_transfer_status(&tid, "searching") {
+                                        warn!("DB update_transfer_status('searching') failed for {tid}: {e}");
+                                    }
+                                });
                             }
 
                             // Attempt archive recovery if we have significant progress on an archive file
@@ -7921,7 +7927,13 @@ pub async fn start_network(
                 };
                 let was_completed = completed_file_hash.is_some();
                 let mut promoted = Vec::new();
-                handle_download_event(event, &app_handle, &transfer_manager, &db, &mut promoted, &mut stats_manager, settings.remove_finished_downloads, &a4af_shared, &settings.download_folder, &mut db_progress_last_persist, DB_PROGRESS_PERSIST_INTERVAL, &mut state.callback_row_pending_since).await;
+                // Isolate per-event panics so one malformed/unexpected download
+                // event can't unwind the whole network loop (→ outer catch →
+                // shutdown). Mirrors the handle_command_inner/handle_udp_packet_inner
+                // catch_unwind pattern.
+                if let Err(p) = std::panic::AssertUnwindSafe(handle_download_event(event, &app_handle, &transfer_manager, &db, &mut promoted, &mut stats_manager, settings.remove_finished_downloads, &a4af_shared, &settings.download_folder, &mut db_progress_last_persist, DB_PROGRESS_PERSIST_INTERVAL, &mut state.callback_row_pending_since)).catch_unwind().await {
+                    error!("handle_download_event panicked, dropping event: {}", describe_panic(&*p));
+                }
 
                 if let Some(ref file_hash) = completed_file_hash {
                     let mut sf = spam_filter.write().await;
@@ -8016,8 +8028,14 @@ pub async fn start_network(
                             last_search_at: 0,
                             priority: priority_str_to_u32(&prio),
                         });
-                        if let Err(e) = db.update_transfer_status(&rid, "searching") {
-                            warn!("DB update_transfer_status('searching') failed for {rid}: {e}");
+                        {
+                            let db = db.clone();
+                            let rid = rid.clone();
+                            tokio::task::spawn_blocking(move || {
+                                if let Err(e) = db.update_transfer_status(&rid, "searching") {
+                                    warn!("DB update_transfer_status('searching') failed for {rid}: {e}");
+                                }
+                            });
                         }
                         let _ = app_handle.emit(
                             "transfer-status",
@@ -8426,7 +8444,9 @@ pub async fn start_network(
                 }
 
                 let mut promoted = Vec::new();
-                handle_upload_event(event, &app_handle, &transfer_manager, &mut promoted, &mut stats_manager).await;
+                if let Err(p) = std::panic::AssertUnwindSafe(handle_upload_event(event, &app_handle, &transfer_manager, &mut promoted, &mut stats_manager)).catch_unwind().await {
+                    error!("handle_upload_event panicked, dropping event: {}", describe_panic(&*p));
+                }
                 for t in promoted {
                     // The transfer just moved from the queue into the active set
                     // with a fresh waiting status (Searching/Queued). Announce it
@@ -11308,6 +11328,19 @@ pub async fn start_network(
                         .retain(|_, last| now.saturating_sub(*last) < SERVER_UDP_SOURCE_REASK_SECS);
                 }
 
+                // Bound `pending_udp_reasks`. Entries are removed when the matching
+                // OP_REASKACK arrives, but sources that never ack (firewalled,
+                // offline, or address-spoofed) would otherwise accumulate one entry
+                // per (ip, udp_port) for the entire session. Cap the table; a dropped
+                // entry only means a single reask goes unmatched and the source is
+                // re-asked on the next reask cycle (~seconds later).
+                {
+                    const MAX_PENDING_UDP_REASKS: usize = 4096;
+                    if state.pending_udp_reasks.len() > MAX_PENDING_UDP_REASKS {
+                        state.pending_udp_reasks.clear();
+                    }
+                }
+
                 // (broker.tick() and broker event drain are now handled
                 // by their own 200 ms `broker_timer` arm — the 5-minute
                 // cadence here was longer than PUNCH_TIMEOUT/RELAY_TIMEOUT
@@ -12625,16 +12658,26 @@ pub async fn start_network(
                                 }
                             }
 
-                            let mut mgr = transfer_manager.write().await;
-                            mgr.update_status(tid, TransferStatus::Failed);
-                            mgr.fail(
-                                tid,
-                                "Cancelled",
-                                Some("transient".to_string()),
-                                Some("cancelled".to_string()),
-                            );
-                            if let Err(e) = db.update_transfer_status(tid, "failed") {
-                                warn!("DB update_transfer_status('failed') failed for {tid}: {e}");
+                            {
+                                let mut mgr = transfer_manager.write().await;
+                                mgr.update_status(tid, TransferStatus::Failed);
+                                mgr.fail(
+                                    tid,
+                                    "Cancelled",
+                                    Some("transient".to_string()),
+                                    Some("cancelled".to_string()),
+                                );
+                            }
+                            // Offload the DB write so a WAL commit can't stall the
+                            // event loop, and never hold `transfer_manager` across it.
+                            {
+                                let db = db.clone();
+                                let tid = tid.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    if let Err(e) = db.update_transfer_status(&tid, "failed") {
+                                        warn!("DB update_transfer_status('failed') failed for {tid}: {e}");
+                                    }
+                                });
                             }
                             let _ = app_handle.emit("transfer-status", serde_json::json!({
                                 "id": tid,
@@ -14020,12 +14063,23 @@ pub async fn start_network(
                     let mut server_disconnect_reason: Option<String> = None;
                     let mut conn_to_restore: Option<Ed2kServerConnection> = None;
                     if let Some(mut conn) = state.server_connection.take() {
-                        // Poll for incoming messages (OP_SERVERLIST responses, status updates, etc.)
-                        let poll_result = conn.poll_messages().await;
+                        // Poll for incoming messages (OP_SERVERLIST responses, status updates, etc.).
+                        // poll_messages() decodes untrusted server bytes inline on the
+                        // event loop, so wrap it in catch_unwind and treat a parse panic
+                        // as a disconnect — the connection is suspect anyway, and one
+                        // malformed packet must not unwind the whole network loop.
+                        let poll_result = std::panic::AssertUnwindSafe(conn.poll_messages())
+                            .catch_unwind()
+                            .await;
                         let events = match poll_result {
-                            Ok(events) => events,
-                            Err(e) => {
+                            Ok(Ok(events)) => events,
+                            Ok(Err(e)) => {
                                 server_disconnect_reason = Some(e.to_string());
+                                Vec::new()
+                            }
+                            Err(p) => {
+                                server_disconnect_reason =
+                                    Some(format!("server poll panicked: {}", describe_panic(&*p)));
                                 Vec::new()
                             }
                         };
@@ -24613,6 +24667,8 @@ async fn handle_command_inner(
             state.pending_note_publishes.clear();
             state.publish_pending.clear();
             state.source_publish_acks.clear();
+            state.pending_udp_reasks.clear();
+            state.server_udp_source_reask_at.clear();
 
             // Reset network state (eMule resets firewall, deletes routing zone)
             state.routing_table.clear();
