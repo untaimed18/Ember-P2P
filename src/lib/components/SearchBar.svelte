@@ -7,6 +7,7 @@
     onsubmit,
     recentKey,
     recentMax = 10,
+    maxLength = 256,
   }: {
     value?: string;
     placeholder?: string;
@@ -20,6 +21,9 @@
     recentKey?: string;
     /** Maximum number of recent queries to keep. */
     recentMax?: number;
+    /** Maximum accepted query length (characters); guards backend/UI from
+     *  pathologically long pasted/automated input. */
+    maxLength?: number;
   } = $props();
 
   let recent: string[] = $state([]);
@@ -157,6 +161,7 @@
         type="text"
         bind:value
         {placeholder}
+        maxlength={maxLength}
         onkeydown={handleKeydown}
         onfocus={handleFocus}
         onblur={handleBlur}
@@ -173,6 +178,7 @@
         type="text"
         bind:value
         {placeholder}
+        maxlength={maxLength}
         onkeydown={handleKeydown}
         onfocus={handleFocus}
         onblur={handleBlur}

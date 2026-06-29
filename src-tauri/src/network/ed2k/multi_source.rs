@@ -27,7 +27,7 @@ use super::transfer::{is_filtered_source_ip, DownloadEvent};
 
 /// Shared registry of active download trackers so the shutdown path can
 /// persist `.part.met` files even when download tasks are aborted.
-pub type SharedTrackerRegistry = Arc<std::sync::Mutex<HashMap<String, Arc<RwLock<PartTracker>>>>>;
+pub type SharedTrackerRegistry = Arc<parking_lot::Mutex<HashMap<String, Arc<RwLock<PartTracker>>>>>;
 
 /// Shared per-peer "known missing parts" hints. Populated by source
 /// workers when a peer accepts our upload request and then drops the
@@ -147,6 +147,21 @@ pub(crate) fn record_peer_missing_parts(
 
 /// Maximum decompressed part size (PARTSIZE + margin = 10 MiB)
 const MAX_DECOMPRESSED_PART: usize = 10 * 1024 * 1024;
+
+/// Maximum accepted on-wire ed2k packet length for a download connection.
+/// The largest legitimate single packet is a file's hashset (16 bytes/part:
+/// ~1.7 MiB even for a 1 TB file) or one ~180 KiB block, so 2 MiB is a wide
+/// safety margin while keeping a malicious/buggy source from making us buffer
+/// up to 10 MiB per connection (the prior cap) — multiplied across multi-source
+/// slots that was a real memory-pressure vector. Mirrors the upload server's
+/// own packet-length hardening.
+const MAX_WIRE_PACKET_LEN: usize = 2 * 1024 * 1024;
+
+/// Maximum peer-supplied OP_FILEDESC comment length we read/allocate. eMule
+/// file comments are short; the declared length is an attacker-controlled u32,
+/// so clamp before slicing/allocating to avoid a cheap per-packet
+/// memory-pressure vector (matches `transfer.rs`).
+const MAX_PEER_COMMENT_LEN: usize = 8 * 1024;
 
 /// eMule-style adaptive pipelining: keeps 1-3 request packets outstanding.
 /// Module-level so the cross-part pipelining helpers below the per-source
@@ -1030,10 +1045,9 @@ impl MultiSourceDownload {
         let tracker = Arc::new(RwLock::new(pt));
 
         if let Some(ref registry) = self.tracker_registry {
-            // Recover the guard on poisoning so the tracker is still registered
-            // (otherwise its .part.met may never be persisted on shutdown).
-            let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
-            reg.insert(self.transfer_id.clone(), tracker.clone());
+            registry
+                .lock()
+                .insert(self.transfer_id.clone(), tracker.clone());
         }
 
         // If .part.met shows progress but the .part file is missing, the tracker
@@ -3344,10 +3358,7 @@ impl MultiSourceDownload {
         }
 
         if let Some(ref registry) = self.tracker_registry {
-            // Recover the guard on poisoning so the completed transfer's entry
-            // is still removed rather than leaking a stale tracker.
-            let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
-            reg.remove(&self.transfer_id);
+            registry.lock().remove(&self.transfer_id);
         }
 
         Ok(())
@@ -5013,8 +5024,9 @@ async fn download_parts_from_source(
         }
         if proto == OP_EMULEPROT && opcode == OP_FILEDESC && _payload.len() >= 5 {
             let rating = _payload[0];
-            let clen =
-                u32::from_le_bytes([_payload[1], _payload[2], _payload[3], _payload[4]]) as usize;
+            let clen = (u32::from_le_bytes([_payload[1], _payload[2], _payload[3], _payload[4]])
+                as usize)
+                .min(MAX_PEER_COMMENT_LEN);
             if clen
                 .checked_add(5)
                 .map_or(false, |need| _payload.len() >= need)
@@ -5828,8 +5840,9 @@ async fn download_parts_from_source(
                 emit_source!("queued", Some(rank), 0u64);
             } else if proto == OP_EMULEPROT && opcode == OP_FILEDESC && payload.len() >= 5 {
                 let rating = payload[0];
-                let clen =
-                    u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]) as usize;
+                let clen = (u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]])
+                    as usize)
+                    .min(MAX_PEER_COMMENT_LEN);
                 if clen
                     .checked_add(5)
                     .map_or(false, |need| payload.len() >= need)
@@ -7274,8 +7287,9 @@ async fn download_parts_from_source(
                     (OP_EMULEPROT, OP_FILEDESC) if payload.len() >= 5 => {
                         let rating = payload[0];
                         let comment_len =
-                            u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]])
-                                as usize;
+                            (u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]])
+                                as usize)
+                                .min(MAX_PEER_COMMENT_LEN);
                         if comment_len
                             .checked_add(5)
                             .map_or(false, |need| payload.len() >= need)
@@ -8508,7 +8522,7 @@ async fn read_packet_async_ms<R: AsyncReadExt + Unpin + ?Sized>(
     const OP_PACKEDPROT: u8 = 0xD4;
     let protocol = reader.read_u8().await?;
     let length = reader.read_u32_le().await? as usize;
-    if length == 0 || length > 10 * 1024 * 1024 {
+    if length == 0 || length > MAX_WIRE_PACKET_LEN {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "invalid packet length",
@@ -8517,9 +8531,10 @@ async fn read_packet_async_ms<R: AsyncReadExt + Unpin + ?Sized>(
     let opcode = reader.read_u8().await?;
     let payload_len = length - 1;
     // Grow the buffer on the heap with bytes that actually arrive rather than
-    // trusting the declared length up front. A peer that announces a near-10
-    // MiB packet but then stalls can otherwise pin a full ~10 MiB allocation
-    // per connection. We grow in bounded steps directly into the Vec instead
+    // trusting the declared length up front. A peer that announces a large
+    // packet but then stalls can otherwise pin a full allocation up to the
+    // wire cap per connection. We grow in bounded steps directly into the Vec
+    // instead
     // of via a large stack array: this read is awaited deep inside the
     // multi-source download future, and a 64 KiB stack buffer there bloats
     // that (already huge) future's poll frame enough to overflow the worker

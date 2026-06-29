@@ -496,6 +496,7 @@
   "servers_log_downloading_met": "Descargando server.met desde {url}...",
   "servers_log_failed": "Falló: {error}",
   "servers_validation_ip_required": "Se necesita la IP/dirección del servidor",
+  "servers_validation_ip_invalid": "Introduce una dirección IPv4 o un nombre de host válidos",
   "servers_validation_port_range": "El puerto debe ser un número entre 1 y 65535",
   "servers_validation_met_url": "Introduce una URL de server.met válida",
   "servers_removed_one": "1 servidor eliminado",
@@ -1379,6 +1380,9 @@
   "transfers_empty_no_uploads": "No hay subidas activas",
   "transfers_empty_no_uploads_sub": "Los archivos compartidos aparecerán aquí cuando los pares los soliciten.",
   "transfers_empty_no_upload_matches": "Ninguna subida coincide con este filtro",
+
+  "transfers_upload_partial_seed_badge": "Compartiendo",
+  "transfers_upload_partial_seed_title": "Compartiendo las partes verificadas y completas de \"{name}\" mientras sigues descargando el resto (compartición parcial de archivos).",
 
   "transfers_queue_disconnected_title": "Desconectado — esperando devolución de llamada",
   "transfers_queue_credit_title": "Ratio de crédito (1.0 = sin historial, 10.0 = máx.)",

@@ -2442,10 +2442,7 @@ struct PendingDownload {
 }
 
 async fn udp_reask_completed_parts(state: &NetworkState, transfer_id: &str) -> Option<Vec<bool>> {
-    let tracker = match state.tracker_registry.lock() {
-        Ok(registry) => registry.get(transfer_id).cloned(),
-        Err(_) => None,
-    }?;
+    let tracker = state.tracker_registry.lock().get(transfer_id).cloned()?;
     let parts = tracker.read().await.completed_parts();
     Some(parts)
 }
@@ -2488,10 +2485,7 @@ fn check_disk_space(download_dir: &std::path::Path, needed_bytes: u64) -> bool {
 }
 
 async fn save_registered_part_tracker(state: &NetworkState, transfer_id: &str, reason: &str) {
-    let tracker = match state.tracker_registry.lock() {
-        Ok(reg) => reg.get(transfer_id).cloned(),
-        Err(poisoned) => poisoned.into_inner().get(transfer_id).cloned(),
-    };
+    let tracker = state.tracker_registry.lock().get(transfer_id).cloned();
 
     let Some(tracker) = tracker else {
         return;
@@ -4873,7 +4867,7 @@ pub async fn start_network(
         friend_search_initial_done: false,
         friend_search_started_at: None,
         friend_reconnect_last: HashMap::new(),
-        tracker_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        tracker_registry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         nat_info: ember::nat::NatInfo::unknown(),
         connection_broker: None,
         broker_event_rx: None,
@@ -7126,6 +7120,15 @@ pub async fn start_network(
                     sf.auto_mark_not_spam(file_hash);
                 }
                 for t in promoted {
+                    // The transfer just moved from the queue into the active set
+                    // with a fresh waiting status (Searching/Queued). Announce it
+                    // now so the row leaves "Queued" in real time instead of
+                    // waiting for the next reconciling poll.
+                    crate::commands::transfers::emit_transfer_status(
+                        &app_handle,
+                        &t.id,
+                        &t.status,
+                    );
                     let control = TransferControl::new();
                     {
                         let mut mgr = transfer_manager.write().await;
@@ -7617,6 +7620,15 @@ pub async fn start_network(
                 let mut promoted = Vec::new();
                 handle_upload_event(event, &app_handle, &transfer_manager, &mut promoted, &mut stats_manager).await;
                 for t in promoted {
+                    // The transfer just moved from the queue into the active set
+                    // with a fresh waiting status (Searching/Queued). Announce it
+                    // now so the row leaves "Queued" in real time instead of
+                    // waiting for the next reconciling poll.
+                    crate::commands::transfers::emit_transfer_status(
+                        &app_handle,
+                        &t.id,
+                        &t.status,
+                    );
                     let control = TransferControl::new();
                     {
                         let mut mgr = transfer_manager.write().await;
@@ -16545,17 +16557,12 @@ pub async fn start_network(
     // write-guard could still be releasing it. A short bounded `read().await`
     // waits for that hand-off instead of dropping the save, while the timeout
     // still guarantees shutdown can't hang on a genuinely stuck tracker.
-    let trackers: Vec<_> = match state.tracker_registry.lock() {
-        Ok(reg) => reg
-            .iter()
-            .map(|(tid, t)| (tid.clone(), t.clone()))
-            .collect(),
-        Err(poisoned) => poisoned
-            .into_inner()
-            .iter()
-            .map(|(tid, t)| (tid.clone(), t.clone()))
-            .collect(),
-    };
+    let trackers: Vec<_> = state
+        .tracker_registry
+        .lock()
+        .iter()
+        .map(|(tid, t)| (tid.clone(), t.clone()))
+        .collect();
     if !trackers.is_empty() {
         let count = trackers.len();
         // Save every .part.met *concurrently* under one global deadline. Done
@@ -20367,9 +20374,7 @@ async fn handle_command_inner(
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
             }
             if cleanup_ack.is_some() {
-                if let Ok(mut reg) = state.tracker_registry.lock() {
-                    reg.remove(&transfer_id);
-                }
+                state.tracker_registry.lock().remove(&transfer_id);
             }
 
             // Remove partial download from KAD source publish
@@ -21851,17 +21856,12 @@ async fn handle_command_inner(
             // Snapshot tracker handles first, then await each lock with a
             // short bound so a mid-write tracker doesn't silently miss its
             // resume metadata.
-            let disconnect_trackers: Vec<_> = match state.tracker_registry.lock() {
-                Ok(reg) => reg
-                    .iter()
-                    .map(|(tid, tracker)| (tid.clone(), tracker.clone()))
-                    .collect(),
-                Err(poisoned) => poisoned
-                    .into_inner()
-                    .iter()
-                    .map(|(tid, tracker)| (tid.clone(), tracker.clone()))
-                    .collect(),
-            };
+            let disconnect_trackers: Vec<_> = state
+                .tracker_registry
+                .lock()
+                .iter()
+                .map(|(tid, tracker)| (tid.clone(), tracker.clone()))
+                .collect();
             let tracker_saves = futures::future::join_all(disconnect_trackers.into_iter().map(
                 |(tid, tracker)| async move {
                     save_part_tracker_snapshot(tracker, &tid, "disconnect").await;
@@ -21902,9 +21902,7 @@ async fn handle_command_inner(
             }
 
             // Clear the registry — tasks are gone, trackers are saved.
-            if let Ok(mut reg) = state.tracker_registry.lock() {
-                reg.clear();
-            }
+            state.tracker_registry.lock().clear();
             state.active_source_senders.clear();
             // Lockstep cleanup — KAD disconnect tears down all
             // workers, so the established-source channel map must be
