@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use flate2::read::{DeflateDecoder, ZlibDecoder};
+use futures::FutureExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use tokio::sync::mpsc;
@@ -667,7 +668,42 @@ impl Ed2kDownload {
 
     /// Run a download on a pre-established connection (Hello handshake already done).
     /// Used for KAD callback connections where the firewalled source connected to us.
+    ///
+    /// Thin panic-isolating wrapper around [`Self::run_from_callback_inner`]:
+    /// like the multi-source worker, this runs in a detached task, so a panic
+    /// must become an `Err` (caught here) rather than silently killing the task
+    /// and leaving the transfer stuck "active".
     pub async fn run_from_callback(
+        self,
+        reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+        writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+        peer_user_hash: [u8; 16],
+        emule_info_done: bool,
+        event_tx: mpsc::Sender<DownloadEvent>,
+    ) -> anyhow::Result<()> {
+        match std::panic::AssertUnwindSafe(self.run_from_callback_inner(
+            reader,
+            writer,
+            peer_user_hash,
+            emule_info_done,
+            event_tx,
+        ))
+        .catch_unwind()
+        .await
+        {
+            Ok(result) => result,
+            Err(panic) => {
+                let msg = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_string());
+                Err(anyhow::anyhow!("callback download worker panicked: {msg}"))
+            }
+        }
+    }
+
+    async fn run_from_callback_inner(
         self,
         mut reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
         mut writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
@@ -2936,8 +2972,12 @@ impl Ed2kDownload {
                                 // Per-file writer thread serializes the writes for
                                 // us; await is just an mpsc round-trip.
                                 for &(gs, ge) in &fill_subranges {
-                                    let off = (gs - start) as usize;
-                                    let len = (ge - gs) as usize;
+                                    // `start <= gs <= ge <= end` and `data.len() ==
+                                    // end - start` are guaranteed by the validation
+                                    // above; saturating_sub keeps these offsets sound
+                                    // even if that coupling is ever loosened.
+                                    let off = gs.saturating_sub(start) as usize;
+                                    let len = ge.saturating_sub(gs) as usize;
                                     output
                                         .write(gs, data[off..off + len].to_vec())
                                         .await
