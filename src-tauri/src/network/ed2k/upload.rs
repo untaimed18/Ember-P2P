@@ -119,7 +119,7 @@ pub type FirewallProbeSet = Arc<std::sync::Mutex<std::collections::HashSet<std::
 
 /// Per-slot smoothed upload rate registry: peer address -> bytes/sec (EWMA).
 /// Updated by each upload task; read by `compute_dynamic_slot_count`.
-pub(crate) type SlotRateRegistry = Arc<std::sync::Mutex<HashMap<SocketAddr, u64>>>;
+pub(crate) type SlotRateRegistry = Arc<parking_lot::Mutex<HashMap<SocketAddr, u64>>>;
 
 /// Recognized incoming buddy connection: (user_hash, reader, writer)
 pub type BuddyConnectionParts = (
@@ -280,6 +280,11 @@ const SESSIONMAXTIME_SECS: u64 = 3600;
 const MIN_UP_CLIENTS_ALLOWED: usize = 2;
 /// eMule MAX_UP_CLIENTS_ALLOWED: maximum upload slots
 const MAX_UP_CLIENTS_ALLOWED: usize = 100;
+/// eMule UPLOAD_CLIENT_MAXDATARATE (opcodes.h:109): the assumed per-slot target
+/// upload rate caps at 25 KiB/s. As the active slot count grows the per-slot
+/// target grows by 1 KiB/s per slot up to this cap, which limits how many extra
+/// slots the dynamic calculation opens. Matches CUploadQueue::GetTargetClientDataRate.
+const UPLOAD_CLIENT_MAXDATARATE: u64 = 25 * 1024;
 /// m7: Hard queue limit = soft + max(soft, 800) / 4.  Between soft and hard,
 /// only clients with above-average score are admitted; above hard, all rejected.
 const HARD_UPLOAD_QUEUE_SIZE: usize = MAX_UPLOAD_QUEUE_SIZE
@@ -994,7 +999,7 @@ pub(crate) fn compute_queue_rank(
             entry.ember_verified,
         );
         if es > my_score || (es == my_score && entry.join_time < my_join_time) {
-            rank += 1;
+            rank = rank.saturating_add(1);
         }
     }
     rank
@@ -1002,6 +1007,29 @@ pub(crate) fn compute_queue_rank(
 
 /// eMule MAX_PURGEQUEUETIME: 1 hour in seconds
 pub(crate) const MAX_PURGEQUEUETIME_SECS: u64 = 3600;
+
+/// Pure decision core of `UploadHandler::purge_unshared_queue_entries`, split
+/// out so the eviction rule can be unit-tested without constructing a full
+/// `UploadHandler` (which needs channels, sockets, a GeoIP reader, etc.).
+///
+/// Returns the set of queued file hashes to evict: those that are NOT the
+/// all-zero placeholder (peer queued before naming a file), NOT still present
+/// in the shared index, and NOT still backed by a download (so partial-file
+/// seeding of a file we're actively downloading is never purged).
+fn unshared_purge_hashes<'a>(
+    queued_hashes: impl IntoIterator<Item = &'a [u8; 16]>,
+    is_shared: impl Fn(&[u8; 16]) -> bool,
+    is_downloading: impl Fn(&[u8; 16]) -> bool,
+) -> std::collections::HashSet<[u8; 16]> {
+    let mut out = std::collections::HashSet::new();
+    for h in queued_hashes {
+        if *h == [0u8; 16] || is_shared(h) || is_downloading(h) {
+            continue;
+        }
+        out.insert(*h);
+    }
+    out
+}
 
 /// Compute the rank of a queued peer reached over UDP (OP_REASKFILEPING).
 ///
@@ -1022,7 +1050,15 @@ pub(crate) async fn udp_queue_rank_for_peer(
     from_udp_port: u16,
     file_hash: &[u8; 16],
 ) -> Option<u16> {
-    let queue = upload_queue.lock().await;
+    // Snapshot the queue and release its lock BEFORE acquiring the credit /
+    // index read locks, so `upload_queue` is never held across an `.await`
+    // (and no two of these locks are ever held simultaneously — this sidesteps
+    // both contention and any lock-ordering hazard). The reported rank is
+    // advisory, so scoring a snapshot taken microseconds earlier is fine.
+    let queue: Vec<QueueEntry> = {
+        let guard = upload_queue.lock().await;
+        guard.clone()
+    };
     let cm = credit_manager.read().await;
     let idx = local_index.read().await;
     let mut best: Option<&QueueEntry> = None;
@@ -1146,7 +1182,7 @@ pub async fn start_upload_server(
 
     let active_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let slot_notify = Arc::new(tokio::sync::Notify::new());
-    let slot_rates: SlotRateRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let slot_rates: SlotRateRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
 
     let server = Arc::new(UploadHandler {
         local_index,
@@ -1206,6 +1242,9 @@ pub async fn start_upload_server(
 
     let mut slot_check_interval = tokio::time::interval(std::time::Duration::from_secs(1));
     slot_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Counts 1 s slot-check ticks so the heavier "file no longer offered" queue
+    // purge runs on a coarser (~30 s) cadence than the proactive slot opener.
+    let mut slot_check_ticks: u64 = 0;
 
     loop {
         tokio::select! {
@@ -1304,27 +1343,54 @@ pub async fn start_upload_server(
                             continue;
                         }
 
-                        // Enforce global connection limit
-                        let current_total = server.total_connections.load(std::sync::atomic::Ordering::Relaxed);
-                        if current_total >= MAX_TOTAL_CONNECTIONS {
-                            debug!("Rejecting connection from {peer_addr}: global connection limit reached ({current_total})");
+                        // Enforce global connection limit. Reserve the slot with
+                        // an atomic compare-exchange rather than a separate
+                        // load-check-then-`fetch_add`: under a burst of
+                        // simultaneous accepts the old check-then-act let
+                        // multiple handlers each observe `< MAX` and increment
+                        // past MAX_TOTAL_CONNECTIONS.
+                        let reserved = {
+                            let mut cur = server
+                                .total_connections
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                            loop {
+                                if cur >= MAX_TOTAL_CONNECTIONS {
+                                    break false;
+                                }
+                                match server.total_connections.compare_exchange_weak(
+                                    cur,
+                                    cur + 1,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                ) {
+                                    Ok(_) => break true,
+                                    Err(actual) => cur = actual,
+                                }
+                            }
+                        };
+                        if !reserved {
+                            debug!("Rejecting connection from {peer_addr}: global connection limit reached");
                             drop(stream);
                             continue;
                         }
 
-                        // Enforce per-IP connection limit
+                        // Enforce per-IP connection limit. If we reject here,
+                        // release the global slot reserved just above so the
+                        // reservation isn't leaked.
                         {
                             let mut counts = server.ip_connection_counts.lock().await;
                             let count = counts.entry(peer_addr.ip()).or_insert(0);
                             if *count >= MAX_CONNECTIONS_PER_IP {
                                 debug!("Rejecting connection from {peer_addr}: per-IP limit reached");
+                                drop(counts);
+                                server
+                                    .total_connections
+                                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                                 drop(stream);
                                 continue;
                             }
                             *count += 1;
                         }
-
-                        server.total_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let _ = stream.set_nodelay(true);
                         // Cap the kernel TCP send buffer so our sender-side
                         // `uploaded` counter (which advances when bytes are
@@ -1393,6 +1459,16 @@ pub async fn start_upload_server(
                         server.slot_notify.notify_waiters();
                     }
                 }
+
+                // eMule Process()-loop maintenance: evict waiting peers whose
+                // requested file we no longer share or download. Throttled to
+                // ~30 s so the index / transfer-manager scan stays off the
+                // per-connection admission path (which only does the cheap
+                // age-based purge).
+                slot_check_ticks = slot_check_ticks.wrapping_add(1);
+                if slot_check_ticks % 30 == 0 {
+                    server.purge_unshared_queue_entries().await;
+                }
             }
         }
     }
@@ -1419,18 +1495,33 @@ impl UploadHandler {
             // enforcing it for partials is pure hardening with no impact on
             // serving real in-root partials. Download partials served from the
             // transfer manager use the `Temp/{id}.part` path below.
-            let folders = self.shared_folders.read().await;
-            let mut allowed: Vec<String> = folders.clone();
-            allowed.push(self.download_folder.to_string_lossy().to_string());
-            allowed.push(
-                self.download_folder
-                    .join("Downloads")
-                    .to_string_lossy()
-                    .to_string(),
-            );
-            let in_allowed = std::fs::canonicalize(&path)
-                .map(|canon| crate::security::is_path_within_dirs(&canon, &allowed))
-                .unwrap_or(false);
+            // Build the allowed-roots snapshot under the lock, then drop the
+            // read guard *before* the blocking canonicalize below so the
+            // `shared_folders` lock is never held across an `.await`.
+            let allowed: Vec<String> = {
+                let folders = self.shared_folders.read().await;
+                let mut allowed: Vec<String> = folders.clone();
+                allowed.push(self.download_folder.to_string_lossy().to_string());
+                allowed.push(
+                    self.download_folder
+                        .join("Downloads")
+                        .to_string_lossy()
+                        .to_string(),
+                );
+                allowed
+            };
+            // `canonicalize` is a blocking filesystem syscall; run it (and the
+            // pure containment check that consumes its result) on the blocking
+            // pool so it never stalls a Tokio worker. Fail closed (reject) on a
+            // join error.
+            let path_for_check = path.clone();
+            let in_allowed = tokio::task::spawn_blocking(move || {
+                std::fs::canonicalize(&path_for_check)
+                    .map(|canon| crate::security::is_path_within_dirs(&canon, &allowed))
+                    .unwrap_or(false)
+            })
+            .await
+            .unwrap_or(false);
             if !in_allowed {
                 tracing::debug!(
                     "Rejecting resolve for file not within shared/download roots: {}",
@@ -1478,6 +1569,101 @@ impl UploadHandler {
             aich_hash_hex: String::new(),
             is_partial: true,
         })
+    }
+
+    /// Periodic eMule-style queue maintenance: evict waiting peers whose
+    /// requested file we no longer offer.
+    ///
+    /// eMule's `FindBestClientInQueue` / `CheckForTimeOver` drop a queued client
+    /// when `theApp.sharedfiles->GetFileByID(uploadfileid)` returns null (the
+    /// file was un-shared or removed). We mirror that with a cheap, in-memory
+    /// predicate — present in the shared index OR backed by a download (active
+    /// or queued) in the transfer manager — deliberately avoiding the per-file
+    /// `canonicalize`/`exists` work that `resolve_upload_file` does, so this can
+    /// run on the slow maintenance timer instead of the hot admission path
+    /// (which keeps doing only the cheap `MAX_PURGEQUEUETIME` age sweep). The
+    /// test errs toward KEEPING an entry (membership only, no filesystem probe),
+    /// so a file we're still sharing or downloading is never purged out from
+    /// under a waiting peer; the serve path still does the authoritative
+    /// resolution.
+    ///
+    /// Entries with the all-zero placeholder hash (peer queued before naming a
+    /// file) are skipped — they have no file to compare against yet and are
+    /// reaped by the age sweep instead.
+    ///
+    /// Lock discipline: holds at most ONE of `upload_queue`, `local_index`,
+    /// `transfer_manager` at any moment (never nested), so it cannot deadlock
+    /// against paths that take those locks in any order.
+    async fn purge_unshared_queue_entries(&self) {
+        // 1. Distinct, named file hashes currently in the queue.
+        let hashes: Vec<[u8; 16]> = {
+            let queue = self.upload_queue.lock().await;
+            if queue.is_empty() {
+                return;
+            }
+            let mut set: std::collections::HashSet<[u8; 16]> = std::collections::HashSet::new();
+            for e in queue.iter() {
+                if e.file_hash != [0u8; 16] {
+                    set.insert(e.file_hash);
+                }
+            }
+            set.into_iter().collect()
+        };
+        if hashes.is_empty() {
+            return;
+        }
+
+        // 2. Snapshot membership under each lock SEPARATELY (never nested, per
+        //    the lock discipline noted above): which queued hashes are still in
+        //    the shared index, then which are still backed by a download.
+        let shared: std::collections::HashSet<[u8; 16]> = {
+            let index = self.local_index.read().await;
+            hashes
+                .iter()
+                .copied()
+                .filter(|h| index.get_by_hash(&hex::encode(h)).is_some())
+                .collect()
+        };
+        // Short-circuit: if every queued file is still shared there is nothing
+        // to purge, and we can skip taking the transfer-manager lock entirely.
+        if shared.len() == hashes.len() {
+            return;
+        }
+        let downloading: std::collections::HashSet<[u8; 16]> = {
+            let mgr = self.transfer_manager.read().await;
+            hashes
+                .iter()
+                .copied()
+                .filter(|h| {
+                    let hex_h = hex::encode(h);
+                    mgr.active.values().any(|t| {
+                        t.direction == TransferDirection::Download && t.file_hash == hex_h
+                    }) || mgr.queue.iter().any(|t| {
+                        t.direction == TransferDirection::Download && t.file_hash == hex_h
+                    })
+                })
+                .collect()
+        };
+
+        let unserveable =
+            unshared_purge_hashes(&hashes, |h| shared.contains(h), |h| downloading.contains(h));
+        if unserveable.is_empty() {
+            return;
+        }
+
+        // 3. Evict the orphaned waiters.
+        let removed = {
+            let mut queue = self.upload_queue.lock().await;
+            let before = queue.len();
+            queue.retain(|e| !unserveable.contains(&e.file_hash));
+            before - queue.len()
+        };
+        if removed > 0 {
+            debug!(
+                "Upload queue: purged {removed} waiting peer(s) for {} file(s) no longer shared or downloading (eMule file-gone queue purge)",
+                unserveable.len()
+            );
+        }
     }
 
     /// One "request" per file per incoming connection (eMule-style asked count).
@@ -1542,7 +1728,7 @@ impl UploadHandler {
         let target_per_slot = if active <= 3 {
             3u64 * 1024
         } else {
-            (3u64 * 1024 + (active as u64 - 3) * 1024).min(10 * 1024)
+            (3u64 * 1024 + (active as u64 - 3) * 1024).min(UPLOAD_CLIENT_MAXDATARATE)
         };
 
         let computed = (effective_rate / target_per_slot).max(MIN_UP_CLIENTS_ALLOWED as u64);
@@ -1551,7 +1737,7 @@ impl UploadHandler {
             .min(max_configured);
 
         if active >= 2 {
-            let rates = self.slot_rates.lock().unwrap_or_else(|e| e.into_inner());
+            let rates = self.slot_rates.lock();
             if rates.len() >= 2 {
                 let mut sorted: Vec<u64> = rates.values().copied().collect();
                 sorted.sort_unstable();
@@ -2791,6 +2977,11 @@ impl UploadHandler {
         )> = None;
         let mut cached_is_video_ext: Option<(PathBuf, bool)> = None;
         const PART_TRACKER_REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
+        // One-shot INFO log per session the first time we serve verified bytes
+        // out of a `.part` file (eMule-style partial-file sharing). Makes it
+        // observable that we're seeding a file we're still downloading, without
+        // spamming a line per block.
+        let mut logged_partial_seed = false;
 
         // Dedicated reader task: ed2k framing requires four sequential awaits
         // (proto, length, opcode, payload). The main loop uses tokio::select!
@@ -3868,19 +4059,49 @@ impl UploadHandler {
                                 is_verified_friend,
                                 hello_caps.ember_pubkey.as_ref(), ember_verified,
                             );
-                            let avg_score = if queue.is_empty() { 0.0 } else {
-                                let total: f64 = queue.iter().map(|e| {
+                            // Score every existing entry exactly once and reuse
+                            // those scores for BOTH the admission average and the
+                            // queue rank below, instead of scanning (and
+                            // re-scoring) the whole queue twice — the old code ran
+                            // an avg loop AND a full `compute_queue_rank` re-scan.
+                            let entry_scores: Vec<f64> = queue
+                                .iter()
+                                .map(|e| {
                                     score_queue_entry(
                                         &cm, &idx_snap, &e.user_hash, e.file_hash,
                                         e.join_time.elapsed().as_secs(), e.current_addr,
                                         e.emule_version, e.is_friend_slot,
                                         e.ember_pubkey.as_ref(), e.ember_verified,
                                     )
-                                }).sum();
-                                total / queue.len() as f64
+                                })
+                                .collect();
+                            // Scores are captured; the credit/index locks are no
+                            // longer needed for this branch.
+                            drop(cm);
+                            drop(idx_snap);
+                            let avg_score = if entry_scores.is_empty() {
+                                0.0
+                            } else {
+                                entry_scores.iter().sum::<f64>() / entry_scores.len() as f64
                             };
                             if new_score >= avg_score {
                                 let join_time = queue_join_time;
+                                // Rank = 1 + existing entries that outrank the
+                                // newcomer. Mirrors `compute_queue_rank`'s ordering
+                                // exactly (higher score wins; equal score breaks
+                                // toward the earlier join_time) but reuses
+                                // `entry_scores` so the queue isn't re-scored.
+                                let mut rank_val: u16 = 1;
+                                for (e, &es) in queue.iter().zip(entry_scores.iter()) {
+                                    if e.identity == queue_identity {
+                                        continue;
+                                    }
+                                    if es > new_score
+                                        || (es == new_score && e.join_time < join_time)
+                                    {
+                                        rank_val = rank_val.saturating_add(1);
+                                    }
+                                }
                                 queue.push(QueueEntry {
                                     identity: queue_identity.clone(),
                                     current_addr: Some(peer_addr),
@@ -3894,17 +4115,9 @@ impl UploadHandler {
                                     ember_pubkey: hello_caps.ember_pubkey,
                                     ember_verified,
                                 });
-                                let rank_val = compute_queue_rank(
-                                    &cm, &idx_snap, &queue,
-                                    &queue_identity, new_score, join_time,
-                                );
-                                drop(cm);
-                                drop(idx_snap);
                                 rank_val
                             } else {
                                 debug!("Upload queue in soft-hard zone, peer score {new_score:.1} below avg {avg_score:.1}, rejecting {peer_addr}");
-                                drop(cm);
-                                drop(idx_snap);
                                 drop(queue);
                                 write_packet_async(&mut writer, OP_EMULEPROT, OP_QUEUEFULL, &[]).await?;
                                 break;
@@ -4264,11 +4477,23 @@ impl UploadHandler {
                             None => true,
                         };
                         if need_rebuild {
-                            cached_part_tracker = Some((
-                                file_path.clone(),
-                                super::part_tracker::PartTracker::new(total_size, &file_path),
-                                std::time::Instant::now(),
-                            ));
+                            // `PartTracker::new` synchronously reads the
+                            // `.part.met` from disk; run it on the blocking pool
+                            // so it never stalls a Tokio worker on the serve hot
+                            // path. (It's infallible — IO errors yield an empty
+                            // tracker — so the only failure here is a join panic,
+                            // in which case we fall back to the direct call.)
+                            let fp = file_path.clone();
+                            let ts = total_size;
+                            let tracker = tokio::task::spawn_blocking(move || {
+                                super::part_tracker::PartTracker::new(ts, &fp)
+                            })
+                            .await
+                            .unwrap_or_else(|_| {
+                                super::part_tracker::PartTracker::new(total_size, &file_path)
+                            });
+                            cached_part_tracker =
+                                Some((file_path.clone(), tracker, std::time::Instant::now()));
                         }
                     }
                     let part_tracker_ref = cached_part_tracker.as_ref().map(|(_, t, _)| t);
@@ -4358,6 +4583,20 @@ impl UploadHandler {
                                     file_path.display()
                                 );
                                 continue;
+                            }
+                            // First verified range we serve out of this `.part`
+                            // file on this session: announce the partial-file
+                            // seed once so it's visible that swarming is working.
+                            if !logged_partial_seed {
+                                logged_partial_seed = true;
+                                info!(
+                                    "Seeding partial file \"{}\" to {} — serving already-verified parts while still downloading it",
+                                    file_path
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("<unknown>"),
+                                    peer_addr
+                                );
                             }
                         }
 
@@ -4487,121 +4726,141 @@ impl UploadHandler {
                                 && self
                                     .skip_compress_video
                                     .load(std::sync::atomic::Ordering::Relaxed));
-                        let mut sent_compressed = false;
-                        if use_compression {
-                            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-                            if encoder.write_all(&data).is_ok() {
-                                if let Ok(compressed) = encoder.finish() {
-                                    // Only use compression if it actually saves space
-                                    if compressed.len() < data.len() {
-                                        let use_i64 = end > u32::MAX as u64;
-                                        let newsize = compressed.len() as u32;
-                                        let header_len = if use_i64 { 28 } else { 24 };
-                                        let total_uncompressed = data.len() as u64;
-                                        let total_compressed = compressed.len() as u64;
-
-                                        let mut cursor = 0usize;
-                                        let mut uncompressed_accounted: u64 = 0;
-                                        while cursor < compressed.len() {
-                                            let remaining = compressed.len() - cursor;
-                                            let chunk_len = if remaining < SMALL_PACKET_THRESHOLD {
-                                                remaining
-                                            } else {
-                                                MAX_PACKET_DATA
-                                            };
-                                            let chunk = &compressed[cursor..cursor + chunk_len];
-
-                                            let mut part_payload =
-                                                Vec::with_capacity(header_len + chunk_len);
-                                            part_payload.extend_from_slice(&hash);
-                                            if use_i64 {
-                                                part_payload.extend_from_slice(&start.to_le_bytes());
-                                            } else {
-                                                part_payload.extend_from_slice(&(start as u32).to_le_bytes());
-                                            }
-                                            // Every packet in the stream repeats the
-                                            // total compressed size — that's how the
-                                            // downloader knows when the block ends.
-                                            part_payload.extend_from_slice(&newsize.to_le_bytes());
-                                            part_payload.extend_from_slice(chunk);
-
-                                            self.acquire_upload_bandwidth(chunk_len as u64).await;
-                                            let write_start = std::time::Instant::now();
-                                            write_packet_async(
-                                                &mut writer,
-                                                OP_EMULEPROT,
-                                                if use_i64 { OP_COMPRESSEDPART_I64 } else { OP_COMPRESSEDPART },
-                                                &part_payload,
-                                            )
-                                            .await?;
-                                            let write_elapsed = write_start.elapsed();
-                                            packets_this_batch = packets_this_batch.saturating_add(1);
-                                            if write_elapsed > slowest_write {
-                                                slowest_write = write_elapsed;
-                                            }
-                                            if write_elapsed >= UPLOAD_SLOW_WRITE_THRESHOLD {
-                                                slow_writes_this_batch =
-                                                    slow_writes_this_batch.saturating_add(1);
-                                                info!(
-                                                    target: "ember::upload_diag",
-                                                    "slow_write {peer_addr} kind=compressed \
-                                                     chunk_len={chunk_len} elapsed_ms={} \
-                                                     uploaded={uploaded}B — TCP back-pressure",
-                                                    write_elapsed.as_millis(),
-                                                );
-                                            }
-
-                                            cursor += chunk_len;
-
-                                            // Attribute uncompressed-byte progress
-                                            // proportionally to this packet's share
-                                            // of the compressed stream. eMule does
-                                            // the same thing for its own payload
-                                            // accounting (see CreatePackedPackets:
-                                            //   payloadSize = togo ? nPacketSize*oldSize/newsize
-                                            //               : oldSize - totalPayloadSize).
-                                            // The final packet gets the remainder so
-                                            // the sum over the block equals exactly
-                                            // data.len() with no rounding drift.
-                                            let share = if cursor < compressed.len() {
-                                                (chunk_len as u64)
-                                                    .saturating_mul(total_uncompressed)
-                                                    / total_compressed
-                                            } else {
-                                                total_uncompressed
-                                                    .saturating_sub(uncompressed_accounted)
-                                            };
-                                            uncompressed_accounted += share;
-                                            uploaded += share;
-                                            rate_tracker.record_send(share);
-                                            batch_credited_bytes =
-                                                batch_credited_bytes.saturating_add(share);
-
-                                            if let Some(tid) = &transfer_id {
-                                                let should_emit = match last_progress_emit {
-                                                    None => true,
-                                                    Some(last) => {
-                                                        last.elapsed() >= PROGRESS_EMIT_MIN_INTERVAL
-                                                    }
-                                                };
-                                                if should_emit {
-                                                    last_progress_emit =
-                                                        Some(std::time::Instant::now());
-                                                    last_progress_uploaded = uploaded;
-                                                    let _ = self.upload_event_tx.send(UploadEvent {
-                                                        transfer_id: tid.clone(),
-                                                        kind: UploadEventKind::Progress {
-                                                            uploaded,
-                                                            total: total_size,
-                                                        },
-                                                    }).await;
-                                                }
-                                            }
+                        // Run the zlib pass off the async runtime: compressing a
+                        // ~180 KiB block is CPU-bound and would otherwise pin a
+                        // Tokio worker for the whole pass, competing with the
+                        // reactor that also drives downloads, accepts, and KAD.
+                        // The file read above is already offloaded the same way.
+                        // `data` is moved into the blocking task and handed back
+                        // so the uncompressed fallback below can reuse it with no
+                        // extra copy.
+                        let (data, compressed_opt): (Vec<u8>, Option<Vec<u8>>) =
+                            if use_compression {
+                                tokio::task::spawn_blocking(move || {
+                                    let mut encoder =
+                                        ZlibEncoder::new(Vec::new(), Compression::default());
+                                    let compressed = match encoder.write_all(&data) {
+                                        // Only keep the compressed copy if it
+                                        // actually saves space.
+                                        Ok(()) => {
+                                            encoder.finish().ok().filter(|c| c.len() < data.len())
                                         }
-                                        sent_compressed = true;
+                                        Err(_) => None,
+                                    };
+                                    (data, compressed)
+                                })
+                                .await?
+                            } else {
+                                (data, None)
+                            };
+
+                        let mut sent_compressed = false;
+                        if let Some(compressed) = compressed_opt {
+                            let use_i64 = end > u32::MAX as u64;
+                            let newsize = compressed.len() as u32;
+                            let header_len = if use_i64 { 28 } else { 24 };
+                            let total_uncompressed = data.len() as u64;
+                            let total_compressed = compressed.len() as u64;
+
+                            let mut cursor = 0usize;
+                            let mut uncompressed_accounted: u64 = 0;
+                            while cursor < compressed.len() {
+                                let remaining = compressed.len() - cursor;
+                                let chunk_len = if remaining < SMALL_PACKET_THRESHOLD {
+                                    remaining
+                                } else {
+                                    MAX_PACKET_DATA
+                                };
+                                let chunk = &compressed[cursor..cursor + chunk_len];
+
+                                let mut part_payload =
+                                    Vec::with_capacity(header_len + chunk_len);
+                                part_payload.extend_from_slice(&hash);
+                                if use_i64 {
+                                    part_payload.extend_from_slice(&start.to_le_bytes());
+                                } else {
+                                    part_payload.extend_from_slice(&(start as u32).to_le_bytes());
+                                }
+                                // Every packet in the stream repeats the
+                                // total compressed size — that's how the
+                                // downloader knows when the block ends.
+                                part_payload.extend_from_slice(&newsize.to_le_bytes());
+                                part_payload.extend_from_slice(chunk);
+
+                                self.acquire_upload_bandwidth(chunk_len as u64).await;
+                                let write_start = std::time::Instant::now();
+                                write_packet_async(
+                                    &mut writer,
+                                    OP_EMULEPROT,
+                                    if use_i64 { OP_COMPRESSEDPART_I64 } else { OP_COMPRESSEDPART },
+                                    &part_payload,
+                                )
+                                .await?;
+                                let write_elapsed = write_start.elapsed();
+                                packets_this_batch = packets_this_batch.saturating_add(1);
+                                if write_elapsed > slowest_write {
+                                    slowest_write = write_elapsed;
+                                }
+                                if write_elapsed >= UPLOAD_SLOW_WRITE_THRESHOLD {
+                                    slow_writes_this_batch =
+                                        slow_writes_this_batch.saturating_add(1);
+                                    info!(
+                                        target: "ember::upload_diag",
+                                        "slow_write {peer_addr} kind=compressed \
+                                         chunk_len={chunk_len} elapsed_ms={} \
+                                         uploaded={uploaded}B — TCP back-pressure",
+                                        write_elapsed.as_millis(),
+                                    );
+                                }
+
+                                cursor += chunk_len;
+
+                                // Attribute uncompressed-byte progress
+                                // proportionally to this packet's share
+                                // of the compressed stream. eMule does
+                                // the same thing for its own payload
+                                // accounting (see CreatePackedPackets:
+                                //   payloadSize = togo ? nPacketSize*oldSize/newsize
+                                //               : oldSize - totalPayloadSize).
+                                // The final packet gets the remainder so
+                                // the sum over the block equals exactly
+                                // data.len() with no rounding drift.
+                                let share = if cursor < compressed.len() {
+                                    (chunk_len as u64)
+                                        .saturating_mul(total_uncompressed)
+                                        / total_compressed
+                                } else {
+                                    total_uncompressed
+                                        .saturating_sub(uncompressed_accounted)
+                                };
+                                uncompressed_accounted += share;
+                                uploaded += share;
+                                rate_tracker.record_send(share);
+                                batch_credited_bytes =
+                                    batch_credited_bytes.saturating_add(share);
+
+                                if let Some(tid) = &transfer_id {
+                                    let should_emit = match last_progress_emit {
+                                        None => true,
+                                        Some(last) => {
+                                            last.elapsed() >= PROGRESS_EMIT_MIN_INTERVAL
+                                        }
+                                    };
+                                    if should_emit {
+                                        last_progress_emit =
+                                            Some(std::time::Instant::now());
+                                        last_progress_uploaded = uploaded;
+                                        let _ = self.upload_event_tx.send(UploadEvent {
+                                            transfer_id: tid.clone(),
+                                            kind: UploadEventKind::Progress {
+                                                uploaded,
+                                                total: total_size,
+                                            },
+                                        }).await;
                                     }
                                 }
                             }
+                            sent_compressed = true;
                         }
                         if sent_compressed {
                             continue;
@@ -4733,7 +4992,6 @@ impl UploadHandler {
                         }
                         self.slot_rates
                             .lock()
-                            .unwrap_or_else(|e| e.into_inner())
                             .insert(peer_addr, rate_tracker.smoothed_rate());
                         // Bump the useful-activity gauge ONLY after bytes
                         // actually flowed. The earlier "bump on REQUESTPARTS
@@ -4777,7 +5035,20 @@ impl UploadHandler {
                         let q = self.upload_queue.lock().await;
                         !q.is_empty()
                     };
+                    // eMule CheckForTimeOver (UploadQueue.cpp:773) returns false
+                    // for a friend slot: a verified friend is NEVER rotated out,
+                    // neither by the per-session byte cap (SESSIONMAXTRANS) nor the
+                    // max session time (SESSIONMAXTIME). Friend priority requires
+                    // proof-of-possession on THIS session (merely claiming a
+                    // friend's hash is not enough), matching the queue-insertion
+                    // and preemption sites. Without this exemption a friend's
+                    // transfer was interrupted with OP_OUTOFPARTREQS every ~9.5 MB
+                    // (re-queued, then immediately re-granted via their score, but
+                    // with a needless stall) — eMule keeps the friend uploading
+                    // continuously.
+                    let is_verified_friend = is_friend && ember_auth_state.is_verified();
                     let session_expired = queue_has_waiters
+                        && !is_verified_friend
                         && (uploaded >= SESSIONMAXTRANS
                             || session_start
                                 .map(|t| t.elapsed().as_secs() >= SESSIONMAXTIME_SECS)
@@ -4894,7 +5165,7 @@ impl UploadHandler {
 
                         slot_guard.deactivate();
                         session_start = None;
-                        self.slot_rates.lock().unwrap_or_else(|e| e.into_inner()).remove(&peer_addr);
+                        self.slot_rates.lock().remove(&peer_addr);
                         rate_tracker = SessionRateTracker::new();
                         // Re-arm the promotion poller. We re-queue this peer just
                         // below, so the periodic grant path (read-timeout branch)
@@ -5058,7 +5329,7 @@ impl UploadHandler {
                     transfer_id = None;
                     uploaded = 0;
                     session_start = None;
-                    self.slot_rates.lock().unwrap_or_else(|e| e.into_inner()).remove(&peer_addr);
+                    self.slot_rates.lock().remove(&peer_addr);
                     rate_tracker = SessionRateTracker::new();
                     current_file_hash = None;
                     total_size = 0;
@@ -6029,10 +6300,7 @@ impl UploadHandler {
             });
         }
 
-        self.slot_rates
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&peer_addr);
+        self.slot_rates.lock().remove(&peer_addr);
 
         // slot_guard Drop handles upload slot release automatically
 
@@ -6422,6 +6690,62 @@ mod scoring_tests {
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             4662,
         ))
+    }
+
+    /// `unshared_purge_hashes` is the decision core of the periodic
+    /// "file no longer offered" queue sweep (eMule's file-gone purge). It must
+    /// evict a waiting peer only when the requested file is gone from BOTH the
+    /// shared index and the download set — never while we're still sharing it
+    /// or partial-seeding it mid-download — and must always leave the all-zero
+    /// placeholder hash (peer queued before naming a file) alone.
+    #[test]
+    fn unshared_purge_keeps_shared_and_downloading_drops_orphans() {
+        let shared_hash = [0x11u8; 16];
+        let downloading_hash = [0x22u8; 16];
+        let orphan_hash = [0x33u8; 16];
+        let placeholder = [0u8; 16];
+
+        let queued = [shared_hash, downloading_hash, orphan_hash, placeholder];
+        let shared: std::collections::HashSet<[u8; 16]> = [shared_hash].into_iter().collect();
+        let downloading: std::collections::HashSet<[u8; 16]> =
+            [downloading_hash].into_iter().collect();
+
+        let evict = unshared_purge_hashes(
+            queued.iter(),
+            |h| shared.contains(h),
+            |h| downloading.contains(h),
+        );
+
+        assert_eq!(evict.len(), 1, "only the orphan should be evicted");
+        assert!(evict.contains(&orphan_hash), "orphaned file must be purged");
+        assert!(!evict.contains(&shared_hash), "shared file must be kept");
+        assert!(
+            !evict.contains(&downloading_hash),
+            "partial-seeded download must be kept"
+        );
+        assert!(
+            !evict.contains(&placeholder),
+            "all-zero placeholder hash must never be purged"
+        );
+    }
+
+    /// When every queued file is still accounted for (shared or downloading)
+    /// the sweep evicts nothing.
+    #[test]
+    fn unshared_purge_empty_when_all_accounted_for() {
+        let a = [0xAAu8; 16];
+        let b = [0xBBu8; 16];
+        let queued = [a, b];
+        let shared: std::collections::HashSet<[u8; 16]> = [a].into_iter().collect();
+        let downloading: std::collections::HashSet<[u8; 16]> = [b].into_iter().collect();
+
+        let evict = unshared_purge_hashes(
+            queued.iter(),
+            |h| shared.contains(h),
+            |h| downloading.contains(h),
+        );
+
+        assert!(evict.is_empty(), "nothing orphaned -> nothing purged");
     }
 
     /// Seed an eMule credit record so `get_queue_score` returns a

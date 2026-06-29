@@ -265,6 +265,13 @@
     if (!s.nickname.trim()) {
       return m.settings_validation_nickname_empty();
     }
+    // Mirror the backend's 128-byte cap (commands/settings.rs) so an oversized
+    // nickname is rejected here with a clear message instead of only failing on
+    // save. `maxlength` on the input is a coarse char guard; this is the
+    // authoritative byte check (multi-byte UTF-8 can exceed it).
+    if (new TextEncoder().encode(s.nickname).length > 128) {
+      return m.error_settings_nickname_too_long();
+    }
     if (!s.download_folder.trim()) {
       return m.settings_validation_folder_empty();
     }
@@ -919,7 +926,7 @@
           </div>
           <div class="field">
             <label for="nickname">{m.settings_nickname_label()}</label>
-            <input id="nickname" bind:value={settings.nickname} placeholder={m.settings_nickname_placeholder()} />
+            <input id="nickname" bind:value={settings.nickname} maxlength="128" placeholder={m.settings_nickname_placeholder()} />
           </div>
           <div class="field toggle-row">
             <div class="toggle-info">

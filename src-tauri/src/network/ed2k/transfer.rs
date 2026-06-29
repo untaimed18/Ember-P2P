@@ -26,6 +26,15 @@ const READ_TIMEOUT_SECS: u64 = super::dead_sources::DOWNLOADTIMEOUT_SECS as u64;
 /// Maximum decompressed part size (PARTSIZE + margin = 10 MiB)
 const MAX_DECOMPRESSED_PART: usize = 10 * 1024 * 1024;
 
+/// Maximum accepted on-wire ed2k packet length for a download connection.
+/// The largest legitimate single packet is a file's hashset (16 bytes/part:
+/// ~1.7 MiB even for a 1 TB file) or one ~180 KiB block, so 2 MiB is a wide
+/// safety margin while keeping a malicious/buggy source from making us buffer
+/// up to 10 MiB per connection (the prior cap) — multiplied across multi-source
+/// slots that was a real memory-pressure vector. Mirrors the upload server's
+/// own packet-length hardening.
+const MAX_WIRE_PACKET_LEN: usize = 2 * 1024 * 1024;
+
 /// Returns `true` if the IP should be rejected as a source exchange result.
 ///
 /// Delegates to `security::is_special_use_v4` so every parser path that
@@ -4468,7 +4477,7 @@ async fn read_packet_async<R: AsyncReadExt + Unpin + ?Sized>(
     const OP_PACKEDPROT: u8 = 0xD4;
     let protocol = reader.read_u8().await?;
     let length = reader.read_u32_le().await? as usize;
-    if length == 0 || length > 10 * 1024 * 1024 {
+    if length == 0 || length > MAX_WIRE_PACKET_LEN {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "invalid packet length",
@@ -4477,9 +4486,10 @@ async fn read_packet_async<R: AsyncReadExt + Unpin + ?Sized>(
     let opcode = reader.read_u8().await?;
     let payload_len = length - 1;
     // Grow the buffer on the heap with bytes that actually arrive rather than
-    // trusting the declared length up front. A peer that announces a near-10
-    // MiB packet but then stalls can otherwise pin a full ~10 MiB allocation
-    // per connection. We grow in bounded steps directly into the Vec instead
+    // trusting the declared length up front. A peer that announces a large
+    // packet but then stalls can otherwise pin a full allocation up to the
+    // wire cap per connection. We grow in bounded steps directly into the Vec
+    // instead
     // of via a large stack array: this read is awaited deep inside the
     // per-source download future, and a 64 KiB stack buffer there bloats that
     // (already huge) future's poll frame enough to overflow the worker stack

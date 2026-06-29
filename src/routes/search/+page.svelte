@@ -30,6 +30,10 @@
 
   const searchTimeouts = new Map<number, ReturnType<typeof setTimeout>>();
 
+  /// Upper bound on a search query length sent over IPC. ed2k keywords are
+  /// short; this just guards against pathologically long pasted input.
+  const MAX_SEARCH_QUERY_LEN = 256;
+
   let searchMethod: SearchMethod = $state('global');
   let searchFileType: string = $state('');
 
@@ -662,9 +666,9 @@
     queued: 4, searching: 4, paused: 3, stopped: 2, completed: 1, failed: 0,
   };
 
-  let downloadsByHash = $derived.by(() => {
+  function buildDownloadsByHash(list: readonly Transfer[]): Map<string, Transfer> {
     const map = new Map<string, Transfer>();
-    for (const t of $transfers) {
+    for (const t of list) {
       if (t.direction === 'download' && t.file_hash) {
         const existing = map.get(t.file_hash);
         if (!existing || (DL_STATUS_PRIORITY[t.status] ?? 0) > (DL_STATUS_PRIORITY[existing.status] ?? 0)) {
@@ -673,6 +677,39 @@
       }
     }
     return map;
+  }
+
+  // Maps each downloaded file's hash -> its most-relevant transfer so result
+  // rows can show a live download badge. Rebuilding is cheap, but it fans out
+  // to every visible row, so throttle rebuilds to ~2.5x/sec (leading edge plus
+  // one coalesced trailing rebuild) instead of re-deriving on every 4–10 Hz
+  // progress tick.
+  let downloadsByHash = $state<Map<string, Transfer>>(buildDownloadsByHash(get(transfers)));
+  let dlMapLastBuilt = 0;
+  let dlMapTimer: ReturnType<typeof setTimeout> | null = null;
+  const DL_MAP_MIN_INTERVAL_MS = 400;
+
+  $effect(() => {
+    void $transfers; // track the store
+    const now = Date.now();
+    const elapsed = now - dlMapLastBuilt;
+    if (elapsed >= DL_MAP_MIN_INTERVAL_MS) {
+      dlMapLastBuilt = now;
+      downloadsByHash = buildDownloadsByHash($transfers);
+    } else if (dlMapTimer === null) {
+      dlMapTimer = setTimeout(() => {
+        dlMapTimer = null;
+        dlMapLastBuilt = Date.now();
+        downloadsByHash = buildDownloadsByHash(get(transfers));
+      }, DL_MAP_MIN_INTERVAL_MS - elapsed);
+    }
+  });
+
+  onDestroy(() => {
+    if (dlMapTimer !== null) {
+      clearTimeout(dlMapTimer);
+      dlMapTimer = null;
+    }
   });
 
   function getDownloadTransfer(result: SearchResult): Transfer | undefined {
@@ -966,17 +1003,21 @@
   }
 
   async function handleSearch(query: string) {
-    const q = query.trim();
+    // Clamp the query length before it reaches IPC: ed2k search keywords are
+    // short, and an unbounded string is a needless payload/edge-case vector.
+    const q = query.trim().slice(0, MAX_SEARCH_QUERY_LEN);
     const method = searchMethod;
     filterType = searchFileType;
     const parsedMinSize = filterMinSize !== '' ? parseFloat(filterMinSize) * filterMinUnit : undefined;
     const parsedMaxSize = filterMaxSize !== '' ? parseFloat(filterMaxSize) * filterMaxUnit : undefined;
     const parsedMinAvail = filterMinSources !== '' ? parseInt(filterMinSources, 10) : undefined;
+    // Reject NaN *and* Infinity (e.g. "1e400") and negatives — `Number.isFinite`
+    // excludes both, unlike the previous `!isNaN` which let Infinity through.
     const searchFilterSnapshot: import('$lib/api/search').SearchFilters = {
       fileExtension: filterExtension.trim() || undefined,
-      minSize: parsedMinSize !== undefined && !isNaN(parsedMinSize) ? parsedMinSize : undefined,
-      maxSize: parsedMaxSize !== undefined && !isNaN(parsedMaxSize) ? parsedMaxSize : undefined,
-      minAvailability: parsedMinAvail !== undefined && !isNaN(parsedMinAvail) ? parsedMinAvail : undefined,
+      minSize: parsedMinSize !== undefined && Number.isFinite(parsedMinSize) && parsedMinSize >= 0 ? parsedMinSize : undefined,
+      maxSize: parsedMaxSize !== undefined && Number.isFinite(parsedMaxSize) && parsedMaxSize >= 0 ? parsedMaxSize : undefined,
+      minAvailability: parsedMinAvail !== undefined && Number.isFinite(parsedMinAvail) && parsedMinAvail >= 0 ? parsedMinAvail : undefined,
     };
     if (!q && !hasSearchFilters(searchFilterSnapshot, searchFileType || undefined)) return;
     // An eD2k search needs either the KAD DHT or a connected server. With
@@ -1207,10 +1248,14 @@
     if (!selectedResult || publishingNote) return;
     publishingNote = true;
     publishMessage = '';
+    // The rating input is a free-form number field; browsers can submit
+    // out-of-range or fractional values (and an empty field yields NaN).
+    // Clamp to the backend's 0..5 integer contract before publishing.
+    const rating = Math.max(0, Math.min(5, Math.round(Number(noteRating) || 0)));
     try {
       publishMessage = await publishNote(
         selectedResult.file.hash,
-        noteRating,
+        rating,
         noteComment,
         selectedResult.file.name,
         selectedResult.file.size,
@@ -2376,15 +2421,15 @@
             <p class="hint">{m.search_no_notes()}</p>
           {:else}
             <div class="notes-list">
-              {#each notes as note}
+              {#each notes as note (note)}
                 <div class="note-item">
-                  <span class="note-peer">{note.peer_name || m.search_note_anonymous()}</span>
+                  <span class="note-peer"><bdi>{note.peer_name || m.search_note_anonymous()}</bdi></span>
                   {#if note.rating}
                     {@const r = Math.round(Math.max(0, Math.min(5, note.rating ?? 0)))}
                     <span class="note-rating">{'★'.repeat(r)}{'☆'.repeat(5 - r)}</span>
                   {/if}
                   {#if note.comment}
-                    <span class="note-comment">{note.comment}</span>
+                    <span class="note-comment"><bdi>{note.comment}</bdi></span>
                   {/if}
                 </div>
               {/each}
