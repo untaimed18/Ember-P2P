@@ -168,7 +168,11 @@ impl FirewallChecker {
             let distinct_nets = self.external_ip_votes[&ip].len();
             if distinct_nets >= MIN_IP_VOTES {
                 if self.confirmed_external_ip != Some(ip) {
-                    info!("External IP confirmed: {ip} ({distinct_nets} distinct-/24 votes)");
+                    // Keep the milestone at info but the user's own public IP at
+                    // debug — logs (and support bundles) shouldn't deanonymize the
+                    // local node by default. Mirrors rendezvous.rs.
+                    info!("External IP confirmed ({distinct_nets} distinct-/24 votes)");
+                    debug!("Confirmed external IP: {ip}");
                 }
                 self.confirmed_external_ip = Some(ip);
             }
@@ -180,10 +184,13 @@ impl FirewallChecker {
                 .iter()
                 .map(|(ip, nets)| format!("{}={}", ip, nets.len()))
                 .collect();
+            // Keep the disagreement signal (possible spoof/Sybil) at info, but the
+            // candidate IPs themselves at debug.
             info!(
-                "External IP votes disagree (distinct /24s): [{}]",
-                tally.join(", ")
+                "External IP votes disagree across {} candidates (distinct /24s)",
+                self.external_ip_votes.len()
             );
+            debug!("External IP vote tally (distinct /24s): [{}]", tally.join(", "));
         } else {
             debug!(
                 "External IP vote for {reported_ip} (distinct /24 voters: {})",
@@ -213,13 +220,13 @@ impl FirewallChecker {
         match self.confirmed_external_ip {
             None => {
                 self.confirmed_external_ip = Some(reported_ip);
-                info!("External IP confirmed by ed2k server: {reported_ip}");
+                info!("External IP confirmed by ed2k server");
+                debug!("Server-reported external IP: {reported_ip}");
             }
             Some(existing) if existing == reported_ip => {}
             Some(existing) => {
-                info!(
-                    "Ed2k server reports external IP {reported_ip} but KAD confirmed {existing}; keeping KAD-confirmed value"
-                );
+                info!("Ed2k server reports a different external IP than KAD-confirmed; keeping KAD-confirmed value");
+                debug!("Server reported {reported_ip} vs KAD-confirmed {existing}");
             }
         }
     }

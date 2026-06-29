@@ -63,9 +63,6 @@ function armSearchTimer(hash: string) {
 // of which UI surface is mounted.
 export const activeChatHash = writable<string | null>(null);
 
-let activeChatHashSnapshot: string | null = null;
-activeChatHash.subscribe((v) => { activeChatHashSnapshot = v; });
-
 // Dedup window for inbound `ember:chat-message` events. The backend can deliver
 // the same logical message twice in quick succession (the download- and
 // upload-side session loops both surface it), which would otherwise double-bump
@@ -181,7 +178,7 @@ export async function initFriendsStore() {
         // `unreadCounts` would leave a phantom badge until the
         // tab loses focus and is reactivated. `ChatConversation`
         // separately marks the message read on the backend.
-        if (activeChatHashSnapshot === p.user_hash) return;
+        if (get(activeChatHash) === p.user_hash) return;
         unreadCounts.update((m) => {
           const next = new Map(m);
           next.set(p.user_hash, (next.get(p.user_hash) || 0) + 1);

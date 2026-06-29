@@ -211,7 +211,11 @@ function wasRecentlyRemoved(id: string, now: number): boolean {
 function scheduleProgressFlush() {
   if (progressFlushScheduled) return;
   progressFlushScheduled = true;
-  if (typeof requestAnimationFrame === 'function' && document.visibilityState === 'visible') {
+  if (
+    typeof requestAnimationFrame === 'function' &&
+    typeof document !== 'undefined' &&
+    document.visibilityState === 'visible'
+  ) {
     flushRaf = requestAnimationFrame(() => {
       flushRaf = null;
       flushProgress();

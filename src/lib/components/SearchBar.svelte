@@ -202,7 +202,7 @@
         <span>{m.search_bar_recent_searches()}</span>
         <button type="button" class="recent-clear" onclick={clearRecent}>{m.search_bar_clear_all()}</button>
       </div>
-      {#each recent as q, i}
+      {#each recent as q, i (q)}
         <div
           class="recent-item"
           class:active={i === activeIndex}
