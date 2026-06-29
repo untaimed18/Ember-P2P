@@ -140,13 +140,28 @@ pub fn create_preview_file(
     }
 
     dst.sync_all()?;
-    info!("Created preview file: {}", preview_path.display());
+    // Log the basename only — the full path can contain the username / folder
+    // layout (PII) and shows up in default logs and support bundles.
+    info!(
+        "Created preview file: {}",
+        preview_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("<preview>")
+    );
     Ok(preview_path)
 }
 
 /// Launch the system default media player for the file.
 pub fn launch_preview(file_path: &Path) -> anyhow::Result<()> {
-    info!("Launching preview: {}", file_path.display());
+    // Basename only — avoid logging the full local path (PII) at info level.
+    info!(
+        "Launching preview: {}",
+        file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("<file>")
+    );
 
     #[cfg(target_os = "windows")]
     {

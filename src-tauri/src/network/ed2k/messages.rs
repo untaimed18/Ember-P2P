@@ -1780,9 +1780,13 @@ pub fn parse_answer_sources2(
         ));
     }
 
+    // Cap how many entries we allocate/process from one packet. The length
+    // check above ties `count` to the payload size, but a peer can still
+    // declare up to ~65 k entries within the wire cap; extras are ignored.
+    let process_count = count.min(MAX_SX_SOURCES);
     let mut cursor = Cursor::new(&payload[19..]);
-    let mut entries = Vec::with_capacity(count);
-    for _ in 0..count {
+    let mut entries = Vec::with_capacity(process_count);
+    for _ in 0..process_count {
         let source_id = cursor.read_u32::<LittleEndian>()?;
         let tcp_port = cursor.read_u16::<LittleEndian>()?;
         let server_ip = cursor.read_u32::<LittleEndian>()?;
@@ -1811,6 +1815,12 @@ pub fn parse_answer_sources2(
 
     Ok((version, file_hash, entries))
 }
+
+/// Maximum source-exchange entries we allocate/process from a single packet.
+/// Real eMule SX answers carry far fewer sources; the declared `count` is a
+/// u16 (up to ~65 k), so this caps the per-packet allocation/processing a peer
+/// can force. Any entries beyond the cap are ignored.
+const MAX_SX_SOURCES: usize = 1000;
 
 pub fn parse_answer_sources(
     payload: &[u8],
@@ -1846,9 +1856,10 @@ pub fn parse_answer_sources(
             ),
         ));
     };
-    let mut entries = Vec::with_capacity(count);
+    let process_count = count.min(MAX_SX_SOURCES);
+    let mut entries = Vec::with_capacity(process_count);
 
-    for _ in 0..count {
+    for _ in 0..process_count {
         let source_id = cursor.read_u32::<LittleEndian>()?;
         let tcp_port = cursor.read_u16::<LittleEndian>()?;
         let server_ip = cursor.read_u32::<LittleEndian>()?;
