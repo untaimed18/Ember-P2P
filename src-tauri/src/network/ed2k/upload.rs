@@ -4642,7 +4642,11 @@ impl UploadHandler {
                             break;
                         }
 
-                        let len = ((end - start) as usize).min(PARTSIZE as usize);
+                        // `start < end` is already enforced upstream (range filter
+                        // + per-offset skip), but use saturating_sub so a future
+                        // refactor that drops a guard can't underflow on this
+                        // peer-supplied range.
+                        let len = (end.saturating_sub(start) as usize).min(PARTSIZE as usize);
 
                         // Move the session-cached `File` into `spawn_blocking`
                         // (a `&mut File` isn't `'static`, so we take-and-put
