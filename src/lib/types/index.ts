@@ -101,6 +101,19 @@ export interface Transfer {
   client_software?: string;
   country_code?: string;
   user_hash?: string;
+  /** Upload-direction only: hex bitmap of ED2K parts fully served to this
+   *  peer during the current session (byte index = part / 8, bit = part % 8,
+   *  LSB-first within each byte). Drives the chunked "Up Status" parts bar —
+   *  the analog of eMule's green `m_DoneBlocks_list` fill. */
+  up_part_status?: string;
+  /** Upload-direction only: total ED2K part count (ceil(total_size / PARTSIZE)),
+   *  paired with {@link up_part_status} so the bar renders the right segments. */
+  up_part_count?: number;
+  /** Upload-direction only: hex bitmap (same packing as {@link up_part_status},
+   *  shares {@link up_part_count}) of parts the downloader advertised it already
+   *  had at request time — eMule's `m_abyUpPartStatus`. Shaded dark beneath the
+   *  green served-this-session fill. */
+  up_peer_part_status?: string;
 }
 
 export interface SourceInfo {

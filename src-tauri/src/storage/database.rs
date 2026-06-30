@@ -842,6 +842,9 @@ impl Database {
                     country_code: None,
                     user_hash: None,
                     completed_path: None,
+                    up_part_status: None,
+                    up_part_count: None,
+                    up_peer_part_status: None,
                 })
             })?
             .filter_map(|r| match r {

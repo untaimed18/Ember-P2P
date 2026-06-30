@@ -1,5 +1,6 @@
 <script lang="ts">
   import ProgressBar from '$lib/components/ProgressBar.svelte';
+  import PartsBar from '$lib/components/PartsBar.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import { transfers } from '$lib/stores/transfers';
   import { networkStats } from '$lib/stores/network';
@@ -1413,6 +1414,57 @@
     if (t.a4af_sources > 0) label += `+${t.a4af_sources}`;
     if (t.max_sources > 0) label += ` [${t.max_sources}]`;
     return label;
+  }
+
+  // Minimum ED2K part count before the upload "Up Status" cell switches
+  // from the smooth byte-progress bar to the eMule-style chunked parts
+  // bar. Below this, the few wide segments read worse than a linear fill
+  // (and small files finish before a single 9.28 MB part even completes).
+  const UPLOAD_PARTS_BAR_MIN = 4;
+
+  /** Count parts flagged fully-served in an upload `up_part_status` hex bitmap. */
+  function countServedParts(hex: string | undefined): number {
+    if (!hex) return 0;
+    let n = 0;
+    for (let i = 0; i < hex.length; i += 2) {
+      let b = parseInt(hex.slice(i, i + 2), 16);
+      if (Number.isNaN(b)) continue;
+      while (b) {
+        n += b & 1;
+        b >>= 1;
+      }
+    }
+    return n;
+  }
+
+  /** Count parts the peer already had (`peerHex`) that we have NOT sent this
+   *  session (`servedHex`) — i.e. the currently-visible dark area on the bar. */
+  function countPeerOnlyParts(
+    peerHex: string | undefined,
+    servedHex: string | undefined,
+    total: number
+  ): number {
+    if (!peerHex) return 0;
+    let n = 0;
+    for (let i = 0; i < total; i++) {
+      const off = (i >> 3) * 2;
+      const bit = 1 << (i & 7);
+      const pb = parseInt(peerHex.slice(off, off + 2), 16);
+      const sb = servedHex ? parseInt(servedHex.slice(off, off + 2), 16) : 0;
+      const hasPeer = !Number.isNaN(pb) && (pb & bit) !== 0;
+      const hasServed = !Number.isNaN(sb) && (sb & bit) !== 0;
+      if (hasPeer && !hasServed) n++;
+    }
+    return n;
+  }
+
+  /** Tooltip for the upload parts bar: parts we've sent this session, plus the
+   *  count the downloader already had (eMule `m_abyUpPartStatus`) when present. */
+  function uploadPartsTooltip(t: Transfer): string {
+    const total = t.up_part_count ?? 0;
+    const base = m.transfers_parts({ have: countServedParts(t.up_part_status), total });
+    const peerOnly = countPeerOnlyParts(t.up_peer_part_status, t.up_part_status, total);
+    return peerOnly > 0 ? `${base} · ${m.transfers_parts_peer({ peer: peerOnly })}` : base;
   }
 
   function ulStatusLabel(t: Transfer): string {
@@ -3046,6 +3098,17 @@
                   {:else if column.key === 'up_status'}
                     <td class="bar-cell">
                       {#if t.total_size > 0}
+                        {#if (t.up_part_count ?? 0) >= UPLOAD_PARTS_BAR_MIN}
+                          <PartsBar
+                            partStatus={t.up_part_status}
+                            partCount={t.up_part_count}
+                            peerPartStatus={t.up_peer_part_status}
+                            transferred={t.transferred}
+                            total={t.total_size}
+                            color="var(--accent)"
+                            title={uploadPartsTooltip(t)}
+                          />
+                        {:else}
                         <!--
                           Feed the ProgressBar raw bytes rather than
                           `t.progress`. `t.progress` is recomputed from
@@ -3066,6 +3129,7 @@
                           complete" UX.
                         -->
                         <ProgressBar value={t.transferred} max={t.total_size} color="var(--accent)" />
+                        {/if}
                       {:else}
                         <span class="no-bar">—</span>
                       {/if}

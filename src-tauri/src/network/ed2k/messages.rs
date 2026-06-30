@@ -1935,6 +1935,15 @@ pub struct MultiPacketRequest {
     pub file_identifier: Option<FileIdentifier>,
     pub sub_opcodes: Vec<MultiPacketSubReq>,
     pub is_ext2: bool,
+    /// The downloader's advertised ED2K part status from the
+    /// `OP_REQUESTFILENAME` extended-info block, as `(wire_part_count,
+    /// raw_bitmap_bytes)`. `wire_part_count` follows eMule's
+    /// `GetED2KPartCount()` convention; the bitmap is LSB-first, bit `i` =
+    /// part `i`. `None` when the peer omitted it (extended-requests v0) or it
+    /// was malformed. Drives the dark "peer already has" shading on the upload
+    /// parts bar — the analog of eMule `m_abyUpPartStatus` in
+    /// `CUpDownClient::ProcessExtendedInfo`.
+    pub req_part_status: Option<(u16, Vec<u8>)>,
 }
 
 /// Parse an OP_MULTIPACKET / OP_MULTIPACKET_EXT / OP_MULTIPACKET_EXT2 payload.
@@ -1977,6 +1986,7 @@ pub fn parse_multipacket(payload: &[u8], opcode: u8) -> io::Result<MultiPacketRe
     }
 
     let mut sub_opcodes = Vec::new();
+    let mut req_part_status: Option<(u16, Vec<u8>)> = None;
     while (cursor.position() as usize) < payload.len() {
         let sub_op = cursor.read_u8()?;
         match sub_op {
@@ -1994,6 +2004,10 @@ pub fn parse_multipacket(payload: &[u8], opcode: u8) -> io::Result<MultiPacketRe
                         .checked_add(bitmap_bytes)
                         .is_some_and(|end| end <= payload.len())
                     {
+                        // Capture the advertised bitmap before skipping past it,
+                        // so the uploader can paint the peer's pre-existing parts.
+                        req_part_status =
+                            Some((part_count as u16, payload[pos..pos + bitmap_bytes].to_vec()));
                         cursor.set_position((pos + bitmap_bytes) as u64);
                         // v2: complete sources count. Only consume it if it does not
                         // look like the next byte is already another sub-opcode.
@@ -2054,6 +2068,7 @@ pub fn parse_multipacket(payload: &[u8], opcode: u8) -> io::Result<MultiPacketRe
         file_identifier,
         sub_opcodes,
         is_ext2,
+        req_part_status,
     })
 }
 

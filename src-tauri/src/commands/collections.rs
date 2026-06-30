@@ -360,6 +360,9 @@ pub async fn download_collection_files(
             country_code: None,
             user_hash: None,
             completed_path: None,
+            up_part_status: None,
+            up_part_count: None,
+            up_peer_part_status: None,
         };
 
         let (active_now, persisted_transfer) = {
