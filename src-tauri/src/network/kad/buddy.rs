@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use super::firewall::FirewallStatus;
 use super::types::KadId;
@@ -272,12 +272,12 @@ impl BuddyManager {
         {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
-                warn!("Failed to connect to buddy {}: {}", buddy_id, e);
+                debug!("Failed to connect to buddy {}: {}", buddy_id, e);
                 self.find_failed();
                 return None;
             }
             Err(_) => {
-                warn!("Timeout connecting to buddy {}", buddy_id);
+                debug!("Timeout connecting to buddy {}", buddy_id);
                 self.find_failed();
                 return None;
             }
@@ -287,7 +287,7 @@ impl BuddyManager {
         let supports_crypt = (connect_options & 0x01) != 0;
         let use_obf = allow_obfuscation && supports_crypt && peer_user_hash != [0u8; 16];
         if requires_crypt && !use_obf {
-            warn!(
+            debug!(
                 "Buddy {} requires obfuscation but it is unavailable",
                 buddy_id
             );
@@ -313,11 +313,11 @@ impl BuddyManager {
                 ),
                 Err(e) => {
                     if requires_crypt {
-                        warn!("Obfuscated buddy connect failed and peer requires crypt: {e}");
+                        debug!("Obfuscated buddy connect failed and peer requires crypt: {e}");
                         self.find_failed();
                         return None;
                     }
-                    warn!("Obfuscated buddy connect failed, reconnecting plain: {e}");
+                    debug!("Obfuscated buddy connect failed, reconnecting plain: {e}");
                     drop(raw_reader);
                     drop(raw_writer);
                     let plain_stream = match tokio::time::timeout(
@@ -328,12 +328,12 @@ impl BuddyManager {
                     {
                         Ok(Ok(s)) => s,
                         Ok(Err(e)) => {
-                            warn!("Plain reconnect to buddy failed: {e}");
+                            debug!("Plain reconnect to buddy failed: {e}");
                             self.find_failed();
                             return None;
                         }
                         Err(_) => {
-                            warn!("Plain reconnect to buddy timed out");
+                            debug!("Plain reconnect to buddy timed out");
                             self.find_failed();
                             return None;
                         }
@@ -361,7 +361,7 @@ impl BuddyManager {
         )
         .await
         {
-            warn!("Buddy Hello handshake failed: {e}");
+            debug!("Buddy Hello handshake failed: {e}");
             self.find_failed();
             return None;
         }
@@ -443,7 +443,7 @@ impl BuddyManager {
             {
                 Ok(Ok(())) => true,
                 _ => {
-                    warn!("Buddy ping failed, connection lost");
+                    debug!("Buddy ping failed, connection lost");
                     self.disconnect_buddy();
                     false
                 }
@@ -512,12 +512,12 @@ impl BuddyManager {
             {
                 Ok(Ok(())) => true,
                 Ok(Err(e)) => {
-                    warn!("Failed to relay callback: {e}");
+                    debug!("Failed to relay callback: {e}");
                     self.disconnect_serving();
                     false
                 }
                 Err(_) => {
-                    warn!("Callback relay write timed out");
+                    debug!("Callback relay write timed out");
                     self.disconnect_serving();
                     false
                 }
@@ -571,12 +571,12 @@ impl BuddyManager {
         {
             Ok(Ok(())) => true,
             Ok(Err(e)) => {
-                warn!("Failed to forward OP_REASKCALLBACKUDP to buddy over TCP: {e}");
+                debug!("Failed to forward OP_REASKCALLBACKUDP to buddy over TCP: {e}");
                 self.disconnect_buddy();
                 false
             }
             Err(_) => {
-                warn!("OP_REASKCALLBACKUDP forward to buddy TCP timed out");
+                debug!("OP_REASKCALLBACKUDP forward to buddy TCP timed out");
                 self.disconnect_buddy();
                 false
             }

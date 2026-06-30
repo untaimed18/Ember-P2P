@@ -413,7 +413,7 @@ fn decode_message(opcode: u8, cursor: &mut Cursor<&[u8]>) -> io::Result<KadMessa
             let count = cursor.read_u16::<LittleEndian>()? as usize;
             let capped = count.min(300);
             if count > 300 {
-                tracing::warn!("KAD SEARCH_RES declared {count} results, capping parse to 300");
+                tracing::debug!("KAD SEARCH_RES declared {count} results, capping parse to 300");
             }
             let mut results = Vec::with_capacity(capped);
             for _ in 0..capped {
@@ -438,7 +438,7 @@ fn decode_message(opcode: u8, cursor: &mut Cursor<&[u8]>) -> io::Result<KadMessa
             // generous bound as SEARCH_RES and warn instead of dropping quietly.
             let capped = count.min(300);
             if count > 300 {
-                tracing::warn!(
+                tracing::debug!(
                     "KAD PUBLISH_KEY_REQ declared {count} entries, capping parse to 300"
                 );
             }
@@ -599,7 +599,7 @@ fn decode_message(opcode: u8, cursor: &mut Cursor<&[u8]>) -> io::Result<KadMessa
             let count = cursor.read_u16::<LittleEndian>()? as usize;
             let take = count.min(200);
             if count > 200 {
-                tracing::warn!(
+                tracing::debug!(
                     "KAD BOOTSTRAP_RES (old) declared {count} contacts, capping parse to 200"
                 );
             }
@@ -621,7 +621,7 @@ fn decode_message(opcode: u8, cursor: &mut Cursor<&[u8]>) -> io::Result<KadMessa
             let count = cursor.read_u16::<LittleEndian>()? as usize;
             let capped = count.min(300);
             if count > 300 {
-                tracing::warn!(
+                tracing::debug!(
                     "KAD legacy SEARCH_RES declared {count} results, capping parse to 300"
                 );
             }

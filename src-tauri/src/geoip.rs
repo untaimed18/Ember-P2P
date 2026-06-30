@@ -1,7 +1,7 @@
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info};
 
 pub type GeoIpReader = Arc<Option<maxminddb::Reader<Vec<u8>>>>;
 
@@ -14,7 +14,7 @@ pub fn load(resource_dir: &Path) -> GeoIpReader {
         if alt.exists() {
             return load_from(&alt);
         }
-        warn!("GeoIP database not found at {:?}", db_path);
+        debug!("GeoIP database not found at {:?}", db_path);
         return Arc::new(None);
     }
     load_from(&db_path)
@@ -27,7 +27,7 @@ fn load_from(path: &Path) -> GeoIpReader {
             Arc::new(Some(reader))
         }
         Err(e) => {
-            warn!("Failed to load GeoIP database: {}", e);
+            debug!("Failed to load GeoIP database: {}", e);
             Arc::new(None)
         }
     }

@@ -909,7 +909,7 @@ pub fn parse_hello_answer(payload: &[u8]) -> io::Result<([u8; 16], PeerCapabilit
     caps.tcp_port = hello_tcp_port;
     let safe_count = tag_count.min(256);
     if tag_count > 256 {
-        tracing::warn!("Hello answer has excessive tags: {tag_count}, capping at 256");
+        tracing::debug!("Hello answer has excessive tags: {tag_count}, capping at 256");
     }
     for _ in 0..safe_count {
         let tag_type_raw = cursor.read_u8().unwrap_or(0);
