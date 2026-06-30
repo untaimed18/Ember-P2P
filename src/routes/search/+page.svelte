@@ -6,6 +6,7 @@
   import { startDownload } from '$lib/api/transfers';
   import { transfers } from '$lib/stores/transfers';
   import type { Transfer } from '$lib/types';
+  import { fade } from 'svelte/transition';
   import { appSettings } from '$lib/stores/settings';
   import {
     activeSearchTabId,
@@ -2138,6 +2139,7 @@
             class:history-cancelled-row={!result.result_origin?.includes('Local') && downloadHistoryMap[result.file.hash] === 'cancelled'}
             oncontextmenu={(e) => showContextMenu(e, result)}
             ondblclick={() => download(result)}
+            in:fade={{ duration: 140 }}
           >
             <td class="col-check">
               <input
