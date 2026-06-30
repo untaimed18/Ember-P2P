@@ -189,7 +189,7 @@ pub fn load_nodes_dat_with_format(
                 }
             }
         } else {
-            warn!("Unknown nodes.dat version: {version}, trying as v2");
+            debug!("Unknown nodes.dat version: {version}, trying as v2");
             format = NodesDatFormat::WithVerifiedBit;
             let count = (cursor.read_u32::<LittleEndian>()? as usize).min(50_000);
             expected_count = count;

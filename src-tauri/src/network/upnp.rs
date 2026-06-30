@@ -2,7 +2,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
 
 use tokio::time::Instant;
-use tracing::{info, warn};
+use tracing::{debug, info};
 
 type Gw = igd_next::aio::Gateway<igd_next::aio::tokio::Tokio>;
 
@@ -88,7 +88,7 @@ impl UpnpMappings {
                         true
                     }
                     Err(e) => {
-                        warn!("UPnP: permanent-lease retry failed for {proto} port {port} ({label}): {e}");
+                        debug!("UPnP: permanent-lease retry failed for {proto} port {port} ({label}): {e}");
                         false
                     }
                 }
@@ -106,13 +106,13 @@ impl UpnpMappings {
                         true
                     }
                     Err(e) => {
-                        warn!("UPnP: re-map after conflict failed for {proto} port {port} ({label}): {e}");
+                        debug!("UPnP: re-map after conflict failed for {proto} port {port} ({label}): {e}");
                         false
                     }
                 }
             }
             Err(e) => {
-                warn!("UPnP: failed to map {proto} port {port} ({label}): {e}");
+                debug!("UPnP: failed to map {proto} port {port} ({label}): {e}");
                 false
             }
         }
@@ -128,7 +128,7 @@ impl UpnpMappings {
                 return false;
             };
             let Some(local_ip) = local_ipv4(gateway.addr) else {
-                warn!("Could not determine local IPv4 address for UPnP");
+                debug!("Could not determine local IPv4 address for UPnP");
                 self.tcp_mapped = false;
                 self.udp_mapped = false;
                 self.quic_mapped = false;
@@ -234,7 +234,7 @@ impl UpnpMappings {
                 gw
             }
             Err(e) => {
-                warn!("UPnP gateway discovery failed: {e}");
+                debug!("UPnP gateway discovery failed: {e}");
                 self.note_discovery_failure();
                 return false;
             }
@@ -276,7 +276,7 @@ impl UpnpMappings {
             return self.is_mapped();
         }
         if !self.map_all().await {
-            warn!("UPnP renew failed for all mappings; re-discovering gateway");
+            debug!("UPnP renew failed for all mappings; re-discovering gateway");
             self.gateway = None;
             self.setup().await;
         }

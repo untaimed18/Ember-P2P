@@ -387,7 +387,7 @@ impl ConnectionBroker {
     /// Called when a relay attempt fails.
     pub async fn relay_failed(&mut self, attempt_key: &str, reason: &str) {
         if let Some(attempt) = self.attempts.remove(attempt_key) {
-            warn!("Broker: relay failed for {attempt_key}: {reason}");
+            debug!("Broker: relay failed for {attempt_key}: {reason}");
             self.stats.relay_failures = self.stats.relay_failures.saturating_add(1);
             emit_event(
                 &self.event_tx,
