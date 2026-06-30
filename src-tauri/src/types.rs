@@ -683,6 +683,12 @@ pub struct AppSettings {
     /// Max seconds to wait for a keyword/global search to finish (30–600; default 120).
     #[serde(default = "default_search_timeout_secs")]
     pub search_timeout_secs: u64,
+    /// When false, the UI stops persisting recent search queries (the search
+    /// history dropdown) to local storage. Frontend-only behavior — the backend
+    /// just round-trips it. Defaults to true so existing users keep the prior
+    /// "history is saved" behavior.
+    #[serde(default = "default_true")]
+    pub save_search_history: bool,
     /// Whether the first-time setup wizard has been completed
     #[serde(default)]
     pub setup_complete: bool,
@@ -1051,6 +1057,7 @@ impl Default for AppSettings {
             download_part_retry_rounds: default_download_part_retry_rounds(),
             max_download_file_size_gib: default_max_download_file_size_gib(),
             search_timeout_secs: default_search_timeout_secs(),
+            save_search_history: true,
             setup_complete: false,
             friend_require_approval: true,
             friend_chat_disabled: false,

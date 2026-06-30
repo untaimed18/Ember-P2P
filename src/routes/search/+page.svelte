@@ -6,6 +6,7 @@
   import { startDownload } from '$lib/api/transfers';
   import { transfers } from '$lib/stores/transfers';
   import type { Transfer } from '$lib/types';
+  import { appSettings } from '$lib/stores/settings';
   import {
     activeSearchTabId,
     closeSearchTab,
@@ -1708,6 +1709,7 @@
     placeholder={m.search_query_placeholder()}
     onsubmit={handleSearch}
     recentKey="search-recent-queries-v1"
+    historyEnabled={$appSettings?.save_search_history ?? true}
   />
   <select class="type-select" bind:value={searchMethod} title={m.search_method_title()}>
     <option value="global">{m.search_method_global()}</option>
