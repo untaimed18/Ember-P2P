@@ -12,6 +12,9 @@ interface ProgressPayload {
   progress: number;
   speed: number;
   upload_time?: number;
+  up_part_status?: string;
+  up_part_count?: number;
+  up_peer_part_status?: string;
 }
 
 const STATUS_PRIORITY: Record<string, number> = {
@@ -275,6 +278,9 @@ function flushProgress() {
         health_reason: clearStaleHealth ? undefined : existing.health_reason,
         stalled_since: clearStaleHealth ? undefined : existing.stalled_since,
         ...(p.upload_time != null ? { upload_time: p.upload_time } : {}),
+        ...(p.up_part_status != null ? { up_part_status: p.up_part_status } : {}),
+        ...(p.up_part_count != null ? { up_part_count: p.up_part_count } : {}),
+        ...(p.up_peer_part_status != null ? { up_peer_part_status: p.up_peer_part_status } : {}),
       };
       changed = true;
     }

@@ -180,6 +180,33 @@ pub struct Transfer {
     /// Open/Reveal target exactly the file we wrote.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_path: Option<String>,
+    /// Upload-direction only: hex bitmap of ED2K parts fully served to
+    /// this peer during the current session (byte index = `part / 8`,
+    /// bit index = `part % 8`, LSB-first within each byte). Drives the
+    /// eMule-style chunked "Up Status" parts bar in the UI — the analog
+    /// of eMule's `m_DoneBlocks_list` green fill in `DrawUpStatusBar`.
+    /// `None` for downloads and for uploads that have not yet completed
+    /// a full part.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub up_part_status: Option<String>,
+    /// Upload-direction only: total ED2K part count of the file
+    /// (`ceil(total_size / PARTSIZE)`), paired with [`up_part_status`]
+    /// so the UI renders the correct number of segments.
+    ///
+    /// [`up_part_status`]: Transfer::up_part_status
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub up_part_count: Option<u32>,
+    /// Upload-direction only: hex bitmap (same packing as [`up_part_status`],
+    /// shares [`up_part_count`]) of the ED2K parts the downloader advertised it
+    /// already had at request time — eMule's `m_abyUpPartStatus`. Drives the
+    /// dark "peer already has" shading drawn beneath the green served-this-
+    /// session fill on the parts bar. `None` when the peer advertised no parts
+    /// or didn't send an extended request.
+    ///
+    /// [`up_part_status`]: Transfer::up_part_status
+    /// [`up_part_count`]: Transfer::up_part_count
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub up_peer_part_status: Option<String>,
 }
 
 fn default_priority() -> String {
@@ -1106,6 +1133,17 @@ pub struct TransferProgressPayload<'a> {
     pub direction: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upload_time: Option<u64>,
+    /// Upload-direction only: see [`Transfer::up_part_status`]. Carried
+    /// on live progress events so the parts bar animates between polls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub up_part_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub up_part_count: Option<u32>,
+    /// Upload-direction only: see [`Transfer::up_peer_part_status`]. Carried on
+    /// live progress events so the dark peer-has shading stays in sync between
+    /// the 3 s polls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub up_peer_part_status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -35,6 +35,17 @@
   let activeDownloadCount = $derived(
     $transfers.filter(t => t.direction === 'download' && t.status !== 'completed' && t.status !== 'failed').length
   );
+  let activeUploadCount = $derived(
+    $transfers.filter(t => t.direction === 'upload' && t.status !== 'completed' && t.status !== 'failed').length
+  );
+  let activeTransferCount = $derived(activeDownloadCount + activeUploadCount);
+
+  function downloadsTitle(n: number): string {
+    return n === 1 ? m.sidebar_active_downloads_one() : m.sidebar_active_downloads_other({ count: n });
+  }
+  function uploadsTitle(n: number): string {
+    return n === 1 ? m.sidebar_active_uploads_one() : m.sidebar_active_uploads_other({ count: n });
+  }
 
   // Pending incoming friend-request count. Mirrors the transfers badge
   // pattern so users notice new requests without leaving the current
@@ -274,8 +285,23 @@
               }
             ></span>
           {/if}
-          {#if item.id === 'transfers' && activeDownloadCount > 0}
-            <span class="nav-badge">{activeDownloadCount}</span>
+          {#if item.id === 'transfers' && activeTransferCount > 0}
+            <span class="nav-transfer-counts">
+              {#if activeDownloadCount > 0}
+                <span class="tc-chip tc-down" title={downloadsTitle(activeDownloadCount)}>
+                  <span class="tc-arrow" aria-hidden="true">↓</span>{activeDownloadCount}
+                </span>
+              {/if}
+              {#if activeUploadCount > 0}
+                <span class="tc-chip tc-up" title={uploadsTitle(activeUploadCount)}>
+                  <span class="tc-arrow" aria-hidden="true">↑</span>{activeUploadCount}
+                </span>
+              {/if}
+            </span>
+            <span
+              class="nav-badge nav-badge-collapsed"
+              title={`${downloadsTitle(activeDownloadCount)} · ${uploadsTitle(activeUploadCount)}`}
+            >{activeTransferCount}</span>
           {/if}
           {#if item.id === 'friends' && pendingFriendRequestCount > 0}
             <span
@@ -720,6 +746,61 @@
   .nav-badge.nav-badge-attention {
     background: var(--warning);
     color: #1a1a1a;
+  }
+
+  /* Transfers nav item: split the single count into direction-coded activity
+     chips — download ↓ in accent, upload ↑ in warning — matching the
+     status-bar speed readouts. Soft tinted fills read as "live activity"
+     rather than the solid alert pill used for friend requests. */
+  .nav-transfer-counts {
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    flex-shrink: 0;
+  }
+
+  .tc-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 1px;
+    height: 18px;
+    padding: 0 6px 0 4px;
+    border-radius: 9px;
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .tc-arrow {
+    font-size: 11px;
+    line-height: 1;
+  }
+
+  .tc-down {
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+    color: var(--accent);
+  }
+
+  .tc-up {
+    background: color-mix(in srgb, var(--warning) 20%, transparent);
+    color: var(--warning);
+  }
+
+  /* Collapsed rail: the per-direction chips don't fit, so fall back to a
+     single total-count pill, positioned top-right by the shared
+     `.sidebar.collapsed .nav-badge` rule above. */
+  .nav-badge-collapsed {
+    display: none;
+  }
+
+  .sidebar.collapsed .nav-transfer-counts {
+    display: none;
+  }
+
+  .sidebar.collapsed .nav-badge-collapsed {
+    display: inline-flex;
   }
 
   .nav-dot {
