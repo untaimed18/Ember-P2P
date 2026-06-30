@@ -24,6 +24,8 @@
   import { emberDevToolsEnabled } from '$lib/stores/devTools';
   import type { AppSettings } from '$lib/types';
   import { onMount } from 'svelte';
+  import { page } from '$app/stores';
+  import { fly } from 'svelte/transition';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 
   // Sync `<html lang>` to the active Paraglide locale on every
@@ -291,7 +293,20 @@
           <button onclick={() => location.reload()}>{m.layout_retry()}</button>
         </div>
       {:else}
-        {@render children()}
+        <!--
+          Subtle route transition: a short fade + small rise on each path
+          change ties navigation together. Keyed on pathname (not full URL)
+          so query-param changes (search tabs, filters) don't re-animate.
+          The wrapper mirrors `.page-container`'s flex-column/overflow so the
+          pages' `flex: 1` height chain is preserved. The global
+          prefers-reduced-motion rule in app.css neutralizes this for users
+          who opt out.
+        -->
+        {#key $page.url.pathname}
+          <div class="route-view" in:fly={{ y: 8, duration: 160 }}>
+            {@render children()}
+          </div>
+        {/key}
       {/if}
     </main>
     <StatusBar />
@@ -359,6 +374,21 @@
     flex: 1;
     display: flex;
     flex-direction: column;
+    overflow: hidden;
+  }
+
+  /*
+   * Transition wrapper for the active route. Must replicate
+   * `.page-container`'s layout so pages that rely on `flex: 1` to fill the
+   * viewport (and their inner scroll areas) behave identically whether or
+   * not this wrapper is present. `min-height: 0` lets inner overflow:auto
+   * regions shrink correctly inside the flex column.
+   */
+  .route-view {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
     overflow: hidden;
   }
 
