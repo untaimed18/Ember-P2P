@@ -1555,6 +1555,8 @@
   "settings_reset_spam_data": "Reset learned spam data",
   "settings_search_timeout_label": "Search timeout (seconds)",
   "settings_search_timeout_hint": "How long to wait for global search, source lookup, and file notes (30\u2013600).",
+  "settings_save_search_history": "Save search history",
+  "settings_save_search_history_hint": "Remember recent search queries and suggest them when you start a new search. Turning this off clears your existing history and stops saving new searches.",
   "settings_filename_cleanups_label": "Filename Cleanup Strings",
   "settings_filename_cleanups_hint_prefix": "Pipe-separated substrings stripped from filenames in search and library views (e.g.",
   "settings_filename_cleanups_hint_suffix": "). Leave empty to disable cleanup.",

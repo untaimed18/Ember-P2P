@@ -8,6 +8,7 @@
     recentKey,
     recentMax = 10,
     maxLength = 256,
+    historyEnabled = true,
   }: {
     value?: string;
     placeholder?: string;
@@ -24,6 +25,13 @@
     /** Maximum accepted query length (characters); guards backend/UI from
      *  pathologically long pasted/automated input. */
     maxLength?: number;
+    /**
+     * Gate for persisting `recentKey` history (driven by the "Save search
+     * history" setting). When false the component neither loads nor saves
+     * recent queries and purges any already-stored history. Defaults to true
+     * so callers that don't opt out keep the prior save-by-default behavior.
+     */
+    historyEnabled?: boolean;
   } = $props();
 
   let recent: string[] = $state([]);
@@ -49,13 +57,13 @@
   }
 
   function saveRecent() {
-    if (!recentKey) return;
+    if (!recentKey || !historyEnabled) return;
     try { localStorage.setItem(recentKey, JSON.stringify(recent)); } catch { /* quota — non-fatal */ }
   }
 
   function addRecent(q: string) {
     const trimmed = q.trim();
-    if (!trimmed || !recentKey) return;
+    if (!trimmed || !recentKey || !historyEnabled) return;
     // De-dupe case-insensitively but keep the most recent casing.
     const lower = trimmed.toLowerCase();
     const filtered = recent.filter((r) => r.toLowerCase() !== lower);
@@ -124,7 +132,7 @@
   }
 
   function handleFocus() {
-    if (recentKey && recent.length > 0) {
+    if (recentKey && historyEnabled && recent.length > 0) {
       showRecent = true;
     }
   }
@@ -139,7 +147,19 @@
   }
 
   $effect(() => {
-    loadRecent();
+    if (!recentKey) return;
+    if (historyEnabled) {
+      loadRecent();
+    } else {
+      // History disabled (via the "Save search history" setting): drop the
+      // in-memory list, close the dropdown, and purge the persisted entries so
+      // turning the setting off actually erases past queries rather than just
+      // hiding them. Re-enabling later starts fresh.
+      recent = [];
+      showRecent = false;
+      activeIndex = -1;
+      try { localStorage.removeItem(recentKey); } catch { /* ignore */ }
+    }
   });
 </script>
 

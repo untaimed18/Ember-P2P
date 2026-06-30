@@ -358,6 +358,10 @@ export interface AppSettings {
   max_download_file_size_gib: number;
   /** Global search / find-sources / find-notes timeout in seconds (30–600) */
   search_timeout_secs: number;
+  /** When false, recent search queries are no longer persisted to local
+   *  storage (the search-history dropdown), and any existing history is
+   *  cleared. Defaults to true. */
+  save_search_history: boolean;
   setup_complete: boolean;
   /** Require approval before granting friend-slot priority */
   friend_require_approval: boolean;
