@@ -21,6 +21,7 @@
   } from '$lib/utils';
   import { onMount, onDestroy, untrack } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
+  import { fade } from 'svelte/transition';
   import type { UnlistenFn } from '@tauri-apps/api/event';
   import type { Transfer, SourceInfo, UploadQueueClient, KnownClient } from '$lib/types';
   import * as m from '$lib/paraglide/messages';
@@ -2692,7 +2693,7 @@
                 {@const waitCallbackCount = visibleSources.filter(s => s.status === 'wait_callback').length}
                 {@const connectCount = visibleSources.filter(s => s.status === 'connecting').length}
                 {@const otherCount = visibleSources.length - xferCount - queuedCount - connectCount - waitCallbackCount}
-                <tr class="source-child-row source-summary-row">
+                <tr class="source-child-row source-summary-row" in:fade={{ duration: 150 }}>
                   <td class="source-child-cell" colspan={dlColCount}>
                     <span class="source-summary">
                       <strong>{visibleSources.length}</strong> {visibleSources.length === 1 ? m.transfers_known_peers_one() : m.transfers_known_peers_other()}
@@ -2706,7 +2707,7 @@
                   </td>
                 </tr>
                 {#each visibleSources as src (src.ip + ':' + src.port)}
-                  <tr class="source-child-row src-{src.status}">
+                  <tr class="source-child-row src-{src.status}" in:fade={{ duration: 150 }}>
                     <td class="source-child-cell" colspan={dlColCount}>
                       <span class="source-fields">
                         <span class="source-status-dot src-dot-{src.status}" title={src.status}></span>
@@ -2742,7 +2743,7 @@
             <tr class="section-divider-row">
               <td colspan={dlColCount}>
                 <button class="divider-toggle" onclick={() => completedCollapsed = !completedCollapsed}>
-                  <span class="divider-chevron" class:collapsed={completedCollapsed}>{completedCollapsed ? '\u25B6' : '\u25BC'}</span>
+                  <span class="divider-chevron" class:collapsed={completedCollapsed} aria-hidden="true">{'\u25B6'}</span>
                   {m.transfers_completed_failed_section({ count: filteredCompletedDownloads.length })}
                 </button>
               </td>
@@ -4403,7 +4404,15 @@
   }
   .divider-chevron {
     font-size: 8px;
-    transition: transform 0.15s;
+    display: inline-block;
+    /* Rotate a single caret instead of swapping ▶/▼ glyphs so the
+       collapse/expand reads as one continuous motion. Expanded = pointing
+       down (90deg); collapsed = pointing right (0deg). */
+    transform: rotate(90deg);
+    transition: transform 0.15s ease;
+  }
+  .divider-chevron.collapsed {
+    transform: rotate(0deg);
   }
 
   .completed-row { opacity: 1; }

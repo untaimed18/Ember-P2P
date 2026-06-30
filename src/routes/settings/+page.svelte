@@ -1809,6 +1809,23 @@
     box-shadow: var(--shadow-sm);
     overflow: hidden;
     overflow-anchor: none;
+    /*
+     * Subtle section-switch fade+rise. Sections are toggled via
+     * `.hidden { display: none }` (not mount/unmount), and CSS animations
+     * restart whenever an element flips from display:none back to shown — so
+     * this replays each time a section becomes active without any structural
+     * change. No `forwards` fill on purpose: we must not leave a lingering
+     * non-`none` transform, which would turn the card into the containing
+     * block for any position:fixed popover inside it. The keyframe ends at the
+     * card's natural resting state, so dropping the fill causes no snap. The
+     * global prefers-reduced-motion rule neutralizes it.
+     */
+    animation: settings-card-in var(--transition-slow) ease;
+  }
+
+  @keyframes settings-card-in {
+    from { opacity: 0; transform: translateY(6px); }
+    to   { opacity: 1; transform: translateY(0); }
   }
 
   .card.hidden {

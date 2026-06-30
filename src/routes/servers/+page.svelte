@@ -12,6 +12,8 @@
   import type { ServerInfo } from '$lib/types';
   import { onMount, untrack } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
+  import { fade } from 'svelte/transition';
+  import { flip } from 'svelte/animate';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
 
@@ -770,6 +772,8 @@
                   onclick={(e: MouseEvent) => selectServer(server, e)}
                   ondblclick={() => handleDoubleClick(server)}
                   oncontextmenu={(e: MouseEvent) => handleContextMenu(e, server)}
+                  in:fade={{ duration: 150 }}
+                  animate:flip={{ duration: 180 }}
                 >
                   <td class="name-cell">
                     <span class="server-icon" class:connected-icon={isConnected(server)}>S</span>
