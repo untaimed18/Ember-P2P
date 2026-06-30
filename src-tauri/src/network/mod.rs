@@ -2994,6 +2994,16 @@ struct NetworkState {
     /// gets consumed the moment `try_start_from_known` promotes a transfer to
     /// active (server returned sources first).
     download_source_searches: HashMap<SearchId, (String, [u8; 16])>,
+    /// Per-source-search cursor of how many of `search.results` have already
+    /// been streamed into the download (search_id -> processed result count).
+    /// KAD source searches stay alive for ~60s collecting results; rather than
+    /// dumping everything into the download only at completion (which left a
+    /// download visibly starved for up to a minute even when KAD answered
+    /// within seconds), the `search_poll_timer` tick streams freshly-arrived
+    /// reachable sources incrementally — eMule's `CSearch::ProcessResult`
+    /// hands each source to the download the moment a node answers. Entries
+    /// are pruned when their search leaves `download_source_searches`.
+    source_search_stream_cursor: HashMap<SearchId, usize>,
     /// Downloads waiting for sources (transfer_id -> PendingDownload)
     pending_downloads: HashMap<String, PendingDownload>,
     data_dir: PathBuf,
@@ -5484,6 +5494,7 @@ pub async fn start_network(
         udp_search_queue: VecDeque::new(),
         pending_source_searches: HashMap::new(),
         download_source_searches: HashMap::new(),
+        source_search_stream_cursor: HashMap::new(),
         pending_downloads: HashMap::new(),
         data_dir: data_dir.clone(),
         external_ip: None,
@@ -8694,6 +8705,243 @@ pub async fn start_network(
                                 p.last_streamed_count = new_results;
                             }
                         }
+                    }
+                }
+
+                // Stream KAD source-search results into downloads as they
+                // arrive, rather than waiting for the search to complete or
+                // expire (up to ~60s — TIMEOUT_SOURCE 45s + 15s grace). eMule's
+                // `CSearch::ProcessResult` hands each source to the partfile the
+                // moment a node answers; our keyword searches already stream
+                // (block above) but source searches historically only delivered
+                // at completion, so a download sat visibly starved for up to a
+                // minute even when KAD had answered within seconds. Here we push
+                // the freshly-arrived *reachable HighID* ("direct") sources —
+                // the ones that connect and transfer/queue immediately — and
+                // leave the completion handler below as the authoritative
+                // backstop that also drives the firewalled callback / LowID /
+                // type-6 paths and the UI placeholder rows. Every delivery is
+                // idempotent (per-file dedup in `inject_source_into_active_
+                // transfers` and source-manager registration), so re-processing
+                // the same entries at completion is a no-op.
+                if !state.download_source_searches.is_empty() {
+                    let completed_set: std::collections::HashSet<SearchId> =
+                        completed_ids.iter().copied().collect();
+                    // Snapshot work to do while only *reading* state, so the
+                    // mutating pass below isn't fighting the borrow checker over
+                    // `state.search_manager` / `state.download_source_searches`.
+                    let mut to_stream: Vec<(
+                        SearchId,
+                        String,
+                        [u8; 16],
+                        usize,
+                        Vec<kad::messages::SearchResultEntry>,
+                    )> = Vec::new();
+                    for (sid, (tid, fh)) in &state.download_source_searches {
+                        if completed_set.contains(sid) {
+                            // The completion loop handles this sid this tick.
+                            continue;
+                        }
+                        let Some(search) = state.search_manager.get(sid) else {
+                            continue;
+                        };
+                        if !search.search_type.accepts_search_results() {
+                            continue;
+                        }
+                        let total = search.results.len();
+                        let cursor = state
+                            .source_search_stream_cursor
+                            .get(sid)
+                            .copied()
+                            .unwrap_or(0);
+                        if total > cursor {
+                            to_stream.push((
+                                *sid,
+                                tid.clone(),
+                                *fh,
+                                cursor,
+                                search.results[cursor..].to_vec(),
+                            ));
+                        }
+                    }
+
+                    for (sid, transfer_id, fh, cursor, new_entries) in to_stream {
+                        let new_cursor = cursor + new_entries.len();
+                        let all = extract_kad_sources(&new_entries);
+                        // Learn Ember capability / Noise keys from every
+                        // response, mirroring the completion handler so the
+                        // broker/native-dial caches fill regardless of which
+                        // path (stream vs completion) sees a peer first.
+                        for s in &all {
+                            if !s.ip.is_unspecified() && s.tcp_port != 0 {
+                                if s.is_ember_capable
+                                    && state.ember_capable_peers.len() < MAX_EMBER_CAPABLE_PEERS
+                                {
+                                    state.ember_capable_peers.insert((s.ip, s.tcp_port));
+                                }
+                                if let Some(npub) = s.ember_noise_pub {
+                                    record_ember_noise_key(
+                                        &mut state.ember_noise_keys,
+                                        s.ip,
+                                        s.tcp_port,
+                                        npub,
+                                    );
+                                }
+                            }
+                        }
+                        let kad_sources: Vec<KadSource> = all
+                            .into_iter()
+                            .filter(|s| !is_self_source(s, &state))
+                            .collect();
+
+                        // Direct = reachable HighID sources, same filter the
+                        // completion handler uses for `direct_sources`. Type-6
+                        // direct-callback peers are excluded (they go through the
+                        // UDP-punch path at completion).
+                        let direct_callback_present: Vec<(Ipv4Addr, u16)> = kad_sources
+                            .iter()
+                            .filter(|s| {
+                                s.source_type == 6
+                                    && s.udp_port != 0
+                                    && (s.connect_options & 0x08) != 0
+                            })
+                            .map(|s| (s.ip, s.tcp_port))
+                            .collect();
+                        let direct_sources: Vec<&KadSource> = kad_sources
+                            .iter()
+                            .filter(|s| {
+                                s.buddy_ip.is_none()
+                                    && s.tcp_port != 0
+                                    && !s.ip.is_unspecified()
+                                    && s.lowid == 0
+                                    && (s.source_type != 6
+                                        || !direct_callback_present
+                                            .iter()
+                                            .any(|(ip, p)| *ip == s.ip && *p == s.tcp_port))
+                            })
+                            .collect();
+
+                        if direct_sources.is_empty() {
+                            state.source_search_stream_cursor.insert(sid, new_cursor);
+                            continue;
+                        }
+
+                        // Register in the source manager first so the start /
+                        // inject helpers (which read sources from it) and the
+                        // completion backstop all observe the same set.
+                        {
+                            let mut sm = source_manager.write().await;
+                            for ds in &direct_sources {
+                                sm.register_source_full_opts(
+                                    fh,
+                                    ds.ip,
+                                    ds.tcp_port,
+                                    ds.udp_port,
+                                    ds.source_user_hash.unwrap_or([0u8; 16]),
+                                    ds.connect_options,
+                                );
+                            }
+                        }
+
+                        let is_active = state.active_source_senders.contains_key(&transfer_id);
+                        let mut injected = 0usize;
+                        if is_active {
+                            let matching = [transfer_id.clone()];
+                            let dsources: Vec<DownloadSource> = {
+                                let sm = source_manager.read().await;
+                                direct_sources
+                                    .iter()
+                                    .map(|ds| DownloadSource {
+                                        peer_ip: ds.ip.to_string(),
+                                        peer_port: ds.tcp_port,
+                                        available_parts: Vec::new(),
+                                        peer_user_hash: sm
+                                            .get_user_hash(&fh, ds.ip, ds.tcp_port)
+                                            .or(ds.source_user_hash),
+                                        peer_connect_options: sm
+                                            .get_connect_options(&fh, ds.ip, ds.tcp_port)
+                                            .or(Some(ds.connect_options)),
+                                    })
+                                    .collect()
+                            };
+                            for ds in &dsources {
+                                let stats = inject_source_into_active_transfers(
+                                    &mut state, fh, &matching, ds, 0,
+                                );
+                                injected += stats.injected;
+                            }
+                            if injected > 0 {
+                                info!(
+                                    "Streamed {} KAD direct source(s) into active download {} (search {}, mid-search)",
+                                    injected, transfer_id, sid.0
+                                );
+                            }
+                        } else if state.pending_downloads.contains_key(&transfer_id) {
+                            let started = try_start_pending_download_from_known_sources(
+                                &mut state,
+                                &transfer_id,
+                                &transfer_manager,
+                                &source_manager,
+                                &credit_manager,
+                                &bandwidth_limiter,
+                                &dl_event_tx,
+                                &app_handle,
+                                &settings,
+                                &shared_ember_payload,
+                                &ember_payload_generation,
+                                &shared_banned_ips,
+                                &geoip,
+                                &friend_hashes,
+                                ember_hash,
+                                ed25519_pubkey,
+                                ed25519_secret_key,
+                                &stats_manager.sx_counters,
+                            )
+                            .await;
+                            if started {
+                                info!(
+                                    "Streamed {} KAD direct source(s); started download {} mid-search (search {})",
+                                    direct_sources.len(), transfer_id, sid.0
+                                );
+                            }
+                        }
+
+                        // Refresh the visible source count + nudge any open
+                        // drawer without zeroing live active/queued counters the
+                        // multi-source worker maintains.
+                        if injected > 0 || !is_active {
+                            let sm_known = {
+                                let sm = source_manager.read().await;
+                                sm.source_count(&fh) as u32
+                            };
+                            let mut mgr = transfer_manager.write().await;
+                            mgr.update_source_total(&transfer_id, sm_known);
+                            if let Some((sources, active_sources, queued_sources)) =
+                                mgr.source_counts(&transfer_id)
+                            {
+                                let _ = app_handle.emit(
+                                    "transfer-sources",
+                                    &crate::types::TransferSourcesPayload {
+                                        id: &transfer_id,
+                                        sources,
+                                        active_sources,
+                                        queued_sources,
+                                    },
+                                );
+                            }
+                        }
+
+                        state.source_search_stream_cursor.insert(sid, new_cursor);
+                    }
+
+                    // Prune cursors whose search has left the in-flight map
+                    // (completed, cancelled, or evicted) so this can't grow.
+                    if !state.source_search_stream_cursor.is_empty() {
+                        let live: std::collections::HashSet<SearchId> =
+                            state.download_source_searches.keys().copied().collect();
+                        state
+                            .source_search_stream_cursor
+                            .retain(|sid, _| live.contains(sid));
                     }
                 }
 
