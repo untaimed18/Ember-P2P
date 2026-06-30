@@ -80,6 +80,10 @@
   "sidebar_chats_unread_title_other": "{count} unread messages",
   "sidebar_friend_requests_title_one": "1 pending friend request",
   "sidebar_friend_requests_title_other": "{count} pending friend requests",
+  "sidebar_active_downloads_one": "1 active download",
+  "sidebar_active_downloads_other": "{count} active downloads",
+  "sidebar_active_uploads_one": "1 active upload",
+  "sidebar_active_uploads_other": "{count} active uploads",
   "sidebar_nav_with_shortcut_title": "{label} (Alt+{n})",
   "sidebar_dev_link_title": "Ember-native transport diagnostics (developer)",
 
@@ -1340,6 +1344,7 @@
   "transfers_chip_failed": "{count} failed",
   "transfers_unknown_client": "Unknown Client",
   "transfers_parts": "{have}/{total} parts",
+  "transfers_parts_peer": "{peer} already on peer",
   "transfers_parts_title": "Parts available from this source",
   "transfers_failed_sources_hidden_one": "1 failed source hidden",
   "transfers_failed_sources_hidden_other": "{count} failed sources hidden",

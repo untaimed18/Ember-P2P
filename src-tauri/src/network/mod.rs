@@ -20922,6 +20922,9 @@ async fn handle_command_inner(
                                 country_code: None,
                                 user_hash: None,
                                 completed_path: None,
+                                up_part_status: None,
+                                up_part_count: None,
+                                up_peer_part_status: None,
                             };
                             let _ = db_ref.save_transfer(&db_transfer);
                         }
@@ -23752,6 +23755,9 @@ async fn handle_download_event(
                     uploaded: None,
                     direction: None,
                     upload_time: None,
+                    up_part_status: None,
+                    up_part_count: None,
+                    up_peer_part_status: None,
                 },
             );
         }
@@ -24196,6 +24202,9 @@ async fn handle_upload_event(
                 country_code,
                 user_hash,
                 completed_path: None,
+                up_part_status: None,
+                up_part_count: None,
+                up_peer_part_status: None,
             };
             {
                 let mut mgr = transfer_manager.write().await;
@@ -24203,7 +24212,13 @@ async fn handle_upload_event(
             }
             let _ = app_handle.emit("transfer-started", &transfer);
         }
-        UploadEventKind::Progress { uploaded, total } => {
+        UploadEventKind::Progress {
+            uploaded,
+            total,
+            part_status,
+            part_count,
+            peer_part_status,
+        } => {
             let capped_uploaded = if total > 0 {
                 uploaded.min(total)
             } else {
@@ -24219,6 +24234,20 @@ async fn handle_upload_event(
                         let elapsed =
                             (chrono::Utc::now().timestamp() - t.started_at).max(0) as u64 * 1000;
                         t.upload_time = elapsed;
+                        // Persist the served-parts bitmap on the row so the
+                        // 3 s transfer poll keeps the parts bar in sync with
+                        // the live `transfer-progress` events between polls.
+                        if part_status.is_some() {
+                            t.up_part_status = part_status.clone();
+                        }
+                        if part_count.is_some() {
+                            t.up_part_count = part_count;
+                        }
+                        // Always assign (Some or None): keyed by file hash on the
+                        // session side, so if a row stops matching the advertised
+                        // file the dark "peer has" shading clears instead of
+                        // lingering stale.
+                        t.up_peer_part_status = peer_part_status.clone();
                         elapsed
                     })
                     .unwrap_or(0);
@@ -24240,6 +24269,9 @@ async fn handle_upload_event(
                     uploaded: Some(capped_uploaded),
                     direction: Some("upload"),
                     upload_time: Some(upload_time_ms),
+                    up_part_status: part_status,
+                    up_part_count: part_count,
+                    up_peer_part_status: peer_part_status,
                 },
             );
         }
