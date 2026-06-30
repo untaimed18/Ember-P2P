@@ -1555,6 +1555,8 @@
   "settings_reset_spam_data": "Restablecer datos de spam aprendidos",
   "settings_search_timeout_label": "Tiempo de espera de b\u00fasqueda (segundos)",
   "settings_search_timeout_hint": "Cu\u00e1nto esperar a la b\u00fasqueda global, b\u00fasqueda de fuentes y notas de archivos (30\u2013600).",
+  "settings_save_search_history": "Guardar historial de b\u00fasqueda",
+  "settings_save_search_history_hint": "Recuerda las b\u00fasquedas recientes y las sugiere cuando inicias una nueva b\u00fasqueda. Al desactivarlo se borra tu historial actual y se dejan de guardar nuevas b\u00fasquedas.",
   "settings_filename_cleanups_label": "Cadenas de limpieza de nombres",
   "settings_filename_cleanups_hint_prefix": "Subcadenas separadas por barra vertical que se eliminan de los nombres en las vistas de b\u00fasqueda y biblioteca (por ejemplo,",
   "settings_filename_cleanups_hint_suffix": "). D\u00e9jalo vac\u00edo para desactivar la limpieza.",
