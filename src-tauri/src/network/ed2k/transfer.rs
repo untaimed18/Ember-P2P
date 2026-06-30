@@ -2695,7 +2695,7 @@ impl Ed2kDownload {
                 needed = front;
             }
             if retry_round > 0 {
-                warn!(
+                debug!(
                     "Retry round {}/{} for {} hash-failed parts",
                     retry_round,
                     max_part_rounds,
@@ -2762,7 +2762,7 @@ impl Ed2kDownload {
                 // If blocks exceed 4 GiB but the peer doesn't support large files,
                 // filter them out to avoid sending (0,0) clamped garbage requests.
                 if has_large_offsets && !peer_supports_large_files {
-                    warn!(
+                    debug!(
                         "Skipping part {} — offsets exceed 4 GiB but peer lacks large-file support",
                         part_idx
                     );
@@ -2894,7 +2894,7 @@ impl Ed2kDownload {
                             )
                             .await;
                             if !got_any_data {
-                                warn!("Source {} accepted transfer but sent no data in {}s — disconnecting",
+                                debug!("Source {} accepted transfer but sent no data in {}s — disconnecting",
                                     self.source_addr, INITIAL_DATA_TIMEOUT_SECS);
                                 anyhow::bail!(
                                     "peer accepted transfer but sent no data in {}s",
@@ -2940,7 +2940,7 @@ impl Ed2kDownload {
                                 || data.len() != (end - start) as usize
                             {
                                 consecutive_bad_blocks += 1;
-                                warn!("Invalid block offsets: start={start}, end={end}, data_len={}, file_size={} (bad streak: {consecutive_bad_blocks})", data.len(), self.file_size);
+                                debug!("Invalid block offsets: start={start}, end={end}, data_len={}, file_size={} (bad streak: {consecutive_bad_blocks})", data.len(), self.file_size);
                                 if consecutive_bad_blocks >= MAX_CONSECUTIVE_BAD_BLOCKS {
                                     if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
                                         let _ = event_tx
@@ -3080,7 +3080,7 @@ impl Ed2kDownload {
                             let piece_len = decompressed.len() as u64;
                             if start.saturating_add(piece_len) > self.file_size {
                                 consecutive_bad_blocks += 1;
-                                warn!("Compressed block exceeds file size: start={start}, len={piece_len}, file_size={} (bad streak: {consecutive_bad_blocks})", self.file_size);
+                                debug!("Compressed block exceeds file size: start={start}, len={piece_len}, file_size={} (bad streak: {consecutive_bad_blocks})", self.file_size);
                                 if consecutive_bad_blocks >= MAX_CONSECUTIVE_BAD_BLOCKS {
                                     if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
                                         let _ = event_tx
@@ -3578,8 +3578,8 @@ impl Ed2kDownload {
                         .iter()
                         .any(|&(gs, ge)| gs < pe && ge > ps);
                     if part_has_gaps {
-                        warn!(
-                            "Part {} byte budget met but gaps remain — peer likely sent duplicate blocks, marking for retry",
+debug!(
+                        "Part {} byte budget met but gaps remain — peer likely sent duplicate blocks, marking for retry",
                             part_idx
                         );
                         tracker.save();
@@ -3652,7 +3652,7 @@ impl Ed2kDownload {
                                     )
                                     .await
                                     {
-                                        warn!("Failed to send OP_AICHREQUEST: {e}");
+                                        debug!("Failed to send OP_AICHREQUEST: {e}");
                                     } else {
                                         debug!("Sent OP_AICHREQUEST for part {part_idx}, waiting for answer");
                                         recovery_bytes = wait_for_aich_recovery_answer(

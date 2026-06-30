@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use quinn::{ClientConfig, Endpoint, EndpointConfig, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use tracing::{info, warn};
+use tracing::{debug, info};
 
 /// Idle timeout for QUIC connections.
 const IDLE_TIMEOUT_SECS: u64 = 120;
@@ -160,10 +160,10 @@ fn bind_tuned_udp(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
     let socket = std::net::UdpSocket::bind(addr)?;
     let s = socket2::SockRef::from(&socket);
     if let Err(e) = s.set_recv_buffer_size(UDP_RECV_BUFFER_BYTES) {
-        warn!("UDP set_recv_buffer_size({UDP_RECV_BUFFER_BYTES}) failed: {e} (using OS default)");
+        debug!("UDP set_recv_buffer_size({UDP_RECV_BUFFER_BYTES}) failed: {e} (using OS default)");
     }
     if let Err(e) = s.set_send_buffer_size(UDP_SEND_BUFFER_BYTES) {
-        warn!("UDP set_send_buffer_size({UDP_SEND_BUFFER_BYTES}) failed: {e} (using OS default)");
+        debug!("UDP set_send_buffer_size({UDP_SEND_BUFFER_BYTES}) failed: {e} (using OS default)");
     }
     Ok(socket)
 }

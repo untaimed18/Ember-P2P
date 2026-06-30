@@ -94,7 +94,7 @@ pub async fn open_and_run_friend_session(
         anyhow::bail!("expected HelloAnswer, got proto=0x{proto:02X} op=0x{opcode:02X}");
     }
     let (_peer_user_hash, mut hello_caps) = parse_hello_answer(&data).map_err(|e| {
-        tracing::warn!("Failed to parse HelloAnswer from {addr}: {e}");
+        tracing::debug!("Failed to parse HelloAnswer from {addr}: {e}");
         e
     })?;
 

@@ -123,9 +123,9 @@ fn classify_packet_read_result(
         Ok(pkt) => PollReadPacketResult::Packet(pkt),
         Err(e) => {
             if encrypted {
-                warn!("Server packet read error (encrypted): {e}");
+                debug!("Server packet read error (encrypted): {e}");
             } else {
-                warn!("Server packet read error: {e}");
+                debug!("Server packet read error: {e}");
             }
             PollReadPacketResult::Disconnected(e)
         }
