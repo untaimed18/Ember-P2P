@@ -6,6 +6,8 @@
   import { openChat as openChatTab, removeChatForFriend, renameTab as renameChatTab } from '$lib/stores/chatTabs';
   import { onMount } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
+  import { fade, fly } from 'svelte/transition';
+  import { flip } from 'svelte/animate';
   import { toastWarning } from '$lib/stores/toast';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
@@ -588,7 +590,12 @@
       </div>
       <div class="requests-list">
         {#each friendRequests as req (req.sender_hash)}
-          <div class="request-card">
+          <div
+            class="request-card"
+            in:fly={{ y: 6, duration: 200 }}
+            out:fade={{ duration: 150 }}
+            animate:flip={{ duration: 200 }}
+          >
             <div class="request-avatar">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                 <circle cx="12" cy="8" r="4"/>

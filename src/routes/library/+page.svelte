@@ -1917,7 +1917,7 @@
   <div class="collection-section">
     <div class="collection-toggle-bar">
       <button class="collection-toggle" onclick={() => collectionsOpen = !collectionsOpen}>
-        <span class="toggle-arrow">{collectionsOpen ? '\u25BC' : '\u25B6'}</span>
+        <span class="toggle-arrow" class:open={collectionsOpen} aria-hidden="true">{'\u25B6'}</span>
         <span class="collection-title">
           {m.library_collection_label({ name: loadedCollection?.name ?? m.library_loading_ellipsis() })}
           {#if loadedCollection}
@@ -2192,7 +2192,7 @@
         aria-expanded={topPanelOpen}
         onclick={() => (topPanelOpen = !topPanelOpen)}
       >
-        <span class="section-arrow">{topPanelOpen ? '\u25BE' : '\u25B8'}</span>
+        <span class="section-arrow" class:open={topPanelOpen} aria-hidden="true">{'\u25B8'}</span>
         <span class="section-title">{m.library_top_uploads()}</span>
       </button>
       {#if topPanelOpen}
@@ -2832,7 +2832,8 @@
     text-align: left;
   }
   .sidebar-section-header:hover { color: var(--text-primary); }
-  .section-arrow { width: 10px; color: var(--text-muted); font-size: 10px; }
+  .section-arrow { width: 10px; color: var(--text-muted); font-size: 10px; display: inline-block; transition: transform var(--transition-normal) ease; }
+  .section-arrow.open { transform: rotate(90deg); }
   .section-title { flex: 1; }
   .top-metric-switch {
     display: flex;
@@ -3826,7 +3827,8 @@
     text-align: left;
   }
   .collection-toggle:hover { background: var(--bg-hover); }
-  .toggle-arrow { font-size: 10px; color: var(--text-muted); flex-shrink: 0; }
+  .toggle-arrow { font-size: 10px; color: var(--text-muted); flex-shrink: 0; display: inline-block; transition: transform var(--transition-normal) ease; }
+  .toggle-arrow.open { transform: rotate(90deg); }
   .collection-title { flex: 1; font-weight: 600; }
   .collection-meta { font-weight: 400; color: var(--text-muted); font-size: 12px; margin-left: 6px; }
   .coll-action-btn {
