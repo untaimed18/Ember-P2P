@@ -185,8 +185,18 @@ impl Ed2kServerConnection {
         // Only advertise crypto preference when we're actually on an encrypted connection.
         // Lugdunum servers close plain connections from clients that claim SRVCAP_REQUESTCRYPT,
         // expecting them to reconnect on the obfuscation port.
+        //
+        // Match eMule's default crypt prefs here: SUPPORT + REQUEST, but NOT
+        // REQUIRE. Stock eMule sets SRVCAP_REQUIRECRYPT only when the user opts
+        // into "require obfuscated" (off by default), so advertising it
+        // unconditionally was more aggressive than any vanilla client. These
+        // bits are relayed to peers (they describe how others should connect to
+        // *us*), so dropping REQUIRE doesn't reduce the sources we receive — it
+        // just stops us from looking like a require-only client to strict
+        // lugdunum servers (e.g. eMule Security) that have been observed
+        // dropping the obfuscated login after a valid DH handshake.
         if is_encrypted {
-            flags |= SRVCAP_SUPPORTCRYPT | SRVCAP_REQUESTCRYPT | SRVCAP_REQUIRECRYPT;
+            flags |= SRVCAP_SUPPORTCRYPT | SRVCAP_REQUESTCRYPT;
         }
         let payload = build_login_request(user_hash, tcp_port, nickname, flags);
         info!(
@@ -1148,6 +1158,11 @@ const SRVCAP_UNICODE: u32 = 0x0010;
 const SRVCAP_LARGEFILES: u32 = 0x0100;
 const SRVCAP_SUPPORTCRYPT: u32 = 0x0200;
 const SRVCAP_REQUESTCRYPT: u32 = 0x0400;
+// Documented for completeness but intentionally never advertised: stock eMule
+// only sets this when the user enables "require obfuscated server connection"
+// (off by default), and advertising it unconditionally made strict lugdunum
+// servers drop our obfuscated login. See `login()`.
+#[allow(dead_code)]
 const SRVCAP_REQUIRECRYPT: u32 = 0x0800;
 
 const CT_NAME: u8 = 0x01;
