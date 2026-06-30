@@ -1183,6 +1183,13 @@
             <span class="hint">{m.settings_filename_cleanups_hint_prefix()} <code>{m.settings_filename_cleanups_placeholder()}</code>{m.settings_filename_cleanups_hint_suffix()}</span>
             <input id="filename-cleanups" type="text" bind:value={settings.filename_cleanups} placeholder={m.settings_filename_cleanups_placeholder()} />
           </div>
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">{m.settings_save_search_history()}</span>
+              <span class="hint">{m.settings_save_search_history_hint()}</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.save_search_history} ariaLabel={m.settings_save_search_history()} />
+          </div>
         </div>
       </section>
 
