@@ -770,7 +770,7 @@ async fn register_or_refresh_pending_kad_callback(
         keys.push(upload_server::PendingKadCallbackKey::SourceIp(source_ip));
     }
     if keys.is_empty() {
-        warn!(
+        debug!(
             "Skipping pending KAD callback for {}: no TAG_SOURCEIP and no publisher user hash",
             hex::encode(file_hash),
         );
@@ -1144,7 +1144,7 @@ fn inject_source_into_active_transfers(
         );
     }
     if stats.dropped_full > 0 || stats.dropped_closed > 0 {
-        warn!(
+        debug!(
             "Source {}:{} for {} had drops: full={}, overflowed={}, closed={} (stale: {:?})",
             source.peer_ip,
             source.peer_port,
@@ -1203,7 +1203,7 @@ async fn try_connect_server(
                     return Ok((conn, enc_addr));
                 }
                 Err(e) => {
-                    warn!("Encrypted DH connection to server {ip}:{enc_port} failed: {e}, falling back to plain");
+                    debug!("Encrypted DH connection to server {ip}:{enc_port} failed: {e}, falling back to plain");
                     emit_server_log(
                         app,
                         &format!("Encrypted connection failed, trying plain TCP on port {port}..."),
@@ -1510,7 +1510,7 @@ fn spawn_rendezvous_friend_lookup(
                 );
             }
             Err(e) => {
-                warn!(
+                debug!(
                     "Rendezvous lookup failed for {}: {e}",
                     hex::encode(target_hash)
                 );
@@ -3382,7 +3382,7 @@ async fn handle_server_disconnect(
     app_handle: &tauri::AppHandle,
     reason: &str,
 ) {
-    warn!("Server connection lost: {reason}");
+    debug!("Server connection lost: {reason}");
     emit_server_log(app_handle, &format!("Server disconnected: {reason}"));
     if let Some(handle) = state.pending_server_connect.take() {
         handle.abort();
@@ -3793,7 +3793,7 @@ async fn try_start_pending_download_from_known_sources(
     let tx = dl_event_tx.clone();
     let tx2 = tx.clone();
     if let Some(old_handle) = state.download_handles.remove(&dl_tid2) {
-        warn!(
+        debug!(
             "Aborting existing download task for {dl_tid2} before starting multi-source download"
         );
         old_handle.abort();
@@ -4572,7 +4572,7 @@ pub async fn start_network(
     // succeed.
     if upnp_enabled {
         if !upnp_success {
-            warn!(
+            debug!(
                 "UPnP initial port mapping failed; keeping UPnP enabled and \
                  retrying in the background (set up manual port forwarding if \
                  peers can't reach you)"
@@ -6022,7 +6022,7 @@ pub async fn start_network(
                         }
                     }
                     Err(e) => {
-                        warn!("UDP recv error: {e}");
+                        debug!("UDP recv error: {e}");
                     }
                 }
                 // Process up to 19 more queued packets without re-entering select
@@ -6221,7 +6221,7 @@ pub async fn start_network(
                                 file_type: String::new(),
                             }];
                             if let Err(e) = conn.offer_files(&offer, settings.tcp_port).await {
-                                warn!("Failed to offer new partial to server: {e}");
+                                debug!("Failed to offer new partial to server: {e}");
                             }
                         }
                     }
@@ -6430,7 +6430,7 @@ pub async fn start_network(
                                             file_type: String::new(),
                                         }];
                                         if let Err(e) = conn.offer_files(&offer, state.tcp_port).await {
-                                            warn!("Failed to offer completed download to server: {e}");
+                                            debug!("Failed to offer completed download to server: {e}");
                                         }
                                     }
                                 }
@@ -9921,7 +9921,7 @@ pub async fn start_network(
                             });
                         });
                     } else {
-                        warn!("Initial rendezvous register skipped: external_ip unexpectedly None");
+                        debug!("Initial rendezvous register skipped: external_ip unexpectedly None");
                     }
                 }
 
@@ -10626,7 +10626,7 @@ pub async fn start_network(
                                     if let Err(e) = ember::relay::register_punch(
                                         &rv_url, &our_id, &target_id, port, nat_type_val,
                                     ).await {
-                                        tracing::warn!("Broker: punch register failed for {attempt_key_owned}: {e}");
+                                        tracing::debug!("Broker: punch register failed for {attempt_key_owned}: {e}");
                                         if let Err(send_err) = broker_tx.try_send(ember::broker::BrokerEvent::PunchFailed {
                                             attempt_key: attempt_key_owned,
                                             reason: format!("register failed: {e}"),
@@ -10731,7 +10731,7 @@ pub async fn start_network(
                                             )).await;
                                         }
                                         Err(e) => {
-                                            tracing::warn!("Broker: QUIC punch failed for {attempt_key_owned}: {e}");
+                                            tracing::debug!("Broker: QUIC punch failed for {attempt_key_owned}: {e}");
                                             if let Err(send_err) = broker_tx.try_send(ember::broker::BrokerEvent::PunchFailed {
                                                 attempt_key: attempt_key_owned,
                                                 reason: e,
@@ -10805,7 +10805,7 @@ pub async fn start_network(
                                                 )).await;
                                             }
                                             Err(e) => {
-                                                tracing::warn!("Broker: peer relay failed: {e}");
+                                                tracing::debug!("Broker: peer relay failed: {e}");
                                                 if let Err(send_err) = broker_tx.try_send(ember::broker::BrokerEvent::RelayFailed {
                                                     attempt_key: attempt_key_owned,
                                                     reason: e,
@@ -10900,7 +10900,7 @@ pub async fn start_network(
                                                 )).await;
                                             }
                                             Ok(Err(e)) => {
-                                                tracing::warn!("Broker: server relay failed: {e}");
+                                                tracing::debug!("Broker: server relay failed: {e}");
                                                 if let Err(send_err) = broker_tx.try_send(ember::broker::BrokerEvent::RelayFailed {
                                                     attempt_key: attempt_key_owned,
                                                     reason: e,
@@ -10927,7 +10927,7 @@ pub async fn start_network(
                                         }
                                     });
                                 } else {
-                                    tracing::warn!("Broker: no peer relay candidate and no rendezvous URL for {attempt_key_owned}");
+                                    tracing::debug!("Broker: no peer relay candidate and no rendezvous URL for {attempt_key_owned}");
                                     tokio::spawn(async move {
                                         let Some(broker_tx) = broker_tx else { return; };
                                         if let Err(send_err) = broker_tx.try_send(ember::broker::BrokerEvent::RelayFailed {
@@ -11006,7 +11006,7 @@ pub async fn start_network(
                                             }
                                         }
                                         Err(e) => {
-                                            tracing::warn!(
+                                            tracing::debug!(
                                                 "Broker: Ember client Hello failed for {greet_peer_ip}:{greet_peer_port}: {e}"
                                             );
                                         }
@@ -11023,7 +11023,7 @@ pub async fn start_network(
                                 }
                             }
                             ember::broker::BrokerEvent::ConnectionFailed { ref transfer_id, source_ip, source_port, ref reason } => {
-                                tracing::warn!("Broker: all methods failed for {}:{} (transfer {}): {}", source_ip, source_port, transfer_id, reason);
+                                tracing::debug!("Broker: all methods failed for {}:{} (transfer {}): {}", source_ip, source_port, transfer_id, reason);
                                 if let Some(pfs) = state.per_file_sources.get_mut(transfer_id) {
                                     pfs.set_low_to_low(source_ip, source_port);
                                 }
@@ -11180,7 +11180,7 @@ pub async fn start_network(
                     if let Some(last_contact) = state.last_kad_contact {
                         let now_dc = chrono::Utc::now().timestamp();
                         if now_dc - last_contact > KAD_DISCONNECT_DELAY_SECS {
-                            warn!(
+                            debug!(
                                 "No KAD contact for {}s, resetting to Connecting (eMule KADEMLIADISCONNECTDELAY)",
                                 now_dc - last_contact
                             );
@@ -12934,7 +12934,7 @@ pub async fn start_network(
                                 0,
                             );
                             if stats.dropped_full > 0 || stats.dropped_closed > 0 {
-                                warn!(
+                                debug!(
                                     "A4AF swap: source {} for {} matched {} active downloads, injected={}, preserved={}, full={}, overflowed={}, closed={}",
                                     swap.peer_addr,
                                     target_hex,
@@ -13406,7 +13406,7 @@ pub async fn start_network(
                                                     0,
                                                 );
                                                 if stats.dropped_full > 0 || stats.dropped_closed > 0 {
-                                                    warn!(
+                                                    debug!(
                                                         "Server sources: source {}:{} for {} matched {} active downloads, injected={}, preserved={}, full={}, overflowed={}, closed={}",
                                                         src.ip,
                                                         src.port,
@@ -13548,7 +13548,7 @@ pub async fn start_network(
                                                 0,
                                             );
                                             if stats.dropped_full > 0 || stats.dropped_closed > 0 {
-                                                warn!(
+                                                debug!(
                                                     "Callback source: peer {}:{} for {} matched {} active downloads, injected={}, preserved={}, full={}, overflowed={}, closed={}",
                                                     ip,
                                                     port,
@@ -13752,7 +13752,7 @@ pub async fn start_network(
                                     match conn.login(&user_hash, &nickname, tcp_port).await {
                                         Ok(session) => return Ok((conn, session, resolved_addr)),
                                         Err(login_err) if conn.is_encrypted() => {
-                                            warn!("Encrypted login to {ip}:{port} failed: {login_err}, falling back to plain TCP");
+                                            debug!("Encrypted login to {ip}:{port} failed: {login_err}, falling back to plain TCP");
                                             emit_server_log(
                                                 &app_for_auto,
                                                 &format!("Encrypted login failed ({login_err}), trying plain TCP..."),
@@ -14081,7 +14081,7 @@ pub async fn start_network(
                                             0,
                                         );
                                         if stats.dropped_full > 0 || stats.dropped_closed > 0 {
-                                            warn!(
+                                            debug!(
                                                 "UDP sources: source {}:{} for {} matched {} active downloads, injected={}, preserved={}, full={}, overflowed={}, closed={}",
                                                 ip,
                                                 port,
@@ -14399,7 +14399,7 @@ pub async fn start_network(
                             // client to ask. Without this our `add_servers_from_server`
                             // setting was effectively dead for the common case.
                             if let Err(e) = conn.request_server_list().await {
-                                warn!("Failed to send OP_GETSERVERLIST: {e}");
+                                debug!("Failed to send OP_GETSERVERLIST: {e}");
                             }
                         }
 
@@ -14472,7 +14472,7 @@ pub async fn start_network(
                             if !offer_files.is_empty() {
                                 info!("Offering {} files to server ({} complete, {} partial)", offer_files.len(), complete_count, partial_count);
                                 if let Err(e) = conn.offer_files(&offer_files, settings.tcp_port).await {
-                                    warn!("Failed to send OP_OFFERFILES: {e}");
+                                    debug!("Failed to send OP_OFFERFILES: {e}");
                                 }
                             } else {
                                 warn!("No files to offer to server after login — check shared folders");
@@ -14570,7 +14570,7 @@ pub async fn start_network(
                         }
                     }
                     Ok(ServerConnectResult { ip, port, result: Err(e), .. }) => {
-                        warn!("Failed to connect to server {ip}:{port}: {e}");
+                        debug!("Failed to connect to server {ip}:{port}: {e}");
                         emit_server_log(&app_handle, &format!("Connection failed: {e}"));
                         state.server_reconnect_failures = state.server_reconnect_failures.saturating_add(1);
                         *shared_server_addr.write().await = None;
@@ -14708,7 +14708,7 @@ pub async fn start_network(
                                 let tx = dl_event_tx.clone();
                                 let tx2 = tx.clone();
                                 if let Some(old_handle) = state.download_handles.remove(&dl_tid) {
-                                    warn!("Aborting existing download task for {dl_tid} before starting callback multi-source download");
+                                    debug!("Aborting existing download task for {dl_tid} before starting callback multi-source download");
                                     old_handle.abort();
                                 }
                                 let dl_tid2 = dl_tid.clone();
@@ -15437,9 +15437,9 @@ pub async fn start_network(
                     }
                     Err(e) => {
                         if result.initial {
-                            warn!("Initial rendezvous register failed: {e}");
+                            debug!("Initial rendezvous register failed: {e}");
                         } else {
-                            warn!("Rendezvous heartbeat failed: {e}");
+                            debug!("Rendezvous heartbeat failed: {e}");
                         }
                         state.rendezvous_registered = false;
                         state.rendezvous_last_register = None;
@@ -16069,7 +16069,7 @@ pub async fn start_network(
                     for pending in state.pending_downloads.values_mut() {
                         pending.last_search_at = 0;
                     }
-                    warn!(
+                    debug!(
                         "Watchdog: no UDP activity for {}s with {} pending downloads; forcing immediate source refresh",
                         now.saturating_sub(last_kad_activity_at),
                         state.pending_downloads.len()
@@ -16742,8 +16742,8 @@ pub async fn start_network(
         .await
         {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => warn!("Failed to unregister from rendezvous server: {e}"),
-            Err(_) => warn!("Rendezvous unregister timed out on shutdown; skipping"),
+            Ok(Err(e)) => debug!("Failed to unregister from rendezvous server: {e}"),
+            Err(_) => debug!("Rendezvous unregister timed out on shutdown; skipping"),
         }
     }
 
@@ -18079,9 +18079,9 @@ async fn handle_udp_packet_inner(
     if let Some(opcode) = response_opcode {
         if !state.flood_protection.validate_response(from, opcode) {
             if opcode == 0x3B {
-                warn!("Dropping unsolicited SearchRes from {from} (no matching outgoing SearchKeyReq)");
+                debug!("Dropping unsolicited SearchRes from {from} (no matching outgoing SearchKeyReq)");
             } else if opcode == 0x5A {
-                warn!("Dropping unsolicited FindBuddyRes from {from} (no matching tracked FindBuddyReq)");
+                debug!("Dropping unsolicited FindBuddyRes from {from} (no matching tracked FindBuddyReq)");
             } else if opcode == 0x4B {
                 // Track PublishRes rejections separately so the Publish
                 // cycle log can tell us whether the ack counter is being
@@ -18477,7 +18477,7 @@ async fn handle_udp_packet_inner(
             let wants_ack = kad_options & 0x04 != 0;
             if wants_ack {
                 if packet_sender_udp_key.is_none() {
-                    warn!("Ignoring HelloRes ACK request from {from}: packet did not include a sender UDP key");
+                    debug!("Ignoring HelloRes ACK request from {from}: packet did not include a sender UDP key");
                 }
                 let ack = KadMessage::HelloResAck {
                     sender_id: state.local_id,
@@ -18526,7 +18526,7 @@ async fn handle_udp_packet_inner(
                 _ => return,
             };
             if !packet_valid_receiver_key {
-                warn!("Ignoring HelloResAck from {from}: invalid receiver key");
+                debug!("Ignoring HelloResAck from {from}: invalid receiver key");
                 return;
             }
             let valid_sender = state
@@ -18535,7 +18535,7 @@ async fn handle_udp_packet_inner(
                 .map(|contact| contact.ip == sender_ip)
                 .unwrap_or(false);
             if !valid_sender {
-                warn!(
+                debug!(
                     "Ignoring HelloResAck from {from}: sender {} does not match routing table",
                     sender_id
                 );
@@ -18605,7 +18605,7 @@ async fn handle_udp_packet_inner(
             // Peers commonly return more contacts than requested (e.g. 4 for a
             // FIND_VALUE request asking for 2).
             let contacts = if contacts.len() > KADEMLIA_FIND_NODE as usize {
-                warn!(
+                debug!(
                     "KadRes from {from}: contact count {} exceeds max {}, truncating",
                     contacts.len(),
                     KADEMLIA_FIND_NODE
@@ -19045,7 +19045,7 @@ async fn handle_udp_packet_inner(
                     info!("Node {from} reported full load, will avoid publishing to it for 10 min");
                 }
             } else if load > 80 {
-                warn!("High DHT load ({load}) from {from} for target {target}");
+                debug!("High DHT load ({load}) from {from} for target {target}");
             }
         }
 
@@ -19113,7 +19113,7 @@ async fn handle_udp_packet_inner(
                 match parse_kad_search_expression(&search_terms) {
                     Some(expr) => Some(expr),
                     None => {
-                        warn!("Ignoring SearchKeyReq from {from}: invalid restrictive search expression");
+                        debug!("Ignoring SearchKeyReq from {from}: invalid restrictive search expression");
                         return;
                     }
                 }
@@ -19620,7 +19620,7 @@ async fn handle_udp_packet_inner(
                 _ => return,
             };
             if !state.firewall_checker.is_firewall_check_ip(sender_ip) {
-                tracing::warn!("Ignoring unrequested FirewalledRes from {from}");
+                tracing::debug!("Ignoring unrequested FirewalledRes from {from}");
                 return;
             }
             let external_ip = Ipv4Addr::from(ip.to_be_bytes());
@@ -19847,7 +19847,7 @@ async fn handle_udp_packet_inner(
                 _ => return,
             };
             if !state.firewall_checker.is_udp_firewall_check_ip(sender_ip) {
-                warn!("Ignoring unsolicited FirewallUdp from {from}");
+                debug!("Ignoring unsolicited FirewallUdp from {from}");
                 return;
             }
             let expected_internal = state.udp_port;
@@ -19857,7 +19857,7 @@ async fn handle_udp_packet_inner(
                 .or(state.external_udp_port)
                 .unwrap_or(0);
             if udp_port == 0 || (udp_port != expected_internal && udp_port != expected_external) {
-                warn!(
+                debug!(
                     "Ignoring FirewallUdp from {from}: unexpected incoming port {} (internal={}, external={})",
                     udp_port, expected_internal, expected_external
                 );
@@ -19968,14 +19968,14 @@ async fn handle_udp_packet_inner(
                 None
             };
             if expected_buddy_target != Some(buddy_id) {
-                warn!(
+                debug!(
                     "Ignoring FindBuddyRes from {from}: unexpected buddy target {} (expected {:?})",
                     buddy_id, expected_buddy_target
                 );
                 return;
             }
             if peer_tcp_port == 0 {
-                warn!("Ignoring FindBuddyRes from {from}: missing TCP port");
+                debug!("Ignoring FindBuddyRes from {from}: missing TCP port");
                 return;
             }
             if state.buddy_manager.state() == BuddyState::FindingBuddy
@@ -20036,7 +20036,7 @@ async fn handle_udp_packet_inner(
                 if relayed {
                     debug!("Callback relayed via OP_CALLBACK to buddy");
                 } else {
-                    warn!("Failed to relay callback to buddy");
+                    debug!("Failed to relay callback to buddy");
                 }
             }
         }
@@ -20256,7 +20256,7 @@ async fn handle_command_inner(
                             info!("TCP server search started for '{query}'");
                         }
                         Err(e) => {
-                            warn!("TCP server search failed to send: {e}");
+                            debug!("TCP server search failed to send: {e}");
                         }
                     }
                     state.server_connection = Some(conn);
@@ -20717,7 +20717,7 @@ async fn handle_command_inner(
                     .insert(tid.clone(), est_inject_tx);
                 let tx2 = tx.clone();
                 if let Some(old_handle) = state.download_handles.remove(&tid2) {
-                    warn!("Aborting existing download task for {tid2} before starting new one");
+                    debug!("Aborting existing download task for {tid2} before starting new one");
                     old_handle.abort();
                 }
                 let handle = tokio::spawn(async move {
@@ -20866,7 +20866,7 @@ async fn handle_command_inner(
                     .routing_table
                     .find_closest_prefer_verified(&kad_hash, SEARCH_INITIAL_CONTACTS);
                 if closest.is_empty() {
-                    warn!("No routing table contacts for source search, download will retry later");
+                    debug!("No routing table contacts for source search, download will retry later");
                 }
 
                 let now = chrono::Utc::now().timestamp();
@@ -21122,7 +21122,7 @@ async fn handle_command_inner(
                 .find_closest_prefer_verified(&file_hash, SEARCH_INITIAL_CONTACTS);
 
             if closest.is_empty() {
-                warn!("No contacts to publish note to");
+                debug!("No contacts to publish note to");
                 return;
             }
 
@@ -21130,7 +21130,7 @@ async fn handle_command_inner(
                 .search_manager
                 .start_search(file_hash, SearchType::StoreNotes, closest);
             if sid == SearchId(0) {
-                warn!("Failed to start StoreNotes search: too many active searches");
+                debug!("Failed to start StoreNotes search: too many active searches");
             } else {
                 state.pending_note_publishes.insert(
                     sid,
@@ -21886,9 +21886,9 @@ async fn handle_command_inner(
                     {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => {
-                            warn!("Failed to unregister from rendezvous server on disconnect: {e}")
+                            debug!("Failed to unregister from rendezvous server on disconnect: {e}")
                         }
-                        Err(_) => warn!("Rendezvous unregister timed out on disconnect; skipping"),
+                        Err(_) => debug!("Rendezvous unregister timed out on disconnect; skipping"),
                     }
                 });
             }
@@ -22415,7 +22415,7 @@ async fn handle_command_inner(
                         match conn.login(&user_hash, &nickname, tcp_port).await {
                             Ok(session) => return Ok((conn, session, resolved_addr)),
                             Err(login_err) if conn.is_encrypted() => {
-                                warn!("Encrypted login to {ip_clone}:{port} failed: {login_err}, falling back to plain TCP");
+                                debug!("Encrypted login to {ip_clone}:{port} failed: {login_err}, falling back to plain TCP");
                                 emit_server_log(
                                     &app_for_connect,
                                     &format!("Encrypted login failed ({login_err}), trying plain TCP..."),
@@ -22808,7 +22808,7 @@ async fn handle_command_inner(
                         }
                     }
                     if let Err(e) = conn.offer_files(&offer_files, settings.tcp_port).await {
-                        warn!("Failed to re-send OP_OFFERFILES: {e}");
+                        debug!("Failed to re-send OP_OFFERFILES: {e}");
                     }
                 }
             }

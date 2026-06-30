@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// STUN reflectors used for NAT detection. Listed in attempt order; the
 /// probe walks the whole list so a single dead host doesn't kill the
@@ -176,9 +176,9 @@ fn build_nat_info_from_results(
             .collect::<Vec<_>>()
             .join("; ");
         if detail.is_empty() {
-            warn!("NAT probe: all STUN servers failed");
+            debug!("NAT probe: all STUN servers failed");
         } else {
-            warn!("NAT probe: all STUN servers failed ({detail})");
+            debug!("NAT probe: all STUN servers failed ({detail})");
         }
         return NatInfo {
             nat_type: NatType::Unknown,

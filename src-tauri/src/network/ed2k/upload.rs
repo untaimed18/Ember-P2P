@@ -4352,7 +4352,7 @@ impl UploadHandler {
                         .into_iter()
                         .filter(|&(start, end)| {
                             if end > total_size {
-                                warn!("Peer requested range past file end: {end} > {total_size}");
+                                debug!("Peer requested range past file end: {end} > {total_size}");
                                 false
                             } else if start >= end {
                                 false
@@ -4576,7 +4576,7 @@ impl UploadHandler {
                             // both checks; the old gap-only check missed
                             // the verified-but-unchecked case.
                             if !tracker.is_range_safe_to_serve(start, end) {
-                                warn!(
+                                debug!(
                                     "Rejected upload of incomplete or unverified range {}-{} for {}",
                                     start,
                                     end,

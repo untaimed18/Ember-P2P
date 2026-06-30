@@ -41,7 +41,7 @@ fn relay_http_client() -> reqwest::Client {
             // of failing). The HTTPS requirement itself is still enforced
             // independently by `require_https` at every call site, so even
             // this degraded client can't be used against a plain-HTTP URL.
-            tracing::warn!(
+            tracing::debug!(
                 "relay http client builder failed ({e}); falling back to a no-proxy timeout client"
             );
             reqwest::Client::builder()

@@ -1681,7 +1681,7 @@ impl MultiSourceDownload {
                         // don't penalize (and eventually evict) a good peer.
                         info!("Source {} ({}): stopped by user", src_idx, fail_ip);
                     } else {
-                        warn!("Source {} ({}) failed: {e:#}", src_idx, fail_ip);
+                        debug!("Source {} ({}) failed: {e:#}", src_idx, fail_ip);
                         let _ = fail_etx
                             .send(DownloadEvent::SourceDetail {
                                 transfer_id: fail_tid,
@@ -1812,7 +1812,7 @@ impl MultiSourceDownload {
                                 );
                             }
                             Some(Ok((src_idx, parts, Err(e)))) => {
-                                tracing::warn!(
+                                tracing::debug!(
                                     "source task {src_idx} for parts {:?} ended with error: {e}",
                                     parts
                                 );
@@ -2005,7 +2005,7 @@ impl MultiSourceDownload {
                                 if let Err(e) = &result {
                                     if !super::transfer::is_queue_detached_error(&e.to_string())
                                         && !super::transfer::is_user_cancel_error(&e.to_string()) {
-                                        warn!("Injected source {} ({}) failed: {e:#}", src_idx, fail_ip);
+                                        debug!("Injected source {} ({}) failed: {e:#}", src_idx, fail_ip);
                                         let _ = fail_etx.send(DownloadEvent::SourceDetail {
                                             transfer_id: fail_tid,
                                             ip: fail_ip,
@@ -2228,7 +2228,7 @@ impl MultiSourceDownload {
                                 if let Err(e) = &result {
                                     if !super::transfer::is_queue_detached_error(&e.to_string())
                                         && !super::transfer::is_user_cancel_error(&e.to_string()) {
-                                        warn!("Pre-established source {} ({}) failed: {e:#}", src_idx, fail_ip);
+                                        debug!("Pre-established source {} ({}) failed: {e:#}", src_idx, fail_ip);
                                         let _ = fail_etx.send(DownloadEvent::SourceDetail {
                                             transfer_id: fail_tid,
                                             ip: fail_ip,
@@ -2282,7 +2282,7 @@ impl MultiSourceDownload {
                         );
                     }
                     Ok((src_idx, parts, Err(e))) => {
-                        tracing::warn!(
+                        tracing::debug!(
                             "source task {src_idx} for parts {:?} ended with error during drain: {e}",
                             parts
                         );
@@ -2682,7 +2682,7 @@ impl MultiSourceDownload {
                     if let Err(e) = &result {
                         if !super::transfer::is_queue_detached_error(&e.to_string())
                                         && !super::transfer::is_user_cancel_error(&e.to_string()) {
-                            warn!("Adopted callback source {} ({}) failed: {e:#}", src_idx, fail_ip);
+                            debug!("Adopted callback source {} ({}) failed: {e:#}", src_idx, fail_ip);
                             let _ = fail_etx.send(DownloadEvent::SourceDetail {
                                 transfer_id: fail_tid,
                                 ip: fail_ip,
@@ -2959,7 +2959,7 @@ impl MultiSourceDownload {
             }
 
             retry_round += 1;
-            warn!(
+            debug!(
                 "Retry round {}/{}: {} incomplete parts, dialing {} source(s)",
                 retry_round,
                 max_retry_rounds,
@@ -3164,7 +3164,7 @@ impl MultiSourceDownload {
                                 total_parts: None,
                                 country_code: None,
                             }).await;
-                            warn!("Retry source {} failed: {e:#}", src_idx);
+                            debug!("Retry source {} failed: {e:#}", src_idx);
                         }
                     }
                 }));
@@ -4010,7 +4010,7 @@ async fn download_parts_from_source(
         writer = w0;
         let (puh, hcaps) = parse_hello_answer(&hello_ans_data)
             .map_err(|e| {
-                tracing::warn!("Source {}: failed to parse HelloAnswer: {e}", _src_idx);
+                tracing::debug!("Source {}: failed to parse HelloAnswer: {e}", _src_idx);
                 e
             })
             .unwrap_or_else(|_| {
@@ -6533,7 +6533,7 @@ async fn download_parts_from_source(
                                 part_idx,
                                 &[],
                             );
-                            warn!(
+                            debug!(
                             "Source {} ({}) accepted upload for part {} then FINed with zero bytes — marking this peer as missing part {} for this transfer",
                             _src_idx, addr, part_idx, part_idx,
                         );
@@ -6558,7 +6558,7 @@ async fn download_parts_from_source(
                                 && !all_blocks.is_empty()
                             {
                                 no_data_reasserts += 1;
-                                warn!(
+                                debug!(
                                 "Source {} ({}) accepted upload but sent no data in {}s — re-asserting part {} request (attempt {}/{}), staying connected like eMule",
                                 _src_idx, addr, INITIAL_DATA_TIMEOUT_SECS, part_idx,
                                 no_data_reasserts, MAX_NO_DATA_REASSERTS,
@@ -6605,7 +6605,7 @@ async fn download_parts_from_source(
                                 &[],
                             )
                             .await;
-                            warn!("Source {} ({}) accepted transfer but sent no data after {} re-assert(s) — disconnecting",
+                            debug!("Source {} ({}) accepted transfer but sent no data after {} re-assert(s) — disconnecting",
                             _src_idx, addr, no_data_reasserts);
                             anyhow::bail!(
                                 "peer accepted transfer but sent no data after {} re-assert(s)",
@@ -6655,7 +6655,7 @@ async fn download_parts_from_source(
 
                         if start >= end || end > file_size || data.len() != (end - start) as usize {
                             consecutive_bad_blocks += 1;
-                            tracing::warn!("Invalid block offsets from source {_src_idx}: start={start}, end={end}, data={} (bad streak: {consecutive_bad_blocks})", data.len());
+                            tracing::debug!("Invalid block offsets from source {_src_idx}: start={start}, end={end}, data={} (bad streak: {consecutive_bad_blocks})", data.len());
                             if consecutive_bad_blocks >= MAX_CONSECUTIVE_BAD_BLOCKS {
                                 anyhow::bail!("source {_src_idx} sent {consecutive_bad_blocks} consecutive invalid blocks, disconnecting");
                             }
@@ -6671,7 +6671,7 @@ async fn download_parts_from_source(
                         let piece_len = end - start;
                         if piece_len < MIN_BLOCK_BYTES && end != file_size {
                             consecutive_bad_blocks += 1;
-                            tracing::warn!(
+                            tracing::debug!(
                             "source {_src_idx} sent undersized block ({piece_len} bytes); treating as abusive"
                         );
                             if consecutive_bad_blocks >= MAX_CONSECUTIVE_BAD_BLOCKS {
@@ -6844,7 +6844,7 @@ async fn download_parts_from_source(
                         let piece_len = decompressed.len() as u64;
                         if start.saturating_add(piece_len) > file_size {
                             consecutive_bad_blocks += 1;
-                            tracing::warn!("Compressed block exceeds file size from source {_src_idx} (bad streak: {consecutive_bad_blocks})");
+                            tracing::debug!("Compressed block exceeds file size from source {_src_idx} (bad streak: {consecutive_bad_blocks})");
                             if consecutive_bad_blocks >= MAX_CONSECUTIVE_BAD_BLOCKS {
                                 anyhow::bail!("source {_src_idx} sent {consecutive_bad_blocks} consecutive invalid blocks, disconnecting");
                             }
@@ -7678,7 +7678,7 @@ async fn download_parts_from_source(
                 let (ps, pe) = t.part_range(part_idx);
                 let part_has_gaps = t.gap_list().iter().any(|&(gs, ge)| gs < pe && ge > ps);
                 if part_has_gaps {
-                    warn!(
+                    debug!(
                     "Source {} part {} byte budget met but gaps remain — peer likely sent duplicate blocks, marking for retry",
                     _src_idx, part_idx
                 );
@@ -7762,7 +7762,7 @@ async fn download_parts_from_source(
                                     )
                                     .await
                                     {
-                                        warn!("Failed to send OP_AICHREQUEST: {e}");
+                                        debug!("Failed to send OP_AICHREQUEST: {e}");
                                     } else {
                                         debug!("Sent OP_AICHREQUEST for part {part_idx}, waiting for answer");
                                         recovery_bytes = wait_for_aich_recovery_answer_ms(
