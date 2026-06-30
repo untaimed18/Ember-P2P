@@ -268,6 +268,12 @@ const UPLOAD_SLOW_WRITE_THRESHOLD: std::time::Duration = std::time::Duration::fr
 
 /// Maximum concurrent TCP connections from a single IP address
 const MAX_CONNECTIONS_PER_IP: usize = 3;
+/// Maximum waiting-list entries permitted from a single IP address
+/// (eMule `cSameIP` cap in `CUploadQueue::AddClientToQueue`). Unlike
+/// [`MAX_CONNECTIONS_PER_IP`] this also counts disconnected but
+/// still-queued entries (via [`QueueEntry::last_ip`]), so a peer cannot
+/// churn connections with rotating user-hashes to dilute the queue.
+const MAX_QUEUE_ENTRIES_PER_IP: usize = 3;
 /// Maximum total concurrent TCP connections to the upload server
 const MAX_TOTAL_CONNECTIONS: usize = 100;
 /// Maximum number of peers waiting in the upload queue
@@ -376,10 +382,128 @@ impl QueueIdentity {
 /// queue rank for their peers instead of a placeholder 0.
 pub(crate) type UploadQueueRef = Arc<tokio::sync::Mutex<Vec<QueueEntry>>>;
 
+/// eMule-style upload parts tracking. Records how many bytes of each
+/// ED2K part (`PARTSIZE`, 9.28 MB) we have actually delivered to the
+/// peer during the current session, so the UI can paint a per-chunk
+/// "Up Status" bar — the analog of the green `m_DoneBlocks_list` fill in
+/// eMule's `CUploadListCtrl::DrawUpStatusBar`. `offset`/`len` describe a
+/// fully-delivered on-wire range; each part's tally is capped at
+/// `PARTSIZE` so a peer re-requesting blocks can't push a part past
+/// "complete".
+fn mark_served_parts(served: &mut [u64], offset: u64, len: u64) {
+    if served.is_empty() || len == 0 {
+        return;
+    }
+    let mut pos = offset;
+    let mut remaining = len;
+    while remaining > 0 {
+        let part = (pos / PARTSIZE) as usize;
+        if part >= served.len() {
+            break;
+        }
+        let part_end = (part as u64 + 1).saturating_mul(PARTSIZE);
+        let in_this = part_end.saturating_sub(pos).min(remaining);
+        if in_this == 0 {
+            break;
+        }
+        served[part] = served[part].saturating_add(in_this).min(PARTSIZE);
+        pos = pos.saturating_add(in_this);
+        remaining -= in_this;
+    }
+}
+
+/// Build the IPC representation of the served-parts tally: a hex bitmap
+/// (byte index = `part / 8`, bit = `part % 8`, LSB-first within each
+/// byte) where a set bit means that whole part has been delivered this
+/// session, paired with the file's total part count. Returns
+/// `(None, None)` only when the total size is unknown; otherwise the
+/// bitmap is always emitted (all-zero early on) so the UI can render a
+/// full-width grey bar immediately and fill it in as parts complete.
+fn build_up_part_status(served: &[u64], total_size: u64) -> (Option<String>, Option<u32>) {
+    use std::fmt::Write as _;
+    if total_size == 0 {
+        return (None, None);
+    }
+    let part_count = total_size.div_ceil(PARTSIZE).max(1) as usize;
+    let mut bytes = vec![0u8; part_count.div_ceil(8)];
+    // Only trust the tally when it matches the current file's part count.
+    // During a mid-session file switch it can briefly still be sized for the
+    // previous file; rather than paint stale parts we emit an all-grey bar
+    // until the new file's blocks land and re-size the tally.
+    if served.len() == part_count {
+        for (i, &s) in served.iter().enumerate() {
+            let part_size = if i + 1 < part_count {
+                PARTSIZE
+            } else {
+                total_size.saturating_sub((part_count as u64 - 1) * PARTSIZE)
+            };
+            if part_size > 0 && s >= part_size {
+                bytes[i / 8] |= 1u8 << (i % 8);
+            }
+        }
+    }
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for b in &bytes {
+        let _ = write!(hex, "{b:02x}");
+    }
+    (Some(hex), Some(part_count as u32))
+}
+
+/// Decode a downloader's advertised ED2K part bitmap (from the
+/// `OP_REQUESTFILENAME` extended-info block — see
+/// [`MultiPacketRequest::req_part_status`]) into the IPC hex bitmap used by the
+/// upload parts bar, the analog of eMule's `m_abyUpPartStatus`
+/// (`CUpDownClient::ProcessExtendedInfo`). `advertised` is the peer's
+/// `GetED2KPartCount()`-convention count and `bitmap` its raw LSB-first bytes
+/// (bit `i` = part `i`).
+///
+/// Returns `None` — i.e. no dark "peer already has" shading, the graceful
+/// fallback — when the size is unknown, the advertised count does not match
+/// this file's wire part count, the bitmap is too short, or the peer has no
+/// parts. This refuse-on-mismatch posture means a malformed or stale
+/// advertisement from an untrusted peer can never paint garbage parts; a
+/// matching peer's output is re-packed to the file's real part count so it
+/// lines up bit-for-bit with the served bitmap from [`build_up_part_status`].
+fn peer_part_status_hex(advertised: u16, bitmap: &[u8], total_size: u64) -> Option<String> {
+    use std::fmt::Write as _;
+    if total_size == 0 || advertised == 0 {
+        return None;
+    }
+    let real_parts = ed2k_part_count_for_size(total_size);
+    if real_parts == 0 || advertised != ed2k_wire_part_count(total_size) as u16 {
+        return None;
+    }
+    let need = (advertised as usize).div_ceil(8);
+    if bitmap.len() < need {
+        return None;
+    }
+    let mut out = vec![0u8; real_parts.div_ceil(8)];
+    let mut any = false;
+    for i in 0..real_parts {
+        if (bitmap[i / 8] >> (i % 8)) & 1 != 0 {
+            out[i / 8] |= 1u8 << (i % 8);
+            any = true;
+        }
+    }
+    if !any {
+        return None;
+    }
+    let mut hex = String::with_capacity(out.len() * 2);
+    for b in &out {
+        let _ = write!(hex, "{b:02x}");
+    }
+    Some(hex)
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct QueueEntry {
     pub(crate) identity: QueueIdentity,
     pub(crate) current_addr: Option<SocketAddr>,
+    /// Last IP this entry was seen connecting from. Unlike
+    /// `current_addr` (cleared to `None` on disconnect) this survives
+    /// disconnects, so the per-IP queue cap (eMule `cSameIP`) still
+    /// counts lingering waiting-list entries from a churning peer.
+    pub(crate) last_ip: Option<std::net::IpAddr>,
     pub(crate) udp_port: u16,
     pub(crate) user_hash: [u8; 16],
     pub(crate) file_hash: [u8; 16],
@@ -438,6 +562,16 @@ pub enum UploadEventKind {
     Progress {
         uploaded: u64,
         total: u64,
+        /// eMule-style served-parts bitmap and total part count, driving
+        /// the chunked "Up Status" bar. See
+        /// [`crate::types::Transfer::up_part_status`].
+        part_status: Option<String>,
+        part_count: Option<u32>,
+        /// Hex bitmap of parts the downloader advertised it already has at
+        /// request time (eMule `m_abyUpPartStatus`), shading the parts bar
+        /// dark. Shares [`part_count`]. See
+        /// [`crate::types::Transfer::up_peer_part_status`].
+        peer_part_status: Option<String>,
     },
     Completed,
     Failed {
@@ -2882,6 +3016,20 @@ impl UploadHandler {
         let mut uploaded: u64 = 0;
         let mut transfer_id: Option<String> = None;
         let mut total_size: u64 = 0;
+        // eMule-style served-parts tally backing the chunked "Up Status"
+        // bar: per ED2K part, the number of bytes we've actually
+        // delivered to this peer this session. Sized lazily the first
+        // time we serve a block (once `total_size` is known).
+        // `mark_served_parts` records each delivered range and
+        // `build_up_part_status` packs the completed-part bitmap for IPC.
+        let mut served_bytes_per_part: Vec<u64> = Vec::new();
+        // eMule `m_abyUpPartStatus`: the parts the downloader told us it
+        // already has, captured from the `OP_REQUESTFILENAME` extended-info
+        // block and shaded dark on the parts bar. Keyed by file hash so a
+        // mid-session file switch (A4AF) can never paint the previous file's
+        // possession — at emit time we only use it when the hash still matches
+        // `current_file_hash`, otherwise it falls back to no shading.
+        let mut peer_part_status: Option<([u8; 16], String)> = None;
         // Rate-limit `UploadEventKind::Progress` emission to the shared
         // `ul_event_tx` channel. The hot path in `OP_REQUESTPARTS` fires one
         // Progress per ~180 KiB block (often 3 per request), which at
@@ -3769,6 +3917,21 @@ impl UploadHandler {
                     }
                     if let Some(hash) = current_file_hash {
                         if let Some(file) = self.resolve_upload_file(&hash).await {
+                            // eMule ProcessExtendedInfo: bytes after the 16-byte
+                            // hash carry the downloader's advertised part status
+                            // (ExtendedRequests v1+ — partcount u16 + bitmap).
+                            // Capture it for the dark "peer already has" shading;
+                            // a non-extended request is exactly 16 bytes so the
+                            // length check naturally gates v0 peers out.
+                            if payload.len() >= 18 {
+                                let ext = &payload[16..];
+                                let advertised = u16::from_le_bytes([ext[0], ext[1]]);
+                                if let Some(hex) =
+                                    peer_part_status_hex(advertised, &ext[2..], file.size)
+                                {
+                                    peer_part_status = Some((hash, hex));
+                                }
+                            }
                             let name_bytes = file.name.as_bytes();
                             let mut resp = Vec::with_capacity(16 + 2 + name_bytes.len());
                             resp.extend_from_slice(&hash);
@@ -4008,6 +4171,7 @@ impl UploadHandler {
                             queue.iter().position(|e| e.identity == queue_identity)
                         {
                             queue[pos].current_addr = Some(peer_addr);
+                            queue[pos].last_ip = Some(peer_addr.ip());
                             queue[pos].udp_port = hello_caps.udp_port;
                             queue[pos].user_hash = peer_user_hash;
                             queue[pos].file_hash = current_file_hash.unwrap_or([0u8; 16]);
@@ -4042,6 +4206,31 @@ impl UploadHandler {
                             drop(cm);
                             drop(idx_snap);
                             rank_val
+                        } else if queue
+                            .iter()
+                            .filter(|e| {
+                                e.identity != queue_identity
+                                    && e.last_ip == Some(peer_addr.ip())
+                            })
+                            .count()
+                            >= MAX_QUEUE_ENTRIES_PER_IP
+                        {
+                            // eMule cSameIP cap (CUploadQueue::AddClientToQueue):
+                            // never let one IP occupy more than a few
+                            // waiting-list slots. `current_addr` is cleared on
+                            // disconnect but `last_ip` is not, so this also
+                            // bounds a peer that churns connections with
+                            // rotating user-hashes to pile up lingering entries
+                            // — which the concurrent MAX_CONNECTIONS_PER_IP cap
+                            // alone does not prevent.
+                            debug!(
+                                "Per-IP upload-queue cap reached for {} (>= {} entries), rejecting {peer_addr}",
+                                peer_addr.ip(),
+                                MAX_QUEUE_ENTRIES_PER_IP,
+                            );
+                            drop(queue);
+                            write_packet_async(&mut writer, OP_EMULEPROT, OP_QUEUEFULL, &[]).await?;
+                            break;
                         } else if queue.len() >= HARD_UPLOAD_QUEUE_SIZE {
                             debug!("Upload queue at hard limit ({HARD_UPLOAD_QUEUE_SIZE}), sending OP_QUEUEFULL to {peer_addr}");
                             drop(queue);
@@ -4105,6 +4294,7 @@ impl UploadHandler {
                                 queue.push(QueueEntry {
                                     identity: queue_identity.clone(),
                                     current_addr: Some(peer_addr),
+                                    last_ip: Some(peer_addr.ip()),
                                     udp_port: hello_caps.udp_port,
                                     user_hash: peer_user_hash,
                                     file_hash: new_fh,
@@ -4131,6 +4321,7 @@ impl UploadHandler {
                             queue.push(QueueEntry {
                                 identity: queue_identity.clone(),
                                 current_addr: Some(peer_addr),
+                                last_ip: Some(peer_addr.ip()),
                                 udp_port: hello_caps.udp_port,
                                 user_hash: peer_user_hash,
                                 file_hash: new_fh,
@@ -4854,16 +5045,38 @@ impl UploadHandler {
                                         last_progress_emit =
                                             Some(std::time::Instant::now());
                                         last_progress_uploaded = uploaded;
+                                        let (part_status, part_count) =
+                                            build_up_part_status(&served_bytes_per_part, total_size);
+                                        let peer_part = peer_part_status
+                                            .as_ref()
+                                            .filter(|(h, _)| Some(*h) == current_file_hash)
+                                            .map(|(_, s)| s.clone());
                                         let _ = self.upload_event_tx.send(UploadEvent {
                                             transfer_id: tid.clone(),
                                             kind: UploadEventKind::Progress {
                                                 uploaded,
                                                 total: total_size,
+                                                part_status,
+                                                part_count,
+                                                peer_part_status: peer_part,
                                             },
                                         }).await;
                                     }
                                 }
                             }
+                            // Size (or re-size, after a mid-session file
+                            // switch where `total_size` changed) the tally to
+                            // the current file's part count before recording.
+                            let want_parts =
+                                total_size.div_ceil(PARTSIZE).max(1) as usize;
+                            if total_size > 0 && served_bytes_per_part.len() != want_parts {
+                                served_bytes_per_part = vec![0u64; want_parts];
+                            }
+                            mark_served_parts(
+                                &mut served_bytes_per_part,
+                                start,
+                                data.len() as u64,
+                            );
                             sent_compressed = true;
                         }
                         if sent_compressed {
@@ -4938,11 +5151,20 @@ impl UploadHandler {
                                 if should_emit {
                                     last_progress_emit = Some(std::time::Instant::now());
                                     last_progress_uploaded = uploaded;
+                                    let (part_status, part_count) =
+                                        build_up_part_status(&served_bytes_per_part, total_size);
+                                    let peer_part = peer_part_status
+                                        .as_ref()
+                                        .filter(|(h, _)| Some(*h) == current_file_hash)
+                                        .map(|(_, s)| s.clone());
                                     let _ = self.upload_event_tx.send(UploadEvent {
                                         transfer_id: tid.clone(),
                                         kind: UploadEventKind::Progress {
                                             uploaded,
                                             total: total_size,
+                                            part_status,
+                                            part_count,
+                                            peer_part_status: peer_part,
                                         },
                                     }).await;
                                 }
@@ -4950,6 +5172,14 @@ impl UploadHandler {
 
                             cursor += chunk_len;
                         }
+                        // Size (or re-size, after a mid-session file switch
+                        // where `total_size` changed) the tally to the current
+                        // file's part count before recording.
+                        let want_parts = total_size.div_ceil(PARTSIZE).max(1) as usize;
+                        if total_size > 0 && served_bytes_per_part.len() != want_parts {
+                            served_bytes_per_part = vec![0u64; want_parts];
+                        }
+                        mark_served_parts(&mut served_bytes_per_part, start, data.len() as u64);
                     }
 
                     // Diagnostic: batch-level summary. `credited_bytes == 0`
@@ -5023,14 +5253,62 @@ impl UploadHandler {
                         if uploaded != last_progress_uploaded {
                             last_progress_emit = Some(std::time::Instant::now());
                             last_progress_uploaded = uploaded;
+                            let (part_status, part_count) =
+                                build_up_part_status(&served_bytes_per_part, total_size);
+                            let peer_part = peer_part_status
+                                .as_ref()
+                                .filter(|(h, _)| Some(*h) == current_file_hash)
+                                .map(|(_, s)| s.clone());
                             let _ = self.upload_event_tx.send(UploadEvent {
                                 transfer_id: tid.clone(),
                                 kind: UploadEventKind::Progress {
                                     uploaded,
                                     total: total_size,
+                                    part_status,
+                                    part_count,
+                                    peer_part_status: peer_part,
                                 },
                             }).await;
                         }
+                    }
+
+                    // eMule's upload list has no terminal "Complete" row: a
+                    // client occupies a slot only while it is actively being
+                    // served and the row disappears the instant the session
+                    // ends (CUploadQueue::RemoveFromUploadQueue). Once a peer
+                    // has received the entire file from us this session there
+                    // are no more parts it can legitimately request, so we
+                    // finalize the transfer now and close the connection
+                    // rather than letting the row linger at "Complete 100%"
+                    // until the 60 s idle gate or an eventual peer disconnect
+                    // fires. Cumulative upload totals live in StatsManager, so
+                    // dropping the per-session row loses no history; a peer
+                    // that wants another file just reconnects (cheap, and
+                    // exactly how eMule clients pipeline multiple files).
+                    if total_size > 0 && uploaded >= total_size {
+                        info!(
+                            target: "ember::upload_diag",
+                            "session_end {peer_addr} reason=file_complete \
+                             uploaded={uploaded}B total={total_size}B \
+                             session_age={}s iters={outer_loop_iterations} — \
+                             dropping completed upload row",
+                            session_open_at.elapsed().as_secs(),
+                        );
+                        if let Some(tid) = &transfer_id {
+                            let _ = self
+                                .upload_event_tx
+                                .send(UploadEvent {
+                                    transfer_id: tid.clone(),
+                                    kind: UploadEventKind::Completed,
+                                })
+                                .await;
+                        }
+                        // Cleared so the shared teardown below does not emit a
+                        // second terminal event for this transfer. The Ember
+                        // session record still fires there (session_start is
+                        // left intact) with completed = true.
+                        transfer_id = None;
+                        break;
                     }
 
                     // Enforce eMule session limits + score-based preemption.
@@ -5193,6 +5471,7 @@ impl UploadHandler {
                                 queue.iter_mut().find(|e| e.identity == queue_identity)
                             {
                                 entry.current_addr = Some(peer_addr);
+                                entry.last_ip = Some(peer_addr.ip());
                                 entry.udp_port = hello_caps.udp_port;
                                 entry.user_hash = peer_user_hash;
                                 entry.file_hash = current_file_hash.unwrap_or([0u8; 16]);
@@ -5217,6 +5496,7 @@ impl UploadHandler {
                                 queue.push(QueueEntry {
                                     identity: queue_identity.clone(),
                                     current_addr: Some(peer_addr),
+                                    last_ip: Some(peer_addr.ip()),
                                     udp_port: hello_caps.udp_port,
                                     user_hash: peer_user_hash,
                                     file_hash: current_file_hash.unwrap_or([0u8; 16]),
@@ -5256,6 +5536,7 @@ impl UploadHandler {
                                     queue.push(QueueEntry {
                                         identity: queue_identity.clone(),
                                         current_addr: Some(peer_addr),
+                                        last_ip: Some(peer_addr.ip()),
                                         udp_port: hello_caps.udp_port,
                                         user_hash: peer_user_hash,
                                         file_hash: new_fh,
@@ -5541,6 +5822,19 @@ impl UploadHandler {
                             }
                             current_file_hash = Some(mpreq.file_hash);
                             total_size = file.size;
+
+                                // eMule ProcessExtendedInfo over MultiPacket: the
+                                // OP_REQUESTFILENAME sub-block carries the peer's
+                                // advertised part status. `parse_multipacket`
+                                // captured the raw bitmap; decode it for the dark
+                                // "peer already has" shading.
+                                if let Some((advertised, ref bitmap)) = mpreq.req_part_status {
+                                    if let Some(hex) =
+                                        peer_part_status_hex(advertised, bitmap, file.size)
+                                    {
+                                        peer_part_status = Some((mpreq.file_hash, hex));
+                                    }
+                                }
 
                                 let partial_bitmap = if file.is_partial && file.size > 0 {
                                     let tracker = super::part_tracker::PartTracker::new(file.size, &file.path);

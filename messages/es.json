@@ -112,6 +112,10 @@
   "sidebar_chats_unread_title_other": "{count} mensajes sin leer",
   "sidebar_friend_requests_title_one": "1 solicitud de amistad pendiente",
   "sidebar_friend_requests_title_other": "{count} solicitudes de amistad pendientes",
+  "sidebar_active_downloads_one": "1 descarga activa",
+  "sidebar_active_downloads_other": "{count} descargas activas",
+  "sidebar_active_uploads_one": "1 subida activa",
+  "sidebar_active_uploads_other": "{count} subidas activas",
   "sidebar_nav_with_shortcut_title": "{label} (Alt+{n})",
   "sidebar_dev_link_title": "Diagnóstico del transporte nativo Ember (desarrollador)",
 
@@ -1373,6 +1377,7 @@
   "transfers_chip_failed": "{count} fallidas",
   "transfers_unknown_client": "Cliente desconocido",
   "transfers_parts": "{have}/{total} partes",
+  "transfers_parts_peer": "{peer} ya en el par",
   "transfers_parts_title": "Partes disponibles en esta fuente",
   "transfers_failed_sources_hidden_one": "1 fuente fallida oculta",
   "transfers_failed_sources_hidden_other": "{count} fuentes fallidas ocultas",
