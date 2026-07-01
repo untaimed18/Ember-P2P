@@ -294,13 +294,20 @@ fn read_contact_v2(cursor: &mut Cursor<&[u8]>) -> anyhow::Result<KadContact> {
     let udp_port = cursor.read_u16::<LittleEndian>()?;
     let tcp_port = cursor.read_u16::<LittleEndian>()?;
     let version = cursor.read_u8()?;
-    let kad_udp_key_raw = cursor.read_u64::<LittleEndian>()?;
+    // eMule CKadUDPKey::ReadFromFile reads two little-endian uint32s in the
+    // order (m_dwKey, m_dwIP). Read them in that same order so a genuine
+    // eMule nodes.dat is interpreted correctly. Reading the 8 bytes as a
+    // single LE u64 and splitting high/low (as before) silently transposes
+    // key <-> ip, which self-consistent Ember-only files hid but which
+    // corrupts key verification whenever an eMule-produced file is imported.
+    let kad_udp_key_val = cursor.read_u32::<LittleEndian>()?;
+    let kad_udp_key_ip = cursor.read_u32::<LittleEndian>()?;
     let verified_byte = cursor.read_u8()?;
 
-    let udp_key = if kad_udp_key_raw != 0 {
+    let udp_key = if kad_udp_key_val != 0 {
         Some(KadUDPKey {
-            key: (kad_udp_key_raw >> 32) as u32,
-            ip: (kad_udp_key_raw & 0xFFFFFFFF) as u32,
+            key: kad_udp_key_val,
+            ip: kad_udp_key_ip,
         })
     } else {
         None
@@ -356,10 +363,13 @@ pub fn save_nodes_dat(path: &Path, contacts: &[KadContact]) -> anyhow::Result<()
         buf.write_u16::<LittleEndian>(c.udp_port)?;
         buf.write_u16::<LittleEndian>(c.tcp_port)?;
         buf.write_u8(c.version)?;
-        let key_val = c
-            .udp_key
-            .map_or(0u64, |k| (k.key as u64) << 32 | k.ip as u64);
-        buf.write_u64::<LittleEndian>(key_val)?;
+        // eMule CKadUDPKey::StoreToFile writes two little-endian uint32s in
+        // the order (m_dwKey, m_dwIP). Match that byte order exactly so the
+        // file stays compatible with eMule and round-trips with the
+        // ReadFromFile-equivalent in read_contact_v2.
+        let (key_val, key_ip) = c.udp_key.map_or((0u32, 0u32), |k| (k.key, k.ip));
+        buf.write_u32::<LittleEndian>(key_val)?;
+        buf.write_u32::<LittleEndian>(key_ip)?;
         buf.write_u8(if c.verified { 1 } else { 0 })?;
     }
 

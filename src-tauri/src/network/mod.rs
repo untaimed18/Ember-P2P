@@ -46,7 +46,8 @@ use self::kad::messages::{self, KadMessage, KADEMLIA_FIND_NODE};
 use self::kad::obfuscation;
 use self::kad::protection::FloodProtection;
 use self::kad::publish::{
-    kad_id_to_md4_bytes, md4_bytes_to_kad_id, KeywordPublishBatch, PublishManager, PublishableFile,
+    kad_id_to_md4_bytes, md4_bytes_to_kad_id, round_robin_next, KeywordPublishBatch, PublishManager,
+    PublishableFile,
 };
 use self::kad::routing::RoutingTable;
 use self::kad::search::{
@@ -3073,6 +3074,10 @@ struct NetworkState {
     /// the network after ~24h; loaded from the `published_notes` table at
     /// startup so republishing survives restarts.
     published_notes: HashMap<KadId, PublishedNote>,
+    /// eMule `CSharedFileList::m_currFileNotes`: round-robin cursor over
+    /// `published_notes`, mirroring `PublishManager::source_cursor` (see
+    /// `round_robin_next`) since notes live outside `PublishManager`.
+    notes_publish_cursor: Option<KadId>,
     /// Nodes that reported load=100 -- avoid publishing to them for a while
     overloaded_nodes: HashMap<Ipv4Addr, i64>,
     flood_protection: FloodProtection,
@@ -3215,6 +3220,17 @@ struct NetworkState {
     /// Comment/rating manager
     comment_manager: Arc<RwLock<CommentManager>>,
     firewall_checker: FirewallChecker,
+    /// eMule `CUDPFirewallTester::m_liPossibleTestClients`: fresh contacts
+    /// (discovered via the crippled NODEFWCHECKUDP-style lookup below and kept
+    /// OUT of the routing table) that we have never sent a UDP packet to, used
+    /// as UDP-firewall probe targets. Drawing probe targets from already-known
+    /// routing-table peers can yield a false "UDP open" verdict behind a
+    /// restricted-cone NAT, so probes must go to genuinely fresh IPs.
+    udp_fw_candidate_pool: VecDeque<KadContact>,
+    /// The in-flight fresh-node lookup seeding `udp_fw_candidate_pool`
+    /// (eMule `CSearchManager::FindNodeFWCheckUDP`). Tracked so we don't start
+    /// duplicate lookups while one is still gathering candidates.
+    udp_fw_node_search: Option<SearchId>,
     /// Whether we have LowID from the server
     low_id: bool,
     /// Our server-assigned client ID
@@ -5516,6 +5532,7 @@ pub async fn start_network(
         pending_notes_searches: HashMap::new(),
         pending_note_publishes: HashMap::new(),
         published_notes: HashMap::new(),
+        notes_publish_cursor: None,
         overloaded_nodes: HashMap::new(),
         flood_protection: FloodProtection::new(),
         buddy_manager,
@@ -5564,6 +5581,8 @@ pub async fn start_network(
         download_handles: HashMap::new(),
         comment_manager: comment_manager.clone(),
         firewall_checker: FirewallChecker::new(),
+        udp_fw_candidate_pool: VecDeque::new(),
+        udp_fw_node_search: None,
         low_id: false,
         server_client_id: 0,
         pending_server_connect: None,
@@ -6199,8 +6218,11 @@ pub async fn start_network(
     // eMule main loop calls Kademlia::Process very frequently; ~100ms matches typical tick cadence.
     let mut kad_process_timer = tokio::time::interval(std::time::Duration::from_millis(100));
     kad_process_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    // eMule Kademlia::Process: Consolidate() every MIN2S(45), not 45 minutes
-    let mut consolidate_timer = tokio::time::interval(std::time::Duration::from_secs(45));
+    // eMule Kademlia::Process schedules Consolidate() every MIN2S(45) —
+    // and MIN2S(min) == min*60, so that is 45 *minutes* (2700s), not 45
+    // seconds. The previous 45s value ran the whole zone tree ~60x too
+    // often, wasting CPU and thrashing split/merge near bucket boundaries.
+    let mut consolidate_timer = tokio::time::interval(std::time::Duration::from_secs(2700));
     consolidate_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut buddy_timer = tokio::time::interval(std::time::Duration::from_secs(60));
     buddy_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -8637,6 +8659,46 @@ pub async fn start_network(
                     }
                 }
 
+                // eMule StorePacket for keyword publishes: the same eager
+                // per-response send as the source-publish loop above, so a
+                // shared file's keywords become searchable within seconds of
+                // the DHT walk finding in-tolerance nodes rather than only at
+                // search completion (now held open for close to the full
+                // eMule lifetime — see `check_phase_transition`). A keyword
+                // batch can carry multiple 50-entry packets, so every
+                // eagerly-found contact gets all of them.
+                {
+                    let store_sids: Vec<SearchId> = state.store_keyword_searches.keys().copied().collect();
+                    for sid in store_sids {
+                        if let Some(search) = state.search_manager.get_mut(&sid) {
+                            let candidates = search.next_publish_candidates();
+                            if !candidates.is_empty() {
+                                if let Some(batch) = state.store_keyword_searches.get(&sid).cloned() {
+                                    for msg in &batch.messages {
+                                        let opcode = kad_request_opcode(msg).unwrap_or(0);
+                                        for contact in &candidates {
+                                            let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+                                            if let Ok(packet) = messages::encode_packet(msg) {
+                                                state.flood_protection.track_request(addr, opcode);
+                                                let _ = send_kad_packet(&udp_socket, &packet, addr, &state, &contact.id).await;
+                                                let now_ts = chrono::Utc::now().timestamp();
+                                                let pending = state
+                                                    .publish_pending
+                                                    .entry((batch.keyword_hash, addr))
+                                                    .or_insert((batch.keyword_hash, now_ts, false, 0));
+                                                pending.0 = batch.keyword_hash;
+                                                pending.1 = now_ts;
+                                                pending.2 = false;
+                                                pending.3 = pending.3.saturating_add(1);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Check for completed searches
                 let completed_ids: Vec<SearchId> = state.search_manager.active
                     .iter()
@@ -10165,19 +10227,28 @@ pub async fn start_network(
                         // 50-entry packets), not one DHT walk per file token.
                         if let Some(search) = state.search_manager.get(&sid) {
                             let now = chrono::Utc::now().timestamp();
-                            let mut sent_any = false;
-                            for msg in &batch.messages {
-                                // Publish only to nodes that actually answered during
-                                // the lookup AND fall within the eMule search tolerance
-                                // of the keyword target (mirrors the StoreSource path).
-                                // Publishing to never-queried / out-of-tolerance nodes
-                                // just gets rejected remotely and wastes publish slots.
-                                for contact in search.closest.iter()
-                                    .filter(|c| !state.overloaded_nodes.contains_key(&c.ip)
+                            // Publish only to nodes that actually answered during
+                            // the lookup AND fall within the eMule search tolerance
+                            // of the keyword target (mirrors the StoreSource path).
+                            // Publishing to never-queried / out-of-tolerance nodes
+                            // just gets rejected remotely and wastes publish slots.
+                            // Skip whatever the eager per-tick loop
+                            // (`next_publish_candidates`) already reached while
+                            // the search was walking — this is the completion
+                            // mop-up, not a resend of it.
+                            let already_published = &search.store_sent;
+                            let remaining = STORE_PUBLISH_TARGET_TOTAL.saturating_sub(already_published.len());
+                            let candidates: Vec<&kad::types::KadContact> = search.closest.iter()
+                                .filter(|c| {
+                                    !already_published.contains(&c.id)
+                                        && !state.overloaded_nodes.contains_key(&c.ip)
                                         && search.responded_during_lookup.contains(&c.id)
-                                        && kad::search::within_search_tolerance_pub(&search.target, &c.id))
-                                    .take(STORE_PUBLISH_TARGET_TOTAL)
-                                {
+                                        && kad::search::within_search_tolerance_pub(&search.target, &c.id)
+                                })
+                                .take(remaining)
+                                .collect();
+                            for msg in &batch.messages {
+                                for contact in &candidates {
                                     let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                                     if let Ok(packet) = messages::encode_packet(msg) {
                                         state.flood_protection.track_request(addr, kad_request_opcode(msg).unwrap_or(0));
@@ -10191,19 +10262,21 @@ pub async fn start_network(
                                         pending.1 = now;
                                         pending.2 = false;
                                         pending.3 = pending.3.saturating_add(1);
-                                        sent_any = true;
                                     }
                                 }
                             }
-                            if sent_any {
+                            let total_published = already_published.len() + candidates.len();
+                            if total_published > 0 {
                                 state.publish_manager.mark_keyword_published(&batch.keyword_hash);
                                 info!(
-                                    "StoreKeyword search {} completed: published keyword '{}' ({} file entries, {} packet(s)) to up to {} closest nodes",
+                                    "StoreKeyword search {} completed: published keyword '{}' ({} file entries, {} packet(s)) to {} closest nodes ({} during lookup, {} at completion)",
                                     sid.0,
                                     batch.keyword,
                                     batch.file_hashes.len(),
                                     batch.messages.len(),
-                                    STORE_PUBLISH_TARGET_TOTAL,
+                                    total_published,
+                                    already_published.len(),
+                                    candidates.len(),
                                 );
                             }
                         }
@@ -11245,6 +11318,16 @@ pub async fn start_network(
                     continue;
                 }
 
+                // eMule `CSharedFileList::Publish()` examines exactly one
+                // round-robin candidate per type per tick — a blind index
+                // walk (`m_currFileSrc`/`GetNextKeyword()`/`m_currFileNotes`)
+                // that only sometimes lands on something actually due —
+                // rather than scanning the whole set for the next due item.
+                // With the concurrency caps below now an effective throttle
+                // (searches occupy their slot for close to the full eMule
+                // lifetime, see `check_phase_transition`), matching this
+                // walk too avoids Ember reacting to "just became due" faster
+                // than eMule ever would.
                 let active_store_src = state.store_source_searches.len();
                 if active_store_src < KADEMLIA_TOTAL_STORE_SRC {
                     let in_flight_sources: HashSet<KadId> = state
@@ -11252,14 +11335,12 @@ pub async fn start_network(
                         .values()
                         .map(|(hash, _)| *hash)
                         .collect();
-                    if let Some(file) = state
-                        .publish_manager
-                        .files_needing_source_publish()
-                        .into_iter()
-                        .find(|file| !in_flight_sources.contains(&file.file_hash))
-                        .cloned()
-                    {
-                        if let Some(msg) = state.publish_manager.build_source_publish(&file) {
+                    if let Some(file) = state.publish_manager.next_source_candidate().cloned() {
+                        if in_flight_sources.contains(&file.file_hash) {
+                            // Already being published this cycle — eMule's
+                            // PrepareLookup would likewise no-op on a
+                            // duplicate target. The cursor already moved on.
+                        } else if let Some(msg) = state.publish_manager.build_source_publish(&file) {
                             let closest = state
                                 .routing_table
                                 .find_closest_prefer_verified(&file.file_hash, SEARCH_INITIAL_CONTACTS);
@@ -11295,23 +11376,20 @@ pub async fn start_network(
                         .values()
                         .map(|batch| batch.keyword_hash)
                         .collect();
-                    if let Some(batch) = state
-                        .publish_manager
-                        .keyword_batches_needing_publish(KADEMLIA_TOTAL_STORE_KEY)
-                        .into_iter()
-                        .find(|batch| !in_flight_keywords.contains(&batch.keyword_hash))
-                    {
-                        let closest = state
-                            .routing_table
-                            .find_closest_prefer_verified(&batch.keyword_hash, SEARCH_INITIAL_CONTACTS);
-                        if !closest.is_empty() {
-                            let sid = state.search_manager.start_search(
-                                batch.keyword_hash,
-                                SearchType::StoreKeyword,
-                                closest,
-                            );
-                            if sid != SearchId(0) {
-                                state.store_keyword_searches.insert(sid, batch);
+                    if let Some(batch) = state.publish_manager.next_keyword_candidate() {
+                        if !in_flight_keywords.contains(&batch.keyword_hash) {
+                            let closest = state
+                                .routing_table
+                                .find_closest_prefer_verified(&batch.keyword_hash, SEARCH_INITIAL_CONTACTS);
+                            if !closest.is_empty() {
+                                let sid = state.search_manager.start_search(
+                                    batch.keyword_hash,
+                                    SearchType::StoreKeyword,
+                                    closest,
+                                );
+                                if sid != SearchId(0) {
+                                    state.store_keyword_searches.insert(sid, batch);
+                                }
                             }
                         }
                     }
@@ -11325,16 +11403,13 @@ pub async fn start_network(
                         .values()
                         .map(|(h, _, _, _, _)| *h)
                         .collect();
-                    let due_note = state
-                        .published_notes
-                        .iter()
-                        .find(|(hash, note)| {
-                            now_ts - note.last_publish > REPUBLISH_NOTE_SECS
-                                && !in_flight.contains(*hash)
-                        })
+                    let due_note = round_robin_next(&state.published_notes, &mut state.notes_publish_cursor)
+                        .filter(|hash| !in_flight.contains(hash))
+                        .and_then(|hash| state.published_notes.get(&hash).map(|note| (hash, note)))
+                        .filter(|(_, note)| now_ts - note.last_publish > REPUBLISH_NOTE_SECS)
                         .map(|(hash, note)| {
                             (
-                                *hash,
+                                hash,
                                 note.rating,
                                 note.comment.clone(),
                                 note.file_name.clone(),
@@ -12191,7 +12266,7 @@ pub async fn start_network(
                 }
             }
 
-            // eMule Consolidate: merge sparse sibling leaf zones every 45 seconds
+            // eMule Consolidate: merge sparse sibling leaf zones every 45 minutes
             _ = consolidate_timer.tick() => {
                 if state.stats.status == NetworkStatus::Disconnected { continue; }
                 let merged = state.routing_table.consolidate();
@@ -15606,6 +15681,30 @@ pub async fn start_network(
                                     }
                                 }
                             }
+                        } else if is_low && session.server_reported_ip != 0 {
+                            // eMule ServerSocket OP_IDCHANGE: for a LowID client the
+                            // server reports our real public IP at offset 12 —
+                            // `if (IsLowID(clientid) && dwServerReportedIP != 0)
+                            // SetPublicIP(dwServerReportedIP)`. LowID keeps us
+                            // firewalled, so unlike the HighID branch we do NOT touch
+                            // firewalled status; this only teaches us our external IP,
+                            // which a LowID node otherwise never learns from the
+                            // server side. server_reported_ip is already gated to a
+                            // non-LowID-range value when parsed.
+                            let ext_ip = Ipv4Addr::from(session.server_reported_ip.to_le_bytes());
+                            if !ext_ip.is_unspecified()
+                                && !ext_ip.is_loopback()
+                                && !ext_ip.is_private()
+                                && state.external_ip.is_none()
+                            {
+                                set_external_ip(&mut state, Some(ext_ip));
+                                state.stats.external_ip = ext_ip.to_string();
+                                info!("External IP set from server LowID report");
+                                // Trusted single-reporter path, same as the HighID
+                                // case above (records the confirmed external IP
+                                // without the KAD distinct-/24 vote requirement).
+                                state.firewall_checker.handle_server_highid_response(ext_ip);
+                            }
                         }
 
                         // eMule: "Update server list when connecting" —
@@ -18614,10 +18713,61 @@ fn update_publish_manager_state(state: &mut NetworkState) {
     }
 }
 
+/// Upper bound on buffered fresh UDP-firewall probe candidates. eMule keeps a
+/// small `m_liPossibleTestClients` list; we allow a few more for reliability.
+const UDP_FW_CANDIDATE_POOL_MAX: usize = 64;
+
 fn dispatch_udp_firewall_probe_requests(state: &mut NetworkState, settings: &AppSettings) {
     if !state.firewall_checker.needs_udp_firewall_probes() {
+        // Test finished/inactive: drop leftover fresh candidates and forget the
+        // scratch lookup so the next cycle starts clean (eMule
+        // CUDPFirewallTester clears m_liPossibleTestClients and cancels the
+        // NODEFWCHECKUDP search when the test concludes).
+        state.udp_fw_candidate_pool.clear();
+        state.udp_fw_node_search = None;
         return;
     }
+
+    // eMule CSearchManager::FindNodeFWCheckUDP: seed a random-target node lookup
+    // whose *discovered* contacts we only ever reach over TCP, so they are
+    // guaranteed to be IPs we have never sent a KAD UDP packet to. Probing
+    // already-known routing-table peers can yield a false "UDP open" verdict
+    // behind a restricted-cone NAT (a UDP mapping to that peer may already
+    // exist from earlier Kad traffic).
+    let fw_search_active = match state.udp_fw_node_search {
+        Some(sid) => state
+            .search_manager
+            .get(&sid)
+            .map(|s| !s.completed)
+            .unwrap_or(false),
+        None => false,
+    };
+    if !fw_search_active {
+        state.udp_fw_node_search = None;
+        if state.udp_fw_candidate_pool.is_empty() {
+            let target = KadId::random();
+            let closest = state
+                .routing_table
+                .find_closest_prefer_verified(&target, SEARCH_INITIAL_CONTACTS);
+            if !closest.is_empty() {
+                let sid =
+                    state
+                        .search_manager
+                        .start_search(target, SearchType::FindNode, closest);
+                if sid != SearchId(0) {
+                    if let Some(s) = state.search_manager.get_mut(&sid) {
+                        s.is_udp_fw_probe_search = true;
+                    }
+                    state.udp_fw_node_search = Some(sid);
+                    debug!(
+                        "Started fresh-node lookup {} to seed UDP firewall probe candidates",
+                        sid.0
+                    );
+                }
+            }
+        }
+    }
+
     let external_udp_port = state
         .firewall_checker
         .external_udp_port()
@@ -18625,25 +18775,27 @@ fn dispatch_udp_firewall_probe_requests(state: &mut NetworkState, settings: &App
         .or(state.external_udp_port)
         .unwrap_or(settings.udp_port);
 
-    // Prefer contacts that report open TCP (kad_options bit 1 clear).
-    // Contacts with kad_options == 0 haven't reported status; put them second.
-    let mut candidates: Vec<KadContact> = state
-        .routing_table
-        .all_contacts()
-        .filter(|c| {
-            c.verified
-                && !c.is_dead()
-                && c.version > KADEMLIA_VERSION5_48A
-                && c.tcp_port > 0
-                && !c.is_tcp_firewalled()
-                && !state.firewall_checker.is_udp_firewall_check_ip(c.ip)
-        })
-        .cloned()
-        .collect();
-    // Sort: contacts with known-open TCP first (kad_options reported & not firewalled),
-    // then contacts with unknown status (kad_options == 0).
-    candidates.sort_by_key(|c| if c.kad_options != 0 { 0u8 } else { 1u8 });
-    let contacts: Vec<KadContact> = candidates.into_iter().take(4).collect();
+    // Draw probe targets exclusively from the fresh candidate pool. Skip
+    // ourselves, anything already probed this cycle, anything that has since
+    // entered the routing table (now UDP-contacted), and filtered/banned IPs.
+    let self_ip = state.external_ip;
+    let mut contacts: Vec<KadContact> = Vec::new();
+    while contacts.len() < 4 {
+        let Some(candidate) = state.udp_fw_candidate_pool.pop_front() else {
+            break;
+        };
+        if Some(candidate.ip) == self_ip
+            || candidate.tcp_port == 0
+            || candidate.version <= KADEMLIA_VERSION5_48A
+            || state.firewall_checker.is_udp_firewall_check_ip(candidate.ip)
+            || state.routing_table.get_contact(&candidate.id).is_some()
+            || state.ip_filter.is_blocked(candidate.ip)
+            || state.banned_ips.contains(&candidate.ip)
+        {
+            continue;
+        }
+        contacts.push(candidate);
+    }
 
     if !contacts.is_empty() {
         info!(
@@ -21431,6 +21583,7 @@ async fn handle_udp_packet_inner(
                         contacts.len() - safe_contacts.len()
                     );
                     search.handle_response(&sender_id, safe_contacts.clone());
+                    let is_fw_probe_search = search.is_udp_fw_probe_search;
 
                     // eMule behavior: for FindBuddy searches, send FindBuddyReq
                     // to EVERY node that responds during the lookup, not just the
@@ -21454,8 +21607,25 @@ async fn handle_udp_packet_inner(
                         }
                     }
 
-                    for c in &safe_contacts {
-                        state.routing_table.insert(c.clone());
+                    if is_fw_probe_search {
+                        // eMule CUDPFirewallTester::AddPossibleTestContact: keep
+                        // these discovered nodes OUT of the routing table (so we
+                        // never send them a KAD UDP packet) and stash them as
+                        // fresh UDP-firewall probe candidates instead.
+                        for c in &safe_contacts {
+                            if c.version > KADEMLIA_VERSION5_48A
+                                && c.tcp_port > 0
+                                && state.routing_table.get_contact(&c.id).is_none()
+                                && !state.udp_fw_candidate_pool.iter().any(|x| x.ip == c.ip)
+                                && state.udp_fw_candidate_pool.len() < UDP_FW_CANDIDATE_POOL_MAX
+                            {
+                                state.udp_fw_candidate_pool.push_back(c.clone());
+                            }
+                        }
+                    } else {
+                        for c in &safe_contacts {
+                            state.routing_table.insert(c.clone());
+                        }
                     }
                 }
             }
@@ -21663,6 +21833,39 @@ async fn handle_udp_packet_inner(
                     "Publish confirmed for {target} from {from} (orig_key={:?}, load={load}, total_confirmed={})",
                     key, state.publish_confirmed
                 );
+                // eMule `CSearchManager::ProcessPublishResult`: every ack
+                // increments the owning search's answer count so it can end
+                // early (`record_publish_ack`) instead of waiting out its
+                // full lifetime once enough nodes have confirmed. Look the
+                // search up by the hash it was tracking under rather than
+                // `target` directly — for source/keyword/notes publishes
+                // that's the same value, but going through the small
+                // in-flight maps avoids assuming that equivalence here.
+                let ack_sid = if is_source_publish {
+                    state
+                        .store_source_searches
+                        .iter()
+                        .find(|(_, (file_hash, _))| *file_hash == publish_file_hash)
+                        .map(|(sid, _)| *sid)
+                } else {
+                    state
+                        .store_keyword_searches
+                        .iter()
+                        .find(|(_, batch)| batch.keyword_hash == publish_file_hash)
+                        .map(|(sid, _)| *sid)
+                        .or_else(|| {
+                            state
+                                .pending_note_publishes
+                                .iter()
+                                .find(|(_, (file_hash, ..))| *file_hash == publish_file_hash)
+                                .map(|(sid, _)| *sid)
+                        })
+                };
+                if let Some(sid) = ack_sid {
+                    if let Some(search) = state.search_manager.get_mut(&sid) {
+                        search.record_publish_ack();
+                    }
+                }
                 if is_source_publish {
                     if let Some(count) = state.source_publish_acks.get_mut(&publish_file_hash) {
                         *count = count.saturating_add(1);
