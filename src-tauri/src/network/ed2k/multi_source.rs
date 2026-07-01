@@ -8700,8 +8700,14 @@ pub async fn perform_outbound_hello(
     hello_options.supports_crypt_layer = false;
     hello_options.requests_crypt_layer = false;
     hello_options.requires_crypt_layer = false;
-    let hello_payload =
-        build_hello_with_buddy_opts(user_hash, our_client_id, tcp_port, nickname, None, &hello_options);
+    let hello_payload = build_hello_with_buddy_opts(
+        user_hash,
+        our_client_id,
+        tcp_port,
+        nickname,
+        None,
+        &hello_options,
+    );
 
     write_packet_async_ms(writer, OP_EDONKEYHEADER, OP_HELLO, &hello_payload)
         .await

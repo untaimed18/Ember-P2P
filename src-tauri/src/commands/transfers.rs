@@ -998,7 +998,12 @@ pub async fn resume_transfer(
         let was_active_resumable = manager
             .active
             .get(&transfer_id)
-            .map(|t| matches!(t.status, TransferStatus::Paused | TransferStatus::Insufficient))
+            .map(|t| {
+                matches!(
+                    t.status,
+                    TransferStatus::Paused | TransferStatus::Insufficient
+                )
+            })
             .unwrap_or(false);
         if manager.get_control(&transfer_id).is_none() {
             manager.register_control(&transfer_id, TransferControl::new());
@@ -1370,7 +1375,12 @@ pub async fn resume_all_transfers(
             let was_active_resumable = manager
                 .active
                 .get(&id)
-                .map(|t| matches!(t.status, TransferStatus::Paused | TransferStatus::Insufficient))
+                .map(|t| {
+                    matches!(
+                        t.status,
+                        TransferStatus::Paused | TransferStatus::Insufficient
+                    )
+                })
                 .unwrap_or(false);
             let p = manager.resume(&id);
             if was_active_resumable && p.is_empty() {

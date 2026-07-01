@@ -325,7 +325,9 @@ mod tests {
         let resp_response_sig_bytes: [u8; 64] = resp_response[32..].try_into().unwrap();
         let resp_response_sig = Signature::from_bytes(&resp_response_sig_bytes);
         let resp_vk = VerifyingKey::from_bytes(&resp_response_pk).unwrap();
-        assert!(resp_vk.verify_strict(&init_nonce, &resp_response_sig).is_ok());
+        assert!(resp_vk
+            .verify_strict(&init_nonce, &resp_response_sig)
+            .is_ok());
         assert!(crate::network::ember::crypto::verify_ember_hash_binding(
             &resp_response_pk,
             &resp_hash

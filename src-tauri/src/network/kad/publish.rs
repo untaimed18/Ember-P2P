@@ -108,7 +108,10 @@ pub struct PublishManager {
 /// happens to be due right now. `HashMap` has no stable index, so this walks
 /// a deterministic sort of the keys instead; the effect (exactly one
 /// candidate considered per call, full sweep before any repeat) is the same.
-pub(crate) fn round_robin_next<V>(map: &HashMap<KadId, V>, cursor: &mut Option<KadId>) -> Option<KadId> {
+pub(crate) fn round_robin_next<V>(
+    map: &HashMap<KadId, V>,
+    cursor: &mut Option<KadId>,
+) -> Option<KadId> {
     if map.is_empty() {
         *cursor = None;
         return None;
@@ -905,11 +908,7 @@ mod tests {
         );
 
         let second_sweep: Vec<KadId> = (0..hashes.len())
-            .map(|_| {
-                p.next_keyword_candidate()
-                    .expect("still due")
-                    .keyword_hash
-            })
+            .map(|_| p.next_keyword_candidate().expect("still due").keyword_hash)
             .collect();
         assert_eq!(
             second_sweep, first_sweep,
