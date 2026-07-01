@@ -430,6 +430,46 @@ impl SearchState {
         batch
     }
 
+    /// eMule `CSearch::ProcessResponse` immediate dispatch (`SendFindValue`):
+    /// when a KADEMLIA2_RES reveals contacts that fall inside the top-`ALPHA`
+    /// closest set (`m_mapBest`), eMule fires the follow-up query to them
+    /// *synchronously in the packet handler* rather than waiting for the next
+    /// one-second `JumpStart`. `handle_response` fills `priority_queries` with
+    /// exactly those contacts; this drains them and applies the identical
+    /// `pending`/`pending_times`/`tried` marking that `next_to_query` uses, so
+    /// the caller can encode and send the queries right away. Regular
+    /// (non-best) contacts still flow through the periodic `poll_queries` tick,
+    /// matching eMule where only `m_mapBest` additions are queried immediately
+    /// and the remaining `m_mapPossible` pool is drained by `JumpStart`.
+    ///
+    /// Returns `(contact, query_message)` pairs ready to encode and send.
+    /// Bounded by the same per-round batch size as `next_to_query` so a burst
+    /// of responses can never emit an unbounded flight of packets.
+    pub fn take_priority_queries(&mut self) -> Vec<(KadContact, KadMessage)> {
+        if self.completed || self.stop_querying || self.phase != SearchPhase::Lookup {
+            return Vec::new();
+        }
+        let max_batch = if matches!(self.search_type, SearchType::FindNode) {
+            1
+        } else {
+            ALPHA
+        };
+        let now = chrono::Utc::now().timestamp();
+        let mut out = Vec::new();
+        while !self.priority_queries.is_empty() && out.len() < max_batch {
+            let c = self.priority_queries.remove(0);
+            if self.queried.contains(&c.id) || self.pending.contains(&c.id) {
+                continue;
+            }
+            self.pending.insert(c.id);
+            self.pending_times.insert(c.id, now);
+            self.tried.insert((c.ip, c.udp_port), c.id);
+            let msg = self.build_query_message(&c);
+            out.push((c, msg));
+        }
+        out
+    }
+
     /// eMule StorePacket equivalent: during Lookup phase, generate keyword/source
     /// search requests for contacts that have already responded to routing queries.
     /// This matches eMule's JumpStart behavior where StorePacket is called for
