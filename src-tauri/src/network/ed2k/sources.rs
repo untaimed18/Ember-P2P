@@ -267,9 +267,6 @@ impl PerFileSourceList {
         udp_port: u16,
         user_hash: Option<[u8; 16]>,
     ) -> bool {
-        if self.sources.len() >= MAX_SOURCES_PER_FILE {
-            return false;
-        }
         let uh_opt = user_hash.filter(|h| *h != [0u8; 16]);
 
         // Dedup by user hash first (catches type 3/5 publishes that omit
@@ -311,6 +308,13 @@ impl PerFileSourceList {
             }
         }
 
+        // Only a genuinely NEW peer is subject to the capacity cap; the dedup
+        // branches above (which enrich an existing row's udp_port / IP / user
+        // hash and return early) must run even at capacity, otherwise a full
+        // list would freeze existing rows out of learning their identity.
+        if self.sources.len() >= MAX_SOURCES_PER_FILE {
+            return false;
+        }
         let mut entry = DownloadSourceEntry::new(ip, tcp_port);
         entry.udp_port = udp_port;
         entry.source_user_hash = uh_opt;

@@ -714,7 +714,7 @@ impl SearchState {
             )
         {
             let current_offset = self.fetch_page_offset.get(from).copied().unwrap_or(0);
-            let next_offset = current_offset + FETCH_PAGE_SIZE as u16;
+            let next_offset = current_offset.saturating_add(FETCH_PAGE_SIZE as u16);
             if current_offset / FETCH_PAGE_SIZE as u16 + 1 < MAX_PAGES_PER_PEER {
                 self.fetch_page_offset.insert(*from, next_offset);
                 self.fetched.remove(from);

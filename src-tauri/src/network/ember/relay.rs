@@ -159,8 +159,8 @@ impl RelaySession {
         self.last_activity = Instant::now();
     }
 
-    pub fn add_relayed_bytes(&mut self, count: usize) {
-        self.bytes_relayed += count as u64;
+    pub fn add_relayed_bytes(&mut self, count: u64) {
+        self.bytes_relayed += count;
         self.last_activity = Instant::now();
     }
 
@@ -466,8 +466,13 @@ pub async fn poll_punch(rendezvous_url: &str, our_id: &str) -> Result<Option<Pun
     Ok(Some(PunchInfo {
         from_id: body["from_id"].as_str().unwrap_or("").to_string(),
         ip: body["ip"].as_str().unwrap_or("").to_string(),
-        port: body["port"].as_u64().unwrap_or(0) as u16,
-        nat_type: body["nat_type"].as_u64().unwrap_or(5) as u8,
+        // Range-check rather than truncate: a bogus wire value like 65537 must
+        // not silently wrap to a valid-looking port (1). Out-of-range -> 0,
+        // which the punch consumer rejects as undialable.
+        port: u16::try_from(body["port"].as_u64().unwrap_or(0)).unwrap_or(0),
+        // Unknown/out-of-range NAT type defaults to 5 (Unknown), matching the
+        // absent-field default above.
+        nat_type: u8::try_from(body["nat_type"].as_u64().unwrap_or(5)).unwrap_or(5),
     }))
 }
 
@@ -988,7 +993,7 @@ pub async fn run_quic_accept_loop(
                 {
                     let mut mgr_lock = mgr.lock().await;
                     if let Some(mut session) = mgr_lock.remove_session(session_id) {
-                        session.add_relayed_bytes(total_bytes as usize);
+                        session.add_relayed_bytes(total_bytes);
                         info!(
                             "Relay session {session_id} ended: {} bytes relayed ({} active, {} total relayed)",
                             session.bytes_relayed,

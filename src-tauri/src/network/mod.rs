@@ -11011,6 +11011,30 @@ pub async fn start_network(
                                         match ember::relay::poll_punch(&rv_url, &our_id).await {
                                             Ok(Some(info)) => {
                                                 if let Ok(ip) = info.ip.parse::<std::net::IpAddr>() {
+                                                    // Validate the rendezvous-relayed target before we
+                                                    // dial it over QUIC. The punch endpoint is a peer's
+                                                    // self-report proxied by the broker, so a malicious
+                                                    // or buggy peer could name a special-use / non-routable
+                                                    // address (loopback, LAN, CGNAT, 0.0.0.0/8, ...) or a
+                                                    // zero port. Skip those instead of attempting a
+                                                    // connection to a local/undialable endpoint.
+                                                    let target_routable = match ip {
+                                                        std::net::IpAddr::V4(v4) => {
+                                                            !crate::security::is_special_use_v4(v4)
+                                                        }
+                                                        std::net::IpAddr::V6(v6) => {
+                                                            !(v6.is_loopback()
+                                                                || v6.is_unspecified()
+                                                                || v6.is_multicast())
+                                                        }
+                                                    };
+                                                    if !target_routable || info.port == 0 {
+                                                        tracing::debug!(
+                                                            "Broker: ignoring punch target {ip}:{} (non-routable / port 0)",
+                                                            info.port
+                                                        );
+                                                        continue;
+                                                    }
                                                     // Decode the peer's advertised NAT type (carried
                                                     // through the rendezvous /punch coordination) and
                                                     // use it to gate the QUIC attempt. Hole-punching
@@ -13884,13 +13908,18 @@ pub async fn start_network(
                                         // otherwise sneak banned IPs
                                         // into source_manager and out
                                         // via Source Exchange.
-                                        if crate::security::is_special_use_v4(peer_ip)
-                                            || peer_ip.is_multicast()
-                                            || state.ip_filter.is_blocked(peer_ip)
+                                        if state.ip_filter.is_blocked(peer_ip)
                                             || state.banned_ips.contains(&peer_ip)
-                                            || port == 0
+                                            || !connect_serve_target_ok(
+                                                peer_ip,
+                                                port,
+                                                state.external_ip,
+                                                state.tcp_port,
+                                                user_hash,
+                                                &state.user_hash,
+                                            )
                                         {
-                                            debug!("Ignoring server callback for {peer_ip}:{port}: blocked by IP filter / banned / special-use / port 0");
+                                            debug!("Ignoring server callback for {peer_ip}:{port}: blocked by IP filter / banned / special-use / self / port 0");
                                             continue;
                                         }
 
@@ -15074,9 +15103,17 @@ pub async fn start_network(
                         // (crypt_options=0, user_hash=None) and let the peer's Hello drive the rest.
                         // We still keep the download-direction handling below (the peer may also be
                         // a source of a file we want). Non-blocking hand-off; a full queue drops it.
-                        if !(state.ip_filter.is_blocked(dest_ip)
-                            || state.banned_ips.contains(&dest_ip))
-                        {
+                        let buddy_target_safe = !state.ip_filter.is_blocked(dest_ip)
+                            && !state.banned_ips.contains(&dest_ip)
+                            && connect_serve_target_ok(
+                                dest_ip,
+                                dest_port,
+                                state.external_ip,
+                                state.tcp_port,
+                                None,
+                                &state.user_hash,
+                            );
+                        if buddy_target_safe {
                             let cb_addr = SocketAddr::new(dest_ip.into(), dest_port);
                             if let Err(e) = connect_serve_tx.try_send(
                                 upload_server::ConnectServeRequest {
@@ -25586,6 +25623,38 @@ fn is_self_source(src: &KadSource, state: &NetworkState) -> bool {
         }
     }
     false
+}
+
+/// Egress-target guard for LowID "connect-and-serve" dials triggered by a peer
+/// callback (server `OP_CALLBACKREQUESTED` / KAD buddy `OP_CALLBACK`). eMule
+/// mirrors a callback by connecting back to serve the requester, but we must
+/// never dial an undialable or self target: port 0, a special-use / multicast
+/// range (`is_special_use_v4` already covers multicast), our own external
+/// endpoint, or our own user identity (self-dial / reflection). Runtime
+/// `ip_filter` / banned-IP checks need live state and are applied by callers in
+/// addition to this. Returns `true` only when the target is safe to dial.
+fn connect_serve_target_ok(
+    dest_ip: Ipv4Addr,
+    dest_port: u16,
+    external_ip: Option<Ipv4Addr>,
+    self_tcp_port: u16,
+    dest_user_hash: Option<[u8; 16]>,
+    self_user_hash: &[u8; 16],
+) -> bool {
+    if dest_port == 0 || crate::security::is_special_use_v4(dest_ip) {
+        return false;
+    }
+    if let Some(ext) = external_ip {
+        if dest_ip == ext && dest_port == self_tcp_port {
+            return false;
+        }
+    }
+    if let Some(uh) = dest_user_hash {
+        if uh != [0u8; 16] && uh == *self_user_hash {
+            return false;
+        }
+    }
+    true
 }
 
 fn extract_kad_sources(entries: &[kad::messages::SearchResultEntry]) -> Vec<KadSource> {
