@@ -21514,6 +21514,12 @@ async fn handle_udp_packet_inner(
                         })
                     });
 
+                // Buffer for eMule's immediate `SendFindValue` dispatch. Filled
+                // while `search` (a &mut borrow of state.search_manager) is held,
+                // then flushed after the block releases it — `send_kad_packet`
+                // needs a whole-`state` immutable borrow that can't coexist with
+                // the &mut search-manager borrow.
+                let mut reactive_queries: Vec<(KadContact, KadMessage)> = Vec::new();
                 if let (Some(search), Some(sender_id)) =
                     (state.search_manager.get_mut(&sid), sender_id)
                 {
@@ -21584,6 +21590,12 @@ async fn handle_udp_packet_inner(
                     );
                     search.handle_response(&sender_id, safe_contacts.clone());
                     let is_fw_probe_search = search.is_udp_fw_probe_search;
+                    // eMule CSearch::ProcessResponse (SendFindValue): collect the
+                    // queries for freshly-discovered top-ALPHA contacts now, then
+                    // send them below once `search` is no longer borrowed. A UDP
+                    // firewall probe search never populates priority_queries (it
+                    // returns early in handle_response), so this is a no-op there.
+                    reactive_queries = search.take_priority_queries();
 
                     // eMule behavior: for FindBuddy searches, send FindBuddyReq
                     // to EVERY node that responds during the lookup, not just the
@@ -21626,6 +21638,26 @@ async fn handle_udp_packet_inner(
                         for c in &safe_contacts {
                             state.routing_table.insert(c.clone());
                         }
+                    }
+                }
+
+                // eMule CSearch::ProcessResponse SendFindValue: the &mut
+                // state.search_manager borrow above is now released, so fire the
+                // queued top-ALPHA queries immediately over UDP. This removes up
+                // to ~1s of per-hop latency versus deferring every query to the
+                // periodic poll_queries tick; the poll still drives the rest of
+                // the contact pool (eMule JumpStart). Marking already happened in
+                // take_priority_queries, so the next poll won't re-send these.
+                for (contact, msg) in reactive_queries {
+                    let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+                    if state.flood_protection.check_outgoing_rate(addr.ip()) {
+                        debug!("Throttling reactive search packet to {addr}");
+                        continue;
+                    }
+                    if let Ok(packet) = messages::encode_packet(&msg) {
+                        let opcode = packet.get(1).copied().unwrap_or(0);
+                        state.flood_protection.track_request(addr, opcode);
+                        let _ = send_kad_packet(socket, &packet, addr, state, &contact.id).await;
                     }
                 }
             }
