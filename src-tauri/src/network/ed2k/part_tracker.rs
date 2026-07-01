@@ -1302,12 +1302,18 @@ mod tests {
         let reloaded = PartTracker::new(file_size, &part_path);
         let serveable = reloaded.serveable_parts();
         assert_eq!(serveable.len(), 4);
-        assert!(serveable[0], "verified+complete part 0 must reload as serveable");
+        assert!(
+            serveable[0],
+            "verified+complete part 0 must reload as serveable"
+        );
         assert!(
             !serveable[1],
             "complete-but-unverified part 1 must NOT be serveable after reload"
         );
-        assert!(serveable[2], "verified+complete part 2 must reload as serveable");
+        assert!(
+            serveable[2],
+            "verified+complete part 2 must reload as serveable"
+        );
         assert!(!serveable[3], "incomplete part 3 must NOT be serveable");
 
         // Advertised (serveable) parts must stay within the serve gate.

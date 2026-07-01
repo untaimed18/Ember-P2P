@@ -46,13 +46,13 @@ use self::kad::messages::{self, KadMessage, KADEMLIA_FIND_NODE};
 use self::kad::obfuscation;
 use self::kad::protection::FloodProtection;
 use self::kad::publish::{
-    kad_id_to_md4_bytes, md4_bytes_to_kad_id, round_robin_next, KeywordPublishBatch, PublishManager,
-    PublishableFile,
+    kad_id_to_md4_bytes, md4_bytes_to_kad_id, round_robin_next, KeywordPublishBatch,
+    PublishManager, PublishableFile,
 };
 use self::kad::routing::RoutingTable;
 use self::kad::search::{
-    SearchId, SearchManager, SearchPhase, SearchType, SEARCH_INITIAL_CONTACTS,
-    STOP_GRACE_SECS, STORE_PUBLISH_TARGET_TOTAL,
+    SearchId, SearchManager, SearchPhase, SearchType, SEARCH_INITIAL_CONTACTS, STOP_GRACE_SECS,
+    STORE_PUBLISH_TARGET_TOTAL,
 };
 use self::kad::store::DhtStore;
 use self::kad::types::*;
@@ -1080,6 +1080,8 @@ fn inject_source_into_active_transfers(
     //    ranges, optionally private IPs, etc.
     // 3. Banned IPs (live runtime banlist).
     // 4. Reputation-banned user hashes (existing check).
+    // 5. Self-source: our own external IP+port, or our own user hash.
+    // 6. Undialable TCP port 0.
     if let Some(v4) = parsed_ip {
         if crate::security::is_special_use_v4(v4) || v4.is_multicast() {
             stats.dropped_full += transfer_ids.len();
@@ -1093,9 +1095,34 @@ fn inject_source_into_active_transfers(
             stats.dropped_full += transfer_ids.len();
             return stats;
         }
+        // 5. Never inject ourselves. KAD (`is_self_source`) and source-exchange
+        //    workers already drop self up-front, but the server source paths
+        //    (`OP_FOUNDSOURCES` / `OP_GLOBFOUNDSOURCES`) funnel straight through
+        //    this shared gate — without this, a server echoing our own published
+        //    HighID source would make us dial ourselves and burn a slot. eMule
+        //    filters self-sources too.
+        if let Some(ext) = state.external_ip {
+            if v4 == ext && source.peer_port == state.tcp_port {
+                stats.dropped_full += transfer_ids.len();
+                return stats;
+            }
+        }
+        // 6. A TCP port of 0 is not dialable (some server lists carry it); drop
+        //    it before it reaches the per-file source list or a worker.
+        if source.peer_port == 0 {
+            stats.dropped_full += transfer_ids.len();
+            return stats;
+        }
     }
     if let Some(ref uh) = source.peer_user_hash {
         if state.reputation.is_banned(uh) {
+            stats.dropped_full += transfer_ids.len();
+            return stats;
+        }
+        // Self by identity: a source list can carry our own user hash on a
+        // different (e.g. NATed) address than `external_ip`, so the address
+        // check above wouldn't catch it.
+        if *uh != [0u8; 16] && *uh == state.user_hash {
             stats.dropped_full += transfer_ids.len();
             return stats;
         }
@@ -6039,6 +6066,14 @@ pub async fn start_network(
     let upload_queue_handle: ed2k::upload::UploadQueueRef =
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
+    // Channel to ask the upload listener to dial a peer and serve it — the LowID
+    // callback-upload path (eMule `OP_CALLBACKREQUESTED` / KAD buddy `OP_CALLBACK`
+    // → `TryToConnect` → serve). `connect_serve_tx` stays in this function scope
+    // for the server/KAD callback handlers in the main loop below; the receiver
+    // is moved into the listener task, which drains it in its accept `select!`.
+    let (connect_serve_tx, connect_serve_rx) =
+        mpsc::channel::<upload_server::ConnectServeRequest>(64);
+
     // Start the peer-to-peer upload listener (accepts incoming file requests from other KAD peers)
     {
         let ul_tx = ul_event_tx.clone();
@@ -6128,6 +6163,7 @@ pub async fn start_network(
                 ul_disconnected,
                 ul_queue,
                 ul_sx_overhead,
+                connect_serve_rx,
             )
             .await
             {
@@ -7964,7 +8000,7 @@ pub async fn start_network(
                 // event can't unwind the whole network loop (→ outer catch →
                 // shutdown). Mirrors the handle_command_inner/handle_udp_packet_inner
                 // catch_unwind pattern.
-                if let Err(p) = std::panic::AssertUnwindSafe(handle_download_event(event, &app_handle, &transfer_manager, &db, &mut promoted, &mut stats_manager, settings.remove_finished_downloads, &a4af_shared, &settings.download_folder, &mut db_progress_last_persist, DB_PROGRESS_PERSIST_INTERVAL, &mut state.callback_row_pending_since)).catch_unwind().await {
+                if let Err(p) = std::panic::AssertUnwindSafe(handle_download_event(event, &app_handle, &transfer_manager, &source_manager, &db, &mut promoted, &mut stats_manager, settings.remove_finished_downloads, &a4af_shared, &settings.download_folder, &mut db_progress_last_persist, DB_PROGRESS_PERSIST_INTERVAL, &mut state.callback_row_pending_since)).catch_unwind().await {
                     error!("handle_download_event panicked, dropping event: {}", describe_panic(&*p));
                 }
 
@@ -9589,6 +9625,7 @@ pub async fn start_network(
                                                 available_parts: None,
                                                 total_parts: None,
                                                 country_code: crate::geoip::lookup_country(&geoip, std::net::IpAddr::V4(cb_src.ip)),
+                                                user_hash: cb_src.source_user_hash,
                                             },
                                         );
                                         // Fresh row → fresh timestamp, always.
@@ -9621,6 +9658,7 @@ pub async fn start_network(
                                                 available_parts: None,
                                                 total_parts: None,
                                                 country_code: crate::geoip::lookup_country(&geoip, std::net::IpAddr::V4(dc_src.ip)),
+                                                user_hash: dc_src.source_user_hash,
                                             },
                                         );
                                         state.callback_row_pending_since.insert(
@@ -9648,6 +9686,7 @@ pub async fn start_network(
                                                     available_parts: None,
                                                     total_parts: None,
                                                     country_code: crate::geoip::lookup_country(&geoip, std::net::IpAddr::V4(ls.ip)),
+                                                    user_hash: ls.source_user_hash,
                                                 },
                                             );
                                             state.callback_row_pending_since.insert(
@@ -9724,6 +9763,7 @@ pub async fn start_network(
                                                 available_parts: None,
                                                 total_parts: None,
                                                 country_code: cc,
+                                                user_hash: None,
                                             },
                                         );
                                     }
@@ -9791,6 +9831,7 @@ pub async fn start_network(
                                                 available_parts: None,
                                                 total_parts: None,
                                                 country_code: cc,
+                                                user_hash: cb_src.source_user_hash,
                                             },
                                         );
                                         // Fresh row → fresh timestamp, always.
@@ -9826,6 +9867,7 @@ pub async fn start_network(
                                                 available_parts: None,
                                                 total_parts: None,
                                                 country_code: cc,
+                                                user_hash: dc_src.source_user_hash,
                                             },
                                         );
                                         state.callback_row_pending_since.insert(
@@ -9870,6 +9912,7 @@ pub async fn start_network(
                                                 country_code: crate::geoip::lookup_country(
                                                     &geoip, std::net::IpAddr::V4(ls.ip),
                                                 ),
+                                                user_hash: ls.source_user_hash,
                                             },
                                         );
                                         state.callback_row_pending_since.insert(
@@ -10149,6 +10192,7 @@ pub async fn start_network(
                                                 available_parts: None,
                                                 total_parts: None,
                                                 country_code: cc,
+                                                user_hash: cb_src.source_user_hash,
                                             },
                                         );
                                         // Fresh row → fresh timestamp, always.
@@ -10184,6 +10228,7 @@ pub async fn start_network(
                                                 available_parts: None,
                                                 total_parts: None,
                                                 country_code: cc,
+                                                user_hash: dc_src.source_user_hash,
                                             },
                                         );
                                         state.callback_row_pending_since.insert(
@@ -11274,6 +11319,7 @@ pub async fn start_network(
                                                     let parts = crate::network::ed2k::upload::KadCallbackParts {
                                                         peer_ip: std::net::Ipv4Addr::UNSPECIFIED,
                                                         peer_port: 0,
+                                                        peer_hello_port: 0,
                                                         peer_user_hash: [0u8; 16],
                                                         file_hash: [0u8; 16],
                                                         reader: Box::new(reader),
@@ -12215,6 +12261,7 @@ pub async fn start_network(
                                             let parts = upload_server::KadCallbackParts {
                                                 peer_ip: greet_peer_ip,
                                                 peer_port: greet_peer_port,
+                                                peer_hello_port: 0,
                                                 peer_user_hash,
                                                 file_hash: greet_file_hash,
                                                 reader: greet_reader,
@@ -13203,6 +13250,7 @@ pub async fn start_network(
                                         available_parts: None,
                                         total_parts: None,
                                         country_code: cc,
+                                        user_hash: None,
                                     },
                                 );
                             }
@@ -13353,6 +13401,7 @@ pub async fn start_network(
                                         available_parts: None,
                                         total_parts: None,
                                         country_code: cc,
+                                        user_hash: None,
                                     },
                                 );
                             }
@@ -14638,10 +14687,28 @@ pub async fn start_network(
                                                     // `inject_source_into_active_transfers` so
                                                     // we don't actually connect, but we'd still
                                                     // forward the bad IP to other peers.
+                                                    // Never store ourselves (a
+                                                    // server that we published
+                                                    // this file to can echo our
+                                                    // own HighID back) or an
+                                                    // undialable port 0 — both
+                                                    // would otherwise be reask-
+                                                    // dialed and forwarded via
+                                                    // Source Exchange. Mirrors
+                                                    // `is_self_source` + the
+                                                    // inject gate.
+                                                    let is_self = (state.external_ip == Some(v4)
+                                                        && src.port == state.tcp_port)
+                                                        || matches!(
+                                                            src.user_hash,
+                                                            Some(uh) if uh != [0u8; 16] && uh == state.user_hash
+                                                        );
                                                     if crate::security::is_special_use_v4(v4)
                                                         || v4.is_multicast()
                                                         || state.ip_filter.is_blocked(v4)
                                                         || state.banned_ips.contains(&v4)
+                                                        || src.port == 0
+                                                        || is_self
                                                     {
                                                         continue;
                                                     }
@@ -14754,6 +14821,7 @@ pub async fn start_network(
                                                             available_parts: None,
                                                             total_parts: None,
                                                             country_code: cc,
+                                                            user_hash: None,
                                                         },
                                                     );
                                                 }
@@ -14782,20 +14850,17 @@ pub async fn start_network(
                                     emit_server_log(&app_handle, &format!("Server: {msg}"));
                                 }
                                 ed2k::server::ServerEvent::CallbackRequested { ip, port, crypt_options, user_hash } => {
-                                    // KNOWN DIVERGENCE FROM eMule (accepted gap, not a bug): eMule
-                                    // connects back here (ServerSocket OP_CALLBACKREQUESTED ->
-                                    // TryToConnect) and its unified client then serves the peer,
-                                    // including *uploads* requested by a peer that could only reach us
-                                    // because we are LowID. Ember instead treats the callback peer purely
-                                    // as a download *source* (registered + injected into active downloads
-                                    // below) and never connects back to serve. Consequence: a LowID Ember
-                                    // (unreachable inbound) cannot upload to peers who can only reach it
-                                    // via server callback -- connect-back is a LowID node's only upload
-                                    // route. Fixing it requires extracting the large inline serve loop
-                                    // from UploadHandler::handle_connection into a reusable session so it
-                                    // can run on a self-initiated connection; deferred until LowID
-                                    // upload/sharing is a priority. The same gap applies to the KAD buddy
-                                    // OP_CALLBACK relay path.
+                                    // eMule parity (ServerSocket OP_CALLBACKREQUESTED ->
+                                    // TryToConnect -> unified serve): we dial the peer back and serve
+                                    // it via the upload listener's outbound connect-and-serve path, so
+                                    // a firewalled LowID node can still upload to peers that can only
+                                    // reach it through a server callback (connect-back is a LowID
+                                    // node's only upload route). We ALSO keep the download-direction
+                                    // handling below (register + inject the peer as a source) for the
+                                    // case where this same peer is a LowID *source* of a file we're
+                                    // downloading; eMule unifies both directions on one connection,
+                                    // Ember uses one connection per direction. The KAD buddy
+                                    // OP_CALLBACK relay path dials back the same way.
                                     info!("Server callback requested: peer at {ip}:{port}");
                                     if let Ok(peer_ip) = ip.parse::<std::net::Ipv4Addr>() {
                                         // Same IP-filter gate as the
@@ -14813,10 +14878,27 @@ pub async fn start_network(
                                             || peer_ip.is_multicast()
                                             || state.ip_filter.is_blocked(peer_ip)
                                             || state.banned_ips.contains(&peer_ip)
+                                            || port == 0
                                         {
-                                            debug!("Ignoring server callback for {peer_ip}:{port}: blocked by IP filter / banned / special-use");
+                                            debug!("Ignoring server callback for {peer_ip}:{port}: blocked by IP filter / banned / special-use / port 0");
                                             continue;
                                         }
+
+                                        // eMule TryToConnect: dial the peer back and serve it, so a
+                                        // firewalled LowID node can upload over the connection it
+                                        // opens. Non-blocking hand-off to the upload listener; a full
+                                        // queue just drops the request (the peer re-asks on a timer).
+                                        let cb_addr = std::net::SocketAddr::from((peer_ip, port));
+                                        if let Err(e) = connect_serve_tx.try_send(
+                                            upload_server::ConnectServeRequest {
+                                                peer_addr: cb_addr,
+                                                crypt_options: crypt_options.unwrap_or(0),
+                                                user_hash,
+                                            },
+                                        ) {
+                                            debug!("Could not enqueue callback-serve for {cb_addr}: {e}");
+                                        }
+
                                         let matching_hashes = if let Some(addr) = state.server_addr {
                                             if let std::net::IpAddr::V4(v4) = addr.ip() {
                                                 let sm = source_manager.read().await;
@@ -15340,6 +15422,18 @@ pub async fn start_network(
                                             if state.banned_ips.contains(ip) {
                                                 continue;
                                             }
+                                            // Drop undialable port 0 and our own
+                                            // echoed HighID (same as the TCP
+                                            // found-sources path) so neither is
+                                            // reask-dialed or SX-forwarded.
+                                            if *port == 0 {
+                                                continue;
+                                            }
+                                            if state.external_ip == Some(*ip)
+                                                && *port == state.tcp_port
+                                            {
+                                                continue;
+                                            }
                                             sm.register_source_full_server(
                                                 file_hash, *ip, *port, 0,
                                                 udp_server_ip, udp_server_port,
@@ -15449,6 +15543,7 @@ pub async fn start_network(
                                                             available_parts: None,
                                                             total_parts: None,
                                                             country_code: cc.clone(),
+                                                            user_hash: None,
                                                         },
                                                     );
                                                 }
@@ -15959,6 +16054,31 @@ pub async fn start_network(
                     Some(BuddyEvent::Callback { file_hash, dest_ip, dest_port }) => {
                         info!("Buddy callback: connect to {dest_ip}:{dest_port} for file {}", hex::encode(file_hash));
 
+                        // eMule parity (KAD buddy OP_CALLBACK -> TryToConnect -> serve): a peer
+                        // reached us (LowID) through our buddy relay because it wants to interact
+                        // over a connection *we* open. Dial back and serve it via the upload
+                        // listener's outbound path, so a firewalled node can upload. buddy.rs
+                        // already validated the callback (crypto check token, non-zero port, not
+                        // special-use); we add the runtime ip-filter / ban gate here before dialing.
+                        // The KAD callback carries no crypt options or user hash, so we dial plain
+                        // (crypt_options=0, user_hash=None) and let the peer's Hello drive the rest.
+                        // We still keep the download-direction handling below (the peer may also be
+                        // a source of a file we want). Non-blocking hand-off; a full queue drops it.
+                        if !(state.ip_filter.is_blocked(dest_ip)
+                            || state.banned_ips.contains(&dest_ip))
+                        {
+                            let cb_addr = SocketAddr::new(dest_ip.into(), dest_port);
+                            if let Err(e) = connect_serve_tx.try_send(
+                                upload_server::ConnectServeRequest {
+                                    peer_addr: cb_addr,
+                                    crypt_options: 0,
+                                    user_hash: None,
+                                },
+                            ) {
+                                debug!("Could not enqueue buddy callback-serve for {cb_addr}: {e}");
+                            }
+                        }
+
                         let matching_tid = state.pending_downloads.iter()
                             .find(|(_, pd)| {
                                 hex::decode(&pd.file_hash).ok()
@@ -16431,6 +16551,7 @@ pub async fn start_network(
                         // moved into the EstablishedSource.
                         let cb_peer_ip = parts.peer_ip;
                         let cb_peer_port = parts.peer_port;
+                        let cb_peer_hello_port = parts.peer_hello_port;
                         let cb_peer_user_hash = parts.peer_user_hash;
                         let cb_file_hash = parts.file_hash;
                         let cb_emule_info_done = parts.emule_info_done;
@@ -16470,10 +16591,16 @@ pub async fn start_network(
                         {
                             let mut sm = source_manager.write().await;
                             if let Some((srv_ip, srv_port)) = server_info {
-                                sm.promote_lowid_source(
-                                    srv_ip, srv_port,
-                                    cb_peer_port,
-                                    cb_peer_ip,
+                                // Link this callback to the LowID row we already
+                                // track (matched by the peer's *listening* port
+                                // from its Hello, not this connection's ephemeral
+                                // port) so the peer isn't counted twice. It stays
+                                // a LowID row — reconnects still go via a fresh
+                                // server callback.
+                                sm.link_lowid_callback_identity(
+                                    srv_ip,
+                                    srv_port,
+                                    cb_peer_hello_port,
                                     cb_peer_user_hash,
                                 );
                             }
@@ -18764,10 +18891,9 @@ fn dispatch_udp_firewall_probe_requests(state: &mut NetworkState, settings: &App
                 .routing_table
                 .find_closest_prefer_verified(&target, SEARCH_INITIAL_CONTACTS);
             if !closest.is_empty() {
-                let sid =
-                    state
-                        .search_manager
-                        .start_search(target, SearchType::FindNode, closest);
+                let sid = state
+                    .search_manager
+                    .start_search(target, SearchType::FindNode, closest);
                 if sid != SearchId(0) {
                     if let Some(s) = state.search_manager.get_mut(&sid) {
                         s.is_udp_fw_probe_search = true;
@@ -18801,7 +18927,9 @@ fn dispatch_udp_firewall_probe_requests(state: &mut NetworkState, settings: &App
         if Some(candidate.ip) == self_ip
             || candidate.tcp_port == 0
             || candidate.version <= KADEMLIA_VERSION5_48A
-            || state.firewall_checker.is_udp_firewall_check_ip(candidate.ip)
+            || state
+                .firewall_checker
+                .is_udp_firewall_check_ip(candidate.ip)
             || state.routing_table.get_contact(&candidate.id).is_some()
             || state.ip_filter.is_blocked(candidate.ip)
             || state.banned_ips.contains(&candidate.ip)
@@ -19216,8 +19344,10 @@ async fn handle_ember_native_udp_inner(
                     if let Err(e) = socket.send_to(&packet, from).await {
                         debug!("ember-udp: failed to send ExchangeData reply to {from}: {e}");
                     } else {
-                        state.ember_diagnostics.ember_exchange_sent =
-                            state.ember_diagnostics.ember_exchange_sent.saturating_add(1);
+                        state.ember_diagnostics.ember_exchange_sent = state
+                            .ember_diagnostics
+                            .ember_exchange_sent
+                            .saturating_add(1);
                     }
                 }
                 // The session is established (we just decrypted the
@@ -23826,7 +23956,9 @@ async fn handle_command_inner(
                     .routing_table
                     .find_closest_prefer_verified(&kad_hash, SEARCH_INITIAL_CONTACTS);
                 if closest.is_empty() {
-                    debug!("No routing table contacts for source search, download will retry later");
+                    debug!(
+                        "No routing table contacts for source search, download will retry later"
+                    );
                 }
 
                 let now = chrono::Utc::now().timestamp();
@@ -24293,8 +24425,7 @@ async fn handle_command_inner(
                 diag.broker_relay_failures = bs.relay_failures;
                 diag.broker_active_attempts = broker.active_attempts() as u32;
                 diag.broker_relay_candidates = broker.relay_candidate_count() as u32;
-                diag.broker_oldest_attempt_age_secs =
-                    broker.oldest_attempt_age_secs().unwrap_or(0);
+                diag.broker_oldest_attempt_age_secs = broker.oldest_attempt_age_secs().unwrap_or(0);
             }
             {
                 let rm = state.relay_manager.lock().await;
@@ -27000,6 +27131,7 @@ async fn handle_download_event(
     event: DownloadEvent,
     app_handle: &tauri::AppHandle,
     transfer_manager: &Arc<RwLock<TransferManager>>,
+    source_manager: &Arc<RwLock<SourceManager>>,
     db: &Arc<Database>,
     promoted_out: &mut Vec<Transfer>,
     stats_manager: &mut StatsManager,
@@ -27193,36 +27325,49 @@ async fn handle_download_event(
                 "completed" => crate::types::SourceStatus::Completed,
                 _ => crate::types::SourceStatus::Failed,
             };
-            // Events arriving at this handler come from real
-            // download workers (multi_source / transfer) for live
-            // peer connections — placeholder rows we seed from KAD
-            // search results bypass `DownloadEvent` and write
-            // directly to the transfer manager, so they never
-            // reach here. That means any event here is the signal
-            // "this peer is connected (or actively being dialled)
-            // on (ip, port)". Strip any stale placeholder rows
-            // for the same IP that we seeded earlier from KAD —
-            // they keyed by the peer's *listed* listening port,
-            // while the live connection almost always lands on a
-            // different ephemeral port, so without this cleanup
-            // the UI ends up with two rows per peer (one
-            // forever-"Connecting" placeholder next to the real
-            // transferring/queued row). The `except_port` guard
-            // preserves the one placeholder row that happens to
-            // share the live row's port — `update_source_detail`
-            // below updates it in place, no duplicate to clean up.
+            // Every event here comes from a real download worker
+            // (multi_source / transfer) reporting a *live* peer connection on
+            // (ip, port). Placeholder rows we seed from KAD/server source
+            // lists bypass `DownloadEvent` and are written straight to the
+            // transfer manager, so any event here means "this peer is now
+            // connected / being dialled". Give the live row the peer's stable
+            // identity (its eD2k user hash, looked up by IP) so it can be
+            // coalesced with any earlier row for the same peer: a LowID/KAD/
+            // server callback or a Path-B push-grant reconnect lands on the
+            // peer's *ephemeral* outbound port — a different (ip, port) key
+            // than the listening port we seeded — and eMule keeps a single
+            // client per peer keyed by hash (`CUpDownClient::Compare`).
+            // Without this the UI shows two rows per peer (a forever-
+            // "Connecting"/"Queued" row next to the real transferring row).
             //
-            // This is defence-in-depth alongside the dedicated
-            // cleanup in the `kad_callback_rx` path: if a callback
-            // arrives via a path that path doesn't cover
-            // (e.g. future protocol additions, or the fallback-
-            // to-metadata-injection branch), the placeholder still
-            // goes away as soon as the worker reports any live
-            // state for the peer.
+            // Identity lookup is exact-first: the live worker registers the
+            // peer's hash against the connection's *actual* port (the listening
+            // port for a dialed HighID source, the ephemeral outbound port for
+            // an adopted callback/push-grant stream), so an exact (ip, port)
+            // match is unambiguous even when several peers share one NAT IP. We
+            // only fall back to the by-IP identity when that port isn't
+            // registered yet, and `unique_user_hash_for_ip` deliberately returns
+            // `None` when the IP maps to more than one identity, so we never
+            // mis-attribute a live connection or merge distinct peers behind one
+            // NAT; callback placeholders at that IP are still cleaned up by
+            // label inside `supersede_duplicate_peer_rows`.
+            let live_hash = if let Ok(v4) = ip.parse::<std::net::Ipv4Addr>() {
+                let sm = source_manager.read().await;
+                sm.get_user_hash_by_addr(v4, port)
+                    .or_else(|| sm.unique_user_hash_for_ip(v4))
+            } else {
+                None
+            };
             let placeholder_removed = {
                 let mut mgr = transfer_manager.write().await;
-                let removed =
-                    mgr.remove_callback_placeholders_for_ip_except(&transfer_id, &ip, Some(port));
+                // Drop any other row representing this same peer: one carrying
+                // the same user hash at a different port/IP-key (this coalesces
+                // the ephemeral live row with the listening/placeholder row —
+                // including a Path-B queued row, which was stamped with the
+                // hash while it was queued), plus any callback placeholder at
+                // this IP (the pre-existing callback cleanup). The live
+                // (ip, port) row is preserved and updated in place below.
+                let removed = mgr.supersede_duplicate_peer_rows(&transfer_id, &ip, port, live_hash);
                 mgr.update_source_detail(
                     &transfer_id,
                     crate::types::SourceInfo {
@@ -27237,6 +27382,7 @@ async fn handle_download_event(
                         available_parts,
                         total_parts,
                         country_code: country_code.clone(),
+                        user_hash: live_hash,
                     },
                 );
                 removed

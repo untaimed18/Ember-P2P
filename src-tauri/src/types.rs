@@ -273,6 +273,15 @@ pub struct SourceInfo {
     pub total_parts: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub country_code: Option<String>,
+    /// Stable peer identity (eD2k user hash). Mirrors eMule's
+    /// `CUpDownClient` identity: a peer keeps this across connection
+    /// direction and port changes, so it is used to coalesce rows for the
+    /// same peer that would otherwise appear twice — once at its advertised
+    /// listening port (from server/KAD/SX discovery) and once at the
+    /// ephemeral outbound port of an adopted inbound (LowID/callback/
+    /// push-grant) connection. `None` when the identity isn't known yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_hash: Option<[u8; 16]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
