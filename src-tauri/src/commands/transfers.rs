@@ -566,14 +566,30 @@ pub async fn cancel_transfers_batch(
         }
 
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        let _ = state
+        if let Err(e) = state
             .network_tx
             .send(NetworkCommand::CancelDownload {
                 transfer_id: transfer_id.clone(),
                 cleanup_ack: Some(ack_tx),
             })
-            .await;
-        let _ = tokio::time::timeout(CMD_REPLY_TIMEOUT, ack_rx).await;
+            .await
+        {
+            // Network task is gone: nothing will release the download's file
+            // handle. We still clean up so the partial doesn't leak, but log it
+            // — silently dropping this hid that the delete below runs without a
+            // teardown handshake.
+            tracing::warn!(
+                "cancel_transfers_batch: network task unavailable for {transfer_id}; deleting partial without teardown ack ({e})"
+            );
+        } else if tokio::time::timeout(CMD_REPLY_TIMEOUT, ack_rx).await.is_err() {
+            // Teardown didn't ack within the window; the worker may still hold
+            // the .part handle. We proceed (bounded wait; eMule always deletes),
+            // but surface it so a delete/replace error on Windows is explainable
+            // rather than a silent race.
+            tracing::warn!(
+                "cancel_transfers_batch: cleanup ack timed out for {transfer_id}; deleting partial may race a slow teardown"
+            );
+        }
 
         let dl_folder = {
             let config = state.config.read().await;

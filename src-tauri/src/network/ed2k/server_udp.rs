@@ -760,10 +760,13 @@ fn apply_udp_uint_tag(
     match name_id {
         0xD3 if value > 0 => media.duration = Some(value as u32),
         0xD4 if value > 0 => media.bitrate = Some(value as u32),
-        0xF7 => *rating = Some(value as u8),
+        // eMule file ratings are 0..=5; clamp rather than `as u8`-truncate so a
+        // bogus server value (e.g. 256 -> 0, 261 -> 5) can't wrap into a
+        // misleading rating.
+        0xF7 => *rating = Some(value.min(5) as u8),
         _ if is("bitrate") && value > 0 => media.bitrate = Some(value as u32),
         _ if is("length") && value > 0 => media.duration = Some(value as u32),
-        _ if is("filerating") || is("rating") => *rating = Some(value as u8),
+        _ if is("filerating") || is("rating") => *rating = Some(value.min(5) as u8),
         _ => {}
     }
 }
