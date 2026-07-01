@@ -1056,12 +1056,13 @@ impl AbuseTracker {
         false
     }
 
-    /// Record a request from this IP. Returns true if the IP should be banned.
-    fn record_request(&mut self, ip: std::net::IpAddr) -> bool {
-        let ip = Self::normalize_ip(&ip);
-        let now = std::time::Instant::now();
-
-        // Periodic cleanup of expired entries
+    /// Evict expired / lapsed entries at most once per 10 min. Shared by every
+    /// entry-inserting path so the map stays bounded regardless of which one
+    /// dominates — a firewalled LowID node that only ever dials out via
+    /// callback-serve exercises `record_file_not_found` (a served peer asking
+    /// for a file we don't have) without the inbound `record_request` that
+    /// used to own cleanup, so eviction has to run from both.
+    fn maybe_cleanup(&mut self, now: std::time::Instant) {
         if now.duration_since(self.last_cleanup).as_secs() > 600 {
             self.entries.retain(|_, e| match e.banned_until {
                 Some(u) if now >= u => false,
@@ -1070,6 +1071,13 @@ impl AbuseTracker {
             });
             self.last_cleanup = now;
         }
+    }
+
+    /// Record a request from this IP. Returns true if the IP should be banned.
+    fn record_request(&mut self, ip: std::net::IpAddr) -> bool {
+        let ip = Self::normalize_ip(&ip);
+        let now = std::time::Instant::now();
+        self.maybe_cleanup(now);
 
         let entry = self.entries.entry(ip).or_insert_with(|| AbuseEntry {
             request_count: 0,
@@ -1107,6 +1115,7 @@ impl AbuseTracker {
     fn record_file_not_found(&mut self, ip: std::net::IpAddr) -> bool {
         let ip = Self::normalize_ip(&ip);
         let now = std::time::Instant::now();
+        self.maybe_cleanup(now);
         let entry = self.entries.entry(ip).or_insert_with(|| AbuseEntry {
             request_count: 0,
             window_start: now,
@@ -1515,7 +1524,13 @@ pub async fn start_upload_server(
 
     loop {
         tokio::select! {
-            biased;
+            // Fair (unbiased) polling across the three arms. A `biased;` order
+            // here polled `accept()` first every iteration, so under sustained
+            // inbound-connection pressure the slot-maintenance tick and the
+            // LowID callback-serve arm could starve indefinitely — the tick
+            // drives queue upkeep and the callback-serve arm is a firewalled
+            // node's ONLY upload route. Random-order polling lets every ready
+            // arm make progress; the OS backlog still buffers pending accepts.
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, peer_addr)) => {
@@ -1739,7 +1754,7 @@ pub async fn start_upload_server(
             }
             // LowID callback-serve: the network task asks us to dial a peer and
             // serve it (server `OP_CALLBACKREQUESTED` / KAD buddy `OP_CALLBACK`).
-            // Lower `select!` priority than inbound accepts (biased order above).
+            // Polled fairly with the accept/tick arms (no `biased;` above).
             maybe_req = connect_serve_rx.recv(), if !connect_serve_closed => {
                 let req = match maybe_req {
                     Some(r) => r,
