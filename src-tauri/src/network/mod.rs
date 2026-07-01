@@ -14782,6 +14782,20 @@ pub async fn start_network(
                                     emit_server_log(&app_handle, &format!("Server: {msg}"));
                                 }
                                 ed2k::server::ServerEvent::CallbackRequested { ip, port, crypt_options, user_hash } => {
+                                    // KNOWN DIVERGENCE FROM eMule (accepted gap, not a bug): eMule
+                                    // connects back here (ServerSocket OP_CALLBACKREQUESTED ->
+                                    // TryToConnect) and its unified client then serves the peer,
+                                    // including *uploads* requested by a peer that could only reach us
+                                    // because we are LowID. Ember instead treats the callback peer purely
+                                    // as a download *source* (registered + injected into active downloads
+                                    // below) and never connects back to serve. Consequence: a LowID Ember
+                                    // (unreachable inbound) cannot upload to peers who can only reach it
+                                    // via server callback -- connect-back is a LowID node's only upload
+                                    // route. Fixing it requires extracting the large inline serve loop
+                                    // from UploadHandler::handle_connection into a reusable session so it
+                                    // can run on a self-initiated connection; deferred until LowID
+                                    // upload/sharing is a priority. The same gap applies to the KAD buddy
+                                    // OP_CALLBACK relay path.
                                     info!("Server callback requested: peer at {ip}:{port}");
                                     if let Ok(peer_ip) = ip.parse::<std::net::Ipv4Addr>() {
                                         // Same IP-filter gate as the
