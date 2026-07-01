@@ -31,6 +31,118 @@ use crate::network::kad::buddy::PendingBuddySet;
 use crate::network::kad::ip_filter::SharedIpFilter;
 use crate::network::kad::types::cuint128_swap;
 
+// Post-negotiation stream wrappers. Defined at module scope (rather than inline
+// in `run_session`) so the outbound connect-and-serve path can build the same
+// concrete reader/writer the inbound path uses and hand them to the shared
+// session logic. An enum avoids dyn dispatch on the hot upload read/write path.
+enum StreamReader {
+    Plain(tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>),
+    Obfuscated(
+        tokio::io::BufReader<Rc4Reader<tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>>>,
+    ),
+}
+enum StreamWriter {
+    Plain(tokio::io::BufWriter<tokio::net::tcp::OwnedWriteHalf>),
+    Obfuscated(
+        tokio::io::BufWriter<Rc4Writer<tokio::io::BufWriter<tokio::net::tcp::OwnedWriteHalf>>>,
+    ),
+}
+
+impl AsyncRead for StreamReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            StreamReader::Plain(r) => Pin::new(r).poll_read(cx, buf),
+            StreamReader::Obfuscated(r) => Pin::new(r).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for StreamWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        match self.get_mut() {
+            StreamWriter::Plain(w) => Pin::new(w).poll_write(cx, buf),
+            StreamWriter::Obfuscated(w) => Pin::new(w).poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            StreamWriter::Plain(w) => Pin::new(w).poll_flush(cx),
+            StreamWriter::Obfuscated(w) => Pin::new(w).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            StreamWriter::Plain(w) => Pin::new(w).poll_shutdown(cx),
+            StreamWriter::Obfuscated(w) => Pin::new(w).poll_shutdown(cx),
+        }
+    }
+}
+
+/// How an upload session was initiated.
+///
+/// `Inbound` is a peer that dialed our listener (the classic path). `OutboundServe`
+/// is a connection *we* dialed in response to a server/KAD callback so a
+/// firewalled (LowID) node can still upload — mirroring eMule's
+/// `OP_CALLBACKREQUESTED` → `TryToConnect` → unified-client-serve behaviour.
+/// Both variants share the entire post-handshake serve loop in `run_session`;
+/// only the handshake preamble differs (who sends `OP_HELLO` first, and
+/// `negotiate_incoming` vs `negotiate_outgoing`).
+enum ConnInit {
+    Inbound(TcpStream),
+    OutboundServe(Box<OutboundServeState>),
+}
+
+/// A fully handshaked outbound connection produced by `connect_and_serve`, handed
+/// to `run_session` so it converges straight into the shared serve loop without
+/// re-running any inbound-only handshake steps.
+struct OutboundServeState {
+    reader: StreamReader,
+    writer: StreamWriter,
+    /// The peer's `OP_HELLOANSWER` payload. Parsed once into `hello_caps` before
+    /// entering the serve loop; the inbound-only diversions that also read
+    /// `hello_data` are skipped for outbound so its exact bytes don't matter
+    /// past that parse.
+    hello_data: Vec<u8>,
+    peer_user_hash: [u8; 16],
+    hello_caps: PeerCapabilities,
+    /// A packet the peer sent *instead of* `OP_EMULEINFOANSWER` during the
+    /// outbound handshake (e.g. it jumped straight to a file request). Rare —
+    /// eMule answers EmuleInfo first — but when present it is fed to the serve
+    /// loop as its first `deferred_packet` so nothing is dropped.
+    first_packet: Option<(u8, u8, Vec<u8>)>,
+}
+
+/// Request from the network task asking the upload listener to dial `peer_addr`
+/// and serve it — the LowID callback-upload path. Flows network → upload,
+/// opposite to [`KadCallbackParts`] (which flows upload → network for the
+/// download-adoption path).
+#[derive(Debug, Clone)]
+pub struct ConnectServeRequest {
+    pub peer_addr: SocketAddr,
+    /// Peer crypt options from the callback (bit0 = supports, bit1 = requests,
+    /// bit2 = requires). Drives whether we dial obfuscated, matching eMule's
+    /// `SetConnectOptions` + `Connect` encryption decision.
+    pub crypt_options: u8,
+    /// Peer ED2K user hash from the callback when known. Required to seed the
+    /// RC4 key for an obfuscated dial (eMule derives obfuscation from the user
+    /// hash); `None`/zero forces a plain dial.
+    pub user_hash: Option<[u8; 16]>,
+}
+
 struct UploadSlotGuard {
     active_count: Arc<std::sync::atomic::AtomicUsize>,
     slot_notify: Arc<tokio::sync::Notify>,
@@ -134,6 +246,13 @@ pub type BuddyConnectionParts = (
 pub struct KadCallbackParts {
     pub peer_ip: std::net::Ipv4Addr,
     pub peer_port: u16,
+    /// The peer's *advertised listening* TCP port, parsed from its Hello
+    /// (bytes 21-22). Distinct from `peer_port`, which is the ephemeral source
+    /// port of this inbound connection. Used to link a server-LowID callback
+    /// back to the LowID source row we stored at that listening port (keyed by
+    /// `(server, listening_port)`), so the peer isn't double-counted. `0` when
+    /// the Hello was too short to carry it.
+    pub peer_hello_port: u16,
     pub peer_user_hash: [u8; 16],
     pub file_hash: [u8; 16],
     pub reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
@@ -224,6 +343,12 @@ pub struct UdpFirewallCheckRequest {
 }
 
 const CLIENT_TIMEOUT_SECS: u64 = 120;
+/// Per-step timeout for the *outbound* callback-serve handshake (TCP connect,
+/// Hello/EmuleInfo round-trips). Much tighter than [`CLIENT_TIMEOUT_SECS`]:
+/// a callback peer that doesn't answer promptly isn't worth a long stall on a
+/// task we spawned proactively. Matches the peer-connect timeout the download
+/// side uses.
+const OUTBOUND_SERVE_HANDSHAKE_SECS: u64 = 15;
 /// Minimum wall time between `UploadEventKind::Progress` events for a
 /// single upload session. The OP_REQUESTPARTS handler naturally fires one
 /// Progress per 180 KiB block sent; at 2 MiB/s that's ~11 events/sec per
@@ -1298,6 +1423,10 @@ pub async fn start_upload_server(
     // and outbound ANSWERSOURCES / EMBER_SOURCEEXCHANGE bytes; the
     // network-loop drains them into the SourceExchange overhead row.
     sx_overhead: crate::storage::statistics::SharedSxOverheadCounters,
+    // Callback-serve requests from the network task (server `OP_CALLBACKREQUESTED`
+    // and KAD buddy `OP_CALLBACK`): each asks us to dial a peer and serve it so a
+    // firewalled LowID node can still upload. Drained in the accept `select!`.
+    mut connect_serve_rx: tokio::sync::mpsc::Receiver<ConnectServeRequest>,
 ) -> anyhow::Result<()> {
     let addr: SocketAddr = format!("0.0.0.0:{tcp_port}").parse()?;
     let listener = match TcpListener::bind(addr).await {
@@ -1379,6 +1508,10 @@ pub async fn start_upload_server(
     // Counts 1 s slot-check ticks so the heavier "file no longer offered" queue
     // purge runs on a coarser (~30 s) cadence than the proactive slot opener.
     let mut slot_check_ticks: u64 = 0;
+    // Latches when the callback-serve sender is dropped so we stop polling that
+    // `select!` branch (a closed channel's `recv()` returns `None` immediately
+    // and would otherwise busy-spin the loop).
+    let mut connect_serve_closed = false;
 
     loop {
         tokio::select! {
@@ -1604,6 +1737,105 @@ pub async fn start_upload_server(
                     server.purge_unshared_queue_entries().await;
                 }
             }
+            // LowID callback-serve: the network task asks us to dial a peer and
+            // serve it (server `OP_CALLBACKREQUESTED` / KAD buddy `OP_CALLBACK`).
+            // Lower `select!` priority than inbound accepts (biased order above).
+            maybe_req = connect_serve_rx.recv(), if !connect_serve_closed => {
+                let req = match maybe_req {
+                    Some(r) => r,
+                    None => {
+                        // Sender dropped (shutdown): stop polling this branch so
+                        // the select! doesn't busy-spin on an always-ready None.
+                        connect_serve_closed = true;
+                        continue;
+                    }
+                };
+                let peer_ip = req.peer_addr.ip();
+
+                // Reserve a global slot with the same cap + atomic CAS the
+                // inbound accept path uses, so outbound callback serves can't
+                // push the process past MAX_TOTAL_CONNECTIONS.
+                let reserved = {
+                    let mut cur = server
+                        .total_connections
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    loop {
+                        if cur >= MAX_TOTAL_CONNECTIONS {
+                            break false;
+                        }
+                        match server.total_connections.compare_exchange_weak(
+                            cur,
+                            cur + 1,
+                            std::sync::atomic::Ordering::Relaxed,
+                            std::sync::atomic::Ordering::Relaxed,
+                        ) {
+                            Ok(_) => break true,
+                            Err(actual) => cur = actual,
+                        }
+                    }
+                };
+                if !reserved {
+                    debug!(
+                        "Dropping callback-serve to {}: global connection limit reached",
+                        req.peer_addr
+                    );
+                    continue;
+                }
+                {
+                    let mut counts = server.ip_connection_counts.lock().await;
+                    let count = counts.entry(peer_ip).or_insert(0);
+                    if *count >= MAX_CONNECTIONS_PER_IP {
+                        debug!(
+                            "Dropping callback-serve to {}: per-IP limit reached",
+                            req.peer_addr
+                        );
+                        drop(counts);
+                        server
+                            .total_connections
+                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    }
+                    *count += 1;
+                }
+
+                let server = server.clone();
+                tokio::spawn(async move {
+                    let result = std::panic::AssertUnwindSafe(server.connect_and_serve(req))
+                        .catch_unwind()
+                        .await;
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            let msg = e.to_string();
+                            if msg.contains("end of file")
+                                || msg.contains("Connection reset")
+                                || msg.contains("connection reset")
+                                || msg.contains("broken pipe")
+                                || msg.contains("timed out")
+                                || msg.contains("timeout")
+                                || msg.contains("tcp connect")
+                            {
+                                debug!("Callback-serve to {peer_ip} ended: {msg}");
+                            } else {
+                                warn!("Callback-serve to {peer_ip} ended: {e}");
+                            }
+                        }
+                        Err(_panic) => {
+                            error!("Callback-serve handler panicked for {peer_ip}");
+                        }
+                    }
+                    server
+                        .total_connections
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    let mut counts = server.ip_connection_counts.lock().await;
+                    if let Some(count) = counts.get_mut(&peer_ip) {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            counts.remove(&peer_ip);
+                        }
+                    }
+                });
+            }
         }
     }
 }
@@ -1770,11 +2002,12 @@ impl UploadHandler {
                 .copied()
                 .filter(|h| {
                     let hex_h = hex::encode(h);
-                    mgr.active.values().any(|t| {
-                        t.direction == TransferDirection::Download && t.file_hash == hex_h
-                    }) || mgr.queue.iter().any(|t| {
-                        t.direction == TransferDirection::Download && t.file_hash == hex_h
-                    })
+                    mgr.active
+                        .values()
+                        .any(|t| t.direction == TransferDirection::Download && t.file_hash == hex_h)
+                        || mgr.queue.iter().any(|t| {
+                            t.direction == TransferDirection::Download && t.file_hash == hex_h
+                        })
                 })
                 .collect()
         };
@@ -2005,158 +2238,485 @@ impl UploadHandler {
         stream: TcpStream,
         peer_addr: SocketAddr,
     ) -> anyhow::Result<()> {
+        self.run_session(peer_addr, ConnInit::Inbound(stream)).await
+    }
+
+    /// Dial `peer_addr` and serve it as an upload peer — the LowID callback
+    /// upload path. This mirrors eMule's `OP_CALLBACKREQUESTED` → `TryToConnect`
+    /// → unified-client-serve behaviour: a firewalled node that a peer can only
+    /// reach via a server/KAD callback can still upload by connecting *out* and
+    /// then serving over that connection.
+    ///
+    /// We are the connection initiator, so (opposite of the inbound listener) we
+    /// send `OP_HELLO` / `OP_EMULEINFO` first and read the peer's answers, then
+    /// hand the fully-handshaked stream to [`run_session`], which converges into
+    /// the exact same serve loop an inbound upload uses. Obfuscation follows
+    /// eMule's `Connect()` encryption decision: dial obfuscated only when the
+    /// peer's callback crypt options ask for it, we hold the peer's user hash to
+    /// seed RC4, and our own obfuscation layer is enabled. A crypt-*required*
+    /// peer that fails obfuscation is abandoned; otherwise we retry once plain.
+    async fn connect_and_serve(&self, req: ConnectServeRequest) -> anyhow::Result<()> {
+        let peer_addr = req.peer_addr;
+        let peer_hash = req.user_hash.filter(|h| *h != [0u8; 16]);
+        let obf_enabled = self
+            .obfuscation_enabled
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let peer_requires_crypt = (req.crypt_options & 0x04) != 0;
+        // eMule: obfuscate when we have a hash to key RC4, our layer is enabled,
+        // and the peer supports (bit0) or requests (bit1) crypt.
+        let want_obf = peer_hash.is_some() && obf_enabled && (req.crypt_options & 0x03) != 0;
+
+        let mut try_obf = want_obf;
+        let mut fallback_used = false;
+        loop {
+            let stream = match tokio::time::timeout(
+                std::time::Duration::from_secs(OUTBOUND_SERVE_HANDSHAKE_SECS),
+                TcpStream::connect(peer_addr),
+            )
+            .await
+            {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => anyhow::bail!("connect_and_serve {peer_addr}: tcp connect: {e}"),
+                Err(_) => anyhow::bail!("connect_and_serve {peer_addr}: tcp connect timeout"),
+            };
+            super::multi_source::tune_peer_stream(&stream);
+
+            let (raw_r, raw_w) = stream.into_split();
+            let mut buf_r = tokio::io::BufReader::new(raw_r);
+            let mut buf_w = tokio::io::BufWriter::new(raw_w);
+
+            let (mut reader, mut writer): (StreamReader, StreamWriter) = if try_obf {
+                let hash = peer_hash.unwrap();
+                match tcp_obfuscation::negotiate_outgoing(&mut buf_r, &mut buf_w, &hash).await {
+                    Ok((recv_key, send_key)) => (
+                        StreamReader::Obfuscated(tokio::io::BufReader::new(Rc4Reader::new(
+                            buf_r, recv_key,
+                        ))),
+                        StreamWriter::Obfuscated(tokio::io::BufWriter::new(Rc4Writer::new(
+                            buf_w, send_key,
+                        ))),
+                    ),
+                    Err(e) => {
+                        if peer_requires_crypt {
+                            anyhow::bail!(
+                                "connect_and_serve {peer_addr}: peer requires crypt but obfuscation failed: {e}"
+                            );
+                        }
+                        if fallback_used {
+                            anyhow::bail!("connect_and_serve {peer_addr}: obfuscation failed: {e}");
+                        }
+                        debug!(
+                            "connect_and_serve {peer_addr}: obfuscation failed ({e}); retrying plain"
+                        );
+                        try_obf = false;
+                        fallback_used = true;
+                        continue;
+                    }
+                }
+            } else {
+                (StreamReader::Plain(buf_r), StreamWriter::Plain(buf_w))
+            };
+
+            // Outbound Hello (we initiate: send OP_HELLO, expect OP_HELLOANSWER).
+            let our_client_id = self
+                .external_ip_shared
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let buddy = self.shared_buddy_info.read().await.clone();
+            let hello_options = self.hello_options().await;
+            let hello_payload = build_hello_with_buddy_opts(
+                &self.user_hash,
+                our_client_id,
+                self.tcp_port,
+                &self.nickname,
+                buddy,
+                &hello_options,
+            );
+            if let Err(e) =
+                write_packet_async(&mut writer, OP_EDONKEYHEADER, OP_HELLO, &hello_payload).await
+            {
+                anyhow::bail!("connect_and_serve {peer_addr}: send Hello: {e}");
+            }
+
+            let (hproto, hopcode, hello_data) = match tokio::time::timeout(
+                std::time::Duration::from_secs(OUTBOUND_SERVE_HANDSHAKE_SECS),
+                read_packet_async_inner(&mut reader),
+            )
+            .await
+            {
+                Ok(Ok(pkt)) => pkt,
+                Ok(Err(e)) => {
+                    anyhow::bail!("connect_and_serve {peer_addr}: read HelloAnswer: {e}")
+                }
+                Err(_) => anyhow::bail!("connect_and_serve {peer_addr}: HelloAnswer timed out"),
+            };
+            if hproto != OP_EDONKEYHEADER || hopcode != OP_HELLOANSWER {
+                anyhow::bail!(
+                    "connect_and_serve {peer_addr}: expected HelloAnswer, got proto=0x{hproto:02X} op=0x{hopcode:02X}"
+                );
+            }
+            let (peer_user_hash, mut hello_caps) =
+                parse_hello_answer(&hello_data).unwrap_or_else(|_| {
+                    let mut puh = [0u8; 16];
+                    if hello_data.len() >= 16 {
+                        puh.copy_from_slice(&hello_data[..16]);
+                    }
+                    (puh, PeerCapabilities::default())
+                });
+
+            // Outbound EmuleInfo: send ours, then read the peer's answer. A
+            // non-EmuleInfo packet here (peer jumped straight to a file request)
+            // is captured as `first_packet` and replayed by the serve loop.
+            let emule_payload =
+                build_emule_info(self.udp_port, obf_enabled, Some(&self.ember_hash), None);
+            let _ =
+                write_packet_async(&mut writer, OP_EMULEPROT, OP_EMULEINFO, &emule_payload).await;
+            let mut first_packet: Option<(u8, u8, Vec<u8>)> = None;
+            if let Ok(Ok((eproto, eopcode, epayload))) = tokio::time::timeout(
+                std::time::Duration::from_secs(OUTBOUND_SERVE_HANDSHAKE_SECS),
+                read_packet_async_inner(&mut reader),
+            )
+            .await
+            {
+                if eproto == OP_EMULEPROT
+                    && (eopcode == OP_EMULEINFOANSWER || eopcode == OP_EMULEINFO)
+                {
+                    merge_caps(&mut hello_caps, parse_emule_info(&epayload));
+                    if eopcode == OP_EMULEINFO {
+                        let answer = build_emule_info(
+                            self.udp_port,
+                            obf_enabled,
+                            Some(&self.ember_hash),
+                            None,
+                        );
+                        let _ = write_packet_async(
+                            &mut writer,
+                            OP_EMULEPROT,
+                            OP_EMULEINFOANSWER,
+                            &answer,
+                        )
+                        .await;
+                    }
+                } else {
+                    first_packet = Some((eproto, eopcode, epayload));
+                }
+            }
+
+            let is_obf = matches!(reader, StreamReader::Obfuscated(_));
+            info!(
+                "connect_and_serve: established outbound upload session to {peer_addr} (obf={is_obf}, user={})",
+                crate::security::short_hash(&peer_user_hash),
+            );
+
+            let state = OutboundServeState {
+                reader,
+                writer,
+                hello_data,
+                peer_user_hash,
+                hello_caps,
+                first_packet,
+            };
+            return self
+                .run_session(peer_addr, ConnInit::OutboundServe(Box::new(state)))
+                .await;
+        }
+    }
+
+    /// Shared upload-session driver for both inbound connections (a peer dialed
+    /// our listener) and outbound connect-and-serve connections (we dialed a
+    /// peer in response to a server/KAD callback so a firewalled LowID node can
+    /// still upload — eMule's `OP_CALLBACKREQUESTED` → `TryToConnect` behaviour).
+    /// The handshake preamble differs by direction; everything from the EmuleInfo
+    /// exchange through the serve loop and teardown is byte-for-byte identical,
+    /// so both paths converge into the same code below.
+    async fn run_session(&self, peer_addr: SocketAddr, init: ConnInit) -> anyhow::Result<()> {
+        // Outbound callbacks are dialed by us for a known peer, so they skip the
+        // inbound-only steps: the ban precheck, the buddy/KAD/server/Path-B
+        // stream diversions, the abuse-request counter, and the inbound EmuleInfo
+        // read (we complete EmuleInfo during the outbound handshake instead).
+        let outbound = matches!(init, ConnInit::OutboundServe(_));
+
         // Check if already banned (fast path), but don't count yet --
         // buddy/KAD callback connections are legitimate and shouldn't
         // inflate the request counter.
-        {
+        if !outbound {
             let tracker = self.abuse_tracker.lock().await;
             if tracker.is_banned(&peer_addr.ip()) {
                 anyhow::bail!("auto-banned for excessive requests");
             }
         }
 
-        let (reader, writer) = stream.into_split();
-        let mut raw_reader = tokio::io::BufReader::new(reader);
-        let mut raw_writer = tokio::io::BufWriter::new(writer);
-
-        // Negotiate obfuscation with full handshake response.
-        let negotiation = match tokio::time::timeout(
-            std::time::Duration::from_secs(CLIENT_TIMEOUT_SECS),
-            tcp_obfuscation::negotiate_incoming(
-                &mut raw_reader,
-                &mut raw_writer,
-                &self.user_hash,
-                true,
-            ),
-        )
-        .await
-        {
-            Ok(Ok(result)) => result,
-            Ok(Err(e)) if is_connection_closed(&e) => {
-                info!("Probe connection from {peer_addr} (closed immediately)");
-                return Ok(());
-            }
-            Ok(Err(e)) => {
-                info!("Obfuscation negotiation failed from {peer_addr}: {e}");
-                return Ok(());
-            }
-            Err(_) => {
-                info!("Timeout during negotiation from {peer_addr}");
-                return Ok(());
-            }
-        };
-
-        // After negotiation, wrap streams based on result.
-        // We use an enum to avoid dyn dispatch issues with AsyncReadExt.
-        enum StreamReader {
-            Plain(tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>),
-            Obfuscated(
-                tokio::io::BufReader<
-                    Rc4Reader<tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>>,
-                >,
-            ),
-        }
-        enum StreamWriter {
-            Plain(tokio::io::BufWriter<tokio::net::tcp::OwnedWriteHalf>),
-            Obfuscated(
-                tokio::io::BufWriter<
-                    Rc4Writer<tokio::io::BufWriter<tokio::net::tcp::OwnedWriteHalf>>,
-                >,
-            ),
-        }
-
-        impl AsyncRead for StreamReader {
-            fn poll_read(
-                self: Pin<&mut Self>,
-                cx: &mut std::task::Context<'_>,
-                buf: &mut tokio::io::ReadBuf<'_>,
-            ) -> std::task::Poll<io::Result<()>> {
-                match self.get_mut() {
-                    StreamReader::Plain(r) => Pin::new(r).poll_read(cx, buf),
-                    StreamReader::Obfuscated(r) => Pin::new(r).poll_read(cx, buf),
-                }
-            }
-        }
-
-        impl AsyncWrite for StreamWriter {
-            fn poll_write(
-                self: Pin<&mut Self>,
-                cx: &mut std::task::Context<'_>,
-                buf: &[u8],
-            ) -> std::task::Poll<io::Result<usize>> {
-                match self.get_mut() {
-                    StreamWriter::Plain(w) => Pin::new(w).poll_write(cx, buf),
-                    StreamWriter::Obfuscated(w) => Pin::new(w).poll_write(cx, buf),
-                }
-            }
-            fn poll_flush(
-                self: Pin<&mut Self>,
-                cx: &mut std::task::Context<'_>,
-            ) -> std::task::Poll<io::Result<()>> {
-                match self.get_mut() {
-                    StreamWriter::Plain(w) => Pin::new(w).poll_flush(cx),
-                    StreamWriter::Obfuscated(w) => Pin::new(w).poll_flush(cx),
-                }
-            }
-            fn poll_shutdown(
-                self: Pin<&mut Self>,
-                cx: &mut std::task::Context<'_>,
-            ) -> std::task::Poll<io::Result<()>> {
-                match self.get_mut() {
-                    StreamWriter::Plain(w) => Pin::new(w).poll_shutdown(cx),
-                    StreamWriter::Obfuscated(w) => Pin::new(w).poll_shutdown(cx),
-                }
-            }
-        }
-
-        // Server port test detection: if this IP matches our connected/pending server,
-        // the server is verifying our TCP port is reachable for HighID assignment.
-        // Use a short timeout so we respond quickly without blocking the main login.
-        let is_server_port_test = {
-            let server_addr = self.shared_server_addr.read().await;
-            server_addr
-                .map(|a| a.ip() == peer_addr.ip())
-                .unwrap_or(false)
-        };
-
+        // Produce the post-Hello session state via whichever path initiated this
+        // connection. `obf_ember_hash` / `obf_emule_caps` are only set by the
+        // inbound obfuscated branch; outbound leaves them `None` (its EmuleInfo
+        // caps are already merged into `hello_caps` by `connect_and_serve`).
         let mut obf_ember_hash: Option<[u8; 16]> = None;
         let mut obf_emule_caps: Option<PeerCapabilities> = None;
-        let (mut reader, mut writer, hello_data, peer_user_hash) = match negotiation {
-            NegotiationResult::Obfuscated {
-                recv_key,
-                mut send_key,
-            } => {
-                info!("Obfuscated connection from {peer_addr}");
-                let mut obf_reader =
-                    tokio::io::BufReader::new(Rc4Reader::new(raw_reader, recv_key));
+        // A packet handed over by the outbound handshake to replay as the serve
+        // loop's first packet (see `OutboundServeState::first_packet`). Always
+        // `None` for inbound.
+        let mut outbound_first_packet: Option<(u8, u8, Vec<u8>)> = None;
+        let (mut reader, mut writer, hello_data, peer_user_hash, mut hello_caps) = match init {
+            ConnInit::OutboundServe(state) => {
+                let OutboundServeState {
+                    reader,
+                    writer,
+                    hello_data,
+                    peer_user_hash,
+                    hello_caps,
+                    first_packet,
+                } = *state;
+                outbound_first_packet = first_packet;
+                (reader, writer, hello_data, peer_user_hash, hello_caps)
+            }
+            ConnInit::Inbound(stream) => {
+                let (reader, writer) = stream.into_split();
+                let mut raw_reader = tokio::io::BufReader::new(reader);
+                let mut raw_writer = tokio::io::BufWriter::new(writer);
 
-                let probe_timeout = if is_server_port_test {
-                    info!("Server port test detected from {peer_addr}");
-                    std::time::Duration::from_secs(3)
-                } else {
-                    std::time::Duration::from_secs(15)
+                // Negotiate obfuscation with full handshake response.
+                let negotiation = match tokio::time::timeout(
+                    std::time::Duration::from_secs(CLIENT_TIMEOUT_SECS),
+                    tcp_obfuscation::negotiate_incoming(
+                        &mut raw_reader,
+                        &mut raw_writer,
+                        &self.user_hash,
+                        true,
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(e)) if is_connection_closed(&e) => {
+                        info!("Probe connection from {peer_addr} (closed immediately)");
+                        return Ok(());
+                    }
+                    Ok(Err(e)) => {
+                        info!("Obfuscation negotiation failed from {peer_addr}: {e}");
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        info!("Timeout during negotiation from {peer_addr}");
+                        return Ok(());
+                    }
                 };
-                let first_pkt =
-                    tokio::time::timeout(probe_timeout, read_packet_async_inner(&mut obf_reader))
+
+                // Server port test detection: if this IP matches our connected/pending server,
+                // the server is verifying our TCP port is reachable for HighID assignment.
+                // Use a short timeout so we respond quickly without blocking the main login.
+                let is_server_port_test = {
+                    let server_addr = self.shared_server_addr.read().await;
+                    server_addr
+                        .map(|a| a.ip() == peer_addr.ip())
+                        .unwrap_or(false)
+                };
+
+                let (reader, writer, hello_data, peer_user_hash) = match negotiation {
+                    NegotiationResult::Obfuscated {
+                        recv_key,
+                        mut send_key,
+                    } => {
+                        info!("Obfuscated connection from {peer_addr}");
+                        let mut obf_reader =
+                            tokio::io::BufReader::new(Rc4Reader::new(raw_reader, recv_key));
+
+                        let probe_timeout = if is_server_port_test {
+                            info!("Server port test detected from {peer_addr}");
+                            std::time::Duration::from_secs(3)
+                        } else {
+                            std::time::Duration::from_secs(15)
+                        };
+                        let first_pkt = tokio::time::timeout(
+                            probe_timeout,
+                            read_packet_async_inner(&mut obf_reader),
+                        )
                         .await;
 
-                match first_pkt {
-                    Ok(Ok((proto, opcode, payload)))
-                        if proto == OP_EDONKEYHEADER && opcode == OP_HELLO =>
-                    {
-                        let mut puh = [0u8; 16];
-                        if payload.len() >= 17 {
-                            puh.copy_from_slice(&payload[1..17]);
+                        match first_pkt {
+                            Ok(Ok((proto, opcode, payload)))
+                                if proto == OP_EDONKEYHEADER && opcode == OP_HELLO =>
+                            {
+                                let mut puh = [0u8; 16];
+                                if payload.len() >= 17 {
+                                    puh.copy_from_slice(&payload[1..17]);
+                                }
+
+                                let buddy = self.shared_buddy_info.read().await.clone();
+                                let hello_options = self.hello_options().await;
+                                // Advertise our real HighID client_id when we have a
+                                // trusted public IP. Falls back to `0` pre-handshake,
+                                // which stock eMule auto-heals from the connect IP
+                                // (BaseClient.cpp:608) but strict/older clients may
+                                // interpret as LowID. See the
+                                // `external_ip_shared` field docs.
+                                let our_client_id = self
+                                    .external_ip_shared
+                                    .load(std::sync::atomic::Ordering::Relaxed);
+                                let hello_payload = build_hello_answer_with_buddy_opts(
+                                    &self.user_hash,
+                                    our_client_id,
+                                    self.tcp_port,
+                                    &self.nickname,
+                                    buddy,
+                                    &hello_options,
+                                );
+                                let mut pkt = Vec::with_capacity(6 + hello_payload.len());
+                                pkt.push(OP_EDONKEYHEADER);
+                                pkt.extend_from_slice(
+                                    &((1 + hello_payload.len()) as u32).to_le_bytes(),
+                                );
+                                pkt.push(OP_HELLOANSWER);
+                                pkt.extend_from_slice(&hello_payload);
+                                let mut enc = vec![0u8; pkt.len()];
+                                send_key.process(&pkt, &mut enc);
+                                raw_writer.write_all(&enc).await?;
+                                raw_writer.flush().await?;
+
+                                let emule_payload = build_emule_info(
+                                    self.udp_port,
+                                    self.obfuscation_enabled
+                                        .load(std::sync::atomic::Ordering::Relaxed),
+                                    Some(&self.ember_hash),
+                                    None,
+                                );
+                                let mut epkt = Vec::with_capacity(6 + emule_payload.len());
+                                epkt.push(OP_EMULEPROT);
+                                epkt.extend_from_slice(
+                                    &((1 + emule_payload.len()) as u32).to_le_bytes(),
+                                );
+                                epkt.push(OP_EMULEINFOANSWER);
+                                epkt.extend_from_slice(&emule_payload);
+                                let mut eenc = vec![0u8; epkt.len()];
+                                send_key.process(&epkt, &mut eenc);
+                                raw_writer.write_all(&eenc).await?;
+                                raw_writer.flush().await?;
+
+                                if is_server_port_test {
+                                    info!("Server port test from {peer_addr}: replied to Hello+EmuleInfo, port verified");
+                                    let mut discard = [0u8; 4096];
+                                    let _ = tokio::time::timeout(
+                                        std::time::Duration::from_secs(5),
+                                        async {
+                                            loop {
+                                                match obf_reader.read(&mut discard).await {
+                                                    Ok(0) | Err(_) => break,
+                                                    Ok(_) => continue,
+                                                }
+                                            }
+                                        },
+                                    )
+                                    .await;
+                                    return Ok(());
+                                }
+
+                                // Consume peer's EmuleInfo/SecIdent packets
+                                let mut obf_peer_ember_hash: Option<[u8; 16]> = None;
+                                let mut obf_peer_caps: Option<PeerCapabilities> = None;
+                                for _ in 0..5 {
+                                    match tokio::time::timeout(
+                                        std::time::Duration::from_secs(5),
+                                        read_packet_async_inner(&mut obf_reader),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok((p, o, ref data))) => {
+                                            if p == OP_EMULEPROT
+                                                && (o == OP_EMULEINFOANSWER || o == OP_EMULEINFO)
+                                            {
+                                                let ic = parse_emule_info(data);
+                                                if ic.ember_hash.is_some() {
+                                                    obf_peer_ember_hash = ic.ember_hash;
+                                                }
+                                                obf_peer_caps = Some(ic);
+                                                break;
+                                            }
+                                        }
+                                        _ => break,
+                                    }
+                                }
+
+                                let obf_writer =
+                                    tokio::io::BufWriter::new(Rc4Writer::new(raw_writer, send_key));
+                                obf_ember_hash = obf_peer_ember_hash;
+                                obf_emule_caps = obf_peer_caps;
+                                (
+                                    StreamReader::Obfuscated(obf_reader),
+                                    StreamWriter::Obfuscated(obf_writer),
+                                    payload,
+                                    puh,
+                                )
+                            }
+                            Ok(Ok((proto, opcode, _)))
+                                if proto == OP_EMULEPROT && opcode == OP_PORTTEST =>
+                            {
+                                let mut pkt = Vec::with_capacity(8);
+                                pkt.push(OP_EMULEPROT);
+                                pkt.extend_from_slice(&2u32.to_le_bytes());
+                                pkt.push(OP_PORTTEST);
+                                pkt.push(0x12);
+                                let mut enc = vec![0u8; pkt.len()];
+                                send_key.process(&pkt, &mut enc);
+                                raw_writer.write_all(&enc).await?;
+                                raw_writer.flush().await?;
+                                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                                return Ok(());
+                            }
+                            _ => {
+                                if is_server_port_test {
+                                    info!("Server port test from {peer_addr}: no Hello received, keeping alive briefly");
+                                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                                }
+                                return Ok(());
+                            }
                         }
+                    }
+                    NegotiationResult::Plain { first_byte } => {
+                        let mut rd = StreamReader::Plain(raw_reader);
+                        let mut wr = StreamWriter::Plain(raw_writer);
+                        let (proto, opcode, hd) =
+                            read_packet_with_first_byte(&mut rd, first_byte).await?;
+
+                        if (proto == OP_EDONKEYHEADER || proto == OP_EMULEPROT)
+                            && opcode == OP_PORTTEST
+                        {
+                            debug!("Received TCP Port Test from {peer_addr}");
+                            let reply = [0x12u8];
+                            write_packet_async(&mut wr, proto, OP_PORTTEST, &reply).await?;
+                            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+                            {
+                                let mut waiters = self.active_port_tests.lock().await;
+                                waiters.insert(peer_addr.ip(), tx);
+                            }
+                            let signal =
+                                tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                                    .await;
+                            {
+                                let mut waiters = self.active_port_tests.lock().await;
+                                waiters.remove(&peer_addr.ip());
+                            }
+                            if let Ok(Some(_)) = signal {
+                                write_packet_async(&mut wr, proto, OP_PORTTEST, &reply).await?;
+                            }
+                            return Ok(());
+                        }
+
+                        if proto != OP_EDONKEYHEADER || opcode != OP_HELLO {
+                            info!(
+                        "Non-Hello packet from {peer_addr}: proto=0x{proto:02X} op=0x{opcode:02X}"
+                    );
+                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                            return Ok(());
+                        }
+
+                        let mut puh = [0u8; 16];
+                        if hd.len() >= 17 {
+                            puh.copy_from_slice(&hd[1..17]);
+                        }
+                        debug!("Got Hello from {peer_addr}");
 
                         let buddy = self.shared_buddy_info.read().await.clone();
                         let hello_options = self.hello_options().await;
-                        // Advertise our real HighID client_id when we have a
-                        // trusted public IP. Falls back to `0` pre-handshake,
-                        // which stock eMule auto-heals from the connect IP
-                        // (BaseClient.cpp:608) but strict/older clients may
-                        // interpret as LowID. See the
-                        // `external_ip_shared` field docs.
+                        // Advertise our real HighID client_id when known (see the
+                        // matching block in the obfuscated path above for rationale).
                         let our_client_id = self
                             .external_ip_shared
                             .load(std::sync::atomic::Ordering::Relaxed);
@@ -2168,16 +2728,46 @@ impl UploadHandler {
                             buddy,
                             &hello_options,
                         );
-                        let mut pkt = Vec::with_capacity(6 + hello_payload.len());
-                        pkt.push(OP_EDONKEYHEADER);
-                        pkt.extend_from_slice(&((1 + hello_payload.len()) as u32).to_le_bytes());
-                        pkt.push(OP_HELLOANSWER);
-                        pkt.extend_from_slice(&hello_payload);
-                        let mut enc = vec![0u8; pkt.len()];
-                        send_key.process(&pkt, &mut enc);
-                        raw_writer.write_all(&enc).await?;
-                        raw_writer.flush().await?;
+                        write_packet_async(
+                            &mut wr,
+                            OP_EDONKEYHEADER,
+                            OP_HELLOANSWER,
+                            &hello_payload,
+                        )
+                        .await?;
 
+                        // Mirror eMule's ListenSocket::ProcessPacket OP_HELLO path
+                        // (ListenSocket.cpp:273): after responding with OP_HELLOANSWER,
+                        // send our OP_EMULEINFOANSWER so the peer gets a complete
+                        // eMule handshake before we hand off to multi_source.
+                        //
+                        // Without this packet, the peer's CUpDownClient sees only
+                        // OP_HELLOANSWER from us — its `m_byInfopacketsReceived`
+                        // still flips to IP_BOTH via the eMule tags embedded in
+                        // our HelloAnswer (`ProcessHelloTypePacket` bIsMule
+                        // branch, BaseClient.cpp:661-664), so the SecIdent state
+                        // machine *does* start — but many eMule mods and a
+                        // surprising number of legitimate clients (anti-leecher
+                        // heuristics in NeoMule/MorphXT/etc., plus older aMule
+                        // 2.3.x builds that the log shows are common on this
+                        // network) treat the absence of an explicit
+                        // OP_EMULEINFO/OP_EMULEINFOANSWER round trip as a
+                        // half-baked handshake. They accept the TCP connection,
+                        // ACK our HelloAnswer, then silently FIN as soon as we
+                        // send OP_REQUESTFILENAME — the exact symptom we hit in
+                        // production for every KAD-callback source:
+                        //
+                        //   `stage:file_status_wait (round 0, got_filename=false,
+                        //    early_accept=false): unexpected end of file`
+                        //
+                        // The obfuscated path above (line ~1602) already sends
+                        // OP_EMULEINFOANSWER unconditionally for the same
+                        // reason. KAD-callback sources connect back in
+                        // plaintext by default (the firewalled peer doesn't
+                        // know our user hash until they parse our HelloAnswer,
+                        // so eMule's `Connect()` falls through to
+                        // `SetConnectionEncryption(false, NULL, false)`), which
+                        // is why this regression only ever bit callback flows.
                         let emule_payload = build_emule_info(
                             self.udp_port,
                             self.obfuscation_enabled
@@ -2185,201 +2775,26 @@ impl UploadHandler {
                             Some(&self.ember_hash),
                             None,
                         );
-                        let mut epkt = Vec::with_capacity(6 + emule_payload.len());
-                        epkt.push(OP_EMULEPROT);
-                        epkt.extend_from_slice(&((1 + emule_payload.len()) as u32).to_le_bytes());
-                        epkt.push(OP_EMULEINFOANSWER);
-                        epkt.extend_from_slice(&emule_payload);
-                        let mut eenc = vec![0u8; epkt.len()];
-                        send_key.process(&epkt, &mut eenc);
-                        raw_writer.write_all(&eenc).await?;
-                        raw_writer.flush().await?;
-
-                        if is_server_port_test {
-                            info!("Server port test from {peer_addr}: replied to Hello+EmuleInfo, port verified");
-                            let mut discard = [0u8; 4096];
-                            let _ =
-                                tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                                    loop {
-                                        match obf_reader.read(&mut discard).await {
-                                            Ok(0) | Err(_) => break,
-                                            Ok(_) => continue,
-                                        }
-                                    }
-                                })
-                                .await;
-                            return Ok(());
-                        }
-
-                        // Consume peer's EmuleInfo/SecIdent packets
-                        let mut obf_peer_ember_hash: Option<[u8; 16]> = None;
-                        let mut obf_peer_caps: Option<PeerCapabilities> = None;
-                        for _ in 0..5 {
-                            match tokio::time::timeout(
-                                std::time::Duration::from_secs(5),
-                                read_packet_async_inner(&mut obf_reader),
-                            )
-                            .await
-                            {
-                                Ok(Ok((p, o, ref data))) => {
-                                    if p == OP_EMULEPROT
-                                        && (o == OP_EMULEINFOANSWER || o == OP_EMULEINFO)
-                                    {
-                                        let ic = parse_emule_info(data);
-                                        if ic.ember_hash.is_some() {
-                                            obf_peer_ember_hash = ic.ember_hash;
-                                        }
-                                        obf_peer_caps = Some(ic);
-                                        break;
-                                    }
-                                }
-                                _ => break,
-                            }
-                        }
-
-                        let obf_writer =
-                            tokio::io::BufWriter::new(Rc4Writer::new(raw_writer, send_key));
-                        obf_ember_hash = obf_peer_ember_hash;
-                        obf_emule_caps = obf_peer_caps;
-                        (
-                            StreamReader::Obfuscated(obf_reader),
-                            StreamWriter::Obfuscated(obf_writer),
-                            payload,
-                            puh,
+                        write_packet_async(
+                            &mut wr,
+                            OP_EMULEPROT,
+                            OP_EMULEINFOANSWER,
+                            &emule_payload,
                         )
+                        .await?;
+                        (rd, wr, hd, puh)
                     }
-                    Ok(Ok((proto, opcode, _)))
-                        if proto == OP_EMULEPROT && opcode == OP_PORTTEST =>
-                    {
-                        let mut pkt = Vec::with_capacity(8);
-                        pkt.push(OP_EMULEPROT);
-                        pkt.extend_from_slice(&2u32.to_le_bytes());
-                        pkt.push(OP_PORTTEST);
-                        pkt.push(0x12);
-                        let mut enc = vec![0u8; pkt.len()];
-                        send_key.process(&pkt, &mut enc);
-                        raw_writer.write_all(&enc).await?;
-                        raw_writer.flush().await?;
-                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                        return Ok(());
-                    }
-                    _ => {
-                        if is_server_port_test {
-                            info!("Server port test from {peer_addr}: no Hello received, keeping alive briefly");
-                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                        }
-                        return Ok(());
-                    }
+                };
+
+                let (_, mut hello_caps) = parse_hello_packet(&hello_data)
+                    .unwrap_or_else(|_| ([0u8; 16], PeerCapabilities::default()));
+                if let Some(obf_caps) = obf_emule_caps.take() {
+                    merge_caps(&mut hello_caps, obf_caps);
                 }
-            }
-            NegotiationResult::Plain { first_byte } => {
-                let mut rd = StreamReader::Plain(raw_reader);
-                let mut wr = StreamWriter::Plain(raw_writer);
-                let (proto, opcode, hd) = read_packet_with_first_byte(&mut rd, first_byte).await?;
-
-                if (proto == OP_EDONKEYHEADER || proto == OP_EMULEPROT) && opcode == OP_PORTTEST {
-                    debug!("Received TCP Port Test from {peer_addr}");
-                    let reply = [0x12u8];
-                    write_packet_async(&mut wr, proto, OP_PORTTEST, &reply).await?;
-                    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-                    {
-                        let mut waiters = self.active_port_tests.lock().await;
-                        waiters.insert(peer_addr.ip(), tx);
-                    }
-                    let signal =
-                        tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await;
-                    {
-                        let mut waiters = self.active_port_tests.lock().await;
-                        waiters.remove(&peer_addr.ip());
-                    }
-                    if let Ok(Some(_)) = signal {
-                        write_packet_async(&mut wr, proto, OP_PORTTEST, &reply).await?;
-                    }
-                    return Ok(());
-                }
-
-                if proto != OP_EDONKEYHEADER || opcode != OP_HELLO {
-                    info!(
-                        "Non-Hello packet from {peer_addr}: proto=0x{proto:02X} op=0x{opcode:02X}"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                    return Ok(());
-                }
-
-                let mut puh = [0u8; 16];
-                if hd.len() >= 17 {
-                    puh.copy_from_slice(&hd[1..17]);
-                }
-                debug!("Got Hello from {peer_addr}");
-
-                let buddy = self.shared_buddy_info.read().await.clone();
-                let hello_options = self.hello_options().await;
-                // Advertise our real HighID client_id when known (see the
-                // matching block in the obfuscated path above for rationale).
-                let our_client_id = self
-                    .external_ip_shared
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                let hello_payload = build_hello_answer_with_buddy_opts(
-                    &self.user_hash,
-                    our_client_id,
-                    self.tcp_port,
-                    &self.nickname,
-                    buddy,
-                    &hello_options,
-                );
-                write_packet_async(&mut wr, OP_EDONKEYHEADER, OP_HELLOANSWER, &hello_payload)
-                    .await?;
-
-                // Mirror eMule's ListenSocket::ProcessPacket OP_HELLO path
-                // (ListenSocket.cpp:273): after responding with OP_HELLOANSWER,
-                // send our OP_EMULEINFOANSWER so the peer gets a complete
-                // eMule handshake before we hand off to multi_source.
-                //
-                // Without this packet, the peer's CUpDownClient sees only
-                // OP_HELLOANSWER from us — its `m_byInfopacketsReceived`
-                // still flips to IP_BOTH via the eMule tags embedded in
-                // our HelloAnswer (`ProcessHelloTypePacket` bIsMule
-                // branch, BaseClient.cpp:661-664), so the SecIdent state
-                // machine *does* start — but many eMule mods and a
-                // surprising number of legitimate clients (anti-leecher
-                // heuristics in NeoMule/MorphXT/etc., plus older aMule
-                // 2.3.x builds that the log shows are common on this
-                // network) treat the absence of an explicit
-                // OP_EMULEINFO/OP_EMULEINFOANSWER round trip as a
-                // half-baked handshake. They accept the TCP connection,
-                // ACK our HelloAnswer, then silently FIN as soon as we
-                // send OP_REQUESTFILENAME — the exact symptom we hit in
-                // production for every KAD-callback source:
-                //
-                //   `stage:file_status_wait (round 0, got_filename=false,
-                //    early_accept=false): unexpected end of file`
-                //
-                // The obfuscated path above (line ~1602) already sends
-                // OP_EMULEINFOANSWER unconditionally for the same
-                // reason. KAD-callback sources connect back in
-                // plaintext by default (the firewalled peer doesn't
-                // know our user hash until they parse our HelloAnswer,
-                // so eMule's `Connect()` falls through to
-                // `SetConnectionEncryption(false, NULL, false)`), which
-                // is why this regression only ever bit callback flows.
-                let emule_payload = build_emule_info(
-                    self.udp_port,
-                    self.obfuscation_enabled
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                    Some(&self.ember_hash),
-                    None,
-                );
-                write_packet_async(&mut wr, OP_EMULEPROT, OP_EMULEINFOANSWER, &emule_payload)
-                    .await?;
-                (rd, wr, hd, puh)
+                (reader, writer, hello_data, peer_user_hash, hello_caps)
             }
         };
 
-        let (_, mut hello_caps) = parse_hello_packet(&hello_data)
-            .unwrap_or_else(|_| ([0u8; 16], PeerCapabilities::default()));
-        if let Some(obf_caps) = obf_emule_caps.take() {
-            merge_caps(&mut hello_caps, obf_caps);
-        }
         let peer_source_exchange_ver = hello_caps.source_exchange_ver.max(1);
         let peer_secure_ident_level = hello_caps.secure_ident_level;
         let peer_compression_ver = hello_caps.compression_ver;
@@ -2409,7 +2824,9 @@ impl UploadHandler {
         // `buddy_conn_tx` channel: if the channel is at capacity, `.send().await`
         // parks until a receiver drains it, and anything in the network loop
         // that wanted to `lock().await` this mutex would deadlock.
-        let buddy_callback = {
+        let buddy_callback = if outbound {
+            None
+        } else {
             let mut pending = self.pending_buddy_hashes.lock().await;
             pending.remove(&peer_user_hash)
         };
@@ -2434,8 +2851,22 @@ impl UploadHandler {
             return Ok(());
         }
 
+        // Inbound-only stream diversions (buddy handled above): match this
+        // connection against pending KAD/server callbacks and Path-B queued
+        // sources. None of these apply to an outbound dial we initiated, so a
+        // `None` here (whenever `outbound`) cleanly skips all three blocks below
+        // without re-indenting them.
+        let diversion_ip: Option<std::net::Ipv4Addr> = if outbound {
+            None
+        } else {
+            match peer_addr.ip() {
+                std::net::IpAddr::V4(v4) => Some(v4),
+                _ => None,
+            }
+        };
+
         // Check if this is a KAD callback connection (firewalled source connecting back)
-        if let std::net::IpAddr::V4(peer_v4) = peer_addr.ip() {
+        if let Some(peer_v4) = diversion_ip {
             let peer_hello_port = if hello_data.len() >= 23 {
                 u16::from_le_bytes([hello_data[21], hello_data[22]])
             } else {
@@ -2537,6 +2968,7 @@ impl UploadHandler {
                 let parts = KadCallbackParts {
                     peer_ip: peer_v4,
                     peer_port: peer_addr.port(),
+                    peer_hello_port,
                     peer_user_hash,
                     file_hash,
                     reader: dyn_reader,
@@ -2553,7 +2985,7 @@ impl UploadHandler {
         // back after we sent OP_CALLBACKREQUEST). We match by the TCP port the
         // peer reports in its Hello packet against registered LowID sources for
         // our currently-connected server.
-        if let std::net::IpAddr::V4(peer_v4) = peer_addr.ip() {
+        if let Some(peer_v4) = diversion_ip {
             let peer_hello_port = if hello_data.len() >= 23 {
                 u16::from_le_bytes([hello_data[21], hello_data[22]])
             } else {
@@ -2603,6 +3035,7 @@ impl UploadHandler {
                     let parts = KadCallbackParts {
                         peer_ip: peer_v4,
                         peer_port: peer_addr.port(),
+                        peer_hello_port,
                         peer_user_hash,
                         file_hash,
                         reader: dyn_reader,
@@ -2630,7 +3063,7 @@ impl UploadHandler {
         // downloaders (the index is empty unless a download has queued
         // sources). Done BEFORE recording an upload request for abuse tracking
         // so a legitimate reconnect is never counted against the peer.
-        if let std::net::IpAddr::V4(peer_v4) = peer_addr.ip() {
+        if let Some(peer_v4) = diversion_ip {
             let divert_file: Option<[u8; 16]> = {
                 let idx = reconnect_index();
                 let guard = idx.read().unwrap_or_else(|e| e.into_inner());
@@ -2670,9 +3103,18 @@ impl UploadHandler {
                         return Ok(());
                     }
                 };
+                // Path-B peers are HighID push-grants, not server-LowID
+                // callbacks, so this listening port won't match a LowID row; we
+                // still carry it to keep the struct consistently populated.
+                let peer_hello_port = if hello_data.len() >= 23 {
+                    u16::from_le_bytes([hello_data[21], hello_data[22]])
+                } else {
+                    0
+                };
                 let parts = KadCallbackParts {
                     peer_ip: peer_v4,
                     peer_port: peer_addr.port(),
+                    peer_hello_port,
                     peer_user_hash,
                     file_hash,
                     reader: dyn_reader,
@@ -2686,8 +3128,10 @@ impl UploadHandler {
         }
 
         // Now that buddy/KAD/server callback connections have been dispatched,
-        // count this as a real upload request for abuse tracking.
-        {
+        // count this as a real upload request for abuse tracking. Skipped for
+        // outbound callback serves: we dialed this peer, so it never made an
+        // inbound request that should count against a rate limit.
+        if !outbound {
             let mut tracker = self.abuse_tracker.lock().await;
             let banned = tracker.record_request(peer_addr.ip());
             drop(tracker);
@@ -2723,36 +3167,42 @@ impl UploadHandler {
         // dead-store warning for the initial `None`).
         let mut pending_peer_challenge: Option<(u32, u8)> = None;
 
-        // Handle EmuleInfo exchange (or the peer may skip straight to file requests)
-        let (proto2, opcode2, payload2) = read_packet_timeout(&mut reader).await?;
-        let mut deferred_packet: Option<(u8, u8, Vec<u8>)> = None;
+        // Handle EmuleInfo exchange. Inbound: the peer sends its OP_EMULEINFO
+        // here (or skips straight to file requests). Outbound callback serves
+        // already completed the EmuleInfo round-trip inside `connect_and_serve`,
+        // so we don't read again — `deferred_packet` stays `None` and the main
+        // loop reads the peer's first real packet fresh.
+        let mut deferred_packet: Option<(u8, u8, Vec<u8>)> = outbound_first_packet.take();
         let mut peer_ember_hash: Option<[u8; 16]> = hello_caps.ember_hash.or(obf_ember_hash);
         let mut peer_secure_ident_level = peer_secure_ident_level;
-        if proto2 == OP_EMULEPROT && opcode2 == OP_EMULEINFO {
-            let incoming_caps = parse_emule_info(&payload2);
-            merge_caps(&mut hello_caps, incoming_caps);
-            peer_ember_hash = hello_caps.ember_hash;
-            peer_secure_ident_level = hello_caps.secure_ident_level;
-            ul_client_software = client_software_from_caps(&hello_caps);
-            if !hello_caps.peer_name.is_empty() {
-                ul_peer_name = hello_caps.peer_name.clone();
+        if !outbound {
+            let (proto2, opcode2, payload2) = read_packet_timeout(&mut reader).await?;
+            if proto2 == OP_EMULEPROT && opcode2 == OP_EMULEINFO {
+                let incoming_caps = parse_emule_info(&payload2);
+                merge_caps(&mut hello_caps, incoming_caps);
+                peer_ember_hash = hello_caps.ember_hash;
+                peer_secure_ident_level = hello_caps.secure_ident_level;
+                ul_client_software = client_software_from_caps(&hello_caps);
+                if !hello_caps.peer_name.is_empty() {
+                    ul_peer_name = hello_caps.peer_name.clone();
+                }
+                let emule_payload = build_emule_info(
+                    self.udp_port,
+                    self.obfuscation_enabled
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    Some(&self.ember_hash),
+                    None,
+                );
+                write_packet_async(
+                    &mut writer,
+                    OP_EMULEPROT,
+                    OP_EMULEINFOANSWER,
+                    &emule_payload,
+                )
+                .await?;
+            } else {
+                deferred_packet = Some((proto2, opcode2, payload2));
             }
-            let emule_payload = build_emule_info(
-                self.udp_port,
-                self.obfuscation_enabled
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                Some(&self.ember_hash),
-                None,
-            );
-            write_packet_async(
-                &mut writer,
-                OP_EMULEPROT,
-                OP_EMULEINFOANSWER,
-                &emule_payload,
-            )
-            .await?;
-        } else {
-            deferred_packet = Some((proto2, opcode2, payload2));
         }
 
         // Send `OP_EMBER_HELLO` so other Ember peers can detect us out-of-

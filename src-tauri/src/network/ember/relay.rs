@@ -1030,6 +1030,7 @@ pub async fn run_quic_accept_loop(
                 let parts = crate::network::ed2k::upload::KadCallbackParts {
                     peer_ip,
                     peer_port: remote.port(),
+                    peer_hello_port: 0,
                     peer_user_hash: [0u8; 16],
                     file_hash,
                     reader: Box::new(init_recv),
@@ -1059,6 +1060,7 @@ pub async fn run_quic_accept_loop(
                 let parts = crate::network::ed2k::upload::KadCallbackParts {
                     peer_ip,
                     peer_port: remote.port(),
+                    peer_hello_port: 0,
                     peer_user_hash: [0u8; 16],
                     file_hash: [0u8; 16],
                     reader: Box::new(chained),

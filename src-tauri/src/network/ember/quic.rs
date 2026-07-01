@@ -485,9 +485,14 @@ mod tests {
 
         // Correct pin → the verifier accepts the server cert (its `ember-{hex}`
         // SAN matches `server_id`) and the round-trip succeeds.
-        let conn = connect_pinned(&client, server_addr, "ember", Some((&c_cert, &c_key, server_id)))
-            .await
-            .expect("pinned connect with correct node id should succeed");
+        let conn = connect_pinned(
+            &client,
+            server_addr,
+            "ember",
+            Some((&c_cert, &c_key, server_id)),
+        )
+        .await
+        .expect("pinned connect with correct node id should succeed");
         let (mut send, mut recv) = conn.open_bi().await.unwrap();
         send.write_all(b"ping").await.unwrap();
         send.finish().unwrap();
@@ -497,8 +502,13 @@ mod tests {
 
         // Wrong pin → the verifier rejects the server cert (node-id mismatch)
         // and the handshake fails.
-        let bad = connect_pinned(&client, server_addr, "ember", Some((&c_cert, &c_key, [0xFF; 16])))
-            .await;
+        let bad = connect_pinned(
+            &client,
+            server_addr,
+            "ember",
+            Some((&c_cert, &c_key, [0xFF; 16])),
+        )
+        .await;
         assert!(bad.is_err(), "pinned connect with wrong node id must fail");
 
         server_handle.abort();

@@ -142,8 +142,12 @@ pub struct DispatchOutcome {
 /// type is no longer `Copy`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EmberControlMessage {
-    Ping { nonce: u64 },
-    Pong { nonce: u64 },
+    Ping {
+        nonce: u64,
+    },
+    Pong {
+        nonce: u64,
+    },
     /// Ask the peer to reply with its current EPX source/peer payload.
     /// No body — the request itself is the whole message.
     ExchangeRequest,
@@ -151,7 +155,9 @@ pub enum EmberControlMessage {
     /// path: `ember::build_exchange_payload*` /
     /// `ember::parse_exchange_payload`). Lets two Ember peers trade
     /// source and peer hints over the encrypted Noise channel.
-    ExchangeData { payload: Vec<u8> },
+    ExchangeData {
+        payload: Vec<u8>,
+    },
 }
 
 impl EmberControlMessage {
@@ -1261,7 +1267,10 @@ mod tests {
     #[test]
     fn control_message_decode_rejects_malformed() {
         // Wrong version.
-        assert_eq!(EmberControlMessage::decode(&[0, 1, 0, 0, 0, 0, 0, 0, 0, 0]), None);
+        assert_eq!(
+            EmberControlMessage::decode(&[0, 1, 0, 0, 0, 0, 0, 0, 0, 0]),
+            None
+        );
         // Ping/Pong with wrong length.
         assert_eq!(EmberControlMessage::decode(&[1, 1, 0, 0]), None);
         // ExchangeRequest must have no trailing bytes.

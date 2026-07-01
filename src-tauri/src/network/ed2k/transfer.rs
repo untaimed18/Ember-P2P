@@ -3578,7 +3578,7 @@ impl Ed2kDownload {
                         .iter()
                         .any(|&(gs, ge)| gs < pe && ge > ps);
                     if part_has_gaps {
-debug!(
+                        debug!(
                         "Part {} byte budget met but gaps remain — peer likely sent duplicate blocks, marking for retry",
                             part_idx
                         );
