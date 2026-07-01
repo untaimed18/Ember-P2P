@@ -88,6 +88,46 @@ pub struct PublishManager {
     pub buddy_id: Option<KadId>,
     records: HashMap<KadId, PublishRecord>,
     keyword_records: HashMap<KadId, KeywordRecord>,
+    /// eMule `CSharedFileList::m_currFileSrc`: round-robin cursor over
+    /// `records`, advanced by exactly one entry per scheduler tick
+    /// regardless of whether that entry turns out to be due. See
+    /// `next_source_candidate`.
+    source_cursor: Option<KadId>,
+    /// eMule `CKnownFile::CPublishKeywordList`'s internal round-robin
+    /// cursor (`GetNextKeyword`): same "one candidate per tick" walk as
+    /// `source_cursor`, over `keyword_records`.
+    keyword_cursor: Option<KadId>,
+}
+
+/// eMule `CSharedFileList::Publish()` walks a plain array index
+/// (`m_currFileSrc` / `m_currFileNotes`) through its known-file list,
+/// examining exactly one candidate per `KADEMLIAPUBLISHTIME` tick regardless
+/// of whether it turns out to be due, and wraps back to the start once it
+/// runs off the end — so a full sweep of N entries takes N ticks even when
+/// none of them are due, rather than jumping straight to whichever entry
+/// happens to be due right now. `HashMap` has no stable index, so this walks
+/// a deterministic sort of the keys instead; the effect (exactly one
+/// candidate considered per call, full sweep before any repeat) is the same.
+pub(crate) fn round_robin_next<V>(map: &HashMap<KadId, V>, cursor: &mut Option<KadId>) -> Option<KadId> {
+    if map.is_empty() {
+        *cursor = None;
+        return None;
+    }
+    let mut keys: Vec<KadId> = map.keys().copied().collect();
+    keys.sort();
+    let next = match *cursor {
+        Some(c) => match keys.iter().position(|k| *k == c) {
+            Some(pos) => keys[(pos + 1) % keys.len()],
+            // Cursor's previous entry is gone (file unshared / keyword
+            // pruned) — eMule's index would now point at whatever shifted
+            // into that slot; restarting from the front is the simplest
+            // equivalent and still guarantees a full sweep.
+            None => keys[0],
+        },
+        None => keys[0],
+    };
+    *cursor = Some(next);
+    Some(next)
 }
 
 impl PublishManager {
@@ -107,6 +147,8 @@ impl PublishManager {
             buddy_id: None,
             records: HashMap::new(),
             keyword_records: HashMap::new(),
+            source_cursor: None,
+            keyword_cursor: None,
         }
     }
 
@@ -197,63 +239,88 @@ impl PublishManager {
             .collect()
     }
 
-    /// Build eMule-style keyword publishes: one store search per keyword,
-    /// carrying up to 150 complete shared files and split into 50-entry
-    /// `PublishKeyReq` packets.
-    pub fn keyword_batches_needing_publish(&self, max_keywords: usize) -> Vec<KeywordPublishBatch> {
+    /// eMule `CSharedFileList::Publish()` STOREFILE branch: advance the
+    /// round-robin cursor by exactly one file and return it only if that
+    /// one candidate is actually due. Called at most once per
+    /// `KADEMLIAPUBLISHTIME` tick regardless of the outcome — like eMule, a
+    /// full sweep of N shared files takes N ticks even when none of them
+    /// are due, rather than searching the whole set for whichever file
+    /// happens to be due right now.
+    pub fn next_source_candidate(&mut self) -> Option<&PublishableFile> {
+        let next = round_robin_next(&self.records, &mut self.source_cursor)?;
         let now = chrono::Utc::now().timestamp();
-        let mut batches = Vec::new();
+        let record = self.records.get(&next)?;
+        if now.saturating_sub(record.last_source_publish) > REPUBLISH_SOURCE_SECS {
+            Some(&record.file)
+        } else {
+            None
+        }
+    }
 
-        for (keyword_hash, keyword_record) in &self.keyword_records {
-            if batches.len() >= max_keywords {
+    /// eMule `CSharedFileList::Publish()` STOREKEYWORD branch: advance the
+    /// keyword round-robin cursor by exactly one target and return its
+    /// publish batch only if that one candidate is actually due. See
+    /// `next_source_candidate` for why this doesn't just scan for the next
+    /// due keyword.
+    pub fn next_keyword_candidate(&mut self) -> Option<KeywordPublishBatch> {
+        let next = round_robin_next(&self.keyword_records, &mut self.keyword_cursor)?;
+        let now = chrono::Utc::now().timestamp();
+        let record = self.keyword_records.get(&next)?;
+        let shift = record.backoff_shift.min(4);
+        let interval = REPUBLISH_KEYWORD_SECS.saturating_mul(1_i64 << shift);
+        if now.saturating_sub(record.last_publish) <= interval {
+            return None;
+        }
+        self.build_batch_for_keyword(next, record)
+    }
+
+    /// Gather up to 150 complete, keyword-publishable files backing
+    /// `keyword_hash` and split them into 50-entry `PublishKeyReq` packets.
+    /// Returns `None` if no live file currently backs this keyword (e.g.
+    /// the last one was unshared but the keyword record hasn't been pruned
+    /// yet).
+    fn build_batch_for_keyword(
+        &self,
+        keyword_hash: KadId,
+        keyword_record: &KeywordRecord,
+    ) -> Option<KeywordPublishBatch> {
+        let mut entries = Vec::new();
+        let mut file_hashes = Vec::new();
+        for record in self.records.values() {
+            if !record.file.keyword_publishable {
+                continue;
+            }
+            if !extract_keywords(&record.file.file_name)
+                .into_iter()
+                .any(|kw| kw == keyword_record.keyword)
+            {
+                continue;
+            }
+            entries.push(Self::build_keyword_entry(&record.file));
+            file_hashes.push(record.file.file_hash);
+            if entries.len() >= MAX_FILES_PER_KEYWORD_PUBLISH {
                 break;
             }
-            let shift = keyword_record.backoff_shift.min(4);
-            let interval = REPUBLISH_KEYWORD_SECS.saturating_mul(1_i64 << shift);
-            if now.saturating_sub(keyword_record.last_publish) <= interval {
-                continue;
-            }
-
-            let mut entries = Vec::new();
-            let mut file_hashes = Vec::new();
-            for record in self.records.values() {
-                if !record.file.keyword_publishable {
-                    continue;
-                }
-                if !extract_keywords(&record.file.file_name)
-                    .into_iter()
-                    .any(|kw| kw == keyword_record.keyword)
-                {
-                    continue;
-                }
-                entries.push(Self::build_keyword_entry(&record.file));
-                file_hashes.push(record.file.file_hash);
-                if entries.len() >= MAX_FILES_PER_KEYWORD_PUBLISH {
-                    break;
-                }
-            }
-
-            if entries.is_empty() {
-                continue;
-            }
-
-            let messages = entries
-                .chunks(MAX_FILES_PER_KEYWORD_PACKET)
-                .map(|chunk| KadMessage::PublishKeyReq {
-                    target: *keyword_hash,
-                    entries: chunk.to_vec(),
-                })
-                .collect();
-
-            batches.push(KeywordPublishBatch {
-                keyword_hash: *keyword_hash,
-                keyword: keyword_record.keyword.clone(),
-                messages,
-                file_hashes,
-            });
         }
 
-        batches
+        if entries.is_empty() {
+            return None;
+        }
+
+        let messages = entries
+            .chunks(MAX_FILES_PER_KEYWORD_PACKET)
+            .map(|chunk| KadMessage::PublishKeyReq {
+                target: keyword_hash,
+                entries: chunk.to_vec(),
+            })
+            .collect();
+
+        Some(KeywordPublishBatch {
+            keyword_hash,
+            keyword: keyword_record.keyword.clone(),
+            messages,
+            file_hashes,
+        })
     }
 
     /// Mark a keyword target as published.
@@ -728,6 +795,125 @@ mod tests {
                 .any(|t| matches!(&t.name, TagName::Str(s) if s == "ember")),
             "firewalled publish must still advertise ember capability — \
              the broker uses this to decide whether to attempt LowID-to-LowID",
+        );
+    }
+
+    /// eMule `StorePacket`'s STOREFILE guard only refuses a file that has
+    /// already been published within `REPUBLISH_SOURCE_SECS`; freshly
+    /// registered files must not be re-offered on the very next tick.
+    #[test]
+    fn next_source_candidate_returns_none_when_not_due() {
+        let mut p = make_publisher(false);
+        let mut file = sample_file();
+        file.last_source_publish = chrono::Utc::now().timestamp();
+        p.add_file(file);
+        assert!(
+            p.next_source_candidate().is_none(),
+            "freshly published file should not be due yet"
+        );
+    }
+
+    /// eMule `CSharedFileList::m_currFileSrc`: a blind round-robin index
+    /// that visits every shared file exactly once per sweep, then repeats
+    /// in the same order — never re-scanning for "whichever file happens
+    /// to be due" the way a `.find()` over the due set would.
+    #[test]
+    fn next_source_candidate_sweeps_all_files_before_repeating() {
+        let mut p = make_publisher(false);
+        let mut hashes: Vec<KadId> = Vec::new();
+        for i in 0u8..5 {
+            let mut file = sample_file();
+            file.file_hash = KadId([i; 16]);
+            file.file_name = format!("file-{i}.bin");
+            file.last_source_publish = 0; // due immediately
+            hashes.push(file.file_hash);
+            p.add_file(file);
+        }
+
+        let first_sweep: Vec<KadId> = (0..hashes.len())
+            .map(|_| {
+                p.next_source_candidate()
+                    .expect("all 5 files are due")
+                    .file_hash
+            })
+            .collect();
+        let mut sorted_first = first_sweep.clone();
+        sorted_first.sort();
+        let mut sorted_expected = hashes.clone();
+        sorted_expected.sort();
+        assert_eq!(
+            sorted_first, sorted_expected,
+            "one full sweep must visit every file exactly once"
+        );
+
+        let second_sweep: Vec<KadId> = (0..hashes.len())
+            .map(|_| {
+                p.next_source_candidate()
+                    .expect("still due — mark_source_published was never called")
+                    .file_hash
+            })
+            .collect();
+        assert_eq!(
+            second_sweep, first_sweep,
+            "the sweep order must repeat identically, like eMule's wrapping index"
+        );
+    }
+
+    /// Same "one candidate per call, full sweep before repeating" contract
+    /// as `next_source_candidate`, for the keyword round-robin
+    /// (`GetNextKeyword` in eMule).
+    #[test]
+    fn next_keyword_candidate_returns_none_when_not_due() {
+        let mut p = make_publisher(false);
+        p.add_file(sample_file());
+        let hashes: Vec<KadId> = p.keyword_records.keys().copied().collect();
+        for h in &hashes {
+            p.mark_keyword_published(h);
+        }
+        assert!(
+            p.next_keyword_candidate().is_none(),
+            "just-published keyword should not be due yet"
+        );
+    }
+
+    #[test]
+    fn next_keyword_candidate_sweeps_all_keywords_before_repeating() {
+        let mut p = make_publisher(false);
+        let mut file = sample_file();
+        file.file_name = "alpha bravo charlie.dat".to_string();
+        p.add_file(file);
+        let mut hashes: Vec<KadId> = p.keyword_records.keys().copied().collect();
+        hashes.sort();
+        assert_eq!(
+            hashes.len(),
+            3,
+            "expected 3 distinct keywords from the sample filename"
+        );
+
+        let first_sweep: Vec<KadId> = (0..hashes.len())
+            .map(|_| {
+                p.next_keyword_candidate()
+                    .expect("all keywords are due")
+                    .keyword_hash
+            })
+            .collect();
+        let mut sorted_first = first_sweep.clone();
+        sorted_first.sort();
+        assert_eq!(
+            sorted_first, hashes,
+            "one full sweep must visit every keyword exactly once"
+        );
+
+        let second_sweep: Vec<KadId> = (0..hashes.len())
+            .map(|_| {
+                p.next_keyword_candidate()
+                    .expect("still due")
+                    .keyword_hash
+            })
+            .collect();
+        assert_eq!(
+            second_sweep, first_sweep,
+            "sweep order must repeat identically"
         );
     }
 
