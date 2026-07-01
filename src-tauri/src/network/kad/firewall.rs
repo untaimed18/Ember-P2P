@@ -190,7 +190,10 @@ impl FirewallChecker {
                 "External IP votes disagree across {} candidates (distinct /24s)",
                 self.external_ip_votes.len()
             );
-            debug!("External IP vote tally (distinct /24s): [{}]", tally.join(", "));
+            debug!(
+                "External IP vote tally (distinct /24s): [{}]",
+                tally.join(", ")
+            );
         } else {
             debug!(
                 "External IP vote for {reported_ip} (distinct /24 voters: {})",

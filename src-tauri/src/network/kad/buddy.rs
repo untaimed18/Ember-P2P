@@ -181,7 +181,11 @@ impl BuddyManager {
     /// users who are actually open or not yet checked.
     ///
     /// Uses escalating backoff: 60s → 120s → 240s → 480s → 600s (max).
-    pub fn should_find_buddy(&self, tcp_status: FirewallStatus, udp_status: FirewallStatus) -> bool {
+    pub fn should_find_buddy(
+        &self,
+        tcp_status: FirewallStatus,
+        udp_status: FirewallStatus,
+    ) -> bool {
         if tcp_status != FirewallStatus::Firewalled {
             return false;
         }
@@ -939,7 +943,14 @@ mod tests {
 
     fn test_manager() -> BuddyManager {
         let pending: PendingBuddySet = Arc::new(Mutex::new(HashMap::new()));
-        BuddyManager::new(KadId([1u8; 16]), [2u8; 16], "test".to_string(), 4662, 4672, pending)
+        BuddyManager::new(
+            KadId([1u8; 16]),
+            [2u8; 16],
+            "test".to_string(),
+            4662,
+            4672,
+            pending,
+        )
     }
 
     #[test]

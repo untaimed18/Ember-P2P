@@ -820,6 +820,40 @@ impl SourceManager {
         None
     }
 
+    /// Return the single eD2k user hash associated with `ip` across all tracked
+    /// files, or `None` if the IP is unknown, has no hashed entry, or maps to
+    /// *more than one* distinct identity (i.e. multiple peers behind the same
+    /// NAT — we can't safely attribute a live connection to one of them by IP
+    /// alone). Used to stamp a live source row with its peer identity even when
+    /// the live connection landed on the peer's ephemeral outbound port
+    /// (different from the listening port we tracked), so duplicate rows for
+    /// the same peer can be coalesced (mirrors eMule keying a client by hash).
+    ///
+    /// Only *non-expired* entries are considered: a stale hash left over from a
+    /// previous peer that held this IP (e.g. reloaded from `sources.met`, or an
+    /// entry whose peer left and whose address was reassigned) must not be
+    /// attributed to whoever holds the IP now, or we could mis-stamp a live
+    /// connection and merge two distinct peers.
+    pub fn unique_user_hash_for_ip(&self, ip: Ipv4Addr) -> Option<[u8; 16]> {
+        let now = chrono::Utc::now().timestamp();
+        let mut found: Option<[u8; 16]> = None;
+        for entries in self.sources.values() {
+            for e in entries {
+                if e.ip == ip
+                    && e.user_hash != [0u8; 16]
+                    && now.saturating_sub(e.last_seen) < SOURCE_EXPIRY_SECS
+                {
+                    match found {
+                        None => found = Some(e.user_hash),
+                        Some(h) if h == e.user_hash => {}
+                        Some(_) => return None,
+                    }
+                }
+            }
+        }
+        found
+    }
+
     /// Look up all known IPs for a given user_hash across all tracked files.
     pub fn find_ips_by_user_hash(&self, user_hash: &[u8; 16]) -> Vec<Ipv4Addr> {
         let mut ips = Vec::new();
@@ -942,9 +976,25 @@ impl SourceManager {
         self.sources
             .get(file_hash)
             .map(|v| {
-                v.iter()
+                // eMule keys a client by user hash (CUpDownClient::Compare):
+                // two SourceEntries with the same hash are ONE source, not two
+                // — e.g. a peer tracked at both its advertised listening port
+                // and the ephemeral outbound port of an adopted callback/
+                // push-grant connection. Count each distinct non-zero identity
+                // once, plus each hash-less entry once. Only non-expired
+                // entries count (stale entries linger for hash/crypt lookups).
+                let mut seen: std::collections::HashSet<[u8; 16]> =
+                    std::collections::HashSet::new();
+                let mut count = 0usize;
+                for e in v
+                    .iter()
                     .filter(|e| now.saturating_sub(e.last_seen) < SOURCE_EXPIRY_SECS)
-                    .count()
+                {
+                    if e.user_hash == [0u8; 16] || seen.insert(e.user_hash) {
+                        count += 1;
+                    }
+                }
+                count
             })
             .unwrap_or(0)
     }
@@ -1269,10 +1319,17 @@ impl SourceManager {
         let now = chrono::Utc::now().timestamp();
         let entries = self.sources.entry(file_hash).or_default();
 
-        if let Some(existing) = entries
-            .iter_mut()
-            .find(|e| e.client_id == client_id && client_id > 0)
-        {
+        // A LowID `client_id` is only unique *within one server* — different
+        // servers routinely hand out the same low IDs to different peers. Key
+        // the dedup on `(client_id, server)` so a same-numbered LowID source
+        // learned from another server can't silently overwrite (and thereby
+        // lose the reachability of) an already-tracked peer.
+        if let Some(existing) = entries.iter_mut().find(|e| {
+            e.client_id == client_id
+                && client_id > 0
+                && e.server_ip == server_ip
+                && e.server_port == server_port
+        }) {
             existing.last_seen = now;
             existing.tcp_port = port;
             existing.server_ip = server_ip;
@@ -1378,49 +1435,88 @@ impl SourceManager {
         out
     }
 
-    /// Record that OP_CALLBACKREQUEST was sent for a LowID source.
+    /// Record that OP_CALLBACKREQUEST was sent for a LowID source. Now that
+    /// `register_lowid_source` keeps one row per `(client_id, server)`, a file
+    /// can legitimately hold several rows sharing a `client_id` (the same low ID
+    /// handed out by different servers). We only hold a TCP link to one server
+    /// at a time and request callbacks through it, but throttling *every* row
+    /// with this `client_id` is the safe choice: it stops the per-cycle re-ask
+    /// loop from re-sending immediately, and the rare over-throttle of a
+    /// different server's identically-numbered row merely defers its callback by
+    /// one `FILEREASKTIME` window — far better than a callback-spam loop.
     pub fn mark_callback_sent(&mut self, file_hash: &[u8; 16], client_id: u32) {
         let now = chrono::Utc::now().timestamp();
         if let Some(entries) = self.sources.get_mut(file_hash) {
-            if let Some(entry) = entries.iter_mut().find(|e| e.client_id == client_id) {
+            for entry in entries.iter_mut().filter(|e| e.client_id == client_id) {
                 entry.last_callback_at = now;
             }
         }
     }
 
-    /// Promote a LowID source to a HighID source after a callback connection
-    /// reveals the peer's real IP. Returns the file hashes this source was
-    /// registered for so callers can inject it into active transfers.
-    pub fn promote_lowid_source(
+    /// Link a just-connected server-LowID callback to the LowID source row we
+    /// already track for it, stamping the peer's now-known user hash so the
+    /// swarm isn't double-counted.
+    ///
+    /// A LowID source is learned from a server source list as
+    /// `(client_id, listening_port, server)` with an unknown user hash and no
+    /// routable IP. When the peer answers our `OP_CALLBACKREQUEST` it connects
+    /// from an *ephemeral* port, and that live connection is separately
+    /// registered as an ordinary `(real_ip, ephemeral_port, hash)` row. Without
+    /// linking the two, `source_count` (which de-dupes by user hash) counts the
+    /// peer twice — once as the hash-less LowID row, once as the hashed live row.
+    ///
+    /// We match by `(server, listening_port)` because the peer's Hello carries
+    /// its *listening* port, not the ephemeral source port of this connection.
+    /// We only stamp the hash + refresh `last_seen`; the row stays LowID (its
+    /// `client_id` and unspecified IP are untouched) so reconnects still go via
+    /// a fresh server callback — a LowID peer is never directly dialable.
+    ///
+    /// Disambiguation is deliberately conservative: if a row already carries
+    /// this exact hash we just refresh it, otherwise we stamp only when there is
+    /// *exactly one* hash-less candidate. Two hash-less LowID peers from the
+    /// same server that both advertise the same listening port (e.g. the 4662
+    /// default) are indistinguishable here, so we leave them alone rather than
+    /// risk pinning the wrong identity onto a peer. `listening_port == 0` or a
+    /// zero `user_hash` matches nothing.
+    pub fn link_lowid_callback_identity(
         &mut self,
         server_ip: u32,
         server_port: u16,
-        tcp_port: u16,
-        peer_ip: Ipv4Addr,
+        listening_port: u16,
         user_hash: [u8; 16],
-    ) -> Vec<[u8; 16]> {
+    ) {
+        if listening_port == 0 || user_hash == [0u8; 16] {
+            return;
+        }
         let now = chrono::Utc::now().timestamp();
-        let mut promoted_hashes = Vec::new();
-        for (file_hash, entries) in &mut self.sources {
-            for entry in entries.iter_mut() {
-                if entry.client_id > 0
-                    && entry.tcp_port == tcp_port
-                    && entry.server_ip == server_ip
-                    && entry.server_port == server_port
-                    && now.saturating_sub(entry.last_seen) < SOURCE_EXPIRY_SECS
-                    && (user_hash == [0u8; 16]
-                        || entry.user_hash == [0u8; 16]
-                        || entry.user_hash == user_hash)
+        for entries in self.sources.values_mut() {
+            let mut exact_idx: Option<usize> = None;
+            let mut hashless_idx: Option<usize> = None;
+            let mut hashless_count = 0usize;
+            for (i, e) in entries.iter().enumerate() {
+                if e.client_id > 0
+                    && e.tcp_port == listening_port
+                    && e.server_ip == server_ip
+                    && e.server_port == server_port
                 {
-                    entry.ip = peer_ip;
-                    if user_hash != [0u8; 16] {
-                        entry.user_hash = user_hash;
+                    if e.user_hash == user_hash {
+                        exact_idx = Some(i);
+                        break;
+                    } else if e.user_hash == [0u8; 16] {
+                        hashless_count += 1;
+                        hashless_idx = Some(i);
                     }
-                    promoted_hashes.push(*file_hash);
+                }
+            }
+            if let Some(i) = exact_idx {
+                entries[i].last_seen = now;
+            } else if hashless_count == 1 {
+                if let Some(i) = hashless_idx {
+                    entries[i].user_hash = user_hash;
+                    entries[i].last_seen = now;
                 }
             }
         }
-        promoted_hashes
     }
 
     pub fn find_lowid_files_by_port(
@@ -1581,5 +1677,111 @@ mod tests {
         assert!(pfs.callback_reask_due(ip, 4662));
         pfs.mark_callback_requested(ip, 4662);
         assert!(!pfs.callback_reask_due(ip, 4662));
+    }
+
+    #[test]
+    fn link_lowid_callback_stamps_single_row_and_dedups_count() {
+        // A LowID source learned from a server (hash unknown) plus the live
+        // callback connection (registered at its ephemeral port with the peer's
+        // hash) must collapse to ONE counted source once we link them by the
+        // peer's advertised listening port.
+        let hash = [0x91; 16];
+        let srv_ip = u32::from_le_bytes([1, 2, 3, 4]);
+        let srv_port = 4661u16;
+        let peer_hash = [0xC7; 16];
+        let real_ip = Ipv4Addr::new(9, 9, 9, 9);
+        let listening_port = 4662u16;
+        let ephemeral_port = 51000u16;
+
+        let mut sm = SourceManager::new();
+        // LowID row from the server source list: client_id set, hash unknown.
+        sm.register_lowid_source(hash, 5, listening_port, srv_ip, srv_port, [0u8; 16], 0);
+        // Live callback connection lands on the ephemeral port, hash known.
+        sm.register_source_full_opts(hash, real_ip, ephemeral_port, 0, peer_hash, 0);
+        assert_eq!(sm.source_count(&hash), 2, "before linking: counted twice");
+
+        sm.link_lowid_callback_identity(srv_ip, srv_port, listening_port, peer_hash);
+
+        assert_eq!(
+            sm.source_count(&hash),
+            1,
+            "after linking the LowID row carries the peer hash, so it de-dupes"
+        );
+        // The row stays LowID (client_id kept, IP still unspecified) so future
+        // reconnects still go through a fresh server callback.
+        let lowid_row = sm
+            .sources
+            .get(&hash)
+            .unwrap()
+            .iter()
+            .find(|e| e.client_id == 5)
+            .expect("LowID row still present");
+        assert_eq!(
+            lowid_row.user_hash, peer_hash,
+            "hash stamped onto LowID row"
+        );
+        assert_eq!(
+            lowid_row.ip,
+            Ipv4Addr::UNSPECIFIED,
+            "row stays LowID (no routable IP)"
+        );
+    }
+
+    #[test]
+    fn link_lowid_callback_skips_ambiguous_colisteners() {
+        // Two different LowID peers from the same server both advertising the
+        // default listening port are indistinguishable at callback time, so a
+        // single callback must NOT pin its identity onto either of them.
+        let hash = [0x92; 16];
+        let srv_ip = u32::from_le_bytes([1, 2, 3, 4]);
+        let srv_port = 4661u16;
+        let peer_hash = [0xD3; 16];
+        let listening_port = 4662u16;
+
+        let mut sm = SourceManager::new();
+        sm.register_lowid_source(hash, 5, listening_port, srv_ip, srv_port, [0u8; 16], 0);
+        sm.register_lowid_source(hash, 7, listening_port, srv_ip, srv_port, [0u8; 16], 0);
+
+        sm.link_lowid_callback_identity(srv_ip, srv_port, listening_port, peer_hash);
+
+        for e in sm.sources.get(&hash).unwrap() {
+            assert_eq!(
+                e.user_hash, [0u8; 16],
+                "ambiguous co-listeners must be left unstamped"
+            );
+        }
+    }
+
+    #[test]
+    fn link_lowid_callback_refreshes_exact_hash_row_only() {
+        // When a row already carries this exact identity (a reconnect), we only
+        // refresh it — and we must not stamp a *different* co-listening peer.
+        let hash = [0x93; 16];
+        let srv_ip = u32::from_le_bytes([5, 6, 7, 8]);
+        let srv_port = 4665u16;
+        let known_hash = [0x1A; 16];
+        let other_hash = [0u8; 16];
+        let listening_port = 5000u16;
+
+        let mut sm = SourceManager::new();
+        // Known peer (already linked earlier) and a different hash-less peer,
+        // both LowID on the same server but *different* listening ports so the
+        // known one is matched unambiguously.
+        sm.register_lowid_source(hash, 5, listening_port, srv_ip, srv_port, known_hash, 0);
+        sm.register_lowid_source(hash, 7, 5001, srv_ip, srv_port, other_hash, 0);
+        // Age the known row so we can observe the refresh.
+        let stale = chrono::Utc::now().timestamp() - 100;
+        for e in sm.sources.get_mut(&hash).unwrap().iter_mut() {
+            e.last_seen = stale;
+        }
+
+        sm.link_lowid_callback_identity(srv_ip, srv_port, listening_port, known_hash);
+
+        let rows = sm.sources.get(&hash).unwrap();
+        let known = rows.iter().find(|e| e.client_id == 5).unwrap();
+        let other = rows.iter().find(|e| e.client_id == 7).unwrap();
+        assert!(known.last_seen > stale, "exact-hash row refreshed");
+        assert_eq!(other.last_seen, stale, "unrelated row untouched");
+        assert_eq!(other.user_hash, [0u8; 16], "unrelated row not stamped");
     }
 }

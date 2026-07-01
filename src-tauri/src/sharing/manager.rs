@@ -692,6 +692,13 @@ impl TransferManager {
             if source.country_code.is_some() {
                 existing.country_code = source.country_code;
             }
+            // Backfill the peer identity if we learn it later (e.g. the row
+            // was seeded from a hash-less server source list, then the live
+            // handshake taught us the user hash). Never downgrade a known
+            // identity to `None`.
+            if source.user_hash.is_some() {
+                existing.user_hash = source.user_hash;
+            }
         } else {
             const MAX_SOURCES_PER_TRANSFER: usize = 500;
             if sources.len() >= MAX_SOURCES_PER_TRANSFER {
@@ -844,6 +851,62 @@ impl TransferManager {
                     && Self::is_callback_placeholder_row(s)
                     && Some(s.port) != except_port;
                 if is_placeholder {
+                    removed.push((s.ip.clone(), s.port));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        removed
+    }
+
+    /// Collapse duplicate rows for the peer whose *live* connection is
+    /// reported at `(live_ip, live_port)` into that single row, mirroring
+    /// eMule's one-`CUpDownClient`-per-peer model (`CUpDownClient::Compare`,
+    /// which matches by user hash first).
+    ///
+    /// A peer discovered via the server/KAD/source-exchange is seeded at its
+    /// *advertised listening* port (or, for a KAD callback, under a synthetic
+    /// display key), but when it is a LowID/KAD/server callback or a Path-B
+    /// push-grant reconnect, the live connection lands on the peer's
+    /// *ephemeral* outbound port — a different `(ip, port)`/key — so the UI
+    /// would otherwise show two rows for the same peer (one stuck
+    /// "Connecting"/"Queued", one actually transferring). This removes the
+    /// other rows that represent the same peer:
+    ///   * any row carrying the same user hash (the peer's stable identity),
+    ///     regardless of its port or IP-key — this is the primary, precise
+    ///     match and is what coalesces the ephemeral live row with the
+    ///     discovery/placeholder row even when they were keyed differently;
+    ///   * any callback *placeholder* row (KAD/direct/server-relay) at the
+    ///     same IP, matching the pre-existing callback-cleanup behaviour.
+    ///
+    /// We deliberately do NOT drop a hash-less non-callback row just because it
+    /// shares the IP: that would remove a *distinct* peer behind the same NAT.
+    ///
+    /// The live row itself (`live_ip:live_port`) is always kept. Returns the
+    /// `(ip, port)` pairs removed so the caller can emit matching
+    /// `transfer-source-detail` `status:"failed"` events (the frontend keys
+    /// rows by `(ip, port)` and drops them on that terminal status).
+    pub fn supersede_duplicate_peer_rows(
+        &mut self,
+        transfer_id: &str,
+        live_ip: &str,
+        live_port: u16,
+        live_user_hash: Option<[u8; 16]>,
+    ) -> Vec<(String, u16)> {
+        let uh = live_user_hash.filter(|h| *h != [0u8; 16]);
+        let mut removed = Vec::new();
+        if let Some(rows) = self.source_details.get_mut(transfer_id) {
+            rows.retain(|s| {
+                // Never drop the live row we're keeping.
+                if s.ip == live_ip && s.port == live_port {
+                    return true;
+                }
+                let same_peer_by_hash = matches!((uh, s.user_hash), (Some(a), Some(b)) if a == b);
+                let labeled_callback_placeholder =
+                    s.ip == live_ip && Self::is_callback_placeholder_row(s);
+                if same_peer_by_hash || labeled_callback_placeholder {
                     removed.push((s.ip.clone(), s.port));
                     false
                 } else {
