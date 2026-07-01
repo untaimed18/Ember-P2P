@@ -197,6 +197,26 @@ pub struct SearchState {
     pub store_pending: HashSet<KadId>,
     store_pending_times: HashMap<KadId, i64>,
     find_buddy_sent: HashSet<KadId>,
+    /// eMule `CSearch::m_uAnswers` for Store searches: count of
+    /// KADEMLIA2_PUBLISH_RES acks received (incremented by
+    /// `record_publish_ack`, called from `CSearchManager::ProcessPublishResult`'s
+    /// equivalent in the network loop). Crossing `STORE_PUBLISH_TARGET_TOTAL`
+    /// ends the search early instead of waiting out the full lifetime.
+    store_acks_received: u32,
+    /// When this Store search parked in Lookup with `stop_querying` set
+    /// (see `check_phase_transition`). Used by `store_search_exhausted` to
+    /// require a short settle window — mirroring eMule's `PENDING_TIMEOUT`
+    /// grace — before declaring the search out of work, so trailing
+    /// responses to queries sent just before parking still get a chance.
+    parked_at: Option<i64>,
+    /// eMule `CSearch::NODEFWCHECKUDP`: this lookup only exists to *discover*
+    /// fresh contacts to seed the UDP firewall test. Its discovered contacts
+    /// must never be queried over UDP (doing so would open a NAT mapping and
+    /// defeat the reachability test), so `handle_response` records the
+    /// responder and stops instead of chasing closer nodes. The mod.rs
+    /// KADEMLIA2_RES handler siphons the returned contacts into the firewall
+    /// test pool and keeps them out of the routing table.
+    pub is_udp_fw_probe_search: bool,
 }
 
 impl SearchState {
@@ -232,6 +252,9 @@ impl SearchState {
             store_pending: HashSet::new(),
             store_pending_times: HashMap::new(),
             find_buddy_sent: HashSet::new(),
+            store_acks_received: 0,
+            parked_at: None,
+            is_udp_fw_probe_search: false,
         }
     }
 
@@ -246,6 +269,69 @@ impl SearchState {
             self.completed = true;
             self.completed_at = Some(chrono::Utc::now().timestamp());
         }
+    }
+
+    /// eMule `CSearchManager::ProcessPublishResult`: every KADEMLIA2_PUBLISH_RES
+    /// increments `CSearch::m_uAnswers`, and `StorePacket` refuses to send (and
+    /// calls `PrepareToStop`) once that count exceeds `SEARCHSTOREFILE_TOTAL` /
+    /// `SEARCHSTOREKEYWORD_TOTAL` (both `STORE_PUBLISH_TARGET_TOTAL` here) — a
+    /// search that already has enough nodes confirmed doesn't need to sit
+    /// around for its full 140s/100s lifetime. The caller (the network loop's
+    /// PublishRes handler) calls this once per ack it can attribute to a
+    /// Store search's target.
+    pub fn record_publish_ack(&mut self) {
+        let is_store = matches!(
+            self.search_type,
+            SearchType::StoreKeyword | SearchType::StoreFile | SearchType::StoreNotes
+        );
+        if !is_store || self.completed {
+            return;
+        }
+        self.store_acks_received = self.store_acks_received.saturating_add(1);
+        if self.store_acks_received as usize > STORE_PUBLISH_TARGET_TOTAL {
+            info!(
+                "Search {}: {} publish acks confirmed (target {}), ending early instead of waiting out the lifetime",
+                self.id.0, self.store_acks_received, STORE_PUBLISH_TARGET_TOTAL
+            );
+            self.mark_completed();
+        }
+    }
+
+    /// Read-only equivalent of `next_publish_candidates` (which mutates
+    /// `store_sent`): true if a responded, in-tolerance contact still exists
+    /// that hasn't been published to and the target quota isn't already met.
+    fn has_publish_candidates_remaining(&self) -> bool {
+        if self.store_sent.len() >= STORE_PUBLISH_TARGET_TOTAL {
+            return false;
+        }
+        self.closest.iter().any(|c| {
+            self.responded_during_lookup.contains(&c.id)
+                && !self.store_sent.contains(&c.id)
+                && within_search_tolerance(&self.target, &c.id)
+        })
+    }
+
+    /// eMule `CSearch::JumpStart`: an empty `m_mapPossible` triggers
+    /// `PrepareToStop()` immediately rather than waiting out the lifetime —
+    /// there's nothing left the search could still do. A parked Store search
+    /// (see `check_phase_transition`) is the Ember analogue of a fully-drained
+    /// `m_mapPossible`: no publish candidates left, and no outstanding routing
+    /// query that could surface a new one. The settle window since parking
+    /// (`PENDING_TIMEOUT_SECS`, the same grace the search gives its own
+    /// queries) guards against declaring victory before a response to a query
+    /// sent just before parking has had a chance to land.
+    pub fn store_search_exhausted(&self) -> bool {
+        let is_store = matches!(
+            self.search_type,
+            SearchType::StoreKeyword | SearchType::StoreFile | SearchType::StoreNotes
+        );
+        if !is_store || self.completed || !self.stop_querying || !self.pending.is_empty() {
+            return false;
+        }
+        let settled = self
+            .parked_at
+            .is_some_and(|t| chrono::Utc::now().timestamp() - t >= PENDING_TIMEOUT_SECS);
+        settled && !self.has_publish_candidates_remaining()
     }
 
     pub fn seed(&mut self, contacts: Vec<KadContact>) {
@@ -485,6 +571,18 @@ impl SearchState {
         // `check_phase_transition` from Fetch is a no-op.
         self.responded_during_lookup.insert(*from);
 
+        // eMule NODEFWCHECKUDP (CSearch::ProcessResponse): a UDP-firewall
+        // probe lookup deliberately does NOT feed the returned contacts back
+        // into its own candidate lists — querying them over UDP would open a
+        // NAT mapping to exactly the peers we want to stay "fresh". Record the
+        // responder for bookkeeping and stop here; the KADEMLIA2_RES handler
+        // in the network loop harvests the returned contacts into the firewall
+        // test pool (and keeps them out of the routing table).
+        if self.is_udp_fw_probe_search {
+            self.check_completion();
+            return;
+        }
+
         let from_distance = self.target.xor_distance(from);
         let old_best = self
             .closest
@@ -707,6 +805,20 @@ impl SearchState {
             return;
         }
 
+        let is_store = matches!(
+            self.search_type,
+            SearchType::StoreKeyword | SearchType::StoreFile | SearchType::StoreNotes
+        );
+
+        // A Store search that already converged stays parked here (see the
+        // `is_store` branch below) so `next_publish_candidates` keeps
+        // streaming to late responders instead of being force-completed.
+        // Without this guard, every further response would re-run the
+        // convergence branch below and re-log "lookup converged" forever.
+        if is_store && self.stop_querying {
+            return;
+        }
+
         // eMule requires actual responses (m_mapResponded) before fetching.
         // If no contacts have responded, do not transition; let the search
         // expire at its lifetime instead.
@@ -731,11 +843,6 @@ impl SearchState {
             })
             .collect();
 
-        let is_store = matches!(
-            self.search_type,
-            SearchType::StoreKeyword | SearchType::StoreFile | SearchType::StoreNotes
-        );
-
         if all_queried || enough_queried || max_lookup_reached {
             let responded_candidates: Vec<&KadContact> = self
                 .closest
@@ -744,18 +851,41 @@ impl SearchState {
                 .collect();
             info!(
                 "Search {}: lookup converged (queried={}, stale_rounds={}, closest={}, verified={}, \
-                within_tolerance={}, responded_in_closest={}, store_pending={}), switching to fetch",
+                within_tolerance={}, responded_in_closest={}, store_pending={}), {}",
                 self.id.0, self.queried.len(), self.lookup_stale_rounds, self.closest.len(),
                 self.responded_during_lookup.len(), tolerance_candidates.len(), responded_candidates.len(),
-                self.store_pending.len()
+                self.store_pending.len(),
+                if is_store { "holding open to publish" } else { "switching to fetch" },
             );
             self.pending.clear();
             self.pending_times.clear();
-            self.fetch_started_at = Some(chrono::Utc::now().timestamp());
             if is_store {
-                self.mark_completed();
+                // eMule's StoreFile/StoreKeyword/StoreNotes searches have no
+                // real "fetch" step — publishing IS the lookup's side effect
+                // (`next_publish_candidates`, which only runs during Lookup).
+                // Switching phase here would both stop that eager publishing
+                // and (via the Store arm of `build_query_message`'s Fetch
+                // branch) mark the search completed within one more tick —
+                // which is what made every Store search finish in ~1-3s
+                // instead of occupying its slot for close to the full eMule
+                // lifetime (140s/100s). That turned the 3/4-concurrent-search
+                // cap in the publish scheduler into a no-op: instead of eMule's
+                // "a few searches busy for ~2.5 minutes, then quiet", Ember
+                // free-lists a slot and starts the next due keyword/source
+                // every ~2s, so publishing never visibly stops. Halting new
+                // routing queries here (like eMule backing off once responses
+                // stop improving the lookup) while staying in Lookup lets late
+                // in-tolerance responders still get eagerly published to until
+                // the search finally expires via `is_expired()`, or finishes
+                // early via `record_publish_ack`/`store_search_exhausted`
+                // once it's done all the work it can (see those for eMule's
+                // matching early-exit paths in `StorePacket`/`JumpStart`).
+                self.stop_querying = true;
+                self.parked_at = Some(chrono::Utc::now().timestamp());
+            } else {
+                self.fetch_started_at = Some(chrono::Utc::now().timestamp());
+                self.phase = SearchPhase::Fetch;
             }
-            self.phase = SearchPhase::Fetch;
         }
     }
 
@@ -906,6 +1036,12 @@ impl SearchState {
                 }
             }
             SearchPhase::Fetch => match self.search_type {
+                // Defensive fallback only: `check_phase_transition` no longer
+                // moves Store searches into `Fetch` (they park in `Lookup`
+                // with `stop_querying` set instead, see there for why), so
+                // this arm should not be reachable in practice. Kept so a
+                // Store search can never spin forever if some future code
+                // path does flip its phase.
                 SearchType::StoreKeyword | SearchType::StoreFile | SearchType::StoreNotes => {
                     self.mark_completed();
                     KadMessage::Ping
@@ -1106,8 +1242,16 @@ impl SearchManager {
                 state.fetch_started_at = Some(chrono::Utc::now().timestamp());
             }
 
-            if state.is_expired() && !state.completed {
+            // eMule `JumpStart`: `m_mapPossible.empty()` -> `PrepareToStop()`
+            // immediately, rather than waiting out the search's base lifetime.
+            let exhausted = !state.is_expired() && state.store_search_exhausted();
+            if (state.is_expired() || exhausted) && !state.completed {
                 let elapsed = chrono::Utc::now().timestamp() - state.started_at;
+                let end_reason = if exhausted {
+                    "no publish candidates left, ending early"
+                } else {
+                    "expired"
+                };
                 let type_label = match state.search_type {
                     SearchType::FindNode => "FindNode",
                     SearchType::FindKeyword => "FindKeyword",
@@ -1139,9 +1283,10 @@ impl SearchManager {
                     );
                 } else {
                     info!(
-                        "Search {} ({}) expired after {}s with {} results (phase={:?}, queried={}, responded={})",
+                        "Search {} ({}) {} after {}s with {} results (phase={:?}, queried={}, responded={})",
                         sid.0,
                         type_label,
+                        end_reason,
                         elapsed,
                         state.results.len(),
                         state.phase,
@@ -1384,6 +1529,85 @@ mod tests {
         assert!(
             state.next_publish_candidates().is_empty(),
             "eMule caps store publishes at 10 target nodes per search"
+        );
+    }
+
+    #[test]
+    fn record_publish_ack_completes_search_once_target_exceeded() {
+        let mut state = SearchState::new(SearchId(1), near_kad_id(0), SearchType::StoreKeyword);
+        for _ in 0..STORE_PUBLISH_TARGET_TOTAL {
+            state.record_publish_ack();
+            assert!(
+                !state.completed,
+                "must not complete before exceeding SEARCHSTOREKEYWORD_TOTAL, like eMule's `m_uAnswers > SEARCHSTOREKEYWORD_TOTAL`"
+            );
+        }
+        state.record_publish_ack();
+        assert!(
+            state.completed,
+            "eMule's StorePacket calls PrepareToStop once m_uAnswers exceeds the total"
+        );
+    }
+
+    #[test]
+    fn record_publish_ack_is_a_no_op_for_non_store_searches() {
+        let mut state = SearchState::new(SearchId(1), near_kad_id(0), SearchType::FindKeyword);
+        for _ in 0..=STORE_PUBLISH_TARGET_TOTAL + 5 {
+            state.record_publish_ack();
+        }
+        assert!(
+            !state.completed,
+            "publish acks are meaningless for Find-type searches and must not affect them"
+        );
+    }
+
+    #[test]
+    fn store_search_not_exhausted_before_parking_or_before_settle_window() {
+        let target = near_kad_id(0);
+        let mut state = SearchState::new(SearchId(1), target, SearchType::StoreFile);
+        assert!(
+            !state.store_search_exhausted(),
+            "a search that hasn't converged/parked yet must not be treated as exhausted"
+        );
+
+        // Park it (mirrors the `is_store` branch of `check_phase_transition`)
+        // with no publish candidates left, but *just now* — still inside the
+        // settle window, so it must not yet report exhausted.
+        state.stop_querying = true;
+        state.parked_at = Some(chrono::Utc::now().timestamp());
+        assert!(
+            !state.store_search_exhausted(),
+            "must wait out the settle window for trailing responses before ending early"
+        );
+    }
+
+    #[test]
+    fn store_search_exhausted_after_settle_window_with_no_candidates_left() {
+        let target = near_kad_id(0);
+        let mut state = SearchState::new(SearchId(1), target, SearchType::StoreKeyword);
+        state.stop_querying = true;
+        state.parked_at = Some(chrono::Utc::now().timestamp() - PENDING_TIMEOUT_SECS);
+
+        assert!(
+            state.store_search_exhausted(),
+            "no responded/in-tolerance contacts and nothing pending means eMule's \
+            m_mapPossible.empty() equivalent — should end early rather than idle for the full lifetime"
+        );
+    }
+
+    #[test]
+    fn store_search_not_exhausted_while_candidates_remain() {
+        let target = near_kad_id(0);
+        let mut state = SearchState::new(SearchId(1), target, SearchType::StoreFile);
+        let c = contact(near_kad_id(1), 1);
+        state.responded_during_lookup.insert(c.id);
+        state.closest = vec![c];
+        state.stop_querying = true;
+        state.parked_at = Some(chrono::Utc::now().timestamp() - PENDING_TIMEOUT_SECS);
+
+        assert!(
+            !state.store_search_exhausted(),
+            "an unpublished in-tolerance responder is still a valid publish candidate"
         );
     }
 
