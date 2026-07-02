@@ -62,6 +62,57 @@ pub async fn open_and_run_friend_session(
     super::multi_source::tune_peer_stream(&stream);
 
     let (raw_r, raw_w) = stream.into_split();
+    run_friend_session_over_transport(
+        Box::new(raw_r),
+        Box::new(raw_w),
+        addr,
+        expected_ember_hash,
+        our_user_hash,
+        our_ember_hash,
+        our_nickname,
+        our_client_id,
+        tcp_port,
+        udp_port,
+        obfuscate,
+        ember_sessions,
+        ul_event_tx,
+        friend_hashes,
+        ed25519_pubkey,
+        ed25519_secret_key,
+    )
+    .await
+}
+
+/// Like [`open_and_run_friend_session`] but drives the full Ember
+/// handshake (EmuleInfo / `OP_EMBER_HELLO` / Ed25519 PoP / friend request)
+/// over an already-established bidirectional transport instead of dialing
+/// TCP itself. Used by [`connect_friend_with_fallback`] for the QUIC
+/// hole-punch and rendezvous-relay transports, which hand back boxed
+/// `AsyncRead`/`AsyncWrite` halves rather than a `TcpStream`.
+///
+/// `addr` is used only for logging and the identity-guard error message —
+/// for non-TCP transports pass the best available description of where
+/// the peer was actually reached (e.g. the rendezvous-reported punch
+/// address, or `0.0.0.0:0` for a pure relay hop).
+#[allow(clippy::too_many_arguments)]
+pub async fn run_friend_session_over_transport(
+    raw_r: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+    raw_w: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+    addr: SocketAddr,
+    expected_ember_hash: [u8; 16],
+    our_user_hash: [u8; 16],
+    our_ember_hash: [u8; 16],
+    our_nickname: String,
+    our_client_id: u32,
+    tcp_port: u16,
+    udp_port: u16,
+    obfuscate: bool,
+    ember_sessions: EmberSessionMap,
+    ul_event_tx: tokio::sync::mpsc::Sender<UploadEvent>,
+    friend_hashes: Arc<RwLock<std::collections::HashSet<[u8; 16]>>>,
+    ed25519_pubkey: Option<[u8; 32]>,
+    ed25519_secret_key: Option<[u8; 32]>,
+) -> anyhow::Result<FriendSessionHandle> {
     let mut reader = tokio::io::BufReader::new(raw_r);
     let mut writer = tokio::io::BufWriter::new(raw_w);
 
@@ -491,7 +542,347 @@ pub async fn open_and_run_friend_session(
     Ok(handle)
 }
 
+/// Number of `/punch/{id}` polls to make after registering, and the delay
+/// between them. A friend's own offline-retry loop fires independently of
+/// ours (there is no request/response coupling before this point — see
+/// [`punch_friend`]), so this window exists purely to catch two
+/// independently-scheduled retries landing close together. The rendezvous
+/// server only retains a punch registration for 30 s
+/// (`rendezvous-server/src/main.rs::PUNCH_TTL`), so polling much past
+/// that would just poll a registration that already expired.
+const FRIEND_PUNCH_POLL_ATTEMPTS: usize = 12;
+const FRIEND_PUNCH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Reach a friend who isn't directly dialable by trying, in order: a
+/// plain TCP dial to `addr` (the previous, sole behaviour), an Ember QUIC
+/// hole-punch coordinated via the rendezvous server, and finally a
+/// rendezvous WebSocket relay hop. Returns as soon as any method produces
+/// a live, authenticated Ember session.
+///
+/// Before this, friend sessions had zero fallback beyond
+/// `TcpStream::connect` — two friends who are both behind a NAT that
+/// doesn't forward the advertised port (extremely common for LowID /
+/// firewalled peers) could never open chat or browse with each other even
+/// though the exact same hole-punch/relay machinery already existed for
+/// file-transfer sources.
+///
+/// `rendezvous_url` empty or `quic_endpoint` absent degrade gracefully to
+/// TCP-only, matching the previous behaviour exactly.
+#[allow(clippy::too_many_arguments)]
+pub async fn connect_friend_with_fallback(
+    addr: SocketAddr,
+    expected_ember_hash: [u8; 16],
+    our_user_hash: [u8; 16],
+    our_ember_hash: [u8; 16],
+    our_nickname: String,
+    our_client_id: u32,
+    tcp_port: u16,
+    udp_port: u16,
+    obfuscate: bool,
+    ember_sessions: EmberSessionMap,
+    ul_event_tx: tokio::sync::mpsc::Sender<UploadEvent>,
+    friend_hashes: Arc<RwLock<std::collections::HashSet<[u8; 16]>>>,
+    ed25519_pubkey: Option<[u8; 32]>,
+    ed25519_secret_key: Option<[u8; 32]>,
+    rendezvous_url: String,
+    our_nat_type: crate::network::ember::nat::NatType,
+    our_external_addr: Option<SocketAddr>,
+    quic_endpoint: Option<Arc<quinn::Endpoint>>,
+) -> anyhow::Result<FriendSessionHandle> {
+    let tcp_err = match open_and_run_friend_session(
+        addr,
+        expected_ember_hash,
+        our_user_hash,
+        our_ember_hash,
+        our_nickname.clone(),
+        our_client_id,
+        tcp_port,
+        udp_port,
+        obfuscate,
+        ember_sessions.clone(),
+        ul_event_tx.clone(),
+        friend_hashes.clone(),
+        ed25519_pubkey,
+        ed25519_secret_key,
+    )
+    .await
+    {
+        Ok(handle) => return Ok(handle),
+        Err(e) => e,
+    };
+
+    if rendezvous_url.is_empty() {
+        return Err(tcp_err);
+    }
+    info!(
+        "Friend TCP connect to {} ({}) failed ({tcp_err}); trying Ember NAT traversal",
+        addr,
+        hex::encode(expected_ember_hash)
+    );
+
+    if let (Some(endpoint), Some(ext_addr)) = (quic_endpoint.as_ref(), our_external_addr) {
+        if our_nat_type != crate::network::ember::nat::NatType::Symmetric {
+            match punch_friend(
+                &rendezvous_url,
+                endpoint,
+                our_ember_hash,
+                expected_ember_hash,
+                ext_addr,
+                our_nat_type,
+            )
+            .await
+            {
+                Ok((send, recv)) => {
+                    info!(
+                        "Friend hole-punch to {} succeeded",
+                        hex::encode(expected_ember_hash)
+                    );
+                    return run_friend_session_over_transport(
+                        Box::new(recv),
+                        Box::new(send),
+                        addr,
+                        expected_ember_hash,
+                        our_user_hash,
+                        our_ember_hash,
+                        our_nickname.clone(),
+                        our_client_id,
+                        tcp_port,
+                        udp_port,
+                        obfuscate,
+                        ember_sessions.clone(),
+                        ul_event_tx.clone(),
+                        friend_hashes.clone(),
+                        ed25519_pubkey,
+                        ed25519_secret_key,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    debug!(
+                        "Friend hole-punch to {} failed: {e}",
+                        hex::encode(expected_ember_hash)
+                    );
+                }
+            }
+        }
+    }
+
+    match relay_friend(&rendezvous_url, our_ember_hash, expected_ember_hash, addr).await {
+        Ok(ws_stream) => {
+            info!(
+                "Friend relay to {} connected",
+                hex::encode(expected_ember_hash)
+            );
+            let (r, w) = tokio::io::split(ws_stream);
+            run_friend_session_over_transport(
+                Box::new(r),
+                Box::new(w),
+                addr,
+                expected_ember_hash,
+                our_user_hash,
+                our_ember_hash,
+                our_nickname,
+                our_client_id,
+                tcp_port,
+                udp_port,
+                obfuscate,
+                ember_sessions,
+                ul_event_tx,
+                friend_hashes,
+                ed25519_pubkey,
+                ed25519_secret_key,
+            )
+            .await
+        }
+        Err(e) => {
+            debug!(
+                "Friend relay to {} failed: {e}",
+                hex::encode(expected_ember_hash)
+            );
+            Err(anyhow::anyhow!(
+                "all connection methods failed for friend {}: tcp={tcp_err}; relay={e}",
+                hex::encode(expected_ember_hash)
+            ))
+        }
+    }
+}
+
+/// Coordinate a QUIC hole-punch with a friend via the rendezvous server,
+/// keyed directly by `ember_hash` rather than the synthetic IP:port id
+/// the download broker uses for anonymous sources — both friends already
+/// know each other's stable identity, so no synthetic scheme is needed.
+///
+/// This is purely best-effort: it only succeeds if the friend's own
+/// client is *at the same time* trying to reach us — e.g. its own
+/// offline-friend retry loop fired within the rendezvous server's 30 s
+/// punch-registration window — and therefore registers a reciprocal
+/// punch back at us. There is no separate "responder" role to implement
+/// here: each side's normal reconnect attempt already plays both parts,
+/// since [`connect_friend_with_fallback`] is exactly what runs whenever
+/// either side's retry loop wakes up for this friend.
+async fn punch_friend(
+    rendezvous_url: &str,
+    endpoint: &quinn::Endpoint,
+    our_ember_hash: [u8; 16],
+    friend_ember_hash: [u8; 16],
+    our_external_addr: SocketAddr,
+    our_nat_type: crate::network::ember::nat::NatType,
+) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
+    let our_id = format!("{:0>64}", hex::encode(our_ember_hash));
+    let target_id = format!("{:0>64}", hex::encode(friend_ember_hash));
+
+    // Register the port our QUIC endpoint is actually bound to, not
+    // `our_external_addr.port()` — that address comes from the KAD UDP
+    // STUN probe (a *different* socket than the QUIC endpoint the friend
+    // will actually dial), so advertising it here would misdirect the
+    // friend's `punch_quic` connect at a socket we're not listening on.
+    let advertise_port = endpoint
+        .local_addr()
+        .map(|a| a.port())
+        .unwrap_or_else(|_| our_external_addr.port());
+    crate::network::ember::relay::register_punch(
+        rendezvous_url,
+        &our_id,
+        &target_id,
+        advertise_port,
+        our_nat_type.as_u8(),
+    )
+    .await?;
+
+    for _ in 0..FRIEND_PUNCH_POLL_ATTEMPTS {
+        tokio::time::sleep(FRIEND_PUNCH_POLL_INTERVAL).await;
+        match crate::network::ember::relay::poll_punch(rendezvous_url, &our_id).await {
+            Ok(Some(info)) => {
+                let Ok(ip) = info.ip.parse::<std::net::IpAddr>() else {
+                    continue;
+                };
+                let routable = match ip {
+                    std::net::IpAddr::V4(v4) => !crate::security::is_special_use_v4(v4),
+                    std::net::IpAddr::V6(_) => !crate::security::is_private_ip(ip),
+                };
+                if !routable || info.port == 0 {
+                    debug!(
+                        "Friend punch: ignoring non-routable target {ip}:{}",
+                        info.port
+                    );
+                    continue;
+                }
+                let peer_addr = SocketAddr::new(ip, info.port);
+                return super::super::ember::broker::punch_quic(endpoint, peer_addr, None)
+                    .await
+                    .map_err(|e| format!("QUIC punch to {peer_addr} failed: {e}"));
+            }
+            Ok(None) => {}
+            Err(e) => debug!("Friend punch poll error: {e}"),
+        }
+    }
+    Err("no reciprocal punch registration found before timeout".to_string())
+}
+
+/// Fall back to a rendezvous-brokered WebSocket relay to reach a friend
+/// whose hole-punch (if attempted) didn't land.
+///
+/// Addressed by `(ip, port)` — the same synthetic id scheme the download
+/// broker uses for LowID sources, and the *only* scheme the existing
+/// relay-invite responder (`network/mod.rs`'s "poll for incoming
+/// server-relay invitations" task, which every rendezvous-registered node
+/// already runs unconditionally) knows how to answer. `friend_addr` is
+/// the friend's last rendezvous-registered `(ip, tcp_port)` — the exact
+/// value that responder independently recomputes from its own
+/// `state.external_ip` / `state.quic_port`, so no new responder-side code
+/// is needed: the friend's own client picks this invitation up the next
+/// time its existing poller runs.
+async fn relay_friend(
+    rendezvous_url: &str,
+    our_ember_hash: [u8; 16],
+    friend_ember_hash: [u8; 16],
+    friend_addr: SocketAddr,
+) -> Result<crate::network::ember::relay::WsStream, String> {
+    let target_id = match friend_addr.ip() {
+        std::net::IpAddr::V4(v4) => format!(
+            "{:0>64}",
+            format!("{:08x}{:04x}", u32::from(v4), friend_addr.port())
+        ),
+        std::net::IpAddr::V6(_) => {
+            return Err("friend relay requires an IPv4 rendezvous address".to_string())
+        }
+    };
+    let nonce = {
+        use rand::RngCore;
+        let mut n = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut n);
+        hex::encode(n)
+    };
+    let session_id = format!(
+        "friend-{}-{}-{}",
+        hex::encode(our_ember_hash),
+        hex::encode(friend_ember_hash),
+        nonce
+    );
+
+    crate::network::ember::relay::post_relay_invite(rendezvous_url, &target_id, &session_id)
+        .await?;
+    crate::network::ember::relay::connect_server_relay(rendezvous_url, &session_id).await
+}
+
 use super::multi_source::parse_browse_response;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// With an empty `rendezvous_url`, `connect_friend_with_fallback` must
+    /// behave exactly like the old TCP-only `open_and_run_friend_session`
+    /// — no punch/relay attempted, and the original TCP error is returned
+    /// promptly rather than hanging. Regression guard for the "friend
+    /// connections have zero NAT-traversal fallback" gap: this confirms
+    /// the new fallback path is strictly additive and degrades cleanly
+    /// when no rendezvous server is configured.
+    #[tokio::test]
+    async fn fallback_degrades_to_tcp_only_when_rendezvous_url_empty() {
+        // Reserve a port and then close it so the subsequent connect is a
+        // fast, deterministic refusal rather than depending on some
+        // hopefully-unused port number.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local_addr");
+        drop(listener);
+
+        let ember_sessions: EmberSessionMap =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let (ul_tx, _ul_rx) = tokio::sync::mpsc::channel(8);
+        let friend_hashes = Arc::new(RwLock::new(std::collections::HashSet::new()));
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            connect_friend_with_fallback(
+                addr,
+                [0x11; 16],
+                [0x22; 16],
+                [0x33; 16],
+                "tester".to_string(),
+                0,
+                4662,
+                4672,
+                false,
+                ember_sessions,
+                ul_tx,
+                friend_hashes,
+                None,
+                None,
+                String::new(),
+                crate::network::ember::nat::NatType::Unknown,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("connect_friend_with_fallback must not hang with no rendezvous URL");
+
+        assert!(result.is_err());
+    }
+}
 
 async fn write_packet<W: AsyncWriteExt + Unpin + ?Sized>(
     writer: &mut W,

@@ -173,8 +173,46 @@ const MAX_PUNCH_PER_TARGET: usize = 8;
 /// consumption to ~6 maxed-out clients before backpressure kicks in.
 const MAX_RELAY_SESSIONS_PER_IP: usize = 32;
 const MAX_GLOBAL_RELAY_SESSIONS: usize = 200;
-const RELAY_BANDWIDTH_CAP_BYTES: usize = 256 * 1024;
-const RELAY_SESSION_TIMEOUT: Duration = Duration::from_secs(120);
+/// Combined (both directions summed) byte ceiling for a single relay
+/// session — see `RelaySessionEntry` for why both directions share one
+/// counter. This is the server-relay counterpart to
+/// `ember::relay::RELAY_MAX_BYTES_PER_DIRECTION` on the client, and
+/// suffers from the same class of bug that constant's doc comment
+/// describes: the previous value here (`256 KiB`) was smaller than a
+/// *single* eD2K part (~9.28 MiB), so every LowID-to-LowID transfer
+/// that fell back to the server relay (both peers firewalled/symmetric,
+/// no volunteer peer-relay available) tripped the cap and was torn
+/// down almost immediately — `bridge_relay`/`run_peer1_loop` `break`
+/// unconditionally once `new_total > RELAY_BANDWIDTH_CAP_BYTES`, there
+/// is no partial-credit or backoff.
+///
+/// `256 MiB` covers dozens of parts per session while still bounding
+/// worst-case server egress: with `MAX_GLOBAL_RELAY_SESSIONS = 200`
+/// and `RELAY_SESSION_TIMEOUT` below, the absolute worst case is
+/// `200 * 256 MiB = 50 GiB` of relay traffic per timeout window, which
+/// is a deliberately smaller blast radius than the client's own
+/// volunteer-relay ceiling (`4 sessions * 2 dirs * 8 GiB = 64 GiB` per
+/// `RELAY_MAX_DURATION`) since this server is shared infrastructure
+/// rather than a single peer's own uplink.
+const RELAY_BANDWIDTH_CAP_BYTES: usize = 256 * 1024 * 1024;
+/// Hard per-session lifetime, independent of activity. Was `120s`,
+/// which is far too short for the byte cap above to ever be reached
+/// at realistic relay throughput (256 MiB in 120s needs a sustained
+/// ~2.1 MiB/s just from this one session) — the timeout, not the
+/// bandwidth cap, was the binding constraint that killed most
+/// server-relayed transfers. `30` minutes gives a session a realistic
+/// chance to move the full byte budget (≈142 KiB/s sustained) while
+/// still bounding how long any one session can occupy a slot against
+/// `MAX_GLOBAL_RELAY_SESSIONS`. Transfers that need longer than this
+/// simply reconnect through a fresh relay session and resume, same as
+/// any other eD2K peer disconnect — see `multi_source.rs` reconnect
+/// handling.
+const RELAY_SESSION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// Pre-bridge only: how long peer1 waits for peer2 to dial in and join
+/// before giving up (see the `if peer2_tx.is_none()` guard in
+/// `run_peer1_loop`). Unrelated to in-transfer inactivity — once
+/// peer2 joins, this timeout is no longer consulted — so it does not
+/// need to scale with the bandwidth/duration changes above.
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RELAY_INVITES_PER_TARGET: usize = 8;
 const RELAY_INVITE_TTL: Duration = Duration::from_secs(60);
@@ -245,8 +283,8 @@ struct PunchEntry {
 /// `bridge_relay` uses on peer2's side. Previously each half tracked
 /// its own local counter, which double-counted peer1→peer2 traffic (it
 /// passed through both loops) and never combined with peer2→peer1
-/// traffic — making the 256 KiB `RELAY_BANDWIDTH_CAP_BYTES` cap
-/// effectively vary per-direction and per-attach-order.
+/// traffic — making the `RELAY_BANDWIDTH_CAP_BYTES` cap effectively
+/// vary per-direction and per-attach-order.
 ///
 /// Replaces the older single-direction relay where peer1's WS frames
 /// were silently dropped. The bridge is now genuinely full-duplex.
@@ -1135,8 +1173,8 @@ async fn run_peer1_loop(
 /// `total_bytes` is the per-session shared counter; peer1's loop
 /// holds a clone and increments it for peer1→peer2 frames when it
 /// forwards them, and we increment here for peer2→peer1 frames.
-/// That way the 256 KiB cap applies uniformly to the sum of both
-/// directions. We do NOT re-count on the `peer2_inbox_rx` drain
+/// That way `RELAY_BANDWIDTH_CAP_BYTES` applies uniformly to the sum
+/// of both directions. We do NOT re-count on the `peer2_inbox_rx` drain
 /// side — those bytes were already counted once by peer1's loop
 /// when they entered the relay; counting them again would
 /// double-charge the same payload.

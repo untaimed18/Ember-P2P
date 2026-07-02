@@ -1654,6 +1654,8 @@
   "settings_filter_incoming_hint": "Apply IP filter to incoming peer connections. VPN users may need to disable this since VPN IPs often appear in filter lists.",
   "settings_block_private_label": "Block Private IPs",
   "settings_block_private_hint": "Reject 10.x, 192.168.x, etc. from the routing table.",
+  "settings_allow_shared_browse_label": "Allow Browsing My Shares",
+  "settings_allow_shared_browse_hint": "Let eMule, aMule, MLDonkey, and other ed2k clients view your shared file list ('View Files'). Off by default — when off, browse requests get a polite denial instead of your file list.",
   "settings_antileech_label": "Anti-Leech Filter",
   "settings_antileech_hint": "Reject incoming peer connections from known leech clients.",
   "settings_antileech_loading": "Loading patterns...",

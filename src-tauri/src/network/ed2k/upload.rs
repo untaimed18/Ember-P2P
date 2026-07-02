@@ -40,12 +40,20 @@ enum StreamReader {
     Obfuscated(
         tokio::io::BufReader<Rc4Reader<tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>>>,
     ),
+    /// A pre-established, already-encrypted-at-the-transport-layer stream
+    /// (QUIC hole-punch / peer-relay / server-relay) handed to us via
+    /// [`ConnInit::InboundStream`]. Never obfuscation-negotiated: the far
+    /// end sends plain eD2k framing directly, matching how the download
+    /// side treats these same transports in `ember::broker` /
+    /// `friend_connect::run_friend_session_over_transport`.
+    Boxed(Box<dyn tokio::io::AsyncRead + Unpin + Send>),
 }
 enum StreamWriter {
     Plain(tokio::io::BufWriter<tokio::net::tcp::OwnedWriteHalf>),
     Obfuscated(
         tokio::io::BufWriter<Rc4Writer<tokio::io::BufWriter<tokio::net::tcp::OwnedWriteHalf>>>,
     ),
+    Boxed(Box<dyn tokio::io::AsyncWrite + Unpin + Send>),
 }
 
 impl AsyncRead for StreamReader {
@@ -57,6 +65,7 @@ impl AsyncRead for StreamReader {
         match self.get_mut() {
             StreamReader::Plain(r) => Pin::new(r).poll_read(cx, buf),
             StreamReader::Obfuscated(r) => Pin::new(r).poll_read(cx, buf),
+            StreamReader::Boxed(r) => Pin::new(&mut **r).poll_read(cx, buf),
         }
     }
 }
@@ -70,6 +79,7 @@ impl AsyncWrite for StreamWriter {
         match self.get_mut() {
             StreamWriter::Plain(w) => Pin::new(w).poll_write(cx, buf),
             StreamWriter::Obfuscated(w) => Pin::new(w).poll_write(cx, buf),
+            StreamWriter::Boxed(w) => Pin::new(&mut **w).poll_write(cx, buf),
         }
     }
     fn poll_flush(
@@ -79,6 +89,7 @@ impl AsyncWrite for StreamWriter {
         match self.get_mut() {
             StreamWriter::Plain(w) => Pin::new(w).poll_flush(cx),
             StreamWriter::Obfuscated(w) => Pin::new(w).poll_flush(cx),
+            StreamWriter::Boxed(w) => Pin::new(&mut **w).poll_flush(cx),
         }
     }
     fn poll_shutdown(
@@ -88,6 +99,7 @@ impl AsyncWrite for StreamWriter {
         match self.get_mut() {
             StreamWriter::Plain(w) => Pin::new(w).poll_shutdown(cx),
             StreamWriter::Obfuscated(w) => Pin::new(w).poll_shutdown(cx),
+            StreamWriter::Boxed(w) => Pin::new(&mut **w).poll_shutdown(cx),
         }
     }
 }
@@ -104,6 +116,31 @@ impl AsyncWrite for StreamWriter {
 enum ConnInit {
     Inbound(TcpStream),
     OutboundServe(Box<OutboundServeState>),
+    /// A pre-established bidirectional stream from Ember NAT traversal
+    /// (QUIC hole-punch, peer relay, or rendezvous server relay) where we
+    /// are the source/upload side despite not being a literal `TcpListener`
+    /// acceptor. The far end still sends `OP_HELLO` first exactly like a
+    /// normal inbound TCP dial, so this converges into the same
+    /// server-role handshake as [`ConnInit::Inbound`] minus the TCP accept
+    /// and obfuscation-negotiation steps (the transport is already secured
+    /// end-to-end by QUIC/TLS, so no RC4 layer is negotiated on top).
+    InboundStream {
+        reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+        writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+    },
+}
+
+/// Request handed from the network task to the upload listener for a
+/// pre-established stream (Ember QUIC hole-punch, peer relay, or
+/// rendezvous server relay) that should be served as an upload session.
+/// Flows network → upload, alongside [`ConnectServeRequest`] (which dials
+/// out) and opposite [`KadCallbackParts`] (which flows upload → network for
+/// the download-adoption path this is deliberately *not* used for — see
+/// [`ConnInit::InboundStream`]).
+pub struct InboundStreamRequest {
+    pub peer_addr: SocketAddr,
+    pub reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+    pub writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
 }
 
 /// A fully handshaked outbound connection produced by `connect_and_serve`, handed
@@ -852,6 +889,12 @@ struct UploadHandler {
     /// Apply IP filter to incoming TCP connections (when false, only
     /// outbound is filtered). Live-toggleable; checked once per accept.
     filter_incoming_connections: Arc<std::sync::atomic::AtomicBool>,
+    /// Answer vanilla `OP_ASKSHAREDFILES` ("View Files") requests from any
+    /// ed2k-compatible peer with our real shared-file list. Live-toggleable
+    /// from the Settings page; read on every inbound request rather than
+    /// snapshotted at session start, so a mid-session toggle takes effect
+    /// immediately. Off by default — see `AppSettings::allow_shared_files_browse`.
+    share_browsing_enabled: Arc<std::sync::atomic::AtomicBool>,
     /// IPs we probed with FirewalledReq -- connect-back proves TCP is open
     firewall_probe_ips: FirewallProbeSet,
     /// Shared atomic: set to false when TCP is proven open
@@ -1299,6 +1342,60 @@ fn unshared_purge_hashes<'a>(
     out
 }
 
+/// Encode the `OP_ASKSHAREDFILESANSWER` payload for a set of shared files:
+/// `<count 4>(<HASH 16><ID 4><PORT 2><1 Tag_set>)[count]`. Pure function
+/// (no I/O, no `&self`) so it's directly unit-testable; the async
+/// `UploadHandler::build_shared_files_answer` just gathers `(hash_hex, name,
+/// size, extension)` tuples from the live index and hands them here.
+///
+/// Entries whose hash doesn't decode to at least 16 bytes are skipped rather
+/// than aborting the whole answer — a single corrupt index row shouldn't
+/// hide the rest of the user's shares from a legitimate browse request.
+fn encode_shared_files_answer(
+    files: &[(String, String, u64, String)],
+    client_id: u32,
+    tcp_port: u16,
+) -> Vec<u8> {
+    let mut entries = Vec::with_capacity(files.len().saturating_mul(64));
+    let mut count: u32 = 0;
+    for (hash_hex, name, size, extension) in files {
+        let hash_bytes = match hex::decode(hash_hex) {
+            Ok(b) if b.len() >= 16 => b,
+            _ => continue,
+        };
+        entries.extend_from_slice(&hash_bytes[..16]);
+        entries.extend_from_slice(&client_id.to_le_bytes());
+        entries.extend_from_slice(&tcp_port.to_le_bytes());
+
+        let mut tag_count: u32 = 0;
+        let mut tags = Vec::new();
+        write_ed2k_tag(&mut tags, 0x01, &Ed2kTagValue::String(name.clone())); // FT_FILENAME
+        tag_count += 1;
+        // Same OLD_MAX_EMULE_FILE_SIZE boundary as offer_files_chunk: files
+        // above it also carry FT_FILESIZE_HI (0x3A) with the high 32 bits
+        // so large-file sizes round-trip correctly.
+        write_ed2k_tag(&mut tags, 0x02, &Ed2kTagValue::Uint32(*size as u32)); // FT_FILESIZE
+        tag_count += 1;
+        if *size > OLD_MAX_EMULE_FILE_SIZE {
+            write_ed2k_tag(&mut tags, 0x3A, &Ed2kTagValue::Uint32((*size >> 32) as u32));
+            tag_count += 1;
+        }
+        let file_type = crate::search::index::infer_file_type(extension);
+        if !file_type.is_empty() {
+            write_ed2k_tag(&mut tags, 0x03, &Ed2kTagValue::String(file_type)); // FT_FILETYPE
+            tag_count += 1;
+        }
+        entries.extend_from_slice(&tag_count.to_le_bytes());
+        entries.extend_from_slice(&tags);
+        count += 1;
+    }
+
+    let mut payload = Vec::with_capacity(4 + entries.len());
+    payload.extend_from_slice(&count.to_le_bytes());
+    payload.extend_from_slice(&entries);
+    payload
+}
+
 /// Compute the rank of a queued peer reached over UDP (OP_REASKFILEPING).
 ///
 /// Matches on either a known `user_hash` or the UDP source IP — we don't
@@ -1402,6 +1499,7 @@ pub async fn start_upload_server(
     antileech: crate::security::antileech::SharedAntiLeechFilter,
     skip_compress_video: Arc<std::sync::atomic::AtomicBool>,
     filter_incoming_connections: Arc<std::sync::atomic::AtomicBool>,
+    share_browsing_enabled: Arc<std::sync::atomic::AtomicBool>,
     firewall_probe_ips: FirewallProbeSet,
     firewalled_shared: Arc<std::sync::atomic::AtomicBool>,
     // Our current external IPv4 in ed2k HighID encoding (little-endian u32
@@ -1436,6 +1534,13 @@ pub async fn start_upload_server(
     // and KAD buddy `OP_CALLBACK`): each asks us to dial a peer and serve it so a
     // firewalled LowID node can still upload. Drained in the accept `select!`.
     mut connect_serve_rx: tokio::sync::mpsc::Receiver<ConnectServeRequest>,
+    // Pre-established, transport-encrypted streams from the network task: a
+    // punch-responder's outbound QUIC dial to an initiator, or a relay-invite
+    // websocket adopted for a download-broker `StartRelay` session. Both
+    // arrive with no matching download (we're the source/upload side), so
+    // they're served here rather than through `kad_callback_tx`. Drained in
+    // the same accept `select!`.
+    mut inbound_stream_rx: tokio::sync::mpsc::Receiver<InboundStreamRequest>,
 ) -> anyhow::Result<()> {
     let addr: SocketAddr = format!("0.0.0.0:{tcp_port}").parse()?;
     let listener = match TcpListener::bind(addr).await {
@@ -1489,6 +1594,7 @@ pub async fn start_upload_server(
         antileech,
         skip_compress_video,
         filter_incoming_connections,
+        share_browsing_enabled,
         firewall_probe_ips,
         firewalled_shared,
         external_ip_shared,
@@ -1521,6 +1627,8 @@ pub async fn start_upload_server(
     // `select!` branch (a closed channel's `recv()` returns `None` immediately
     // and would otherwise busy-spin the loop).
     let mut connect_serve_closed = false;
+    // Same latch pattern for the punch/relay inbound-stream channel below.
+    let mut inbound_stream_closed = false;
 
     loop {
         tokio::select! {
@@ -1851,6 +1959,100 @@ pub async fn start_upload_server(
                     }
                 });
             }
+            // Punch/relay-adopted streams: the network task already completed
+            // a QUIC hole-punch or relay-invite websocket connect on our
+            // behalf. Same admission checks (global/per-IP caps) as a plain
+            // inbound accept; no IP-filter/ban check here because these
+            // streams didn't come through the plain TCP listener (the peer's
+            // IP was already vetted at rendezvous-registration time and, for
+            // hole-punches, `peer_addr` may be a placeholder unspecified
+            // address for relay sessions where the true peer IP is hidden
+            // behind the relay).
+            maybe_stream = inbound_stream_rx.recv(), if !inbound_stream_closed => {
+                let req = match maybe_stream {
+                    Some(r) => r,
+                    None => {
+                        inbound_stream_closed = true;
+                        continue;
+                    }
+                };
+                let peer_addr = req.peer_addr;
+                let peer_ip = peer_addr.ip();
+
+                let reserved = {
+                    let mut cur = server
+                        .total_connections
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    loop {
+                        if cur >= MAX_TOTAL_CONNECTIONS {
+                            break false;
+                        }
+                        match server.total_connections.compare_exchange_weak(
+                            cur,
+                            cur + 1,
+                            std::sync::atomic::Ordering::Relaxed,
+                            std::sync::atomic::Ordering::Relaxed,
+                        ) {
+                            Ok(_) => break true,
+                            Err(actual) => cur = actual,
+                        }
+                    }
+                };
+                if !reserved {
+                    debug!(
+                        "Dropping punch/relay-adopted stream from {peer_addr}: global connection limit reached"
+                    );
+                    continue;
+                }
+                {
+                    let mut counts = server.ip_connection_counts.lock().await;
+                    let count = counts.entry(peer_ip).or_insert(0);
+                    if *count >= MAX_CONNECTIONS_PER_IP {
+                        debug!(
+                            "Dropping punch/relay-adopted stream from {peer_addr}: per-IP limit reached"
+                        );
+                        drop(counts);
+                        server
+                            .total_connections
+                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    }
+                    *count += 1;
+                }
+
+                let server = server.clone();
+                tokio::spawn(async move {
+                    let result = std::panic::AssertUnwindSafe(
+                        server.handle_inbound_stream(peer_addr, req.reader, req.writer),
+                    )
+                    .catch_unwind()
+                    .await;
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            let msg = e.to_string();
+                            if msg.contains("end of file") || msg.contains("Connection reset")
+                                || msg.contains("connection reset") || msg.contains("broken pipe")
+                            {
+                                debug!("Punch/relay-adopted stream from {peer_addr}: {msg}");
+                            } else {
+                                warn!("Punch/relay-adopted stream from {peer_addr} ended: {e}");
+                            }
+                        }
+                        Err(_panic) => {
+                            error!("Punch/relay-adopted stream handler panicked for {peer_addr}");
+                        }
+                    }
+                    server.total_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    let mut counts = server.ip_connection_counts.lock().await;
+                    if let Some(count) = counts.get_mut(&peer_ip) {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            counts.remove(&peer_ip);
+                        }
+                    }
+                });
+            }
         }
     }
 }
@@ -1862,61 +2064,76 @@ impl UploadHandler {
             let index = self.local_index.read().await;
             index.get_by_hash(&hash_hex).cloned()
         } {
-            let path = PathBuf::from(&file.path);
-            let is_partial = path.extension().map(|e| e == "part").unwrap_or(false);
-            // Always enforce containment, including for `.part` entries: the
-            // served file must canonicalize to a location inside a shared
-            // folder or a download root. Previously this check was skipped
-            // when `shared_folders` was empty, which meant a stale index entry
-            // could still be served after the user cleared all shares; it was
-            // also skipped entirely for `.part` index entries, so a stale or
-            // tampered index row pointing at an out-of-root partial could be
-            // served. The indexer never indexes `*.part`, so a legitimate
-            // partial inside a shared/download root still passes this check —
-            // enforcing it for partials is pure hardening with no impact on
-            // serving real in-root partials. Download partials served from the
-            // transfer manager use the `Temp/{id}.part` path below.
-            // Build the allowed-roots snapshot under the lock, then drop the
-            // read guard *before* the blocking canonicalize below so the
-            // `shared_folders` lock is never held across an `.await`.
-            let allowed: Vec<String> = {
-                let folders = self.shared_folders.read().await;
-                let mut allowed: Vec<String> = folders.clone();
-                allowed.push(self.download_folder.to_string_lossy().to_string());
-                allowed.push(
-                    self.download_folder
-                        .join("Downloads")
-                        .to_string_lossy()
-                        .to_string(),
-                );
-                allowed
-            };
-            // `canonicalize` is a blocking filesystem syscall; run it (and the
-            // pure containment check that consumes its result) on the blocking
-            // pool so it never stalls a Tokio worker. Fail closed (reject) on a
-            // join error.
-            let path_for_check = path.clone();
-            let in_allowed = tokio::task::spawn_blocking(move || {
-                std::fs::canonicalize(&path_for_check)
-                    .map(|canon| crate::security::is_path_within_dirs(&canon, &allowed))
-                    .unwrap_or(false)
-            })
-            .await
-            .unwrap_or(false);
-            if !in_allowed {
-                tracing::debug!(
-                    "Rejecting resolve for file not within shared/download roots: {}",
-                    hash_hex
-                );
-                return None;
+            'shared: {
+                // Respect the user's "shared" toggle: unsharing a completed file
+                // stops it from being offered/published (see
+                // `build_shared_files_answer`'s `filter(|f| f.shared)`), but a
+                // peer that already learned the hash before the toggle (KAD
+                // publish, source exchange, a friend's known-sources cache, …)
+                // could otherwise still pull it straight from the index forever.
+                // Break out (instead of returning) so an in-progress download of
+                // the same hash can still fall through to the transfer-manager
+                // branch below — `shared` only governs completed, indexed files.
+                if !file.shared {
+                    tracing::debug!("Rejecting resolve for unshared file: {}", hash_hex);
+                    break 'shared;
+                }
+                let path = PathBuf::from(&file.path);
+                let is_partial = path.extension().map(|e| e == "part").unwrap_or(false);
+                // Always enforce containment, including for `.part` entries: the
+                // served file must canonicalize to a location inside a shared
+                // folder or a download root. Previously this check was skipped
+                // when `shared_folders` was empty, which meant a stale index entry
+                // could still be served after the user cleared all shares; it was
+                // also skipped entirely for `.part` index entries, so a stale or
+                // tampered index row pointing at an out-of-root partial could be
+                // served. The indexer never indexes `*.part`, so a legitimate
+                // partial inside a shared/download root still passes this check —
+                // enforcing it for partials is pure hardening with no impact on
+                // serving real in-root partials. Download partials served from the
+                // transfer manager use the `Temp/{id}.part` path below.
+                // Build the allowed-roots snapshot under the lock, then drop the
+                // read guard *before* the blocking canonicalize below so the
+                // `shared_folders` lock is never held across an `.await`.
+                let allowed: Vec<String> = {
+                    let folders = self.shared_folders.read().await;
+                    let mut allowed: Vec<String> = folders.clone();
+                    allowed.push(self.download_folder.to_string_lossy().to_string());
+                    allowed.push(
+                        self.download_folder
+                            .join("Downloads")
+                            .to_string_lossy()
+                            .to_string(),
+                    );
+                    allowed
+                };
+                // `canonicalize` is a blocking filesystem syscall; run it (and the
+                // pure containment check that consumes its result) on the blocking
+                // pool so it never stalls a Tokio worker. Fail closed (reject) on a
+                // join error.
+                let path_for_check = path.clone();
+                let in_allowed = tokio::task::spawn_blocking(move || {
+                    std::fs::canonicalize(&path_for_check)
+                        .map(|canon| crate::security::is_path_within_dirs(&canon, &allowed))
+                        .unwrap_or(false)
+                })
+                .await
+                .unwrap_or(false);
+                if !in_allowed {
+                    tracing::debug!(
+                        "Rejecting resolve for file not within shared/download roots: {}",
+                        hash_hex
+                    );
+                    return None;
+                }
+                return Some(ResolvedUploadFile {
+                    name: file.name,
+                    path,
+                    size: file.size,
+                    aich_hash_hex: file.aich_hash,
+                    is_partial,
+                });
             }
-            return Some(ResolvedUploadFile {
-                name: file.name,
-                path,
-                size: file.size,
-                aich_hash_hex: file.aich_hash,
-                is_partial,
-            });
         }
 
         let transfer = {
@@ -1950,6 +2167,39 @@ impl UploadHandler {
             aich_hash_hex: String::new(),
             is_partial: true,
         })
+    }
+
+    /// Build the `OP_ASKSHAREDFILESANSWER` payload: `<count 4>(<HASH
+    /// 16><ID 4><PORT 2><1 Tag_set>)[count]` — the same per-file shape
+    /// eMule's `SharedFileList.cpp` uses for `OP_OFFERFILES` (see
+    /// `server::offer_files_chunk`), reusing the shared `write_ed2k_tag`
+    /// encoder rather than a third copy of the tag-writing logic.
+    ///
+    /// Only files the user actively shares (`FileInfo::shared`) are
+    /// included — this mirrors what the Settings/Library UI calls "shared",
+    /// not in-progress downloads. `client_id`/`self.tcp_port` are our real
+    /// identity (not the server's magic compression IDs): this answer goes
+    /// straight to the peer that already has our real address, so there's
+    /// nothing to obscure.
+    async fn build_shared_files_answer(&self, client_id: u32) -> Vec<u8> {
+        // Real libraries rarely exceed a few hundred thousand files; this
+        // bounds the worst case (huge or pathological index) so a single
+        // browse request can't force us to build and hold an unbounded
+        // buffer in memory before it's flushed to a peer's socket.
+        const MAX_BROWSE_ANSWER_FILES: usize = 50_000;
+
+        let files: Vec<(String, String, u64, String)> = {
+            let index = self.local_index.read().await;
+            index
+                .all_files()
+                .iter()
+                .filter(|f| f.shared)
+                .take(MAX_BROWSE_ANSWER_FILES)
+                .map(|f| (f.hash.clone(), f.name.clone(), f.size, f.extension.clone()))
+                .collect()
+        };
+
+        encode_shared_files_answer(&files, client_id, self.tcp_port)
     }
 
     /// Periodic eMule-style queue maintenance: evict waiting peers whose
@@ -2256,6 +2506,23 @@ impl UploadHandler {
         self.run_session(peer_addr, ConnInit::Inbound(stream)).await
     }
 
+    /// Serve an already-established, transport-encrypted stream handed to us
+    /// by the network task — a punch-responder QUIC dial-out or a friend/
+    /// download-broker relay-invite websocket that succeeded. Neither case
+    /// has a `TcpStream` to hand to `ConnInit::Inbound` (QUIC and the relay
+    /// websocket are already end-to-end encrypted at the transport layer,
+    /// so there's also no eMule obfuscation negotiation to perform), so this
+    /// skips straight to the Hello/EmuleInfo exchange inside `run_session`.
+    async fn handle_inbound_stream(
+        &self,
+        peer_addr: SocketAddr,
+        reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+        writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+    ) -> anyhow::Result<()> {
+        self.run_session(peer_addr, ConnInit::InboundStream { reader, writer })
+            .await
+    }
+
     /// Dial `peer_addr` and serve it as an upload peer — the LowID callback
     /// upload path. This mirrors eMule's `OP_CALLBACKREQUESTED` → `TryToConnect`
     /// → unified-client-serve behaviour: a firewalled node that a peer can only
@@ -2449,6 +2716,18 @@ impl UploadHandler {
         // stream diversions, the abuse-request counter, and the inbound EmuleInfo
         // read (we complete EmuleInfo during the outbound handshake instead).
         let outbound = matches!(init, ConnInit::OutboundServe(_));
+        // A punch/relay-adopted stream is inbound-like for banning/counting
+        // purposes, but MUST skip the buddy/KAD-callback/server-callback/Path-B
+        // diversions below: those match on `(peer_addr.ip(), peer_user_hash,
+        // hello_port)` against pending *download*-side bookkeeping, and this
+        // peer's identity can coincidentally collide with an unrelated pending
+        // entry (e.g. we're also trying to download something else from them).
+        // `StreamReader`/`StreamWriter::Boxed` have no TCP-typed counterpart,
+        // so those diversions' exhaustive matches would otherwise silently
+        // drop the connection via their `_ => return Ok(())` fallback instead
+        // of continuing into the upload serve loop.
+        let inbound_stream = matches!(init, ConnInit::InboundStream { .. });
+        let skip_diversions = outbound || inbound_stream;
 
         // Check if already banned (fast path), but don't count yet --
         // buddy/KAD callback connections are legitimate and shouldn't
@@ -2482,6 +2761,82 @@ impl UploadHandler {
                 } = *state;
                 outbound_first_packet = first_packet;
                 (reader, writer, hello_data, peer_user_hash, hello_caps)
+            }
+            ConnInit::InboundStream {
+                reader: boxed_reader,
+                writer: boxed_writer,
+            } => {
+                let mut rd = StreamReader::Boxed(boxed_reader);
+                let mut wr = StreamWriter::Boxed(boxed_writer);
+
+                let (proto, opcode, hd) = match tokio::time::timeout(
+                    std::time::Duration::from_secs(CLIENT_TIMEOUT_SECS),
+                    read_packet_async_inner(&mut rd),
+                )
+                .await
+                {
+                    Ok(Ok(pkt)) => pkt,
+                    Ok(Err(e)) if is_connection_closed(&e) => {
+                        info!("Punch/relay-adopted connection from {peer_addr} closed immediately");
+                        return Ok(());
+                    }
+                    Ok(Err(e)) => {
+                        info!("Punch/relay-adopted connection read failed from {peer_addr}: {e}");
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        info!("Timeout waiting for Hello on punch/relay-adopted connection from {peer_addr}");
+                        return Ok(());
+                    }
+                };
+
+                if proto != OP_EDONKEYHEADER || opcode != OP_HELLO {
+                    info!(
+                        "Non-Hello packet on punch/relay-adopted connection from {peer_addr}: proto=0x{proto:02X} op=0x{opcode:02X}"
+                    );
+                    return Ok(());
+                }
+
+                let mut puh = [0u8; 16];
+                if hd.len() >= 17 {
+                    puh.copy_from_slice(&hd[1..17]);
+                }
+                debug!("Got Hello from punch/relay-adopted peer {peer_addr}");
+
+                let buddy = self.shared_buddy_info.read().await.clone();
+                let hello_options = self.hello_options().await;
+                let our_client_id = self
+                    .external_ip_shared
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let hello_payload = build_hello_answer_with_buddy_opts(
+                    &self.user_hash,
+                    our_client_id,
+                    self.tcp_port,
+                    &self.nickname,
+                    buddy,
+                    &hello_options,
+                );
+                write_packet_async(&mut wr, OP_EDONKEYHEADER, OP_HELLOANSWER, &hello_payload)
+                    .await?;
+
+                // Same rationale as the plain-TCP inbound branch below: send our
+                // EmuleInfoAnswer unconditionally so the peer's client completes
+                // a full eMule handshake (many mods/clients otherwise treat a
+                // Hello-only reply as half-baked and silently FIN on the first
+                // file request).
+                let emule_payload = build_emule_info(
+                    self.udp_port,
+                    self.obfuscation_enabled
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    Some(&self.ember_hash),
+                    None,
+                );
+                write_packet_async(&mut wr, OP_EMULEPROT, OP_EMULEINFOANSWER, &emule_payload)
+                    .await?;
+
+                let (_, hello_caps) = parse_hello_packet(&hd)
+                    .unwrap_or_else(|_| ([0u8; 16], PeerCapabilities::default()));
+                (rd, wr, hd, puh, hello_caps)
             }
             ConnInit::Inbound(stream) => {
                 let (reader, writer) = stream.into_split();
@@ -2839,7 +3194,7 @@ impl UploadHandler {
         // `buddy_conn_tx` channel: if the channel is at capacity, `.send().await`
         // parks until a receiver drains it, and anything in the network loop
         // that wanted to `lock().await` this mutex would deadlock.
-        let buddy_callback = if outbound {
+        let buddy_callback = if skip_diversions {
             None
         } else {
             let mut pending = self.pending_buddy_hashes.lock().await;
@@ -2871,7 +3226,7 @@ impl UploadHandler {
         // sources. None of these apply to an outbound dial we initiated, so a
         // `None` here (whenever `outbound`) cleanly skips all three blocks below
         // without re-indenting them.
-        let diversion_ip: Option<std::net::Ipv4Addr> = if outbound {
+        let diversion_ip: Option<std::net::Ipv4Addr> = if skip_diversions {
             None
         } else {
             match peer_addr.ip() {
@@ -6085,6 +6440,43 @@ impl UploadHandler {
                     total_size = 0;
                 }
 
+                // Vanilla eDonkey/eMule "View Files" — works with any
+                // ed2k-compatible client (eMule, aMule, MLDonkey, ...), not
+                // just other instances of this app. Gated on a plain
+                // Settings toggle rather than friendship/auth, matching
+                // real eMule's "Show shared files to everybody" behavior.
+                // When disabled we still answer — with an explicit denial
+                // — rather than silently dropping the request, so the
+                // asker's client shows "access denied" instead of hanging.
+                (OP_EDONKEYHEADER, OP_ASKSHAREDFILES) => {
+                    if self
+                        .share_browsing_enabled
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        let client_id = self
+                            .external_ip_shared
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        let resp = self.build_shared_files_answer(client_id).await;
+                        write_packet_async(
+                            &mut writer,
+                            OP_EDONKEYHEADER,
+                            OP_ASKSHAREDFILESANSWER,
+                            &resp,
+                        )
+                        .await?;
+                        debug!("Answered OP_ASKSHAREDFILES from {peer_addr}");
+                    } else {
+                        write_packet_async(
+                            &mut writer,
+                            OP_EDONKEYHEADER,
+                            OP_ASKSHAREDDENIEDANS,
+                            &[],
+                        )
+                        .await?;
+                        debug!("Denied OP_ASKSHAREDFILES from {peer_addr} (browsing disabled)");
+                    }
+                }
+
                 (OP_EDONKEYHEADER, OP_HASHSETREQ) if payload.len() >= 16 => {
                     let mut req_hash = [0u8; 16];
                     req_hash.copy_from_slice(&payload[..16]);
@@ -7823,5 +8215,165 @@ mod scoring_tests {
             observed_ratio > expected_ratio * 0.85,
             "reliability differential should produce ≳{expected_ratio:.2}× score gap, got {observed_ratio:.3}×",
         );
+    }
+}
+
+#[cfg(test)]
+mod browse_answer_tests {
+    //! Wire-format tests for `OP_ASKSHAREDFILESANSWER` (native eMule/ed2k
+    //! "View Files" browse). These lock down the exact byte layout so a
+    //! future refactor can't silently break interop with real eMule/aMule
+    //! clients without a failing test.
+    use super::*;
+
+    /// One small file must produce exactly: count=1, then
+    /// `<hash 16><id 4><port 2>`, then `tag_count=2` covering FT_FILENAME
+    /// (string) and FT_FILESIZE (uint32) — no FT_FILESIZE_HI since the file
+    /// is well under the large-file boundary, and no FT_FILETYPE since the
+    /// extension is unrecognized.
+    #[test]
+    fn encodes_single_small_file_with_expected_tags() {
+        let hash_hex = "00112233445566778899aabbccddeeff".to_string(); // 16 bytes
+        let files = vec![(
+            hash_hex.clone(),
+            "movie.unknownext".to_string(),
+            12345u64,
+            "unknownext".to_string(),
+        )];
+
+        let payload =
+            encode_shared_files_answer(&files, 0x0100A8C0 /* 192.168.0.1 LE */, 4662);
+
+        let mut pos = 0usize;
+        let count = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        assert_eq!(count, 1, "one shared file should yield count=1");
+
+        let hash_bytes = hex::decode(&hash_hex).unwrap();
+        assert_eq!(
+            &payload[pos..pos + 16],
+            &hash_bytes[..16],
+            "hash must round-trip byte-for-byte"
+        );
+        pos += 16;
+
+        let id = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap());
+        assert_eq!(
+            id, 0x0100A8C0,
+            "client id must be our real id, not a magic compression id"
+        );
+        pos += 4;
+
+        let port = u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap());
+        assert_eq!(port, 4662);
+        pos += 2;
+
+        let tag_count = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap());
+        assert_eq!(tag_count, 2, "expected FT_FILENAME + FT_FILESIZE only");
+        pos += 4;
+
+        // FT_FILENAME: type=0x02 (string), name_len=1, name_id=0x01, then u16 len + bytes.
+        assert_eq!(payload[pos], 0x02);
+        pos += 1;
+        assert_eq!(
+            u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap()),
+            1
+        );
+        pos += 2;
+        assert_eq!(payload[pos], 0x01);
+        pos += 1;
+        let name_len = u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap()) as usize;
+        pos += 2;
+        assert_eq!(&payload[pos..pos + name_len], b"movie.unknownext");
+        pos += name_len;
+
+        // FT_FILESIZE: type=0x03 (uint32), name_len=1, name_id=0x02, u32 value.
+        assert_eq!(payload[pos], 0x03);
+        pos += 1;
+        assert_eq!(
+            u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap()),
+            1
+        );
+        pos += 2;
+        assert_eq!(payload[pos], 0x02);
+        pos += 1;
+        let size = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap());
+        assert_eq!(size, 12345);
+        pos += 4;
+
+        assert_eq!(pos, payload.len(), "no trailing/missing bytes");
+    }
+
+    /// Files above `OLD_MAX_EMULE_FILE_SIZE` must carry an extra
+    /// FT_FILESIZE_HI (0x3A) tag with the high 32 bits, matching
+    /// `offer_files_chunk`'s large-file handling exactly.
+    #[test]
+    fn large_file_gets_filesize_hi_tag() {
+        let hash_hex = "11".repeat(16);
+        let big_size = OLD_MAX_EMULE_FILE_SIZE + (5u64 << 32) + 42;
+        let files = vec![(hash_hex, "big.iso".to_string(), big_size, "iso".to_string())];
+
+        let payload = encode_shared_files_answer(&files, 0, 4662);
+
+        // count(4) + hash(16) + id(4) + port(2) + tag_count(4)
+        let tag_count = u32::from_le_bytes(payload[26..30].try_into().unwrap());
+        // FT_FILENAME + FT_FILESIZE + FT_FILESIZE_HI + FT_FILETYPE (iso -> "Iso")
+        assert_eq!(tag_count, 4);
+
+        // FT_FILESIZE_HI tag header: type=0x03 (uint32), name_len=1 (LE u16:
+        // 0x01, 0x00), name_id=0x3A — scan for that exact 4-byte header
+        // followed by the expected high-32-bits value (5).
+        let hi_value = 5u32.to_le_bytes();
+        let hi_tag_present = payload
+            .windows(8)
+            .any(|w| w[0..4] == [0x03, 0x01, 0x00, 0x3A] && w[4..8] == hi_value);
+        assert!(
+            hi_tag_present,
+            "expected an FT_FILESIZE_HI (0x3A) uint32 tag with value 5 for a >4GB file"
+        );
+    }
+
+    /// An unshared / non-decodable hash must be skipped without aborting
+    /// the whole answer — one bad index row shouldn't hide every other
+    /// legitimately shared file from the requester.
+    #[test]
+    fn skips_entries_with_invalid_hash() {
+        let good_hash = "aa".repeat(16);
+        let files = vec![
+            (
+                "not-hex".to_string(),
+                "bad.txt".to_string(),
+                10,
+                "txt".to_string(),
+            ),
+            (
+                good_hash.clone(),
+                "good.txt".to_string(),
+                10,
+                "txt".to_string(),
+            ),
+        ];
+
+        let payload = encode_shared_files_answer(&files, 0, 4662);
+        let count = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+        assert_eq!(
+            count, 1,
+            "the invalid-hash entry must be skipped, not counted"
+        );
+        assert_eq!(
+            &payload[4..20],
+            &hex::decode(good_hash).unwrap()[..],
+            "surviving entry must be the good one"
+        );
+    }
+
+    /// No shared files -> a well-formed empty answer (count=0), matching
+    /// real eMule's behavior of answering with an empty list rather than
+    /// treating "nothing shared" as a denial.
+    #[test]
+    fn empty_share_list_encodes_zero_count() {
+        let payload = encode_shared_files_answer(&[], 0, 4662);
+        assert_eq!(payload.len(), 4);
+        assert_eq!(u32::from_le_bytes(payload[..4].try_into().unwrap()), 0);
     }
 }

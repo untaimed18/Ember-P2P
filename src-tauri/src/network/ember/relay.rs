@@ -739,10 +739,20 @@ const QUIC_ACCEPT_INFLIGHT_CAP: usize = 64;
 ///   1. **RELAY_REQUEST** — peer wants us to relay a LowID transfer (existing relay logic)
 ///   2. **RELAY_CONNECT** — a relay node is forwarding a client to us (relay target)
 ///   3. **Raw eMule bytes** — hole-punched direct connection
+///
+/// Cases 2 and 3 both mean *we* are the firewalled source being reached by a
+/// downloader (via a relay operator, or directly via a successful hole
+/// punch) — we remain the upload/server role at the eD2K protocol level, so
+/// both hand their stream to the upload listener's `InboundStreamRequest`
+/// path rather than `kad_callback_tx` (which only adopts sources for *our
+/// own* pending downloads and has no consumer for a connection with no
+/// matching active download).
 pub async fn run_quic_accept_loop(
     endpoint: std::sync::Arc<quinn::Endpoint>,
     relay_manager: std::sync::Arc<tokio::sync::Mutex<RelayManager>>,
-    kad_callback_tx: tokio::sync::mpsc::Sender<crate::network::ed2k::upload::KadCallbackParts>,
+    inbound_stream_tx: tokio::sync::mpsc::Sender<
+        crate::network::ed2k::upload::InboundStreamRequest,
+    >,
 ) {
     info!("QUIC accept loop started on {:?}", endpoint.local_addr());
     let accept_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(QUIC_ACCEPT_INFLIGHT_CAP));
@@ -774,7 +784,7 @@ pub async fn run_quic_accept_loop(
 
         let mgr = relay_manager.clone();
         let ep = endpoint.clone();
-        let cb_tx = kad_callback_tx.clone();
+        let cb_tx = inbound_stream_tx.clone();
         tokio::spawn(async move {
             // Hold the permit for the lifetime of the accept task so
             // long-running relay sessions count against the cap; they
@@ -1019,62 +1029,34 @@ pub async fn run_quic_accept_loop(
                     return;
                 }
 
-                let peer_ip = match remote.ip() {
-                    std::net::IpAddr::V4(v4) => v4,
-                    _ => {
-                        debug!("QUIC accept: non-IPv4 RELAY_CONNECT from {remote}");
-                        return;
-                    }
-                };
-
                 info!(
                     "QUIC accept: relay-target connection from {remote}, file {}",
                     hex::encode(file_hash)
                 );
 
-                let parts = crate::network::ed2k::upload::KadCallbackParts {
-                    peer_ip,
-                    peer_port: remote.port(),
-                    peer_hello_port: 0,
-                    peer_user_hash: [0u8; 16],
-                    file_hash,
+                let req = crate::network::ed2k::upload::InboundStreamRequest {
+                    peer_addr: remote,
                     reader: Box::new(init_recv),
                     writer: Box::new(init_send),
-                    emule_info_done: false,
-                    peer_caps: Default::default(),
                 };
-                if let Err(e) = cb_tx.try_send(parts) {
-                    debug!("QUIC accept: dropping relay-target callback from {remote}: {e}");
+                if let Err(e) = cb_tx.try_send(req) {
+                    debug!("QUIC accept: dropping relay-target stream from {remote}: {e}");
                 }
             } else {
                 // === Hole-punch or other direct connection ===
-                let peer_ip = match remote.ip() {
-                    std::net::IpAddr::V4(v4) => v4,
-                    _ => {
-                        debug!("QUIC accept: non-IPv4 direct connection from {remote}");
-                        return;
-                    }
-                };
-
                 info!(
                     "QUIC accept: direct connection from {remote} (first byte 0x{:02X})",
                     header[0]
                 );
 
                 let chained = std::io::Cursor::new(header.to_vec()).chain(init_recv);
-                let parts = crate::network::ed2k::upload::KadCallbackParts {
-                    peer_ip,
-                    peer_port: remote.port(),
-                    peer_hello_port: 0,
-                    peer_user_hash: [0u8; 16],
-                    file_hash: [0u8; 16],
+                let req = crate::network::ed2k::upload::InboundStreamRequest {
+                    peer_addr: remote,
                     reader: Box::new(chained),
                     writer: Box::new(init_send),
-                    emule_info_done: false,
-                    peer_caps: Default::default(),
                 };
-                if let Err(e) = cb_tx.try_send(parts) {
-                    debug!("QUIC accept: dropping direct callback from {remote}: {e}");
+                if let Err(e) = cb_tx.try_send(req) {
+                    debug!("QUIC accept: dropping direct stream from {remote}: {e}");
                 }
             }
         });

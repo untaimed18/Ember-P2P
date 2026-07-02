@@ -699,7 +699,10 @@ pub async fn cancel_transfers_batch(
             tracing::warn!(
                 "cancel_transfers_batch: network task unavailable for {transfer_id}; deleting partial without teardown ack ({e})"
             );
-        } else if tokio::time::timeout(CMD_REPLY_TIMEOUT, ack_rx).await.is_err() {
+        } else if tokio::time::timeout(CMD_REPLY_TIMEOUT, ack_rx)
+            .await
+            .is_err()
+        {
             // Teardown didn't ack within the window; the worker may still hold
             // the .part handle. We proceed (bounded wait; eMule always deletes),
             // but surface it so a delete/replace error on Windows is explainable

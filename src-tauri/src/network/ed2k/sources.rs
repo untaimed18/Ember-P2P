@@ -323,8 +323,13 @@ impl PerFileSourceList {
     }
 
     /// Mark a source as having started a connection attempt.
-    pub fn set_connecting(&mut self, ip: Ipv4Addr, port: u16) {
-        if let Some(s) = self.find_mut(ip, port) {
+    ///
+    /// `user_hash`, here and on every mutator below that takes it, is only
+    /// consulted when `ip` is unspecified (see [`Self::resolve_idx`]) —
+    /// callers that always have a real IP (the overwhelming majority) can
+    /// pass `None` with no change in behaviour.
+    pub fn set_connecting(&mut self, ip: Ipv4Addr, port: u16, user_hash: Option<[u8; 16]>) {
+        if let Some(s) = self.find_mut(ip, port, user_hash) {
             s.state = DownloadSourceState::Connecting;
             s.last_asked = Instant::now();
             s.state_changed = Instant::now();
@@ -332,8 +337,14 @@ impl PerFileSourceList {
     }
 
     /// Mark a source as queued (received OP_QUEUERANKING).
-    pub fn set_on_queue(&mut self, ip: Ipv4Addr, port: u16, rank: Option<u32>) {
-        if let Some(s) = self.find_mut(ip, port) {
+    pub fn set_on_queue(
+        &mut self,
+        ip: Ipv4Addr,
+        port: u16,
+        rank: Option<u32>,
+        user_hash: Option<[u8; 16]>,
+    ) {
+        if let Some(s) = self.find_mut(ip, port, user_hash) {
             s.state = DownloadSourceState::OnQueue { rank };
             s.state_changed = Instant::now();
             s.fail_count = s.fail_count.saturating_sub(1);
@@ -341,8 +352,8 @@ impl PerFileSourceList {
     }
 
     /// Mark a source as actively transferring.
-    pub fn set_downloading(&mut self, ip: Ipv4Addr, port: u16) {
-        if let Some(s) = self.find_mut(ip, port) {
+    pub fn set_downloading(&mut self, ip: Ipv4Addr, port: u16, user_hash: Option<[u8; 16]>) {
+        if let Some(s) = self.find_mut(ip, port, user_hash) {
             s.state = DownloadSourceState::Downloading;
             s.state_changed = Instant::now();
             s.fail_count = 0;
@@ -351,8 +362,14 @@ impl PerFileSourceList {
 
     /// Record a weighted failure for a source. Queue progress and successful
     /// transfers will decay this score over time.
-    pub fn set_failed_with_penalty(&mut self, ip: Ipv4Addr, port: u16, penalty: u32) {
-        if let Some(s) = self.find_mut(ip, port) {
+    pub fn set_failed_with_penalty(
+        &mut self,
+        ip: Ipv4Addr,
+        port: u16,
+        penalty: u32,
+        user_hash: Option<[u8; 16]>,
+    ) {
+        if let Some(s) = self.find_mut(ip, port, user_hash) {
             s.state = DownloadSourceState::Failed;
             s.state_changed = Instant::now();
             s.fail_count = s.fail_count.saturating_add(penalty.max(1));
@@ -360,8 +377,8 @@ impl PerFileSourceList {
     }
 
     /// Mark a source as having no needed parts.
-    pub fn set_none_needed_parts(&mut self, ip: Ipv4Addr, port: u16) {
-        if let Some(s) = self.find_mut(ip, port) {
+    pub fn set_none_needed_parts(&mut self, ip: Ipv4Addr, port: u16, user_hash: Option<[u8; 16]>) {
+        if let Some(s) = self.find_mut(ip, port, user_hash) {
             s.state = DownloadSourceState::NoneNeededParts;
             s.state_changed = Instant::now();
             s.fail_count = s.fail_count.saturating_sub(1);
@@ -369,16 +386,16 @@ impl PerFileSourceList {
     }
 
     /// Mark a source as waiting for Low-ID callback via server.
-    pub fn set_wait_callback(&mut self, ip: Ipv4Addr, port: u16) {
-        if let Some(s) = self.find_mut(ip, port) {
+    pub fn set_wait_callback(&mut self, ip: Ipv4Addr, port: u16, user_hash: Option<[u8; 16]>) {
+        if let Some(s) = self.find_mut(ip, port, user_hash) {
             s.state = DownloadSourceState::WaitCallback;
             s.state_changed = Instant::now();
         }
     }
 
     /// Mark a source as waiting for Low-ID callback via Kad buddy.
-    pub fn set_wait_callback_kad(&mut self, ip: Ipv4Addr, port: u16) {
-        if let Some(s) = self.find_mut(ip, port) {
+    pub fn set_wait_callback_kad(&mut self, ip: Ipv4Addr, port: u16, user_hash: Option<[u8; 16]>) {
+        if let Some(s) = self.find_mut(ip, port, user_hash) {
             s.state = DownloadSourceState::WaitCallbackKad;
             s.state_changed = Instant::now();
         }
@@ -397,17 +414,7 @@ impl PerFileSourceList {
         source_user_hash: Option<[u8; 16]>,
         is_new: bool,
     ) {
-        let target_idx = if ip.is_unspecified() {
-            source_user_hash.and_then(|uh| {
-                self.sources
-                    .iter()
-                    .position(|s| s.source_user_hash == Some(uh))
-            })
-        } else {
-            self.sources
-                .iter()
-                .position(|s| s.ip == ip && s.tcp_port == port)
-        };
+        let target_idx = self.resolve_idx(ip, port, source_user_hash);
         if let Some(idx) = target_idx {
             let s = &mut self.sources[idx];
             s.callback_buddy_ip = Some(buddy_ip);
@@ -425,46 +432,61 @@ impl PerFileSourceList {
     }
 
     /// Whether a KAD callback `CallbackReq` should be sent now.
-    pub fn callback_reask_due(&self, ip: Ipv4Addr, port: u16) -> bool {
-        self.find(ip, port)
+    pub fn callback_reask_due(&self, ip: Ipv4Addr, port: u16, user_hash: Option<[u8; 16]>) -> bool {
+        self.find(ip, port, user_hash)
             .map(|s| s.kad_callback_reask_due())
             .unwrap_or(false)
     }
 
     /// Bump the reask timer after a successful `CallbackReq` send.
-    pub fn mark_callback_requested(&mut self, ip: Ipv4Addr, port: u16) {
-        if let Some(s) = self.find_mut(ip, port) {
+    pub fn mark_callback_requested(&mut self, ip: Ipv4Addr, port: u16, user_hash: Option<[u8; 16]>) {
+        if let Some(s) = self.find_mut(ip, port, user_hash) {
             s.last_asked = Instant::now();
         }
     }
 
     /// Both sides are Low-ID; direct connection is impossible.
-    pub fn set_low_to_low(&mut self, ip: Ipv4Addr, port: u16) {
-        if let Some(s) = self.find_mut(ip, port) {
+    ///
+    /// Classic ed2k-server (and Source-Exchange) search results carry only
+    /// an opaque LowID `client_id` for firewalled peers — never a real
+    /// IP — so callers that discover such a source while we ourselves are
+    /// also LowID/firewalled (meaning the standard `OP_CALLBACKREQUEST`
+    /// relay can't help either, since it just asks the peer to dial an
+    /// address that is itself unreachable) register it here with
+    /// `ip = Ipv4Addr::UNSPECIFIED` and resolve it back by its ed2k user
+    /// hash via `user_hash` rather than leaving it invisible. Because
+    /// `add_source_with_identity` and `set_kad_callback_buddy` dedupe
+    /// unspecified-IP rows by that same user hash, a later Kad
+    /// firewalled-buddy publish for the same peer transparently upgrades
+    /// this placeholder to `WaitCallbackKad` and lets the existing Ember
+    /// hole-punch/relay broker path take over — rather than the source
+    /// permanently sitting as a dead end.
+    pub fn set_low_to_low(&mut self, ip: Ipv4Addr, port: u16, user_hash: Option<[u8; 16]>) {
+        if let Some(s) = self.find_mut(ip, port, user_hash) {
             s.state = DownloadSourceState::LowToLowIp;
             s.state_changed = Instant::now();
         }
     }
 
     /// Both sides are Low-ID but Ember relay/hole-punch is being attempted.
-    pub fn set_ember_relay(&mut self, ip: Ipv4Addr, port: u16) {
-        if let Some(s) = self.find_mut(ip, port) {
+    pub fn set_ember_relay(&mut self, ip: Ipv4Addr, port: u16, user_hash: Option<[u8; 16]>) {
+        if let Some(s) = self.find_mut(ip, port, user_hash) {
             s.state = DownloadSourceState::EmberRelay;
             s.state_changed = Instant::now();
         }
     }
 
     /// Remote peer has banned us.
-    pub fn set_banned(&mut self, ip: Ipv4Addr, port: u16) {
-        if let Some(s) = self.find_mut(ip, port) {
+    pub fn set_banned(&mut self, ip: Ipv4Addr, port: u16, user_hash: Option<[u8; 16]>) {
+        if let Some(s) = self.find_mut(ip, port, user_hash) {
             s.state = DownloadSourceState::Banned;
             s.state_changed = Instant::now();
         }
     }
 
     /// Too many concurrent connections; retry later.
-    pub fn set_too_many_conns(&mut self, ip: Ipv4Addr, port: u16) {
-        if let Some(s) = self.find_mut(ip, port) {
+    pub fn set_too_many_conns(&mut self, ip: Ipv4Addr, port: u16, user_hash: Option<[u8; 16]>) {
+        if let Some(s) = self.find_mut(ip, port, user_hash) {
             s.state = DownloadSourceState::TooManyConns;
             s.state_changed = Instant::now();
         }
@@ -578,7 +600,10 @@ impl PerFileSourceList {
     /// tick — peers throttle/ban the IP and we self-DoS our own
     /// upstream.
     pub fn mark_udp_reask_sent(&mut self, ip: Ipv4Addr, tcp_port: u16) {
-        if let Some(s) = self.find_mut(ip, tcp_port) {
+        // UDP reask only ever targets rows with a real, dialable IP (see
+        // `sources_needing_udp_reask`), so `ip` is never unspecified here —
+        // no `user_hash` needed to disambiguate.
+        if let Some(s) = self.find_mut(ip, tcp_port, None) {
             s.last_udp_reask = std::time::Instant::now();
         }
     }
@@ -646,16 +671,44 @@ impl PerFileSourceList {
         }
     }
 
-    fn find(&self, ip: Ipv4Addr, port: u16) -> Option<&DownloadSourceEntry> {
-        self.sources
-            .iter()
-            .find(|s| s.ip == ip && s.tcp_port == port)
+    /// Resolve the index of the source a caller means by `(ip, port[,
+    /// user_hash])`. Classic ed2k-server / Source-Exchange results carry no
+    /// real IP for firewalled LowID peers (`ip == UNSPECIFIED`, see
+    /// [`Self::set_low_to_low_by_identity`]'s doc comment), and it is common
+    /// for many *different* such peers to share the same advertised TCP
+    /// port (e.g. the eMule default 4662) — so matching an unspecified-IP
+    /// row by `(ip, port)` alone is ambiguous and can silently mutate the
+    /// wrong peer's row. When `ip` is unspecified, resolve by publisher user
+    /// hash instead (the only stable identity these rows have) and nothing
+    /// else — a `None`/unmatched hash intentionally resolves to no row
+    /// rather than falling back to the ambiguous `(ip, port)` match.
+    /// Otherwise (a real IP) match by `(ip, port)` as usual.
+    fn resolve_idx(&self, ip: Ipv4Addr, port: u16, user_hash: Option<[u8; 16]>) -> Option<usize> {
+        if ip.is_unspecified() {
+            user_hash.and_then(|uh| {
+                self.sources
+                    .iter()
+                    .position(|s| s.source_user_hash == Some(uh))
+            })
+        } else {
+            self.sources
+                .iter()
+                .position(|s| s.ip == ip && s.tcp_port == port)
+        }
     }
 
-    fn find_mut(&mut self, ip: Ipv4Addr, port: u16) -> Option<&mut DownloadSourceEntry> {
-        self.sources
-            .iter_mut()
-            .find(|s| s.ip == ip && s.tcp_port == port)
+    fn find(&self, ip: Ipv4Addr, port: u16, user_hash: Option<[u8; 16]>) -> Option<&DownloadSourceEntry> {
+        self.resolve_idx(ip, port, user_hash).map(|i| &self.sources[i])
+    }
+
+    fn find_mut(
+        &mut self,
+        ip: Ipv4Addr,
+        port: u16,
+        user_hash: Option<[u8; 16]>,
+    ) -> Option<&mut DownloadSourceEntry> {
+        self.resolve_idx(ip, port, user_hash)
+            .map(move |i| &mut self.sources[i])
     }
 }
 
@@ -1654,13 +1707,13 @@ mod tests {
         let mut pfs = PerFileSourceList::new(hash);
         assert!(pfs.add_source_full(ip, 4662, 4672));
 
-        pfs.set_failed_with_penalty(ip, 4662, 4);
+        pfs.set_failed_with_penalty(ip, 4662, 4, None);
         assert_eq!(pfs.sources[0].fail_count, 4);
 
-        pfs.set_on_queue(ip, 4662, Some(10));
+        pfs.set_on_queue(ip, 4662, Some(10), None);
         assert_eq!(pfs.sources[0].fail_count, 3);
 
-        pfs.set_none_needed_parts(ip, 4662);
+        pfs.set_none_needed_parts(ip, 4662, None);
         assert_eq!(pfs.sources[0].fail_count, 2);
     }
 
@@ -1673,8 +1726,8 @@ mod tests {
         assert!(pfs.add_source_full(a, 4662, 4672));
         assert!(pfs.add_source_full(b, 4663, 4673));
 
-        pfs.set_on_queue(a, 4662, Some(50));
-        pfs.set_on_queue(b, 4663, Some(5));
+        pfs.set_on_queue(a, 4662, Some(50), None);
+        pfs.set_on_queue(b, 4663, Some(5), None);
         let now = Instant::now() + Duration::from_secs(2000);
 
         let ready = pfs.sources_ready_for_reask_at(now);
@@ -1690,8 +1743,8 @@ mod tests {
         assert!(pfs.add_source_full(keep_ip, 4662, 0));
         assert!(pfs.add_source_full(drop_ip, 4663, 0));
 
-        pfs.set_failed_with_penalty(keep_ip, 4662, 3);
-        pfs.set_failed_with_penalty(drop_ip, 4663, 9);
+        pfs.set_failed_with_penalty(keep_ip, 4662, 3, None);
+        pfs.set_failed_with_penalty(drop_ip, 4663, 9, None);
         pfs.purge_dead_sources();
 
         assert_eq!(pfs.sources.len(), 1);
@@ -1741,9 +1794,62 @@ mod tests {
         let mut pfs = PerFileSourceList::new(hash);
         assert!(pfs.add_source_full(ip, 4662, 0));
         pfs.set_kad_callback_buddy(ip, 4662, buddy, 4672, [0xAA; 16], Some([0xBB; 16]), true);
-        assert!(pfs.callback_reask_due(ip, 4662));
-        pfs.mark_callback_requested(ip, 4662);
-        assert!(!pfs.callback_reask_due(ip, 4662));
+        assert!(pfs.callback_reask_due(ip, 4662, None));
+        pfs.mark_callback_requested(ip, 4662, None);
+        assert!(!pfs.callback_reask_due(ip, 4662, None));
+    }
+
+    #[test]
+    fn set_low_to_low_targets_correct_unspecified_ip_row_by_identity() {
+        // Two different classic-ed2k-server LowID peers for the same file,
+        // both stored with `ip = UNSPECIFIED` (no real address known) and
+        // disambiguated only by user hash. Marking one low-to-low must not
+        // affect the other, even though `find_mut(ip, port)` alone can't
+        // tell them apart.
+        let hash = [0x55; 16];
+        let uh_a = [0xAA; 16];
+        let uh_b = [0xBB; 16];
+        let mut pfs = PerFileSourceList::new(hash);
+        assert!(pfs.add_source_with_identity(Ipv4Addr::UNSPECIFIED, 0, 0, Some(uh_a)));
+        assert!(pfs.add_source_with_identity(Ipv4Addr::UNSPECIFIED, 0, 0, Some(uh_b)));
+        assert_eq!(pfs.sources.len(), 2);
+
+        pfs.set_low_to_low(Ipv4Addr::UNSPECIFIED, 0, Some(uh_a));
+
+        let row_a = pfs
+            .sources
+            .iter()
+            .find(|s| s.source_user_hash == Some(uh_a))
+            .unwrap();
+        assert!(matches!(row_a.state, DownloadSourceState::LowToLowIp));
+
+        let row_b = pfs
+            .sources
+            .iter()
+            .find(|s| s.source_user_hash == Some(uh_b))
+            .unwrap();
+        assert!(!matches!(row_b.state, DownloadSourceState::LowToLowIp));
+
+        // Re-adding the same peer later (e.g. a KAD firewalled-buddy
+        // publish for the same user hash) must merge into this same row
+        // rather than creating a duplicate — this is what lets the
+        // existing `set_kad_callback_buddy` merge path upgrade a
+        // placeholder low-to-low entry to `WaitCallbackKad` for free.
+        assert!(!pfs.add_source_with_identity(Ipv4Addr::UNSPECIFIED, 0, 0, Some(uh_a)));
+        assert_eq!(pfs.sources.len(), 2);
+    }
+
+    #[test]
+    fn set_low_to_low_targets_real_ip_when_specified() {
+        let hash = [0x56; 16];
+        let ip = Ipv4Addr::new(7, 7, 7, 7);
+        let mut pfs = PerFileSourceList::new(hash);
+        assert!(pfs.add_source_full(ip, 4662, 0));
+        pfs.set_low_to_low(ip, 4662, None);
+        assert!(matches!(
+            pfs.sources[0].state,
+            DownloadSourceState::LowToLowIp
+        ));
     }
 
     #[test]

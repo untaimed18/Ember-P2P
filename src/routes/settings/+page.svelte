@@ -1420,6 +1420,14 @@
             <ToggleSwitch bind:checked={settings.block_private_ips} ariaLabel={m.settings_block_private_label()} />
           </div>
 
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">{m.settings_allow_shared_browse_label()}</span>
+              <span class="hint">{m.settings_allow_shared_browse_hint()}</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.allow_shared_files_browse} ariaLabel={m.settings_allow_shared_browse_label()} />
+          </div>
+
           <div class="divider"></div>
 
           <div class="field toggle-row">
