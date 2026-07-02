@@ -1391,13 +1391,10 @@ fn spawn_rendezvous_friend_lookup(
     // doesn't forward the advertised port, which used to be a hard dead
     // end for this — the single choke point every offline-friend lookup
     // (initial burst, auto-retry, disconnect-reconnect, manual
-    // find/retry commands) funnels through.
-    let nat_type_fc = state.nat_info.nat_type;
-    let ext_addr_fc = state.nat_info.external_addr;
-    let quic_ep_fc = state
-        .connection_broker
-        .as_ref()
-        .and_then(|b| b.quic_endpoint().cloned());
+    // find/retry commands) funnels through. Cloning the Arc (not its
+    // contents) here is cheap and lets `connect_friend_with_fallback`
+    // re-read the live values later instead of this snapshot going stale.
+    let nat_ctx_fc = state.friend_nat_context.clone();
 
     tokio::spawn(async move {
         match rendezvous::lookup(&rv_url, &target_hash).await {
@@ -1485,9 +1482,7 @@ fn spawn_rendezvous_friend_lookup(
                         Some(ed25519_pubkey),
                         Some(ed25519_secret_key),
                         rv_url.clone(),
-                        nat_type_fc,
-                        ext_addr_fc,
-                        quic_ep_fc,
+                        nat_ctx_fc,
                     )
                     .await
                     {
@@ -1603,6 +1598,27 @@ fn spawn_rendezvous_friend_lookup(
     });
 }
 
+/// Backoff interval (seconds) before the periodic bootstrap timer is allowed
+/// to re-blast `bootstrap::default_bootstrap_contacts()` — the handful of
+/// long-running public eMule KAD seed IPs — again. `shift` is how many times
+/// we've already sent the blast since the last successful `Connected`
+/// transition (or process start).
+///
+/// eMule's own `CKademlia::Process()` pops one bootstrap contact at a time no
+/// more than every 15s (2s only while the routing table is completely empty)
+/// and stops entirely once its bootstrap list is exhausted — it never
+/// re-hits the same well-known IPs forever. We don't have that "give up"
+/// behavior (this is the only fallback for a client with no nodes.dat and no
+/// live contacts), so instead we grow the interval each time we send:
+/// 10s, 20s, 40s, ..., capped at 10 minutes once `shift` reaches 6. Without
+/// this, a client that's permanently offline or UDP-firewalled would hammer
+/// the same 5 public IPs every 10s indefinitely for as long as the app runs.
+fn hardcoded_bootstrap_backoff_interval(shift: u32) -> i64 {
+    const BASE_SECS: i64 = 10;
+    const MAX_SECS: i64 = 10 * 60;
+    BASE_SECS.saturating_mul(1i64 << shift.min(6)).min(MAX_SECS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1619,6 +1635,26 @@ mod tests {
             peer_user_hash: None,
             peer_connect_options: None,
         }
+    }
+
+    /// Regression guard for the KAD bootstrap-hammering fix: the interval
+    /// must start at the same 10s cadence as before (no behavior change for
+    /// a healthy, quickly-connecting client), strictly grow with `shift`,
+    /// and cap at 10 minutes instead of growing unbounded.
+    #[test]
+    fn hardcoded_bootstrap_backoff_interval_grows_then_caps() {
+        assert_eq!(hardcoded_bootstrap_backoff_interval(0), 10);
+        assert_eq!(hardcoded_bootstrap_backoff_interval(1), 20);
+        assert_eq!(hardcoded_bootstrap_backoff_interval(2), 40);
+        assert_eq!(hardcoded_bootstrap_backoff_interval(3), 80);
+        assert_eq!(hardcoded_bootstrap_backoff_interval(4), 160);
+        assert_eq!(hardcoded_bootstrap_backoff_interval(5), 320);
+        assert_eq!(hardcoded_bootstrap_backoff_interval(6), 600);
+        // Must stay capped at 10 minutes for any larger shift, including
+        // values well past what `1i64 << shift` could otherwise overflow to.
+        assert_eq!(hardcoded_bootstrap_backoff_interval(7), 600);
+        assert_eq!(hardcoded_bootstrap_backoff_interval(100), 600);
+        assert_eq!(hardcoded_bootstrap_backoff_interval(u32::MAX), 600);
     }
 
     #[test]
@@ -3082,6 +3118,14 @@ struct NetworkState {
     tracker_registry: SharedTrackerRegistry,
     /// Cached NAT type info for LowID-to-LowID hole-punch decisions
     nat_info: ember::nat::NatInfo,
+    /// Live-updated mirror of `nat_info` (plus the QUIC endpoint once
+    /// available) shared with spawned friend-dial tasks via
+    /// `connect_friend_with_fallback`, so a fresh read right before the
+    /// hole-punch attempt sees the current values instead of whatever was
+    /// true when the task was spawned — see `FriendNatContext`'s doc
+    /// comment. Kept in sync wherever `nat_info` or `connection_broker` is
+    /// updated.
+    friend_nat_context: ember::nat::SharedFriendNatContext,
     /// Connection broker for LowID-to-LowID transfers via hole-punch/relay
     connection_broker: Option<ember::broker::ConnectionBroker>,
     /// Broker event receiver (fed by ConnectionBroker, consumed in main select loop)
@@ -4948,6 +4992,7 @@ pub async fn start_network(
         friend_reconnect_last: HashMap::new(),
         tracker_registry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         nat_info: ember::nat::NatInfo::unknown(),
+        friend_nat_context: ember::nat::new_shared_friend_nat_context(),
         connection_broker: None,
         broker_event_rx: None,
         relay_manager: Arc::new(tokio::sync::Mutex::new(ember::relay::RelayManager::new())),
@@ -5447,6 +5492,20 @@ pub async fn start_network(
     let mut bootstrap_timer = tokio::time::interval(std::time::Duration::from_secs(10));
     bootstrap_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut bootstrap_attempts: u32 = 0;
+    // Backoff state for the hardcoded-seed-node blast below. eMule's own
+    // CKademlia::Process() pops one bootstrap contact at a time no more than
+    // every 15s (2s only while the routing table is truly empty) and stops
+    // entirely once its bootstrap list is exhausted — it never re-hits the
+    // same handful of well-known IPs forever. We don't have that "give up"
+    // behavior (this is our only fallback for a client with no nodes.dat and
+    // no live contacts), but without *some* backoff a client that's
+    // permanently offline or firewalled from UDP would otherwise hammer the
+    // same 5 public seed IPs every 10s indefinitely for as long as the app
+    // runs. Track the last send time and a shift that grows the interval
+    // (10s, 20s, 40s, ... capped at 10 minutes) each time we actually send,
+    // reset once we successfully reach `NetworkStatus::Connected`.
+    let mut last_hardcoded_bootstrap_ts: i64 = 0;
+    let mut hardcoded_bootstrap_backoff_shift: u32 = 0;
     let mut publish_timer = tokio::time::interval(std::time::Duration::from_secs(60));
     publish_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // eMule's Kad publish driver wakes every KADEMLIAPUBLISHTIME (2s)
@@ -6876,18 +6935,13 @@ pub async fn start_network(
                             // NAT-fallback context — see `spawn_rendezvous_friend_lookup`'s
                             // identical capture for why a plain TCP-only dial isn't enough.
                             let rv_url = settings.rendezvous_url.clone();
-                            let nat_type = state.nat_info.nat_type;
-                            let ext_addr = state.nat_info.external_addr;
-                            let quic_ep = state
-                                .connection_broker
-                                .as_ref()
-                                .and_then(|b| b.quic_endpoint().cloned());
+                            let nat_ctx = state.friend_nat_context.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = ed2k::friend_connect::connect_friend_with_fallback(
                                     friend_addr, friend_eh, our_uh, our_eh, nick,
                                     cid, tcp, udp, obfs, sess, ultx, fh,
                                     Some(ed25519_pubkey), Some(ed25519_secret_key),
-                                    rv_url, nat_type, ext_addr, quic_ep,
+                                    rv_url, nat_ctx,
                                 ).await {
                                     info!("Proactive friend session to {} failed: {e}", hex::encode(friend_eh));
                                     let _ = ultx2.send(upload_server::UploadEvent {
@@ -7505,6 +7559,19 @@ pub async fn start_network(
                                 "user_hash": hex::encode(eh),
                             }));
                         }
+                    }
+                }
+
+                if let UploadEventKind::EmberFriendConnected { ember_hash } = event.kind {
+                    // Outbound session just came up. Mirror the inbound-activity
+                    // block above: mark online (if not already) and notify the
+                    // UI. `friend_hashes` re-check guards the same removal race
+                    // documented on the `FriendSeen` handlers.
+                    if !state.online_friends.contains_key(&ember_hash) && friend_hashes.read().await.contains(&ember_hash) {
+                        state.online_friends.insert(ember_hash, chrono::Utc::now().timestamp());
+                        let _ = app_handle.emit("ember:friend-online", serde_json::json!({
+                            "user_hash": hex::encode(ember_hash),
+                        }));
                     }
                 }
 
@@ -9895,20 +9962,29 @@ pub async fn start_network(
                     // eMule: only send BootstrapReq to hardcoded nodes while NOT connected.
                     // Once connected, rely on FindNode searches and eMule big-timer RandomLookup for growth.
                     if state.stats.status != NetworkStatus::Connected {
-                        for contact in &bootstrap::default_bootstrap_contacts() {
-                            let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
-                            let msg = KadMessage::BootstrapReq;
-                            if let Ok(packet) = messages::encode_packet(&msg) {
-                                // Track the outgoing request (opcode 0x01) so the
-                                // matching `BootstrapRes` (0x09) passes
-                                // `validate_response`. The sampled-contact path
-                                // below already does this; without it, every
-                                // hardcoded-node bootstrap reply was dropped as
-                                // "unsolicited", stalling cold-start bootstrap.
-                                state.flood_protection.track_request(addr, 0x01);
-                                let _ = udp_socket.send_to(&packet, addr).await;
+                        let due_interval =
+                            hardcoded_bootstrap_backoff_interval(hardcoded_bootstrap_backoff_shift);
+                        if now_ts - last_hardcoded_bootstrap_ts >= due_interval {
+                            last_hardcoded_bootstrap_ts = now_ts;
+                            hardcoded_bootstrap_backoff_shift =
+                                hardcoded_bootstrap_backoff_shift.saturating_add(1);
+                            for contact in &bootstrap::default_bootstrap_contacts() {
+                                let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+                                let msg = KadMessage::BootstrapReq;
+                                if let Ok(packet) = messages::encode_packet(&msg) {
+                                    // Track the outgoing request (opcode 0x01) so the
+                                    // matching `BootstrapRes` (0x09) passes
+                                    // `validate_response`. The sampled-contact path
+                                    // below already does this; without it, every
+                                    // hardcoded-node bootstrap reply was dropped as
+                                    // "unsolicited", stalling cold-start bootstrap.
+                                    state.flood_protection.track_request(addr, 0x01);
+                                    let _ = udp_socket.send_to(&packet, addr).await;
+                                }
                             }
                         }
+                    } else {
+                        hardcoded_bootstrap_backoff_shift = 0;
                     }
 
                     // Query a sample of known contacts with BootstrapReq to discover
@@ -10320,6 +10396,16 @@ pub async fn start_network(
                             }
                         }
 
+                        // Publish the QUIC endpoint to spawned friend-dial
+                        // tasks — see `FriendNatContext`. Broker creation
+                        // only happens once per session (this is the sole
+                        // `state.connection_broker = Some(..)` site), but a
+                        // dial spawned before this point would otherwise
+                        // have captured `quic_endpoint: None` forever.
+                        if let Some(ep) = broker.quic_endpoint() {
+                            state.friend_nat_context.write().unwrap_or_else(|p| p.into_inner()).quic_endpoint =
+                                Some(ep.clone());
+                        }
                         state.connection_broker = Some(broker);
                         state.broker_event_rx = Some(broker_rx);
                     }
@@ -16262,6 +16348,13 @@ pub async fn start_network(
                             result.reason, ext_ip, ext_ip, state.udp_port,
                         );
                     }
+                }
+                // Publish the final (post-fallback) nat_type/external_addr to
+                // spawned friend-dial tasks — see `FriendNatContext`.
+                {
+                    let mut ctx = state.friend_nat_context.write().unwrap_or_else(|p| p.into_inner());
+                    ctx.nat_type = state.nat_info.nat_type;
+                    ctx.external_addr = state.nat_info.external_addr;
                 }
             }
 
@@ -24014,12 +24107,7 @@ async fn handle_command_inner(
                                 let msg = message.clone();
                                 let ul_tx2 = ul_event_tx.clone();
                                 let rv_url = settings.rendezvous_url.clone();
-                                let nat_type = state.nat_info.nat_type;
-                                let ext_addr = state.nat_info.external_addr;
-                                let quic_ep = state
-                                    .connection_broker
-                                    .as_ref()
-                                    .and_then(|b| b.quic_endpoint().cloned());
+                                let nat_ctx = state.friend_nat_context.clone();
                                 // debug! (not info!) because the Ember hash + address pair
                                 // is identity-correlatable PII; we keep it for troubleshooting
                                 // but don't surface it in the default log stream.
@@ -24045,9 +24133,7 @@ async fn handle_command_inner(
                                         Some(ed25519_pubkey),
                                         Some(ed25519_secret_key),
                                         rv_url,
-                                        nat_type,
-                                        ext_addr,
-                                        quic_ep,
+                                        nat_ctx,
                                     )
                                     .await
                                     {
@@ -24153,12 +24239,7 @@ async fn handle_command_inner(
                             let db3 = db.clone();
                             let msg = message.clone();
                             let ultx2 = ul_event_tx.clone();
-                            let nat_type = state.nat_info.nat_type;
-                            let ext_addr = state.nat_info.external_addr;
-                            let quic_ep = state
-                                .connection_broker
-                                .as_ref()
-                                .and_then(|b| b.quic_endpoint().cloned());
+                            let nat_ctx = state.friend_nat_context.clone();
                             state
                                 .outbound_session_tasks
                                 .insert(friend_eh, std::time::Instant::now());
@@ -24188,9 +24269,7 @@ async fn handle_command_inner(
                                             Some(ed25519_pubkey),
                                             Some(ed25519_secret_key),
                                             rv_url.clone(),
-                                            nat_type,
-                                            ext_addr,
-                                            quic_ep,
+                                            nat_ctx,
                                         )
                                         .await
                                         {
@@ -24332,12 +24411,7 @@ async fn handle_command_inner(
                                 let fh = friend_hashes.clone();
                                 let ul_tx2 = ul_event_tx.clone();
                                 let rv_url = settings.rendezvous_url.clone();
-                                let nat_type = state.nat_info.nat_type;
-                                let ext_addr = state.nat_info.external_addr;
-                                let quic_ep = state
-                                    .connection_broker
-                                    .as_ref()
-                                    .and_then(|b| b.quic_endpoint().cloned());
+                                let nat_ctx = state.friend_nat_context.clone();
                                 info!(
                                     "Auto-connecting to friend {} for browse at {}",
                                     hex::encode(friend_eh),
@@ -24361,9 +24435,7 @@ async fn handle_command_inner(
                                         Some(ed25519_pubkey),
                                         Some(ed25519_secret_key),
                                         rv_url,
-                                        nat_type,
-                                        ext_addr,
-                                        quic_ep,
+                                        nat_ctx,
                                     )
                                     .await
                                     {
@@ -24445,12 +24517,7 @@ async fn handle_command_inner(
                             let fh = friend_hashes.clone();
                             let app2 = app_handle.clone();
                             let ultx2 = ul_event_tx.clone();
-                            let nat_type = state.nat_info.nat_type;
-                            let ext_addr = state.nat_info.external_addr;
-                            let quic_ep = state
-                                .connection_broker
-                                .as_ref()
-                                .and_then(|b| b.quic_endpoint().cloned());
+                            let nat_ctx = state.friend_nat_context.clone();
                             state
                                 .outbound_session_tasks
                                 .insert(friend_eh, std::time::Instant::now());
@@ -24480,9 +24547,7 @@ async fn handle_command_inner(
                                             Some(ed25519_pubkey),
                                             Some(ed25519_secret_key),
                                             rv_url.clone(),
-                                            nat_type,
-                                            ext_addr,
-                                            quic_ep,
+                                            nat_ctx,
                                         )
                                         .await
                                         {
@@ -25413,6 +25478,7 @@ async fn handle_upload_event(
         | UploadEventKind::EmberBrowseRequest { .. }
         | UploadEventKind::EmberBrowseResponse { .. }
         | UploadEventKind::EmberFriendDisconnected { .. }
+        | UploadEventKind::EmberFriendConnected { .. }
         | UploadEventKind::EmberFriendSearchFailed { .. }
         | UploadEventKind::PeerAutoBanned { .. }
         | UploadEventKind::EmberFriendRequest { .. } => {

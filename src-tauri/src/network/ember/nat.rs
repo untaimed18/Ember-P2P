@@ -43,6 +43,12 @@ pub enum NatType {
     Unknown,
 }
 
+impl Default for NatType {
+    fn default() -> Self {
+        NatType::Unknown
+    }
+}
+
 impl NatType {
     pub fn is_punchable(&self) -> bool {
         matches!(
@@ -132,6 +138,38 @@ impl NatInfo {
         self.last_probed = Instant::now();
         true
     }
+}
+
+/// Live, shared snapshot of the NAT-traversal inputs a friend-connect dial
+/// needs: NAT type/external address (from the periodic STUN probe) and the
+/// QUIC endpoint (created once, lazily, after the first external IP is
+/// known). Wrapped in `Arc<std::sync::RwLock<..>>` and handed to
+/// `friend_connect::connect_friend_with_fallback` so it can re-read the
+/// *current* values right before attempting hole-punch — instead of a
+/// snapshot captured at `tokio::spawn` time.
+///
+/// This matters because the TCP-first attempt each dial makes before ever
+/// looking at NAT info can itself take up to ~15s (`open_and_run_friend_session`'s
+/// connect timeout). A snapshot taken before that TCP attempt started can be
+/// badly stale by the time the hole-punch fallback actually runs — most
+/// visibly when a dial is spawned while `external_addr` is still `None`
+/// (probe in flight or not yet started): the old by-value parameters would
+/// permanently skip hole-punch for that dial even though the probe finishes
+/// (and `quic_endpoint`/`nat_type` become usable) well within the TCP
+/// timeout window. The periodic auto-retry sweep would eventually pick a
+/// stale miss back up, but only after a multi-minute wait — pointless when
+/// the fresh values were one lock-read away the whole time.
+#[derive(Clone, Default)]
+pub struct FriendNatContext {
+    pub nat_type: NatType,
+    pub external_addr: Option<SocketAddr>,
+    pub quic_endpoint: Option<Arc<quinn::Endpoint>>,
+}
+
+pub type SharedFriendNatContext = Arc<std::sync::RwLock<FriendNatContext>>;
+
+pub fn new_shared_friend_nat_context() -> SharedFriendNatContext {
+    Arc::new(std::sync::RwLock::new(FriendNatContext::default()))
 }
 
 /// Probe NAT using the caller-owned UDP socket for sends while receiving STUN

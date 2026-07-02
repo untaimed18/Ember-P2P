@@ -793,6 +793,22 @@ pub enum UploadEventKind {
     EmberFriendDisconnected {
         ember_hash: [u8; 16],
     },
+    /// A friend session was just established from the *outbound* dial side
+    /// (`friend_connect::run_friend_session_over_transport`, the single
+    /// choke point every `connect_friend_with_fallback` /
+    /// `open_and_run_friend_session` caller funnels through). Inbound
+    /// sessions and message/request activity already flip a friend online
+    /// via `FriendSeen` / `EmberChatMessage` / `EmberBrowseResponse` /
+    /// `EmberFriendRequest` — but a purely outbound session that hasn't
+    /// exchanged any application traffic yet had no event that updated
+    /// `state.online_friends`, only a UI-only `ember:friend-online` emit at
+    /// each call site. That left the backend's own bookkeeping (which
+    /// `GetOnlineFriends` and the auto-retry/dedup skip-checks read)
+    /// silently stale for outbound-only sessions until *something* else
+    /// happened to touch `online_friends` for that friend.
+    EmberFriendConnected {
+        ember_hash: [u8; 16],
+    },
     /// Outbound friend-search lookup failed *before* a session was
     /// ever established (rendezvous returned None / Err, or the
     /// initial dial failed). Used purely as an internal signal from

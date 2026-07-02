@@ -340,6 +340,19 @@ pub async fn run_friend_session_over_transport(
 
     info!("Friend session handshake with {} complete (hash={}, binding_verified={ember_hash_binding_verified})", addr, hex::encode(peer_ember_hash));
 
+    // Tell the network task this friend is reachable now, not just once
+    // they happen to send us a chat/browse message. See the variant's doc
+    // comment for why the UI-only `ember:friend-online` emits already at
+    // every caller's success branch aren't enough on their own.
+    let _ = ul_event_tx
+        .send(UploadEvent {
+            transfer_id: String::new(),
+            kind: UploadEventKind::EmberFriendConnected {
+                ember_hash: peer_ember_hash,
+            },
+        })
+        .await;
+
     let handle = FriendSessionHandle { outbound_tx };
 
     let session_ember_sessions = ember_sessions.clone();
@@ -566,8 +579,13 @@ const FRIEND_PUNCH_POLL_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// though the exact same hole-punch/relay machinery already existed for
 /// file-transfer sources.
 ///
-/// `rendezvous_url` empty or `quic_endpoint` absent degrade gracefully to
-/// TCP-only, matching the previous behaviour exactly.
+/// `rendezvous_url` empty or `nat_ctx`'s `quic_endpoint` absent degrade
+/// gracefully to TCP-only, matching the previous behaviour exactly.
+///
+/// `nat_ctx` is read fresh (not snapshotted by the caller) right before the
+/// hole-punch attempt, after the TCP-first attempt above has already had a
+/// chance to fail — see [`crate::network::ember::nat::FriendNatContext`]'s
+/// doc comment for why that matters.
 #[allow(clippy::too_many_arguments)]
 pub async fn connect_friend_with_fallback(
     addr: SocketAddr,
@@ -585,9 +603,7 @@ pub async fn connect_friend_with_fallback(
     ed25519_pubkey: Option<[u8; 32]>,
     ed25519_secret_key: Option<[u8; 32]>,
     rendezvous_url: String,
-    our_nat_type: crate::network::ember::nat::NatType,
-    our_external_addr: Option<SocketAddr>,
-    quic_endpoint: Option<Arc<quinn::Endpoint>>,
+    nat_ctx: crate::network::ember::nat::SharedFriendNatContext,
 ) -> anyhow::Result<FriendSessionHandle> {
     let tcp_err = match open_and_run_friend_session(
         addr,
@@ -619,6 +635,17 @@ pub async fn connect_friend_with_fallback(
         addr,
         hex::encode(expected_ember_hash)
     );
+
+    // Re-read the NAT context now, not at task-spawn time. The TCP attempt
+    // above can take up to ~15s (`open_and_run_friend_session`'s connect
+    // timeout) on its own; a value snapshotted before that started could be
+    // stale by a wide margin — most importantly, `external_addr`/`nat_type`
+    // may have still been `Unknown`/`None` (probe not yet finished) at spawn
+    // time but resolved by now. See `FriendNatContext`'s doc comment.
+    let (our_nat_type, our_external_addr, quic_endpoint) = {
+        let ctx = nat_ctx.read().unwrap_or_else(|p| p.into_inner());
+        (ctx.nat_type, ctx.external_addr, ctx.quic_endpoint.clone())
+    };
 
     if let (Some(endpoint), Some(ext_addr)) = (quic_endpoint.as_ref(), our_external_addr) {
         if our_nat_type != crate::network::ember::nat::NatType::Symmetric {
@@ -872,15 +899,144 @@ mod tests {
                 None,
                 None,
                 String::new(),
-                crate::network::ember::nat::NatType::Unknown,
-                None,
-                None,
+                crate::network::ember::nat::new_shared_friend_nat_context(),
             ),
         )
         .await
         .expect("connect_friend_with_fallback must not hang with no rendezvous URL");
 
         assert!(result.is_err());
+    }
+
+    /// Regression guard for the "online_friends not updated on successful
+    /// outbound rendezvous connect" gap: drives a full mock peer through
+    /// the real Hello / EmuleInfo / OP_EMBER_HELLO / Ed25519 PoP handshake
+    /// over an in-memory duplex pipe and asserts that a successful
+    /// `run_friend_session_over_transport` call — the single choke point
+    /// every outbound dial (rendezvous lookup, chat/browse auto-connect,
+    /// proactive `FriendSeen` dial) funnels through — emits
+    /// `UploadEventKind::EmberFriendConnected` so the network loop's
+    /// `state.online_friends` bookkeeping (and therefore `GetOnlineFriends`)
+    /// reflects the session immediately, not only after the peer happens to
+    /// send a chat/browse message.
+    #[tokio::test]
+    async fn successful_outbound_session_emits_ember_friend_connected() {
+        let our_sk = SigningKey::generate(&mut OsRng);
+        let our_pk_bytes = our_sk.verifying_key().to_bytes();
+        let our_sk_bytes = our_sk.to_bytes();
+
+        let peer_sk = SigningKey::generate(&mut OsRng);
+        let peer_pk_bytes = peer_sk.verifying_key().to_bytes();
+        let peer_ember_hash =
+            crate::network::ember::crypto::node_id_from_public_key(&peer_sk.verifying_key());
+
+        let (client, server) = tokio::io::duplex(8192);
+        let (client_r, client_w) = tokio::io::split(client);
+        let (mut server_r, mut server_w) = tokio::io::split(server);
+
+        let ember_sessions: EmberSessionMap = Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let (ul_tx, mut ul_rx) = tokio::sync::mpsc::channel(16);
+        let friend_hashes = Arc::new(RwLock::new(std::collections::HashSet::from([
+            peer_ember_hash,
+        ])));
+        let addr: SocketAddr = "127.0.0.1:4662".parse().unwrap();
+
+        let session_task = tokio::spawn(run_friend_session_over_transport(
+            Box::new(client_r),
+            Box::new(client_w),
+            addr,
+            peer_ember_hash,
+            [0x11; 16],
+            [0x22; 16],
+            "tester".to_string(),
+            0,
+            4662,
+            4672,
+            false,
+            ember_sessions,
+            ul_tx,
+            friend_hashes,
+            Some(our_pk_bytes),
+            Some(our_sk_bytes),
+        ));
+
+        // Mock peer: plays the responder side of the handshake so the
+        // client-side function under test runs its real success path.
+        let mock_peer = async {
+            let (proto, opcode, _) = read_packet_inner(&mut server_r).await.unwrap();
+            assert_eq!((proto, opcode), (OP_EDONKEYHEADER, OP_HELLO));
+            let hello_answer = build_hello_answer_with_buddy_opts(
+                &[0x99; 16],
+                0,
+                4662,
+                "peer",
+                None,
+                &HelloOptions::default_for_udp_port(4672),
+            );
+            write_packet(&mut server_w, OP_EDONKEYHEADER, OP_HELLOANSWER, &hello_answer)
+                .await
+                .unwrap();
+
+            let (proto, opcode, _) = read_packet_inner(&mut server_r).await.unwrap();
+            assert_eq!((proto, opcode), (OP_EMULEPROT, OP_EMULEINFO));
+            let info_answer = build_emule_info(4672, false, None, None);
+            write_packet(&mut server_w, OP_EMULEPROT, OP_EMULEINFOANSWER, &info_answer)
+                .await
+                .unwrap();
+
+            let (proto, opcode, _) = read_packet_inner(&mut server_r).await.unwrap();
+            assert_eq!((proto, opcode), (OP_EMULEPROT, OP_EMBER_HELLO));
+            let ember_hello = build_ember_hello(&peer_ember_hash, "peer", Some(&peer_pk_bytes));
+            write_packet(&mut server_w, OP_EMULEPROT, OP_EMBER_HELLOANSWER, &ember_hello)
+                .await
+                .unwrap();
+
+            let (proto, opcode, our_nonce) = read_packet_inner(&mut server_r).await.unwrap();
+            assert_eq!((proto, opcode), (OP_EMULEPROT, OP_EMBER_AUTH_CHALLENGE));
+            let mut peer_nonce = [0u8; 32];
+            OsRng.fill_bytes(&mut peer_nonce);
+            write_packet(&mut server_w, OP_EMULEPROT, OP_EMBER_AUTH_CHALLENGE, &peer_nonce)
+                .await
+                .unwrap();
+            let sig = peer_sk.sign(&our_nonce);
+            let mut resp = Vec::with_capacity(96);
+            resp.extend_from_slice(&peer_pk_bytes);
+            resp.extend_from_slice(&sig.to_bytes());
+            write_packet(&mut server_w, OP_EMULEPROT, OP_EMBER_AUTH_RESPONSE, &resp)
+                .await
+                .unwrap();
+
+            let (proto, opcode, _) = read_packet_inner(&mut server_r).await.unwrap();
+            assert_eq!((proto, opcode), (OP_EMULEPROT, OP_EMBER_AUTH_RESPONSE));
+
+            let (proto, opcode, _) = read_packet_inner(&mut server_r).await.unwrap();
+            assert_eq!((proto, opcode), (OP_EMULEPROT, OP_EMBER_FRIEND_REQ));
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), mock_peer)
+            .await
+            .expect("mock peer handshake must not hang");
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), session_task)
+            .await
+            .expect("session task must not hang")
+            .expect("session task must not panic");
+        assert!(
+            result.is_ok(),
+            "handshake against a well-behaved mock peer must succeed: {:?}",
+            result.err().map(|e| e.to_string())
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), ul_rx.recv())
+            .await
+            .expect("must receive an UploadEvent before timeout")
+            .expect("event channel must not be closed");
+        assert!(
+            matches!(
+                event.kind,
+                UploadEventKind::EmberFriendConnected { ember_hash } if ember_hash == peer_ember_hash
+            ),
+            "expected the first event to be EmberFriendConnected for the peer's hash"
+        );
     }
 }
 
