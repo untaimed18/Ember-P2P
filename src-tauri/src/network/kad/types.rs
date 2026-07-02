@@ -431,7 +431,10 @@ impl KadContact {
         if self.expires_at == 0 {
             return false;
         }
-        chrono::Utc::now().timestamp() > self.expires_at
+        // `>=` so a contact is treated as expired starting exactly at its
+        // deadline instead of one second late — matches the same
+        // TTL-boundary convention used by `StoredEntry::is_expired`.
+        chrono::Utc::now().timestamp() >= self.expires_at
     }
 
     /// Whether this contact is dead (type 4).

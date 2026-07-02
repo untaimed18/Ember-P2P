@@ -360,24 +360,38 @@ impl PublishManager {
         keyword_hash: KadId,
         keyword_record: &KeywordRecord,
     ) -> Option<KeywordPublishBatch> {
+        // Use `keyword_index` (already the source of truth for
+        // `files_for_keyword`) instead of re-tokenizing every shared
+        // file's name via `extract_keywords` on every republish. This also
+        // fixes a determinism gap: iterating `self.records.values()`
+        // directly walked `HashMap` order, so when more than
+        // `MAX_FILES_PER_KEYWORD_PUBLISH` files backed one keyword, *which*
+        // subset got published could vary between calls/restarts purely
+        // from hash-map iteration order, silently starving some files of
+        // ever being advertised under a popular keyword. Sorting by file
+        // hash gives a stable, repeatable selection.
+        let mut file_hashes: Vec<KadId> = match self.keyword_index.get(&keyword_hash) {
+            Some(hashes) => hashes.iter().copied().collect(),
+            None => return None,
+        };
+        file_hashes.sort();
+
         let mut entries = Vec::new();
-        let mut file_hashes = Vec::new();
-        for record in self.records.values() {
+        let mut selected_hashes = Vec::new();
+        for file_hash in file_hashes {
+            let Some(record) = self.records.get(&file_hash) else {
+                continue;
+            };
             if !record.file.keyword_publishable {
                 continue;
             }
-            if !extract_keywords(&record.file.file_name)
-                .into_iter()
-                .any(|kw| kw == keyword_record.keyword)
-            {
-                continue;
-            }
             entries.push(Self::build_keyword_entry(&record.file));
-            file_hashes.push(record.file.file_hash);
+            selected_hashes.push(record.file.file_hash);
             if entries.len() >= MAX_FILES_PER_KEYWORD_PUBLISH {
                 break;
             }
         }
+        let file_hashes = selected_hashes;
 
         if entries.is_empty() {
             return None;
@@ -654,13 +668,22 @@ impl PublishManager {
         }
     }
 
+    /// Same lookup `files_for_keyword` does (`keyword_index` gives the file
+    /// hashes for this keyword directly), avoiding a full
+    /// `extract_keywords` re-tokenization of every shared file's name on
+    /// every republish-due check — the scheduler calls this once per
+    /// tracked keyword on every publish tick, so with a large library that
+    /// used to add up to an O(keywords × files) sweep per tick.
     fn keyword_has_publishable_files(&self, keyword: &str) -> bool {
-        self.records.values().any(|record| {
-            record.file.keyword_publishable
-                && extract_keywords(&record.file.file_name)
-                    .into_iter()
-                    .any(|kw| kw == keyword)
-        })
+        let hash = keyword_to_kad_id(keyword);
+        self.keyword_index
+            .get(&hash)
+            .is_some_and(|file_hashes| {
+                file_hashes
+                    .iter()
+                    .filter_map(|h| self.records.get(h))
+                    .any(|record| record.file.keyword_publishable)
+            })
     }
 }
 

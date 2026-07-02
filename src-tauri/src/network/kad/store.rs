@@ -29,7 +29,7 @@ pub struct StoredEntry {
 
 impl StoredEntry {
     pub fn is_expired(&self, now: i64) -> bool {
-        now.saturating_sub(self.stored_at) > self.ttl_secs
+        now.saturating_sub(self.stored_at) >= self.ttl_secs
     }
 }
 
@@ -233,6 +233,24 @@ impl DhtStore {
     }
 
     pub fn store_notes_entry(&mut self, target: &KadId, sender_id: KadId, tags: Vec<KadTag>) -> u8 {
+        // Mirror `store_source_entry`'s minimum-field gate: a note with
+        // neither a non-empty comment (TAG_DESCRIPTION) nor a non-zero
+        // rating (TAG_FILERATING) carries nothing worth serving back to
+        // other peers via `search_notes`. Without this, an empty/no-op
+        // PublishNotesReq still consumed a `MAX_NOTES_PER_FILE` slot and
+        // could itself be searched-and-returned as a blank note.
+        let has_comment = tags.iter().any(|t| {
+            matches!(&t.name, TagName::Id(TAG_DESCRIPTION))
+                && matches!(&t.value, TagValue::String(s) if !s.is_empty())
+        });
+        let has_rating = tags.iter().any(|t| {
+            matches!(&t.name, TagName::Id(TAG_FILERATING))
+                && matches!(&t.value, TagValue::Uint8(r) if *r > 0)
+        });
+        if !has_comment && !has_rating {
+            return self.compute_load();
+        }
+
         let bucket = self.notes_entries.entry(*target).or_default();
         let now = chrono::Utc::now().timestamp();
 
@@ -408,5 +426,66 @@ mod source_store_tests {
             .and_then(|t| t.as_uint());
         assert_eq!(tcp, Some(4662), "published TCP port must be preserved");
         assert_eq!(udp, Some(5000), "UDP port falls back to the packet source");
+    }
+}
+
+#[cfg(test)]
+mod notes_store_tests {
+    use super::*;
+
+    fn id_tag(id: u8, value: TagValue) -> KadTag {
+        KadTag {
+            name: TagName::Id(id),
+            value,
+        }
+    }
+
+    fn target() -> KadId {
+        KadId([0x33; 16])
+    }
+
+    fn sender() -> KadId {
+        KadId([0x44; 16])
+    }
+
+    #[test]
+    fn rejects_empty_note_with_no_comment_or_rating() {
+        let mut store = DhtStore::new();
+        let tags = vec![id_tag(TAG_FILERATING, TagValue::Uint8(0))];
+        store.store_notes_entry(&target(), sender(), tags);
+        assert!(
+            store.search_notes(&target()).is_empty(),
+            "a note with no comment and a zero rating must not be indexed"
+        );
+    }
+
+    #[test]
+    fn rejects_note_with_empty_comment_string() {
+        let mut store = DhtStore::new();
+        let tags = vec![id_tag(TAG_DESCRIPTION, TagValue::String(String::new()))];
+        store.store_notes_entry(&target(), sender(), tags);
+        assert!(
+            store.search_notes(&target()).is_empty(),
+            "an empty-string comment must not be treated as meaningful content"
+        );
+    }
+
+    #[test]
+    fn accepts_note_with_nonempty_comment() {
+        let mut store = DhtStore::new();
+        let tags = vec![id_tag(
+            TAG_DESCRIPTION,
+            TagValue::String("great file".to_string()),
+        )];
+        store.store_notes_entry(&target(), sender(), tags);
+        assert_eq!(store.search_notes(&target()).len(), 1);
+    }
+
+    #[test]
+    fn accepts_note_with_nonzero_rating() {
+        let mut store = DhtStore::new();
+        let tags = vec![id_tag(TAG_FILERATING, TagValue::Uint8(5))];
+        store.store_notes_entry(&target(), sender(), tags);
+        assert_eq!(store.search_notes(&target()).len(), 1);
     }
 }
