@@ -753,6 +753,28 @@ pub async fn import_ipfilter_file(
         .await
         .map_err(|e| coded_ctx("security_task_failed", "Task failed", e))??
     } else {
+        // Unlike the .gz/.zip branch above (which decompresses into a
+        // bounded buffer) and every other ipfilter-loading path in this
+        // file (URL download, zip-from-URL), a plain .dat/.txt/.p2p local
+        // file was passed straight through to `ReloadIpFilter` with no
+        // size check at all — a user picking (or a compromised frontend
+        // supplying) an arbitrarily large file would have it copied
+        // wholesale into ipfilter.dat by the network-loop handler.
+        // Enforce the same MAX_RESPONSE_BYTES cap here for consistency.
+        let metadata = tokio::fs::metadata(&path).await.map_err(|e| {
+            coded_ctx("security_failed_to_stat_file", "Failed to read file metadata", e)
+        })?;
+        if metadata.len() > MAX_RESPONSE_BYTES as u64 {
+            return Err(coded_ctx(
+                "security_ipfilter_file_too_large",
+                "IP filter file is too large",
+                format!(
+                    "{} bytes exceeds the {} MiB limit",
+                    metadata.len(),
+                    MAX_RESPONSE_BYTES / (1024 * 1024)
+                ),
+            ));
+        }
         path
     };
 

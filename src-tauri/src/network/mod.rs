@@ -22918,10 +22918,34 @@ async fn handle_command_inner(
             // Persist the imported filter to ipfilter.dat so it loads on next startup
             let default_path = state.data_dir.join("ipfilter.dat");
             if path != default_path {
-                if let Err(e) = std::fs::copy(&path, &default_path) {
-                    warn!("Failed to persist IP filter to {:?}: {}", default_path, e);
-                } else {
-                    info!("Persisted imported IP filter to {:?}", default_path);
+                // Defense in depth: `import_ipfilter_file` (the only caller
+                // that can supply an arbitrary local path rather than one
+                // of our own already-size-capped downloads) enforces this
+                // same limit before sending this command, but a `path` !=
+                // `default_path` can in principle reach this handler from
+                // any future caller too. Stat-and-reject here so this
+                // command can never be tricked into copying an unbounded
+                // file into ipfilter.dat regardless of caller.
+                const MAX_IMPORTED_IPFILTER_BYTES: u64 = 50 * 1024 * 1024;
+                match std::fs::metadata(&path) {
+                    Ok(meta) if meta.len() > MAX_IMPORTED_IPFILTER_BYTES => {
+                        warn!(
+                            "Refusing to import IP filter from {:?}: {} bytes exceeds the {} MiB cap",
+                            path,
+                            meta.len(),
+                            MAX_IMPORTED_IPFILTER_BYTES / (1024 * 1024)
+                        );
+                    }
+                    Ok(_) => {
+                        if let Err(e) = std::fs::copy(&path, &default_path) {
+                            warn!("Failed to persist IP filter to {:?}: {}", default_path, e);
+                        } else {
+                            info!("Persisted imported IP filter to {:?}", default_path);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to stat IP filter import path {:?}: {}", path, e);
+                    }
                 }
             }
             // Load from the (now updated) default path
@@ -24157,13 +24181,34 @@ async fn handle_command_inner(
                 let tid = transfer.id.clone();
                 drop(mgr_guard);
 
-                let part_path = PathBuf::from(&settings.download_folder)
-                    .join("Temp")
-                    .join(format!("{tid}.part"));
+                let temp_dir = PathBuf::from(&settings.download_folder).join("Temp");
+                let part_path = temp_dir.join(format!("{tid}.part"));
 
                 if !part_path.exists() {
                     return Err("Part file not found — download may not have started".to_string());
                 }
+
+                // Defense in depth: verify the resolved part-file path is
+                // actually contained within the Temp directory before
+                // reading it, matching the canonicalize + `starts_with`
+                // containment check every other transfer-file-access path
+                // in this codebase applies (see
+                // `commands/transfers.rs::resolve_transfer_reveal_path` /
+                // `open_file`). `tid` is the transfer's own internal id
+                // rather than raw user input, so this should already be
+                // inert, but a filesystem path built from a
+                // transfer-derived value shouldn't get a free pass from
+                // the containment check every sibling code path enforces.
+                let canonical_part = part_path
+                    .canonicalize()
+                    .map_err(|e| format!("Invalid part-file path: {e}"))?;
+                let canonical_temp_dir = temp_dir
+                    .canonicalize()
+                    .map_err(|e| format!("Invalid temp directory: {e}"))?;
+                if !canonical_part.starts_with(&canonical_temp_dir) {
+                    return Err("Preview path escapes the temp directory".to_string());
+                }
+                let part_path = canonical_part;
 
                 // `PartTracker::new` reads and parses the `.part.met` file
                 // from disk; run it on the blocking pool so the main network
