@@ -649,9 +649,18 @@ impl CreditManager {
             return None;
         }
         match self.credits.get(user_hash) {
+            // `ident_ip == current_ip` alone isn't enough when both are `0`
+            // (e.g. LowID peers or a stale record from a legacy clients.met
+            // that never recorded an IP): that comparison is vacuously true
+            // without ever having pinned the identity to a real address, so
+            // require both sides to be non-zero before skipping the
+            // challenge. Mirrors the same non-zero requirement
+            // `get_current_ident_state` uses for its BadGuy comparison.
             Some(record)
                 if !record.public_key.is_empty()
                     && record.ident_state == IdentState::Verified
+                    && record.ident_ip != 0
+                    && current_ip != 0
                     && record.ident_ip == current_ip =>
             {
                 None
