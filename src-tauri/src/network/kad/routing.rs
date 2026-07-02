@@ -1261,10 +1261,24 @@ impl RoutingTable {
         verified
     }
 
+    /// Closest contacts to `target` by XOR distance, regardless of verified
+    /// status (unlike `find_closest_verified*`). Used to seed fresh
+    /// FindNode/self-lookup searches and bootstrap sampling, where we want
+    /// every lead we have — not just Kad2-handshake-verified ones.
+    ///
+    /// Still excludes `is_dead()` contacts: without this, a search or
+    /// bootstrap round gets seeded with contacts we already *know* are
+    /// unresponsive (a prior `checking_type` probe failed), guaranteeing at
+    /// least one wasted round-trip per dead contact and degrading lookup
+    /// quality under churn. Matches the same dead-contact exclusion
+    /// `find_closest_prefer_verified`'s unverified fallback already
+    /// applies, just without that function's verified-first / prefer-
+    /// non-firewalled reordering, which callers here don't want.
     pub fn find_closest(&self, target: &KadId, count: usize) -> Vec<KadContact> {
         let all_contacts = self.all_contacts_vec();
         let mut all: Vec<(KadId, &KadContact)> = all_contacts
             .iter()
+            .filter(|c| !c.is_dead())
             .map(|c| (target.xor_distance(&c.id), *c))
             .collect();
         all.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1515,5 +1529,59 @@ impl RoutingTable {
 
         let modify = ancestor_contacts as f64 / (K_BUCKET_SIZE as f64 * 2.0);
         (2.0f64.powi(leaf_level as i32 - 2) * K_BUCKET_SIZE as f64 * modify) as u32
+    }
+}
+
+#[cfg(test)]
+mod find_closest_tests {
+    use super::*;
+
+    fn contact(id_byte: u8, ip_last_octet: u8) -> KadContact {
+        let now = chrono::Utc::now().timestamp();
+        KadContact {
+            id: KadId([id_byte; 16]),
+            ip: Ipv4Addr::new(1, 2, 3, ip_last_octet),
+            udp_port: 4672,
+            tcp_port: 4662,
+            version: KADEMLIA_VERSION9_50A,
+            last_seen: now,
+            verified: true,
+            contact_type: CONTACT_TYPE_OPEN,
+            udp_key: None,
+            kad_options: 0,
+            created_at: now,
+            expires_at: 0,
+            last_type_set: 0,
+            received_hello: false,
+        }
+    }
+
+    /// Regression guard: `find_closest` seeds fresh FindNode/self-lookup
+    /// searches and bootstrap sampling, so a contact already known dead
+    /// (a prior `checking_type` probe maxed out) must never come back —
+    /// returning it just guarantees a wasted round-trip on the very next
+    /// probe, degrading lookup quality under churn.
+    #[test]
+    fn find_closest_excludes_dead_contacts() {
+        let mut rt = RoutingTable::new(KadId([0xFF; 16]), false);
+
+        let alive = contact(0x01, 1);
+        assert!(rt.insert(alive.clone()), "live contact must be accepted");
+
+        let mut dead = contact(0x02, 2);
+        dead.contact_type = CONTACT_TYPE_DEAD;
+        assert!(rt.insert(dead.clone()), "dead contact must still be insertable (as a live one that later died would be)");
+
+        let target = KadId([0x00; 16]);
+        let closest = rt.find_closest(&target, 10);
+
+        assert!(
+            closest.iter().any(|c| c.id == alive.id),
+            "the live contact must be returned"
+        );
+        assert!(
+            !closest.iter().any(|c| c.id == dead.id),
+            "a known-dead contact must never be returned by find_closest"
+        );
     }
 }

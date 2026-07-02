@@ -203,6 +203,39 @@ pub struct PublishEntry {
     pub tags: Vec<KadTag>,
 }
 
+/// Raw wire opcode for a decoded message, but only for the **request**
+/// variants `protection::is_request_opcode` flood-checks — `None` for
+/// responses/acks/notifications, matching eMule's `InTrackListIsAllowedPacket`
+/// `default: return 0` fallthrough.
+///
+/// Needed because obfuscated packets can't be opcode-classified until
+/// *after* decryption + `decode_packet` succeed (see the caller in
+/// `network/mod.rs`'s UDP dispatch): the pre-decrypt per-opcode flood check
+/// necessarily sees `0xFF` for every obfuscated packet and skips Layer 1
+/// entirely, so the real per-opcode limit (e.g. `SearchKeyReq`'s tight
+/// 5-per-15s cap, which exists specifically to bound `SearchRes`
+/// reflection/amplification) must be re-applied post-decode using the
+/// opcode this function recovers.
+pub fn request_wire_opcode(msg: &KadMessage) -> Option<u8> {
+    match msg {
+        KadMessage::BootstrapReq => Some(KADEMLIA2_BOOTSTRAP_REQ),
+        KadMessage::HelloReq { .. } => Some(KADEMLIA2_HELLO_REQ),
+        KadMessage::KadReq { .. } => Some(KADEMLIA2_REQ),
+        KadMessage::SearchKeyReq { .. } => Some(KADEMLIA2_SEARCH_KEY_REQ),
+        KadMessage::SearchSourceReq { .. } => Some(KADEMLIA2_SEARCH_SOURCE_REQ),
+        KadMessage::SearchNotesReq { .. } => Some(KADEMLIA2_SEARCH_NOTES_REQ),
+        KadMessage::PublishKeyReq { .. } => Some(KADEMLIA2_PUBLISH_KEY_REQ),
+        KadMessage::PublishSourceReq { .. } => Some(KADEMLIA2_PUBLISH_SOURCE_REQ),
+        KadMessage::PublishNotesReq { .. } => Some(KADEMLIA2_PUBLISH_NOTES_REQ),
+        KadMessage::FirewalledReq { .. } => Some(KADEMLIA_FIREWALLED_REQ),
+        KadMessage::Firewalled2Req { .. } => Some(KADEMLIA_FIREWALLED2_REQ),
+        KadMessage::FindBuddyReq { .. } => Some(KADEMLIA_FINDBUDDY_REQ),
+        KadMessage::CallbackReq { .. } => Some(KADEMLIA_CALLBACK_REQ),
+        KadMessage::Ping => Some(KADEMLIA2_PING),
+        _ => None,
+    }
+}
+
 /// Decode a raw UDP packet into a KadMessage.
 pub fn decode_packet(data: &[u8]) -> io::Result<KadMessage> {
     if data.is_empty() {
@@ -1407,6 +1440,149 @@ mod publish_res_tests {
             }
             other => panic!("unexpected message: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod request_wire_opcode_tests {
+    use super::*;
+
+    /// Every opcode `protection::is_request_opcode` flood-checks must be
+    /// recoverable from the decoded message so the post-decrypt
+    /// obfuscation-amplification recheck (see `network::mod`'s UDP
+    /// dispatch) can re-apply Layer 1 with the correct bucket.
+    #[test]
+    fn covers_every_request_variant_with_its_wire_opcode() {
+        assert_eq!(
+            request_wire_opcode(&KadMessage::BootstrapReq),
+            Some(KADEMLIA2_BOOTSTRAP_REQ)
+        );
+        assert_eq!(
+            request_wire_opcode(&KadMessage::HelloReq {
+                sender_id: KadId([0; 16]),
+                tcp_port: 0,
+                version: 0,
+                tags: vec![],
+            }),
+            Some(KADEMLIA2_HELLO_REQ)
+        );
+        assert_eq!(
+            request_wire_opcode(&KadMessage::KadReq {
+                search_type: 0,
+                target: KadId([0; 16]),
+                receiver: KadId([0; 16]),
+            }),
+            Some(KADEMLIA2_REQ)
+        );
+        assert_eq!(
+            request_wire_opcode(&KadMessage::SearchKeyReq {
+                target: KadId([0; 16]),
+                start_position: 0,
+                search_terms: vec![],
+            }),
+            Some(KADEMLIA2_SEARCH_KEY_REQ)
+        );
+        assert_eq!(
+            request_wire_opcode(&KadMessage::SearchSourceReq {
+                target: KadId([0; 16]),
+                start_position: 0,
+                file_size: 0,
+            }),
+            Some(KADEMLIA2_SEARCH_SOURCE_REQ)
+        );
+        assert_eq!(
+            request_wire_opcode(&KadMessage::SearchNotesReq {
+                target: KadId([0; 16]),
+                file_size: 0,
+            }),
+            Some(KADEMLIA2_SEARCH_NOTES_REQ)
+        );
+        assert_eq!(
+            request_wire_opcode(&KadMessage::PublishKeyReq {
+                target: KadId([0; 16]),
+                entries: vec![],
+            }),
+            Some(KADEMLIA2_PUBLISH_KEY_REQ)
+        );
+        assert_eq!(
+            request_wire_opcode(&KadMessage::PublishSourceReq {
+                target: KadId([0; 16]),
+                sender_id: KadId([0; 16]),
+                tags: vec![],
+            }),
+            Some(KADEMLIA2_PUBLISH_SOURCE_REQ)
+        );
+        assert_eq!(
+            request_wire_opcode(&KadMessage::PublishNotesReq {
+                target: KadId([0; 16]),
+                sender_id: KadId([0; 16]),
+                tags: vec![],
+            }),
+            Some(KADEMLIA2_PUBLISH_NOTES_REQ)
+        );
+        assert_eq!(
+            request_wire_opcode(&KadMessage::FirewalledReq { tcp_port: 0 }),
+            Some(KADEMLIA_FIREWALLED_REQ)
+        );
+        assert_eq!(
+            request_wire_opcode(&KadMessage::Firewalled2Req {
+                tcp_port: 0,
+                user_hash: [0; 16],
+                connect_options: 0,
+            }),
+            Some(KADEMLIA_FIREWALLED2_REQ)
+        );
+        assert_eq!(
+            request_wire_opcode(&KadMessage::FindBuddyReq {
+                buddy_id: KadId([0; 16]),
+                user_id: KadId([0; 16]),
+                tcp_port: 0,
+            }),
+            Some(KADEMLIA_FINDBUDDY_REQ)
+        );
+        assert_eq!(
+            request_wire_opcode(&KadMessage::CallbackReq {
+                buddy_id: KadId([0; 16]),
+                file_id: KadId([0; 16]),
+                tcp_port: 0,
+            }),
+            Some(KADEMLIA_CALLBACK_REQ)
+        );
+        assert_eq!(request_wire_opcode(&KadMessage::Ping), Some(KADEMLIA2_PING));
+    }
+
+    /// Responses/acks/notifications must map to `None` — they aren't
+    /// flood-checked by opcode (eMule's `InTrackListIsAllowedPacket`
+    /// `default: return 0`), and treating one as a request would let a
+    /// malicious peer exhaust another peer's tight request budget just by
+    /// naming a response opcode.
+    #[test]
+    fn responses_and_acks_map_to_none() {
+        assert_eq!(
+            request_wire_opcode(&KadMessage::SearchRes {
+                sender_id: KadId([0; 16]),
+                target: KadId([0; 16]),
+                results: vec![],
+            }),
+            None
+        );
+        assert_eq!(
+            request_wire_opcode(&KadMessage::PublishRes {
+                target: KadId([0; 16]),
+                load: 0,
+                request_ack: false,
+            }),
+            None
+        );
+        assert_eq!(request_wire_opcode(&KadMessage::PublishResAck), None);
+        assert_eq!(
+            request_wire_opcode(&KadMessage::Pong { udp_port: 0 }),
+            None
+        );
+        assert_eq!(
+            request_wire_opcode(&KadMessage::FirewalledRes { ip: 0 }),
+            None
+        );
     }
 }
 

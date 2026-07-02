@@ -21310,6 +21310,30 @@ async fn handle_udp_packet_inner(
                 packet_valid_receiver_key = decrypted.valid_receiver_key;
                 match messages::decode_packet(&decrypted.payload) {
                     Ok(m) => {
+                        // The pre-decrypt rate check above necessarily used
+                        // opcode_hint=0xFF and so skipped Layer 1 (the tight
+                        // per-opcode request limits, e.g. SearchKeyReq's
+                        // 5-per-15s) entirely — only the much looser Layer 2
+                        // global-per-IP cap applied. Now that decryption +
+                        // decode revealed the real opcode, close that gap by
+                        // re-running Layer 1 alone (Layer 2 was already
+                        // charged once for this packet and must not be
+                        // charged twice). Without this, an attacker could
+                        // obfuscate SearchKeyReq/PublishKeyReq/etc. floods to
+                        // dodge the per-opcode limits that exist specifically
+                        // to bound SearchRes reflection/amplification.
+                        if let Some(real_opcode) = messages::request_wire_opcode(&m) {
+                            if state.flood_protection.recheck_opcode_limit_post_decrypt(
+                                from.ip(),
+                                known_peer,
+                                real_opcode,
+                            ) {
+                                debug!(
+                                    "Rate limit exceeded for {from} (obfuscated opcode 0x{real_opcode:02X} revealed post-decrypt), dropping packet"
+                                );
+                                return;
+                            }
+                        }
                         // Diagnostic: classify every successful decrypt+decode
                         // so the `Publish cycle:` log can distinguish
                         // "obfuscated path is broken" from "PublishRes
@@ -22668,27 +22692,20 @@ async fn handle_udp_packet_inner(
                     .await;
                 }
             } else {
-                // Identify the sender by IP:port from the routing table
-                let sender_kad_id = {
-                    let v4 = match from.ip() {
-                        std::net::IpAddr::V4(v4) => v4,
-                        _ => Ipv4Addr::UNSPECIFIED,
-                    };
-                    state
-                        .routing_table
-                        .all_contacts()
-                        .find(|c| c.ip == v4 && c.udp_port == from.port())
-                        .map(|c| c.id)
-                        .unwrap_or_else(|| {
-                            let mut id = KadId::zero();
-                            let octets = v4.octets();
-                            id.0[0] = octets[0];
-                            id.0[1] = octets[1];
-                            id.0[2] = octets[2];
-                            id.0[3] = octets[3];
-                            id
-                        })
-                };
+                // Bind the publishing identity the same way PublishSourceReq
+                // and PublishNotesReq do: routing-table id when known,
+                // otherwise a deterministic MD5-derived id over the full
+                // (ip, port) pair. This handler used to roll its own
+                // fallback — first 4 octets of the IP, zero-padded, port
+                // dropped entirely — which let every sender behind the same
+                // public IP (e.g. two NATed peers) collide onto one
+                // trivially-guessable identity. Since `store_keyword_entries`
+                // dedups/updates by `(entry.id, source_id)`, that weak,
+                // predictable identity meant one publisher's keyword entries
+                // could be silently overwritten by anyone able to guess or
+                // reuse the same 4-byte id — a DHT poisoning surface unique
+                // to this handler.
+                let sender_kad_id = resolve_verified_sender_id(state, from, &KadId::zero());
                 let load = state
                     .dht_store
                     .store_keyword_entries(&target, entries, &sender_kad_id);

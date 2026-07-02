@@ -147,6 +147,76 @@ impl FloodProtection {
         }
     }
 
+    /// Layer 1 only: per-(IP, opcode) request-flood check within
+    /// `OPCODE_WINDOW_SECS`. Returns `true` if the packet should be
+    /// dropped. Split out of `check_rate_limit_with_opcode` so
+    /// `recheck_opcode_limit_post_decrypt` can apply it standalone without
+    /// double-counting Layer 2 (the global per-IP cap), which the caller
+    /// already charged once for this packet before decryption was even
+    /// attempted.
+    fn check_opcode_limit(&mut self, ip: IpAddr, known_peer: bool, opcode: u8) -> bool {
+        if !is_request_opcode(opcode) {
+            return false;
+        }
+        let now = Instant::now();
+        let op_key = (ip, opcode);
+        if self.opcode_counters.len() >= MAX_OPCODE_ENTRIES
+            && !self.opcode_counters.contains_key(&op_key)
+        {
+            // K19: previous behaviour rejected the new peer outright as
+            // soon as the per-opcode table filled — an attacker that fills
+            // the table with one-shot spam permanently locks out legit
+            // peers. We now LRU-evict: drop the entry whose window-start
+            // timestamp is oldest, freeing a slot for the new peer.
+            if let Some(oldest_key) = self
+                .opcode_counters
+                .iter()
+                .min_by_key(|(_, (_, t))| *t)
+                .map(|(k, _)| *k)
+            {
+                self.opcode_counters.remove(&oldest_key);
+            } else {
+                return true;
+            }
+        }
+        let op_entry = self.opcode_counters.entry(op_key).or_insert((0, now));
+        if now.saturating_duration_since(op_entry.1).as_secs() >= OPCODE_WINDOW_SECS {
+            op_entry.0 = 1;
+            op_entry.1 = now;
+            false
+        } else {
+            op_entry.0 += 1;
+            let limit = opcode_limit(opcode);
+            let effective = if known_peer { limit * 2 } else { limit };
+            op_entry.0 > effective
+        }
+    }
+
+    /// Re-applies the Layer 1 per-opcode request-flood check for an
+    /// obfuscated packet now that decryption + `decode_packet` have
+    /// revealed its real opcode. `check_rate_limit_with_opcode` necessarily
+    /// skips Layer 1 for every obfuscated packet (opcode is unknown as
+    /// `0xFF` pre-decrypt); without this follow-up call, obfuscated
+    /// requests would only ever face the much looser Layer 2 global-per-IP
+    /// cap (20-40 packets/sec) instead of the tight per-opcode limits
+    /// (e.g. `SearchKeyReq`'s 5-per-15s), which exist specifically to bound
+    /// `SearchRes` UDP reflection/amplification. Only call this for
+    /// obfuscated packets — plain packets already got the accurate opcode
+    /// on the pre-decrypt call, so re-running this for them would
+    /// double-count Layer 1 too.
+    ///
+    /// `real_opcode` should come from `messages::request_wire_opcode`,
+    /// which returns `None` for non-request messages (responses/acks) —
+    /// those never reach this call in the first place.
+    pub fn recheck_opcode_limit_post_decrypt(
+        &mut self,
+        ip: IpAddr,
+        known_peer: bool,
+        real_opcode: u8,
+    ) -> bool {
+        self.check_opcode_limit(ip, known_peer, real_opcode)
+    }
+
     /// Rate-limit with opcode awareness matching eMule PacketTracking.cpp.
     ///
     /// `opcode` is the byte at `data[1]` for a plain 0xE4/0xE5 packet or
@@ -159,8 +229,6 @@ impl FloodProtection {
         known_peer: bool,
         opcode: u8,
     ) -> bool {
-        let now = Instant::now();
-
         // Layer 1: per-(IP, opcode) within OPCODE_WINDOW_SECS.
         //
         // Matches eMule `InTrackListIsAllowedPacket`'s `default: return 0;`
@@ -169,45 +237,18 @@ impl FloodProtection {
         // `decode_packet` could tell them apart, which manifested as
         // `publish_confirmed` stuck at 0 with `wire=0` in diagnostics.
         //
-        // Obfuscated packets (opcode == 0xFF) also bypass Layer 1 because we
-        // can't tell a request from a response until after decryption. The
-        // Layer 2 per-IP per-second cap below is what keeps an obfuscated
-        // flood from burning CPU; rate-limiting by opcode before we know
-        // what the opcode is punishes the responder for us, not the flooder.
-        if opcode != 0xFF && is_request_opcode(opcode) {
-            let op_key = (ip, opcode);
-            if self.opcode_counters.len() >= MAX_OPCODE_ENTRIES
-                && !self.opcode_counters.contains_key(&op_key)
-            {
-                // K19: previous behaviour rejected the new peer outright as
-                // soon as the per-opcode table filled — an attacker that fills
-                // the table with one-shot spam permanently locks out legit
-                // peers. We now LRU-evict: drop the entry whose window-start
-                // timestamp is oldest, freeing a slot for the new peer.
-                if let Some(oldest_key) = self
-                    .opcode_counters
-                    .iter()
-                    .min_by_key(|(_, (_, t))| *t)
-                    .map(|(k, _)| *k)
-                {
-                    self.opcode_counters.remove(&oldest_key);
-                } else {
-                    return true;
-                }
-            }
-            let op_entry = self.opcode_counters.entry(op_key).or_insert((0, now));
-            if now.saturating_duration_since(op_entry.1).as_secs() >= OPCODE_WINDOW_SECS {
-                op_entry.0 = 1;
-                op_entry.1 = now;
-            } else {
-                op_entry.0 += 1;
-                let limit = opcode_limit(opcode);
-                let effective = if known_peer { limit * 2 } else { limit };
-                if op_entry.0 > effective {
-                    return true;
-                }
-            }
+        // Obfuscated packets (opcode == 0xFF) also bypass Layer 1 here
+        // because we can't tell a request from a response until after
+        // decryption — `is_request_opcode(0xFF)` is false, so
+        // `check_opcode_limit` naturally no-ops for them. See
+        // `recheck_opcode_limit_post_decrypt`, which the caller re-runs
+        // once the real opcode is known, so this isn't a permanent bypass,
+        // just a deferral.
+        if self.check_opcode_limit(ip, known_peer, opcode) {
+            return true;
         }
+
+        let now = Instant::now();
 
         // Layer 2: global per-IP per-second cap
         if self.ip_counters.len() >= MAX_IP_ENTRIES && !self.ip_counters.contains_key(&ip) {
@@ -485,6 +526,47 @@ mod kad_protection_tests {
         assert!(
             !fp.check_rate_limit_with_opcode(new_ip, false, 0x21),
             "LRU eviction must admit a fresh peer even when the table is full"
+        );
+    }
+
+    /// Regression guard for the obfuscation amplification bypass: the
+    /// pre-decrypt call always sees opcode 0xFF and so must never trip
+    /// Layer 1, but once the real opcode is known post-decrypt,
+    /// `recheck_opcode_limit_post_decrypt` must enforce the *same*
+    /// per-opcode limit a plaintext packet of that type would have hit —
+    /// otherwise obfuscated SearchKeyReq floods only face the much looser
+    /// Layer 2 global cap, giving an attacker an amplification-friendly
+    /// bypass of the SearchRes-bounding limit.
+    #[test]
+    fn obfuscated_packet_gets_opcode_limit_enforced_post_decrypt() {
+        let mut fp = FloodProtection::new();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 20));
+
+        // Pre-decrypt call with the 0xFF hint must never rate-limit on
+        // opcode grounds alone (Layer 1 is a no-op for 0xFF). Stay well
+        // under Layer 2's global per-IP cap so this only exercises Layer 1.
+        for _ in 0..5 {
+            assert!(
+                !fp.check_rate_limit_with_opcode(ip, false, 0xFF),
+                "pre-decrypt obfuscated hint (0xFF) must not trip Layer 1"
+            );
+        }
+
+        // A fresh IP's post-decrypt SearchKeyReq (0x33) opcode limit is 5
+        // per OPCODE_WINDOW_SECS for an unknown peer — the same limit a
+        // plaintext SearchKeyReq flood would face.
+        for i in 0..5 {
+            assert!(
+                !fp.recheck_opcode_limit_post_decrypt(ip, false, 0x33),
+                "SearchKeyReq #{} should still be within the per-opcode budget",
+                i + 1
+            );
+        }
+        assert!(
+            fp.recheck_opcode_limit_post_decrypt(ip, false, 0x33),
+            "6th obfuscated SearchKeyReq within the window must be rate-limited, \
+             matching the plaintext per-opcode cap instead of only the looser \
+             Layer 2 global cap"
         );
     }
 

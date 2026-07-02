@@ -23,6 +23,23 @@ const OP_EMULEINFOANSWER: u8 = 0x02;
 
 const BUDDY_EVENT_CHANNEL_SIZE: usize = 32;
 const REASK_CALLBACK_BUDGET_PER_SESSION: u32 = 16;
+/// Max time to wait for the *next* packet on a buddy TCP connection before
+/// treating it as dead. Both directions send an `OP_BUDDYPING` roughly every
+/// 60s (see `mod.rs`'s `buddy_timer`), so 3x that interval tolerates a
+/// couple of missed/delayed pings from transient network hiccups while
+/// still bounding how long a truly dead peer can sit idle.
+///
+/// This matters most for the serving side: `serving_buddy_for` is a single
+/// exclusive slot (`accept_buddy_connection` rejects new requesters while
+/// occupied), and without a read-side timeout a firewalled client that
+/// crashes or black-holes mid-session — without ever sending a TCP
+/// FIN/RST — would occupy that slot forever, since `read_ed2k_packet`
+/// blocks indefinitely and nothing else observes read-side inactivity.
+/// Applied uniformly to the "we are firewalled" reader too for the same
+/// defense-in-depth reason (our own `send_buddy_ping` only detects a dead
+/// buddy on *write* failure, not a connection that accepts writes but never
+/// replies).
+const BUDDY_IDLE_TIMEOUT_SECS: u64 = 180;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuddyState {
@@ -415,7 +432,12 @@ impl BuddyManager {
             return None;
         }
         let (event_tx, event_rx) = mpsc::channel(BUDDY_EVENT_CHANNEL_SIZE);
-        let handle = tokio::spawn(run_buddy_reader(reader, event_tx, None));
+        let handle = tokio::spawn(run_buddy_reader(
+            reader,
+            event_tx,
+            None,
+            std::time::Duration::from_secs(BUDDY_IDLE_TIMEOUT_SECS),
+        ));
 
         self.serving_buddy_for = Some(requester_id);
         self.serving_callback_check = Some(callback_check);
@@ -702,16 +724,27 @@ fn event_rx_from_reader(
     buddy_id: KadId,
 ) -> (mpsc::Receiver<BuddyEvent>, tokio::task::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(BUDDY_EVENT_CHANNEL_SIZE);
-    let handle = tokio::spawn(run_buddy_reader(reader, tx, Some(buddy_id)));
+    let handle = tokio::spawn(run_buddy_reader(
+        reader,
+        tx,
+        Some(buddy_id),
+        std::time::Duration::from_secs(BUDDY_IDLE_TIMEOUT_SECS),
+    ));
     (rx, handle)
 }
 
 /// Long-running reader task for a buddy TCP connection.
 /// Reads ed2k packets and sends events back via channel.
+///
+/// `idle_timeout` is a parameter (rather than always using
+/// `BUDDY_IDLE_TIMEOUT_SECS` directly) purely so tests can exercise the
+/// timeout path in milliseconds instead of real minutes; both production
+/// call sites pass `BUDDY_IDLE_TIMEOUT_SECS`.
 async fn run_buddy_reader(
     reader: BuddyReadStream,
     event_tx: mpsc::Sender<BuddyEvent>,
     expected_callback_check: Option<KadId>,
+    idle_timeout: std::time::Duration,
 ) {
     let mut reader = reader;
     // K9: per-session OP_REASKCALLBACKTCP budget. A legit buddy using
@@ -728,7 +761,17 @@ async fn run_buddy_reader(
     let mut callback_budget: u32 = 64;
     let mut reask_callback_budget: u32 = REASK_CALLBACK_BUDGET_PER_SESSION;
     loop {
-        match read_ed2k_packet(&mut reader).await {
+        let read_result = match tokio::time::timeout(idle_timeout, read_ed2k_packet(&mut reader))
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                debug!("Buddy reader idle for {idle_timeout:?} with no traffic, disconnecting");
+                let _ = event_tx.send(BuddyEvent::Disconnected).await;
+                break;
+            }
+        };
+        match read_result {
             Ok((proto, opcode, payload)) => {
                 let event = match (proto, opcode) {
                     (OP_EMULEPROT, OP_BUDDYPING) => {
@@ -979,5 +1022,38 @@ mod tests {
         // A search is already in flight; don't start another even though both
         // ports are firewalled.
         assert!(!mgr.should_find_buddy(FirewallStatus::Firewalled, FirewallStatus::Firewalled));
+    }
+
+    /// Regression guard for the "dead firewalled client occupies the single
+    /// serving slot forever" bug: with no traffic at all on the reader side
+    /// (the peer neither sends anything nor closes the TCP connection —
+    /// e.g. it crashed or the network black-holed without a FIN/RST),
+    /// `run_buddy_reader` must still emit `BuddyEvent::Disconnected` once
+    /// `idle_timeout` elapses, rather than blocking on `read_ed2k_packet`
+    /// indefinitely.
+    #[tokio::test]
+    async fn run_buddy_reader_emits_disconnected_after_idle_timeout() {
+        let (client, server) = tokio::io::duplex(64);
+        // `server` is never written to and never closed here — it stays
+        // open exactly like a black-holed but not-yet-torn-down TCP peer.
+        let reader: BuddyReadStream = Box::new(server);
+        let (event_tx, mut event_rx) = mpsc::channel(BUDDY_EVENT_CHANNEL_SIZE);
+        let handle = tokio::spawn(run_buddy_reader(
+            reader,
+            event_tx,
+            None,
+            std::time::Duration::from_millis(50),
+        ));
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("run_buddy_reader must emit an event within 5s of the 50ms idle timeout, not hang forever");
+        assert!(
+            matches!(event, Some(BuddyEvent::Disconnected)),
+            "expected Disconnected after idle timeout, got {event:?}"
+        );
+
+        drop(client);
+        let _ = handle.await;
     }
 }
