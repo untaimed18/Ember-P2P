@@ -22829,54 +22829,51 @@ async fn handle_udp_packet_inner(
                 results.retain(|entry| matches_search_expr_for_entry(expr, entry));
             }
 
-            {
-                let index = local_index.read().await;
-                for file in index.all_files() {
+            // Answer from the already-indexed `publish_manager` (the same
+            // set of files we'd publish to the DHT under this keyword)
+            // instead of re-tokenizing every locally shared file's name on
+            // every incoming request. `files_for_keyword` is an O(1)
+            // average-case index lookup, not a full-library scan — see
+            // its doc comment for why the previous linear scan was a
+            // remotely-triggerable CPU-amplification vector (a flood of
+            // tiny `SearchKeyReq` packets, one per rotated source address
+            // to dodge the per-IP opcode rate limit, could each force an
+            // O(shared library size) scan regardless of packet size).
+            if results.len() < 200 {
+                for file in state.publish_manager.files_for_keyword(&target) {
                     if results.len() >= 200 {
                         break;
                     }
-                    let file_keywords = kad::publish::extract_keywords(&file.name);
-                    let matches_keyword = file_keywords
-                        .iter()
-                        .any(|kw| kad::publish::keyword_to_kad_id(kw) == target);
-                    if !matches_keyword {
-                        continue;
-                    }
                     if let Some(expr) = &search_expr {
-                        if !matches_search_expr_for_local_file(expr, &file.name, file.size) {
+                        if !matches_search_expr_for_local_file(expr, &file.file_name, file.file_size) {
                             continue;
                         }
                     }
-                    if let Ok(raw_bytes) = hex::decode(&file.hash) {
-                        let kad_hash = md4_bytes_to_kad_id(&raw_bytes);
-                        results.push(kad::messages::SearchResultEntry {
-                            id: kad_hash,
-                            tags: vec![
-                                KadTag {
-                                    name: TagName::Id(TAG_FILENAME),
-                                    value: TagValue::String(file.name.clone()),
-                                },
-                                KadTag {
-                                    name: TagName::Id(TAG_FILESIZE),
-                                    value: TagValue::Uint64(file.size),
-                                },
-                                KadTag {
-                                    name: TagName::Id(TAG_FILETYPE),
-                                    value: TagValue::String(crate::search::index::infer_file_type(
-                                        &file.extension,
-                                    )),
-                                },
-                                KadTag {
-                                    name: TagName::Id(TAG_SOURCES),
-                                    value: TagValue::Uint32(1),
-                                },
-                                KadTag {
-                                    name: TagName::Id(TAG_COMPLETE_SOURCES),
-                                    value: TagValue::Uint32(file.complete_sources.max(1)),
-                                },
-                            ],
-                        });
-                    }
+                    results.push(kad::messages::SearchResultEntry {
+                        id: file.file_hash,
+                        tags: vec![
+                            KadTag {
+                                name: TagName::Id(TAG_FILENAME),
+                                value: TagValue::String(file.file_name.clone()),
+                            },
+                            KadTag {
+                                name: TagName::Id(TAG_FILESIZE),
+                                value: TagValue::Uint64(file.file_size),
+                            },
+                            KadTag {
+                                name: TagName::Id(TAG_FILETYPE),
+                                value: TagValue::String(file.file_type.clone()),
+                            },
+                            KadTag {
+                                name: TagName::Id(TAG_SOURCES),
+                                value: TagValue::Uint32(1),
+                            },
+                            KadTag {
+                                name: TagName::Id(TAG_COMPLETE_SOURCES),
+                                value: TagValue::Uint32(file.complete_sources.max(1)),
+                            },
+                        ],
+                    });
                 }
             }
             let start = (start_position & 0x7FFF) as usize;

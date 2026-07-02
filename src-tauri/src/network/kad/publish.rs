@@ -113,6 +113,14 @@ pub struct PublishManager {
     pub buddy_id: Option<KadId>,
     records: HashMap<KadId, PublishRecord>,
     keyword_records: HashMap<KadId, KeywordRecord>,
+    /// Reverse index (keyword_hash -> file_hashes) kept in sync with
+    /// `records`/`keyword_records` by `ensure_keyword_records_for_file` /
+    /// `remove_file_from_keyword_index`. Backs [`Self::files_for_keyword`],
+    /// which answers inbound `SearchKeyReq` in O(1) + O(matches) instead of
+    /// re-running `extract_keywords` over every shared file per request —
+    /// see that method's doc comment for why the linear scan was a
+    /// remotely-triggerable CPU-amplification vector.
+    keyword_index: HashMap<KadId, std::collections::HashSet<KadId>>,
     /// eMule `CSharedFileList::m_currFileSrc`: round-robin cursor over
     /// `records`, advanced by exactly one entry per scheduler tick
     /// regardless of whether that entry turns out to be due. See
@@ -175,6 +183,7 @@ impl PublishManager {
             buddy_id: None,
             records: HashMap::new(),
             keyword_records: HashMap::new(),
+            keyword_index: HashMap::new(),
             source_cursor: None,
             keyword_cursor: None,
         }
@@ -182,6 +191,17 @@ impl PublishManager {
 
     /// Register a file for publishing.
     pub fn add_file(&mut self, file: PublishableFile) {
+        // A re-add with a different name or `keyword_publishable` flag
+        // (rename, or a partial finishing/re-starting a download) can
+        // change which keywords this file_hash should be indexed under.
+        // Drop the stale associations before re-deriving them below so
+        // `keyword_index` never accumulates entries for keywords the file
+        // no longer matches.
+        if let Some(old) = self.records.get(&file.file_hash) {
+            if old.file.file_name != file.file_name || old.file.keyword_publishable != file.keyword_publishable {
+                self.remove_file_from_keyword_index(&old.file.clone());
+            }
+        }
         self.ensure_keyword_records_for_file(&file);
         self.records
             .entry(file.file_hash)
@@ -205,7 +225,28 @@ impl PublishManager {
 
     /// Remove a file from publishing (e.g. when a download is cancelled).
     pub fn remove_file(&mut self, file_hash: &KadId) {
-        self.records.remove(file_hash);
+        if let Some(record) = self.records.remove(file_hash) {
+            self.remove_file_from_keyword_index(&record.file);
+        }
+    }
+
+    /// Remove `file`'s entry from every keyword bucket it was indexed
+    /// under in `keyword_index`, pruning any bucket left empty. Must be
+    /// called with the file's *old* name/publishability whenever it's
+    /// about to be replaced or dropped from `records`, so the index never
+    /// holds a `file_hash` that `files_for_keyword` would then return
+    /// alongside a `records` lookup miss (or, worse, a stale/renamed
+    /// file's now-wrong metadata).
+    fn remove_file_from_keyword_index(&mut self, file: &PublishableFile) {
+        for keyword in extract_keywords(&file.file_name) {
+            let keyword_hash = keyword_to_kad_id(&keyword);
+            if let Some(set) = self.keyword_index.get_mut(&keyword_hash) {
+                set.remove(&file.file_hash);
+                if set.is_empty() {
+                    self.keyword_index.remove(&keyword_hash);
+                }
+            }
+        }
     }
 
     /// Add a batch of files for publishing.
@@ -241,6 +282,15 @@ impl PublishManager {
             .collect();
         self.keyword_records
             .retain(|_, record| live_keywords.contains(&record.keyword));
+        // Keep `keyword_index` in lock-step: drop any indexed file_hash
+        // that `records.retain` above just dropped, and any now-empty
+        // bucket. Cheap full rebuild rather than surgical per-removed-file
+        // cleanup — this only runs on share-list reconciliation, not on
+        // any network-request path.
+        for hashes in self.keyword_index.values_mut() {
+            hashes.retain(|h| keep.contains(h));
+        }
+        self.keyword_index.retain(|_, hashes| !hashes.is_empty());
     }
 
     /// Number of keyword targets that are currently due for publishing.
@@ -573,6 +623,34 @@ impl PublishManager {
                     last_publish: 0,
                     backoff_shift: 0,
                 });
+            self.keyword_index
+                .entry(keyword_hash)
+                .or_default()
+                .insert(file.file_hash);
+        }
+    }
+
+    /// Files backing `keyword_hash` right now — an O(1) average-case
+    /// lookup via [`Self::keyword_index`] followed by O(matches) record
+    /// fetches, in place of the naive approach of extracting keywords
+    /// from every shared file on every call.
+    ///
+    /// This backs the inbound `SearchKeyReq` handler: before this
+    /// existed, answering a keyword search from a remote peer meant
+    /// tokenizing every locally shared file's name on every single
+    /// incoming request — a remotely-triggerable CPU-amplification
+    /// vector, since a flood of tiny `SearchKeyReq` packets (one per
+    /// spoofed/rotated source address, to dodge the per-IP opcode rate
+    /// limit in `protection.rs`) could each force an O(shared library
+    /// size) scan on the receiving node regardless of packet size.
+    pub fn files_for_keyword(&self, keyword_hash: &KadId) -> Vec<&PublishableFile> {
+        match self.keyword_index.get(keyword_hash) {
+            Some(hashes) => hashes
+                .iter()
+                .filter_map(|h| self.records.get(h))
+                .map(|record| &record.file)
+                .collect(),
+            None => Vec::new(),
         }
     }
 
@@ -1032,5 +1110,133 @@ mod tests {
                 "orphan keyword '{kw}' must be pruned after retain"
             );
         }
+    }
+
+    /// Regression coverage for `med-searchkeyreq-dos`: `files_for_keyword`
+    /// must return exactly the keyword-publishable files backing a given
+    /// keyword hash via the `keyword_index`, without needing to touch
+    /// `local_index` or re-derive keywords for unrelated files.
+    #[test]
+    fn files_for_keyword_finds_matching_publishable_file() {
+        let mut p = PublishManager::new(KadId([0x01; 16]), [0x02; 16], 4662, 4672);
+        let matching = PublishableFile {
+            file_hash: KadId([0xA1; 16]),
+            file_name: "ubuntu server iso".to_string(),
+            file_size: 100,
+            file_type: "Iso".to_string(),
+            complete_sources: 3,
+            keyword_publishable: true,
+            last_source_publish: 0,
+        };
+        let unrelated = PublishableFile {
+            file_hash: KadId([0xB2; 16]),
+            file_name: "totally different name".to_string(),
+            file_size: 200,
+            file_type: "Pro".to_string(),
+            complete_sources: 0,
+            keyword_publishable: true,
+            last_source_publish: 0,
+        };
+        p.add_file(matching.clone());
+        p.add_file(unrelated);
+
+        let hits = p.files_for_keyword(&keyword_to_kad_id("ubuntu"));
+        assert_eq!(hits.len(), 1, "only the matching file should be returned");
+        assert_eq!(hits[0].file_hash, matching.file_hash);
+
+        let misses = p.files_for_keyword(&keyword_to_kad_id("nonexistent"));
+        assert!(misses.is_empty(), "an unpublished keyword must return no files");
+    }
+
+    /// A file registered with `keyword_publishable: false` (e.g. an
+    /// in-progress partial download) must never surface via
+    /// `files_for_keyword` — eMule only answers keyword search with
+    /// complete shared files.
+    #[test]
+    fn files_for_keyword_excludes_non_publishable_files() {
+        let mut p = PublishManager::new(KadId([0x01; 16]), [0x02; 16], 4662, 4672);
+        p.add_file(PublishableFile {
+            file_hash: KadId([0xC3; 16]),
+            file_name: "partial download movie".to_string(),
+            file_size: 500,
+            file_type: "Video".to_string(),
+            complete_sources: 0,
+            keyword_publishable: false,
+            last_source_publish: 0,
+        });
+
+        assert!(
+            p.files_for_keyword(&keyword_to_kad_id("movie")).is_empty(),
+            "a non-keyword-publishable file must not appear in keyword search"
+        );
+    }
+
+    /// Renaming a file (re-`add_file` with the same hash but a different
+    /// name) must drop the stale keyword association, not leave the
+    /// file_hash indexed under both the old and new keyword forever.
+    #[test]
+    fn files_for_keyword_reflects_rename_not_stale_old_name() {
+        let mut p = PublishManager::new(KadId([0x01; 16]), [0x02; 16], 4662, 4672);
+        let hash = KadId([0xD4; 16]);
+        p.add_file(PublishableFile {
+            file_hash: hash,
+            file_name: "original name".to_string(),
+            file_size: 10,
+            file_type: "Pro".to_string(),
+            complete_sources: 0,
+            keyword_publishable: true,
+            last_source_publish: 0,
+        });
+        assert_eq!(p.files_for_keyword(&keyword_to_kad_id("original")).len(), 1);
+
+        p.add_file(PublishableFile {
+            file_hash: hash,
+            file_name: "renamed file".to_string(),
+            file_size: 10,
+            file_type: "Pro".to_string(),
+            complete_sources: 0,
+            keyword_publishable: true,
+            last_source_publish: 0,
+        });
+
+        assert!(
+            p.files_for_keyword(&keyword_to_kad_id("original")).is_empty(),
+            "the old keyword must no longer resolve to the renamed file"
+        );
+        assert_eq!(
+            p.files_for_keyword(&keyword_to_kad_id("renamed")).len(),
+            1,
+            "the new keyword must resolve to the renamed file"
+        );
+    }
+
+    /// `remove_file` must clean up `keyword_index`, not just `records` —
+    /// otherwise a removed file's hash lingers in the index and
+    /// `files_for_keyword` would return a dangling entry (silently
+    /// filtered by the `records.get` lookup today, but wasted memory and
+    /// a latent correctness trap for any future caller that assumes
+    /// `keyword_index` entries are always live).
+    #[test]
+    fn remove_file_prunes_keyword_index() {
+        let mut p = PublishManager::new(KadId([0x01; 16]), [0x02; 16], 4662, 4672);
+        let hash = KadId([0xE5; 16]);
+        p.add_file(PublishableFile {
+            file_hash: hash,
+            file_name: "removable document".to_string(),
+            file_size: 10,
+            file_type: "Doc".to_string(),
+            complete_sources: 0,
+            keyword_publishable: true,
+            last_source_publish: 0,
+        });
+        assert_eq!(p.files_for_keyword(&keyword_to_kad_id("removable")).len(), 1);
+
+        p.remove_file(&hash);
+
+        assert!(p.files_for_keyword(&keyword_to_kad_id("removable")).is_empty());
+        assert!(
+            !p.keyword_index.contains_key(&keyword_to_kad_id("removable")),
+            "an empty keyword bucket must be dropped entirely, not left as an empty Vec/Set"
+        );
     }
 }
