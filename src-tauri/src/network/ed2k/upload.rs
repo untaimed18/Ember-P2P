@@ -7491,7 +7491,25 @@ impl UploadHandler {
                 // — it's typically `NotStarted` when chat/browse
                 // requests first arrive and only flips to `Verified`
                 // a packet or two later.
-                (OP_EMULEPROT, OP_EMBER_CHAT_MSG) if is_ember_friend && ember_auth_state.is_verified() => {
+                // `owns_ember_slot` is required (not just `is_ember_friend
+                // && verified`) on every arm below that emits a
+                // user-facing `UploadEvent`. Two inbound TCP connections
+                // from the same friend can both complete the handshake +
+                // PoP concurrently — only one wins the `ember_sessions`
+                // slot claim in the `OP_EMBER_AUTH_RESPONSE` arm above,
+                // but without this guard the *losing* connection's reader
+                // loop kept processing chat/browse packets and emitting
+                // them to the UI/DB exactly as if it were the canonical
+                // session. If the peer's own session bookkeeping ever
+                // sends the same logical message down both of its
+                // connections (retry, redial-before-teardown, etc.) that
+                // showed up as a duplicated chat message or a spurious
+                // extra browse round trip. The losing connection now
+                // silently drops these opcodes (falling through to the
+                // `_` arm below) instead — it remains fully alive for
+                // ordinary eD2K file-serving, which is unrelated to
+                // friend-session ownership and must not be torn down.
+                (OP_EMULEPROT, OP_EMBER_CHAT_MSG) if is_ember_friend && owns_ember_slot && ember_auth_state.is_verified() => {
                     if let Some(h) = &ember_session_handle { h.touch(); }
                     if let Some(eh) = peer_ember_hash {
                         if !self.friend_hashes.read().await.contains(&eh) {
@@ -7510,7 +7528,7 @@ impl UploadHandler {
                     }
                 }
 
-                (OP_EMULEPROT, OP_EMBER_BROWSE_REQ) if is_ember_friend && ember_auth_state.is_verified() => {
+                (OP_EMULEPROT, OP_EMBER_BROWSE_REQ) if is_ember_friend && owns_ember_slot && ember_auth_state.is_verified() => {
                     if let Some(h) = &ember_session_handle { h.touch(); }
                     if let Some(eh) = peer_ember_hash {
                         if !self.friend_hashes.read().await.contains(&eh) {
@@ -7526,7 +7544,7 @@ impl UploadHandler {
                     }
                 }
 
-                (OP_EMULEPROT, OP_EMBER_BROWSE_RES) if is_ember_friend && ember_auth_state.is_verified() => {
+                (OP_EMULEPROT, OP_EMBER_BROWSE_RES) if is_ember_friend && owns_ember_slot && ember_auth_state.is_verified() => {
                     if let Some(h) = &ember_session_handle { h.touch(); }
                     if let Some(eh) = peer_ember_hash {
                         if !self.friend_hashes.read().await.contains(&eh) {
