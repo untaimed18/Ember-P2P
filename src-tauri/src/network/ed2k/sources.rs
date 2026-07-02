@@ -822,27 +822,54 @@ impl SourceManager {
             .find(|e| e.ip == ip && e.tcp_port == tcp_port)
         {
             existing.last_seen = now;
-            if user_hash != [0u8; 16] {
+            // Only fill in identity/crypt fields when we don't already have
+            // a value for them — never let a later wire announcement for
+            // the same (ip, port) *overwrite* an already-known identity.
+            // Without this guard, a peer could re-announce a victim's
+            // already-tracked IP:port via SX with a fabricated user_hash
+            // and silently corrupt our record of who that source actually
+            // is. Mirrors the same "only if currently unset" merge rule
+            // `load_from_disk` already uses.
+            if existing.user_hash == [0u8; 16] && user_hash != [0u8; 16] {
                 existing.user_hash = user_hash;
             }
-            if udp_port > 0 {
+            if existing.udp_port == 0 && udp_port > 0 {
                 existing.udp_port = udp_port;
             }
-            if server_ip != 0 {
+            if existing.server_ip == 0 && server_ip != 0 {
                 existing.server_ip = server_ip;
             }
-            if server_port != 0 {
+            if existing.server_port == 0 && server_port != 0 {
                 existing.server_port = server_port;
             }
-            if connect_options != 0 {
+            if existing.connect_options == 0 && connect_options != 0 {
                 existing.connect_options = connect_options;
             }
             return;
         }
 
         if entries.len() >= self.max_per_file {
-            entries.sort_by_key(|e| e.last_seen);
-            entries.remove(0);
+            // Prefer evicting anonymous, never-contacted gossip entries
+            // (raw SX/EPX hints we've never even tried to reach) over
+            // sources we've already identified or attempted — otherwise a
+            // peer can flood OP_ANSWERSOURCES with fresh (ip, port) pairs
+            // to push out legitimate, previously-verified sources purely
+            // by being newer than them.
+            let evict_idx = entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.user_hash == [0u8; 16] && e.last_asked == 0)
+                .min_by_key(|(_, e)| e.last_seen)
+                .map(|(i, _)| i)
+                .unwrap_or_else(|| {
+                    entries
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, e)| e.last_seen)
+                        .map(|(i, _)| i)
+                        .unwrap_or(0)
+                });
+            entries.remove(evict_idx);
         }
 
         entries.push(SourceEntry {
@@ -1298,6 +1325,16 @@ impl SourceManager {
         }
         let file_count = read_u32(&data, pos);
         pos += 4;
+        // Cap how many *new* file entries this load can create. Each file
+        // record needs only 18 bytes (hash + src_count) regardless of how
+        // many sources it actually lists, so a crafted/corrupted
+        // `sources.met` could otherwise cheaply inflate `self.sources` with
+        // thousands of near-empty entries well past `MAX_TRACKED_FILES` —
+        // a limit normal operation (`cleanup_expired`) never lets it
+        // exceed. Files already tracked (e.g. an in-progress download)
+        // don't count against this budget since we're merging into them,
+        // not growing the map.
+        let mut new_file_budget = MAX_TRACKED_FILES.saturating_sub(self.sources.len());
         let mut loaded = 0usize;
         for _ in 0..file_count {
             if pos + 18 > data.len() {
@@ -1308,6 +1345,18 @@ impl SourceManager {
             pos += 16;
             let src_count = read_u16(&data, pos);
             pos += 2;
+            let is_new_file = !self.sources.contains_key(&fh);
+            if is_new_file {
+                if new_file_budget == 0 {
+                    // Still advance `pos` past this file's source records
+                    // so the rest of the file parses correctly; we just
+                    // don't create a tracking entry for it.
+                    let skip = (src_count as usize).saturating_mul(43);
+                    pos = pos.saturating_add(skip).min(data.len());
+                    continue;
+                }
+                new_file_budget -= 1;
+            }
             let entries = self.sources.entry(fh).or_default();
             for _ in 0..src_count {
                 // record = 4+2+2+4+2+16+1+4+8 = 43 bytes
@@ -1326,6 +1375,17 @@ impl SourceManager {
                 let client_id = read_u32(&data, pos + 31);
                 let last_seen = read_i64(&data, pos + 35);
                 pos += 43;
+
+                // Loopback/documentation/multicast/etc. addresses have no
+                // business being cached as download sources — the same
+                // filter wire-injected sources are held to before ever
+                // reaching a `SourceManager` (see `mod.rs`'s injection
+                // path). Without this, a crafted or tampered
+                // `sources.met` could seed bogus special-use IPs that get
+                // forwarded to other peers via SX.
+                if client_id == 0 && is_filtered_source_ip(&ip) {
+                    continue;
+                }
 
                 if let Some(existing) = entries
                     .iter_mut()
@@ -1956,5 +2016,164 @@ mod tests {
         assert!(known.last_seen > stale, "exact-hash row refreshed");
         assert_eq!(other.last_seen, stale, "unrelated row untouched");
         assert_eq!(other.user_hash, [0u8; 16], "unrelated row not stamped");
+    }
+
+    #[test]
+    fn register_source_does_not_overwrite_existing_identity() {
+        // A peer re-announcing an already-tracked (ip, port) via SX with a
+        // different user_hash must not corrupt our record of who that
+        // source actually is — only the first identity we learn for a
+        // given (ip, port) should stick.
+        let hash = [0x60; 16];
+        let ip = Ipv4Addr::new(10, 0, 0, 1);
+        let real_hash = [0xAA; 16];
+        let spoofed_hash = [0xBB; 16];
+
+        let mut sm = SourceManager::new();
+        sm.register_source_full_opts(hash, ip, 4662, 4672, real_hash, 1);
+        sm.register_source_full_opts(hash, ip, 4662, 4673, spoofed_hash, 2);
+
+        let entry = sm
+            .sources
+            .get(&hash)
+            .unwrap()
+            .iter()
+            .find(|e| e.ip == ip && e.tcp_port == 4662)
+            .unwrap();
+        assert_eq!(
+            entry.user_hash, real_hash,
+            "later re-announcement must not overwrite an already-known identity"
+        );
+        assert_eq!(
+            entry.connect_options, 1,
+            "later re-announcement must not overwrite already-known crypt options"
+        );
+    }
+
+    #[test]
+    fn register_source_eviction_prefers_anonymous_never_asked_entries() {
+        // At capacity, a newly-seen anonymous source must not be able to
+        // evict an older but already-identified/contacted source purely by
+        // being newer — the least valuable entry (anonymous, never
+        // attempted) should go first regardless of raw age.
+        let hash = [0x61; 16];
+        let identified_ip = Ipv4Addr::new(10, 0, 0, 2);
+        let anon_ip = Ipv4Addr::new(10, 0, 0, 3);
+        let newcomer_ip = Ipv4Addr::new(10, 0, 0, 4);
+
+        // `set_max_per_file` clamps to a minimum of 50, so set the private
+        // field directly to exercise eviction with a small capacity.
+        let mut sm = SourceManager::new();
+        sm.max_per_file = 2;
+
+        sm.register_source_full_opts(hash, identified_ip, 4662, 0, [0xCC; 16], 0);
+        sm.register_source_full_opts(hash, anon_ip, 4663, 0, [0u8; 16], 0);
+
+        // Make the identified source the OLDER of the two by `last_seen`
+        // (and mark it as having actually been contacted) so a naive
+        // oldest-wins eviction would pick it over the younger anonymous
+        // entry — the fix must still prefer evicting the anonymous one.
+        {
+            let entries = sm.sources.get_mut(&hash).unwrap();
+            for e in entries.iter_mut() {
+                if e.ip == identified_ip {
+                    e.last_seen -= 1000;
+                    e.last_asked = chrono::Utc::now().timestamp();
+                }
+            }
+        }
+
+        sm.register_source_full_opts(hash, newcomer_ip, 4664, 0, [0u8; 16], 0);
+
+        let ips: Vec<_> = sm
+            .sources
+            .get(&hash)
+            .unwrap()
+            .iter()
+            .map(|e| e.ip)
+            .collect();
+        assert!(
+            ips.contains(&identified_ip),
+            "older but identified/contacted source must survive eviction"
+        );
+        assert!(
+            !ips.contains(&anon_ip),
+            "anonymous never-contacted source must be evicted first"
+        );
+        assert!(ips.contains(&newcomer_ip));
+    }
+
+    #[test]
+    fn load_from_disk_caps_new_file_entries_at_max_tracked_files() {
+        // A crafted/corrupted sources.met with a huge file_count must not be
+        // able to inflate `self.sources` past MAX_TRACKED_FILES, since each
+        // file record costs only 18 bytes regardless of how many sources it
+        // lists.
+        let dir = std::env::temp_dir().join(format!(
+            "ember_sources_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sources_cap_test.met");
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"ESRC");
+        buf.push(1);
+        let file_count: u32 = (MAX_TRACKED_FILES as u32) + 50;
+        buf.extend_from_slice(&file_count.to_le_bytes());
+        for i in 0..file_count {
+            let mut fh = [0u8; 16];
+            fh[0..4].copy_from_slice(&i.to_le_bytes());
+            buf.extend_from_slice(&fh);
+            buf.extend_from_slice(&0u16.to_le_bytes()); // src_count = 0
+        }
+        std::fs::write(&path, &buf).unwrap();
+
+        let mut sm = SourceManager::new();
+        sm.load_from_disk(&path).unwrap();
+        assert!(
+            sm.sources.len() <= MAX_TRACKED_FILES,
+            "load must not create more than MAX_TRACKED_FILES entries, got {}",
+            sm.sources.len()
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn load_from_disk_skips_special_use_ips() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember_sources_test2_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sources_ipfilter_test.met");
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"ESRC");
+        buf.push(1);
+        buf.extend_from_slice(&1u32.to_le_bytes()); // file_count = 1
+        let fh = [0x77u8; 16];
+        buf.extend_from_slice(&fh);
+        buf.extend_from_slice(&1u16.to_le_bytes()); // src_count = 1
+        // One 43-byte source record with a loopback IP (127.0.0.1).
+        buf.extend_from_slice(&[127, 0, 0, 1]); // ip
+        buf.extend_from_slice(&4662u16.to_le_bytes()); // tcp_port
+        buf.extend_from_slice(&4672u16.to_le_bytes()); // udp_port
+        buf.extend_from_slice(&0u32.to_le_bytes()); // server_ip
+        buf.extend_from_slice(&0u16.to_le_bytes()); // server_port
+        buf.extend_from_slice(&[0u8; 16]); // user_hash
+        buf.push(0); // connect_options
+        buf.extend_from_slice(&0u32.to_le_bytes()); // client_id (0 = HighID)
+        buf.extend_from_slice(&0i64.to_le_bytes()); // last_seen
+        std::fs::write(&path, &buf).unwrap();
+
+        let mut sm = SourceManager::new();
+        let loaded = sm.load_from_disk(&path).unwrap();
+        assert_eq!(loaded, 0, "loopback source must be filtered out on load");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 }

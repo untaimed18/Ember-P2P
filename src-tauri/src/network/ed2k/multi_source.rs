@@ -5333,9 +5333,13 @@ async fn download_parts_from_source(
                         parts_vec.len()
                     );
                     let mut padded = parts_vec;
-                    if padded.len() < part_count {
-                        padded.resize(part_count, false);
-                    }
+                    // Pad short bitmaps up to `part_count`; truncate ones
+                    // longer than the file actually has (a peer can send
+                    // an arbitrarily long bitmap) so `src_available_parts`
+                    // /`src_total_parts` below can't report more parts than
+                    // the file has, even though `ChunkSelector` itself
+                    // already bounds-checks and ignores the extra bits.
+                    padded.resize(part_count, false);
                     peer_file_status = Some(padded);
                 }
             }
@@ -5394,9 +5398,9 @@ async fn download_parts_from_source(
                             parts_vec.len()
                         );
                         let mut padded = parts_vec;
-                        if padded.len() < part_count {
-                            padded.resize(part_count, false);
-                        }
+                        // See the standalone OP_FILESTATUS branch above:
+                        // pad short bitmaps, truncate long ones.
+                        padded.resize(part_count, false);
                         peer_file_status = Some(padded);
                     }
                     got_status = true;
@@ -8489,6 +8493,28 @@ fn parse_sending_part_32(payload: &[u8]) -> std::io::Result<([u8; 16], u64, u64,
     hash.copy_from_slice(&payload[..16]);
     let start = u32::from_le_bytes([payload[16], payload[17], payload[18], payload[19]]) as u64;
     let end = u32::from_le_bytes([payload[20], payload[21], payload[22], payload[23]]) as u64;
+    // Enforce the declared (end - start) matches the actual trailing data,
+    // same as `parse_sending_part_i64` — today's call sites happen to
+    // re-check this themselves, but a parser that silently hands back
+    // whatever bytes follow the header (regardless of what the peer
+    // *claimed* the block size was) is one missed call-site check away
+    // from a length-confusion bug on attacker-controlled data.
+    let expected_len = end.checked_sub(start).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "part end before start")
+    })?;
+    let expected_len = usize::try_from(expected_len).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("sending part length too large: {expected_len}"),
+        )
+    })?;
+    let data_len = payload.len() - 24;
+    if data_len != expected_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("sending part length mismatch: expected {expected_len}, got {data_len}"),
+        ));
+    }
     Ok((hash, start, end, &payload[24..]))
 }
 
@@ -8729,6 +8755,45 @@ pub async fn perform_outbound_hello(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn build_sending_part_32(hash: [u8; 16], start: u32, end: u32, data: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(24 + data.len());
+        buf.extend_from_slice(&hash);
+        buf.extend_from_slice(&start.to_le_bytes());
+        buf.extend_from_slice(&end.to_le_bytes());
+        buf.extend_from_slice(data);
+        buf
+    }
+
+    #[test]
+    fn parse_sending_part_32_accepts_matching_length() {
+        let hash = [0x11; 16];
+        let data = vec![0xABu8; 100];
+        let payload = build_sending_part_32(hash, 1000, 1100, &data);
+        let (h, start, end, out) = parse_sending_part_32(&payload).unwrap();
+        assert_eq!(h, hash);
+        assert_eq!(start, 1000);
+        assert_eq!(end, 1100);
+        assert_eq!(out, &data[..]);
+    }
+
+    #[test]
+    fn parse_sending_part_32_rejects_length_mismatch() {
+        let hash = [0x22; 16];
+        let short_data = vec![0xCDu8; 50];
+        let payload = build_sending_part_32(hash, 1000, 1100, &short_data);
+        assert!(
+            parse_sending_part_32(&payload).is_err(),
+            "declared block length must match the actual trailing data"
+        );
+    }
+
+    #[test]
+    fn parse_sending_part_32_rejects_end_before_start() {
+        let hash = [0x33; 16];
+        let payload = build_sending_part_32(hash, 2000, 1000, &[]);
+        assert!(parse_sending_part_32(&payload).is_err());
+    }
 
     #[test]
     fn injection_wait_breaks_when_channel_is_closed() {
