@@ -7,7 +7,12 @@ use super::types::*;
 
 const MAX_ENTRIES_PER_KEY: usize = 1000;
 const MAX_TOTAL_ENTRIES: usize = 50_000;
-const KEYWORD_TTL_SECS: i64 = 86_400; // 24 hours
+/// How long a keyword entry we're storing *for another node* survives
+/// before we evict it. `publish::keyword_republish_interval` assumes
+/// every other KAD node enforces this same TTL against entries *we*
+/// publish, and caps its load-based backoff so we always renew before
+/// theirs would expire — keep the two in sync if this changes.
+pub(super) const KEYWORD_TTL_SECS: i64 = 86_400; // 24 hours
 const SOURCE_TTL_SECS: i64 = 18_000; // 5 hours
 const NOTES_TTL_SECS: i64 = 86_400; // 24 hours
 const MAX_NOTES_PER_FILE: usize = 150;

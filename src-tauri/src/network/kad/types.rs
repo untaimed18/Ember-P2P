@@ -852,20 +852,32 @@ impl KadTag {
     }
 }
 
-/// Maximum tags per tag list (eMule typically sends < 10 tags per message)
+/// Maximum tags per tag list we *keep* (eMule typically sends < 10 tags per
+/// message). The wire count is a single byte, so a sender can legitimately
+/// declare up to 255 — `write_tag_list` allows exactly that — and rejecting
+/// anything past this cap outright used to drop the *entire* message
+/// (HelloReq/HelloRes/PublishSourceReq/PublishNotesReq/... all share this
+/// reader). That made us silently incompatible with any peer, compliant or
+/// not, that ever sent a legitimately larger tag list. We now cap how many
+/// tags we *retain* here but still fully parse and discard the rest, so the
+/// reader cursor stays correctly aligned for whatever follows the tag list
+/// in the packet — matching the same "skip surplus, don't drop the packet"
+/// fix already applied to the UDP search-result parser.
 const MAX_TAG_LIST_SIZE: usize = 32;
 
 pub fn read_tag_list<R: Read>(reader: &mut R) -> io::Result<Vec<KadTag>> {
     let count = reader.read_u8()? as usize;
-    if count > MAX_TAG_LIST_SIZE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("tag list too large: {count} (max {MAX_TAG_LIST_SIZE})"),
-        ));
+    let mut tags = Vec::with_capacity(count.min(MAX_TAG_LIST_SIZE));
+    for i in 0..count {
+        let tag = KadTag::read_from(reader)?;
+        if i < MAX_TAG_LIST_SIZE {
+            tags.push(tag);
+        }
     }
-    let mut tags = Vec::with_capacity(count);
-    for _ in 0..count {
-        tags.push(KadTag::read_from(reader)?);
+    if count > MAX_TAG_LIST_SIZE {
+        tracing::debug!(
+            "Tag list declared {count} tags, keeping first {MAX_TAG_LIST_SIZE} and discarding the rest"
+        );
     }
     Ok(tags)
 }
@@ -970,6 +982,54 @@ mod kad_tag_wire_layout_tests {
         assert_eq!(parsed[2].uint8_value(), Some(1));
         assert_eq!(parsed[3].uint64_value(), Some(1_234_567_890));
         assert_eq!(parsed[4].uint8_value(), Some(0x0C));
+    }
+
+    /// Regression guard: `write_tag_list` allows up to 255 tags (the wire
+    /// count is a single byte), and a legitimate peer is free to send that
+    /// many. `read_tag_list` used to hard-reject anything past
+    /// `MAX_TAG_LIST_SIZE` (32), dropping the *entire* containing message
+    /// (HelloReq/HelloRes/PublishSourceReq/...). It must instead keep the
+    /// first 32 and still fully consume the rest, so parsing succeeds and
+    /// the reader cursor lands exactly where a trailing field would expect.
+    #[test]
+    fn read_tag_list_keeps_cap_but_consumes_and_discards_surplus() {
+        let tags: Vec<KadTag> = (0..40u16)
+            .map(|i| KadTag {
+                name: TagName::Id(TAG_SOURCEPORT),
+                value: TagValue::Uint16(i),
+            })
+            .collect();
+        let mut buf = Vec::new();
+        write_tag_list(&mut buf, &tags).unwrap();
+
+        // Simulate a trailing field after the tag list in the containing
+        // packet, the way e.g. PublishSourceReq's sender_id follows its tags.
+        let sentinel: u32 = 0xDEAD_BEEF;
+        buf.extend_from_slice(&sentinel.to_le_bytes());
+
+        let mut cursor = std::io::Cursor::new(&buf);
+        let parsed = read_tag_list(&mut cursor).expect(
+            "a >32-tag list must still parse successfully, just with surplus tags dropped",
+        );
+        assert_eq!(
+            parsed.len(),
+            MAX_TAG_LIST_SIZE,
+            "must keep exactly the first {MAX_TAG_LIST_SIZE} tags"
+        );
+        assert_eq!(
+            parsed[0].uint16_value(),
+            Some(0),
+            "kept tags must be the first ones in wire order, not e.g. the last 32"
+        );
+
+        // The cursor must have advanced past all 40 tags, not just the 32
+        // kept ones, so the trailing sentinel reads back intact.
+        let mut trailing = [0u8; 4];
+        std::io::Read::read_exact(&mut cursor, &mut trailing).expect(
+            "reader must be positioned right after the full declared tag count, \
+             not just after the retained subset",
+        );
+        assert_eq!(u32::from_le_bytes(trailing), sentinel);
     }
 
     /// Short string values must serialise as `TAGTYPE_STRING` (u16 length +

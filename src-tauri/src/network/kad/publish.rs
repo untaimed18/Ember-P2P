@@ -6,10 +6,35 @@ use md4::Md4;
 use super::messages::*;
 use super::types::*;
 
-const REPUBLISH_KEYWORD_SECS: i64 = 24 * 3600;
+const REPUBLISH_KEYWORD_SECS: i64 = 20 * 3600;
 const REPUBLISH_SOURCE_SECS: i64 = 5 * 3600;
 const MAX_FILES_PER_KEYWORD_PUBLISH: usize = 150;
 const MAX_FILES_PER_KEYWORD_PACKET: usize = 50;
+
+/// K15's load-based backoff (see [`PublishManager::record_keyword_publish_load`])
+/// doubles the keyword republish interval each time a storing peer reports
+/// a near-full bucket, up to `1 << 4` = 16x. Left uncapped, that reaches
+/// `20h * 16` = 320h (~13.3 days) — vastly longer than the `KEYWORD_TTL_SECS`
+/// (24h) every other KAD node enforces against the entry we published.
+/// Once backoff kicks in even once, our keyword entries would expire
+/// everywhere and our shared files would drop out of keyword search for
+/// days while we're still online, defeating the entire point of
+/// publishing. Cap the backoff-adjusted interval so we always renew with
+/// at least this much margin before the TTL lapses, regardless of shift —
+/// the load-based backoff still meaningfully slows republishing within
+/// that ceiling, it just can't blow through the network's own expiry.
+const KEYWORD_REPUBLISH_SAFETY_MARGIN_SECS: i64 = 2 * 3600;
+
+/// Backoff-adjusted keyword republish interval for a given `backoff_shift`,
+/// clamped so it never exceeds `store::KEYWORD_TTL_SECS` minus a safety
+/// margin. See `KEYWORD_REPUBLISH_SAFETY_MARGIN_SECS` for why the cap is
+/// necessary and `store::KEYWORD_TTL_SECS`'s doc comment for the other side
+/// of this invariant.
+fn keyword_republish_interval(backoff_shift: u32) -> i64 {
+    let shift = backoff_shift.min(4);
+    let uncapped = REPUBLISH_KEYWORD_SECS.saturating_mul(1_i64 << shift);
+    uncapped.min(super::store::KEYWORD_TTL_SECS.saturating_sub(KEYWORD_REPUBLISH_SAFETY_MARGIN_SECS))
+}
 
 /// Bit set in the `"ember"` source-publish tag when this client speaks
 /// the v1 LowID-to-LowID protocol (rendezvous hole-punch + WebSocket
@@ -224,8 +249,7 @@ impl PublishManager {
         self.keyword_records
             .values()
             .filter(|record| {
-                let shift = record.backoff_shift.min(4);
-                let interval = REPUBLISH_KEYWORD_SECS.saturating_mul(1_i64 << shift);
+                let interval = keyword_republish_interval(record.backoff_shift);
                 now.saturating_sub(record.last_publish) > interval
                     && self.keyword_has_publishable_files(&record.keyword)
             })
@@ -269,8 +293,7 @@ impl PublishManager {
         let next = round_robin_next(&self.keyword_records, &mut self.keyword_cursor)?;
         let now = chrono::Utc::now().timestamp();
         let record = self.keyword_records.get(&next)?;
-        let shift = record.backoff_shift.min(4);
-        let interval = REPUBLISH_KEYWORD_SECS.saturating_mul(1_i64 << shift);
+        let interval = keyword_republish_interval(record.backoff_shift);
         if now.saturating_sub(record.last_publish) <= interval {
             return None;
         }
@@ -914,6 +937,33 @@ mod tests {
             second_sweep, first_sweep,
             "sweep order must repeat identically"
         );
+    }
+
+    /// Regression guard: K15's load-based backoff must never stretch the
+    /// keyword republish interval past what `store::KEYWORD_TTL_SECS`
+    /// allows, or our published entries expire on every other node before
+    /// we renew them. Check every possible `backoff_shift` value (the
+    /// real range, plus a couple past the `.min(4)` clamp) stays under the
+    /// TTL with the mandated safety margin.
+    #[test]
+    fn keyword_republish_interval_never_exceeds_store_ttl_minus_margin() {
+        let ceiling = super::super::store::KEYWORD_TTL_SECS - KEYWORD_REPUBLISH_SAFETY_MARGIN_SECS;
+        for shift in 0..=10u32 {
+            let interval = keyword_republish_interval(shift);
+            assert!(
+                interval <= ceiling,
+                "shift {shift} produced interval {interval}s, exceeding the \
+                 {ceiling}s ceiling derived from KEYWORD_TTL_SECS"
+            );
+        }
+        // The backoff must still do something within the ceiling: a higher
+        // shift should never republish *more* often than a lower one.
+        for shift in 0..10u32 {
+            assert!(
+                keyword_republish_interval(shift) <= keyword_republish_interval(shift + 1),
+                "backoff interval must be monotonically non-decreasing with shift"
+            );
+        }
     }
 
     /// Reconciling the shared-file set with `retain_files` must keep the
