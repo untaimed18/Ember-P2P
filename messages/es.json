@@ -1615,6 +1615,8 @@
   "settings_filter_incoming_hint": "Aplicar el filtro IP a las conexiones entrantes de pares. Los usuarios de VPN pueden necesitar desactivarlo, ya que las IPs de VPN suelen aparecer en las listas de filtros.",
   "settings_block_private_label": "Bloquear IPs privadas",
   "settings_block_private_hint": "Rechazar 10.x, 192.168.x, etc. de la tabla de rutas.",
+  "settings_allow_shared_browse_label": "Permitir explorar mis archivos compartidos",
+  "settings_allow_shared_browse_hint": "Permite que eMule, aMule, MLDonkey y otros clientes ed2k vean tu lista de archivos compartidos ('Ver archivos'). Desactivado por defecto: cuando está desactivado, las solicitudes de exploración reciben una denegación educada en lugar de tu lista de archivos.",
   "settings_antileech_label": "Filtro anti-leech",
   "settings_antileech_hint": "Rechazar conexiones entrantes de pares de clientes leech conocidos.",
   "settings_antileech_loading": "Cargando patrones...",

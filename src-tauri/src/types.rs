@@ -560,6 +560,19 @@ pub struct AppSettings {
     /// misbehaving inbound peers.
     #[serde(default)]
     pub filter_incoming_connections: bool,
+    /// Answer standard ed2k "View Files" requests (`OP_ASKSHAREDFILES`) from
+    /// any peer — eMule, aMule, MLDonkey, or any other compatible client —
+    /// with our real shared-file list (`OP_ASKSHAREDFILESANSWER`). This is
+    /// the classic eDonkey2000/eMule "browse shared files" feature; it is
+    /// unrelated to the Ember-only friend browse feature
+    /// (`friend_browse_disabled`), which uses a separate, authenticated
+    /// mechanism. Off by default: exposing your file list to any anonymous
+    /// peer is a new capability, not a restriction on an existing one, so
+    /// it must be explicitly opted into. When off, requests get a polite
+    /// `OP_ASKSHAREDDENIEDANS` refusal rather than being silently dropped,
+    /// matching real eMule's "deny" behavior.
+    #[serde(default)]
+    pub allow_shared_files_browse: bool,
     /// Block private/reserved IPs from being added to the routing table
     #[serde(default = "default_true")]
     pub block_private_ips: bool,
@@ -978,6 +991,7 @@ impl Default for AppSettings {
             obfuscation_enabled: true,
             ip_filter_enabled: true,
             filter_incoming_connections: false,
+            allow_shared_files_browse: false,
             block_private_ips: true,
             filter_servers_by_ip: true,
             add_servers_from_server: true,

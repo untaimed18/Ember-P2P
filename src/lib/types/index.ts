@@ -340,6 +340,11 @@ export interface AppSettings {
   obfuscation_enabled: boolean;
   ip_filter_enabled: boolean;
   filter_incoming_connections: boolean;
+  /** Answer standard ed2k "View Files" requests from any compatible client
+   *  (eMule, aMule, MLDonkey, ...) with our real shared-file list. Off by
+   *  default. Unrelated to `friend_browse_disabled`, which gates the
+   *  separate Ember-only friend browse feature. */
+  allow_shared_files_browse: boolean;
   block_private_ips: boolean;
   filter_servers_by_ip: boolean;
   add_servers_from_server: boolean;

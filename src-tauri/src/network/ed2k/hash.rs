@@ -214,9 +214,17 @@ pub fn hash_file_combined_cancellable(
             if ed2k_part_remaining == 0 && !is_single_part {
                 ed2k_part_hashes.extend_from_slice(&ed2k_part_hasher.finalize_reset());
                 ed2k_part_remaining = file_remaining.min(PARTSIZE);
-            }
 
-            if aich_block_remaining == 0 {
+                // AICH blocks never straddle a part boundary — eMule's
+                // CAICHHashTree hashes each part's blocks independently
+                // (SHAHashSet.cpp), so force-finalize the current block
+                // here even if it's short of a full AICH_BLOCK_SIZE (this
+                // is *always* the case, since PARTSIZE isn't a multiple of
+                // AICH_BLOCK_SIZE), then start the next part's block count
+                // fresh from its own beginning.
+                aich_leaf_hashes.push(aich_block_hasher.finalize_reset().into());
+                aich_block_remaining = file_remaining.min(aich_block_size);
+            } else if aich_block_remaining == 0 {
                 aich_leaf_hashes.push(aich_block_hasher.finalize_reset().into());
                 aich_block_remaining = file_remaining.min(aich_block_size);
             }
@@ -552,5 +560,51 @@ mod link_tests {
         let link = format!("ed2k://|file|a.bin|9|{HASH}|h=10101010101010101010101010101010|/");
         let (_, _, _, aich) = parse_ed2k_link(&link).expect("parse");
         assert!(aich.is_none());
+    }
+}
+
+#[cfg(test)]
+mod combined_hash_tests {
+    use super::*;
+
+    /// Cross-validates the two independent AICH-hashing code paths — the
+    /// streaming combined ed2k+AICH hasher used when sharing a real file,
+    /// and `AICHRecoveryHashSet::build_from_file`'s own read — against each
+    /// other on a genuine multi-part (3-part) file. Both must reset AICH
+    /// block boundaries at every PARTSIZE boundary (`PARTSIZE %
+    /// AICH_BLOCK_SIZE != 0`, so this only exercises correctly if the reset
+    /// actually happens); if either regresses to continuous whole-file
+    /// block chunking, this test will fail because the two paths would
+    /// diverge (or a shared bug would need to affect both identically).
+    #[test]
+    fn combined_aich_hash_matches_build_from_file_for_multi_part() {
+        let aich_block_size = super::super::aich::AICH_BLOCK_SIZE as u64;
+        let file_size = PARTSIZE * 2 + aich_block_size;
+        let path = std::env::temp_dir().join(format!(
+            "ember-hash-test-{}-{}.bin",
+            std::process::id(),
+            file_size
+        ));
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&path).expect("create temp file");
+            let chunk = vec![0x37u8; 1024 * 1024];
+            let mut remaining = file_size;
+            while remaining > 0 {
+                let n = remaining.min(chunk.len() as u64) as usize;
+                f.write_all(&chunk[..n]).expect("write temp file");
+                remaining -= n as u64;
+            }
+        }
+
+        static NEVER: AtomicBool = AtomicBool::new(false);
+        let (_, combined_aich_hex) =
+            hash_file_combined_cancellable(&path, &NEVER).expect("combined hash");
+        let hs = super::super::aich::AICHRecoveryHashSet::build_from_file(&path)
+            .expect("build_from_file");
+
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(combined_aich_hex, hex::encode(hs.root_hash));
     }
 }

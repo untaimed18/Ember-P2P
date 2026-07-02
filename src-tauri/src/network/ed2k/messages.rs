@@ -21,6 +21,18 @@ pub const OP_REQUESTPARTS: u8 = 0x47;
 pub const OP_SENDINGPART: u8 = 0x46;
 pub const OP_END_OF_DOWNLOAD: u8 = 0x49;
 pub const OP_FILEREQANSNOFIL: u8 = 0x48;
+/// "View Files" request — no payload. Vanilla eMule's context-menu
+/// "Show shared files" action, and the mechanism every ed2k-compatible
+/// client (eMule, aMule, MLDonkey, ...) uses to browse a peer's shared
+/// library over an already-established client-to-client session.
+pub const OP_ASKSHAREDFILES: u8 = 0x4A;
+/// Reply to [`OP_ASKSHAREDFILES`]: `<count 4>(<HASH 16><ID 4><PORT 2><1
+/// Tag_set>)[count]` — identical per-file shape to `OP_OFFERFILES`.
+pub const OP_ASKSHAREDFILESANSWER: u8 = 0x4B;
+/// Polite refusal sent instead of [`OP_ASKSHAREDFILESANSWER`] when the
+/// local user has browsing disabled (eMule: "denied" reply so the asker's
+/// UI shows "Access denied" rather than timing out). No payload.
+pub const OP_ASKSHAREDDENIEDANS: u8 = 0x61;
 
 // Extended opcodes (OP_EMULEPROT)
 pub const OP_EMULEINFO: u8 = 0x01;
@@ -515,7 +527,10 @@ fn build_hello_inner(
 }
 
 /// Write a single ed2k tag in old format (type, name_len=1, name_id, value).
-fn write_ed2k_tag(buf: &mut Vec<u8>, name_id: u8, value: &Ed2kTagValue) {
+///
+/// `pub(super)` so sibling modules (e.g. `upload`'s `OP_ASKSHAREDFILESANSWER`
+/// builder) can reuse the same tested tag encoder instead of duplicating it.
+pub(super) fn write_ed2k_tag(buf: &mut Vec<u8>, name_id: u8, value: &Ed2kTagValue) {
     match value {
         Ed2kTagValue::String(s) => {
             buf.write_u8(0x02).unwrap();

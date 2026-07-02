@@ -771,6 +771,220 @@ fn apply_udp_uint_tag(
     }
 }
 
+/// Read and apply a single ED2K tag from a UDP search-result record. Shared
+/// by both the "applied" tag loop below (writes into the real result
+/// fields) and the surplus-tag discard loop for `tag_count > MAX_APPLIED_TAGS`
+/// (writes into throwaway locals purely to keep the cursor aligned for the
+/// next result record) — mirrors `server.rs::parse_search_result`'s
+/// surplus-tag skip so a record that legitimately declares more tags than
+/// the cap doesn't desync the rest of the datagram. Returns `false` on any
+/// decode failure; callers must stop consuming this record's tags (and,
+/// unlike the old inline `?`-based header reads this replaces, never
+/// propagates a hard abort of the whole packet — a single malformed tag
+/// only desyncs its own record, not results already parsed).
+fn read_udp_search_tag(
+    cursor: &mut Cursor<&[u8]>,
+    payload: &[u8],
+    file_name: &mut String,
+    file_size: &mut u64,
+    rating: &mut Option<u8>,
+    comment: &mut Option<String>,
+    media: &mut crate::types::MediaMetadata,
+) -> bool {
+    const MAX_UDP_TAG_NAME_LEN: usize = 256;
+
+    let raw_type = match cursor.read_u8() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let (name_id, tag_type, tag_name) = if raw_type & 0x80 != 0 {
+        let t = raw_type & 0x7F;
+        let n = match cursor.read_u8() {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        (n, t, None)
+    } else {
+        let name_len = match cursor.read_u16::<LittleEndian>() {
+            Ok(v) => v as usize,
+            Err(_) => return false,
+        };
+        if name_len == 1 {
+            let n = match cursor.read_u8() {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            (n, raw_type, None)
+        } else {
+            if name_len > MAX_UDP_TAG_NAME_LEN {
+                return false;
+            }
+            // Bound the name allocation by the bytes actually left in the
+            // packet so a bogus length can't force a large transient buffer
+            // (the read would fail anyway).
+            let remaining = payload.len().saturating_sub(cursor.position() as usize);
+            if name_len > remaining {
+                return false;
+            }
+            // Preserve the string name so ED2K media tags
+            // ("length"/"bitrate"/"codec"/...) can be matched.
+            let mut name_buf = vec![0u8; name_len];
+            if std::io::Read::read_exact(cursor, &mut name_buf).is_err() {
+                return false;
+            }
+            (
+                0u8,
+                raw_type,
+                Some(String::from_utf8_lossy(&name_buf).to_ascii_lowercase()),
+            )
+        }
+    };
+    let tag_name = tag_name.as_deref();
+
+    match tag_type {
+        0x01 => {
+            // TAGTYPE_HASH
+            let mut buf = [0u8; 16];
+            std::io::Read::read_exact(cursor, &mut buf).is_ok()
+        }
+        0x02 => {
+            // TAGTYPE_STRING
+            let slen = cursor.read_u16::<LittleEndian>().ok().unwrap_or(0) as usize;
+            let start = cursor.position() as usize;
+            let end = start.saturating_add(slen);
+            if end > payload.len() {
+                false
+            } else {
+                let bytes = &payload[start..end];
+                cursor.set_position(end as u64);
+                let keep = &bytes[..bytes.len().min(8192)];
+                let value = String::from_utf8_lossy(keep).to_string();
+                apply_udp_string_tag(name_id, tag_name, value, file_name, comment, media);
+                true
+            }
+        }
+        0x03 => {
+            // TAGTYPE_UINT32
+            if let Ok(v) = cursor.read_u32::<LittleEndian>() {
+                match name_id {
+                    0x02 => *file_size = (*file_size & 0xFFFF_FFFF_0000_0000) | v as u64,
+                    0x3A => {
+                        *file_size = (*file_size & 0x0000_0000_FFFF_FFFF) | ((v as u64) << 32)
+                    }
+                    _ => apply_udp_uint_tag(name_id, tag_name, v as u64, rating, media),
+                }
+                true
+            } else {
+                false
+            }
+        }
+        0x04 => {
+            let mut b = [0u8; 4];
+            std::io::Read::read_exact(cursor, &mut b).is_ok()
+        }
+        0x05 => {
+            let _ = cursor.read_u8();
+            true
+        }
+        0x06 => {
+            // TAGTYPE_BOOLARRAY
+            if let Ok(count) = cursor.read_u16::<LittleEndian>() {
+                let bc = (count as usize + 7) / 8;
+                let pos = cursor.position() as usize;
+                if pos + bc <= payload.len() {
+                    cursor.set_position((pos + bc) as u64);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        }
+        0x07 => {
+            // TAGTYPE_BLOB
+            if let Ok(bl) = cursor.read_u32::<LittleEndian>() {
+                let bl = bl as usize;
+                let pos = cursor.position() as usize;
+                if bl <= 1_000_000 && pos + bl <= payload.len() {
+                    cursor.set_position((pos + bl) as u64);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        }
+        0x08 => {
+            // TAGTYPE_UINT16
+            if let Ok(v) = cursor.read_u16::<LittleEndian>() {
+                if name_id == 0x02 {
+                    *file_size = v as u64;
+                } else {
+                    apply_udp_uint_tag(name_id, tag_name, v as u64, rating, media);
+                }
+                true
+            } else {
+                false
+            }
+        }
+        0x09 => {
+            // TAGTYPE_UINT8
+            if let Ok(v) = cursor.read_u8() {
+                if name_id == 0x02 {
+                    *file_size = v as u64;
+                } else {
+                    apply_udp_uint_tag(name_id, tag_name, v as u64, rating, media);
+                }
+                true
+            } else {
+                false
+            }
+        }
+        0x0A => {
+            // TAGTYPE_BSOB
+            if let Ok(bl) = cursor.read_u8() {
+                let pos = cursor.position() as usize + bl as usize;
+                if pos <= payload.len() {
+                    cursor.set_position(pos as u64);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        }
+        0x0B => {
+            // TAGTYPE_UINT64
+            if let Ok(v) = cursor.read_u64::<LittleEndian>() {
+                if name_id == 0x02 {
+                    *file_size = v;
+                } else {
+                    apply_udp_uint_tag(name_id, tag_name, v, rating, media);
+                }
+                true
+            } else {
+                false
+            }
+        }
+        t if (0x11..=0x20).contains(&t) => {
+            // TAGTYPE_STR1..STR16
+            let slen = (t - 0x11 + 1) as usize;
+            let mut sbuf = vec![0u8; slen];
+            if std::io::Read::read_exact(cursor, &mut sbuf).is_ok() {
+                let value = String::from_utf8_lossy(&sbuf).to_string();
+                apply_udp_string_tag(name_id, tag_name, value, file_name, comment, media);
+                true
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
 fn parse_search_results(payload: &[u8]) -> Option<ServerUdpResponse> {
     let mut cursor = Cursor::new(payload);
     let mut results = Vec::new();
@@ -781,9 +995,18 @@ fn parse_search_results(payload: &[u8]) -> Option<ServerUdpResponse> {
         if std::io::Read::read_exact(&mut cursor, &mut file_hash).is_err() {
             break;
         }
-        let client_id = cursor.read_u32::<LittleEndian>().ok()?;
-        let client_port = cursor.read_u16::<LittleEndian>().ok()?;
-        let tag_count = cursor.read_u32::<LittleEndian>().ok()? as usize;
+        let client_id = match cursor.read_u32::<LittleEndian>() {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        let client_port = match cursor.read_u16::<LittleEndian>() {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        let tag_count = match cursor.read_u32::<LittleEndian>() {
+            Ok(v) => v as usize,
+            Err(_) => break,
+        };
 
         let mut file_name = String::new();
         let mut file_size: u64 = 0;
@@ -796,227 +1019,53 @@ fn parse_search_results(payload: &[u8]) -> Option<ServerUdpResponse> {
         // the surplus tag bytes were never consumed and the cursor desynced —
         // dropping every subsequent result. Real search results carry well under
         // a dozen tags, so 256 keeps the cursor aligned for any realistic record
-        // while still treating an absurd count as abusive (break below).
+        // while still treating an absurd count as abusive.
         const MAX_APPLIED_TAGS: usize = 256;
-        // Cap a single tag-name length the same way the TCP parser does
-        // (read_tag_header's MAX_TAG_NAME_LEN). Otherwise a malicious reply could
-        // declare names up to the ~64 KiB UDP payload size, forcing large
-        // transient allocations (×tags ×results).
-        const MAX_UDP_TAG_NAME_LEN: usize = 256;
         let applied_tags = tag_count.min(MAX_APPLIED_TAGS);
         let mut tags_in_sync = true;
         for _ in 0..applied_tags {
-            let raw_type = cursor.read_u8().ok()?;
-            let (name_id, tag_type, tag_name) = if raw_type & 0x80 != 0 {
-                let t = raw_type & 0x7F;
-                let n = cursor.read_u8().ok()?;
-                (n, t, None)
-            } else {
-                let name_len = cursor.read_u16::<LittleEndian>().ok()? as usize;
-                if name_len == 1 {
-                    let n = cursor.read_u8().ok()?;
-                    (n, raw_type, None)
-                } else {
-                    if name_len > MAX_UDP_TAG_NAME_LEN {
-                        return None;
-                    }
-                    // Bound the name allocation by the bytes actually left in
-                    // the packet so a bogus length can't force a large transient
-                    // buffer (the read would fail anyway).
-                    let remaining = payload.len().saturating_sub(cursor.position() as usize);
-                    if name_len > remaining {
-                        return None;
-                    }
-                    // Preserve the string name so ED2K media tags
-                    // ("length"/"bitrate"/"codec"/...) can be matched.
-                    let mut name_buf = vec![0u8; name_len];
-                    std::io::Read::read_exact(&mut cursor, &mut name_buf).ok()?;
-                    (
-                        0u8,
-                        raw_type,
-                        Some(String::from_utf8_lossy(&name_buf).to_ascii_lowercase()),
-                    )
-                }
-            };
-            let tag_name = tag_name.as_deref();
-
-            let ok = match tag_type {
-                0x01 => {
-                    // TAGTYPE_HASH
-                    let mut buf = [0u8; 16];
-                    std::io::Read::read_exact(&mut cursor, &mut buf).is_ok()
-                }
-                0x02 => {
-                    // TAGTYPE_STRING
-                    let slen = cursor.read_u16::<LittleEndian>().ok().unwrap_or(0) as usize;
-                    let start = cursor.position() as usize;
-                    let end = start.saturating_add(slen);
-                    if end > payload.len() {
-                        false
-                    } else {
-                        let bytes = &payload[start..end];
-                        cursor.set_position(end as u64);
-                        let keep = &bytes[..bytes.len().min(8192)];
-                        let value = String::from_utf8_lossy(keep).to_string();
-                        apply_udp_string_tag(
-                            name_id,
-                            tag_name,
-                            value,
-                            &mut file_name,
-                            &mut comment,
-                            &mut media,
-                        );
-                        true
-                    }
-                }
-                0x03 => {
-                    // TAGTYPE_UINT32
-                    if let Ok(v) = cursor.read_u32::<LittleEndian>() {
-                        match name_id {
-                            0x02 => file_size = (file_size & 0xFFFF_FFFF_0000_0000) | v as u64,
-                            0x3A => {
-                                file_size = (file_size & 0x0000_0000_FFFF_FFFF) | ((v as u64) << 32)
-                            }
-                            _ => apply_udp_uint_tag(
-                                name_id,
-                                tag_name,
-                                v as u64,
-                                &mut rating,
-                                &mut media,
-                            ),
-                        }
-                        true
-                    } else {
-                        false
-                    }
-                }
-                0x04 => {
-                    let mut b = [0u8; 4];
-                    std::io::Read::read_exact(&mut cursor, &mut b).is_ok()
-                }
-                0x05 => {
-                    let _ = cursor.read_u8();
-                    true
-                }
-                0x06 => {
-                    // TAGTYPE_BOOLARRAY
-                    if let Ok(count) = cursor.read_u16::<LittleEndian>() {
-                        let bc = (count as usize + 7) / 8;
-                        let pos = cursor.position() as usize;
-                        if pos + bc <= payload.len() {
-                            cursor.set_position((pos + bc) as u64);
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                }
-                0x07 => {
-                    // TAGTYPE_BLOB
-                    if let Ok(bl) = cursor.read_u32::<LittleEndian>() {
-                        let bl = bl as usize;
-                        let pos = cursor.position() as usize;
-                        if bl <= 1_000_000 && pos + bl <= payload.len() {
-                            cursor.set_position((pos + bl) as u64);
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                }
-                0x08 => {
-                    // TAGTYPE_UINT16
-                    if let Ok(v) = cursor.read_u16::<LittleEndian>() {
-                        if name_id == 0x02 {
-                            file_size = v as u64;
-                        } else {
-                            apply_udp_uint_tag(
-                                name_id,
-                                tag_name,
-                                v as u64,
-                                &mut rating,
-                                &mut media,
-                            );
-                        }
-                        true
-                    } else {
-                        false
-                    }
-                }
-                0x09 => {
-                    // TAGTYPE_UINT8
-                    if let Ok(v) = cursor.read_u8() {
-                        if name_id == 0x02 {
-                            file_size = v as u64;
-                        } else {
-                            apply_udp_uint_tag(
-                                name_id,
-                                tag_name,
-                                v as u64,
-                                &mut rating,
-                                &mut media,
-                            );
-                        }
-                        true
-                    } else {
-                        false
-                    }
-                }
-                0x0A => {
-                    // TAGTYPE_BSOB
-                    if let Ok(bl) = cursor.read_u8() {
-                        let pos = cursor.position() as usize + bl as usize;
-                        if pos <= payload.len() {
-                            cursor.set_position(pos as u64);
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                }
-                0x0B => {
-                    // TAGTYPE_UINT64
-                    if let Ok(v) = cursor.read_u64::<LittleEndian>() {
-                        if name_id == 0x02 {
-                            file_size = v;
-                        } else {
-                            apply_udp_uint_tag(name_id, tag_name, v, &mut rating, &mut media);
-                        }
-                        true
-                    } else {
-                        false
-                    }
-                }
-                t if (0x11..=0x20).contains(&t) => {
-                    // TAGTYPE_STR1..STR16
-                    let slen = (t - 0x11 + 1) as usize;
-                    let mut sbuf = vec![0u8; slen];
-                    if std::io::Read::read_exact(&mut cursor, &mut sbuf).is_ok() {
-                        let value = String::from_utf8_lossy(&sbuf).to_string();
-                        apply_udp_string_tag(
-                            name_id,
-                            tag_name,
-                            value,
-                            &mut file_name,
-                            &mut comment,
-                            &mut media,
-                        );
-                        true
-                    } else {
-                        false
-                    }
-                }
-                _ => false,
-            };
-            if !ok {
+            if !read_udp_search_tag(
+                &mut cursor,
+                payload,
+                &mut file_name,
+                &mut file_size,
+                &mut rating,
+                &mut comment,
+                &mut media,
+            ) {
                 tags_in_sync = false;
                 break;
+            }
+        }
+
+        // A result may legitimately carry more than MAX_APPLIED_TAGS tags;
+        // consume (and discard) the surplus so the cursor stays aligned for
+        // the next result record. Without this, tag_count > 256 desyncs the
+        // parser and every subsequent result in the datagram decodes from
+        // the wrong offset (garbage hashes/names) — mirrors the TCP sibling
+        // in `server.rs::parse_search_result`. Only safe to run when the
+        // capped loop above stayed in sync.
+        if tags_in_sync && tag_count > applied_tags {
+            let (mut d_name, mut d_size, mut d_rating, mut d_comment, mut d_media) = (
+                String::new(),
+                0u64,
+                None,
+                None,
+                crate::types::MediaMetadata::default(),
+            );
+            for _ in applied_tags..tag_count {
+                if !read_udp_search_tag(
+                    &mut cursor,
+                    payload,
+                    &mut d_name,
+                    &mut d_size,
+                    &mut d_rating,
+                    &mut d_comment,
+                    &mut d_media,
+                ) {
+                    tags_in_sync = false;
+                    break;
+                }
             }
         }
 
@@ -1031,11 +1080,12 @@ fn parse_search_results(payload: &[u8]) -> Option<ServerUdpResponse> {
             media,
         });
 
-        // If a tag failed to decode, or the record declared more tags than the
-        // cap (so surplus tag bytes remain unconsumed), the cursor is no longer
-        // aligned to the next record. Stop here rather than decoding subsequent
-        // "results" from a mid-tag offset, which would emit garbage entries.
-        if !tags_in_sync || tag_count > applied_tags {
+        // If a tag failed to decode, the cursor is no longer aligned to the
+        // next record. Stop here rather than decoding subsequent "results"
+        // from a mid-tag offset, which would emit garbage entries. The
+        // surplus-tag discard above keeps us aligned on success, so only a
+        // genuine desync forces the break.
+        if !tags_in_sync {
             break;
         }
     }
@@ -1165,6 +1215,66 @@ mod tests {
                     "hash starting with header bytes must parse intact"
                 );
                 assert_eq!(files[1].1[0], (Ipv4Addr::new(9, 9, 9, 9), 4663, 0));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    /// A search result declaring more tags than `MAX_APPLIED_TAGS` (256) must
+    /// not desync the parser for subsequent results in the same datagram —
+    /// this mirrors the discard-surplus-tags fix ported from
+    /// `server.rs::parse_search_result`. Regression for: the UDP parser used
+    /// to `break` the whole record loop as soon as `tag_count > 256` even
+    /// when every one of the (capped) 256 applied tags decoded cleanly,
+    /// silently dropping every result after an oversized-but-benign record.
+    #[test]
+    fn parse_search_results_skips_surplus_tags_without_dropping_later_results() {
+        let addr: SocketAddr = "127.0.0.1:4665".parse().unwrap();
+        let hash_a = [0x11u8; 16];
+        let hash_b = [0x22u8; 16];
+
+        let mut packet = vec![OP_GLOBSEARCHRES];
+
+        // Record A: 300 tags (over the 256 cap), each a minimal 3-byte
+        // "short name" TAGTYPE_UINT8 tag (raw_type=0x80|0x09, name_id, value).
+        packet.extend_from_slice(&hash_a);
+        packet.extend_from_slice(&1234u32.to_le_bytes()); // client_id
+        packet.extend_from_slice(&4662u16.to_le_bytes()); // client_port
+        const SURPLUS_TAG_COUNT: u32 = 300;
+        packet.extend_from_slice(&SURPLUS_TAG_COUNT.to_le_bytes());
+        for _ in 0..SURPLUS_TAG_COUNT {
+            packet.push(0x80 | 0x09); // short-name TAGTYPE_UINT8
+            packet.push(0xEE); // arbitrary unrecognized name_id
+            packet.push(0x01); // 1-byte value
+        }
+
+        // Record B: a normal single-tag record with the real filename, laid
+        // out immediately after record A with no separator (same
+        // contiguous-record wire format `OP_GLOBFOUNDSOURCES` uses).
+        packet.extend_from_slice(&hash_b);
+        packet.extend_from_slice(&5678u32.to_le_bytes()); // client_id
+        packet.extend_from_slice(&4663u16.to_le_bytes()); // client_port
+        packet.extend_from_slice(&1u32.to_le_bytes()); // tag_count
+        packet.push(0x80 | 0x02); // short-name TAGTYPE_STRING
+        packet.push(0x01); // name_id = FT_FILENAME
+        let name = b"test.txt";
+        packet.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        packet.extend_from_slice(name);
+
+        let parsed = parse_server_udp_response(&packet, addr).unwrap();
+        match parsed {
+            ServerUdpResponse::SearchResult { results } => {
+                assert_eq!(
+                    results.len(),
+                    2,
+                    "both records must parse despite record A's surplus tags"
+                );
+                assert_eq!(results[0].file_hash, hash_a);
+                assert_eq!(results[1].file_hash, hash_b);
+                assert_eq!(
+                    results[1].file_name, "test.txt",
+                    "record B's cursor must be correctly aligned, not desynced by record A"
+                );
             }
             other => panic!("unexpected response: {other:?}"),
         }

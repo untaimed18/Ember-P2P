@@ -1386,6 +1386,18 @@ fn spawn_rendezvous_friend_lookup(
     let fh_fc = friend_hashes.clone();
     let sess_fc = state.ember_sessions.clone();
     let ultx_fc = ul_event_tx.clone();
+    // Ember NAT-fallback context for `connect_friend_with_fallback`: a
+    // plain `TcpStream::connect` alone can't reach a friend whose NAT
+    // doesn't forward the advertised port, which used to be a hard dead
+    // end for this — the single choke point every offline-friend lookup
+    // (initial burst, auto-retry, disconnect-reconnect, manual
+    // find/retry commands) funnels through.
+    let nat_type_fc = state.nat_info.nat_type;
+    let ext_addr_fc = state.nat_info.external_addr;
+    let quic_ep_fc = state
+        .connection_broker
+        .as_ref()
+        .and_then(|b| b.quic_endpoint().cloned());
 
     tokio::spawn(async move {
         match rendezvous::lookup(&rv_url, &target_hash).await {
@@ -1457,7 +1469,7 @@ fn spawn_rendezvous_friend_lookup(
                         "Opening persistent session to {} after rendezvous friend discovery",
                         addr
                     );
-                    match ed2k::friend_connect::open_and_run_friend_session(
+                    match ed2k::friend_connect::connect_friend_with_fallback(
                         addr,
                         target_hash,
                         our_uh,
@@ -1472,6 +1484,10 @@ fn spawn_rendezvous_friend_lookup(
                         fh_fc,
                         Some(ed25519_pubkey),
                         Some(ed25519_secret_key),
+                        rv_url.clone(),
+                        nat_type_fc,
+                        ext_addr_fc,
+                        quic_ep_fc,
                     )
                     .await
                     {
@@ -2995,6 +3011,9 @@ struct NetworkState {
     /// Shared "filter incoming connections via IP filter" flag for the
     /// TCP accept loop.
     filter_incoming_shared: Arc<std::sync::atomic::AtomicBool>,
+    /// Shared "answer vanilla OP_ASKSHAREDFILES browse requests" flag for
+    /// the upload listener. Mirrors `settings.allow_shared_files_browse`.
+    share_browsing_shared: Arc<std::sync::atomic::AtomicBool>,
     /// Whether the EPX payload needs rebuilding (set on source changes, cleared after rebuild)
     ember_payload_dirty: bool,
     /// Known Ember peer addresses for peer discovery mesh building.
@@ -4906,6 +4925,9 @@ pub async fn start_network(
         filter_incoming_shared: Arc::new(std::sync::atomic::AtomicBool::new(
             settings.filter_incoming_connections,
         )),
+        share_browsing_shared: Arc::new(std::sync::atomic::AtomicBool::new(
+            settings.allow_shared_files_browse,
+        )),
         ember_payload_dirty: true,
         known_ember_peers: HashMap::new(),
         ember_noise_keys: HashMap::new(),
@@ -4957,9 +4979,23 @@ pub async fn start_network(
             let kept: Vec<_> = sets
                 .into_iter()
                 .take(MAX_AICH_HASH_SETS)
-                .map(|(root, leaves)| ed2k::aich::AICHRecoveryHashSet {
-                    root_hash: root,
-                    leaf_hashes: leaves,
+                .map(|(root, leaves)| {
+                    // known2_64.met (eMule's own format) doesn't store the
+                    // file size, only the master root + leaf hashes, so it
+                    // can't be recovered exactly here. That's fine: sets
+                    // loaded from this cache are only ever used to check
+                    // `root_hash` against already-verified roots and to be
+                    // re-persisted — never to build new
+                    // OP_AICHANSWER recovery data (that always goes through
+                    // `build_from_file` on the live file, which sets the
+                    // real size). Approximate for the `file_size` field so
+                    // it's never left as a misleading `0`.
+                    let file_size = leaves.len() as u64 * ed2k::aich::AICH_BLOCK_SIZE as u64;
+                    ed2k::aich::AICHRecoveryHashSet {
+                        root_hash: root,
+                        leaf_hashes: leaves,
+                        file_size,
+                    }
                 })
                 .collect();
             if total > MAX_AICH_HASH_SETS {
@@ -5118,6 +5154,14 @@ pub async fn start_network(
     // larger cushion prevents both.
     let (kad_callback_tx, mut kad_callback_rx) =
         mpsc::channel::<upload_server::KadCallbackParts>(256);
+
+    // Punch-responder / relay-invite adopted streams: pre-established,
+    // transport-encrypted connections handed to the upload listener to serve
+    // directly (we're the upload/source side; there's no matching active
+    // download for these, so they can't go through `kad_callback_tx`). See
+    // `upload_server::InboundStreamRequest`.
+    let (inbound_stream_tx, inbound_stream_rx) =
+        mpsc::channel::<upload_server::InboundStreamRequest>(256);
     let (udp_fw_check_tx, mut udp_fw_check_rx) =
         mpsc::channel::<upload_server::UdpFirewallCheckRequest>(16);
     let pending_kad_callbacks: upload_server::PendingKadCallbacks =
@@ -5307,6 +5351,7 @@ pub async fn start_network(
         let ul_antileech = shared_antileech.clone();
         let ul_skip_compress = state.skip_compress_video_shared.clone();
         let ul_filter_incoming = state.filter_incoming_shared.clone();
+        let ul_share_browsing = state.share_browsing_shared.clone();
         let ul_obfuscation = state.obfuscation_enabled_shared.clone();
         let ul_download_folder = settings.download_folder.clone();
         let ul_fw_probes = firewall_probe_ips.clone();
@@ -5324,6 +5369,7 @@ pub async fn start_network(
         let ul_disconnected = state.upload_disconnected.clone();
         let ul_queue = upload_queue_handle.clone();
         let ul_sx_overhead = stats_manager.sx_counters.clone();
+        let ul_inbound_stream_rx = inbound_stream_rx;
         tokio::spawn(async move {
             if let Err(e) = upload_server::start_upload_server(
                 tcp_port,
@@ -5352,6 +5398,7 @@ pub async fn start_network(
                 ul_antileech,
                 ul_skip_compress,
                 ul_filter_incoming,
+                ul_share_browsing,
                 ul_fw_probes,
                 ul_fw_shared,
                 ul_ext_ip_shared,
@@ -5372,6 +5419,7 @@ pub async fn start_network(
                 ul_queue,
                 ul_sx_overhead,
                 connect_serve_rx,
+                ul_inbound_stream_rx,
             )
             .await
             {
@@ -5896,6 +5944,10 @@ pub async fn start_network(
                         new_settings.filter_incoming_connections,
                         std::sync::atomic::Ordering::Relaxed,
                     );
+                    state.share_browsing_shared.store(
+                        new_settings.allow_shared_files_browse,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     state.uss_enabled_flag.store(new_settings.uss_enabled, std::sync::atomic::Ordering::Relaxed);
                     state.upload_max_slots.store(
                         new_settings.max_concurrent_uploads as usize,
@@ -6188,6 +6240,10 @@ pub async fn start_network(
                         );
                         state.filter_incoming_shared.store(
                             new_settings.filter_incoming_connections,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        state.share_browsing_shared.store(
+                            new_settings.allow_shared_files_browse,
                             std::sync::atomic::Ordering::Relaxed,
                         );
                         state.uss_enabled_flag.store(
@@ -6817,11 +6873,21 @@ pub async fn start_network(
                             let friend_addr = SocketAddr::new(v4.into(), port);
                             info!("Proactively opening friend session to {} at {}", hex::encode(friend_eh), friend_addr);
                             let ultx2 = ul_event_tx.clone();
+                            // NAT-fallback context — see `spawn_rendezvous_friend_lookup`'s
+                            // identical capture for why a plain TCP-only dial isn't enough.
+                            let rv_url = settings.rendezvous_url.clone();
+                            let nat_type = state.nat_info.nat_type;
+                            let ext_addr = state.nat_info.external_addr;
+                            let quic_ep = state
+                                .connection_broker
+                                .as_ref()
+                                .and_then(|b| b.quic_endpoint().cloned());
                             tokio::spawn(async move {
-                                if let Err(e) = ed2k::friend_connect::open_and_run_friend_session(
+                                if let Err(e) = ed2k::friend_connect::connect_friend_with_fallback(
                                     friend_addr, friend_eh, our_uh, our_eh, nick,
                                     cid, tcp, udp, obfs, sess, ultx, fh,
                                     Some(ed25519_pubkey), Some(ed25519_secret_key),
+                                    rv_url, nat_type, ext_addr, quic_ep,
                                 ).await {
                                     info!("Proactive friend session to {} failed: {e}", hex::encode(friend_eh));
                                     let _ = ultx2.send(upload_server::UploadEvent {
@@ -6920,14 +6986,22 @@ pub async fn start_network(
                     if let Ok(v4) = ip.parse::<Ipv4Addr>() {
                         if let Some(pfs) = state.per_file_sources.get_mut(transfer_id) {
                             match status.as_str() {
-                                "connecting" => pfs.set_connecting(v4, port),
-                                "queued" => pfs.set_on_queue(v4, port, *queue_rank),
-                                "queue_full" => pfs.set_on_queue(v4, port, None),
-                                "transferring" => pfs.set_downloading(v4, port),
+                                // `v4` at this call site always comes from an active
+                                // per-source connection worker (see `DownloadEvent::
+                                // SourceDetail`'s emitters), which by construction
+                                // requires a real, dialable IP — never the identity-only
+                                // `UNSPECIFIED` placeholder rows KAD/server LowID
+                                // publishes create — so `None` here can't collide with
+                                // an unrelated peer's row (see `PerFileSourceList::
+                                // resolve_idx`).
+                                "connecting" => pfs.set_connecting(v4, port, None),
+                                "queued" => pfs.set_on_queue(v4, port, *queue_rank, None),
+                                "queue_full" => pfs.set_on_queue(v4, port, None, None),
+                                "transferring" => pfs.set_downloading(v4, port, None),
                                 "completed" => {}
                                 "failed" => {
                                     if state.banned_ips.contains(&v4) {
-                                        pfs.set_banned(v4, port);
+                                        pfs.set_banned(v4, port, None);
                                     } else {
                                         let penalty = match failure_kind {
                                             Some(SourceFailureKind::Transient) => 1,
@@ -6935,13 +7009,13 @@ pub async fn start_network(
                                             Some(SourceFailureKind::Permanent) => 4,
                                             None => 1,
                                         };
-                                        pfs.set_failed_with_penalty(v4, port, penalty);
+                                        pfs.set_failed_with_penalty(v4, port, penalty, None);
                                     }
                                 }
-                                "no_needed_parts" => pfs.set_none_needed_parts(v4, port),
-                                "wait_callback" => pfs.set_wait_callback(v4, port),
-                                "wait_callback_kad" => pfs.set_wait_callback_kad(v4, port),
-                                "too_many_conns" => pfs.set_too_many_conns(v4, port),
+                                "no_needed_parts" => pfs.set_none_needed_parts(v4, port, None),
+                                "wait_callback" => pfs.set_wait_callback(v4, port, None),
+                                "wait_callback_kad" => pfs.set_wait_callback_kad(v4, port, None),
+                                "too_many_conns" => pfs.set_too_many_conns(v4, port, None),
                                 "low_to_low" => {
                                     let file_hash = pfs.file_hash();
                                     // Gate the broker on prior Ember-capability evidence.
@@ -6964,7 +7038,14 @@ pub async fn start_network(
                                         );
                                         false
                                     } else if let Some(ref mut broker) = state.connection_broker {
-                                        let ext = state.nat_info.external_addr;
+                                        // IP from the confirmed STUN mapping (proves we're
+                                        // actually reachable at *some* port), but the port we
+                                        // advertise to the peer must be our QUIC bind port —
+                                        // the peer's hole-punch dials that socket, not the KAD
+                                        // UDP socket `nat_info.external_addr` was probed on.
+                                        let ext = state.nat_info.external_addr.map(|addr| {
+                                            SocketAddr::new(addr.ip(), state.quic_port.unwrap_or(state.tcp_port))
+                                        });
                                         broker.attempt_low_to_low(
                                             transfer_id, file_hash, v4, port,
                                             state.nat_info.nat_type, ext,
@@ -6973,12 +7054,12 @@ pub async fn start_network(
                                         false
                                     };
                                     if broker_started {
-                                        pfs.set_ember_relay(v4, port);
+                                        pfs.set_ember_relay(v4, port, None);
                                     } else {
-                                        pfs.set_low_to_low(v4, port);
+                                        pfs.set_low_to_low(v4, port, None);
                                     }
                                 }
-                                "banned" => pfs.set_banned(v4, port),
+                                "banned" => pfs.set_banned(v4, port, None),
                                 _ => {}
                             }
                         }
@@ -8581,7 +8662,12 @@ pub async fn start_network(
                                                 );
                                                 false
                                             } else if let Some(ref mut broker) = state.connection_broker {
-                                                let ext = state.nat_info.external_addr;
+                                                // See the matching comment at the other
+                                                // `attempt_low_to_low` call site above: advertise
+                                                // our QUIC bind port, not the KAD-UDP-probed one.
+                                                let ext = state.nat_info.external_addr.map(|addr| {
+                                                    SocketAddr::new(addr.ip(), state.quic_port.unwrap_or(state.tcp_port))
+                                                });
                                                 broker.attempt_low_to_low(
                                                     &transfer_id, fh, cb_src.ip, cb_src.tcp_port,
                                                     state.nat_info.nat_type, ext,
@@ -8590,9 +8676,9 @@ pub async fn start_network(
                                                 false
                                             };
                                             if broker_started {
-                                                pfs.set_ember_relay(cb_src.ip, cb_src.tcp_port);
+                                                pfs.set_ember_relay(cb_src.ip, cb_src.tcp_port, cb_src.source_user_hash);
                                             } else {
-                                                pfs.set_low_to_low(cb_src.ip, cb_src.tcp_port);
+                                                pfs.set_low_to_low(cb_src.ip, cb_src.tcp_port, cb_src.source_user_hash);
                                             }
                                         }
                                     }
@@ -8600,7 +8686,7 @@ pub async fn start_network(
                                     let should_send = state
                                         .per_file_sources
                                         .get(&transfer_id)
-                                        .map(|pfs| pfs.callback_reask_due(cb_src.ip, cb_src.tcp_port))
+                                        .map(|pfs| pfs.callback_reask_due(cb_src.ip, cb_src.tcp_port, cb_src.source_user_hash))
                                         .unwrap_or(false);
                                     if !should_send {
                                         continue;
@@ -8616,7 +8702,7 @@ pub async fn start_network(
                                         fh,
                                     ).await {
                                         if let Some(pfs) = state.per_file_sources.get_mut(&transfer_id) {
-                                            pfs.mark_callback_requested(cb_src.ip, cb_src.tcp_port);
+                                            pfs.mark_callback_requested(cb_src.ip, cb_src.tcp_port, cb_src.source_user_hash);
                                         }
                                         register_or_refresh_pending_kad_callback(
                                             &pending_kad_callbacks,
@@ -10201,7 +10287,7 @@ pub async fn start_network(
                                         );
 
                                         let relay_mgr = state.relay_manager.clone();
-                                        let quic_cb_tx = kad_callback_tx.clone();
+                                        let quic_cb_tx = inbound_stream_tx.clone();
                                         tokio::spawn(ember::relay::run_quic_accept_loop(
                                             ep_arc,
                                             relay_mgr,
@@ -10401,15 +10487,47 @@ pub async fn start_network(
                 }
 
                 // Poll for incoming server-relay invitations (if registered & have external IP).
-                // Use the QUIC port we actually registered with — peers
-                // construct the relay-invite key as `(our_ip, our_quic_port)`
-                // since that's what they read from rendezvous.
+                // Key by our own `tcp_port`, NOT `quic_port`: every producer of a
+                // relay-invite target_id addresses us by the port it already knows
+                // us at — the download broker's `StartRelay` uses the LowID
+                // source's KAD-advertised `tcp_port` (see `attempt_low_to_low`
+                // callers), and `friend_connect::relay_friend` uses the friend's
+                // rendezvous-registered `(ip, tcp_port)` (rendezvous `/register`
+                // always advertises `settings.tcp_port`, never `quic_port` — see
+                // the two `rendezvous::register(...)` call sites above). `quic_port`
+                // only differs from `tcp_port` when the QUIC endpoint had to fall
+                // back off an already-bound port, but even then no peer ever learns
+                // that fallback port through any of the id-construction paths above,
+                // so keying our own poll by it just makes us unreachable in that
+                // case. `quic_port` is still the right value to advertise as the
+                // *destination* to dial (the payload the peer connects to) — see the
+                // `connect_server_relay`/`punch_quic` targets below — just not for
+                // the lookup key itself.
                 if state.rendezvous_registered {
                     if let Some(ext_ip) = state.external_ip {
-                        let advertised_port = state.quic_port.unwrap_or(state.tcp_port);
-                        let our_relay_id = format!("{:0>64}", format!("{:08x}{:04x}", u32::from(ext_ip), advertised_port));
+                        let our_relay_id = format!("{:0>64}", format!("{:08x}{:04x}", u32::from(ext_ip), state.tcp_port));
                         let rv_url = settings.rendezvous_url.clone();
-                        let relay_cb_tx = kad_callback_tx.clone();
+                        let relay_cb_tx = inbound_stream_tx.clone();
+                        // Friend-connect context, needed only when an invite turns
+                        // out to be a `friend_connect::relay_friend` session
+                        // (session_id `friend-{their_eh}-{our_eh}-{nonce}`) rather
+                        // than a download-broker `StartRelay` upload-serve session.
+                        // Cloned up front so the per-`sid` task below is self
+                        // contained; cheap even when unused (a handful of Copy
+                        // fields + one Arc clone per invite, and invites are rare).
+                        let fc_our_user_hash = state.user_hash;
+                        let fc_our_ember_hash = ember_hash;
+                        let fc_nickname = settings.nickname.clone();
+                        let fc_client_id = state
+                            .external_ip
+                            .map(|eip| u32::from_le_bytes(eip.octets()))
+                            .unwrap_or(0);
+                        let fc_tcp_port = settings.tcp_port;
+                        let fc_udp_port = settings.udp_port;
+                        let fc_obfuscate = settings.friend_session_encryption;
+                        let fc_ember_sessions = state.ember_sessions.clone();
+                        let fc_ul_event_tx = ul_event_tx.clone();
+                        let fc_friend_hashes = friend_hashes.clone();
                         tokio::spawn(async move {
                             match ember::relay::poll_relay_invites(&rv_url, &our_relay_id).await {
                                 Ok(session_ids) => {
@@ -10417,23 +10535,63 @@ pub async fn start_network(
                                         tracing::info!("Relay invite received, connecting to session {}", &sid[..16.min(sid.len())]);
                                         let cb_tx = relay_cb_tx.clone();
                                         let url = rv_url.clone();
+                                        // A friend-relay invite (see `relay_friend`) embeds
+                                        // the inviter's ember_hash as the first `-`-delimited
+                                        // hex segment after the `friend-` prefix. Anything
+                                        // else is a download-broker `StartRelay` invite for a
+                                        // LowID source we should serve as an upload.
+                                        let friend_peer_hash: Option<[u8; 16]> = sid
+                                            .strip_prefix("friend-")
+                                            .and_then(|rest| rest.split('-').next())
+                                            .filter(|h| h.len() == 32)
+                                            .and_then(|h| {
+                                                let mut buf = [0u8; 16];
+                                                hex::decode_to_slice(h, &mut buf).ok()?;
+                                                Some(buf)
+                                            });
+                                        let our_uh = fc_our_user_hash;
+                                        let our_eh = fc_our_ember_hash;
+                                        let nick = fc_nickname.clone();
+                                        let cid = fc_client_id;
+                                        let tcp = fc_tcp_port;
+                                        let udp = fc_udp_port;
+                                        let obfs = fc_obfuscate;
+                                        let sess = fc_ember_sessions.clone();
+                                        let ultx = fc_ul_event_tx.clone();
+                                        let fh = fc_friend_hashes.clone();
                                         tokio::spawn(async move {
                                             match ember::relay::connect_server_relay(&url, &sid).await {
                                                 Ok(ws) => {
                                                     let (reader, writer) = tokio::io::split(ws);
-                                                    let parts = crate::network::ed2k::upload::KadCallbackParts {
-                                                        peer_ip: std::net::Ipv4Addr::UNSPECIFIED,
-                                                        peer_port: 0,
-                                                        peer_hello_port: 0,
-                                                        peer_user_hash: [0u8; 16],
-                                                        file_hash: [0u8; 16],
+                                                    if let Some(peer_eh) = friend_peer_hash {
+                                                        let addr = SocketAddr::new(
+                                                            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0,
+                                                        );
+                                                        match ed2k::friend_connect::run_friend_session_over_transport(
+                                                            Box::new(reader), Box::new(writer), addr, peer_eh,
+                                                            our_uh, our_eh, nick, cid, tcp, udp, obfs,
+                                                            sess, ultx, fh, Some(ed25519_pubkey), Some(ed25519_secret_key),
+                                                        ).await {
+                                                            Ok(_) => tracing::info!(
+                                                                "Friend relay session established for {}",
+                                                                hex::encode(peer_eh)
+                                                            ),
+                                                            Err(e) => tracing::debug!(
+                                                                "Friend relay session failed for {}: {e}",
+                                                                hex::encode(peer_eh)
+                                                            ),
+                                                        }
+                                                        return;
+                                                    }
+                                                    let req = crate::network::ed2k::upload::InboundStreamRequest {
+                                                        peer_addr: SocketAddr::new(
+                                                            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0,
+                                                        ),
                                                         reader: Box::new(reader),
                                                         writer: Box::new(writer),
-                                                        emule_info_done: false,
-                                                        peer_caps: Default::default(),
                                                     };
-                                                    if let Err(e) = cb_tx.try_send(parts) {
-                                                        tracing::debug!("Dropping relay callback parts: {e}");
+                                                    if let Err(e) = cb_tx.try_send(req) {
+                                                        tracing::debug!("Dropping relay-adopted stream: {e}");
                                                     }
                                                 }
                                                 Err(e) => {
@@ -10448,6 +10606,129 @@ pub async fn start_network(
                                 }
                             }
                         });
+                    }
+                }
+
+                // Poll for incoming hole-punch requests targeting our own
+                // `(ip, tcp_port)` synthetic id — the exact id a
+                // downloader computes for us when it discovers us as a
+                // LowID/firewalled source (see `attempt_low_to_low`'s
+                // callers, which key `StartPunch`/`StartRelay` by
+                // `(source_ip, source_port)` using the KAD-advertised
+                // `tcp_port`, never `quic_port` — same rationale as the
+                // relay-invite poller immediately above).
+                //
+                // Before this, only the *initiator* side of a broker
+                // attempt ever called `register_punch`/`poll_punch` — the
+                // source being punched had no channel to learn who was
+                // trying to reach it, so `poll_punch` on the initiator's
+                // side could never find a match and every LowID-to-LowID
+                // hole-punch attempt burned its full `PUNCH_TIMEOUT`
+                // before falling back to relay. This mirrors the
+                // relay-invite poller immediately above: reciprocally
+                // register ourselves back at the initiator so its own
+                // poll finds us, then also dial out ourselves (NAT
+                // hole-punching needs an outbound packet from *both*
+                // sides to open a pinhole for the other's inbound
+                // traffic).
+                if state.rendezvous_registered {
+                    if let (Some(ext_ip), Some(broker)) =
+                        (state.external_ip, state.connection_broker.as_ref())
+                    {
+                        if let Some(endpoint) = broker.quic_endpoint().cloned() {
+                            let our_punch_id = format!(
+                                "{:0>64}",
+                                format!("{:08x}{:04x}", u32::from(ext_ip), state.tcp_port)
+                            );
+                            // The port we ask the initiator to dial back on IS
+                            // the QUIC port (opposite of the id above): this is
+                            // the payload value carried in the `/punch` record,
+                            // not the lookup key, and the initiator's
+                            // `punch_quic` call connects over QUIC — so it must
+                            // land on our actual bound QUIC socket, not the
+                            // NAT-probed KAD UDP port `nat_info.external_addr`
+                            // reflects.
+                            let advertised_quic_port = state.quic_port.unwrap_or(state.tcp_port);
+                            let rv_url = settings.rendezvous_url.clone();
+                            let our_nat_type = state.nat_info.nat_type;
+                            let our_ext_addr = state.nat_info.external_addr;
+                            let punch_cb_tx = inbound_stream_tx.clone();
+                            tokio::spawn(async move {
+                                let info = match ember::relay::poll_punch(&rv_url, &our_punch_id).await {
+                                    Ok(Some(info)) => info,
+                                    Ok(None) => return,
+                                    Err(e) => {
+                                        tracing::trace!("Punch responder poll: {e}");
+                                        return;
+                                    }
+                                };
+                                let Ok(ip) = info.ip.parse::<std::net::IpAddr>() else { return; };
+                                let routable = match ip {
+                                    std::net::IpAddr::V4(v4) => !crate::security::is_special_use_v4(v4),
+                                    std::net::IpAddr::V6(_) => !crate::security::is_private_ip(ip),
+                                };
+                                if !routable || info.port == 0 {
+                                    tracing::debug!(
+                                        "Punch responder: ignoring non-routable initiator {ip}:{}",
+                                        info.port
+                                    );
+                                    return;
+                                }
+                                let initiator_addr = SocketAddr::new(ip, info.port);
+                                tracing::info!(
+                                    "Punch responder: reciprocating for initiator {} at {initiator_addr}",
+                                    &info.from_id[..8.min(info.from_id.len())]
+                                );
+
+                                // Reciprocate so the initiator's own `poll_punch`
+                                // (keyed on its own id) finds us and learns our
+                                // real external address to dial. The registered
+                                // port is our QUIC port, not `our_addr.port()`
+                                // (the KAD UDP NAT mapping) — the initiator
+                                // dials this port over QUIC, not UDP/KAD.
+                                if our_ext_addr.is_some() {
+                                    if let Err(e) = ember::relay::register_punch(
+                                        &rv_url, &our_punch_id, &info.from_id,
+                                        advertised_quic_port, our_nat_type.as_u8(),
+                                    ).await {
+                                        tracing::debug!("Punch responder: reciprocal register failed: {e}");
+                                    }
+                                } else {
+                                    tracing::debug!("Punch responder: no external address known yet, skipping reciprocal register");
+                                }
+
+                                // Also dial out ourselves. If this succeeds, treat
+                                // it as a normal inbound connection — we remain the
+                                // upload/server role at the eD2K protocol level
+                                // (the initiator sends OP_HELLO first regardless
+                                // of which side's transport-level `connect()` won
+                                // the race), so hand the punched stream to the
+                                // upload listener's inbound-stream path rather
+                                // than the download-adoption `kad_callback_tx`
+                                // (which has no consumer for a connection with no
+                                // matching active download / zero file hash). If
+                                // it fails, that's fine: the initiator's own
+                                // connect attempt may still land in our
+                                // already-running QUIC accept loop.
+                                match ember::broker::punch_quic(&endpoint, initiator_addr, None).await {
+                                    Ok((send, recv)) => {
+                                        let req = crate::network::ed2k::upload::InboundStreamRequest {
+                                            peer_addr: initiator_addr,
+                                            reader: Box::new(recv),
+                                            writer: Box::new(send),
+                                        };
+                                        if let Err(e) = punch_cb_tx.try_send(req) {
+                                            tracing::debug!("Punch responder: dropping punched stream: {e}");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!(
+                                            "Punch responder: outbound punch to {initiator_addr} failed (initiator's own connect may still land): {e}"
+                                        );
+                                    }
+                                }
+                            });
+                        }
                     }
                 }
 
@@ -11022,10 +11303,8 @@ pub async fn start_network(
                                                         std::net::IpAddr::V4(v4) => {
                                                             !crate::security::is_special_use_v4(v4)
                                                         }
-                                                        std::net::IpAddr::V6(v6) => {
-                                                            !(v6.is_loopback()
-                                                                || v6.is_unspecified()
-                                                                || v6.is_multicast())
+                                                        std::net::IpAddr::V6(_) => {
+                                                            !crate::security::is_private_ip(ip)
                                                         }
                                                     };
                                                     if !target_routable || info.port == 0 {
@@ -11419,7 +11698,14 @@ pub async fn start_network(
                             ember::broker::BrokerEvent::ConnectionFailed { ref transfer_id, source_ip, source_port, ref reason } => {
                                 tracing::debug!("Broker: all methods failed for {}:{} (transfer {}): {}", source_ip, source_port, transfer_id, reason);
                                 if let Some(pfs) = state.per_file_sources.get_mut(transfer_id) {
-                                    pfs.set_low_to_low(source_ip, source_port);
+                                    // `BrokerEvent::ConnectionFailed` doesn't carry the
+                                    // source's user hash, so an unspecified-IP source
+                                    // (LowID buddy publish with no real IP) can't be
+                                    // resolved here — safer to no-op than risk mutating
+                                    // an unrelated peer's row that happens to share the
+                                    // same advertised port (see `PerFileSourceList::
+                                    // resolve_idx`).
+                                    pfs.set_low_to_low(source_ip, source_port, None);
                                 }
                             }
                             ember::broker::BrokerEvent::PunchFailed { ref attempt_key, ref reason } => {
@@ -12108,7 +12394,7 @@ pub async fn start_network(
                             job.file_hash,
                         ).await {
                             if let Some(pfs) = state.per_file_sources.get_mut(&job.transfer_id) {
-                                pfs.mark_callback_requested(job.src_ip, job.src_port);
+                                pfs.mark_callback_requested(job.src_ip, job.src_port, job.user_hash);
                             }
                             register_or_refresh_pending_kad_callback(
                                 &pending_kad_callbacks,
@@ -13708,6 +13994,14 @@ pub async fn start_network(
                                                 _ => None,
                                             }
                                         }).unwrap_or((0, 0));
+                                        // LowID sources found here that we can't reach via
+                                        // `OP_CALLBACKREQUEST` (see the `state.low_id` gate
+                                        // below) because we're LowID ourselves. Collected by
+                                        // user hash (the only stable identity a classic
+                                        // ed2k-server LowID entry carries) and surfaced into
+                                        // matching transfers' `PerFileSourceList` after
+                                        // `matching_transfer_ids` is computed below.
+                                        let mut lowid_unreachable_hashes: Vec<[u8; 16]> = Vec::new();
                                         for src in &sources {
                                             if src.client_id == 0 {
                                                 if let Ok(v4) = src.ip.parse::<Ipv4Addr>() {
@@ -13767,6 +14061,20 @@ pub async fn start_network(
                                                     src.user_hash.unwrap_or([0u8; 16]),
                                                     src.crypt_options.unwrap_or(0),
                                                 );
+                                                // Mirror the `!state.low_id` gate below: when
+                                                // we're LowID/firewalled ourselves, asking the
+                                                // server to relay OP_CALLBACKREQUEST is pointless
+                                                // (it would tell this LowID peer to dial *us*
+                                                // back, which fails the same way). Rather than
+                                                // silently dropping the source, track it as a
+                                                // known low-to-low dead end so it's visible and
+                                                // can be transparently upgraded later — see
+                                                // `set_low_to_low_by_identity`.
+                                                if state.low_id {
+                                                    if let Some(uh) = src.user_hash.filter(|h| *h != [0u8; 16]) {
+                                                        lowid_unreachable_hashes.push(uh);
+                                                    }
+                                                }
                                             }
                                         }
                                         drop(sm);
@@ -13788,6 +14096,17 @@ pub async fn start_network(
                                             let mgr = transfer_manager.read().await;
                                             matching_active_transfer_ids_for_hash(&state, &mgr, &hash_hex)
                                         };
+                                        if !lowid_unreachable_hashes.is_empty() {
+                                            for tid in &matching_transfer_ids {
+                                                let pfs = state.per_file_sources
+                                                    .entry(tid.clone())
+                                                    .or_insert_with(|| ed2k::sources::PerFileSourceList::new(file_hash));
+                                                for uh in &lowid_unreachable_hashes {
+                                                    pfs.add_source_with_identity(Ipv4Addr::UNSPECIFIED, 0, 0, Some(*uh));
+                                                    pfs.set_low_to_low(Ipv4Addr::UNSPECIFIED, 0, Some(*uh));
+                                                }
+                                            }
+                                        }
                                         let mut server_source_ips: Vec<(String, u16)> = Vec::new();
                                         for src in &sources {
                                             if src.client_id == 0 && !src.ip.is_empty() {
@@ -23677,6 +23996,13 @@ async fn handle_command_inner(
                                 let db3 = db.clone();
                                 let msg = message.clone();
                                 let ul_tx2 = ul_event_tx.clone();
+                                let rv_url = settings.rendezvous_url.clone();
+                                let nat_type = state.nat_info.nat_type;
+                                let ext_addr = state.nat_info.external_addr;
+                                let quic_ep = state
+                                    .connection_broker
+                                    .as_ref()
+                                    .and_then(|b| b.quic_endpoint().cloned());
                                 // debug! (not info!) because the Ember hash + address pair
                                 // is identity-correlatable PII; we keep it for troubleshooting
                                 // but don't surface it in the default log stream.
@@ -23686,7 +24012,7 @@ async fn handle_command_inner(
                                     addr
                                 );
                                 tokio::spawn(async move {
-                                    match ed2k::friend_connect::open_and_run_friend_session(
+                                    match ed2k::friend_connect::connect_friend_with_fallback(
                                         addr,
                                         friend_eh,
                                         our_user_hash,
@@ -23701,6 +24027,10 @@ async fn handle_command_inner(
                                         fh,
                                         Some(ed25519_pubkey),
                                         Some(ed25519_secret_key),
+                                        rv_url,
+                                        nat_type,
+                                        ext_addr,
+                                        quic_ep,
                                     )
                                     .await
                                     {
@@ -23806,6 +24136,12 @@ async fn handle_command_inner(
                             let db3 = db.clone();
                             let msg = message.clone();
                             let ultx2 = ul_event_tx.clone();
+                            let nat_type = state.nat_info.nat_type;
+                            let ext_addr = state.nat_info.external_addr;
+                            let quic_ep = state
+                                .connection_broker
+                                .as_ref()
+                                .and_then(|b| b.quic_endpoint().cloned());
                             state
                                 .outbound_session_tasks
                                 .insert(friend_eh, std::time::Instant::now());
@@ -23819,7 +24155,7 @@ async fn handle_command_inner(
                                 {
                                     Ok(Some((ip, port))) => {
                                         let addr = std::net::SocketAddr::new(ip.into(), port);
-                                        match ed2k::friend_connect::open_and_run_friend_session(
+                                        match ed2k::friend_connect::connect_friend_with_fallback(
                                             addr,
                                             friend_eh,
                                             our_uh,
@@ -23834,6 +24170,10 @@ async fn handle_command_inner(
                                             fh,
                                             Some(ed25519_pubkey),
                                             Some(ed25519_secret_key),
+                                            rv_url.clone(),
+                                            nat_type,
+                                            ext_addr,
+                                            quic_ep,
                                         )
                                         .await
                                         {
@@ -23974,6 +24314,13 @@ async fn handle_command_inner(
                                 let ul_tx = ul_event_tx.clone();
                                 let fh = friend_hashes.clone();
                                 let ul_tx2 = ul_event_tx.clone();
+                                let rv_url = settings.rendezvous_url.clone();
+                                let nat_type = state.nat_info.nat_type;
+                                let ext_addr = state.nat_info.external_addr;
+                                let quic_ep = state
+                                    .connection_broker
+                                    .as_ref()
+                                    .and_then(|b| b.quic_endpoint().cloned());
                                 info!(
                                     "Auto-connecting to friend {} for browse at {}",
                                     hex::encode(friend_eh),
@@ -23981,7 +24328,7 @@ async fn handle_command_inner(
                                 );
                                 let db3 = db.clone();
                                 tokio::spawn(async move {
-                                    match ed2k::friend_connect::open_and_run_friend_session(
+                                    match ed2k::friend_connect::connect_friend_with_fallback(
                                         addr,
                                         friend_eh,
                                         our_user_hash,
@@ -23996,6 +24343,10 @@ async fn handle_command_inner(
                                         fh,
                                         Some(ed25519_pubkey),
                                         Some(ed25519_secret_key),
+                                        rv_url,
+                                        nat_type,
+                                        ext_addr,
+                                        quic_ep,
                                     )
                                     .await
                                     {
@@ -24077,6 +24428,12 @@ async fn handle_command_inner(
                             let fh = friend_hashes.clone();
                             let app2 = app_handle.clone();
                             let ultx2 = ul_event_tx.clone();
+                            let nat_type = state.nat_info.nat_type;
+                            let ext_addr = state.nat_info.external_addr;
+                            let quic_ep = state
+                                .connection_broker
+                                .as_ref()
+                                .and_then(|b| b.quic_endpoint().cloned());
                             state
                                 .outbound_session_tasks
                                 .insert(friend_eh, std::time::Instant::now());
@@ -24090,7 +24447,7 @@ async fn handle_command_inner(
                                 {
                                     Ok(Some((ip, port))) => {
                                         let addr = std::net::SocketAddr::new(ip.into(), port);
-                                        match ed2k::friend_connect::open_and_run_friend_session(
+                                        match ed2k::friend_connect::connect_friend_with_fallback(
                                             addr,
                                             friend_eh,
                                             our_uh,
@@ -24105,6 +24462,10 @@ async fn handle_command_inner(
                                             fh,
                                             Some(ed25519_pubkey),
                                             Some(ed25519_secret_key),
+                                            rv_url.clone(),
+                                            nat_type,
+                                            ext_addr,
+                                            quic_ep,
                                         )
                                         .await
                                         {
