@@ -1442,7 +1442,12 @@ fn spawn_rendezvous_friend_lookup(
                 // `friend-online` for visibility — both events are
                 // idempotent in the frontend's Set-based handlers
                 // — and don't dial again.
-                if sess_fc.read().await.contains_key(&target_hash) {
+                if sess_fc
+                    .read()
+                    .await
+                    .get(&target_hash)
+                    .is_some_and(|h| h.is_fresh())
+                {
                     let _ = app_fc.emit(
                         "ember:friend-confirmed",
                         serde_json::json!({
@@ -7867,7 +7872,7 @@ pub async fn start_network(
                         "ip": ip_str,
                         "port": port,
                     }));
-                    if !state.ember_sessions.read().await.contains_key(&friend_eh)
+                    if !state.ember_sessions.read().await.get(&friend_eh).is_some_and(|h| h.is_fresh())
                         && !state.outbound_session_tasks.contains_key(&friend_eh)
                     {
                         if let std::net::IpAddr::V4(v4) = ip {
@@ -8632,8 +8637,8 @@ pub async fn start_network(
                         packet.push(ed2k::messages::OP_EMBER_BROWSE_RES);
                         packet.extend_from_slice(&res_payload);
                         let sessions = state.ember_sessions.read().await;
-                        if let Some(sender) = sessions.get(&browse_eh) {
-                            if let Err(e) = sender.try_send(packet) {
+                        if let Some(handle) = sessions.get(&browse_eh) {
+                            if let Err(e) = handle.tx.try_send(packet) {
                                 tracing::warn!("Browse response to {} dropped: {e}", hex::encode(browse_eh));
                             }
                         }
@@ -8667,7 +8672,7 @@ pub async fn start_network(
                     }));
 
                     if friend_hashes.read().await.contains(&dc_eh)
-                        && !state.ember_sessions.read().await.contains_key(&dc_eh)
+                        && !state.ember_sessions.read().await.get(&dc_eh).is_some_and(|h| h.is_fresh())
                     {
                         let now_inst = std::time::Instant::now();
                         let can_reconnect = match state.friend_reconnect_last.get(&dc_eh) {
@@ -11478,7 +11483,7 @@ pub async fn start_network(
                     let mut search_targets: Vec<[u8; 16]> = Vec::new();
                     for fh in &all_friends {
                         if state.online_friends.contains_key(fh) { continue; }
-                        if sessions.contains_key(fh) { continue; }
+                        if sessions.get(fh).is_some_and(|h| h.is_fresh()) { continue; }
                         if state.outbound_session_tasks.contains_key(fh) { continue; }
                         search_targets.push(*fh);
                     }
@@ -12203,6 +12208,24 @@ pub async fn start_network(
                     state.outbound_session_tasks.retain(|_, started| now.duration_since(*started).as_secs() < 600);
                 }
 
+                // Sweep `ember_sessions` for entries that have gone stale
+                // (see `EmberSessionHandle::is_fresh`) but were never
+                // touched by an insert-time eviction because nothing
+                // happened to try reusing them — e.g. a friend nobody
+                // chatted with or browsed after their connection died
+                // silently. Without this sweep such an entry sits in the
+                // map (harmlessly, since every consumer already checks
+                // freshness) until something finally races to reclaim the
+                // slot; proactively clearing it here just keeps
+                // `GetOnlineFriends`-adjacent map state tidy and bounds it
+                // to genuinely live sessions between friend-search bursts.
+                {
+                    let hashes: Vec<[u8; 16]> = state.ember_sessions.read().await.keys().copied().collect();
+                    for h in hashes {
+                        upload_server::evict_stale_ember_session(&state.ember_sessions, &h).await;
+                    }
+                }
+
                 // Prune the server UDP source-reask throttle map. Once an entry is
                 // older than the reask interval it no longer throttles anything
                 // (the next ask just re-inserts it), so dropping it bounds the map
@@ -12276,7 +12299,7 @@ pub async fn start_network(
                         let mut retry_targets: Vec<[u8; 16]> = Vec::new();
                         for fh in &all_friends {
                             if state.online_friends.contains_key(fh) { continue; }
-                            if sessions.contains_key(fh) { continue; }
+                            if sessions.get(fh).is_some_and(|h| h.is_fresh()) { continue; }
                             if state.outbound_session_tasks.contains_key(fh) { continue; }
                             retry_targets.push(*fh);
                         }
@@ -27031,7 +27054,16 @@ async fn handle_command_inner(
                 let _ = tx.send(Err("Chat is disabled in Friends settings".into()));
             } else {
                 let sessions = state.ember_sessions.read().await;
-                if let Some(sender) = sessions.get(&friend_eh) {
+                // Only reuse the session if it's actually fresh (see
+                // `EmberSessionHandle::is_fresh`). A stale entry's mpsc
+                // channel is usually still open — its receiver lives in a
+                // writer loop that hasn't yet noticed the peer is gone —
+                // so `try_send` below would silently "succeed" into a
+                // socket write that never reaches anyone, and the caller
+                // would see `Ok(())` for a message that's actually lost.
+                // Falling through to the reconnect branch instead gives
+                // the message a real chance of delivery.
+                if let Some(sender) = sessions.get(&friend_eh).filter(|h| h.is_fresh()) {
                     let msg_bytes = message.as_bytes();
                     let mut packet = Vec::with_capacity(6 + msg_bytes.len());
                     packet.push(OP_EMULEPROT);
@@ -27039,7 +27071,7 @@ async fn handle_command_inner(
                     packet.extend_from_slice(&size.to_le_bytes());
                     packet.push(ed2k::messages::OP_EMBER_CHAT_MSG);
                     packet.extend_from_slice(msg_bytes);
-                    match sender.try_send(packet) {
+                    match sender.tx.try_send(packet) {
                         Ok(()) => {
                             let hash_hex = hex::encode(friend_eh);
                             let db2 = db.clone();
@@ -27357,13 +27389,17 @@ async fn handle_command_inner(
                 let _ = tx.send(Err("Browse is disabled in Friends settings".into()));
             } else {
                 let sessions = state.ember_sessions.read().await;
-                if let Some(sender) = sessions.get(&friend_eh) {
+                // See the identical `filter(|h| h.is_fresh())` in
+                // `SendChatMessage` above: reusing a stale session here
+                // would queue the browse request into a channel whose
+                // socket write never reaches a live peer.
+                if let Some(sender) = sessions.get(&friend_eh).filter(|h| h.is_fresh()) {
                     let mut packet = Vec::with_capacity(6);
                     packet.push(OP_EMULEPROT);
                     let size: u32 = 1;
                     packet.extend_from_slice(&size.to_le_bytes());
                     packet.push(ed2k::messages::OP_EMBER_BROWSE_REQ);
-                    match sender.try_send(packet) {
+                    match sender.tx.try_send(packet) {
                         Ok(()) => {
                             let _ = tx.send(Ok(()));
                         }
@@ -27630,7 +27666,12 @@ async fn handle_command_inner(
             // wasteful rendezvous + dial against a peer we're
             // already talking to.
             if state.online_friends.contains_key(&target_hash)
-                || state.ember_sessions.read().await.contains_key(&target_hash)
+                || state
+                    .ember_sessions
+                    .read()
+                    .await
+                    .get(&target_hash)
+                    .is_some_and(|h| h.is_fresh())
             {
                 debug!(
                     "FindFriendAndConnect: {} already online/connected, skipping",
@@ -27667,7 +27708,12 @@ async fn handle_command_inner(
             let hash_hex = hex::encode(target_hash);
 
             if state.online_friends.contains_key(&target_hash)
-                || state.ember_sessions.read().await.contains_key(&target_hash)
+                || state
+                    .ember_sessions
+                    .read()
+                    .await
+                    .get(&target_hash)
+                    .is_some_and(|h| h.is_fresh())
             {
                 info!("RetryFriendSearch: {} already online/connected", hash_hex);
                 let _ = tx.send(Ok(()));

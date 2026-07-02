@@ -11,7 +11,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info};
 
 use super::messages::*;
-use super::upload::{EmberSessionMap, UploadEvent, UploadEventKind};
+use super::upload::{EmberSessionHandle, EmberSessionMap, UploadEvent, UploadEventKind};
 use crate::network::ember::crypto;
 
 /// Result from a successfully established friend session: the outbound sender
@@ -219,14 +219,22 @@ pub async fn run_friend_session_over_transport(
     // below (after auth), so no race window widens here.
     {
         let sessions = ember_sessions.read().await;
-        if let Some(existing_tx) = sessions.get(&peer_ember_hash) {
-            info!(
-                "Friend session for {} already exists after Ember-Hello; skipping duplicate handshake",
-                hex::encode(peer_ember_hash)
-            );
-            return Ok(FriendSessionHandle {
-                outbound_tx: existing_tx.clone(),
-            });
+        if let Some(existing) = sessions.get(&peer_ember_hash) {
+            // A present-but-stale entry (peer gone silently unreachable;
+            // its own reader loop hasn't hit `STALL_TIMEOUT` yet — see
+            // `EmberSessionHandle`) must NOT short-circuit this dial: doing
+            // so would hand back a handle whose writes vanish, exactly the
+            // "blocked re-dial" this freshness check exists to prevent.
+            // Falling through here re-dials for real instead.
+            if existing.is_fresh() {
+                info!(
+                    "Friend session for {} already exists after Ember-Hello; skipping duplicate handshake",
+                    hex::encode(peer_ember_hash)
+                );
+                return Ok(FriendSessionHandle {
+                    outbound_tx: existing.tx.clone(),
+                });
+            }
         }
     }
 
@@ -306,18 +314,28 @@ pub async fn run_friend_session_over_transport(
     // duplicate request from the racing connection too) — return
     // the winner's handle instead and drop this socket cleanly.
     let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+    let ember_session_handle = EmberSessionHandle::new(outbound_tx.clone());
     {
         let mut sessions = ember_sessions.write().await;
-        if let Some(existing_tx) = sessions.get(&peer_ember_hash) {
-            info!(
-                "Friend session for {} already exists (post-auth race); skipping duplicate",
-                hex::encode(peer_ember_hash)
-            );
-            return Ok(FriendSessionHandle {
-                outbound_tx: existing_tx.clone(),
-            });
+        match sessions.get(&peer_ember_hash) {
+            Some(existing) if existing.is_fresh() => {
+                info!(
+                    "Friend session for {} already exists (post-auth race); skipping duplicate",
+                    hex::encode(peer_ember_hash)
+                );
+                return Ok(FriendSessionHandle {
+                    outbound_tx: existing.tx.clone(),
+                });
+            }
+            Some(_stale) => {
+                debug!(
+                    "Friend session slot for {} held by a stale entry; evicting and claiming it",
+                    hex::encode(peer_ember_hash)
+                );
+            }
+            None => {}
         }
-        sessions.insert(peer_ember_hash, outbound_tx.clone());
+        sessions.insert(peer_ember_hash, ember_session_handle.clone());
     }
 
     // Only send the friend request once the slot is reserved. If
@@ -356,6 +374,7 @@ pub async fn run_friend_session_over_transport(
     let handle = FriendSessionHandle { outbound_tx };
 
     let session_ember_sessions = ember_sessions.clone();
+    let session_ember_session_handle = ember_session_handle.clone();
     let session_ul_event_tx = ul_event_tx.clone();
     let session_friend_hashes = friend_hashes.clone();
     tokio::spawn(async move {
@@ -419,6 +438,13 @@ pub async fn run_friend_session_over_transport(
                             // exactly what the peer is signalling
                             // by sending it.
                             last_inbound = now;
+                            // Mirror the same liveness signal into the
+                            // shared `ember_sessions` map so lookups from
+                            // other tasks (command handlers, the
+                            // duplicate-session checks above) see this
+                            // session as fresh for as long as it's
+                            // actually exchanging traffic.
+                            session_ember_session_handle.touch();
                             match (proto, opcode) {
                                 (OP_EMULEPROT, OP_EMBER_CHAT_MSG) => {
                                     if payload.len() <= 4096 {
@@ -1036,6 +1062,144 @@ mod tests {
                 UploadEventKind::EmberFriendConnected { ember_hash } if ember_hash == peer_ember_hash
             ),
             "expected the first event to be EmberFriendConnected for the peer's hash"
+        );
+    }
+
+    /// Regression guard for `med-ember-sessions-stale`: a pre-existing
+    /// `ember_sessions` entry for the peer that hasn't been heard from in
+    /// over `EMBER_SESSION_FRESH_SECS` must NOT short-circuit a fresh
+    /// dial via the early duplicate-session check (see the comment above
+    /// that check in `run_friend_session_over_transport`). Before this
+    /// fix, any stale entry — however old — caused the dial to return the
+    /// old, dead sender immediately without attempting a real handshake,
+    /// silently blackholing the session for up to the ~4.5 min
+    /// `STALL_TIMEOUT` in the original session's own reader loop.
+    #[tokio::test]
+    async fn stale_existing_session_does_not_block_fresh_dial() {
+        let our_sk = SigningKey::generate(&mut OsRng);
+        let our_pk_bytes = our_sk.verifying_key().to_bytes();
+        let our_sk_bytes = our_sk.to_bytes();
+
+        let peer_sk = SigningKey::generate(&mut OsRng);
+        let peer_pk_bytes = peer_sk.verifying_key().to_bytes();
+        let peer_ember_hash =
+            crate::network::ember::crypto::node_id_from_public_key(&peer_sk.verifying_key());
+
+        let (client, server) = tokio::io::duplex(8192);
+        let (client_r, client_w) = tokio::io::split(client);
+        let (mut server_r, mut server_w) = tokio::io::split(server);
+
+        let ember_sessions: EmberSessionMap = Arc::new(RwLock::new(std::collections::HashMap::new()));
+        // Seed the map with a stale entry for this exact peer before the
+        // dial starts — simulating a previous session whose connection
+        // died silently without a clean teardown.
+        let (dead_tx, dead_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let stale_handle = EmberSessionHandle::new(dead_tx);
+        // Comfortably past `EMBER_SESSION_FRESH_SECS` (180s; private to
+        // `upload.rs`) without depending on that exact constant here.
+        stale_handle.backdate_for_test(3600);
+        drop(dead_rx); // the "dead" side: receiver already gone
+        ember_sessions.write().await.insert(peer_ember_hash, stale_handle);
+
+        let (ul_tx, mut ul_rx) = tokio::sync::mpsc::channel(16);
+        let friend_hashes = Arc::new(RwLock::new(std::collections::HashSet::from([
+            peer_ember_hash,
+        ])));
+        let addr: SocketAddr = "127.0.0.1:4662".parse().unwrap();
+
+        let session_task = tokio::spawn(run_friend_session_over_transport(
+            Box::new(client_r),
+            Box::new(client_w),
+            addr,
+            peer_ember_hash,
+            [0x11; 16],
+            [0x22; 16],
+            "tester".to_string(),
+            0,
+            4662,
+            4672,
+            false,
+            ember_sessions,
+            ul_tx,
+            friend_hashes,
+            Some(our_pk_bytes),
+            Some(our_sk_bytes),
+        ));
+
+        let mock_peer = async {
+            let (proto, opcode, _) = read_packet_inner(&mut server_r).await.unwrap();
+            assert_eq!((proto, opcode), (OP_EDONKEYHEADER, OP_HELLO));
+            let hello_answer = build_hello_answer_with_buddy_opts(
+                &[0x99; 16],
+                0,
+                4662,
+                "peer",
+                None,
+                &HelloOptions::default_for_udp_port(4672),
+            );
+            write_packet(&mut server_w, OP_EDONKEYHEADER, OP_HELLOANSWER, &hello_answer)
+                .await
+                .unwrap();
+
+            let (proto, opcode, _) = read_packet_inner(&mut server_r).await.unwrap();
+            assert_eq!((proto, opcode), (OP_EMULEPROT, OP_EMULEINFO));
+            let info_answer = build_emule_info(4672, false, None, None);
+            write_packet(&mut server_w, OP_EMULEPROT, OP_EMULEINFOANSWER, &info_answer)
+                .await
+                .unwrap();
+
+            let (proto, opcode, _) = read_packet_inner(&mut server_r).await.unwrap();
+            assert_eq!((proto, opcode), (OP_EMULEPROT, OP_EMBER_HELLO));
+            let ember_hello = build_ember_hello(&peer_ember_hash, "peer", Some(&peer_pk_bytes));
+            write_packet(&mut server_w, OP_EMULEPROT, OP_EMBER_HELLOANSWER, &ember_hello)
+                .await
+                .unwrap();
+
+            let (proto, opcode, our_nonce) = read_packet_inner(&mut server_r).await.unwrap();
+            assert_eq!((proto, opcode), (OP_EMULEPROT, OP_EMBER_AUTH_CHALLENGE));
+            let mut peer_nonce = [0u8; 32];
+            OsRng.fill_bytes(&mut peer_nonce);
+            write_packet(&mut server_w, OP_EMULEPROT, OP_EMBER_AUTH_CHALLENGE, &peer_nonce)
+                .await
+                .unwrap();
+            let sig = peer_sk.sign(&our_nonce);
+            let mut resp = Vec::with_capacity(96);
+            resp.extend_from_slice(&peer_pk_bytes);
+            resp.extend_from_slice(&sig.to_bytes());
+            write_packet(&mut server_w, OP_EMULEPROT, OP_EMBER_AUTH_RESPONSE, &resp)
+                .await
+                .unwrap();
+
+            let (proto, opcode, _) = read_packet_inner(&mut server_r).await.unwrap();
+            assert_eq!((proto, opcode), (OP_EMULEPROT, OP_EMBER_AUTH_RESPONSE));
+
+            let (proto, opcode, _) = read_packet_inner(&mut server_r).await.unwrap();
+            assert_eq!((proto, opcode), (OP_EMULEPROT, OP_EMBER_FRIEND_REQ));
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), mock_peer)
+            .await
+            .expect("mock peer handshake must not hang — a stale session entry must not short-circuit the dial");
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), session_task)
+            .await
+            .expect("session task must not hang")
+            .expect("session task must not panic");
+        assert!(
+            result.is_ok(),
+            "a real handshake must still occur despite the pre-existing stale session entry: {:?}",
+            result.err().map(|e| e.to_string())
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), ul_rx.recv())
+            .await
+            .expect("must receive an UploadEvent before timeout")
+            .expect("event channel must not be closed");
+        assert!(
+            matches!(
+                event.kind,
+                UploadEventKind::EmberFriendConnected { ember_hash } if ember_hash == peer_ember_hash
+            ),
+            "expected EmberFriendConnected once the fresh session actually completes"
         );
     }
 }

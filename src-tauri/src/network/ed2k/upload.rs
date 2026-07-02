@@ -23,7 +23,104 @@ use crate::search::index::LocalIndex;
 use crate::sharing::manager::TransferManager;
 use crate::types::TransferDirection;
 
-pub type EmberSessionMap = Arc<RwLock<HashMap<[u8; 16], tokio::sync::mpsc::Sender<Vec<u8>>>>>;
+/// A live friend session's outbound packet sender, plus a liveness
+/// timestamp (unix seconds of last confirmed inbound activity from the
+/// peer) refreshed by whichever reader loop owns the session — inbound
+/// (this file's `UploadHandler` connection handler) or outbound
+/// (`friend_connect::run_friend_session_over_transport`).
+///
+/// The wire protocol has no ack on application packets, so a session
+/// whose peer has gone silently unreachable (NAT mapping expired, box
+/// powered off, etc.) can sit with its reader/writer tasks still
+/// technically running — and its `mpsc::Sender` still open and willing to
+/// accept sends — for several minutes before the session's own passive
+/// stall-detector notices and tears it down (see `STALL_TIMEOUT` in
+/// `friend_connect.rs`). Every call site that treats "an entry exists in
+/// `EmberSessionMap`" as "this friend is reachable right now" must check
+/// [`Self::is_fresh`] instead of just presence, and evict+ignore a stale
+/// entry rather than trusting it — otherwise a single dead connection can
+/// silently blackhole chat/browse sends, and block explicit user retries
+/// and the periodic auto-retry sweep, for the entire stall-detector
+/// window.
+#[derive(Clone)]
+pub struct EmberSessionHandle {
+    pub tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    last_activity: Arc<std::sync::atomic::AtomicI64>,
+}
+
+/// How stale a session's last confirmed inbound activity may be before
+/// [`EmberSessionHandle::is_fresh`] stops trusting it. Deliberately well
+/// under the ~4.5 min `STALL_TIMEOUT` a session's own reader loop uses to
+/// detect and tear itself down (3x the 90s `KEEPALIVE_INTERVAL`): that
+/// timeout has to tolerate a lost keepalive in each direction without
+/// flapping a healthy connection, but a caller deciding whether to *trust
+/// an existing session* for a fresh action (send a chat message, honor a
+/// user's "retry" click, auto-retry an offline friend) can afford to be
+/// more impatient — allowing one missed keepalive is enough margin
+/// (2x `KEEPALIVE_INTERVAL` = 180s) without being trigger-happy.
+const EMBER_SESSION_FRESH_SECS: i64 = 180;
+
+impl EmberSessionHandle {
+    pub fn new(tx: tokio::sync::mpsc::Sender<Vec<u8>>) -> Self {
+        Self {
+            tx,
+            last_activity: Arc::new(std::sync::atomic::AtomicI64::new(
+                chrono::Utc::now().timestamp(),
+            )),
+        }
+    }
+
+    /// Record confirmed inbound activity from the peer (any received
+    /// packet, including a bare keepalive — see the reader loops' own
+    /// `last_inbound` tracking, which this mirrors).
+    pub fn touch(&self) {
+        self.last_activity.store(
+            chrono::Utc::now().timestamp(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// True if the peer has been heard from recently enough to trust this
+    /// session for a new send/reuse decision. See `EMBER_SESSION_FRESH_SECS`.
+    pub fn is_fresh(&self) -> bool {
+        let last = self.last_activity.load(std::sync::atomic::Ordering::Relaxed);
+        chrono::Utc::now().timestamp().saturating_sub(last) < EMBER_SESSION_FRESH_SECS
+    }
+
+    /// Test-only: force this handle's liveness timestamp into the past so
+    /// `is_fresh()` reports `false`, simulating a session whose peer went
+    /// silently unreachable without the reader loop's own stall-detector
+    /// having torn it down yet.
+    #[cfg(test)]
+    pub fn backdate_for_test(&self, secs_ago: i64) {
+        self.last_activity.store(
+            chrono::Utc::now().timestamp() - secs_ago,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
+pub type EmberSessionMap = Arc<RwLock<HashMap<[u8; 16], EmberSessionHandle>>>;
+
+/// Remove `hash`'s entry from `sessions` if present but stale (see
+/// [`EmberSessionHandle::is_fresh`]), returning `true` if it was evicted.
+/// Centralizes the "is this friend actually reachable, not just
+/// present-in-the-map" check for every site that gates a dial/send
+/// decision on `EmberSessionMap` — see [`EmberSessionHandle`]'s doc
+/// comment for why presence alone isn't enough. Takes a write lock
+/// unconditionally (simpler than upgrading a read lock, and this is only
+/// called from cold paths: explicit user actions and periodic sweeps, not
+/// per-packet hot loops).
+pub async fn evict_stale_ember_session(sessions: &EmberSessionMap, hash: &[u8; 16]) -> bool {
+    let mut sessions = sessions.write().await;
+    if let Some(handle) = sessions.get(hash) {
+        if !handle.is_fresh() {
+            sessions.remove(hash);
+            return true;
+        }
+    }
+    false
+}
 
 use super::dead_sources::PENDING_KAD_CALLBACK_SECS;
 use super::messages::*;
@@ -3846,6 +3943,12 @@ impl UploadHandler {
         // complete PoP, so the only sessions denied a slot are the ones
         // we cannot prove are the friend.
         let mut owns_ember_slot = false;
+        // Set alongside `owns_ember_slot` when we claim the `ember_sessions`
+        // slot below, so the CHAT/BROWSE/KEEPALIVE arms further down can
+        // `.touch()` it on every subsequent inbound packet — keeping the
+        // liveness timestamp `EmberSessionHandle::is_fresh()` checks against
+        // fresh for as long as this session is actually receiving traffic.
+        let mut ember_session_handle: Option<EmberSessionHandle> = None;
 
         // Now handle file requests in a loop
         let mut current_file_hash: Option<[u8; 16]> = None;
@@ -7320,8 +7423,20 @@ impl UploadHandler {
                             if !owns_ember_slot && is_ember_friend {
                                 if let Some(eh) = peer_ember_hash {
                                     let mut sessions = self.ember_sessions.write().await;
+                                    // A pre-existing entry might just be a
+                                    // stale leftover from a connection that
+                                    // died without a clean teardown (see
+                                    // `EmberSessionHandle`) — evict it so a
+                                    // fresh, actually-verified inbound
+                                    // session isn't blocked from claiming
+                                    // the slot.
+                                    if sessions.get(&eh).is_some_and(|h| !h.is_fresh()) {
+                                        sessions.remove(&eh);
+                                    }
                                     if !sessions.contains_key(&eh) {
-                                        sessions.insert(eh, outbound_tx.clone());
+                                        let handle = EmberSessionHandle::new(outbound_tx.clone());
+                                        ember_session_handle = Some(handle.clone());
+                                        sessions.insert(eh, handle);
                                         owns_ember_slot = true;
                                     }
                                 }
@@ -7377,6 +7492,7 @@ impl UploadHandler {
                 // requests first arrive and only flips to `Verified`
                 // a packet or two later.
                 (OP_EMULEPROT, OP_EMBER_CHAT_MSG) if is_ember_friend && ember_auth_state.is_verified() => {
+                    if let Some(h) = &ember_session_handle { h.touch(); }
                     if let Some(eh) = peer_ember_hash {
                         if !self.friend_hashes.read().await.contains(&eh) {
                             debug!("Ignoring chat from removed friend {}", hex::encode(eh));
@@ -7395,6 +7511,7 @@ impl UploadHandler {
                 }
 
                 (OP_EMULEPROT, OP_EMBER_BROWSE_REQ) if is_ember_friend && ember_auth_state.is_verified() => {
+                    if let Some(h) = &ember_session_handle { h.touch(); }
                     if let Some(eh) = peer_ember_hash {
                         if !self.friend_hashes.read().await.contains(&eh) {
                             debug!("Ignoring browse request from removed friend {}", hex::encode(eh));
@@ -7410,6 +7527,7 @@ impl UploadHandler {
                 }
 
                 (OP_EMULEPROT, OP_EMBER_BROWSE_RES) if is_ember_friend && ember_auth_state.is_verified() => {
+                    if let Some(h) = &ember_session_handle { h.touch(); }
                     if let Some(eh) = peer_ember_hash {
                         if !self.friend_hashes.read().await.contains(&eh) {
                             debug!("Ignoring browse response from removed friend {}", hex::encode(eh));
@@ -7426,7 +7544,9 @@ impl UploadHandler {
                     }
                 }
 
-                (OP_EMULEPROT, OP_EMBER_KEEPALIVE) if is_ember_friend && ember_auth_state.is_verified() => {}
+                (OP_EMULEPROT, OP_EMBER_KEEPALIVE) if is_ember_friend && ember_auth_state.is_verified() => {
+                    if let Some(h) = &ember_session_handle { h.touch(); }
+                }
 
                 _ => {
                     debug!(
@@ -8391,5 +8511,82 @@ mod browse_answer_tests {
         let payload = encode_shared_files_answer(&[], 0, 4662);
         assert_eq!(payload.len(), 4);
         assert_eq!(u32::from_le_bytes(payload[..4].try_into().unwrap()), 0);
+    }
+}
+
+#[cfg(test)]
+mod ember_session_handle_tests {
+    //! Regression coverage for `med-ember-sessions-stale`: a session whose
+    //! peer went silently unreachable must stop being trusted by
+    //! `is_fresh()` well before the ~4.5 min `STALL_TIMEOUT` in
+    //! `friend_connect.rs` finally tears it down, and `evict_stale_ember_session`
+    //! must reclaim exactly (and only) such entries.
+    use super::*;
+
+    #[tokio::test]
+    async fn fresh_handle_reports_fresh_until_backdated() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let handle = EmberSessionHandle::new(tx);
+        assert!(handle.is_fresh(), "a just-created handle must be fresh");
+
+        handle.backdate_for_test(EMBER_SESSION_FRESH_SECS + 1);
+        assert!(
+            !handle.is_fresh(),
+            "a handle with no activity in > EMBER_SESSION_FRESH_SECS must be stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn touch_refreshes_a_backdated_handle() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let handle = EmberSessionHandle::new(tx);
+        handle.backdate_for_test(EMBER_SESSION_FRESH_SECS + 1);
+        assert!(!handle.is_fresh());
+
+        handle.touch();
+        assert!(handle.is_fresh(), "touch() must reset staleness");
+    }
+
+    #[tokio::test]
+    async fn evict_stale_ember_session_removes_only_stale_entries() {
+        let sessions: EmberSessionMap = Arc::new(RwLock::new(HashMap::new()));
+        let stale_hash = [0xAA; 16];
+        let fresh_hash = [0xBB; 16];
+
+        let (stale_tx, _stale_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let stale_handle = EmberSessionHandle::new(stale_tx);
+        stale_handle.backdate_for_test(EMBER_SESSION_FRESH_SECS + 1);
+
+        let (fresh_tx, _fresh_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let fresh_handle = EmberSessionHandle::new(fresh_tx);
+
+        {
+            let mut map = sessions.write().await;
+            map.insert(stale_hash, stale_handle);
+            map.insert(fresh_hash, fresh_handle);
+        }
+
+        let evicted_stale = evict_stale_ember_session(&sessions, &stale_hash).await;
+        let evicted_fresh = evict_stale_ember_session(&sessions, &fresh_hash).await;
+
+        assert!(evicted_stale, "stale entry must be evicted");
+        assert!(!evicted_fresh, "fresh entry must be left alone");
+
+        let map = sessions.read().await;
+        assert!(
+            !map.contains_key(&stale_hash),
+            "stale hash must no longer be present after eviction"
+        );
+        assert!(
+            map.contains_key(&fresh_hash),
+            "fresh hash must still be present"
+        );
+    }
+
+    #[tokio::test]
+    async fn evict_stale_ember_session_is_noop_when_absent() {
+        let sessions: EmberSessionMap = Arc::new(RwLock::new(HashMap::new()));
+        let evicted = evict_stale_ember_session(&sessions, &[0xCC; 16]).await;
+        assert!(!evicted, "evicting an absent hash must report false, not panic");
     }
 }
