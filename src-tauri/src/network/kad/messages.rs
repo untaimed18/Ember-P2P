@@ -471,7 +471,14 @@ fn decode_message(opcode: u8, cursor: &mut Cursor<&[u8]>) -> io::Result<KadMessa
             // generous bound as SEARCH_RES and warn instead of dropping quietly.
             let capped = count.min(300);
             if count > 300 {
-                tracing::debug!(
+                // The handler ACKs with a normal `PublishRes` load byte
+                // regardless of truncation (there's no wire-level "partial
+                // accept" signal in the KAD protocol), so a sender that
+                // declares more than 300 entries has no way to learn the
+                // remainder were silently dropped short of comparing
+                // published vs. served-back keyword counts themselves.
+                // `warn!` at least makes truncation visible in our own logs.
+                tracing::warn!(
                     "KAD PUBLISH_KEY_REQ declared {count} entries, capping parse to 300"
                 );
             }

@@ -13160,7 +13160,7 @@ pub async fn start_network(
                 if !need_buddy {
                     match state.buddy_manager.state() {
                         BuddyState::Connected => {
-                            state.buddy_manager.disconnect_buddy();
+                            state.buddy_manager.disconnect_buddy().await;
                             state.buddy_event_rx = None;
                             *state.shared_buddy_info.write().await = None;
                             info!("Dropped buddy: no longer firewalled on both TCP and UDP");
@@ -16967,7 +16967,7 @@ pub async fn start_network(
                     }
                     Some(BuddyEvent::Disconnected) | None => {
                         if state.buddy_manager.state() == BuddyState::Connected {
-                            state.buddy_manager.disconnect_buddy();
+                            state.buddy_manager.disconnect_buddy().await;
                             state.buddy_event_rx = None;
                             *state.shared_buddy_info.write().await = None;
                         }
@@ -22909,7 +22909,15 @@ async fn handle_udp_packet_inner(
                             },
                             KadTag {
                                 name: TagName::Id(TAG_SOURCES),
-                                value: TagValue::Uint32(1),
+                                // Match `build_keyword_entry`'s publish-side
+                                // value (see publish.rs) instead of a
+                                // hardcoded 1 — we don't separately track a
+                                // "total sources" count distinct from
+                                // "complete sources" for our own shared
+                                // files, and the `max(1)` floor accounts for
+                                // the fact that we ourselves are always a
+                                // complete source for anything we publish.
+                                value: TagValue::Uint32(file.complete_sources.max(1)),
                             },
                             KadTag {
                                 name: TagName::Id(TAG_COMPLETE_SOURCES),
@@ -26041,7 +26049,7 @@ async fn handle_command_inner(
             state.udp_firewalled = true;
             state.udp_fw_verified = false;
             state.overloaded_nodes.clear();
-            state.buddy_manager.reset();
+            state.buddy_manager.reset().await;
             state.buddy_event_rx = None;
             state.serving_event_rx = None;
             *state.shared_buddy_info.write().await = None;

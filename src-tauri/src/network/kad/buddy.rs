@@ -126,7 +126,7 @@ impl BuddyManager {
         }
     }
 
-    pub fn reset(&mut self) {
+    pub async fn reset(&mut self) {
         self.state = BuddyState::NoBuddy;
         self.buddy_id = None;
         self.buddy_addr = None;
@@ -143,9 +143,10 @@ impl BuddyManager {
         self.serving_buddy_for = None;
         self.serving_callback_check = None;
         self.serving_callback_budget = 0;
-        if let Ok(mut guard) = self.pending_buddy_hashes.try_lock() {
-            guard.clear();
-        }
+        // See `disconnect_buddy` — `.await` the real lock instead of a
+        // best-effort `try_lock()` so this can never skip clearing stale
+        // pending-buddy entries under lock contention.
+        self.pending_buddy_hashes.lock().await.clear();
     }
 
     pub fn state(&self) -> BuddyState {
@@ -470,7 +471,7 @@ impl BuddyManager {
                 Ok(Ok(())) => true,
                 _ => {
                     debug!("Buddy ping failed, connection lost");
-                    self.disconnect_buddy();
+                    self.disconnect_buddy().await;
                     false
                 }
             }
@@ -598,18 +599,18 @@ impl BuddyManager {
             Ok(Ok(())) => true,
             Ok(Err(e)) => {
                 debug!("Failed to forward OP_REASKCALLBACKUDP to buddy over TCP: {e}");
-                self.disconnect_buddy();
+                self.disconnect_buddy().await;
                 false
             }
             Err(_) => {
                 debug!("OP_REASKCALLBACKUDP forward to buddy TCP timed out");
-                self.disconnect_buddy();
+                self.disconnect_buddy().await;
                 false
             }
         }
     }
 
-    pub fn disconnect_buddy(&mut self) {
+    pub async fn disconnect_buddy(&mut self) {
         if let Some(h) = self.buddy_reader_handle.take() {
             h.abort();
         }
@@ -617,9 +618,13 @@ impl BuddyManager {
         self.buddy_id = None;
         self.buddy_addr = None;
         self.state = BuddyState::NoBuddy;
-        if let Ok(mut guard) = self.pending_buddy_hashes.try_lock() {
-            guard.clear();
-        }
+        // `.await` the real lock rather than `try_lock()`: the previous
+        // best-effort skip meant that if the upload listener's
+        // `register_pending_buddy` happened to hold the lock at this exact
+        // moment, `pending_buddy_hashes` was left uncleared and stale
+        // entries could linger up to their own 2-minute TTL, causing brief
+        // false-positive buddy matching after a disconnect/reconnect.
+        self.pending_buddy_hashes.lock().await.clear();
         info!("Buddy disconnected");
     }
 

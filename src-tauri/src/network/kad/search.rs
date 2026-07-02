@@ -19,8 +19,11 @@ const LOOKUP_FORCE_FETCH_SECS: i64 = 15;
 pub const STORE_PUBLISH_TARGET_TOTAL: usize = 10;
 const SOURCE_SEARCH_STOP_THRESHOLD: usize = 20;
 const NOTES_SEARCH_STOP_THRESHOLD: usize = 50;
+/// eMule caps a FindBuddy search at `SEARCHFINDBUDDY` (10) distinct
+/// contacts queried. Both the stop-querying check and the reservation
+/// cap below must use this same value — a previous `+ 1` fudge factor
+/// let an 11th contact be queried before `stop_querying` engaged.
 pub const FIND_BUDDY_REQUEST_TOTAL: usize = 10;
-pub const FIND_BUDDY_REQUEST_MAX_SENDS: usize = FIND_BUDDY_REQUEST_TOTAL + 1;
 
 /// eMule seeds searches with 50 contacts (Search.cpp Go() -> GetClosestTo(..., 50, ...))
 pub const SEARCH_INITIAL_CONTACTS: usize = 50;
@@ -803,7 +806,7 @@ impl SearchState {
             SearchType::FindKeyword => self.results.len() >= KEYWORD_SEARCH_STOP_THRESHOLD,
             SearchType::FindSource { .. } => self.results.len() >= SOURCE_SEARCH_STOP_THRESHOLD,
             SearchType::FindNotes { .. } => self.results.len() >= NOTES_SEARCH_STOP_THRESHOLD,
-            SearchType::FindBuddy => self.find_buddy_sent.len() >= FIND_BUDDY_REQUEST_MAX_SENDS,
+            SearchType::FindBuddy => self.find_buddy_sent.len() >= FIND_BUDDY_REQUEST_TOTAL,
             _ => false,
         };
         let now = chrono::Utc::now().timestamp();
@@ -824,11 +827,11 @@ impl SearchState {
         if self.find_buddy_sent.contains(&contact_id) {
             return false;
         }
-        if self.find_buddy_sent.len() >= FIND_BUDDY_REQUEST_MAX_SENDS {
+        if self.find_buddy_sent.len() >= FIND_BUDDY_REQUEST_TOTAL {
             return false;
         }
         self.find_buddy_sent.insert(contact_id);
-        if self.find_buddy_sent.len() >= FIND_BUDDY_REQUEST_MAX_SENDS {
+        if self.find_buddy_sent.len() >= FIND_BUDDY_REQUEST_TOTAL {
             self.stop_querying = true;
         }
         true
@@ -1504,6 +1507,26 @@ mod tests {
         assert_eq!(timed_out, vec![old]);
         assert!(!state.pending.contains(&old));
         assert!(state.pending.contains(&fresh));
+    }
+
+    #[test]
+    fn reserve_find_buddy_request_caps_at_request_total_not_one_more() {
+        let mut state = SearchState::new(SearchId(1), kad_id(1), SearchType::FindBuddy);
+        for i in 0..FIND_BUDDY_REQUEST_TOTAL {
+            assert!(
+                state.reserve_find_buddy_request(kad_id(i as u8 + 10)),
+                "request {i} should be accepted"
+            );
+        }
+        assert_eq!(state.find_buddy_requests_sent(), FIND_BUDDY_REQUEST_TOTAL);
+        assert!(
+            !state.reserve_find_buddy_request(kad_id(200)),
+            "must not allow more than FIND_BUDDY_REQUEST_TOTAL distinct contacts queried"
+        );
+        assert!(
+            state.should_stop_querying(),
+            "stop_querying must engage once the cap is reached, not one request later"
+        );
     }
 
     #[test]
