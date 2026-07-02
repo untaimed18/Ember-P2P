@@ -8611,11 +8611,33 @@ pub async fn start_network(
                             let idx = local_index.read().await;
                             idx.all_files().to_vec()
                         };
+                        // Cap both entry count and total payload bytes. The
+                        // receiving side's inbound frame reader
+                        // (`read_packet_with_first_byte` in upload.rs) rejects
+                        // any packet over 512 KiB outright with no partial
+                        // delivery, so an oversized answer silently loses the
+                        // *entire* browse response rather than a truncated
+                        // one — cap well under that so a large library still
+                        // gets a usable (if truncated) reply. The entry count
+                        // also matches `MAX_BROWSE_ENTRIES` in
+                        // `multi_source::parse_browse_response`, which is what
+                        // the peer receiving our answer actually keeps.
+                        const MAX_BROWSE_ANSWER_FILES: usize = 1_000;
+                        const MAX_BROWSE_ANSWER_BYTES: usize = 400 * 1024;
                         let mut res_payload = Vec::new();
                         let count_offset = res_payload.len();
                         res_payload.extend_from_slice(&0u32.to_le_bytes());
                         let mut actual_count = 0u32;
-                        for f in files.iter().take(5000) {
+                        // Only files the user actively shares — mirrors
+                        // `build_shared_files_answer`'s vanilla-eD2k browse
+                        // filter. Without this, a friend's browse request
+                        // leaked indexed-but-unshared files that the same
+                        // user's vanilla `OP_ASKSHAREDFILES` answer already
+                        // correctly withholds.
+                        for f in files.iter().filter(|f| f.shared).take(MAX_BROWSE_ANSWER_FILES) {
+                            if res_payload.len() >= MAX_BROWSE_ANSWER_BYTES {
+                                break;
+                            }
                             if let Ok(hash_bytes) = hex::decode(&f.hash) {
                                 if hash_bytes.len() == 16 {
                                     res_payload.extend_from_slice(&hash_bytes);
