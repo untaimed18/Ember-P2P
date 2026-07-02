@@ -1712,11 +1712,26 @@ impl Ed2kDownload {
                         );
                     }
                     if parts.is_empty() {
-                        debug!(
-                            "FileStatus: part_count=0 → peer has complete file ({} parts)",
-                            part_count
-                        );
-                        available_parts = vec![true; part_count.max(1)];
+                        // Only trust the `part_count == 0` "complete file"
+                        // sentinel for single-part files. Multi-part peers
+                        // sending it have proven unreliable in the wild (see
+                        // the identical Fix D rationale in
+                        // `multi_source.rs`); leave `available_parts` empty
+                        // (== "unknown, assume available" to `needed_parts`)
+                        // rather than reporting false 100% availability.
+                        if single_part {
+                            debug!(
+                                "FileStatus: part_count=0 → peer has complete file ({} parts)",
+                                part_count
+                            );
+                            available_parts = vec![true; part_count.max(1)];
+                        } else {
+                            debug!(
+                                "FileStatus: part_count=0 for multi-part file ({} parts) — treating as unverified",
+                                part_count
+                            );
+                            available_parts = Vec::new();
+                        }
                     } else {
                         debug!("FileStatus: {} parts", parts.len());
                         let mut padded = parts;
@@ -1850,8 +1865,15 @@ impl Ed2kDownload {
                         }
                         if let Some(parts) = mp.file_status {
                             if parts.is_empty() {
-                                debug!("FileStatus via MultiPacket: part_count=0 → peer has complete file ({} parts)", part_count);
-                                available_parts = vec![true; part_count.max(1)];
+                                // See the standalone OP_FILESTATUS branch above:
+                                // only trust the sentinel for single-part files.
+                                if single_part {
+                                    debug!("FileStatus via MultiPacket: part_count=0 → peer has complete file ({} parts)", part_count);
+                                    available_parts = vec![true; part_count.max(1)];
+                                } else {
+                                    debug!("FileStatus via MultiPacket: part_count=0 for multi-part file ({} parts) — treating as unverified", part_count);
+                                    available_parts = Vec::new();
+                                }
                             } else {
                                 debug!("FileStatus via MultiPacket: {} parts", parts.len());
                                 let mut padded = parts;
@@ -4559,6 +4581,11 @@ async fn wait_for_aich_recovery_answer<R: AsyncReadExt + Unpin + ?Sized>(
                     if ans_hash == *file_hash && ans_part == part_idx && root == expected_master {
                         return Some(payload[38..].to_vec());
                     }
+                    debug!(
+                        "AICH recovery: ignoring non-matching OP_AICHANSWER (expected part {part_idx} hash {}, got part {ans_part} hash {})",
+                        hex::encode(file_hash),
+                        hex::encode(ans_hash)
+                    );
                 }
             }
             Ok(Err(_)) => return None,

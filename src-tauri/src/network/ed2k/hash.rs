@@ -478,7 +478,22 @@ pub fn parse_ed2k_link(link: &str) -> Option<(String, u64, String, Option<String
     let mut aich: Option<String> = None;
     for seg in parts {
         if let Some(b32) = seg.strip_prefix("h=") {
-            aich = aich_base32_to_hex(b32);
+            if let Some(decoded) = aich_base32_to_hex(b32) {
+                match &aich {
+                    None => aich = Some(decoded),
+                    Some(existing) if *existing != decoded => {
+                        // A malformed/tampered link with disagreeing `h=`
+                        // segments used to silently keep whichever came
+                        // last with no indication anything was off. Keep
+                        // the first one seen and surface the conflict
+                        // instead of hiding it.
+                        tracing::debug!(
+                            "ed2k link has conflicting h= segments: keeping {existing}, ignoring {decoded}"
+                        );
+                    }
+                    Some(_) => {}
+                }
+            }
         }
     }
     Some((name, size, hash, aich))

@@ -15,6 +15,14 @@ const BAN_CORRUPTION_RATIO: f64 = 0.32;
 /// valid data.
 const MIN_BYTES_FOR_BAN_DECISION: u64 = 3 * EMBLOCKSIZE;
 
+/// Cap on distinct files tracked at once. Each file's own block list is
+/// already bounded by `MAX_BLOCKS_BEFORE_COMPACT`, but nothing previously
+/// bounded the number of *files* — downloads that are paused/cancelled
+/// (rather than completing or failing, the only two events that call
+/// `remove_file`) never got cleaned up, so a long session with many
+/// started-then-abandoned downloads could grow this map indefinitely.
+const MAX_TRACKED_FILES: usize = 512;
+
 #[derive(Debug, Clone)]
 struct RecordedBlock {
     start: u64,
@@ -32,12 +40,16 @@ impl RecordedBlock {
 
 pub struct CorruptionBlackBox {
     records: HashMap<[u8; 16], Vec<RecordedBlock>>,
+    /// Oldest-first insertion order of `records` keys, used to evict the
+    /// longest-tracked file when `MAX_TRACKED_FILES` is exceeded.
+    insertion_order: std::collections::VecDeque<[u8; 16]>,
 }
 
 impl CorruptionBlackBox {
     pub fn new() -> Self {
         Self {
             records: HashMap::new(),
+            insertion_order: std::collections::VecDeque::new(),
         }
     }
 
@@ -46,6 +58,15 @@ impl CorruptionBlackBox {
     pub fn record_data(&mut self, file_hash: [u8; 16], start: u64, end: u64, ip: Ipv4Addr) {
         if start >= end {
             return;
+        }
+
+        if !self.records.contains_key(&file_hash) {
+            self.insertion_order.push_back(file_hash);
+            if self.insertion_order.len() > MAX_TRACKED_FILES {
+                if let Some(oldest) = self.insertion_order.pop_front() {
+                    self.records.remove(&oldest);
+                }
+            }
         }
 
         let blocks = self.records.entry(file_hash).or_default();
@@ -140,13 +161,52 @@ impl CorruptionBlackBox {
     }
 
     /// Marks all records overlapping [part_start, part_end) as verified (hash check passed).
+    ///
+    /// Splits any block that only *partially* overlaps the range so only
+    /// the verified sub-range is marked — a block can span outside
+    /// `[part_start, part_end)` when a source's write crossed a part
+    /// boundary. Without splitting, bytes outside the actually-checked
+    /// range were being marked verified too, which could hide corruption
+    /// in whichever adjacent part those bytes actually belong to (their
+    /// own MD4 check might never run if this over-broad marking excludes
+    /// them from `corrupted_part_contributors`).
     pub fn verified_part(&mut self, file_hash: &[u8; 16], part_start: u64, part_end: u64) {
         if let Some(blocks) = self.records.get_mut(file_hash) {
-            for block in blocks.iter_mut() {
-                if block.start < part_end && block.end > part_start {
-                    block.verified = true;
+            let mut result = Vec::with_capacity(blocks.len());
+            for block in blocks.drain(..) {
+                if block.verified || block.corrupt || block.start >= part_end || block.end <= part_start {
+                    result.push(block);
+                    continue;
+                }
+                let overlap_start = block.start.max(part_start);
+                let overlap_end = block.end.min(part_end);
+                if block.start < overlap_start {
+                    result.push(RecordedBlock {
+                        start: block.start,
+                        end: overlap_start,
+                        ip: block.ip,
+                        verified: false,
+                        corrupt: false,
+                    });
+                }
+                result.push(RecordedBlock {
+                    start: overlap_start,
+                    end: overlap_end,
+                    ip: block.ip,
+                    verified: true,
+                    corrupt: false,
+                });
+                if block.end > overlap_end {
+                    result.push(RecordedBlock {
+                        start: overlap_end,
+                        end: block.end,
+                        ip: block.ip,
+                        verified: false,
+                        corrupt: false,
+                    });
                 }
             }
+            *blocks = result;
         }
     }
 
@@ -240,6 +300,7 @@ impl CorruptionBlackBox {
     /// Removes all records for a file (e.g. when the download completes).
     pub fn remove_file(&mut self, file_hash: &[u8; 16]) {
         self.records.remove(file_hash);
+        self.insertion_order.retain(|h| h != file_hash);
     }
 }
 
@@ -410,6 +471,34 @@ mod tests {
         let contributors = bb.corrupted_part_contributors(&h, 0, 1000);
         assert_eq!(contributors.len(), 1);
         assert!(contributors.contains(&solo));
+    }
+
+    #[test]
+    fn tracked_file_count_is_capped_via_lru_eviction() {
+        let mut bb = CorruptionBlackBox::new();
+        let hash_n = |n: u16| {
+            let mut h = [0u8; 16];
+            h[0..2].copy_from_slice(&n.to_le_bytes());
+            h
+        };
+
+        for n in 0..(MAX_TRACKED_FILES as u16 + 1) {
+            bb.record_data(hash_n(n), 0, 100, ip(10, 0, 0, 1));
+        }
+
+        assert_eq!(
+            bb.records.len(),
+            MAX_TRACKED_FILES,
+            "tracked file count must never exceed MAX_TRACKED_FILES"
+        );
+        assert!(
+            bb.records.get(&hash_n(0)).is_none(),
+            "oldest file must be evicted first"
+        );
+        assert!(
+            bb.records.get(&hash_n(MAX_TRACKED_FILES as u16)).is_some(),
+            "most recently added file must survive eviction"
+        );
     }
 
     #[test]

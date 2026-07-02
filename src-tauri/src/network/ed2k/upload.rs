@@ -1566,7 +1566,15 @@ pub(crate) async fn udp_queue_rank_for_peer(
                 .current_addr
                 .map(|a| a.ip() == from_ip)
                 .unwrap_or(false)
-            || (entry.current_addr.is_none() && entry.udp_port == from_udp_port);
+            // Port-only fallback for entries with no known address yet.
+            // Requires a real (non-zero) stored UDP port so multiple
+            // queued peers that both still have `udp_port == 0` can't
+            // spuriously match each other via `0 == 0`, and so this
+            // branch never substitutes for the IP checks above by
+            // coincidence when the port happens to still be unset.
+            || (entry.current_addr.is_none()
+                && entry.udp_port != 0
+                && entry.udp_port == from_udp_port);
         if matches {
             match best {
                 Some(prev) if prev.join_time <= entry.join_time => {}

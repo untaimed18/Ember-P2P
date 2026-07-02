@@ -8,7 +8,7 @@ use rand::RngCore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::messages::*;
 use super::upload::{EmberSessionHandle, EmberSessionMap, UploadEvent, UploadEventKind};
@@ -508,7 +508,12 @@ pub async fn run_friend_session_over_transport(
                             }
                         }
                         Err(e) => {
-                            debug!("Friend session read error from {addr}: {e}");
+                            // Root cause of the session ending — the "session
+                            // ended" log itself is already `info!`-level, but
+                            // without this at the same level the actual reason
+                            // (vs. a clean keepalive-stall disconnect) is
+                            // invisible at default log verbosity.
+                            warn!("Friend session read error from {addr}: {e}");
                             break;
                         }
                     }
@@ -516,11 +521,11 @@ pub async fn run_friend_session_over_transport(
                 Some(outbound_data) = outbound_rx.recv() => {
                     last_activity = tokio::time::Instant::now();
                     if writer.write_all(&outbound_data).await.is_err() {
-                        debug!("Friend session write error to {addr}");
+                        warn!("Friend session write error to {addr}");
                         break;
                     }
                     if writer.flush().await.is_err() {
-                        debug!("Friend session flush error to {addr}");
+                        warn!("Friend session flush error to {addr}");
                         break;
                     }
                 }
@@ -548,7 +553,7 @@ pub async fn run_friend_session_over_transport(
                         break;
                     }
                     if write_packet(&mut writer, OP_EMULEPROT, OP_EMBER_KEEPALIVE, &[]).await.is_err() {
-                        debug!("Friend session keepalive to {addr} failed");
+                        warn!("Friend session keepalive to {addr} failed");
                         break;
                     }
                     last_activity = tokio::time::Instant::now();

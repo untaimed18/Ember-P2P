@@ -5453,10 +5453,12 @@ async fn download_parts_from_source(
     } else if single_part {
         src_available_parts = Some(1);
         src_total_parts = Some(1);
-    } else if got_status {
-        src_available_parts = Some(part_count as u32);
-        src_total_parts = Some(part_count as u32);
     }
+    // else: `got_status` was set without a usable bitmap — either the
+    // distrusted `part_count == 0` sentinel on a multi-part file (Fix D
+    // above) or the filename-only handshake fallback. Neither confirms
+    // the peer actually has every part, so leave availability as
+    // unknown (`None`) instead of implying 100% in source-detail UI.
     debug!(
         "Source {} ({}) parts resolved: available={:?} total={:?}",
         _src_idx, addr, src_available_parts, src_total_parts

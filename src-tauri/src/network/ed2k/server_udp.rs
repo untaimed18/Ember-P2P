@@ -690,7 +690,13 @@ fn parse_server_udp_response(data: &[u8], addr: SocketAddr) -> Option<ServerUdpR
             })
         }
         OP_GLOBSEARCHRES => parse_search_results(payload),
-        _ => None,
+        _ => {
+            debug!(
+                "Server UDP: unhandled opcode 0x{opcode:02X} ({} bytes) from {addr}",
+                payload.len()
+            );
+            None
+        }
     }
 }
 /// Parse an eMule media-length string ("h:mm:ss"/"mm:ss"/"ss") into seconds.
