@@ -1637,6 +1637,107 @@ mod tests {
         }
     }
 
+    fn sample_search_result(hash: &str) -> SearchResult {
+        SearchResult {
+            file: FileInfo {
+                id: hash.to_string(),
+                name: "file.bin".to_string(),
+                path: String::new(),
+                size: 1234,
+                hash: hash.to_string(),
+                aich_hash: String::new(),
+                extension: "bin".to_string(),
+                modified_at: 0,
+                priority: "normal".to_string(),
+                requests: 0,
+                accepted: 0,
+                bytes_transferred: 0,
+                alltime_requests: 0,
+                alltime_accepted: 0,
+                alltime_transferred: 0,
+                complete_sources: 0,
+                folder: String::new(),
+                shared: false,
+                shared_kad: false,
+                shared_ed2k: false,
+            },
+            peer_id: String::new(),
+            peer_name: String::new(),
+            availability: 1,
+            file_type: String::new(),
+            source_addresses: Vec::new(),
+            rating: None,
+            comment: None,
+            media: None,
+            spam_rating: 0,
+            is_spam: false,
+            clean_name: String::new(),
+            result_origin: "KAD".to_string(),
+        }
+    }
+
+    fn sample_active_search_request(request_id: u64) -> ActiveSearchRequest {
+        ActiveSearchRequest {
+            request_id,
+            server_pending: false,
+            kad_pending: true,
+            udp_pending: false,
+            file_type_filter: None,
+            keywords: Vec::new(),
+            server_ip: None,
+            server_result_count: 0,
+            streamed_hashes: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Regression guard for the KAD/server streaming cross-batch dedup fix:
+    /// a hash already forwarded to the UI in an earlier streamed batch for
+    /// this search must be dropped from a later batch, while a genuinely
+    /// new hash still passes through. Without this, the same file
+    /// re-announced by a different KAD node / eD2K server got re-scored by
+    /// the batch-local spam heuristics a second time, which could flip
+    /// `is_spam` after the row was already shown — see
+    /// `ActiveSearchRequest::streamed_hashes`.
+    #[test]
+    fn dedup_streamed_batch_drops_hash_already_streamed_this_request() {
+        let mut active = Some(sample_active_search_request(42));
+
+        let mut batch1 = vec![sample_search_result("aaaa"), sample_search_result("bbbb")];
+        dedup_streamed_batch(&mut active, 42, &mut batch1);
+        assert_eq!(batch1.len(), 2, "first sighting of both hashes must pass through");
+
+        // "aaaa" reappears (a different node/server re-announcing the same
+        // file); "cccc" is genuinely new.
+        let mut batch2 = vec![sample_search_result("aaaa"), sample_search_result("cccc")];
+        dedup_streamed_batch(&mut active, 42, &mut batch2);
+        assert_eq!(
+            batch2.iter().map(|r| r.file.hash.as_str()).collect::<Vec<_>>(),
+            vec!["cccc"],
+            "already-streamed hash must be dropped, new hash must pass through"
+        );
+    }
+
+    /// A batch with no matching active search (already replaced by a newer
+    /// one, or none running) must pass through unfiltered rather than
+    /// silently dropping results or filtering against the wrong search's
+    /// dedup set.
+    #[test]
+    fn dedup_streamed_batch_is_noop_for_mismatched_or_missing_request() {
+        let mut none_active: Option<ActiveSearchRequest> = None;
+        let mut batch = vec![sample_search_result("aaaa")];
+        dedup_streamed_batch(&mut none_active, 1, &mut batch);
+        assert_eq!(batch.len(), 1, "no active search at all must not filter anything");
+
+        let mut active = Some(sample_active_search_request(1));
+        let mut batch = vec![sample_search_result("aaaa")];
+        dedup_streamed_batch(&mut active, 999, &mut batch);
+        assert_eq!(
+            batch.len(),
+            1,
+            "batch for a different (stale/replaced) request id must pass through unfiltered"
+        );
+    }
+
     /// Regression guard for the KAD bootstrap-hammering fix: the interval
     /// must start at the same 10s cadence as before (no behavior change for
     /// a healthy, quickly-connecting client), strictly grow with `shift`,
@@ -2679,7 +2780,30 @@ struct ActiveSearchRequest {
     /// uniquely belong to one server / origin IP.
     server_ip: Option<String>,
     server_result_count: usize,
+    /// File hashes already forwarded to the UI for this request, across
+    /// *all* origins (KAD tail-slice batches, UDP global-search per-server
+    /// batches, TCP server "more results" pages). Each streaming call site
+    /// only sees its own small batch, so without this a popular file
+    /// re-announced later by a different KAD node / different eD2K server
+    /// gets spam-scored a second time by `BatchSpamContext::analyze`'s
+    /// batch-local heuristics — `is_spam` can flip false→true (never back,
+    /// since the frontend merges with OR) well after the row was already
+    /// shown, making it vanish under "hide spam" and look like the same
+    /// file flickering. Once a hash has been streamed we drop further
+    /// sightings of it here rather than re-emitting/re-scoring; the vec is
+    /// bounded well below `MAX_STREAMED_HASHES_SOFT_CAP` in practice since
+    /// KAD/TCP/UDP each cap their own result counts, but a hard cap keeps
+    /// a pathological all-servers global search from growing this
+    /// unboundedly for the lifetime of one search.
+    streamed_hashes: std::collections::HashSet<String>,
 }
+
+/// Soft cap on `ActiveSearchRequest::streamed_hashes`. Once reached, dedup
+/// is skipped (results pass through unfiltered) rather than growing the
+/// set further — an extremely broad global search hitting this is already
+/// an edge case, and falling back to "no dedup" is strictly no worse than
+/// the pre-fix behavior.
+const MAX_STREAMED_HASHES_SOFT_CAP: usize = 20_000;
 
 #[derive(Clone, serde::Serialize)]
 struct SearchResultsEvent {
@@ -3205,6 +3329,27 @@ fn filter_results_by_type(
         });
     }
     results
+}
+
+/// Drop entries from `results` whose file hash has already been streamed
+/// for `request_id` in this active search, recording newly-seen hashes as
+/// it goes. A no-op (passes everything through unfiltered) if there's no
+/// matching active search or the dedup set has hit its soft cap — see
+/// `ActiveSearchRequest::streamed_hashes` for why this exists and why that
+/// fallback is safe. Must be called before spam-scoring/enrichment so a
+/// repeat sighting of the same file never reaches `BatchSpamContext`.
+fn dedup_streamed_batch(
+    active_search_request: &mut Option<ActiveSearchRequest>,
+    request_id: u64,
+    results: &mut Vec<SearchResult>,
+) {
+    let Some(active) = active_search_request.as_mut() else {
+        return;
+    };
+    if active.request_id != request_id || active.streamed_hashes.len() >= MAX_STREAMED_HASHES_SOFT_CAP {
+        return;
+    }
+    results.retain(|r| active.streamed_hashes.insert(r.file.hash.clone()));
 }
 
 fn emit_search_results(
@@ -8126,6 +8271,12 @@ pub async fn start_network(
                             if !pending_expr.is_trivial() {
                                 batch.retain(|r| pending_expr.matches(&r.file.name.to_lowercase()));
                             }
+                            // See `ActiveSearchRequest::streamed_hashes`: the same
+                            // file can legitimately reappear in a later, disjoint
+                            // tail slice (a different KAD node re-announcing it),
+                            // and re-scoring it a second time can flip its spam
+                            // classification after the row's already visible.
+                            dedup_streamed_batch(&mut state.active_search_request, pending_request_id, &mut batch);
                             if !batch.is_empty() {
                                 enrich_and_emit_search_results(
                                     &app_handle,
@@ -14002,6 +14153,12 @@ pub async fn start_network(
                                                 .as_ref()
                                                 .map(|a| (a.file_type_filter.clone(), a.keywords.clone(), a.server_ip.clone()))
                                                 .unwrap_or((None, Vec::new(), None));
+                                            let mut search_results = search_results;
+                                            // See `ActiveSearchRequest::streamed_hashes` — an
+                                            // OP_QUERY_MORE_RESULT page could in principle
+                                            // re-return a hash already streamed on an earlier
+                                            // page.
+                                            dedup_streamed_batch(&mut state.active_search_request, request_id, &mut search_results);
                                             enrich_and_emit_search_results(
                                                 &app_handle,
                                                 &spam_filter,
@@ -15087,11 +15244,24 @@ pub async fn start_network(
                                         result_origin: crate::search::merge::ORIGIN_SERVER_UDP.to_string(),
                                     }
                                 }).collect();
-                                if let Some(active) = state.active_search_request.as_ref() {
+                                // Extracted into owned values (rather than an `as_ref()`
+                                // binding kept alive across the call below) so the
+                                // `dedup_streamed_batch` call can take `active_search_request`
+                                // mutably afterward without fighting the borrow checker.
+                                let active_ctx = state.active_search_request.as_ref().map(|a| {
+                                    (a.request_id, a.file_type_filter.clone(), a.keywords.clone())
+                                });
+                                if let Some((request_id, ft_filter, kws)) = active_ctx {
                                     state.server_udp_search_age = 0;
-                                    let request_id = active.request_id;
-                                    let ft_filter = active.file_type_filter.clone();
-                                    let kws = active.keywords.clone();
+                                    let mut search_results = search_results;
+                                    // See `ActiveSearchRequest::streamed_hashes`: a global
+                                    // search fans out to every known server, and the same
+                                    // popular file is very likely to be indexed by more
+                                    // than one of them — each server's reply is its own
+                                    // batch here, so without this the file gets re-scored
+                                    // (and can flip spam-hidden) on every server that also
+                                    // has it.
+                                    dedup_streamed_batch(&mut state.active_search_request, request_id, &mut search_results);
                                     enrich_and_emit_search_results(
                                         &app_handle,
                                         &spam_filter,
@@ -21276,6 +21446,7 @@ async fn handle_command_inner(
                 keywords: Vec::new(),
                 server_ip: state.server_addr.map(|a| a.ip().to_string()),
                 server_result_count: 0,
+                streamed_hashes: std::collections::HashSet::new(),
             };
 
             // Parse the raw query into a boolean keyword tree (implicit AND,
