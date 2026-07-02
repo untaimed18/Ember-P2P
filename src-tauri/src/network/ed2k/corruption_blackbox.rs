@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 
 use super::messages::EMBLOCKSIZE;
@@ -148,6 +148,35 @@ impl CorruptionBlackBox {
                 }
             }
         }
+    }
+
+    /// Returns the distinct IPs that contributed still-unverified data
+    /// overlapping `[start, end)`, without mutating any records.
+    ///
+    /// A part-level MD4 mismatch tells us the aggregate bytes in the part
+    /// are wrong, but not *which* contributor's bytes are the bad ones —
+    /// AICH narrowing (when it succeeds) answers that at 180 KiB
+    /// granularity, but a plain `corrupted_part` call only has part-level
+    /// evidence. When more than one IP contributed to a failed part, a
+    /// caller cannot reliably single out one of them as *the* culprit from
+    /// this event alone: use this to detect that ambiguity before applying
+    /// a per-connection penalty (e.g. a reputation strike) to whichever
+    /// peer happened to be the one that completed/verified the part.
+    pub fn corrupted_part_contributors(
+        &self,
+        file_hash: &[u8; 16],
+        start: u64,
+        end: u64,
+    ) -> HashSet<Ipv4Addr> {
+        let mut ips = HashSet::new();
+        if let Some(blocks) = self.records.get(file_hash) {
+            for block in blocks {
+                if !block.verified && block.start < end && block.end > start {
+                    ips.insert(block.ip);
+                }
+            }
+        }
+        ips
     }
 
     /// Evaluates corruption within [part_start, part_end). Returns a list of IPs
@@ -330,6 +359,57 @@ mod tests {
         bb.record_data(h, 0, 1000, ip(1, 1, 1, 1));
         bb.remove_file(&h);
         assert!(bb.records.get(&h).is_none());
+    }
+
+    #[test]
+    fn corrupted_part_contributors_reports_all_unverified_ips_in_range() {
+        let mut bb = CorruptionBlackBox::new();
+        let h = hash(9);
+        let a = ip(10, 0, 0, 1);
+        let b = ip(10, 0, 0, 2);
+
+        // Two different peers contributed to the same part range.
+        bb.record_data(h, 0, 500, a);
+        bb.record_data(h, 500, 1000, b);
+
+        let contributors = bb.corrupted_part_contributors(&h, 0, 1000);
+        assert_eq!(contributors.len(), 2, "both peers overlap the range");
+        assert!(contributors.contains(&a));
+        assert!(contributors.contains(&b));
+    }
+
+    #[test]
+    fn corrupted_part_contributors_excludes_already_verified_ips() {
+        let mut bb = CorruptionBlackBox::new();
+        let h = hash(10);
+        let a = ip(10, 0, 0, 1);
+        let b = ip(10, 0, 0, 2);
+
+        bb.record_data(h, 0, 500, a);
+        bb.record_data(h, 500, 1000, b);
+        // `a`'s contribution to an earlier part already verified clean;
+        // only `b`'s bytes remain unverified in this part.
+        bb.verified_part(&h, 0, 500);
+
+        let contributors = bb.corrupted_part_contributors(&h, 0, 1000);
+        assert_eq!(
+            contributors.len(),
+            1,
+            "a verified peer must not count as an ambiguous contributor"
+        );
+        assert!(contributors.contains(&b));
+    }
+
+    #[test]
+    fn corrupted_part_contributors_is_a_single_ip_for_one_source_part() {
+        let mut bb = CorruptionBlackBox::new();
+        let h = hash(11);
+        let solo = ip(10, 0, 0, 5);
+        bb.record_data(h, 0, 1000, solo);
+
+        let contributors = bb.corrupted_part_contributors(&h, 0, 1000);
+        assert_eq!(contributors.len(), 1);
+        assert!(contributors.contains(&solo));
     }
 
     #[test]

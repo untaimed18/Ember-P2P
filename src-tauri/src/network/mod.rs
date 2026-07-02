@@ -7344,6 +7344,15 @@ pub async fn start_network(
                     }
                 }
                 if let DownloadEvent::PartCorrupted { ref file_hash, part_start, part_end, ref sender_user_hash, .. } = event {
+                    // Snapshot who contributed still-unverified bytes to this
+                    // exact part range BEFORE `corrupted_part` marks them
+                    // corrupt (marking doesn't change which IP owns a block,
+                    // so ordering isn't strictly required, but doing it first
+                    // keeps the "who could plausibly be blamed" question
+                    // independent of the mutation below).
+                    let contributors = state
+                        .corruption_blackbox
+                        .corrupted_part_contributors(file_hash, part_start, part_end);
                     let ban_list = state.corruption_blackbox.corrupted_part(file_hash, part_start, part_end);
                     for ip in ban_list {
                         // Sustained corruption is a deterministic, serious
@@ -7358,19 +7367,31 @@ pub async fn start_network(
                             &reason,
                         );
                     }
-                    if let Some(ref uh) = sender_user_hash {
-                        let newly_banned = state.reputation.record_event(uh, ember::reputation::ReputationEvent::CorruptData);
-                        if newly_banned {
-                            let sm = source_manager.read().await;
-                            let ips = sm.find_ips_by_user_hash(uh);
-                            drop(sm);
-                            for ip in ips {
-                                if state.banned_ips.insert(ip) {
-                                    warn!("Reputation ban: banning IP {} (user_hash {})", ip, hex::encode(uh));
+                    // `sender_user_hash` is whichever peer's connection
+                    // happened to deliver the bytes that completed this part
+                    // and triggered verification — in a multi-source
+                    // download that is NOT necessarily the peer whose bytes
+                    // were actually bad. Only apply the per-connection
+                    // reputation strike when that peer was the sole
+                    // contributor of unverified data in this part; the
+                    // byte-ratio ban above (which is genuinely per-IP
+                    // attributed) already covers the ambiguous multi-source
+                    // case without punishing an innocent connection.
+                    if contributors.len() <= 1 {
+                        if let Some(ref uh) = sender_user_hash {
+                            let newly_banned = state.reputation.record_event(uh, ember::reputation::ReputationEvent::CorruptData);
+                            if newly_banned {
+                                let sm = source_manager.read().await;
+                                let ips = sm.find_ips_by_user_hash(uh);
+                                drop(sm);
+                                for ip in ips {
+                                    if state.banned_ips.insert(ip) {
+                                        warn!("Reputation ban: banning IP {} (user_hash {})", ip, hex::encode(uh));
+                                    }
                                 }
-                            }
-                            if let Ok(mut shared) = shared_banned_ips.write() {
-                                *shared = state.banned_ips.clone();
+                                if let Ok(mut shared) = shared_banned_ips.write() {
+                                    *shared = state.banned_ips.clone();
+                                }
                             }
                         }
                     }

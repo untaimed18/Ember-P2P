@@ -2875,6 +2875,14 @@ impl Ed2kDownload {
                                     &mut writer, OP_EDONKEYHEADER, OP_CANCELTRANSFER, &[],
                                 ),
                             ).await;
+                            // This callback/single-source path isn't registered in
+                            // `tracker_registry` (only multi-source downloads are), so
+                            // `PauseDownload`'s `save_registered_part_tracker` is a
+                            // no-op here and the task is `abort()`'d right after this
+                            // command returns — without an explicit save here, up to
+                            // `PERIODIC_SAVE_INTERVAL` (60s) of gap-tracking progress
+                            // on the in-flight part would be silently lost on pause.
+                            tracker.save();
                             anyhow::bail!("cancelled by user");
                         }
                         r = tokio::time::timeout(
