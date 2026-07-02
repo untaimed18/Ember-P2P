@@ -1469,9 +1469,23 @@ fn encode_shared_files_answer(
     client_id: u32,
     tcp_port: u16,
 ) -> Vec<u8> {
-    let mut entries = Vec::with_capacity(files.len().saturating_mul(64));
+    // Independent of the caller's `MAX_BROWSE_ANSWER_FILES` entry-count cap
+    // (which alone still allows a multi-MB payload for a large library),
+    // also bound total encoded bytes: `write_packet_async` has no outbound
+    // size limit of its own, and our own inbound frame reader
+    // (`read_packet_with_first_byte`) rejects anything over 512 KiB
+    // outright, so sending an answer this same client couldn't itself
+    // receive back is never useful. A truncated-but-delivered answer is
+    // strictly better than one that's fully built, sent, and then dropped
+    // whole by the receiver's frame-size check.
+    const MAX_ANSWER_BYTES: usize = 400 * 1024;
+
+    let mut entries = Vec::with_capacity(files.len().saturating_mul(64).min(MAX_ANSWER_BYTES));
     let mut count: u32 = 0;
     for (hash_hex, name, size, extension) in files {
+        if entries.len() >= MAX_ANSWER_BYTES {
+            break;
+        }
         let hash_bytes = match hex::decode(hash_hex) {
             Ok(b) if b.len() >= 16 => b,
             _ => continue,
@@ -6388,15 +6402,19 @@ impl UploadHandler {
                         session_start = None;
                         self.slot_rates.lock().remove(&peer_addr);
                         rate_tracker = SessionRateTracker::new();
-                        // Re-arm the promotion poller. We re-queue this peer just
-                        // below, so the periodic grant path (read-timeout branch)
-                        // must track its identity to consider it for re-promotion;
-                        // otherwise the peer stays connected but is never granted a
-                        // new slot until the idle timeout drops it.
-                        queued_identity = Some(queue_identity.clone());
 
-                        // Re-add to upload queue so they can get another turn
-                        {
+                        // Re-add to upload queue so they can get another turn.
+                        // `queued_identity` is only armed once we've confirmed a
+                        // queue entry actually exists for this peer (`re_queued`
+                        // below) — the periodic promotion poll uses a 1s timeout
+                        // while `queued_identity.is_some()`, so arming it
+                        // unconditionally here used to leave a peer stuck
+                        // spinning that poll forever once the queue was full or
+                        // their re-admission score lost the soft-hard-zone
+                        // check: no queue entry existed for them, so the poll
+                        // could never find and promote them, yet nothing ever
+                        // told the peer to give up and reconnect later.
+                        let re_queued = {
                             // Same PoP gate as the initial queue-insertion
                             // site: re-admitting after session-expire
                             // uses the CURRENT verification state. If the
@@ -6431,6 +6449,7 @@ impl UploadHandler {
                                 if entry.ember_pubkey.is_none() {
                                     entry.ember_pubkey = hello_caps.ember_pubkey;
                                 }
+                                true
                             } else if queue.len() < MAX_UPLOAD_QUEUE_SIZE {
                                 queue.push(QueueEntry {
                                     identity: queue_identity.clone(),
@@ -6446,6 +6465,7 @@ impl UploadHandler {
                                     ember_pubkey: hello_caps.ember_pubkey,
                                     ember_verified: ember_auth_state.is_verified(),
                                 });
+                                true
                             } else if queue.len() < HARD_UPLOAD_QUEUE_SIZE {
                                 // m7: Soft-to-hard zone – re-admit after session with score check
                                 let cm = self.credit_manager.read().await;
@@ -6486,8 +6506,26 @@ impl UploadHandler {
                                         ember_pubkey: hello_caps.ember_pubkey,
                                         ember_verified,
                                     });
+                                    true
+                                } else {
+                                    false
                                 }
+                            } else {
+                                false
                             }
+                        };
+
+                        if re_queued {
+                            // Re-arm the promotion poller now that we've confirmed
+                            // a queue entry exists to promote it from.
+                            queued_identity = Some(queue_identity.clone());
+                        } else {
+                            debug!(
+                                "Upload queue full on session-rotation re-admit, sending OP_QUEUEFULL to {peer_addr}"
+                            );
+                            write_packet_async(&mut writer, OP_EMULEPROT, OP_QUEUEFULL, &[])
+                                .await?;
+                            break;
                         }
                     }
                 }
@@ -8529,6 +8567,78 @@ mod browse_answer_tests {
         let payload = encode_shared_files_answer(&[], 0, 4662);
         assert_eq!(payload.len(), 4);
         assert_eq!(u32::from_le_bytes(payload[..4].try_into().unwrap()), 0);
+    }
+
+    /// A pathologically large shared library must not produce a payload
+    /// that can never be delivered: our own inbound frame reader
+    /// (`read_packet_with_first_byte`) rejects any packet over 512 KiB
+    /// outright, so `encode_shared_files_answer`'s internal byte budget
+    /// must keep the *encoded* payload comfortably under that regardless
+    /// of how many files are passed in — and it must still emit a
+    /// well-formed, fully-decodable prefix (truncated count matches the
+    /// number of entries actually written) rather than a partial/corrupt
+    /// tail.
+    #[test]
+    fn huge_share_list_is_truncated_under_frame_size_limit() {
+        let files: Vec<_> = (0..50_000u32)
+            .map(|i| {
+                (
+                    format!("{i:032x}"),
+                    format!("a-reasonably-long-file-name-{i}.mkv"),
+                    123_456_789u64,
+                    "mkv".to_string(),
+                )
+            })
+            .collect();
+
+        let payload = encode_shared_files_answer(&files, 0, 4662);
+
+        assert!(
+            payload.len() < 512 * 1024,
+            "encoded answer must stay under the 512 KiB inbound frame cap, got {} bytes",
+            payload.len()
+        );
+
+        let count = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+        assert!(
+            (count as usize) < files.len(),
+            "50,000 files with long names must be truncated, not all included"
+        );
+        assert!(count > 0, "truncation must still leave at least one entry");
+
+        // The declared count must match how many entries are actually
+        // decodable from the payload — i.e. truncation happened at an
+        // entry boundary, not mid-entry. Tag layout per `write_ed2k_tag`:
+        // type(1) + name_len(2, always 1) + name_id(1) + value, where
+        // value is a u16-prefixed string for type 0x02 or a raw u32 for
+        // type 0x03 (the only two tag types this encoder emits).
+        let mut pos = 4usize;
+        let mut decoded = 0u32;
+        while pos < payload.len() {
+            pos += 16 + 4 + 2; // hash + client_id + port
+            let tag_count = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+            for _ in 0..tag_count {
+                let tag_type = payload[pos];
+                pos += 3; // type(1) + name_len(2, unused: always 1)
+                pos += 1; // name_id(1)
+                match tag_type {
+                    0x02 => {
+                        let str_len =
+                            u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap())
+                                as usize;
+                        pos += 2 + str_len;
+                    }
+                    0x03 => pos += 4,
+                    other => panic!("unexpected tag type {other} in test payload"),
+                }
+            }
+            decoded += 1;
+        }
+        assert_eq!(
+            decoded, count,
+            "declared count must match the number of fully-decodable entries"
+        );
     }
 }
 
