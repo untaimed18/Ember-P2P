@@ -106,6 +106,21 @@ impl DhtStore {
             }
         }
 
+        // `entry(*target).or_default()` above unconditionally inserts a
+        // `target -> Vec::new()` key, even for a request with an empty
+        // `entries` list (a wire-valid `count = 0` publish) or one where
+        // every candidate was rejected by the caps above. Without this,
+        // an attacker can grow `keyword_entries`'s key count without
+        // bound — entirely independent of `MAX_TOTAL_ENTRIES`, which only
+        // bounds stored *entries*, not distinct HashMap keys — by sending
+        // trivial ~20-byte publish requests each addressed to a fresh
+        // `target` within our tolerance zone (our `local_id` isn't
+        // secret, and KAD's UDP transport has no handshake to rate-limit
+        // via source IP once an attacker spoofs a fresh one per packet).
+        if bucket.is_empty() {
+            self.keyword_entries.remove(target);
+        }
+
         self.compute_load()
     }
 
@@ -146,6 +161,17 @@ impl DhtStore {
         self.total_count = self.total_count.saturating_sub(removed);
 
         if self.total_count >= MAX_TOTAL_ENTRIES || bucket.len() >= MAX_ENTRIES_PER_KEY {
+            // Don't leave behind an empty `target -> Vec::new()` key for a
+            // brand-new target that got rejected outright by the global/
+            // per-key cap — see the matching comment in
+            // `store_keyword_entries` for why this otherwise allows
+            // unbounded HashMap key growth that bypasses both caps (the
+            // minimum-field gate above makes this path slightly more
+            // expensive to abuse than the keyword one, but still cheap:
+            // just two tags per packet).
+            if bucket.is_empty() {
+                self.source_entries.remove(target);
+            }
             return self.compute_load();
         }
 
@@ -260,6 +286,12 @@ impl DhtStore {
         self.total_count = self.total_count.saturating_sub(removed);
 
         if self.total_count >= MAX_TOTAL_ENTRIES || bucket.len() >= MAX_NOTES_PER_FILE {
+            // See the matching comment in `store_keyword_entries`/
+            // `store_source_entry`: don't leave an empty bucket key behind
+            // for a brand-new target rejected by the cap.
+            if bucket.is_empty() {
+                self.notes_entries.remove(target);
+            }
             return self.compute_load();
         }
 

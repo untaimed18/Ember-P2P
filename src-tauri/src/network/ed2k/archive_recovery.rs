@@ -258,12 +258,37 @@ fn recover_zip(
         return Ok(0);
     }
 
+    // The writer below only emits classic (non-Zip64) ZIP records: entry
+    // count and every offset/size are packed into u32/u16 fields with a
+    // plain `as` cast. Bail rather than silently truncating — a truncated
+    // offset/count still writes a "successfully recovered" file (the
+    // function returns `Ok`), just one whose central directory points at
+    // the wrong bytes, which is worse than an outright failure since it's
+    // silent corruption discovered only when the user later tries to open
+    // the archive. Large multi-GB archives / >65535-entry archives are
+    // realistic for eD2k-shared ISOs, game installs, and video collections,
+    // so this isn't a hypothetical edge case.
+    if entries.len() > u16::MAX as usize {
+        anyhow::bail!(
+            "cannot recover ZIP: {} entries exceeds the {}-entry limit of the \
+             non-Zip64 central directory this recovery writer emits",
+            entries.len(),
+            u16::MAX
+        );
+    }
+
     // Write recovered ZIP: local headers + data + central directory + EOCD
     let mut central_dir_entries: Vec<Vec<u8>> = Vec::new();
     let mut copy_buf = vec![0u8; 64 * 1024];
 
     for entry in &entries {
         let local_header_offset = output.stream_position()?;
+        if local_header_offset > u32::MAX as u64 {
+            anyhow::bail!(
+                "cannot recover ZIP: local header offset {local_header_offset} exceeds the \
+                 4 GiB limit of the non-Zip64 central directory this recovery writer emits"
+            );
+        }
 
         // Write local file header
         output.write_u32::<LittleEndian>(ZIP_LOCAL_HEADER_MAGIC)?;
@@ -321,10 +346,22 @@ fn recover_zip(
 
     // Write central directory
     let cd_offset = output.stream_position()?;
+    if cd_offset > u32::MAX as u64 {
+        anyhow::bail!(
+            "cannot recover ZIP: central directory offset {cd_offset} exceeds the 4 GiB \
+             limit of the non-Zip64 central directory this recovery writer emits"
+        );
+    }
     let mut cd_size: u64 = 0;
     for cd in &central_dir_entries {
         output.write_all(cd)?;
         cd_size += cd.len() as u64;
+    }
+    if cd_size > u32::MAX as u64 {
+        anyhow::bail!(
+            "cannot recover ZIP: central directory size {cd_size} exceeds the 4 GiB \
+             limit of the non-Zip64 central directory this recovery writer emits"
+        );
     }
 
     // Write End of Central Directory Record
@@ -591,8 +628,22 @@ fn recover_rar(
             };
             let total_pack = pack_size | (high_pack << 32);
 
-            let data_start = pos + head_size;
-            let data_end = data_start + total_pack;
+            // `pack_size`/`high_pack` come straight from file bytes inside a
+            // "filled" (already-downloaded) range, which can originate from
+            // any source that contributed to this part of the download — a
+            // crafted 0xFFFFFFFF/0xFFFFFFFF pair makes `total_pack` ==
+            // `u64::MAX`, so `data_start + total_pack` can overflow a plain
+            // `u64` addition. Reject the candidate header instead of letting
+            // that wrap around into a bogus small `data_end` that would
+            // slip past the `data_end > file_size` guard below.
+            let Some(data_start) = pos.checked_add(head_size) else {
+                pos += 1;
+                continue;
+            };
+            let Some(data_end) = data_start.checked_add(total_pack) else {
+                pos += 1;
+                continue;
+            };
 
             if data_end > file_size {
                 pos += 1;
