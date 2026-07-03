@@ -332,7 +332,13 @@ impl BandwidthLimiter {
 
         if uss_throttling {
             self.set_download_limit(download);
-            if upload > 0 && upload < effective {
+            // `upload == 0` means "unlimited" — an explicit user override
+            // that must take effect immediately just like a reduced cap;
+            // leaving it pinned at the still-throttled `effective` rate
+            // until USS releases would mean "Unlimited" silently doesn't
+            // apply until USS decides latency has recovered, which can be
+            // well after the user expected it to.
+            if upload == 0 || upload < effective {
                 self.set_upload_limit(upload);
             }
         } else {
@@ -530,6 +536,19 @@ mod tests {
         assert_eq!(bw.effective_upload_rate(), 100);
         bw.set_configured_limits(200, 100);
         assert_eq!(bw.effective_upload_rate(), 200);
+    }
+
+    #[test]
+    fn unlimited_upload_applies_immediately_even_while_uss_throttling() {
+        let bw = BandwidthLimiter::new(100, 100);
+        bw.set_uss_active(true);
+        bw.set_upload_limit(30); // USS throttle in effect
+        // Saving "Unlimited" (0) is an explicit user override and must win
+        // immediately, not stay pinned at the USS-throttled rate until USS
+        // decides to release.
+        bw.set_configured_limits(0, 100);
+        assert_eq!(bw.configured_upload_rate(), 0);
+        assert_eq!(bw.effective_upload_rate(), 0);
     }
 
     #[tokio::test]

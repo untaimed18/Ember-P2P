@@ -322,12 +322,17 @@ pub async fn find_notes(
     let kad_hash = md4_bytes_to_kad_id(&parse_exact_file_hash(&file_hash)?);
 
     let (tx, rx) = oneshot::channel();
+    // Generated here (not caller-supplied, unlike `search_files`'s
+    // `request_id`) purely to give the network task something to match
+    // against on cancel; nothing else needs to know it.
+    let request_id: u64 = rand::random();
 
     state
         .network_tx
         .try_send(NetworkCommand::FindNotes {
             file_hash: kad_hash,
             file_size,
+            request_id,
             tx,
         })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
@@ -338,10 +343,22 @@ pub async fn find_notes(
             .search_timeout_secs
             .clamp(SEARCH_TIMEOUT_MIN, SEARCH_TIMEOUT_MAX)
     };
-    let mut results = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx)
+    let mut results = match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx)
         .await
-        .map_err(|_| format!("Notes search timed out after {timeout_secs}s"))?
-        .map_err(|e| coded_ctx("search_notes_search_failed", "Notes search failed", e))?;
+    {
+        Ok(Ok(results)) => results,
+        Ok(Err(e)) => return Err(coded_ctx("search_notes_search_failed", "Notes search failed", e)),
+        Err(_) => {
+            // Without this, the KAD search stayed alive (holding a
+            // routing-table in-use ref and a search-manager slot) until its
+            // own lifetime expired, well after this call had already
+            // returned an error to the caller.
+            let _ = state
+                .network_tx
+                .try_send(NetworkCommand::CancelSearch { request_id });
+            return Err(format!("Notes search timed out after {timeout_secs}s"));
+        }
+    };
     enrich_results(&mut results, &state, &[], None).await;
     Ok(results)
 }
@@ -355,12 +372,14 @@ pub async fn find_sources(
     let kad_hash = md4_bytes_to_kad_id(&parse_exact_file_hash(&file_hash)?);
 
     let (tx, rx) = oneshot::channel();
+    let request_id: u64 = rand::random();
 
     state
         .network_tx
         .try_send(NetworkCommand::FindSources {
             file_hash: kad_hash,
             file_size,
+            request_id,
             tx,
         })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
@@ -371,10 +390,20 @@ pub async fn find_sources(
             .search_timeout_secs
             .clamp(SEARCH_TIMEOUT_MIN, SEARCH_TIMEOUT_MAX)
     };
-    tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx)
-        .await
-        .map_err(|_| format!("Source search timed out after {timeout_secs}s"))?
-        .map_err(|e| coded_ctx("search_source_search_failed", "Source search failed", e))
+    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
+        Ok(Ok(results)) => Ok(results),
+        Ok(Err(e)) => Err(coded_ctx(
+            "search_source_search_failed",
+            "Source search failed",
+            e,
+        )),
+        Err(_) => {
+            let _ = state
+                .network_tx
+                .try_send(NetworkCommand::CancelSearch { request_id });
+            Err(format!("Source search timed out after {timeout_secs}s"))
+        }
+    }
 }
 
 #[tauri::command]

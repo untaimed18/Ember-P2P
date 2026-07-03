@@ -71,6 +71,27 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
             ));
         }
     }
+    // `folder_priorities` has no natural bound from the UI (unlike
+    // `shared_folders`, which the sharing commands already cap), so a
+    // hand-edited `config.json` could otherwise grow this map and its key
+    // lengths unboundedly, slowing settings load/save. Mirror the
+    // shared-folder limits.
+    if settings.folder_priorities.len() > MAX_SHARED_FOLDERS {
+        return Err(coded_ctx(
+            "settings_too_many_folder_priorities",
+            format!("Too many folder priorities (max {MAX_SHARED_FOLDERS})"),
+            MAX_SHARED_FOLDERS,
+        ));
+    }
+    for path in settings.folder_priorities.keys() {
+        if path.len() > MAX_PATH_LEN {
+            return Err(coded_ctx(
+                "settings_folder_priority_path_too_long",
+                format!("Folder priority path exceeds {MAX_PATH_LEN} bytes"),
+                MAX_PATH_LEN,
+            ));
+        }
+    }
     if settings.rendezvous_url.len() > MAX_URL_LEN {
         return Err(coded_ctx(
             "settings_rendezvous_url_too_long",
