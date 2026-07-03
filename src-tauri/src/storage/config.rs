@@ -36,6 +36,33 @@ fn backup_corrupt_config(config_path: &Path, reason: &str) -> Option<PathBuf> {
     }
 }
 
+/// Compares two filesystem paths for equality without requiring either to
+/// exist on disk. `Path::canonicalize` needs a real, resolvable path and
+/// silently fails to detect equality for a not-yet-created folder — exactly
+/// the situation these migration checks run into on a fresh install/first
+/// launch, before the app has created its default download subfolder.
+/// Falling back to plain `Path` equality in that case is case-sensitive and
+/// mixed-separator-sensitive on Windows, which can miss a match that's
+/// semantically the same folder (e.g. a config.json hand-edited or written
+/// by a different code path with different casing) and add a harmless but
+/// confusing duplicate `shared_folders` entry. Comparing via `components()`
+/// instead normalizes separators and trailing slashes; the Windows-only
+/// ASCII case-fold matches its case-insensitive filesystem.
+fn paths_likely_equal(a: &Path, b: &Path) -> bool {
+    let normalize = |p: &Path| {
+        p.components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/")
+    };
+    let (na, nb) = (normalize(a), normalize(b));
+    if cfg!(target_os = "windows") {
+        na.eq_ignore_ascii_case(&nb)
+    } else {
+        na == nb
+    }
+}
+
 pub struct AppConfig {
     pub settings: AppSettings,
     config_path: PathBuf,
@@ -98,7 +125,7 @@ impl AppConfig {
             let dl = std::path::Path::new(&settings.download_folder);
             let is_default = directories::UserDirs::new()
                 .and_then(|u| u.download_dir().map(|d| d.to_path_buf()))
-                .map(|d| dl == d.as_path())
+                .map(|d| paths_likely_equal(dl, &d))
                 .unwrap_or(false);
             if is_default
                 && dl
@@ -124,7 +151,7 @@ impl AppConfig {
             let already_shared = settings.shared_folders.iter().any(|f| {
                 let a = std::path::Path::new(f);
                 let b = &completed_path;
-                a == b
+                paths_likely_equal(a, b)
                     || a.canonicalize()
                         .ok()
                         .zip(b.canonicalize().ok())

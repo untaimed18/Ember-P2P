@@ -380,10 +380,6 @@ impl KnownFileList {
 
     /// Companion to `find_by_hash` for callers that need to mutate a
     /// known-file record in-place (e.g. bumping cumulative counters).
-    /// Kept on the public surface alongside the immutable accessor for
-    /// API symmetry; V2 currently uses `add_or_update` for mutations,
-    /// so this is allowed to be unused.
-    #[allow(dead_code)]
     pub fn find_by_hash_mut(&mut self, hash: &[u8; 16]) -> Option<&mut KnownFileRecord> {
         self.files.get_mut(hash)
     }
@@ -391,7 +387,6 @@ impl KnownFileList {
     /// Manually flag the in-memory list as dirty so the next save will
     /// flush even when no `add_or_update` happened (used by callers
     /// that mutate a record via `find_by_hash_mut`).
-    #[allow(dead_code)]
     pub fn mark_dirty(&mut self) {
         self.touch_dirty();
     }

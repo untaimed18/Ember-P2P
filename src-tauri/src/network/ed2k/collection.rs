@@ -389,11 +389,21 @@ fn read_tag(cursor: &mut Cursor<&Vec<u8>>) -> anyhow::Result<(u8, TagValue)> {
         }
         let mut name_buf = vec![0u8; name_len];
         cursor.read_exact(&mut name_buf)?;
-        if name_len == 1 {
-            name_buf[0]
-        } else {
-            0
-        }
+        // Only the compact (0x80-flagged) form above encodes a genuine
+        // reserved FT_* id. This long-form branch carries an actual name
+        // *string* — even when that string happens to be exactly one
+        // byte, treating its raw byte value as if it were a compact-form
+        // id would let a hand-crafted collection redefine FT_FILENAME /
+        // FT_AICH_HASH (or any other reserved id) via an unrelated
+        // custom-named tag, silently overriding the displayed name/hash
+        // with an attacker-chosen value. No security impact — this only
+        // affects how the *local* viewer displays an imported collection,
+        // and hashes are independently verified against real downloaded
+        // bytes elsewhere — but there's no reason to keep the ambiguity,
+        // so long-form names always resolve to "unknown" here regardless
+        // of their length.
+        let _ = name_buf;
+        0
     };
 
     let real_type = tag_type & 0x7F;
@@ -500,10 +510,22 @@ fn write_string_tag(buf: &mut Vec<u8>, name_id: u8, value: &str) -> anyhow::Resu
     buf.write_u8(TAG_STRING)?;
     buf.write_u16::<LittleEndian>(1)?;
     buf.push(name_id);
-    let bytes = value.as_bytes();
-    let clamped = &bytes[..bytes.len().min(u16::MAX as usize)];
+    // Truncate at a UTF-8 char boundary, not an arbitrary byte offset — a
+    // raw byte-slice cut can land mid-codepoint, and `read_tag` decodes
+    // this value back with `from_utf8_lossy`, which would render the
+    // orphaned trailing bytes as one or more U+FFFD glyphs on reload.
+    let max_len = u16::MAX as usize;
+    let clamped = if value.len() <= max_len {
+        value
+    } else {
+        let mut end = max_len;
+        while end > 0 && !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        &value[..end]
+    };
     buf.write_u16::<LittleEndian>(clamped.len() as u16)?;
-    buf.write_all(clamped)?;
+    buf.write_all(clamped.as_bytes())?;
     Ok(())
 }
 
