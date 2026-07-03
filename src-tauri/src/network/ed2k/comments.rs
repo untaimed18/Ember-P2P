@@ -146,10 +146,6 @@ impl CommentManager {
         }
     }
 
-    pub fn all_comments(&self) -> &HashMap<String, FileCommentInfo> {
-        &self.comments
-    }
-
     pub fn load_from_db_rows(&mut self, rows: Vec<(String, u8, String)>) {
         for (hash, rating, comment) in rows {
             let entry = self.comments.entry(hash).or_default();
