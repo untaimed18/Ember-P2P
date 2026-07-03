@@ -1478,7 +1478,15 @@ fn encode_shared_files_answer(
     // receive back is never useful. A truncated-but-delivered answer is
     // strictly better than one that's fully built, sent, and then dropped
     // whole by the receiver's frame-size check.
-    const MAX_ANSWER_BYTES: usize = 400 * 1024;
+    //
+    // Sized to use the full headroom under that 512 KiB frame limit rather
+    // than an arbitrarily low value, so large libraries browse as completely
+    // as the single-packet eD2k `OP_ASKSHAREDFILESANSWER` format allows (it
+    // has no pagination). 500 KiB of entries + the 4-byte count + framing
+    // stays safely under 512 KiB (~12 KiB margin). This is the compatibility
+    // ceiling: eMule sends the full list, but going past the receiver's frame
+    // cap would lose the *entire* answer, not just the overflow.
+    const MAX_ANSWER_BYTES: usize = 500 * 1024;
 
     let mut entries = Vec::with_capacity(files.len().saturating_mul(64).min(MAX_ANSWER_BYTES));
     let mut count: u32 = 0;

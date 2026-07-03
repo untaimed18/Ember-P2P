@@ -638,6 +638,37 @@ impl KnownFileList {
         self.files.values()
     }
 
+    /// Clear cached AICH root hashes for multi-part files (size > PARTSIZE).
+    ///
+    /// Multi-part AICH roots computed before the SHAHashSet part-boundary fix
+    /// (`hash.rs` / `aich.rs`) are wrong: AICH blocks straddled ed2k PART
+    /// boundaries, so the stored root doesn't match what eMule computes for the
+    /// same file. Recovery data served on demand (`OP_AICHANSWER`) is already
+    /// recomputed correctly, but the *stored* root is what we advertise
+    /// (`OP_AICHFILEHASHANS`, KAD/search results, ed2k `h=` links), so a peer
+    /// that recorded our stale root then rejects our (correct) recovery data.
+    /// Clearing forces a one-time recompute via the normal hash path; the ed2k
+    /// hash is unchanged, only the AICH root is restored. Single-part files
+    /// never cross a part boundary, so their roots were always correct and are
+    /// left untouched.
+    ///
+    /// Returns the number of records whose AICH root was cleared.
+    pub fn clear_stale_multipart_aich(&mut self) -> usize {
+        let mut cleared = 0usize;
+        for record in self.files.values_mut() {
+            if record.file_size > crate::network::ed2k::hash::PARTSIZE
+                && !record.aich_hash.is_empty()
+            {
+                record.aich_hash.clear();
+                cleared += 1;
+            }
+        }
+        if cleared > 0 {
+            self.touch_dirty();
+        }
+        cleared
+    }
+
     /// Load a companion path index so files can be matched by exact path
     /// after restart (the eMule known.met format only stores filenames).
     fn load_path_index(&mut self, path: &Path) {
@@ -742,6 +773,58 @@ impl KnownFileList {
         }
         crate::security::atomic_write(path, &buf, false)?;
         Ok(())
+    }
+}
+
+/// One-time migration (guarded by a marker file) that invalidates AICH root
+/// hashes computed before the multi-part SHAHashSet part-boundary fix. See
+/// [`KnownFileList::clear_stale_multipart_aich`] for why only multi-part roots
+/// are affected.
+///
+/// MUST run before any `known.met` consumer loads the file (the shared-file
+/// index, the indexer/hashing task, and the network task) so they all pick up
+/// the cleared roots — the invalidated files are then recomputed via the
+/// normal startup hashing pass (which yields the same ed2k hash and the
+/// corrected AICH root, preserved into `known.met` by the `SharedFilesChanged`
+/// reconcile with existing counters intact).
+pub fn migrate_aich_v2(data_dir: &Path) {
+    let marker = data_dir.join(".aich_root_v2_migrated");
+    if marker.exists() {
+        return;
+    }
+
+    let known_met = data_dir.join("known.met");
+    if known_met.exists() {
+        let mut list = KnownFileList::load(&known_met);
+        let cleared = list.clear_stale_multipart_aich();
+        if cleared > 0 {
+            if let Err(e) = list.save(&known_met) {
+                // Don't write the marker: a failed save means the stale roots
+                // are still on disk, so we must retry on the next startup.
+                warn!("AICH v2 migration: failed to rewrite known.met ({e}); will retry next startup");
+                return;
+            }
+            info!(
+                "AICH v2 migration: invalidated {cleared} stale multi-part AICH root(s); \
+                 they will be recomputed on this startup's hashing pass"
+            );
+        }
+    }
+
+    // Drop the download-completion AICH cache wholesale: it's keyed by ed2k
+    // hash with no size field, so we can't single out multi-part entries, and
+    // it's a rebuildable cache (repopulated on download completion and from the
+    // corrected known.met via the shared index), so clearing it can't lose
+    // authoritative data — it only prevents a stale root being served from it.
+    let aich_cache = data_dir.join("aich_cache.dat");
+    if aich_cache.exists() {
+        if let Err(e) = std::fs::remove_file(&aich_cache) {
+            warn!("AICH v2 migration: failed to remove aich_cache.dat ({e})");
+        }
+    }
+
+    if let Err(e) = std::fs::write(&marker, b"1") {
+        warn!("AICH v2 migration: failed to write marker ({e}); migration may repeat next startup");
     }
 }
 
@@ -948,6 +1031,45 @@ mod tests {
             "movie.mkv",
             &aich,
         ));
+    }
+
+    #[test]
+    fn clear_stale_multipart_aich_only_clears_multipart_files() {
+        use crate::network::ed2k::hash::PARTSIZE;
+        let mut kf = KnownFileList::new();
+
+        // Single-part file (size == PARTSIZE ⇒ exactly one part, no part
+        // boundary): its AICH root was always correct and must be kept.
+        let mut single = sample_record();
+        single.file_hash = [0x01; 16];
+        single.file_path = "C:/Library/single.bin".to_string();
+        single.file_name = "single.bin".to_string();
+        single.file_size = PARTSIZE;
+        single.aich_hash = "a".repeat(40);
+        kf.add_or_update(single);
+
+        // Multi-part file (size > PARTSIZE): stale root must be cleared.
+        let mut multi = sample_record();
+        multi.file_hash = [0x02; 16];
+        multi.file_path = "C:/Library/multi.bin".to_string();
+        multi.file_name = "multi.bin".to_string();
+        multi.file_size = PARTSIZE + 1;
+        multi.aich_hash = "b".repeat(40);
+        kf.add_or_update(multi);
+
+        let cleared = kf.clear_stale_multipart_aich();
+        assert_eq!(cleared, 1, "only the multi-part file should be cleared");
+        assert!(
+            !kf.find_by_hash(&[0x01; 16]).unwrap().aich_hash.is_empty(),
+            "single-part AICH root must be preserved"
+        );
+        assert!(
+            kf.find_by_hash(&[0x02; 16]).unwrap().aich_hash.is_empty(),
+            "multi-part AICH root must be cleared for recompute"
+        );
+
+        // Idempotent: a second pass finds nothing left to clear.
+        assert_eq!(kf.clear_stale_multipart_aich(), 0);
     }
 
     #[test]
