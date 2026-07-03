@@ -1715,6 +1715,7 @@ mod tests {
             server_pending: false,
             kad_pending: true,
             udp_pending: false,
+            ember_pending: false,
             file_type_filter: None,
             keywords: Vec::new(),
             server_ip: None,
