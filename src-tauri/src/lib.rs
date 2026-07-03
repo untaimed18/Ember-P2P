@@ -303,6 +303,18 @@ pub fn run() {
             // sharing/indexer and some cherry-picked commands still read it
             // via `AppState::known_files`, so we materialise it here rather
             // than leaking `Option<...>` all over the struct.
+            // One-time AICH migration: invalidate multi-part AICH root hashes
+            // computed before the SHAHashSet part-boundary fix so they get
+            // recomputed on this startup's hashing pass. Must run before ANY
+            // known.met consumer loads the file — the AppState copy just below,
+            // the indexer/hashing task, and the network task — so they all see
+            // the cleared roots. Guarded by a marker file, so it's a no-op on
+            // every subsequent launch.
+            {
+                let data_dir = storage::paths::resolve_data_dir_with_app(&app_handle);
+                storage::known_files::migrate_aich_v2(&data_dir);
+            }
+
             let known_files = {
                 let data_dir = storage::paths::resolve_data_dir_with_app(&app_handle);
                 Arc::new(RwLock::new(storage::known_files::KnownFileList::load(
@@ -498,6 +510,19 @@ pub fn run() {
                         file.id = hash.clone();
                         file.hash = hash;
                         file.aich_hash = record.aich_hash.clone();
+                        // A matched record short-circuits hashing. If the AICH
+                        // root was cleared by the v2 migration (or is otherwise
+                        // missing) and the file is multi-part, schedule a
+                        // one-time rehash to recompute it: the ed2k hash comes
+                        // out identical, only the corrected AICH root is
+                        // restored. Single-part files never straddle a part
+                        // boundary, so their roots are always correct and are
+                        // left as-is.
+                        if file.aich_hash.is_empty()
+                            && file.size > crate::network::ed2k::hash::PARTSIZE
+                        {
+                            files_to_hash.push(file.clone());
+                        }
                     } else {
                         files_to_hash.push(file.clone());
                     }
