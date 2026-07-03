@@ -255,7 +255,15 @@ impl ReputationManager {
         };
         let json = serde_json::to_string(&persisted)
             .map_err(|e| format!("reputation serialize: {e}"))?;
-        std::fs::write(path, json).map_err(|e| format!("reputation write: {e}"))
+        // Atomic (temp file + fsync + rename) like `known.met` and the
+        // credit/key material below — this file is rewritten every 5
+        // minutes for the life of any active session, so a crash or
+        // power-loss mid-write under a plain truncating `fs::write` would
+        // silently wipe the entire peer-reputation/ban database on next
+        // launch (a corrupt-JSON `load()` falls back to `Self::new()`,
+        // un-banning every flooder/abuser with no error surfaced).
+        crate::security::atomic_write(path, json.as_bytes(), false)
+            .map_err(|e| format!("reputation write: {e}"))
     }
 
     /// Load reputation data from disk. Returns a new manager on any error.

@@ -13671,14 +13671,36 @@ pub async fn start_network(
                                         )
                                     };
                                     if !needing_callback.is_empty() {
-                                        let mut sm = source_manager.write().await;
+                                        // Send the callback requests (each an
+                                        // untimed TCP write to the eD2K server)
+                                        // WITHOUT holding the SourceManager lock
+                                        // — mirrors the UDP-reask pass above,
+                                        // which was fixed for the same reason:
+                                        // holding `source_manager.write()`
+                                        // across a network `.await` stalls
+                                        // every other reader/writer (including
+                                        // every active MultiSourceDownload
+                                        // worker) and, since this arm runs
+                                        // inside the network task's own
+                                        // `select!`, the whole event loop, for
+                                        // as long as a slow/stalled server
+                                        // takes to drain its socket. Only the
+                                        // bookkeeping update below needs the
+                                        // lock, and that has no `.await`.
+                                        let mut sent_cids = Vec::with_capacity(needing_callback.len());
                                         for cid in &needing_callback {
                                             if conn.request_callback(*cid).await.is_ok() {
-                                                sm.mark_callback_sent(&fh, *cid);
+                                                sent_cids.push(*cid);
                                             }
                                         }
-                                        did_search = true;
-                                        debug!("Sent {} LowID callback requests for pending download", needing_callback.len());
+                                        if !sent_cids.is_empty() {
+                                            let mut sm = source_manager.write().await;
+                                            for cid in &sent_cids {
+                                                sm.mark_callback_sent(&fh, *cid);
+                                            }
+                                            did_search = true;
+                                            debug!("Sent {} LowID callback requests for pending download", sent_cids.len());
+                                        }
                                     }
                                 }
                             }
@@ -15213,13 +15235,29 @@ pub async fn start_network(
                                                 server_addr.ip() == addr.ip() && server_addr.port() == udp_server_port
                                             }).unwrap_or(false);
                                             if current_server_matches {
-                                                let mut sm = source_manager.write().await;
+                                                // Send outside the SourceManager lock — see
+                                                // the identical fix on the TCP-sourced
+                                                // LowID-callback path above for why: an
+                                                // untimed `request_callback` write can stall
+                                                // on a slow/stuck server, and holding `sm`
+                                                // across it blocks every other reader/writer
+                                                // (and, since this runs inline in the
+                                                // network task's own event loop, all of
+                                                // networking) for as long as the write is
+                                                // stuck.
+                                                let mut sent_cids = Vec::with_capacity(needing_callback.len());
                                                 for cid in &needing_callback {
                                                     if conn.request_callback(*cid).await.is_ok() {
-                                                        sm.mark_callback_sent(&file_hash, *cid);
+                                                        sent_cids.push(*cid);
                                                     }
                                                 }
-                                                debug!("Sent {} LowID callback requests from UDP sources", needing_callback.len());
+                                                if !sent_cids.is_empty() {
+                                                    let mut sm = source_manager.write().await;
+                                                    for cid in &sent_cids {
+                                                        sm.mark_callback_sent(&file_hash, *cid);
+                                                    }
+                                                    debug!("Sent {} LowID callback requests from UDP sources", sent_cids.len());
+                                                }
                                             }
                                         }
                                     }
@@ -16966,7 +17004,9 @@ pub async fn start_network(
                             if ed2k_bytes.len() == 16 {
                                 let mut fh = [0u8; 16];
                                 fh.copy_from_slice(&ed2k_bytes);
-                                if !state.aich_root_map.contains_key(&fh) {
+                                if !state.aich_root_map.contains_key(&fh)
+                                    && state.aich_root_map.len() < MAX_AICH_ROOT_MAP_SOFT_CAP
+                                {
                                     if let Some(fi) = index.get_by_hash(&transfer.file_hash) {
                                         if !fi.aich_hash.is_empty() {
                                             if let Ok(ab) = hex::decode(&fi.aich_hash) {
@@ -17924,6 +17964,45 @@ pub async fn start_network(
 
     stats_manager.save_cumulative(&db);
     info!("Statistics saved on shutdown");
+
+    // Drain any in-flight periodic known.met background save before doing
+    // this shutdown's own authoritative save below. `known_met_save_timer`
+    // (every 120s) spawns each save via a detached `tokio::spawn` holding
+    // its own up-to-120s-old clone of `known_files` — breaking out of the
+    // event loop on `Shutdown` does not wait for it. Left alone, that
+    // background task's `atomic_write`/rename can land *after* the
+    // checkpoint+save below and silently revert it to the stale snapshot,
+    // reintroducing the exact "AICH rehash restarts from scratch" bug this
+    // checkpoint exists to fix — intermittently, only when a save happened
+    // to be in flight at quit time. Bounded so a genuinely stuck save can't
+    // hang shutdown.
+    if known_met_save_in_flight {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            known_met_save_result_rx.recv(),
+        )
+        .await
+        {
+            Ok(Some(result)) => {
+                known_met_save_in_flight = false;
+                match result.result {
+                    Ok(true) => known_files.mark_saved_if_generation(result.generation),
+                    Ok(false) => known_files.mark_save_failed(),
+                    Err(e) => {
+                        known_files.mark_save_failed();
+                        error!("Periodic known.met save (drained at shutdown) failed: {e}");
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(_) => {
+                warn!(
+                    "Periodic known.met save still in flight 5s into shutdown; \
+                     proceeding with the final save anyway"
+                );
+            }
+        }
+    }
 
     // Final AICH-root checkpoint before the shutdown save: fold any freshly
     // recomputed roots from the live index into known.met so a hash pass
@@ -24139,9 +24218,21 @@ async fn handle_command_inner(
                             if part_hashes.len()
                                 != ed2k::hash::ed2k_known_met_part_hash_count(f.size)
                             {
-                                part_hashes = ed2k::hash::ed2k_part_hashes_file(
-                                    std::path::Path::new(&f.path),
-                                )
+                                // Hash off the runtime: a synchronous full-file
+                                // read here would otherwise block the network
+                                // select loop (cf. the download-completion path
+                                // above, which hit the same hazard). Every
+                                // never-before-known file takes this branch on
+                                // its first SharedFilesChanged, so on a fresh
+                                // share of a large library this loop can run
+                                // for many files in a row — spawn_blocking
+                                // keeps that I/O off the async worker threads.
+                                let hash_path = std::path::PathBuf::from(&f.path);
+                                part_hashes = tokio::task::spawn_blocking(move || {
+                                    ed2k::hash::ed2k_part_hashes_file(&hash_path)
+                                        .unwrap_or_default()
+                                })
+                                .await
                                 .unwrap_or_default();
                             }
                             known_files.add_or_update(KnownFileRecord {
