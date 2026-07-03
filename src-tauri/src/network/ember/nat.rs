@@ -242,6 +242,18 @@ fn build_nat_info_from_results(
             );
             NatType::Symmetric
         } else if results.len() >= 2 {
+            // Deliberate simplification: comparing the mapped port across
+            // two independent STUN servers can only distinguish Symmetric
+            // NAT (port changes per destination) from "some cone type"
+            // (port stays consistent) — it can't tell Full Cone,
+            // Restricted Cone, and Port-Restricted Cone apart, since that
+            // requires a STUN CHANGE-REQUEST test (asking a server to
+            // reply from a different IP/port) which this prober doesn't
+            // send. `PortRestricted` is used as the conservative default
+            // for "consistent port, filtering unknown" — `is_punchable()`
+            // already treats it the same as the friendlier cone types, so
+            // hole-punch strategy selection isn't affected by not
+            // producing `FullCone`/`RestrictedCone` here.
             info!(
                 "NAT probe: port-restricted or better NAT (consistent port {})",
                 external_addr.port()
@@ -304,7 +316,14 @@ async fn try_stun_server_with_replies(
             }
             match tokio::time::timeout(remaining, replies.recv()).await {
                 Ok(Some((data, from))) => {
-                    if from.ip() != server_addr.ip() {
+                    // Require an exact address match, not just the IP: we
+                    // never send a CHANGE-REQUEST attribute, so a
+                    // conformant STUN server always replies from the same
+                    // `ip:port` it was queried on. Matching IP alone would
+                    // accept a binding response forged (or coincidentally
+                    // sent) by a different service on the same host that
+                    // happens to guess/echo our 96-bit transaction ID.
+                    if from != server_addr {
                         continue;
                     }
                     match parse_binding_response(&data, &txn_id) {
