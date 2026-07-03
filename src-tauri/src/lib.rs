@@ -562,6 +562,13 @@ pub fn run() {
                 let total_to_hash = files_to_hash.len();
                 let mut hashed = 0usize;
                 let mut last_cache_refresh = std::time::Instant::now();
+                // Checkpoint recomputed hashes into known.met periodically so a
+                // long hash pass (notably the one-time AICH migration re-hash)
+                // resumes after a restart instead of starting from zero. Bounded
+                // by both elapsed time and file count so the loss window stays
+                // small whether files hash slowly (large) or quickly (many).
+                let mut last_known_met_persist = std::time::Instant::now();
+                let mut hashed_since_persist = 0usize;
                 let mut was_cancelled = false;
 
                 for file in &files_to_hash {
@@ -618,6 +625,26 @@ pub fn run() {
                             {
                                 commands::sharing::refresh_file_cache(&index_clone, &csf).await;
                                 last_cache_refresh = std::time::Instant::now();
+                            }
+                            // Fold freshly hashed AICH roots into known.met so an
+                            // interrupted pass resumes where it left off. A
+                            // SharedFilesChanged reconcile copies the index's new
+                            // roots into the network task's known.met (preserving
+                            // cumulative counters); its periodic + shutdown save
+                            // then flush them to disk.
+                            if !cancel_flag.load(std::sync::atomic::Ordering::Relaxed)
+                                && still_shared
+                            {
+                                hashed_since_persist += 1;
+                                if hashed_since_persist >= 500
+                                    || last_known_met_persist.elapsed()
+                                        >= std::time::Duration::from_secs(30)
+                                {
+                                    let _ = net_tx
+                                        .try_send(network::NetworkCommand::SharedFilesChanged);
+                                    last_known_met_persist = std::time::Instant::now();
+                                    hashed_since_persist = 0;
+                                }
                             }
                         }
                         Ok(Ok(Err(e))) => {

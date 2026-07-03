@@ -19256,6 +19256,37 @@ pub async fn start_network(
     stats_manager.save_cumulative(&db);
     info!("Statistics saved on shutdown");
 
+    // Final AICH-root checkpoint before the shutdown save: fold any freshly
+    // recomputed roots from the live index into known.met so a hash pass
+    // interrupted by this shutdown (e.g. the one-time AICH migration re-hash)
+    // resumes next launch instead of restarting. This mirrors the aich_hash
+    // arm of the SharedFilesChanged reconcile, minus the publish-set rebuild
+    // that's pointless during shutdown, and preserves every other field.
+    {
+        let idx = local_index.read().await;
+        let mut any_updated = false;
+        for f in idx.all_files() {
+            if f.aich_hash.is_empty() || f.hash.is_empty() {
+                continue;
+            }
+            if let Ok(hb) = hex::decode(&f.hash) {
+                if hb.len() == 16 {
+                    let mut fh = [0u8; 16];
+                    fh.copy_from_slice(&hb);
+                    if let Some(record) = known_files.find_by_hash_mut(&fh) {
+                        if record.aich_hash != f.aich_hash {
+                            record.aich_hash = f.aich_hash.clone();
+                            any_updated = true;
+                        }
+                    }
+                }
+            }
+        }
+        if any_updated {
+            known_files.mark_dirty();
+        }
+    }
+
     let known_path = state.data_dir.join("known.met");
     if let Err(e) = known_files.save(&known_path) {
         error!("Failed to save known.met on shutdown: {e}");
