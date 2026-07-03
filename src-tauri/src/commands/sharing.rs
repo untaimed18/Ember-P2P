@@ -308,6 +308,7 @@ pub async fn add_shared_folder(
     let network_tx = state.network_tx.clone();
     let scanning = state.scanning_count.clone();
     let cancel_flags = state.hash_cancel_flags.clone();
+    let fresh_part_hashes = state.fresh_part_hashes.clone();
     let config = state.config.clone();
 
     let cancel_flag = Arc::new(AtomicBool::new(false));
@@ -427,7 +428,7 @@ pub async fn add_shared_folder(
             .await;
 
             match hash_result {
-                Ok(Ok(Ok((ed2k_hash, aich_hash)))) => {
+                Ok(Ok(Ok((ed2k_hash, aich_hash, part_hashes)))) => {
                     debug!(
                         "Hash complete: {} -> {}",
                         file.name,
@@ -442,6 +443,19 @@ pub async fn add_shared_folder(
                         let cfg = config.read().await;
                         file_in_shared_folders(&updated_file.path, &cfg.settings.shared_folders)
                     };
+                    // Hand the part hashes already computed above off to the
+                    // network task's `SharedFilesChanged` handler so it
+                    // doesn't re-read this file from disk just to recompute
+                    // the same values for known.met.
+                    if still_shared && !part_hashes.is_empty() {
+                        if let Ok(hash_bytes) = hex::decode(&updated_file.hash) {
+                            if hash_bytes.len() == 16 {
+                                let mut fh = [0u8; 16];
+                                fh.copy_from_slice(&hash_bytes);
+                                fresh_part_hashes.write().await.insert(fh, part_hashes);
+                            }
+                        }
+                    }
                     {
                         let mut index = local_index.write().await;
                         index.remove_file_by_id(&file_temp_id);
@@ -1149,6 +1163,7 @@ pub async fn reload_shared_files(
     let network_tx = state.network_tx.clone();
     let scanning = state.scanning_count.clone();
     let cancel_flags = state.hash_cancel_flags.clone();
+    let fresh_part_hashes = state.fresh_part_hashes.clone();
     let config = state.config.clone();
     let discovery_folders = folders.clone();
 
@@ -1278,7 +1293,7 @@ pub async fn reload_shared_files(
             .await;
 
             match hash_result {
-                Ok(Ok(Ok((ed2k_hash, aich_hash)))) => {
+                Ok(Ok(Ok((ed2k_hash, aich_hash, part_hashes)))) => {
                     debug!(
                         "Reload hash complete: {} -> {}",
                         file.name,
@@ -1293,6 +1308,19 @@ pub async fn reload_shared_files(
                         let cfg = config.read().await;
                         file_in_shared_folders(&updated_file.path, &cfg.settings.shared_folders)
                     };
+                    // Hand the part hashes already computed above off to the
+                    // network task's `SharedFilesChanged` handler so it
+                    // doesn't re-read this file from disk just to recompute
+                    // the same values for known.met.
+                    if still_shared && !part_hashes.is_empty() {
+                        if let Ok(hash_bytes) = hex::decode(&updated_file.hash) {
+                            if hash_bytes.len() == 16 {
+                                let mut fh = [0u8; 16];
+                                fh.copy_from_slice(&hash_bytes);
+                                fresh_part_hashes.write().await.insert(fh, part_hashes);
+                            }
+                        }
+                    }
                     {
                         let mut index = local_index.write().await;
                         index.remove_file_by_id(&file_temp_id);

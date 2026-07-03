@@ -4704,6 +4704,7 @@ pub async fn start_network(
     mut cmd_rx: mpsc::Receiver<NetworkCommand>,
     mut settings: AppSettings,
     local_index: Arc<RwLock<LocalIndex>>,
+    fresh_part_hashes: Arc<RwLock<HashMap<[u8; 16], Vec<[u8; 16]>>>>,
     db: Arc<Database>,
     transfer_manager: Arc<RwLock<TransferManager>>,
     bandwidth_limiter: Arc<BandwidthLimiter>,
@@ -6143,6 +6144,10 @@ pub async fn start_network(
                                                 final_path: Some(
                                                     final_path.to_string_lossy().into_owned(),
                                                 ),
+                                                // `reverify_complete_part_file` only
+                                                // re-checks the whole-file ed2k hash,
+                                                // not a per-part hashset.
+                                                part_hashes: Vec::new(),
                                             })
                                             .await;
                                     }
@@ -6382,6 +6387,7 @@ pub async fn start_network(
                         cmd,
                         &mut state,
                         &local_index,
+                        &fresh_part_hashes,
                         &settings,
                         &dl_event_tx,
                         &bandwidth_limiter,
@@ -6659,6 +6665,7 @@ pub async fn start_network(
                             cmd,
                             &mut state,
                             &local_index,
+                            &fresh_part_hashes,
                             &settings,
                             &dl_event_tx,
                             &bandwidth_limiter,
@@ -6725,7 +6732,7 @@ pub async fn start_network(
                             .unwrap_or(0),
                     });
                 }
-                if let DownloadEvent::Completed { ref transfer_id, .. } = event {
+                if let DownloadEvent::Completed { ref transfer_id, part_hashes: ref event_part_hashes, .. } = event {
                     {
                         let mgr_snap = transfer_manager.read().await;
                         if let Some(t) = mgr_snap.get_transfer(transfer_id) {
@@ -6815,16 +6822,30 @@ pub async fn start_network(
                                 fh.copy_from_slice(&hash_bytes);
                                 if known_files.find_by_hash(&fh).is_none() {
                                     use crate::storage::known_files::KnownFileRecord;
-                                    // Hash off the runtime: a freshly completed large
-                                    // file would otherwise block the network select loop
-                                    // for the full part-hash read (cf. the restore path).
-                                    let hash_path = completed_path.clone();
-                                    let part_hashes = tokio::task::spawn_blocking(move || {
-                                        ed2k::hash::ed2k_part_hashes_file(&hash_path)
-                                            .unwrap_or_default()
-                                    })
-                                    .await
-                                    .unwrap_or_default();
+                                    // Prefer the hashset already verified during
+                                    // the transfer (see `DownloadEvent::Completed`)
+                                    // over re-reading this whole file from disk a
+                                    // second time — same fix as the
+                                    // `SharedFilesChanged` handler, applied here
+                                    // for the download-completion path.
+                                    let part_hashes = if !event_part_hashes.is_empty() {
+                                        event_part_hashes.clone()
+                                    } else {
+                                        // Fallback for completion paths that don't
+                                        // track a verified hashset (zero-byte
+                                        // files, single-source callback downloads,
+                                        // restart re-verification). A freshly
+                                        // completed large file taking this branch
+                                        // would otherwise block the network select
+                                        // loop for the full part-hash read.
+                                        let hash_path = completed_path.clone();
+                                        tokio::task::spawn_blocking(move || {
+                                            ed2k::hash::ed2k_part_hashes_file(&hash_path)
+                                                .unwrap_or_default()
+                                        })
+                                        .await
+                                        .unwrap_or_default()
+                                    };
                                     let record = KnownFileRecord {
                                         file_hash: fh,
                                         part_hashes,
@@ -7702,6 +7723,7 @@ pub async fn start_network(
                         },
                         &mut state,
                         &local_index,
+                        &fresh_part_hashes,
                         &settings,
                         &dl_event_tx,
                         &bandwidth_limiter,
@@ -8266,6 +8288,7 @@ pub async fn start_network(
                         },
                         &mut state,
                         &local_index,
+                        &fresh_part_hashes,
                         &settings,
                         &dl_event_tx,
                         &bandwidth_limiter,
@@ -21769,6 +21792,7 @@ async fn handle_command(
     cmd: NetworkCommand,
     state: &mut NetworkState,
     local_index: &Arc<RwLock<LocalIndex>>,
+    fresh_part_hashes: &Arc<RwLock<HashMap<[u8; 16], Vec<[u8; 16]>>>>,
     settings: &AppSettings,
     dl_event_tx: &mpsc::Sender<DownloadEvent>,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
@@ -21799,6 +21823,7 @@ async fn handle_command(
         cmd,
         state,
         local_index,
+        fresh_part_hashes,
         settings,
         dl_event_tx,
         bandwidth_limiter,
@@ -21840,6 +21865,7 @@ async fn handle_command_inner(
     cmd: NetworkCommand,
     state: &mut NetworkState,
     local_index: &Arc<RwLock<LocalIndex>>,
+    fresh_part_hashes: &Arc<RwLock<HashMap<[u8; 16], Vec<[u8; 16]>>>>,
     settings: &AppSettings,
     dl_event_tx: &mpsc::Sender<DownloadEvent>,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
@@ -24424,22 +24450,42 @@ async fn handle_command_inner(
                             if part_hashes.len()
                                 != ed2k::hash::ed2k_known_met_part_hash_count(f.size)
                             {
-                                // Hash off the runtime: a synchronous full-file
-                                // read here would otherwise block the network
-                                // select loop (cf. the download-completion path
-                                // above, which hit the same hazard). Every
-                                // never-before-known file takes this branch on
-                                // its first SharedFilesChanged, so on a fresh
-                                // share of a large library this loop can run
-                                // for many files in a row — spawn_blocking
-                                // keeps that I/O off the async worker threads.
-                                let hash_path = std::path::PathBuf::from(&f.path);
-                                part_hashes = tokio::task::spawn_blocking(move || {
-                                    ed2k::hash::ed2k_part_hashes_file(&hash_path)
-                                        .unwrap_or_default()
-                                })
-                                .await
-                                .unwrap_or_default();
+                                // Prefer the part hashes already produced as a
+                                // byproduct of the initial ED2K+AICH combined
+                                // hash pass (`hash_file_combined_cancellable`,
+                                // stashed by the hashing task into
+                                // `fresh_part_hashes`) over re-reading the
+                                // whole file from disk a second time. Every
+                                // never-before-known file used to take the
+                                // fallback branch below on its first
+                                // SharedFilesChanged, so on a fresh share of a
+                                // large library this loop ran a full re-hash
+                                // for many files in a row — sequentially, on
+                                // this same network event loop task — which is
+                                // what starved KAD UDP/timers/IPC snapshots
+                                // (contacts, search activity) for the whole
+                                // hashing pass. spawn_blocking alone didn't
+                                // fix that: it only keeps the disk I/O off the
+                                // async worker threads, not off *this* task.
+                                if let Some(cached) =
+                                    fresh_part_hashes.write().await.remove(&fh)
+                                {
+                                    part_hashes = cached;
+                                } else {
+                                    // Fallback for files whose part hashes
+                                    // weren't produced by our own hash pass
+                                    // (e.g. resolved from an older known.met /
+                                    // version-skew edge case). Rare, so an
+                                    // occasional blocking re-read here is
+                                    // acceptable.
+                                    let hash_path = std::path::PathBuf::from(&f.path);
+                                    part_hashes = tokio::task::spawn_blocking(move || {
+                                        ed2k::hash::ed2k_part_hashes_file(&hash_path)
+                                            .unwrap_or_default()
+                                    })
+                                    .await
+                                    .unwrap_or_default();
+                                }
                             }
                             known_files.add_or_update(KnownFileRecord {
                                 file_hash: fh,
@@ -25875,6 +25921,7 @@ async fn handle_download_event(
         DownloadEvent::Completed {
             transfer_id,
             final_path,
+            ..
         } => {
             stats_manager.record_completed_download();
             // A download reaches Completed only after every part is present

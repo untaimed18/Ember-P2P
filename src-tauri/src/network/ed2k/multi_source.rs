@@ -1041,6 +1041,7 @@ impl MultiSourceDownload {
                 .send(DownloadEvent::Completed {
                     transfer_id: self.transfer_id.clone(),
                     final_path: Some(zero_final.to_string_lossy().into_owned()),
+                    part_hashes: Vec::new(),
                 })
                 .await;
             return Ok(());
@@ -3304,10 +3305,19 @@ impl MultiSourceDownload {
                     let t = tracker.read().await;
                     t.delete_met();
                 }
+                // `part_hashes` was fetched from a source via
+                // OP_HASHSETREQUEST(2) and cryptographically verified
+                // against `self.file_hash` by `verify_hashset` before being
+                // stored (see the hashset-wait stage above) — reuse it here
+                // instead of making the completion handler re-read this
+                // whole file from disk just to recompute the same values
+                // for `known.met`.
+                let verified_part_hashes = part_hashes.read().await.clone();
                 let _ = event_tx
                     .send(DownloadEvent::Completed {
                         transfer_id: self.transfer_id.clone(),
                         final_path: Some(actual_final.to_string_lossy().into_owned()),
+                        part_hashes: verified_part_hashes,
                     })
                     .await;
             } else {
