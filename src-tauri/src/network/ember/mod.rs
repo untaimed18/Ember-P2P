@@ -186,6 +186,12 @@ pub fn build_exchange_payload_with_relay_attestations(
             buf.write_u16::<LittleEndian>(peer.tcp_port).unwrap();
         }
     } else {
+        if peer_count > 0 {
+            tracing::debug!(
+                "EPX builder: dropping {peer_count} peer(s) — payload already at {}B, size cap is {MAX_EPX_PAYLOAD}B",
+                buf.len()
+            );
+        }
         buf.write_u16::<LittleEndian>(0).unwrap();
     }
 
@@ -282,6 +288,10 @@ fn append_relay_attestations(buf: &mut Vec<u8>, attestations: &[RelayAttestation
     }
     let trailer_size = 4 + 1 + 2 + count * RELAY_ATTESTATION_FIXED_SIZE;
     if buf.len() + trailer_size > MAX_EPX_PAYLOAD {
+        tracing::debug!(
+            "EPX builder: dropping {count} relay attestation(s) — payload already at {}B, trailer needs {trailer_size}B more, cap is {MAX_EPX_PAYLOAD}B",
+            buf.len()
+        );
         return;
     }
     buf.extend_from_slice(RELAY_ATTESTATION_MAGIC);
@@ -452,12 +462,20 @@ pub fn parse_exchange_payload(data: &[u8]) -> anyhow::Result<ExchangeResult> {
     // bump `RUST_LOG=ember=debug` and see exactly which peer's
     // payload is malformed.
     let mut peers = Vec::new();
+    // Tracks whether the cursor reliably points past the *entire* declared
+    // peer section (all `peer_count` records, not just the `MAX_EPX_PEERS`
+    // we actually keep). If a non-conformant peer declares more peers than
+    // we cap at, or than the payload actually contains, the cursor would
+    // otherwise land mid-section and the relay-attestation trailer lookup
+    // below would misinterpret peer bytes as the `ERAT` magic/fields.
+    let mut peers_fully_parsed = true;
     if version >= 3 && !files_fully_parsed {
         tracing::debug!(
             "EPX v{version}: suppressing peer section because file section was truncated ({} of {} files parsed)",
             entries.len(),
             file_count,
         );
+        peers_fully_parsed = false;
     }
     if version >= 3 && files_fully_parsed {
         let remaining = data.len() - cursor.position() as usize;
@@ -467,6 +485,7 @@ pub fn parse_exchange_payload(data: &[u8]) -> anyhow::Result<ExchangeResult> {
             for _ in 0..count {
                 let remaining = data.len() - cursor.position() as usize;
                 if remaining < 6 {
+                    peers_fully_parsed = false;
                     break;
                 }
                 let mut ip_bytes = [0u8; 4];
@@ -479,9 +498,28 @@ pub fn parse_exchange_payload(data: &[u8]) -> anyhow::Result<ExchangeResult> {
                 }
                 peers.push(EmberPeer { ip, tcp_port });
             }
+            // A peer declaring more than MAX_EPX_PEERS didn't have its
+            // surplus records consumed by the loop above (capped at
+            // `count`). Skip the remainder so the cursor still lands on
+            // the real trailer instead of mid-peer-section — but only
+            // when we didn't already bail out above for a genuinely
+            // truncated payload.
+            if peers_fully_parsed && peer_count > MAX_EPX_PEERS {
+                let surplus_bytes = (peer_count - MAX_EPX_PEERS) * 6;
+                let remaining = data.len() - cursor.position() as usize;
+                if remaining < surplus_bytes {
+                    peers_fully_parsed = false;
+                } else {
+                    cursor.set_position(cursor.position() + surplus_bytes as u64);
+                }
+            }
+        } else if remaining > 0 {
+            // Non-zero but too short to even hold the peer_count field —
+            // the payload is truncated right at the peer-section boundary.
+            peers_fully_parsed = false;
         }
     }
-    let relay_attestations = if version >= 4 && files_fully_parsed {
+    let relay_attestations = if version >= 4 && files_fully_parsed && peers_fully_parsed {
         parse_relay_attestation_trailer(data, cursor.position() as usize)
     } else {
         Vec::new()
@@ -521,38 +559,43 @@ fn parse_relay_attestation_trailer(data: &[u8], offset: usize) -> Vec<RelayAttes
         return Vec::new();
     }
 
+    // Once at least one entry has parsed cleanly, a truncated or malformed
+    // *later* entry stops the loop but keeps everything decoded so far —
+    // one bad attestation in a batch (e.g. from a peer running a newer
+    // trailer version with extra trailing fields we don't understand)
+    // used to discard every valid attestation alongside it.
     let mut attestations = Vec::with_capacity(declared_count);
     for _ in 0..declared_count {
         let pos = cursor.position() as usize;
         if remaining.len().saturating_sub(pos) < RELAY_ATTESTATION_FIXED_SIZE {
-            return Vec::new();
+            return attestations;
         }
         let mut pubkey = [0u8; 32];
         if cursor.read_exact(&mut pubkey).is_err() {
-            return Vec::new();
+            return attestations;
         }
         let mut ip_bytes = [0u8; 4];
         if cursor.read_exact(&mut ip_bytes).is_err() {
-            return Vec::new();
+            return attestations;
         }
         let Ok(relay_port) = cursor.read_u16::<LittleEndian>() else {
-            return Vec::new();
+            return attestations;
         };
         let Ok(expires_at_unix) = cursor.read_u64::<LittleEndian>() else {
-            return Vec::new();
+            return attestations;
         };
         let Ok(capability_bits) = cursor.read_u32::<LittleEndian>() else {
-            return Vec::new();
+            return attestations;
         };
         let Ok(signature_len) = cursor.read_u16::<LittleEndian>() else {
-            return Vec::new();
+            return attestations;
         };
         if signature_len != 64 {
-            return Vec::new();
+            return attestations;
         }
         let mut signature = [0u8; 64];
         if cursor.read_exact(&mut signature).is_err() {
-            return Vec::new();
+            return attestations;
         }
         attestations.push(RelayAttestation {
             ed25519_pubkey: pubkey,
@@ -638,6 +681,25 @@ mod tests {
             RELAY_ATTESTATION_CAP_RELAY_V1,
         );
         assert!(!verify_relay_attestation(&att, now));
+    }
+
+    #[test]
+    fn truncated_second_attestation_still_returns_first() {
+        let now: u64 = 1_700_000_000;
+        let att1 = make_attestation(now + 600);
+        let att2 = make_attestation(now + 600);
+        let mut payload =
+            build_exchange_payload_with_relay_attestations(&[], &[], &[att1.clone(), att2]);
+        // Truncate mid-second-entry (after the declared_count=2 header and
+        // the first fully-encoded attestation) to simulate a peer sending
+        // a malformed/cut-off trailer.
+        payload.truncate(payload.len() - 10);
+        let result = parse_exchange_payload(&payload).unwrap();
+        assert_eq!(
+            result.relay_attestations,
+            vec![att1],
+            "a truncated later entry must not discard already-valid earlier ones"
+        );
     }
 
     #[test]

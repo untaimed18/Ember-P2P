@@ -130,6 +130,16 @@ impl PeerReputation {
     }
 }
 
+/// On-disk representation of `ReputationManager`. Wrapping the peer list
+/// with `last_decay` (rather than persisting a bare array, as before) lets
+/// `load()` know how long the process was offline and apply the decay
+/// that would otherwise have happened on the normal hourly tick.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedReputation {
+    last_decay: u64,
+    peers: Vec<PeerReputation>,
+}
+
 /// Manages reputation scores for all known peers.
 #[derive(Clone)]
 pub struct ReputationManager {
@@ -247,8 +257,11 @@ impl ReputationManager {
 
     /// Save reputation data to disk as JSON.
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        let serializable: Vec<&PeerReputation> = self.peers.values().collect();
-        let json = serde_json::to_string(&serializable)
+        let persisted = PersistedReputation {
+            last_decay: self.last_decay,
+            peers: self.peers.values().cloned().collect(),
+        };
+        let json = serde_json::to_string(&persisted)
             .map_err(|e| format!("reputation serialize: {e}"))?;
         std::fs::write(path, json).map_err(|e| format!("reputation write: {e}"))
     }
@@ -266,23 +279,69 @@ impl ReputationManager {
     pub fn load(path: &Path) -> Self {
         let data = match std::fs::read_to_string(path) {
             Ok(d) => d,
-            Err(_) => return Self::new(),
+            // A missing file is the expected first-run state, not a
+            // problem worth logging.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::new(),
+            Err(e) => {
+                tracing::warn!(
+                    "reputation load failed to read {}: {e}; starting fresh",
+                    path.display()
+                );
+                return Self::new();
+            }
         };
-        let entries: Vec<PeerReputation> = match serde_json::from_str(&data) {
-            Ok(e) => e,
-            Err(_) => return Self::new(),
+
+        // Prefer the current wrapped format (carries `last_decay` so decay
+        // for elapsed offline time can be applied below); fall back to the
+        // legacy bare-array format from before `last_decay` was persisted.
+        let (entries, persisted_last_decay) = match serde_json::from_str::<PersistedReputation>(
+            &data,
+        ) {
+            Ok(p) => (p.peers, Some(p.last_decay)),
+            Err(_) => match serde_json::from_str::<Vec<PeerReputation>>(&data) {
+                Ok(e) => (e, None),
+                Err(e) => {
+                    tracing::warn!(
+                        "reputation load failed to parse {}: {e}; starting fresh",
+                        path.display()
+                    );
+                    return Self::new();
+                }
+            },
         };
+
         let now = now_secs();
         let max_ban = now.saturating_add(BAN_DURATION.as_secs() + 3600);
         let mut peers = HashMap::with_capacity(entries.len());
+        let mut newest_interaction = 0u64;
         for mut entry in entries {
             entry.score = entry.score.clamp(MIN_REPUTATION, MAX_REPUTATION);
             entry.banned_until =
                 entry
                     .banned_until
                     .map(|until| if until > max_ban { max_ban } else { until });
+            newest_interaction = newest_interaction.max(entry.last_interaction);
             peers.insert(entry.node_id, entry);
         }
+
+        // Decay scores for time elapsed while the app was offline. Without
+        // this, a peer whose score cratered right before a long shutdown
+        // reappears at the exact same score instead of having decayed
+        // toward zero the way it would have if the process had stayed up.
+        // Prefer the persisted `last_decay`; for legacy files that never
+        // recorded it, fall back to the most recent `last_interaction`
+        // across all peers as the best available proxy.
+        let last_decay = persisted_last_decay
+            .filter(|&d| d <= now)
+            .unwrap_or_else(|| newest_interaction.min(now));
+        let elapsed = now.saturating_sub(last_decay);
+        let intervals = (elapsed / DECAY_INTERVAL.as_secs()) as u32;
+        if intervals > 0 {
+            for peer in peers.values_mut() {
+                peer.apply_decay(intervals);
+            }
+        }
+
         let mut mgr = Self {
             peers,
             last_decay: now,
@@ -302,15 +361,45 @@ impl ReputationManager {
             return;
         }
         let to_remove = self.peers.len() - MAX_TRACKED_PEERS;
-        let mut entries: Vec<([u8; 16], i32, u64)> = self
-            .peers
-            .iter()
-            .map(|(id, p)| (*id, p.score, p.last_interaction))
-            .collect();
+        let now = now_secs();
+
+        // A banned peer's score sits at or below `BAN_THRESHOLD` by
+        // definition, which is exactly the range naive lowest-score-first
+        // eviction targets first — so under table pressure the worst
+        // offenders were evicted (and thus silently unbanned, since
+        // `is_banned` on an unknown id just returns `false`) before any
+        // well-behaved peer. Prefer evicting non-banned peers; only reach
+        // into the banned set (soonest-expiring first) if that alone
+        // can't free enough slots.
+        let mut non_banned: Vec<([u8; 16], i32, u64)> = Vec::new();
+        let mut banned: Vec<([u8; 16], u64)> = Vec::new();
+        for (id, p) in self.peers.iter() {
+            if p.is_banned(now) {
+                banned.push((*id, p.banned_until.unwrap_or(0)));
+            } else {
+                non_banned.push((*id, p.score, p.last_interaction));
+            }
+        }
         // Sort: lowest score first, oldest interaction first
-        entries.sort_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)));
-        for (id, _, _) in entries.iter().take(to_remove) {
+        non_banned.sort_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)));
+
+        let mut removed = 0usize;
+        for (id, _, _) in non_banned.iter() {
+            if removed >= to_remove {
+                break;
+            }
             self.peers.remove(id);
+            removed += 1;
+        }
+        if removed < to_remove {
+            banned.sort_by(|a, b| a.1.cmp(&b.1));
+            for (id, _) in banned.iter() {
+                if removed >= to_remove {
+                    break;
+                }
+                self.peers.remove(id);
+                removed += 1;
+            }
         }
     }
 }
@@ -422,5 +511,104 @@ mod tests {
         mgr.record_event(&[11u8; 16], ReputationEvent::DhtResponse);
         mgr.record_event(&[12u8; 16], ReputationEvent::DhtResponse);
         assert_eq!(mgr.tracked_count(), 2);
+    }
+
+    fn unique_temp_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "ember_reputation_{label}_{}_{}.json",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ))
+    }
+
+    #[test]
+    fn eviction_prefers_non_banned_peers_over_banned() {
+        let mut mgr = ReputationManager::new();
+        let banned_id = [20u8; 16];
+        // Drive one peer into a ban.
+        for _ in 0..10 {
+            mgr.record_event(&banned_id, ReputationEvent::CorruptData);
+        }
+        assert!(mgr.is_banned(&banned_id));
+
+        // Fill the map past capacity with well-behaved peers so eviction
+        // triggers on the next event.
+        for i in 0..MAX_TRACKED_PEERS {
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            id[15] = 0xFF; // keep distinct from `banned_id`
+            mgr.record_event(&id, ReputationEvent::DhtResponse);
+        }
+
+        assert!(
+            mgr.is_banned(&banned_id),
+            "a banned peer must not be evicted ahead of well-behaved peers"
+        );
+        assert!(mgr.tracked_count() <= MAX_TRACKED_PEERS);
+    }
+
+    #[test]
+    fn save_and_load_roundtrip_preserves_last_decay() {
+        let path = unique_temp_path("roundtrip");
+        let mut mgr = ReputationManager::new();
+        mgr.record_event(&[30u8; 16], ReputationEvent::SuccessfulHandshake);
+        mgr.save(&path).expect("save reputation");
+
+        let loaded = ReputationManager::load(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(loaded.tracked_count(), 1);
+        assert_eq!(loaded.score(&[30u8; 16]), SCORE_SUCCESSFUL_HANDSHAKE);
+    }
+
+    #[test]
+    fn load_applies_decay_for_elapsed_offline_time() {
+        let path = unique_temp_path("offline_decay");
+        let node_id = [31u8; 16];
+        let stale_last_decay = test_now().saturating_sub(10 * DECAY_INTERVAL.as_secs());
+        let mut peer = PeerReputation::new(node_id, stale_last_decay);
+        peer.score = 500;
+        let persisted = PersistedReputation {
+            last_decay: stale_last_decay,
+            peers: vec![peer],
+        };
+        std::fs::write(&path, serde_json::to_string(&persisted).unwrap())
+            .expect("write persisted reputation");
+
+        let loaded = ReputationManager::load(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            loaded.score(&node_id) < 500,
+            "score should have decayed toward zero for the elapsed offline interval"
+        );
+    }
+
+    #[test]
+    fn load_accepts_legacy_bare_array_format() {
+        let path = unique_temp_path("legacy_format");
+        let node_id = [32u8; 16];
+        let peer = PeerReputation::new(node_id, test_now());
+        std::fs::write(&path, serde_json::to_string(&vec![peer]).unwrap())
+            .expect("write legacy reputation");
+
+        let loaded = ReputationManager::load(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(loaded.tracked_count(), 1);
+    }
+
+    #[test]
+    fn load_returns_fresh_manager_on_corrupt_file() {
+        let path = unique_temp_path("corrupt");
+        std::fs::write(&path, b"not valid json{{{").expect("write corrupt reputation");
+
+        let loaded = ReputationManager::load(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(loaded.tracked_count(), 0);
     }
 }

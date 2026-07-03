@@ -418,6 +418,19 @@ impl EmberTransport {
 
     /// Process an incoming Ember-encrypted UDP packet.
     pub fn process_incoming(&mut self, data: &[u8], from: SocketAddr) -> IncomingResult {
+        // `dispatch_incoming` is the only wired-up caller today and already
+        // enforces this cap, but `process_incoming` is `pub` and documented
+        // as the lower-level entry point — enforce it here too so any
+        // future direct caller can't drive proportional-to-datagram-size
+        // allocation in the handshake parsers below via an oversized
+        // packet.
+        if data.len() > MAX_EMBER_DATAGRAM_BYTES {
+            debug!(
+                "process_incoming: dropping oversized Ember UDP datagram from {from}: {} bytes",
+                data.len()
+            );
+            return IncomingResult::Rejected;
+        }
         if data.len() < HEADER_LEN {
             return IncomingResult::Rejected;
         }
@@ -752,6 +765,13 @@ impl EmberTransport {
         }
         self.sessions
             .insert(from, NoiseSession::new(transport, remote_noise_pub));
+        // Clear any stale pending handshake for this address (e.g. an
+        // earlier XX attempt we initiated before this IK init arrived).
+        // Left in place, it lingers until the 30s pending-cleanup sweep
+        // and can confuse a late, stray XX packet into being processed
+        // against a handshake state that's no longer relevant now that a
+        // session exists.
+        self.pending.remove(&from);
         trace!("IK handshake completed (responder) with {from}");
 
         let decrypted = if payload_len > 0 {

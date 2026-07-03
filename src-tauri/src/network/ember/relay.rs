@@ -250,8 +250,17 @@ impl RelayManager {
         self.sessions.get_mut(&id)
     }
 
+    /// Removes a session and folds its `bytes_relayed` into the cumulative
+    /// lifetime total before returning it. Every call site removes a
+    /// session because it's ending (normal completion, error, or explicit
+    /// teardown) — without folding here, only `cleanup()`'s expiry path
+    /// contributed to `total_bytes_relayed()`, so sessions that ended any
+    /// other way (the common case) silently dropped their bytes from the
+    /// lifetime counter reported in stats/logs.
     pub fn remove_session(&mut self, id: u32) -> Option<RelaySession> {
-        self.sessions.remove(&id)
+        let session = self.sessions.remove(&id)?;
+        self.total_bytes_relayed += session.bytes_relayed;
+        Some(session)
     }
 
     /// Clean up expired sessions.
@@ -264,13 +273,12 @@ impl RelayManager {
             .collect();
 
         for id in &expired {
-            if let Some(session) = self.sessions.remove(id) {
+            if let Some(session) = self.remove_session(*id) {
                 info!(
                     "RelayManager: expired {} ({} bytes relayed)",
                     session.describe(),
                     session.bytes_relayed
                 );
-                self.total_bytes_relayed += session.bytes_relayed;
             }
         }
         expired
@@ -545,17 +553,40 @@ pub async fn connect_to_peer_relay(
     full.extend_from_slice(&resp_header);
     full.extend_from_slice(&payload_buf);
 
-    let (msg_type, returned_sid, _payload) =
+    let (msg_type, returned_sid, payload) =
         decode_relay_message(&full).ok_or_else(|| "invalid relay response".to_string())?;
 
     if msg_type == MSG_RELAY_REJECT {
-        return Err("relay peer rejected request".to_string());
+        // Payload is a single reason byte (see `build_relay_reject`):
+        // 0x01 capacity, 0x02 bad target, 0x03 attestation/auth failure.
+        // Surfacing it lets callers distinguish "try another relay" from
+        // "this attestation is stale, refresh it" instead of a single
+        // generic error for every rejection cause.
+        let reason = payload.first().copied();
+        return Err(match reason {
+            Some(0x01) => "relay peer rejected request: at capacity".to_string(),
+            Some(0x02) => "relay peer rejected request: invalid/non-public target".to_string(),
+            Some(0x03) => {
+                "relay peer rejected request: unauthenticated or unknown attestation".to_string()
+            }
+            Some(other) => format!("relay peer rejected request: reason 0x{other:02X}"),
+            None => "relay peer rejected request".to_string(),
+        });
     }
     if msg_type != MSG_RELAY_ACCEPT {
         return Err(format!("unexpected relay response type: {msg_type}"));
     }
+    // The relay echoes back our session ID; a mismatch here means either a
+    // desynchronized/multiplexed response on this connection or a relay
+    // implementation that doesn't preserve it — either way we can't trust
+    // the ACCEPT actually corresponds to the request we just sent.
+    if returned_sid != session_id {
+        return Err(format!(
+            "relay accept echoed mismatched session id: expected {session_id}, got {returned_sid}"
+        ));
+    }
 
-    info!("Relay: peer relay accepted at {relay_addr}, session {session_id} (relay echoed {returned_sid})");
+    info!("Relay: peer relay accepted at {relay_addr}, session {session_id}");
     Ok((send, recv))
 }
 
@@ -1002,13 +1033,20 @@ pub async fn run_quic_accept_loop(
 
                 {
                     let mut mgr_lock = mgr.lock().await;
-                    if let Some(mut session) = mgr_lock.remove_session(session_id) {
+                    // Record the final byte count on the still-active
+                    // session *before* removing it, so `remove_session`'s
+                    // fold into the manager's cumulative
+                    // `total_bytes_relayed` counter actually includes
+                    // this session's bytes instead of the pre-transfer 0.
+                    if let Some(session) = mgr_lock.get_session_mut(session_id) {
                         session.add_relayed_bytes(total_bytes);
+                    }
+                    if let Some(session) = mgr_lock.remove_session(session_id) {
                         info!(
                             "Relay session {session_id} ended: {} bytes relayed ({} active, {} total relayed)",
                             session.bytes_relayed,
                             mgr_lock.active_count(),
-                            mgr_lock.total_bytes_relayed() + session.bytes_relayed,
+                            mgr_lock.total_bytes_relayed(),
                         );
                     }
                 }
@@ -1289,6 +1327,46 @@ mod tests {
 
         mgr.remove_session(sid);
         assert_eq!(mgr.active_count(), 0);
+    }
+
+    #[test]
+    fn remove_session_folds_bytes_into_cumulative_total() {
+        let mut mgr = RelayManager::new();
+        assert_eq!(mgr.total_bytes_relayed(), 0);
+
+        let sid = mgr
+            .create_session(
+                Ipv4Addr::new(1, 2, 3, 4),
+                4662,
+                Ipv4Addr::new(5, 6, 7, 8),
+                4663,
+                [2u8; 16],
+            )
+            .unwrap();
+        mgr.get_session_mut(sid).unwrap().add_relayed_bytes(500);
+
+        let removed = mgr.remove_session(sid);
+        assert_eq!(removed.map(|s| s.bytes_relayed), Some(500));
+        assert_eq!(
+            mgr.total_bytes_relayed(),
+            500,
+            "bytes from a normally-ended session must count toward the lifetime total, \
+             not just sessions reaped by cleanup()"
+        );
+
+        // A second session's bytes accumulate on top rather than replacing.
+        let sid2 = mgr
+            .create_session(
+                Ipv4Addr::new(9, 9, 9, 9),
+                4662,
+                Ipv4Addr::new(5, 6, 7, 8),
+                4663,
+                [3u8; 16],
+            )
+            .unwrap();
+        mgr.get_session_mut(sid2).unwrap().add_relayed_bytes(250);
+        mgr.remove_session(sid2);
+        assert_eq!(mgr.total_bytes_relayed(), 750);
     }
 
     #[test]
