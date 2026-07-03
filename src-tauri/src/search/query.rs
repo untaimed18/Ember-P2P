@@ -51,7 +51,20 @@ impl QueryExpr {
         match self {
             QueryExpr::Term(s) => {
                 buf.push(0x01);
-                let bytes = s.as_bytes();
+                // The wire length prefix is a u16, so a term whose UTF-8
+                // encoding exceeds 65535 bytes would otherwise have its
+                // length silently wrap (`bytes.len() as u16`), writing a
+                // length prefix that doesn't match the bytes that follow
+                // and desyncing the remote parser for the rest of the
+                // expression. No realistic keyword approaches this size, so
+                // truncate defensively at a valid UTF-8 boundary rather than
+                // rejecting the whole query — this only ever engages for a
+                // pathological single token.
+                let mut end = s.len().min(u16::MAX as usize);
+                while end > 0 && !s.is_char_boundary(end) {
+                    end -= 1;
+                }
+                let bytes = &s.as_bytes()[..end];
                 buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
                 buf.extend_from_slice(bytes);
             }
@@ -536,5 +549,34 @@ mod tests {
         // search rather than "everything except cam".
         let expr = parse("-cam").unwrap();
         assert_eq!(expr, term("cam"));
+    }
+
+    #[test]
+    fn oversized_term_is_truncated_not_length_wrapped() {
+        // A term far longer than u16::MAX bytes must not produce a wire
+        // length prefix that undercounts (via `as u16` wraparound) the
+        // bytes actually written, which would desync a remote parser
+        // reading the rest of the expression.
+        let huge = "a".repeat(u16::MAX as usize + 500);
+        let expr = term(&huge);
+        let wire = expr.to_wire_bytes();
+        assert_eq!(wire[0], 0x01);
+        let declared_len = u16::from_le_bytes([wire[1], wire[2]]) as usize;
+        assert_eq!(declared_len, u16::MAX as usize);
+        assert_eq!(wire.len(), 3 + declared_len);
+    }
+
+    #[test]
+    fn oversized_multibyte_term_truncates_at_char_boundary() {
+        // A multi-byte UTF-8 term truncated at exactly u16::MAX bytes could
+        // land mid-codepoint; the truncation must back off to a valid
+        // boundary so `str::from_utf8` on the receiving end doesn't fail.
+        let huge: String = "é".repeat((u16::MAX as usize / 2) + 500);
+        let expr = term(&huge);
+        let wire = expr.to_wire_bytes();
+        let declared_len = u16::from_le_bytes([wire[1], wire[2]]) as usize;
+        assert!(declared_len <= u16::MAX as usize);
+        let term_bytes = &wire[3..3 + declared_len];
+        assert!(std::str::from_utf8(term_bytes).is_ok());
     }
 }

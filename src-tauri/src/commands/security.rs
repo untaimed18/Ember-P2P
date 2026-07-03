@@ -186,16 +186,28 @@ pub async fn remove_ip_filter_range(
     start_ip: String,
     end_ip: String,
 ) -> Result<(), String> {
-    start_ip
-        .parse::<Ipv4Addr>()
+    let start: Ipv4Addr = start_ip
+        .parse()
         .map_err(|_| coded("security_invalid_start_ip", "Invalid start IP address"))?;
-    end_ip
-        .parse::<Ipv4Addr>()
+    let end: Ipv4Addr = end_ip
+        .parse()
         .map_err(|_| coded("security_invalid_end_ip", "Invalid end IP address"))?;
+    // Mirror add_ip_filter_range's ordering check: an inverted range can
+    // never match an entry added through the add path (which rejects
+    // start > end), so without this check here the remove silently no-ops
+    // and the caller gets no feedback that the range they typed could never
+    // have existed.
+    if u32::from(start) > u32::from(end) {
+        return Err(coded(
+            "security_start_ip_must_be_less_than_end",
+            "Start IP must be less than or equal to end IP",
+        ));
+    }
 
+    let (tx, rx) = oneshot::channel();
     state
         .network_tx
-        .send(NetworkCommand::RemoveIpRange { start_ip, end_ip })
+        .send(NetworkCommand::RemoveIpRange { start_ip, end_ip, tx })
         .await
         .map_err(|e| {
             coded_ctx(
@@ -205,6 +217,19 @@ pub async fn remove_ip_filter_range(
             )
         })?;
 
+    let removed = await_reply(
+        rx,
+        "security_failed_to_remove_range",
+        "Failed to remove range",
+    )
+    .await?;
+    if !removed {
+        return Err(coded(
+            "security_range_not_found",
+            "No matching IP filter range found to remove",
+        ));
+    }
+
     Ok(())
 }
 
@@ -213,21 +238,15 @@ pub async fn set_ip_filter_enabled(
     state: tauri::State<'_, AppState>,
     enabled: bool,
 ) -> Result<(), String> {
-    state
-        .network_tx
-        .send(NetworkCommand::SetIpFilterEnabled { enabled })
-        .await
-        .map_err(|e| {
-            coded_ctx(
-                "security_failed_to_update_filter",
-                "Failed to update filter",
-                e,
-            )
-        })?;
-
-    // Persist before committing the in-memory flag so a failed write can't
-    // leave the saved config diverged from disk (the runtime filter was
-    // already updated above, which is the fail-safe direction for security).
+    // Persist *before* applying the runtime change (reversed from the
+    // original order). `SetIpFilterEnabled` is a fire-and-forget bool flip
+    // with no ack, so there's no way to roll the network task's live state
+    // back if the disk write fails after the fact — the old order left the
+    // running filter and `AppState.config.settings` both diverged from disk
+    // (and from each other) until restart. Persisting first means a save
+    // failure bails out before touching runtime state at all, so nothing
+    // ever diverges; a channel-send failure after a successful save just
+    // means the already-correct persisted value takes effect on next start.
     let (new_settings, save_data) = {
         let config = state.config.read().await;
         let mut new_settings = config.settings.clone();
@@ -243,6 +262,19 @@ pub async fn set_ip_filter_enabled(
     .await
     .map_err(|e| coded_ctx("security_save_task_failed", "Save task failed", e))?
     .map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?;
+
+    state
+        .network_tx
+        .send(NetworkCommand::SetIpFilterEnabled { enabled })
+        .await
+        .map_err(|e| {
+            coded_ctx(
+                "security_failed_to_update_filter",
+                "Failed to update filter",
+                e,
+            )
+        })?;
+
     {
         let mut config = state.config.write().await;
         config.settings = new_settings;
@@ -256,19 +288,9 @@ pub async fn set_block_private_ips(
     state: tauri::State<'_, AppState>,
     block_private: bool,
 ) -> Result<(), String> {
-    state
-        .network_tx
-        .send(NetworkCommand::SetBlockPrivateIps { block_private })
-        .await
-        .map_err(|e| {
-            coded_ctx(
-                "security_failed_to_update_filter",
-                "Failed to update filter",
-                e,
-            )
-        })?;
-
-    // Persist before committing the in-memory flag (see set_ip_filter_enabled).
+    // Persist before applying the runtime change — see set_ip_filter_enabled
+    // for why this order avoids a config/runtime divergence window on save
+    // failure.
     let (new_settings, save_data) = {
         let config = state.config.read().await;
         let mut new_settings = config.settings.clone();
@@ -284,6 +306,19 @@ pub async fn set_block_private_ips(
     .await
     .map_err(|e| coded_ctx("security_save_task_failed", "Save task failed", e))?
     .map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?;
+
+    state
+        .network_tx
+        .send(NetworkCommand::SetBlockPrivateIps { block_private })
+        .await
+        .map_err(|e| {
+            coded_ctx(
+                "security_failed_to_update_filter",
+                "Failed to update filter",
+                e,
+            )
+        })?;
+
     {
         let mut config = state.config.write().await;
         config.settings = new_settings;

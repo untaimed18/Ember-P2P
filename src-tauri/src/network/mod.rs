@@ -2327,6 +2327,7 @@ pub enum NetworkCommand {
     FindSources {
         file_hash: KadId,
         file_size: u64,
+        request_id: u64,
         tx: oneshot::Sender<Vec<(String, u16)>>,
     },
     BanPeer {
@@ -2338,6 +2339,7 @@ pub enum NetworkCommand {
     FindNotes {
         file_hash: KadId,
         file_size: u64,
+        request_id: u64,
         tx: oneshot::Sender<Vec<SearchResult>>,
     },
     PublishNote {
@@ -2378,6 +2380,7 @@ pub enum NetworkCommand {
     RemoveIpRange {
         start_ip: String,
         end_ip: String,
+        tx: oneshot::Sender<bool>,
     },
     SetIpFilterEnabled {
         enabled: bool,
@@ -2843,6 +2846,11 @@ struct PublishedNote {
     last_publish: i64,
 }
 
+/// Pending `find_sources`/`find_notes` IPC response channel, paired with the
+/// caller-generated `request_id` so `NetworkCommand::CancelSearch` can find
+/// and tear down the underlying KAD search if the IPC caller times out.
+type PendingHelperSearchTx<T> = (u64, oneshot::Sender<T>);
+
 struct NetworkState {
     local_id: KadId,
     user_hash: [u8; 16],
@@ -2868,7 +2876,11 @@ struct NetworkState {
     /// Throttled UDP global search queue: packets to send one-at-a-time at
     /// 750ms intervals (eMule UDPSEARCHSPEED = SEC2MS(3)/4).
     udp_search_queue: VecDeque<(Vec<u8>, std::net::SocketAddr)>,
-    pending_source_searches: HashMap<SearchId, oneshot::Sender<Vec<(String, u16)>>>,
+    /// Pending source searches: search_id -> (request_id, response sender).
+    /// `request_id` (caller-generated) lets `NetworkCommand::CancelSearch`
+    /// cancel a `find_sources` call on IPC timeout, same as it already does
+    /// for `search_files`'s keyword searches.
+    pending_source_searches: HashMap<SearchId, PendingHelperSearchTx<Vec<(String, u16)>>>,
     /// Source searches tied to pending downloads (search_id -> (transfer_id, file_hash_md4)).
     /// File hash is carried alongside so the search-completion handler can build
     /// CallbackReqs / inject sources without re-reading `pending_downloads`, which
@@ -2945,8 +2957,9 @@ struct NetworkState {
     store_keyword_searches: HashMap<SearchId, KeywordPublishBatch>,
     /// Store-source searches: search_id -> (file_hash, publish message)
     store_source_searches: HashMap<SearchId, (KadId, KadMessage)>,
-    /// Pending notes searches: search_id -> response sender
-    pending_notes_searches: HashMap<SearchId, oneshot::Sender<Vec<SearchResult>>>,
+    /// Pending notes searches: search_id -> (request_id, response sender).
+    /// See `pending_source_searches` for why `request_id` is carried here.
+    pending_notes_searches: HashMap<SearchId, PendingHelperSearchTx<Vec<SearchResult>>>,
     /// Pending note publishes: search_id -> (file_hash, rating, comment)
     pending_note_publishes: HashMap<SearchId, (KadId, u8, String, Option<String>, Option<u64>)>,
     /// Notes we have published to the KAD DHT, keyed by the file's KadId.
@@ -3546,10 +3559,10 @@ fn finalize_removed_searches(
             }
             maybe_finish_active_search(state, app_handle, request_id);
         }
-        if let Some(tx) = state.pending_source_searches.remove(sid) {
+        if let Some((_, tx)) = state.pending_source_searches.remove(sid) {
             let _ = tx.send(Vec::new());
         }
-        if let Some(tx) = state.pending_notes_searches.remove(sid) {
+        if let Some((_, tx)) = state.pending_notes_searches.remove(sid) {
             let _ = tx.send(Vec::new());
         }
         state.download_source_searches.remove(sid);
@@ -3560,11 +3573,31 @@ fn finalize_removed_searches(
 }
 
 fn cancel_search_request(state: &mut NetworkState, app_handle: &tauri::AppHandle, request_id: u64) {
+    // Match by `request_id` across all three IPC-facing search kinds that
+    // carry one (keyword `search_files`, plus `find_sources`/`find_notes`,
+    // which used to have no cancel path at all and so kept their KAD search
+    // alive — wasting a routing-table in-use slot and a search-manager slot
+    // — until the search's own lifetime expired well after the IPC caller
+    // had already timed out and moved on).
     let cancelled: Vec<SearchId> = state
         .pending_keyword_searches
         .iter()
         .filter(|(_, pending)| pending.request_id == request_id)
         .map(|(sid, _)| *sid)
+        .chain(
+            state
+                .pending_source_searches
+                .iter()
+                .filter(|(_, (rid, _))| *rid == request_id)
+                .map(|(sid, _)| *sid),
+        )
+        .chain(
+            state
+                .pending_notes_searches
+                .iter()
+                .filter(|(_, (rid, _))| *rid == request_id)
+                .map(|(sid, _)| *sid),
+        )
         .collect();
 
     for sid in &cancelled {
@@ -3589,10 +3622,10 @@ fn cancel_search_request(state: &mut NetworkState, app_handle: &tauri::AppHandle
         // cancelled search can't leave dangling channels/entries behind. Mirrors
         // `finalize_removed_searches`; idempotent (each lookup is a no-op when
         // absent).
-        if let Some(tx) = state.pending_source_searches.remove(sid) {
+        if let Some((_, tx)) = state.pending_source_searches.remove(sid) {
             let _ = tx.send(Vec::new());
         }
-        if let Some(tx) = state.pending_notes_searches.remove(sid) {
+        if let Some((_, tx)) = state.pending_notes_searches.remove(sid) {
             let _ = tx.send(Vec::new());
         }
         state.download_source_searches.remove(sid);
@@ -8116,7 +8149,17 @@ pub async fn start_network(
                         if state.udp_search_queue.is_empty() {
                             state.server_udp_search_age += 1;
                         }
-                        if state.server_udp_search_age > 10 {
+                        // Scale the post-drain grace period from the user's
+                        // configured `search_timeout_secs` (a tenth of it,
+                        // clamped to 10-30s) instead of a hardcoded 10s that
+                        // ignored the setting entirely. This keeps the
+                        // default (120s setting -> 12s grace) close to the
+                        // old fixed value while giving users who raise the
+                        // overall timeout proportionally more time for
+                        // straggler UDP replies, and users who lower it a
+                        // floor so the leg isn't cut off unreasonably fast.
+                        let udp_grace_secs = (settings.search_timeout_secs / 10).clamp(10, 30);
+                        if u64::from(state.server_udp_search_age) > udp_grace_secs {
                             active.udp_pending = false;
                             udp_finished_request = Some(active.request_id);
                             state.udp_search_queue.clear();
@@ -8613,6 +8656,17 @@ pub async fn start_network(
                         local_results = filter_results_by_type(local_results, &file_type_filter);
                         local_results.sort_by(|a, b| b.availability.cmp(&a.availability));
                         local_results.truncate(2000);
+                        // Intentional: the `search_files` IPC call returns as soon as
+                        // the KAD leg (normally the slowest, ~45-60s) finishes, rather
+                        // than blocking further for the bounded TCP-server (<=30s) and
+                        // UDP (<=30s) legs — those are usually already done or timed
+                        // out by this point, and any hits that land after this point
+                        // still reach the UI via streamed `search-results` events plus
+                        // the later `search-complete` event from
+                        // `maybe_finish_active_search` below. Deliberately not blocking
+                        // the oneshot on `active.server_pending`/`udp_pending` here
+                        // keeps the awaited command call latency bounded by the KAD
+                        // leg instead of the sum of all three.
                         let _ = tx.send(local_results);
                         if let Some(active) = state.active_search_request.as_mut() {
                             if active.request_id == request_id {
@@ -8620,7 +8674,7 @@ pub async fn start_network(
                             }
                         }
                         maybe_finish_active_search(&mut state, &app_handle, request_id);
-                    } else if let Some(tx) = state.pending_source_searches.remove(&sid) {
+                    } else if let Some((_, tx)) = state.pending_source_searches.remove(&sid) {
                         let sources = if let Some(search) = state.search_manager.get(&sid) {
                             let all = extract_kad_sources(&search.results);
                             // Remember any peer that advertised Ember capability so
@@ -9780,7 +9834,7 @@ pub async fn start_network(
                             "transfer:sources-updated",
                             serde_json::json!({ "transfer_id": refresh_transfer_id }),
                         );
-                    } else if let Some(tx) = state.pending_notes_searches.remove(&sid) {
+                    } else if let Some((_, tx)) = state.pending_notes_searches.remove(&sid) {
                         let results = if let Some(search) = state.search_manager.get(&sid) {
                             info!(
                                 "Notes search {} completed: {} results",
@@ -9922,7 +9976,7 @@ pub async fn start_network(
                                     value: TagValue::Uint64(file.size),
                                 });
                             } else {
-                                if let Some(name) = file_name.filter(|name| !name.is_empty()) {
+                                if let Some(name) = file_name.clone().filter(|name| !name.is_empty()) {
                                     note_tags.push(KadTag {
                                         name: TagName::Id(TAG_FILENAME),
                                         value: TagValue::String(name),
@@ -9938,7 +9992,7 @@ pub async fn start_network(
                             if !comment.is_empty() {
                                 note_tags.push(KadTag {
                                     name: TagName::Id(TAG_DESCRIPTION),
-                                    value: TagValue::String(comment),
+                                    value: TagValue::String(comment.clone()),
                                 });
                             }
                             if rating > 0 {
@@ -9988,6 +10042,41 @@ pub async fn start_network(
                                 }
                             }
                             if sent > 0 {
+                                // Only now — after PublishNotesReq packets were
+                                // actually transmitted — do we record/refresh
+                                // the note's `last_publish` and reset its 24h
+                                // republish timer. This is a shared completion
+                                // path for both the first-time publish
+                                // (`NetworkCommand::PublishNote`) and every
+                                // subsequent scheduled republish, neither of
+                                // which insert/update `published_notes`
+                                // themselves anymore — a search that timed out
+                                // or found zero reachable nodes used to still
+                                // reset the timer (or, for first publish,
+                                // record a "published" entry) despite nothing
+                                // actually being sent.
+                                if rating > 0 || !comment.trim().is_empty() {
+                                    state.published_notes.insert(
+                                        file_hash,
+                                        PublishedNote {
+                                            rating,
+                                            comment: comment.clone(),
+                                            file_name: file_name.clone(),
+                                            file_size,
+                                            last_publish: now,
+                                        },
+                                    );
+                                    if let Err(e) = db.save_published_note(
+                                        &file_hash.to_hex(),
+                                        rating,
+                                        &comment,
+                                        now,
+                                        file_name.as_deref(),
+                                        file_size,
+                                    ) {
+                                        warn!("Failed to persist note republish timestamp: {e}");
+                                    }
+                                }
                                 info!(
                                     "StoreNotes search {} completed: published note (rating={}) to {} closest nodes",
                                     sid.0, rating, sent
@@ -11148,20 +11237,15 @@ pub async fn start_network(
                                 state
                                     .pending_note_publishes
                                     .insert(sid, (file_hash, rating, comment.clone(), file_name.clone(), file_size));
-                                if let Some(note) = state.published_notes.get_mut(&file_hash) {
-                                    note.last_publish = now_ts;
-                                }
-                                if let Err(e) = db.save_published_note(
-                                    &file_hash.to_hex(),
-                                    rating,
-                                    &comment,
-                                    now_ts,
-                                    file_name.as_deref(),
-                                    file_size,
-                                )
-                                {
-                                    warn!("Failed to persist note republish timestamp: {e}");
-                                }
+                                // `last_publish`/the DB row are updated once the
+                                // search actually completes and PublishNotesReq
+                                // packets go out (see the `sent > 0` branch in
+                                // the StoreNotes search-completion handler
+                                // below), not here at scheduling time — a
+                                // search that finds no reachable closest nodes
+                                // or times out would otherwise still reset the
+                                // 24h republish timer despite nothing being
+                                // published.
                                 info!("Republishing KAD note for file {file_hash} (search {})", sid.0);
                             }
                         }
@@ -14742,10 +14826,14 @@ pub async fn start_network(
                     }
                 }
 
-                // Timeout pending server search after 30 seconds
+                // Timeout pending server search after 30 seconds. This
+                // counter ticks once per second (this loop iteration), so
+                // the threshold must be 29, not 15 — the previous value
+                // cut the server leg off after ~15s, half of the
+                // documented/intended duration.
                 if state.pending_server_search.is_some() {
                     state.server_search_age += 1;
-                    if state.server_search_age > 15 {
+                    if state.server_search_age > 29 {
                         if let Some(mut pending) = state.pending_server_search.take() {
                             let request_id = pending.request_id;
                             info!("Server search timed out, returning {} local results", pending.results.len());
@@ -22489,14 +22577,18 @@ async fn handle_command_inner(
                     rating,
                     comment.len()
                 );
-                // Remember this note so it gets re-published every ~24h (DHT
-                // note entries expire), and persist it so republishing
-                // survives restarts. Only non-empty notes are tracked — an
-                // empty note would be a no-op publish. The `publish_note`
-                // command already rejects fully-empty notes, but we re-check
-                // here to stay robust against other internal callers.
+                // Track (and persist) the note right away with a
+                // `last_publish: 0` sentinel — not `now_ts` — so it survives
+                // a crash/restart before this attempt finishes and, if this
+                // attempt sends to zero nodes, the round-robin republish
+                // scheduler's `now_ts - note.last_publish > REPUBLISH_NOTE_SECS`
+                // due-check finds it immediately eligible for retry instead
+                // of waiting a full 24h. `last_publish` is only bumped to a
+                // real timestamp once PublishNotesReq packets actually go
+                // out (the `sent > 0` branch in the StoreNotes
+                // search-completion handler), so the 24h timer can't be
+                // reset by a search that found no reachable nodes.
                 if rating > 0 || !comment.trim().is_empty() {
-                    let now_ts = chrono::Utc::now().timestamp();
                     state.published_notes.insert(
                         file_hash,
                         PublishedNote {
@@ -22504,14 +22596,14 @@ async fn handle_command_inner(
                             comment: comment.clone(),
                             file_name: file_name.clone(),
                             file_size,
-                            last_publish: now_ts,
+                            last_publish: 0,
                         },
                     );
                     if let Err(e) = db.save_published_note(
                         &file_hash.to_hex(),
                         rating,
                         &comment,
-                        now_ts,
+                        0,
                         file_name.as_deref(),
                         file_size,
                     ) {
@@ -22867,11 +22959,17 @@ async fn handle_command_inner(
             // contacts can be cleaned up normally) then drop the search.
             let sid = crate::network::kad::search::SearchId(id);
             if let Some(removed) = state.search_manager.remove(&sid) {
-                if !removed.in_use_ids.is_empty() {
-                    state
-                        .routing_table
-                        .release_contacts_in_use(&removed.in_use_ids);
-                }
+                // Beyond the in-use refs, a cancelled search can still have
+                // pending IPC oneshots (`pending_keyword_searches` /
+                // `pending_source_searches` / `pending_notes_searches`) and
+                // bookkeeping entries (`download_source_searches`,
+                // `store_keyword_searches`, `store_source_searches`,
+                // `pending_note_publishes`) keyed on this `sid`. Without
+                // this, callers of `find_notes`/`find_sources`/global
+                // search hang until their own IPC timeout instead of
+                // resolving immediately, and `active_search_request.kad_pending`
+                // can be left stuck set so `search-complete` never fires.
+                finalize_removed_searches(state, app_handle, &[sid], &removed.in_use_ids);
                 info!("KAD search {id} cancelled by user");
             } else {
                 debug!("KAD search {id} not found (already completed?) — ignoring cancel");
@@ -22890,6 +22988,7 @@ async fn handle_command_inner(
         NetworkCommand::FindNotes {
             file_hash,
             file_size,
+            request_id,
             tx,
         } => {
             let closest = state
@@ -22910,12 +23009,13 @@ async fn handle_command_inner(
                 let _ = tx.send(Vec::new());
                 return;
             }
-            state.pending_notes_searches.insert(sid, tx);
+            state.pending_notes_searches.insert(sid, (request_id, tx));
         }
 
         NetworkCommand::FindSources {
             file_hash,
             file_size,
+            request_id,
             tx,
         } => {
             let closest = state
@@ -22937,10 +23037,26 @@ async fn handle_command_inner(
                 let _ = tx.send(Vec::new());
                 return;
             }
-            state.pending_source_searches.insert(sid, tx);
+            state.pending_source_searches.insert(sid, (request_id, tx));
         }
 
         NetworkCommand::BootstrapContacts { contacts } => {
+            // Our own export path (`export_bootstrap_contacts`) caps at 200
+            // contacts, but a hand-crafted or third-party-client nodes.dat
+            // is only bounded by the download size cap (10-16MB), which
+            // could still hold hundreds of thousands of small contact
+            // records. Cap injection well above the normal 200-contact norm
+            // (to tolerate larger legitimate lists from other clients)
+            // without letting a pathological file drive an unbounded burst
+            // of routing-table insert work on this single command handler.
+            const MAX_BOOTSTRAP_CONTACTS: usize = 1000;
+            let declared_count = contacts.len();
+            if declared_count > MAX_BOOTSTRAP_CONTACTS {
+                warn!(
+                    "BootstrapContacts: {declared_count} contacts exceeds cap, truncating to {MAX_BOOTSTRAP_CONTACTS}"
+                );
+            }
+            let contacts: Vec<_> = contacts.into_iter().take(MAX_BOOTSTRAP_CONTACTS).collect();
             let count = contacts.len();
             for c in &contacts {
                 state.routing_table.insert(c.clone());
@@ -23041,8 +23157,9 @@ async fn handle_command_inner(
             }
         }
 
-        NetworkCommand::RemoveIpRange { start_ip, end_ip } => {
-            if state.ip_filter.remove_range(&start_ip, &end_ip) {
+        NetworkCommand::RemoveIpRange { start_ip, end_ip, tx } => {
+            let removed = state.ip_filter.remove_range(&start_ip, &end_ip);
+            if removed {
                 state
                     .ip_filter
                     .update_shared_snapshot(&state.shared_ip_filter);
@@ -23050,7 +23167,10 @@ async fn handle_command_inner(
                     "Removed IP filter range {start_ip} - {end_ip}, total ranges: {}",
                     state.ip_filter.range_count()
                 );
+            } else {
+                debug!("RemoveIpRange: no matching range {start_ip} - {end_ip}");
             }
+            let _ = tx.send(removed);
         }
 
         NetworkCommand::SetIpFilterEnabled { enabled } => {
@@ -23191,10 +23311,10 @@ async fn handle_command_inner(
             {
                 let _ = tx.send(local_results);
             }
-            for (_, tx) in state.pending_source_searches.drain() {
+            for (_, (_, tx)) in state.pending_source_searches.drain() {
                 let _ = tx.send(Vec::new());
             }
-            for (_, tx) in state.pending_notes_searches.drain() {
+            for (_, (_, tx)) in state.pending_notes_searches.drain() {
                 let _ = tx.send(Vec::new());
             }
             state.active_search_request = None;
@@ -23907,8 +24027,8 @@ async fn handle_command_inner(
             // search index but the upload handler — which reads
             // `KnownFileRecord::upload_priority` — kept using the
             // stale value until the next process restart.
-            if let Ok(hash_bytes) = hex::decode(&file_hash_hex) {
-                if hash_bytes.len() == 16 {
+            match hex::decode(&file_hash_hex) {
+                Ok(hash_bytes) if hash_bytes.len() == 16 => {
                     let mut fh = [0u8; 16];
                     fh.copy_from_slice(&hash_bytes);
                     if let Some(record) = known_files.find_by_hash_mut(&fh) {
@@ -23917,7 +24037,25 @@ async fn handle_command_inner(
                         debug!(
                             "Updated upload_priority={priority} for {file_hash_hex} in known.met"
                         );
+                    } else {
+                        // `SetUploadPriority` is a fire-and-forget `try_send`
+                        // from the UI with no ack, so this is the only
+                        // signal that a priority change silently didn't
+                        // take effect (e.g. a race with the file not yet
+                        // being registered in `known_files`).
+                        warn!(
+                            "SetUploadPriority: no known_files record for hash {file_hash_hex}; priority={priority} not applied"
+                        );
                     }
+                }
+                Ok(hash_bytes) => {
+                    warn!(
+                        "SetUploadPriority: hash {file_hash_hex} has {} bytes, expected 16; ignoring",
+                        hash_bytes.len()
+                    );
+                }
+                Err(e) => {
+                    warn!("SetUploadPriority: invalid hex hash {file_hash_hex}: {e}");
                 }
             }
         }
@@ -24203,7 +24341,6 @@ async fn handle_command_inner(
             if avg > 0.0 {
                 debug!("File {} average rating: {:.1}", file_hash, avg);
             }
-            let _all = cm.all_comments();
             let info = cm.get_comments(&file_hash).cloned();
             let _ = tx.send(info);
         }
