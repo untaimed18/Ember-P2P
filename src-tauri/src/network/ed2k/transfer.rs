@@ -193,6 +193,15 @@ pub enum DownloadEvent {
         /// paths that don't move a `.part` (e.g. zero-byte files) — the
         /// handler then falls back to reconstructing the path.
         final_path: Option<String>,
+        /// The ed2k part-hash list ("hashset"), already fetched from a
+        /// source and cryptographically verified against the file's own
+        /// ed2k hash during the transfer (see `verify_hashset`), if this
+        /// download path tracks one. Lets the completion handler write a
+        /// `known.met` record without re-reading the whole file from disk a
+        /// second time — empty when unavailable (zero-byte files,
+        /// single-source callback downloads, restart re-verification),
+        /// in which case the handler falls back to the old re-read.
+        part_hashes: Vec<[u8; 16]>,
     },
     Failed {
         transfer_id: String,
@@ -765,6 +774,7 @@ impl Ed2kDownload {
                 .send(DownloadEvent::Completed {
                     transfer_id: self.transfer_id.clone(),
                     final_path: Some(zero_final.to_string_lossy().into_owned()),
+                    part_hashes: Vec::new(),
                 })
                 .await;
             return Ok(());
@@ -798,6 +808,10 @@ impl Ed2kDownload {
                     .send(DownloadEvent::Completed {
                         transfer_id: self.transfer_id.clone(),
                         final_path: completed_path_out,
+                        // `download_from_streams` doesn't currently surface its
+                        // internal verified hashset to this out-parameter list;
+                        // the completion handler falls back to a disk re-read.
+                        part_hashes: Vec::new(),
                     })
                     .await;
                 Ok(())

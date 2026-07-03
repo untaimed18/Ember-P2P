@@ -36,6 +36,20 @@ pub struct AppState {
     /// Per-folder cancellation flags for background hashing tasks.
     /// Key = folder path (or "__reload__" / "__startup__" for special tasks).
     pub hash_cancel_flags: Arc<RwLock<HashMap<String, Arc<AtomicBool>>>>,
+    /// Transient handoff buffer: ed2k part-hashes computed as a byproduct of
+    /// the initial combined ED2K+AICH hash pass (`hash_file_combined_cancellable`),
+    /// keyed by the 16-byte ed2k file hash. Populated by the hashing tasks
+    /// (startup indexing, `add_shared_folder`, `reload_shared_files`) and
+    /// drained by the network task's `SharedFilesChanged` handler, which
+    /// otherwise has to re-read the whole file from disk to recompute the
+    /// same part hashes for `known.met`. That redundant re-read used to run
+    /// sequentially on the single network event loop task for every newly
+    /// shared file, starving KAD UDP/timers/IPC snapshots (contacts, search
+    /// activity) for the whole duration of a large hash pass — this cache
+    /// lets the common case skip it entirely. Entries are removed as soon as
+    /// they're consumed, so this stays small/transient rather than growing
+    /// unbounded.
+    pub fresh_part_hashes: Arc<RwLock<HashMap<[u8; 16], Vec<[u8; 16]>>>>,
     /// Cached KAD contacts updated by the network loop — avoids blocking the event loop.
     pub cached_contacts: Arc<RwLock<Vec<KadContactInfo>>>,
     /// Cached transfer statistics — updated by the network loop.

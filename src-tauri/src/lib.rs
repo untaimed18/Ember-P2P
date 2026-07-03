@@ -263,6 +263,7 @@ pub fn run() {
             let cached_transfer_stats: Arc<RwLock<crate::storage::statistics::TransferStats>> = Arc::new(RwLock::new(Default::default()));
             let cached_shared_files: Arc<RwLock<Vec<crate::types::FileInfo>>> = Arc::new(RwLock::new(Vec::new()));
             let hash_cancel_flags: Arc<RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>> = Arc::new(RwLock::new(std::collections::HashMap::new()));
+            let fresh_part_hashes: Arc<RwLock<std::collections::HashMap<[u8; 16], Vec<[u8; 16]>>>> = Arc::new(RwLock::new(std::collections::HashMap::new()));
             let cached_peers_net = cached_peers.clone();
             let cached_stats_net = cached_stats.clone();
             let cached_contacts_net = cached_contacts.clone();
@@ -336,6 +337,7 @@ pub fn run() {
                 cached_transfer_stats,
                 cached_shared_files: cached_shared_files.clone(),
                 hash_cancel_flags: hash_cancel_flags.clone(),
+                fresh_part_hashes: fresh_part_hashes.clone(),
                 spam_filter: spam_filter.clone(),
                 upload_shared_folders: upload_shared_folders.clone(),
                 friend_hashes: friend_hashes.clone(),
@@ -459,6 +461,7 @@ pub fn run() {
             let startup_app = app_handle.clone();
             let net_tx = startup_network_tx;
             let startup_cancel_flags = hash_cancel_flags.clone();
+            let startup_fresh_part_hashes = fresh_part_hashes.clone();
             tauri::async_runtime::spawn(async move {
                 if shared_folders.is_empty() {
                     info!("Indexed 0 files from 0 shared folders");
@@ -598,7 +601,7 @@ pub fn run() {
                     ).await;
 
                     match hash_result {
-                        Ok(Ok(Ok((ed2k_hash, aich_hash)))) => {
+                        Ok(Ok(Ok((ed2k_hash, aich_hash, part_hashes)))) => {
                             tracing::debug!("Startup hash complete: {} -> {}", file.name, &ed2k_hash[..ed2k_hash.len().min(8)]);
                             let mut updated = file.clone();
                             updated.id = ed2k_hash.clone();
@@ -609,6 +612,21 @@ pub fn run() {
                                 let cfg = state.config.read().await;
                                 commands::sharing::file_in_shared_folders(&updated.path, &cfg.settings.shared_folders)
                             };
+                            // Hand the part hashes already computed above off to
+                            // the network task's `SharedFilesChanged` handler so
+                            // it doesn't re-read this file from disk just to
+                            // recompute the same values for known.met. Skipped
+                            // for single-part files (empty list) and files no
+                            // longer shared (nothing will ever drain them).
+                            if still_shared && !part_hashes.is_empty() {
+                                if let Ok(hash_bytes) = hex::decode(&updated.hash) {
+                                    if hash_bytes.len() == 16 {
+                                        let mut fh = [0u8; 16];
+                                        fh.copy_from_slice(&hash_bytes);
+                                        startup_fresh_part_hashes.write().await.insert(fh, part_hashes);
+                                    }
+                                }
+                            }
                             {
                                 let mut idx = index_clone.write().await;
                                 idx.remove_file_by_id(&file_temp_id);
@@ -715,6 +733,7 @@ pub fn run() {
 
             let net_handle = app_handle.clone();
             let net_index = local_index.clone();
+            let net_fresh_part_hashes = fresh_part_hashes.clone();
             let net_db = db.clone();
             let net_transfers = transfer_manager.clone();
             let net_bw = bandwidth_limiter.clone();
@@ -730,6 +749,7 @@ pub fn run() {
                     network_rx,
                     settings,
                     net_index,
+                    net_fresh_part_hashes,
                     net_db,
                     net_transfers,
                     net_bw,

@@ -148,11 +148,18 @@ pub fn ed2k_part_hashes_file_cancellable(
 
 /// Compute both ED2K and AICH hashes in a single pass over the file,
 /// halving disk I/O compared to computing them separately.
-/// Returns (ed2k_hash_hex, aich_hash_hex).
+/// Returns (ed2k_hash_hex, aich_hash_hex, ed2k_part_hashes).
+///
+/// `ed2k_part_hashes` is the same per-9.28MB-part MD4 digest list that
+/// [`ed2k_part_hashes_file_cancellable`] would independently recompute from
+/// disk (empty for single-part files) — this function already has to
+/// compute each part hash to derive `ed2k_hash_hex`, so returning it lets
+/// callers cache it for `known.met` instead of re-reading the whole file a
+/// second time later (see the `SharedFilesChanged` handler).
 pub fn hash_file_combined_cancellable(
     path: &Path,
     cancelled: &AtomicBool,
-) -> anyhow::Result<(String, String)> {
+) -> anyhow::Result<(String, String, Vec<[u8; 16]>)> {
     use sha1::Sha1;
 
     let mut file = std::fs::File::open(path)?;
@@ -161,7 +168,7 @@ pub fn hash_file_combined_cancellable(
     if file_size == 0 {
         let ed2k = hex::encode(Md4::digest([]));
         let aich = hex::encode(<[u8; 20]>::from(Sha1::digest([])));
-        return Ok((ed2k, aich));
+        return Ok((ed2k, aich, Vec::new()));
     }
 
     let is_single_part = file_size < PARTSIZE;
@@ -173,6 +180,12 @@ pub fn hash_file_combined_cancellable(
     } else {
         let num_parts = file_size.div_ceil(PARTSIZE) as usize;
         Vec::with_capacity((num_parts + 1) * 16)
+    };
+    let mut ed2k_part_hash_list: Vec<[u8; 16]> = if is_single_part {
+        Vec::new()
+    } else {
+        let num_parts = file_size.div_ceil(PARTSIZE) as usize;
+        Vec::with_capacity(num_parts + 1)
     };
 
     let mut aich_block_hasher = Sha1::new();
@@ -212,7 +225,9 @@ pub fn hash_file_combined_cancellable(
             offset += can_take;
 
             if ed2k_part_remaining == 0 && !is_single_part {
-                ed2k_part_hashes.extend_from_slice(&ed2k_part_hasher.finalize_reset());
+                let part_hash: [u8; 16] = ed2k_part_hasher.finalize_reset().into();
+                ed2k_part_hashes.extend_from_slice(&part_hash);
+                ed2k_part_hash_list.push(part_hash);
                 ed2k_part_remaining = file_remaining.min(PARTSIZE);
 
                 // AICH blocks never straddle a part boundary — eMule's
@@ -235,7 +250,9 @@ pub fn hash_file_combined_cancellable(
         hex::encode(ed2k_part_hasher.finalize())
     } else {
         if file_size % PARTSIZE == 0 {
-            ed2k_part_hashes.extend_from_slice(&Md4::digest([]));
+            let empty_hash: [u8; 16] = Md4::digest([]).into();
+            ed2k_part_hashes.extend_from_slice(&empty_hash);
+            ed2k_part_hash_list.push(empty_hash);
         }
         hex::encode(Md4::digest(&ed2k_part_hashes))
     };
@@ -243,7 +260,7 @@ pub fn hash_file_combined_cancellable(
     let aich_root = super::aich::hierarchical_root(&aich_leaf_hashes, file_size);
     let aich_hash = hex::encode(aich_root);
 
-    Ok((ed2k_hash, aich_hash))
+    Ok((ed2k_hash, aich_hash, ed2k_part_hash_list))
 }
 
 /// In-memory equivalent of [`ed2k_hash_file`]. Used by the
@@ -613,13 +630,24 @@ mod combined_hash_tests {
         }
 
         static NEVER: AtomicBool = AtomicBool::new(false);
-        let (_, combined_aich_hex) =
+        let (_, combined_aich_hex, combined_part_hashes) =
             hash_file_combined_cancellable(&path, &NEVER).expect("combined hash");
         let hs = super::super::aich::AICHRecoveryHashSet::build_from_file(&path)
             .expect("build_from_file");
+        let reread_part_hashes =
+            ed2k_part_hashes_file_cancellable(&path, &NEVER).expect("part hashes");
 
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(combined_aich_hex, hex::encode(hs.root_hash));
+        // The part hashes returned as a byproduct of the combined pass must be
+        // byte-for-byte identical to independently re-reading the file, since
+        // callers (the `SharedFilesChanged` handler) rely on this to skip the
+        // second read entirely.
+        assert_eq!(combined_part_hashes, reread_part_hashes);
+        assert_eq!(
+            combined_part_hashes.len(),
+            ed2k_known_met_part_hash_count(file_size)
+        );
     }
 }

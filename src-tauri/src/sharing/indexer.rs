@@ -160,11 +160,12 @@ impl FileIndexer {
         Ok((ed2k, aich))
     }
 
-    /// Cancellable version -- computes both hashes in a single pass.
+    /// Cancellable version -- computes both hashes (plus the ed2k part-hash
+    /// list, for `known.met`) in a single pass.
     pub fn hash_file_cancellable(
         path: &Path,
         cancelled: &AtomicBool,
-    ) -> anyhow::Result<(String, String)> {
+    ) -> anyhow::Result<(String, String, Vec<[u8; 16]>)> {
         hash_file_combined_cancellable(path, cancelled)
     }
 }
