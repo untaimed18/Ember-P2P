@@ -1122,8 +1122,20 @@ fn write_string_tag(w: &mut impl Write, tag_id: u8, value: &str) -> anyhow::Resu
     w.write_u8(TAGTYPE_STRING)?;
     w.write_u16::<LittleEndian>(1)?;
     w.write_u8(tag_id)?;
-    let bytes = value.as_bytes();
-    let clamped = &bytes[..bytes.len().min(u16::MAX as usize)];
+    // Truncate at a UTF-8 char boundary, not an arbitrary byte offset —
+    // see the sibling `write_string_tag` in `collection.rs` for why a raw
+    // byte-slice cut can corrupt the tail of the value on reload.
+    let max_len = u16::MAX as usize;
+    let clamped = if value.len() <= max_len {
+        value
+    } else {
+        let mut end = max_len;
+        while end > 0 && !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        &value[..end]
+    };
+    let clamped = clamped.as_bytes();
     w.write_u16::<LittleEndian>(clamped.len() as u16)?;
     w.write_all(clamped)?;
     Ok(())

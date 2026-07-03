@@ -10,6 +10,15 @@ use super::messages::*;
 
 const SERVER_POLL_READABLE_TIMEOUT_MS: u64 = 5;
 const SERVER_POLL_PACKET_TIMEOUT_SECS: u64 = 1;
+/// Bound on any single write to the server socket. Every write here runs
+/// inline in the network task's `tokio::select!` loop (not spawned), so an
+/// unbounded `write_all`/`flush` against a server that stops draining its
+/// receive buffer — congested, overloaded, or simply hostile — would
+/// otherwise stall all networking for as long as the OS TCP stack allows.
+/// 30s mirrors the read-side timeout already used for the login exchange
+/// (`Ed2kServerConnection::login`) — generous for a legitimate server on
+/// an ordinary connection, short enough to bound the worst case.
+const SERVER_WRITE_TIMEOUT_SECS: u64 = 30;
 
 // Server protocol opcodes (OP_EDONKEYHEADER)
 pub const OP_LOGINREQUEST: u8 = 0x01;
@@ -216,15 +225,25 @@ impl Ed2kServerConnection {
         wire_packet.push(OP_LOGINREQUEST);
         wire_packet.extend_from_slice(&payload);
 
-        match &mut self.transport {
-            ServerTransport::Plain { writer, .. } => {
-                writer.write_all(&wire_packet).await?;
-                writer.flush().await?;
-            }
-            ServerTransport::Encrypted(stream) => {
-                stream.write_login(&wire_packet).await?;
-            }
-        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(SERVER_WRITE_TIMEOUT_SECS),
+            async {
+                match &mut self.transport {
+                    ServerTransport::Plain { writer, .. } => {
+                        writer.write_all(&wire_packet).await?;
+                        writer.flush().await
+                    }
+                    ServerTransport::Encrypted(stream) => stream.write_login(&wire_packet).await,
+                }
+            },
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "server login write timed out",
+            ))
+        })?;
 
         let mut session = ServerSession {
             client_id: 0,
@@ -400,29 +419,41 @@ impl Ed2kServerConnection {
                 "compressed packet too large for u32 length field",
             )
         })?;
-        match &mut self.transport {
-            ServerTransport::Plain { writer, .. } => {
-                use tokio::io::AsyncWriteExt;
-                writer.write_u8(OP_PACKEDPROT).await?;
-                writer.write_all(&wire_len.to_le_bytes()).await?;
-                writer.write_u8(opcode).await?;
-                writer.write_all(compressed_payload).await?;
-                writer.flush().await?;
-                Ok(())
-            }
-            ServerTransport::Encrypted(stream) => {
-                let mut wire = Vec::with_capacity(6 + compressed_payload.len());
-                wire.push(OP_PACKEDPROT);
-                wire.extend_from_slice(&wire_len.to_le_bytes());
-                wire.push(opcode);
-                wire.extend_from_slice(compressed_payload);
-                let mut encrypted = vec![0u8; wire.len()];
-                stream.send_key.process(&wire, &mut encrypted);
-                stream.writer.write_all(&encrypted).await?;
-                stream.writer.flush().await?;
-                Ok(())
-            }
-        }
+        let timed = tokio::time::timeout(
+            std::time::Duration::from_secs(SERVER_WRITE_TIMEOUT_SECS),
+            async {
+                match &mut self.transport {
+                    ServerTransport::Plain { writer, .. } => {
+                        use tokio::io::AsyncWriteExt;
+                        writer.write_u8(OP_PACKEDPROT).await?;
+                        writer.write_all(&wire_len.to_le_bytes()).await?;
+                        writer.write_u8(opcode).await?;
+                        writer.write_all(compressed_payload).await?;
+                        writer.flush().await?;
+                        Ok(())
+                    }
+                    ServerTransport::Encrypted(stream) => {
+                        let mut wire = Vec::with_capacity(6 + compressed_payload.len());
+                        wire.push(OP_PACKEDPROT);
+                        wire.extend_from_slice(&wire_len.to_le_bytes());
+                        wire.push(opcode);
+                        wire.extend_from_slice(compressed_payload);
+                        let mut encrypted = vec![0u8; wire.len()];
+                        stream.send_key.process(&wire, &mut encrypted);
+                        stream.writer.write_all(&encrypted).await?;
+                        stream.writer.flush().await?;
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await;
+        timed.unwrap_or_else(|_| {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "server write timed out",
+            ))
+        })
     }
 
     async fn write_packet(&mut self, opcode: u8, payload: &[u8]) -> io::Result<()> {
@@ -448,9 +479,21 @@ impl Ed2kServerConnection {
                 );
                 let mut encrypted = vec![0u8; wire.len()];
                 stream.send_key.process(&wire, &mut encrypted);
-                stream.writer.write_all(&encrypted).await?;
-                stream.writer.flush().await?;
-                Ok(())
+                let write = async {
+                    stream.writer.write_all(&encrypted).await?;
+                    stream.writer.flush().await
+                };
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(SERVER_WRITE_TIMEOUT_SECS),
+                    write,
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "server write timed out",
+                    ))
+                })
             }
         }
     }
@@ -1204,8 +1247,21 @@ fn write_string_tag(buf: &mut Vec<u8>, name_id: u8, value: &str) {
     buf.push(0x02); // TAGTYPE_STRING
     buf.extend_from_slice(&1u16.to_le_bytes()); // name length = 1
     buf.push(name_id);
-    let bytes = value.as_bytes();
-    let clamped = &bytes[..bytes.len().min(u16::MAX as usize)];
+    // Truncate at a UTF-8 char boundary rather than an arbitrary byte
+    // offset, so an overlong value never splits a multi-byte codepoint
+    // (the receiving peer decodes this as UTF-8 and would otherwise show
+    // a mangled/replacement-character tail).
+    let max_len = u16::MAX as usize;
+    let clamped = if value.len() <= max_len {
+        value
+    } else {
+        let mut end = max_len;
+        while end > 0 && !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        &value[..end]
+    };
+    let clamped = clamped.as_bytes();
     buf.extend_from_slice(&(clamped.len() as u16).to_le_bytes());
     buf.extend_from_slice(clamped);
 }
@@ -1671,12 +1727,24 @@ async fn write_server_packet<W: AsyncWriteExt + Unpin>(
             "packet payload too large for u32 length field",
         )
     })?;
-    writer.write_u8(OP_EDONKEYHEADER).await?;
-    writer.write_u32_le(wire_len).await?;
-    writer.write_u8(opcode).await?;
-    writer.write_all(payload).await?;
-    writer.flush().await?;
-    Ok(())
+    let write = async {
+        writer.write_u8(OP_EDONKEYHEADER).await?;
+        writer.write_u32_le(wire_len).await?;
+        writer.write_u8(opcode).await?;
+        writer.write_all(payload).await?;
+        writer.flush().await
+    };
+    tokio::time::timeout(
+        std::time::Duration::from_secs(SERVER_WRITE_TIMEOUT_SECS),
+        write,
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "server write timed out",
+        ))
+    })
 }
 
 async fn read_server_packet_timeout<R: AsyncReadExt + Unpin>(

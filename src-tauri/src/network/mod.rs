@@ -1743,6 +1743,42 @@ mod tests {
         );
     }
 
+    /// Regression guard: hitting `MAX_STREAMED_HASHES_SOFT_CAP` must not
+    /// disable dedup entirely. Hashes tracked before the cap was reached
+    /// should keep being filtered on every later sighting; only a brand
+    /// new hash first seen after the cap goes untracked (accepted
+    /// trade-off — see the constant's doc comment).
+    #[test]
+    fn dedup_streamed_batch_keeps_deduping_already_tracked_hashes_past_soft_cap() {
+        let mut active = sample_active_search_request(7);
+        for i in 0..MAX_STREAMED_HASHES_SOFT_CAP {
+            active.streamed_hashes.insert(format!("preexisting-{i}"));
+        }
+        let mut active = Some(active);
+
+        let mut batch = vec![
+            sample_search_result("preexisting-0"),
+            sample_search_result("brand-new"),
+        ];
+        dedup_streamed_batch(&mut active, 7, &mut batch);
+        assert_eq!(
+            batch.iter().map(|r| r.file.hash.as_str()).collect::<Vec<_>>(),
+            vec!["brand-new"],
+            "already-tracked hash must still be dropped even past the soft cap, \
+             and a genuinely new hash must still pass through"
+        );
+        let active_ref = active.as_ref().unwrap();
+        assert_eq!(
+            active_ref.streamed_hashes.len(),
+            MAX_STREAMED_HASHES_SOFT_CAP,
+            "set must not grow past the soft cap"
+        );
+        assert!(
+            !active_ref.streamed_hashes.contains("brand-new"),
+            "new hashes seen past the cap are not tracked (documented trade-off)"
+        );
+    }
+
     /// Regression guard for the KAD bootstrap-hammering fix: the interval
     /// must start at the same 10s cadence as before (no behavior change for
     /// a healthy, quickly-connecting client), strictly grow with `shift`,
@@ -2806,11 +2842,13 @@ struct ActiveSearchRequest {
     streamed_hashes: std::collections::HashSet<String>,
 }
 
-/// Soft cap on `ActiveSearchRequest::streamed_hashes`. Once reached, dedup
-/// is skipped (results pass through unfiltered) rather than growing the
-/// set further — an extremely broad global search hitting this is already
-/// an edge case, and falling back to "no dedup" is strictly no worse than
-/// the pre-fix behavior.
+/// Soft cap on `ActiveSearchRequest::streamed_hashes`. Once reached, the set
+/// stops growing (bounding memory for a pathological all-servers global
+/// search) but dedup itself doesn't stop: hashes already tracked before the
+/// cap was hit are still filtered on every subsequent sighting — only a
+/// *new* hash first seen after the cap goes untracked (and so can't be
+/// deduped against a later repeat of itself). That's strictly better than
+/// giving up on dedup entirely once the cap is reached.
 const MAX_STREAMED_HASHES_SOFT_CAP: usize = 20_000;
 
 #[derive(Clone, serde::Serialize)]
@@ -3044,7 +3082,22 @@ struct NetworkState {
     server_udp_source_reask_at: HashMap<(String, u16, [u8; 16]), i64>,
     /// Pending client UDP OP_REASKFILEPING context. OP_REASKACK carries no
     /// file hash, so correlate by sender endpoint to update only one file list.
-    pending_udp_reasks: HashMap<(Ipv4Addr, u16), [u8; 16]>,
+    /// Value is `(file_hash, sent_at)` — the timestamp lets the cap-eviction
+    /// pass below drop the oldest (most likely dead/unreachable) entries
+    /// instead of nuking every in-flight reask whenever the table fills up.
+    pending_udp_reasks: HashMap<(Ipv4Addr, u16), ([u8; 16], i64)>,
+    /// Order-independent fingerprint `(entry_count, xor_fold)` of the last
+    /// `OP_OFFERFILES` list actually sent from the `SharedFilesChanged`
+    /// handler, so a re-fire whose offer set is byte-for-byte identical to
+    /// what the server already has can skip re-sending it. Without this,
+    /// a long AICH-only re-hash pass — which fires `SharedFilesChanged`
+    /// every ~30s purely to checkpoint `known.met`, without actually
+    /// adding/removing/completing any shared file — rebuilds and
+    /// re-transmits the *entire* offer list to the server every single
+    /// time even though nothing the server cares about changed. `None`
+    /// until the first send this session, so the first `SharedFilesChanged`
+    /// after connecting always sends unconditionally.
+    last_offer_files_signature: Option<(usize, u64)>,
     /// Round-robin cursor for TCP OP_GETSOURCES batching across downloads.
     server_tcp_getsources_cursor: usize,
     /// Unix-seconds timestamp of the most recent successful server login.
@@ -3236,6 +3289,21 @@ struct NetworkState {
     firewall_req_cooldown: HashMap<Ipv4Addr, i64>,
     /// Ember friends currently connected (ember_hash -> last_seen_timestamp)
     online_friends: HashMap<[u8; 16], i64>,
+    /// Short-lived dedup for inbound Ember chat messages: ember_hash ->
+    /// (last message text, received-at timestamp). A friend's chat can
+    /// legitimately arrive via either the dedicated `friend_connect.rs`
+    /// session (`UploadEventKind::EmberChatMessage`) or an ordinary
+    /// `transfer.rs` download connection to the same friend
+    /// (`DownloadEvent::EmberChatMessage`) — the latter has no
+    /// `ember_sessions` slot-ownership check (deliberately: a transient
+    /// download connection must never be allowed to steal the canonical
+    /// session slot used for outbound chat routing), so if both happen to
+    /// be open at once and the peer's own client re-sends the same
+    /// logical message down more than one connection, we'd otherwise
+    /// persist and display it twice. Suppressing an exact-text repeat
+    /// from the same friend within `EMBER_CHAT_DEDUP_WINDOW_SECS` closes
+    /// that without touching connection/session semantics.
+    recent_ember_chat: HashMap<[u8; 16], (String, i64)>,
     /// Shared Ember session map for sending outbound packets to friend connections
     ember_sessions: upload_server::EmberSessionMap,
     /// Shared flag: set to true when network is disconnected so the upload
@@ -3328,6 +3396,36 @@ const MAX_AICH_HASH_SETS: usize = 10_000;
 /// a given file).
 const MAX_AICH_ROOT_MAP_SOFT_CAP: usize = 100_000;
 
+/// Window for suppressing an exact-text repeat of a friend's chat message
+/// arriving via a second connection (see `NetworkState::recent_ember_chat`).
+/// Short enough that a friend deliberately re-sending the same text twice
+/// in a real conversation is very unlikely to be swallowed, long enough to
+/// cover the realistic skew between two TCP connections both delivering
+/// the same peer-side send.
+const EMBER_CHAT_DEDUP_WINDOW_SECS: i64 = 5;
+
+/// Order-independent fingerprint of an `OP_OFFERFILES` list: `(entry_count,
+/// xor_fold)`. Used by the `SharedFilesChanged` handler to skip re-sending
+/// an offer that's identical to what the server was already told — see
+/// `NetworkState::last_offer_files_signature`. Iteration order of the
+/// backing index isn't guaranteed stable across calls, so entries are
+/// XOR-folded (commutative) rather than hashed positionally; `entry_count`
+/// is included as a cheap extra guard against the (astronomically unlikely)
+/// case of two differing sets XOR-folding to the same value.
+fn offer_files_signature(files: &[ed2k::server::OfferFile]) -> (usize, u64) {
+    use std::hash::{Hash, Hasher};
+    let mut fold: u64 = 0;
+    for f in files {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        f.hash.hash(&mut h);
+        f.size.hash(&mut h);
+        f.is_complete.hash(&mut h);
+        f.name.hash(&mut h);
+        fold ^= h.finish();
+    }
+    (files.len(), fold)
+}
+
 /// Filter search results by file type, matching eMule's AddToList behavior:
 /// when a type filter is active, reject any result whose inferred type
 /// doesn't match the requested type.
@@ -3351,11 +3449,11 @@ fn filter_results_by_type(
 
 /// Drop entries from `results` whose file hash has already been streamed
 /// for `request_id` in this active search, recording newly-seen hashes as
-/// it goes. A no-op (passes everything through unfiltered) if there's no
-/// matching active search or the dedup set has hit its soft cap — see
-/// `ActiveSearchRequest::streamed_hashes` for why this exists and why that
-/// fallback is safe. Must be called before spam-scoring/enrichment so a
-/// repeat sighting of the same file never reaches `BatchSpamContext`.
+/// it goes (up to `MAX_STREAMED_HASHES_SOFT_CAP` — see that constant for
+/// what happens beyond it). A no-op (passes everything through unfiltered)
+/// if there's no matching active search. Must be called before
+/// spam-scoring/enrichment so a repeat sighting of the same file never
+/// reaches `BatchSpamContext`.
 fn dedup_streamed_batch(
     active_search_request: &mut Option<ActiveSearchRequest>,
     request_id: u64,
@@ -3364,10 +3462,19 @@ fn dedup_streamed_batch(
     let Some(active) = active_search_request.as_mut() else {
         return;
     };
-    if active.request_id != request_id || active.streamed_hashes.len() >= MAX_STREAMED_HASHES_SOFT_CAP {
+    if active.request_id != request_id {
         return;
     }
-    results.retain(|r| active.streamed_hashes.insert(r.file.hash.clone()));
+    results.retain(|r| {
+        if active.streamed_hashes.contains(&r.file.hash) {
+            false
+        } else if active.streamed_hashes.len() < MAX_STREAMED_HASHES_SOFT_CAP {
+            active.streamed_hashes.insert(r.file.hash.clone());
+            true
+        } else {
+            true
+        }
+    });
 }
 
 fn emit_search_results(
@@ -3695,6 +3802,12 @@ async fn handle_server_disconnect(
     state.server_addr = None;
     state.low_id = false;
     state.server_client_id = 0;
+    // A new connection (even to the same server) is a fresh session that
+    // has no memory of any previous OP_OFFERFILES we sent — the dedup
+    // signature in the `SharedFilesChanged` handler must not carry over,
+    // or the first offer after reconnecting could be wrongly skipped as
+    // "unchanged" when the new server session has never seen it.
+    state.last_offer_files_signature = None;
     *shared_server_addr.write().await = None;
     if let Some(mut pending) = state.pending_server_search.take() {
         let request_id = pending.request_id;
@@ -5100,6 +5213,7 @@ pub async fn start_network(
         udp_source_queue: VecDeque::new(),
         server_udp_source_reask_at: HashMap::new(),
         pending_udp_reasks: HashMap::new(),
+        last_offer_files_signature: None,
         server_tcp_getsources_cursor: 0,
         server_connected_at: 0,
         starved_server_reask_at: std::collections::HashMap::new(),
@@ -5165,6 +5279,7 @@ pub async fn start_network(
         firewall_connect_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
         firewall_req_cooldown: HashMap::new(),
         online_friends: HashMap::new(),
+        recent_ember_chat: HashMap::new(),
         ember_sessions: Arc::new(RwLock::new(HashMap::new())),
         upload_disconnected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         rendezvous_registered: false,
@@ -7185,20 +7300,39 @@ pub async fn start_network(
                         // be exported intact. Sanitising on ingress
                         // closes that storage and roundtrip path.
                         let cleaned = crate::security::sanitize_chat_text(message);
-                        let db2 = db.clone();
-                        let h2 = hash_hex.clone();
-                        let msg2 = cleaned.clone();
-                        tokio::task::spawn_blocking(move || {
-                            if let Err(e) = db2.insert_chat_message(&h2, "received", &msg2) {
-                                tracing::warn!("Failed to persist received chat message: {e}");
-                            }
-                        });
-                        let _ = app_handle.emit("ember:chat-message", serde_json::json!({
-                            "user_hash": hash_hex,
-                            "message": cleaned,
-                            "direction": "received",
-                            "timestamp": chrono::Utc::now().timestamp(),
-                        }));
+                        // Dedup against a near-simultaneous delivery of the
+                        // same text via the other channel (an ordinary
+                        // download connection has no `ember_sessions`
+                        // ownership check — see `recent_ember_chat`'s doc
+                        // comment for why that's intentional rather than a
+                        // gap to plumb around).
+                        let now = chrono::Utc::now().timestamp();
+                        let is_dup = state
+                            .recent_ember_chat
+                            .get(&chat_ember_hash)
+                            .is_some_and(|(last_msg, last_at)| {
+                                *last_msg == cleaned
+                                    && now.saturating_sub(*last_at) <= EMBER_CHAT_DEDUP_WINDOW_SECS
+                            });
+                        state
+                            .recent_ember_chat
+                            .insert(chat_ember_hash, (cleaned.clone(), now));
+                        if !is_dup {
+                            let db2 = db.clone();
+                            let h2 = hash_hex.clone();
+                            let msg2 = cleaned.clone();
+                            tokio::task::spawn_blocking(move || {
+                                if let Err(e) = db2.insert_chat_message(&h2, "received", &msg2) {
+                                    tracing::warn!("Failed to persist received chat message: {e}");
+                                }
+                            });
+                            let _ = app_handle.emit("ember:chat-message", serde_json::json!({
+                                "user_hash": hash_hex,
+                                "message": cleaned,
+                                "direction": "received",
+                                "timestamp": now,
+                            }));
+                        }
                     }
                     continue;
                 }
@@ -7833,20 +7967,41 @@ pub async fn start_network(
                         // land here, so this single call covers
                         // every inbound chat persistence point.
                         let cleaned = crate::security::sanitize_chat_text(message);
-                        let db2 = db.clone();
-                        let h2 = hash_hex.clone();
-                        let msg2 = cleaned.clone();
-                        tokio::task::spawn_blocking(move || {
-                            if let Err(e) = db2.insert_chat_message(&h2, "received", &msg2) {
-                                tracing::warn!("Failed to persist received chat message: {e}");
-                            }
-                        });
-                        let _ = app_handle.emit("ember:chat-message", serde_json::json!({
-                            "user_hash": hash_hex,
-                            "message": cleaned,
-                            "direction": "received",
-                            "timestamp": chrono::Utc::now().timestamp(),
-                        }));
+                        // Dedup against the `DownloadEvent::EmberChatMessage`
+                        // path above — see `recent_ember_chat`'s doc comment.
+                        // The two upload-listener routes feeding *this* arm
+                        // already can't double-deliver on their own (both
+                        // honour `ember_sessions` slot ownership), but an
+                        // ordinary download connection to the same friend
+                        // deliberately doesn't participate in that ownership
+                        // check, so this shared map is what catches it.
+                        let now = chrono::Utc::now().timestamp();
+                        let is_dup = state
+                            .recent_ember_chat
+                            .get(&chat_eh)
+                            .is_some_and(|(last_msg, last_at)| {
+                                *last_msg == cleaned
+                                    && now.saturating_sub(*last_at) <= EMBER_CHAT_DEDUP_WINDOW_SECS
+                            });
+                        state
+                            .recent_ember_chat
+                            .insert(chat_eh, (cleaned.clone(), now));
+                        if !is_dup {
+                            let db2 = db.clone();
+                            let h2 = hash_hex.clone();
+                            let msg2 = cleaned.clone();
+                            tokio::task::spawn_blocking(move || {
+                                if let Err(e) = db2.insert_chat_message(&h2, "received", &msg2) {
+                                    tracing::warn!("Failed to persist received chat message: {e}");
+                                }
+                            });
+                            let _ = app_handle.emit("ember:chat-message", serde_json::json!({
+                                "user_hash": hash_hex,
+                                "message": cleaned,
+                                "direction": "received",
+                                "timestamp": now,
+                            }));
+                        }
                     }
                 }
 
@@ -11474,7 +11629,26 @@ pub async fn start_network(
                 {
                     const MAX_PENDING_UDP_REASKS: usize = 4096;
                     if state.pending_udp_reasks.len() > MAX_PENDING_UDP_REASKS {
-                        state.pending_udp_reasks.clear();
+                        // Oldest-first: an ack normally arrives within a few
+                        // round-trip seconds of the reask being sent, so an
+                        // entry surviving past this age is almost certainly a
+                        // source that will never ack (dead/firewalled) rather
+                        // than one about to. Evicting by age instead of
+                        // clearing the whole table preserves correlation for
+                        // every reask sent in roughly the last reask cycle.
+                        const MAX_PENDING_UDP_REASK_AGE_SECS: i64 = 30;
+                        let now = chrono::Utc::now().timestamp();
+                        state
+                            .pending_udp_reasks
+                            .retain(|_, (_, sent_at)| now.saturating_sub(*sent_at) < MAX_PENDING_UDP_REASK_AGE_SECS);
+                        // Pathological fallback: if a flood of reasks was sent
+                        // inside the same age window and age-based eviction
+                        // couldn't bring the table back under budget, fall
+                        // back to the old behavior rather than growing
+                        // unbounded.
+                        if state.pending_udp_reasks.len() > MAX_PENDING_UDP_REASKS {
+                            state.pending_udp_reasks.clear();
+                        }
                     }
                 }
 
@@ -13529,7 +13703,9 @@ pub async fn start_network(
                             // Mark optimistically under the lock; the send happens
                             // after the lock is released below.
                             sm.mark_asked(&fh, *ip, *tcp_port);
-                            state.pending_udp_reasks.insert((*ip, *udp_port), fh);
+                            state
+                                .pending_udp_reasks
+                                .insert((*ip, *udp_port), (fh, chrono::Utc::now().timestamp()));
                             to_send.push((addr, pkt));
                             sent_this_tick.insert((*ip, *tcp_port));
                             sent += 1;
@@ -13565,9 +13741,10 @@ pub async fn start_network(
                                 // forever. Marked optimistically under the lock; the
                                 // send happens after the lock is released below.
                                 pfs.mark_udp_reask_sent(*ip, *tcp_port);
-                                state
-                                    .pending_udp_reasks
-                                    .insert((*ip, *udp_port), pfs.file_hash);
+                                state.pending_udp_reasks.insert(
+                                    (*ip, *udp_port),
+                                    (pfs.file_hash, chrono::Utc::now().timestamp()),
+                                );
                                 to_send.push((addr, pkt));
                                 pfs_sent += 1;
                             }
@@ -16906,7 +17083,7 @@ pub async fn start_network(
                 }
             }
 
-            // Periodic known.met save (every 11 minutes, matching eMule)
+            // Periodic known.met save (every 120s)
             _ = known_met_save_timer.tick() => {
                 if known_files.is_dirty() && !known_met_save_in_flight {
                     let known_path = state.data_dir.join("known.met");
@@ -17984,7 +18161,6 @@ pub async fn start_network(
         .await
         {
             Ok(Some(result)) => {
-                known_met_save_in_flight = false;
                 match result.result {
                     Ok(true) => known_files.mark_saved_if_generation(result.generation),
                     Ok(false) => known_files.mark_save_failed(),
@@ -19161,7 +19337,7 @@ async fn handle_udp_packet_inner(
                     IpAddr::V6(v6) => v6.to_ipv4_mapped(),
                 };
                 if let Some(v4) = v4_opt {
-                    if let Some(file_hash) = state.pending_udp_reasks.remove(&(v4, from.port())) {
+                    if let Some((file_hash, _)) = state.pending_udp_reasks.remove(&(v4, from.port())) {
                         if let Some(pfs) = state
                             .per_file_sources
                             .values_mut()
@@ -23192,41 +23368,68 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::ReloadIpFilter { path } => {
-            // Persist the imported filter to ipfilter.dat so it loads on next startup
+            // Persist the imported filter to ipfilter.dat so it loads on next startup.
+            //
+            // The whole sequence below (stat, up-to-50MB copy, then a
+            // line-by-line parse of the destination file) is synchronous
+            // filesystem I/O that would otherwise run inline on the
+            // network task, stalling all UDP/TCP/IPC processing for its
+            // duration. It's a rare, manually-triggered admin action
+            // (import a filter list), but there's no reason for it to
+            // share the hang-prone anti-pattern the rest of this file was
+            // hardened against — move it to a blocking-pool thread. We
+            // temporarily swap `state.ip_filter` out for an equivalent
+            // empty placeholder (same enabled/block_private flags) for
+            // the duration; nothing else can observe or mutate `state`
+            // while this command handler is still awaiting, since the
+            // network task processes one command at a time.
             let default_path = state.data_dir.join("ipfilter.dat");
-            if path != default_path {
-                // Defense in depth: `import_ipfilter_file` (the only caller
-                // that can supply an arbitrary local path rather than one
-                // of our own already-size-capped downloads) enforces this
-                // same limit before sending this command, but a `path` !=
-                // `default_path` can in principle reach this handler from
-                // any future caller too. Stat-and-reject here so this
-                // command can never be tricked into copying an unbounded
-                // file into ipfilter.dat regardless of caller.
-                const MAX_IMPORTED_IPFILTER_BYTES: u64 = 50 * 1024 * 1024;
-                match std::fs::metadata(&path) {
-                    Ok(meta) if meta.len() > MAX_IMPORTED_IPFILTER_BYTES => {
-                        warn!(
-                            "Refusing to import IP filter from {:?}: {} bytes exceeds the {} MiB cap",
-                            path,
-                            meta.len(),
-                            MAX_IMPORTED_IPFILTER_BYTES / (1024 * 1024)
-                        );
-                    }
-                    Ok(_) => {
-                        if let Err(e) = std::fs::copy(&path, &default_path) {
-                            warn!("Failed to persist IP filter to {:?}: {}", default_path, e);
-                        } else {
-                            info!("Persisted imported IP filter to {:?}", default_path);
+            let placeholder =
+                IpFilter::new(state.ip_filter.is_enabled(), state.ip_filter.blocks_private());
+            let mut filter = std::mem::replace(&mut state.ip_filter, placeholder);
+            let load_path = default_path.clone();
+            filter = tokio::task::spawn_blocking(move || {
+                if path != load_path {
+                    // Defense in depth: `import_ipfilter_file` (the only caller
+                    // that can supply an arbitrary local path rather than one
+                    // of our own already-size-capped downloads) enforces this
+                    // same limit before sending this command, but a `path` !=
+                    // `default_path` can in principle reach this handler from
+                    // any future caller too. Stat-and-reject here so this
+                    // command can never be tricked into copying an unbounded
+                    // file into ipfilter.dat regardless of caller.
+                    const MAX_IMPORTED_IPFILTER_BYTES: u64 = 50 * 1024 * 1024;
+                    match std::fs::metadata(&path) {
+                        Ok(meta) if meta.len() > MAX_IMPORTED_IPFILTER_BYTES => {
+                            warn!(
+                                "Refusing to import IP filter from {:?}: {} bytes exceeds the {} MiB cap",
+                                path,
+                                meta.len(),
+                                MAX_IMPORTED_IPFILTER_BYTES / (1024 * 1024)
+                            );
+                        }
+                        Ok(_) => {
+                            if let Err(e) = std::fs::copy(&path, &load_path) {
+                                warn!("Failed to persist IP filter to {:?}: {}", load_path, e);
+                            } else {
+                                info!("Persisted imported IP filter to {:?}", load_path);
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to stat IP filter import path {:?}: {}", path, e);
                         }
                     }
-                    Err(e) => {
-                        warn!("Failed to stat IP filter import path {:?}: {}", path, e);
-                    }
                 }
-            }
-            // Load from the (now updated) default path
-            state.ip_filter.load_from_file(&default_path);
+                // Load from the (now updated) default path
+                filter.load_from_file(&load_path);
+                filter
+            })
+            .await
+            .unwrap_or_else(|e| {
+                error!("ReloadIpFilter background task panicked: {e}");
+                IpFilter::new(state.ip_filter.is_enabled(), state.ip_filter.blocks_private())
+            });
+            state.ip_filter = filter;
             state
                 .ip_filter
                 .update_shared_snapshot(&state.shared_ip_filter);
@@ -23956,6 +24159,9 @@ async fn handle_command_inner(
                 state.server_addr = None;
                 *shared_server_addr.write().await = None;
                 state.stats.server_status = "disconnected".to_string();
+                // See `handle_server_disconnect`: the next connection is a
+                // fresh session that hasn't seen any offer we sent before.
+                state.last_offer_files_signature = None;
                 let _ = app_handle.emit(
                     "server-status-changed",
                     serde_json::json!({ "status": "disconnected" }),
@@ -24430,8 +24636,16 @@ async fn handle_command_inner(
                             });
                         }
                     }
-                    if let Err(e) = conn.offer_files(&offer_files, settings.tcp_port).await {
+                    let signature = offer_files_signature(&offer_files);
+                    if state.last_offer_files_signature == Some(signature) {
+                        debug!(
+                            "Skipping OP_OFFERFILES resend: offer set unchanged ({} files)",
+                            offer_files.len()
+                        );
+                    } else if let Err(e) = conn.offer_files(&offer_files, settings.tcp_port).await {
                         debug!("Failed to re-send OP_OFFERFILES: {e}");
+                    } else {
+                        state.last_offer_files_signature = Some(signature);
                     }
                 }
             }
