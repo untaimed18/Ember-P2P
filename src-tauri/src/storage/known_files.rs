@@ -24,6 +24,18 @@ const FT_LASTSHARED: u8 = 0x24;
 // eMule's `FT_DL_ACTIVE_TIME` id. Read it for migration, but write the real
 // eMule tag above.
 const FT_KADLASTPUBLISHSRC_LEGACY_EMBER: u8 = 0x23;
+// Ember-only tag (not part of the eMule known.met format): presence with a
+// nonzero value means the user explicitly unshared this file while leaving
+// it in place under a shared folder. Chosen well outside every FT_* id used
+// above so it can never collide with a real eMule tag. Absent (the common
+// case) means shared, which keeps old known.met files backward compatible.
+const FT_EMBER_UNSHARED: u8 = 0xE0;
+// Ember-only tag: last known KAD/source-manager complete-source ("Peers")
+// count, refreshed roughly every 60s while connected. Persisted purely so
+// the Library UI shows the last-known figure immediately at startup instead
+// of resetting to 0 until the next sync — it's a point-in-time gauge, not a
+// cumulative counter, so a fresh sync always simply overwrites it.
+const FT_EMBER_SOURCES: u8 = 0xE1;
 
 const TAG_STRING: u8 = 0x02;
 const TAG_UINT32: u8 = 0x03;
@@ -44,6 +56,15 @@ pub struct KnownFileRecord {
     pub upload_priority: u8,
     pub last_publish_src: u32,
     pub last_shared: u32,
+    /// Whether the user still wants this file offered to the network. Mirrors
+    /// `FileInfo::shared` so an explicit per-file "Unshare" (as opposed to
+    /// removing the file from a shared folder entirely) survives a restart.
+    /// Defaults to `true` so records from before this field existed keep
+    /// behaving exactly as they did (nothing was ever persisted as unshared).
+    pub is_shared: bool,
+    /// Last known complete-source ("Peers") count, refreshed roughly every
+    /// 60s by the source-count sync while connected. See `FT_EMBER_SOURCES`.
+    pub complete_sources: u32,
 }
 
 #[derive(Clone)]
@@ -189,6 +210,8 @@ impl KnownFileList {
             upload_priority: 0,
             last_publish_src: 0,
             last_shared: 0,
+            is_shared: true,
+            complete_sources: 0,
         };
 
         for _ in 0..tag_count {
@@ -252,6 +275,8 @@ impl KnownFileList {
                             record.last_publish_src = v;
                         }
                         FT_LASTSHARED => record.last_shared = v,
+                        FT_EMBER_UNSHARED => record.is_shared = v == 0,
+                        FT_EMBER_SOURCES => record.complete_sources = v,
                         _ => {}
                     }
                 }
@@ -593,6 +618,14 @@ impl KnownFileList {
                 write_u32_tag(&mut tags, FT_LASTSHARED, record.last_shared)?;
                 tag_count += 1;
             }
+            if !record.is_shared {
+                write_u32_tag(&mut tags, FT_EMBER_UNSHARED, 1)?;
+                tag_count += 1;
+            }
+            if record.complete_sources > 0 {
+                write_u32_tag(&mut tags, FT_EMBER_SOURCES, record.complete_sources)?;
+                tag_count += 1;
+            }
 
             buf.write_u32::<LittleEndian>(tag_count)?;
             buf.write_all(&tags)?;
@@ -911,6 +944,39 @@ fn aich_base32_to_hex(value: &str) -> Option<String> {
     }
 }
 
+/// Encode a UI priority label into the byte stored as
+/// `KnownFileRecord::upload_priority` (and shipped as the `FT_ULPRIORITY`
+/// known-file tag). Order matches eMule's priority enum: 0=verylow, 1=low,
+/// 2=normal, 3=high, 4=release, 5=auto. Unknown labels fall back to `normal`
+/// so a malformed UI value never silently promotes a file to the highest tier.
+pub fn priority_str_to_u8(priority: &str) -> u8 {
+    match priority {
+        "verylow" => 0,
+        "low" => 1,
+        "normal" => 2,
+        "high" => 3,
+        "release" => 4,
+        "auto" => 5,
+        _ => 2,
+    }
+}
+
+/// Inverse of [`priority_str_to_u8`], used to restore a file's priority
+/// label from its persisted `known.met` record when the file is
+/// rediscovered (app restart, folder reload). Out-of-range bytes (never
+/// written by this app, but a foreign/corrupt file could contain anything)
+/// fall back to `normal` for the same reason the encoder does.
+pub fn priority_u8_to_str(priority: u8) -> &'static str {
+    match priority {
+        0 => "verylow",
+        1 => "low",
+        3 => "high",
+        4 => "release",
+        5 => "auto",
+        _ => "normal",
+    }
+}
+
 fn write_u32_tag(buf: &mut Vec<u8>, name_id: u8, value: u32) -> anyhow::Result<()> {
     buf.write_u8(TAG_UINT32)?;
     buf.write_u16::<LittleEndian>(1)?;
@@ -946,6 +1012,8 @@ mod tests {
             upload_priority: 0,
             last_publish_src: 0,
             last_shared: 0,
+            is_shared: true,
+            complete_sources: 0,
         }
     }
 
@@ -1087,5 +1155,103 @@ mod tests {
             "movie.mkv",
             "", // <-- discovery hasn't computed AICH yet
         ));
+    }
+
+    /// A record with no unshare tag ever written (the common case, and every
+    /// known.met written before this field existed) must load as shared.
+    #[test]
+    fn is_shared_defaults_true_when_tag_absent() {
+        let mut kf = KnownFileList::new();
+        let r = sample_record();
+        let hash = r.file_hash;
+        kf.add_or_update(r);
+        assert!(kf.find_by_hash(&hash).unwrap().is_shared);
+    }
+
+    /// Regression for the "Unshare survives a restart" fix: an explicitly
+    /// unshared file's `is_shared = false` must round-trip through an actual
+    /// save + load of known.met, not just stay correct in memory.
+    #[test]
+    fn is_shared_false_roundtrips_through_save_and_load() {
+        let mut kf = KnownFileList::new();
+        let mut r = sample_record();
+        r.is_shared = false;
+        let hash = r.file_hash;
+        kf.add_or_update(r);
+
+        let path = std::env::temp_dir().join(format!(
+            "ember_known_met_shared_roundtrip_{}_{}.met",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        kf.save(&path).expect("save known.met");
+
+        let loaded = KnownFileList::load(&path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_file_name("known_paths.dat"));
+
+        assert!(
+            !loaded.find_by_hash(&hash).unwrap().is_shared,
+            "is_shared=false must survive a save/load round trip"
+        );
+    }
+
+    /// A record with no source-count tag ever written (the common case, and
+    /// every known.met written before this field existed) must load as 0,
+    /// matching the pre-existing "unknown until synced" behavior.
+    #[test]
+    fn complete_sources_defaults_zero_when_tag_absent() {
+        let mut kf = KnownFileList::new();
+        let r = sample_record();
+        let hash = r.file_hash;
+        kf.add_or_update(r);
+        assert_eq!(kf.find_by_hash(&hash).unwrap().complete_sources, 0);
+    }
+
+    /// Regression for "persist the Peers count": the last-known
+    /// complete-source count must round-trip through an actual save + load
+    /// of known.met so the Library UI doesn't show 0 immediately at startup.
+    #[test]
+    fn complete_sources_roundtrips_through_save_and_load() {
+        let mut kf = KnownFileList::new();
+        let mut r = sample_record();
+        r.complete_sources = 7;
+        let hash = r.file_hash;
+        kf.add_or_update(r);
+
+        let path = std::env::temp_dir().join(format!(
+            "ember_known_met_sources_roundtrip_{}_{}.met",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        kf.save(&path).expect("save known.met");
+
+        let loaded = KnownFileList::load(&path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_file_name("known_paths.dat"));
+
+        assert_eq!(
+            loaded.find_by_hash(&hash).unwrap().complete_sources,
+            7,
+            "complete_sources must survive a save/load round trip"
+        );
+    }
+
+    #[test]
+    fn priority_str_u8_roundtrip_covers_every_label() {
+        for label in ["verylow", "low", "normal", "high", "release", "auto"] {
+            let byte = priority_str_to_u8(label);
+            assert_eq!(
+                priority_u8_to_str(byte),
+                label,
+                "priority label {label} must survive an str->u8->str round trip"
+            );
+        }
     }
 }

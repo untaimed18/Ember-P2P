@@ -90,6 +90,21 @@
         { keys: ['Right-click'], label: () => m.shortcuts_table_context() },
       ],
     },
+    {
+      title: () => m.shortcuts_section_library(),
+      shortcuts: [
+        { keys: ['/'], label: () => m.shortcuts_library_focus_search() },
+        { keys: ['Ctrl', 'A'], label: () => m.shortcuts_library_select_all() },
+        { keys: ['Ctrl', 'D'], label: () => m.shortcuts_library_clear_selection() },
+        { keys: ['Ctrl', 'C'], label: () => m.shortcuts_library_copy_links() },
+        { keys: ['Enter'], label: () => m.shortcuts_library_open() },
+        { keys: ['Delete'], label: () => m.shortcuts_library_delete() },
+        { keys: ['Space'], label: () => m.shortcuts_library_toggle_check() },
+        { keys: ['↑ / ↓'], label: () => m.shortcuts_library_navigate() },
+        { keys: ['Home / End'], label: () => m.shortcuts_library_jump_ends() },
+        { keys: ['PgUp / PgDn'], label: () => m.shortcuts_library_page() },
+      ],
+    },
   ];
 
   function onKeydown(e: KeyboardEvent) {

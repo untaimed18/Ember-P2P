@@ -161,6 +161,14 @@
     }
   }
 
+  // Public: let the parent page open the column show/hide/reorder menu
+  // from a visible toolbar button. The menu was previously reachable only
+  // by right-clicking a column header, with no on-screen hint that it
+  // existed at all.
+  export function openColumnMenu(e: MouseEvent) {
+    openMenu(e);
+  }
+
   $effect(() => {
     const el = scrollContainer;
     if (!el) return;
@@ -843,18 +851,22 @@
     padding: 0 4px;
     border-radius: 999px;
     line-height: 15px;
+    border: 1px solid transparent;
   }
   .shared-badge.kad {
-    background: rgba(52, 152, 219, 0.15);
-    color: #3498db;
+    background: color-mix(in srgb, var(--kad-color) 15%, transparent);
+    border-color: color-mix(in srgb, var(--kad-color) 30%, transparent);
+    color: var(--kad-color);
   }
   .shared-badge.ed2k {
-    background: rgba(155, 89, 182, 0.15);
-    color: #9b59b6;
+    background: color-mix(in srgb, var(--ed2k-color) 15%, transparent);
+    border-color: color-mix(in srgb, var(--ed2k-color) 30%, transparent);
+    color: var(--ed2k-color);
   }
   .shared-badge.aich {
-    background: rgba(39, 174, 96, 0.15);
-    color: #27ae60;
+    background: color-mix(in srgb, var(--aich-color) 15%, transparent);
+    border-color: color-mix(in srgb, var(--aich-color) 30%, transparent);
+    color: var(--aich-color);
   }
 
   /* Missing files: path no longer resolves on disk. Dim the row and tint the
@@ -872,12 +884,12 @@
     flex-shrink: 0;
   }
 
-  .prio-verylow { color: #888; }
-  .prio-low { color: #59b; }
+  .prio-verylow { color: var(--priority-verylow); }
+  .prio-low { color: var(--priority-low); }
   .prio-normal { color: var(--text-primary); }
-  .prio-high { color: #e0a030; }
-  .prio-release { color: #e05050; font-weight: 600; }
-  .prio-auto { color: #7cb342; }
+  .prio-high { color: var(--warning); }
+  .prio-release { color: var(--danger); font-weight: 600; }
+  .prio-auto { color: var(--priority-auto); }
 
   /* --- Column context menu --- */
   .col-ctx-menu {

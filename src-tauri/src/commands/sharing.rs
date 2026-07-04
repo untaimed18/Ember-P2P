@@ -33,7 +33,7 @@ use crate::commands::errors::{coded, coded_ctx};
 use crate::network::NetworkCommand;
 use crate::search::index::LocalIndex;
 use crate::sharing::indexer::FileIndexer;
-use crate::storage::known_files::KnownFileList;
+use crate::storage::known_files::{priority_str_to_u8, priority_u8_to_str, KnownFileList};
 use crate::types::*;
 use tracing::{debug, info, warn};
 
@@ -123,6 +123,16 @@ fn resolve_from_known(files: &mut Vec<FileInfo>, known: &KnownFileList) -> Vec<F
             file.id = hash.clone();
             file.hash = hash;
             file.aich_hash = record.aich_hash.clone();
+            // Restore the per-file priority and shared/unshared choice from
+            // known.met — without this, every rediscovery (folder add,
+            // reload, or cold startup) silently reset a custom priority back
+            // to "normal" and re-shared a file the user had explicitly
+            // unshared.
+            file.priority = priority_u8_to_str(record.upload_priority).to_string();
+            file.shared = record.is_shared;
+            // Restore the last-known Peers count so the UI doesn't flash
+            // back to 0 until the next 60s source-count sync completes.
+            file.complete_sources = record.complete_sources;
         } else {
             needs_hashing.push(file.clone());
         }
@@ -933,24 +943,6 @@ pub async fn set_folder_priority(
     Ok(changed.len() as u32)
 }
 
-/// Encode a UI priority label into the u8 stored in
-/// `KnownFileRecord::upload_priority` (and shipped over the wire as the
-/// `FT_ULPRIORITY` known-file tag). Order matches eMule's priority
-/// enum: 0=verylow, 1=low, 2=normal, 3=high, 4=release, 5=auto.
-/// Unknown labels fall back to `normal` so a malformed UI value never
-/// promotes a file to the highest tier silently.
-fn priority_str_to_u8(priority: &str) -> u8 {
-    match priority {
-        "verylow" => 0,
-        "low" => 1,
-        "normal" => 2,
-        "high" => 3,
-        "release" => 4,
-        "auto" => 5,
-        _ => 2,
-    }
-}
-
 #[tauri::command]
 pub async fn set_file_priority(
     state: tauri::State<'_, AppState>,
@@ -1079,16 +1071,11 @@ pub async fn batch_share(
             MAX_BATCH_IDS,
         ));
     }
-    let count = {
+    let changed_hashes = {
         let mut index = state.local_index.write().await;
-        let mut n = 0u32;
-        for path in &file_paths {
-            if index.set_file_shared_by_path(path, true) {
-                n += 1;
-            }
-        }
-        n
+        index.set_shared_by_paths(&file_paths, true)
     };
+    let count = changed_hashes.len() as u32;
     if count > 0 {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
         if let Err(e) = state
@@ -1096,6 +1083,19 @@ pub async fn batch_share(
             .try_send(NetworkCommand::SharedFilesChanged)
         {
             warn!("Failed to queue SharedFilesChanged after batch share: {e}");
+        }
+        for hash in &changed_hashes {
+            if state
+                .network_tx
+                .try_send(NetworkCommand::SetFileShared {
+                    file_hash_hex: hash.clone(),
+                    shared: true,
+                })
+                .is_err()
+            {
+                warn!("Network channel full during batch share persistence push");
+                break;
+            }
         }
         let _ = app.emit(
             "shared-files-changed",
@@ -1121,16 +1121,11 @@ pub async fn batch_unshare(
             MAX_BATCH_IDS,
         ));
     }
-    let count = {
+    let changed_hashes = {
         let mut index = state.local_index.write().await;
-        let mut n = 0u32;
-        for path in &file_paths {
-            if index.set_file_shared_by_path(path, false) {
-                n += 1;
-            }
-        }
-        n
+        index.set_shared_by_paths(&file_paths, false)
     };
+    let count = changed_hashes.len() as u32;
     if count > 0 {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
         if let Err(e) = state
@@ -1138,6 +1133,19 @@ pub async fn batch_unshare(
             .try_send(NetworkCommand::SharedFilesChanged)
         {
             warn!("Failed to queue SharedFilesChanged after batch unshare: {e}");
+        }
+        for hash in &changed_hashes {
+            if state
+                .network_tx
+                .try_send(NetworkCommand::SetFileShared {
+                    file_hash_hex: hash.clone(),
+                    shared: false,
+                })
+                .is_err()
+            {
+                warn!("Network channel full during batch unshare persistence push");
+                break;
+            }
         }
         let _ = app.emit(
             "shared-files-changed",
@@ -1502,13 +1510,28 @@ pub async fn unshare_file(
             None
         }
     };
-    if file.is_some() {
+    if let Some(f) = &file {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
         if let Err(e) = state
             .network_tx
             .try_send(NetworkCommand::SharedFilesChanged)
         {
             warn!("Failed to queue SharedFilesChanged after unshare: {e}");
+        }
+        // Persist the unshare into known.met so it survives a restart — see
+        // `NetworkCommand::SetFileShared`. Best-effort like the priority
+        // equivalent: a dropped send just delays persistence until the next
+        // successful toggle or SharedFilesChanged reconciliation.
+        if !f.hash.is_empty()
+            && state
+                .network_tx
+                .try_send(NetworkCommand::SetFileShared {
+                    file_hash_hex: f.hash.clone(),
+                    shared: false,
+                })
+                .is_err()
+        {
+            warn!("Network channel full; unshare not yet flushed to known.met");
         }
         let _ = app.emit("shared-files-changed", serde_json::json!({ "unshared": 1 }));
         info!(
@@ -1542,13 +1565,24 @@ pub async fn share_file(
         index.set_file_shared_by_path(&file_path, true);
         index.get_by_path(&file_path).cloned()
     };
-    if file.is_some() {
+    if let Some(f) = &file {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
         if let Err(e) = state
             .network_tx
             .try_send(NetworkCommand::SharedFilesChanged)
         {
             warn!("Failed to queue SharedFilesChanged after share: {e}");
+        }
+        if !f.hash.is_empty()
+            && state
+                .network_tx
+                .try_send(NetworkCommand::SetFileShared {
+                    file_hash_hex: f.hash.clone(),
+                    shared: true,
+                })
+                .is_err()
+        {
+            warn!("Network channel full; share not yet flushed to known.met");
         }
         let _ = app.emit("shared-files-changed", serde_json::json!({ "shared": 1 }));
         info!("Shared file {}", file_path);
@@ -1573,6 +1607,19 @@ pub async fn unshare_folder(
             .try_send(NetworkCommand::SharedFilesChanged)
         {
             warn!("Failed to queue SharedFilesChanged after unshare_folder: {e}");
+        }
+        for hash in &affected_hashes {
+            if state
+                .network_tx
+                .try_send(NetworkCommand::SetFileShared {
+                    file_hash_hex: hash.clone(),
+                    shared: false,
+                })
+                .is_err()
+            {
+                warn!("Network channel full during folder unshare persistence push");
+                break;
+            }
         }
         let _ = app.emit(
             "shared-files-changed",

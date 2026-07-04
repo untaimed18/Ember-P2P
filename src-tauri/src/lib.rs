@@ -507,12 +507,30 @@ pub fn run() {
                 };
 
                 let mut files_to_hash: Vec<crate::types::FileInfo> = Vec::new();
+                // Paths with no known.met record at all — genuinely new to
+                // this library, as opposed to a previously-shared file that's
+                // merely being rediscovered. Only these should inherit a
+                // shared folder's *current* default priority below; a file
+                // that already has a persisted priority keeps it even if the
+                // folder default has since changed, matching `set_file_priority`'s
+                // per-file-override contract.
+                let mut new_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
                 for file in &mut all_discovered {
                     if let Some(record) = known_list.find_by_path_and_meta(&file.path, file.size, file.modified_at) {
                         let hash = hex::encode(record.file_hash);
                         file.id = hash.clone();
                         file.hash = hash;
                         file.aich_hash = record.aich_hash.clone();
+                        // Restore the per-file priority and shared/unshared
+                        // choice from known.met. Without this, every cold
+                        // start silently reset custom priorities to "normal"
+                        // and re-shared files the user had explicitly
+                        // unshared.
+                        file.priority = storage::known_files::priority_u8_to_str(record.upload_priority).to_string();
+                        file.shared = record.is_shared;
+                        // Restore the last-known Peers count so the Library
+                        // doesn't show 0 until the next 60s source-count sync.
+                        file.complete_sources = record.complete_sources;
                         // A matched record short-circuits hashing. If the AICH
                         // root was cleared by the v2 migration (or is otherwise
                         // missing) and the file is multi-part, schedule a
@@ -527,6 +545,7 @@ pub fn run() {
                             files_to_hash.push(file.clone());
                         }
                     } else {
+                        new_paths.insert(crate::search::index::normalize_path_key(&file.path));
                         files_to_hash.push(file.clone());
                     }
                 }
@@ -549,10 +568,14 @@ pub fn run() {
                     let mut index = index_clone.write().await;
                     index.add_files(all_discovered.clone());
                     // Apply each shared folder's default upload priority so
-                    // newly discovered files (and files added while the app
-                    // was closed) inherit eMule-style per-directory priority.
+                    // newly discovered files (files with no known.met record —
+                    // never seen before, or added while the app was closed)
+                    // inherit eMule-style per-directory priority. Restricted to
+                    // `new_paths` so this doesn't clobber a per-file priority
+                    // that was just restored from known.met above for a file
+                    // that was already known.
                     for (folder, priority) in &folder_priorities {
-                        index.set_priority_under_folder(folder, priority);
+                        index.set_priority_under_folder_for_paths(folder, priority, &new_paths);
                     }
                 }
                 commands::sharing::refresh_file_cache(&index_clone, &csf).await;

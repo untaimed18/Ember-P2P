@@ -2536,6 +2536,15 @@ pub enum NetworkCommand {
         rating: u8,
         comment: String,
     },
+    /// Persist a per-file share/unshare toggle into `known.met` so it
+    /// survives a restart. Mirrors `SetUploadPriority`: the UI-facing
+    /// `unshare_file`/`share_file`/`unshare_folder`/`batch_share`/
+    /// `batch_unshare` commands flip the live `LocalIndex` flag immediately
+    /// and fire this as a best-effort follow-up to make it durable.
+    SetFileShared {
+        file_hash_hex: String,
+        shared: bool,
+    },
     GetFileComments {
         file_hash: String,
         tx: oneshot::Sender<Option<ed2k::comments::FileCommentInfo>>,
@@ -6860,6 +6869,8 @@ pub async fn start_network(
                                         upload_priority: 0,
                                         last_publish_src: 0,
                                         last_shared: 0,
+                                        is_shared: true,
+                                        complete_sources: 0,
                                     };
                                     known_files.add_or_update(record);
                                 }
@@ -17474,7 +17485,7 @@ pub async fn start_network(
                     continue;
                 }
                 let sm = source_manager.read().await;
-                let mut updates: Vec<(String, u32)> = Vec::new();
+                let mut updates: Vec<(String, [u8; 16], u32)> = Vec::new();
                 for hash_hex in &hashes {
                     let hash_bytes: [u8; 16] = match hex::decode(hash_hex) {
                         Ok(b) if b.len() == 16 => {
@@ -17506,16 +17517,33 @@ pub async fn start_network(
                         }
                     }
                     if count > 0 {
-                        updates.push((hash_hex.clone(), count));
+                        updates.push((hash_hex.clone(), hash_bytes, count));
                     }
                 }
                 drop(sm);
                 if !updates.is_empty() {
                     let mut index = local_index.write().await;
-                    for (hash_hex, count) in &updates {
+                    for (hash_hex, _, count) in &updates {
                         index.update_complete_sources(hash_hex, *count);
                     }
                     drop(index);
+                    // Persist the freshly-synced counts too, so the Library
+                    // shows the last-known Peers figure immediately at the
+                    // next startup instead of resetting to 0 until this sync
+                    // runs again (it's a point-in-time gauge, so a fresh
+                    // count always simply overwrites the stored one).
+                    let mut known_dirty = false;
+                    for (_, hash_bytes, count) in &updates {
+                        if let Some(record) = known_files.find_by_hash_mut(hash_bytes) {
+                            if record.complete_sources != *count {
+                                record.complete_sources = *count;
+                                known_dirty = true;
+                            }
+                        }
+                    }
+                    if known_dirty {
+                        known_files.mark_dirty();
+                    }
                     let li_ref = local_index.clone();
                     let s_files = shared_files.clone();
                     let kad_connected = state.stats.status == NetworkStatus::Connected;
@@ -20462,6 +20490,7 @@ async fn handle_udp_packet_inner(
                         // these discovered nodes OUT of the routing table (so we
                         // never send them a KAD UDP packet) and stash them as
                         // fresh UDP-firewall probe candidates instead.
+                        let mut gained_candidate = false;
                         for c in &safe_contacts {
                             if c.version > KADEMLIA_VERSION5_48A
                                 && c.tcp_port > 0
@@ -20470,7 +20499,22 @@ async fn handle_udp_packet_inner(
                                 && state.udp_fw_candidate_pool.len() < UDP_FW_CANDIDATE_POOL_MAX
                             {
                                 state.udp_fw_candidate_pool.push_back(c.clone());
+                                gained_candidate = true;
                             }
+                        }
+                        // Drain the pool the instant fresh candidates land instead
+                        // of waiting for the next incidental Pong to trigger
+                        // `dispatch_udp_firewall_probe_requests`. On a just-started
+                        // routing table the handful of contacts pinged for port
+                        // discovery at `start_check()` time are often stale and
+                        // never reply, so without this the fresh-node lookup could
+                        // finish populating the pool well inside the 30s response
+                        // window yet no probe would ever actually be sent this
+                        // cycle — the classic "TCP: Open / UDP: Unknown until you
+                        // click Recheck" symptom (the manual recheck merely gets
+                        // lucky with an unrelated Pong arriving in time).
+                        if gained_candidate {
+                            dispatch_udp_firewall_probe_requests(state, settings);
                         }
                     } else {
                         for c in &safe_contacts {
@@ -24402,6 +24446,48 @@ async fn handle_command_inner(
             }
         }
 
+        NetworkCommand::SetFileShared {
+            file_hash_hex,
+            shared,
+        } => {
+            // Same rationale as `SetUploadPriority` above: push the toggle
+            // straight into `known.met` so the file's shared state survives
+            // a restart instead of silently reverting to shared=true the
+            // next time this path is rediscovered.
+            match hex::decode(&file_hash_hex) {
+                Ok(hash_bytes) if hash_bytes.len() == 16 => {
+                    let mut fh = [0u8; 16];
+                    fh.copy_from_slice(&hash_bytes);
+                    if let Some(record) = known_files.find_by_hash_mut(&fh) {
+                        record.is_shared = shared;
+                        known_files.mark_dirty();
+                        debug!(
+                            "Updated is_shared={shared} for {file_hash_hex} in known.met"
+                        );
+                    } else {
+                        // Fire-and-forget `try_send` with no ack, same as
+                        // `SetUploadPriority` — this is the only signal that
+                        // the toggle didn't take effect (e.g. a race with the
+                        // file not yet registered in `known_files`). The next
+                        // `SharedFilesChanged` will create the record from the
+                        // live `LocalIndex` flag, so it isn't lost, just delayed.
+                        warn!(
+                            "SetFileShared: no known_files record for hash {file_hash_hex}; shared={shared} not yet persisted"
+                        );
+                    }
+                }
+                Ok(hash_bytes) => {
+                    warn!(
+                        "SetFileShared: hash {file_hash_hex} has {} bytes, expected 16; ignoring",
+                        hash_bytes.len()
+                    );
+                }
+                Err(e) => {
+                    warn!("SetFileShared: invalid hex hash {file_hash_hex}: {e}");
+                }
+            }
+        }
+
         NetworkCommand::SharedFilesChanged => {
             let index = local_index.read().await;
             for f in index.all_files() {
@@ -24433,15 +24519,41 @@ async fn handle_command_inner(
                             // request totals shouldn't reset just
                             // because mtime drifted).
                             let existing = known_files.find_by_hash(&fh).cloned();
-                            let (att, atr, ata, prio, lps) = match &existing {
+                            let (att, atr, ata, prio, lps, is_shared, sources) = match &existing {
                                 Some(r) => (
                                     r.all_time_transferred.max(f.bytes_transferred),
                                     r.all_time_requested.max(f.requests),
                                     r.all_time_accepted.max(f.accepted),
                                     r.upload_priority,
                                     r.last_publish_src,
+                                    // Preserve the persisted share flag across a
+                                    // metadata-drift refresh — a user's unshare/
+                                    // share toggle goes through `SetFileShared`,
+                                    // not this path, so this rewrite must never
+                                    // silently flip it back.
+                                    r.is_shared,
+                                    // Preserve the last-known Peers count too — a
+                                    // metadata-drift refresh has nothing to do
+                                    // with source availability, so it must not
+                                    // reset the count back to 0. The periodic
+                                    // source-count sync is the only place that
+                                    // should ever change this value.
+                                    r.complete_sources,
                                 ),
-                                None => (f.bytes_transferred, f.requests, f.accepted, 0, 0),
+                                // Brand-new record: seed both from the file's
+                                // current live state (its priority may already
+                                // reflect a shared-folder default; a file can
+                                // only be unshared here if it was toggled off
+                                // before its very first known.met record existed).
+                                None => (
+                                    f.bytes_transferred,
+                                    f.requests,
+                                    f.accepted,
+                                    crate::storage::known_files::priority_str_to_u8(&f.priority),
+                                    0,
+                                    f.shared,
+                                    f.complete_sources,
+                                ),
                             };
                             let mut part_hashes = existing
                                 .as_ref()
@@ -24508,6 +24620,8 @@ async fn handle_command_inner(
                                 upload_priority: prio,
                                 last_publish_src: lps,
                                 last_shared: chrono::Utc::now().timestamp() as u32,
+                                is_shared,
+                                complete_sources: sources,
                             });
                         }
                     }
