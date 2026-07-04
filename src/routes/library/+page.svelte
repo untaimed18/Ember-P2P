@@ -56,7 +56,7 @@
   // Bound to the virtualized file table; used by arrow-key navigation
   // to scroll the new selection into view (the row may not exist in
   // the DOM yet because the table is virtualized).
-  let libraryTableRef: { scrollRowIntoView: (i: number) => void } | undefined = $state(undefined);
+  let libraryTableRef: { scrollRowIntoView: (i: number) => void; openColumnMenu: (e: MouseEvent) => void } | undefined = $state(undefined);
   let filterFolder: string | null = $state(null);
   let hashProgress: { current: number; total: number; file_name: string } | null = $state(null);
   let stoppedByUser = $state(false);
@@ -1901,6 +1901,18 @@
     {#if hasActiveLibraryFilters}
       <button class="ghost clear-library-filters" onclick={clearLibraryFilters}>{m.library_clear_filters()}</button>
     {/if}
+    <button
+      class="dupes-toggle columns-btn"
+      onclick={(e) => libraryTableRef?.openColumnMenu(e)}
+      title={m.library_columns_title()}
+    >
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" width="12" height="12" aria-hidden="true">
+        <rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/>
+        <line x1="6" y1="2.5" x2="6" y2="13.5"/>
+        <line x1="10" y1="2.5" x2="10" y2="13.5"/>
+      </svg>
+      {m.library_columns_button()}
+    </button>
     <span class="inline-stats">
       <span class="inline-stat">{m.library_stat_files({ count: files.length.toLocaleString() })}</span>
       <span class="inline-sep">&middot;</span>
@@ -2460,8 +2472,8 @@
             {selectedFile.shared ? m.common_yes() : m.common_no()}
             {#if selectedFile.hash}
               <span class="meta-badges">
-                {#if selectedFile.shared && selectedFile.shared_kad}<span class="meta-badge" title={m.library_published_kad()}>KAD</span>{/if}
-                {#if selectedFile.shared && selectedFile.shared_ed2k}<span class="meta-badge" title={m.library_published_ed2k()}>eD2K</span>{/if}
+                {#if selectedFile.shared && selectedFile.shared_kad}<span class="meta-badge meta-badge-kad" title={m.library_published_kad()}>KAD</span>{/if}
+                {#if selectedFile.shared && selectedFile.shared_ed2k}<span class="meta-badge meta-badge-ed2k" title={m.library_published_ed2k()}>eD2K</span>{/if}
                 {#if selectedFile.aich_hash}<span class="meta-badge meta-badge-aich" title={m.library_aich_available()}>AICH</span>{/if}
               </span>
             {/if}
@@ -2693,7 +2705,7 @@
     border-radius: 10px;
     padding: 22px 28px;
     text-align: center;
-    color: var(--text, #e0e0e0);
+    color: var(--text-primary);
     box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
     max-width: 360px;
   }
@@ -3372,7 +3384,7 @@
     font-size: 12px;
     border: 1px solid var(--border);
     border-radius: 4px;
-    background: var(--bg-primary, #1e1e1e);
+    background: var(--bg-primary);
     color: inherit;
     cursor: pointer;
   }
@@ -3386,7 +3398,7 @@
     font-size: 12px;
     border: 1px solid var(--border);
     border-radius: 4px;
-    background: var(--bg-primary, #1e1e1e);
+    background: var(--bg-primary);
     color: inherit;
     cursor: pointer;
     white-space: nowrap;
@@ -3404,6 +3416,12 @@
   .dupes-toggle:disabled {
     opacity: 0.5;
     cursor: not-allowed;
+  }
+  .columns-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    color: var(--text-secondary);
   }
   .missing-toggle.active {
     background: color-mix(in srgb, var(--danger, #e74c3c) 20%, transparent);
@@ -3628,17 +3646,31 @@
   }
   .copy-btn:hover { color: var(--accent); border-color: var(--accent); }
   .meta-badges { display: inline-flex; gap: 4px; margin-left: 4px; }
+  /* Tinted-chip recipe matching the same badges in the file table
+     (LibraryVirtualTable's .shared-badge) so KAD/eD2K/AICH read as the
+     same concept — and the same color — in both places. */
   .meta-badge {
     font-size: 10px;
-    padding: 1px 4px;
-    border-radius: 3px;
-    background: var(--accent);
-    color: #fff;
     font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 999px;
     letter-spacing: 0.3px;
+    border: 1px solid transparent;
+  }
+  .meta-badge.meta-badge-kad {
+    background: color-mix(in srgb, var(--kad-color) 15%, transparent);
+    border-color: color-mix(in srgb, var(--kad-color) 30%, transparent);
+    color: var(--kad-color);
+  }
+  .meta-badge.meta-badge-ed2k {
+    background: color-mix(in srgb, var(--ed2k-color) 15%, transparent);
+    border-color: color-mix(in srgb, var(--ed2k-color) 30%, transparent);
+    color: var(--ed2k-color);
   }
   .meta-badge.meta-badge-aich {
-    background: #27ae60;
+    background: color-mix(in srgb, var(--aich-color) 15%, transparent);
+    border-color: color-mix(in srgb, var(--aich-color) 30%, transparent);
+    color: var(--aich-color);
   }
 
   .drawer-section-divider {
@@ -3657,12 +3689,12 @@
     border: 1px solid var(--border);
     background: var(--bg-surface);
   }
-  .prio-badge.prio-verylow { color: #888; }
-  .prio-badge.prio-low { color: #59b; }
+  .prio-badge.prio-verylow { color: var(--priority-verylow); }
+  .prio-badge.prio-low { color: var(--priority-low); }
   .prio-badge.prio-normal { color: var(--text-primary); }
-  .prio-badge.prio-high { color: #e0a030; border-color: color-mix(in srgb, #e0a030 45%, var(--border)); }
-  .prio-badge.prio-release { color: #e05050; border-color: color-mix(in srgb, #e05050 45%, var(--border)); }
-  .prio-badge.prio-auto { color: #7cb342; }
+  .prio-badge.prio-high { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, var(--border)); }
+  .prio-badge.prio-release { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); }
+  .prio-badge.prio-auto { color: var(--priority-auto); }
 
   /* --- Comment panel --- */
   .comment-last-saved {

@@ -382,6 +382,32 @@ impl LocalIndex {
         changed
     }
 
+    /// Like [`set_priority_under_folder`](Self::set_priority_under_folder),
+    /// but restricted to paths present in `only_paths`. Used at startup so a
+    /// shared folder's configured default priority seeds genuinely new files
+    /// (no prior `known.met` record) without clobbering a per-file priority
+    /// that was just restored from an existing record — a per-file override
+    /// should stick even if it happens to differ from the folder's current
+    /// default, exactly like `set_file_priority` intends.
+    pub fn set_priority_under_folder_for_paths(
+        &mut self,
+        folder: &str,
+        priority: &str,
+        only_paths: &HashSet<String>,
+    ) -> Vec<(String, String)> {
+        let mut changed = Vec::new();
+        for file in &mut self.files {
+            if only_paths.contains(&normalize_path_key(&file.path))
+                && crate::security::path_matches_dir(&file.path, folder)
+                && file.priority != priority
+            {
+                file.priority = priority.to_string();
+                changed.push((file.path.clone(), file.hash.clone()));
+            }
+        }
+        changed
+    }
+
     pub fn set_file_shared_by_path(&mut self, path: &str, shared: bool) -> bool {
         if let Some(&idx) = self.path_map.get(&normalize_path_key(path)) {
             if let Some(file) = self.files.get_mut(idx) {
@@ -396,6 +422,28 @@ impl LocalIndex {
         let mut affected = Vec::new();
         for file in &mut self.files {
             if crate::security::path_matches_dir(&file.path, prefix)
+                && !file.hash.is_empty()
+                && file.shared != shared
+            {
+                file.shared = shared;
+                affected.push(file.hash.clone());
+            }
+        }
+        affected
+    }
+
+    /// Bulk variant of [`set_file_shared_by_path`](Self::set_file_shared_by_path)
+    /// for an explicit path list (the Library multi-select share/unshare
+    /// actions). Returns the ed2k hash of every file actually flipped, so
+    /// callers can push a `known.met` persistence command per file without a
+    /// second round of path lookups. Files with no hash yet (still hashing)
+    /// are skipped — there's no known.met record to persist the flag into
+    /// yet, mirroring `set_shared_by_path_prefix`.
+    pub fn set_shared_by_paths(&mut self, paths: &[String], shared: bool) -> Vec<String> {
+        let keys: HashSet<String> = paths.iter().map(|p| normalize_path_key(p)).collect();
+        let mut affected = Vec::new();
+        for file in &mut self.files {
+            if keys.contains(&normalize_path_key(&file.path))
                 && !file.hash.is_empty()
                 && file.shared != shared
             {
