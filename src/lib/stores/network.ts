@@ -48,6 +48,13 @@ export const networkStats = writable<NetworkStats>({
 export const networkError = writable<string | null>(null);
 export type ServerStatus = 'connected' | 'connecting' | 'disconnected';
 export const serverStatus = writable<ServerStatus>('disconnected');
+const KNOWN_SERVER_STATUSES = new Set<ServerStatus>(['connected', 'connecting', 'disconnected']);
+
+function narrowServerStatus(raw: unknown): ServerStatus | undefined {
+  return typeof raw === 'string' && (KNOWN_SERVER_STATUSES as Set<string>).has(raw)
+    ? (raw as ServerStatus)
+    : undefined;
+}
 
 // True once UPnP has been auto-disabled this session after a failed start-up
 // mapping. Lets UI (e.g. the KAD-page UPnP tile) show "Disabled" immediately,
@@ -237,8 +244,10 @@ export async function initNetworkStore() {
       lastUpnpMapped = mapped;
     }));
     registered.push(await listen<{ message: string }>('network-error', (event) => {
+      const message = typeof event.payload?.message === 'string' ? event.payload.message : '';
+      if (!message) return;
       lastEventUpdate = Date.now();
-      networkError.set(event.payload.message);
+      networkError.set(message);
     }));
     // Fatal network errors come directly from the network-task supervisor
     // in `lib.rs` — the payload is a bare redacted string (not an object).
@@ -270,7 +279,8 @@ export async function initNetworkStore() {
       }
     }));
     registered.push(await listen<{ status: ServerStatus }>('server-status-changed', (event) => {
-      serverStatus.set(event.payload.status);
+      const status = narrowServerStatus(event.payload?.status);
+      if (status) serverStatus.set(status);
     }));
   } catch (e) {
     for (const u of registered) u();
