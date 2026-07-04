@@ -50,6 +50,11 @@
 
   let friendRequests: FriendRequestInfo[] = $derived($friendRequestsStore);
   let failedSearchToastsShown = new Set<string>();
+  const FRIEND_HASH_RE = /^[0-9a-f]{32}$/i;
+
+  function validFriendHash(raw: unknown): string | null {
+    return typeof raw === 'string' && FRIEND_HASH_RE.test(raw) ? raw.toLowerCase() : null;
+  }
 
   // Whenever a friend comes online, reset our "we already toasted for this
   // hash" memo so the next offline search failure can re-toast. Reactively
@@ -248,6 +253,7 @@
 
     listen<{ firewalled: boolean }>('firewall-status', (event) => {
       if (destroyed) return;
+      if (typeof event.payload?.firewalled !== 'boolean') return;
       isFirewalled = event.payload.firewalled;
       if (!event.payload.firewalled) recheckingFirewall = false;
     }).then(fn => { if (destroyed) fn(); else unlistenFns.push(fn); })
@@ -255,8 +261,9 @@
 
     listen<{ user_hash: string; reason?: string }>('ember:friend-search-failed', (event) => {
       if (destroyed) return;
-      const hash = event.payload.user_hash;
-      const reason = event.payload.reason || 'error';
+      const hash = validFriendHash(event.payload?.user_hash);
+      if (!hash) return;
+      const reason = typeof event.payload?.reason === 'string' ? event.payload.reason : 'error';
       if (failedSearchToastsShown.has(hash)) return;
       failedSearchToastsShown.add(hash);
       const f = friends.find(fr => fr.user_hash === hash);

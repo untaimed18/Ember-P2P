@@ -219,6 +219,14 @@ let flushScheduled = false;
 let flushRaf: number | null = null;
 let flushTimeout: ReturnType<typeof setTimeout> | null = null;
 
+function validRequestId(raw: unknown): number | null {
+  return typeof raw === 'number' && Number.isSafeInteger(raw) && raw > 0 ? raw : null;
+}
+
+function validCount(raw: unknown): number {
+  return typeof raw === 'number' && Number.isFinite(raw) ? Math.max(0, Math.floor(raw)) : 0;
+}
+
 function flushSearchResults() {
   flushScheduled = false;
   flushRaf = null;
@@ -263,7 +271,8 @@ export async function initSearchStore() {
     // batches back-to-back; buffering folds them into one merge per tab per
     // frame instead of an O(N·B) rebuild per event.
     registered.push(await listen<{ request_id: number; results: SearchResult[] }>('search-results', (event) => {
-      const requestId = event.payload.request_id;
+      const requestId = validRequestId(event.payload?.request_id);
+      if (requestId === null) return;
       const incoming = event.payload.results;
       if (!Array.isArray(incoming)) return;
       if (dev) {
@@ -283,7 +292,8 @@ export async function initSearchStore() {
       scheduleFlush();
     }));
     registered.push(await listen<{ request_id: number }>('search-complete', (event) => {
-      const requestId = event.payload.request_id;
+      const requestId = validRequestId(event.payload?.request_id);
+      if (requestId === null) return;
       // Flush any buffered `search-results` for this request synchronously
       // before flipping `isSearching` off — otherwise the spinner could
       // disappear while the last batch of results is still queued for the
@@ -314,16 +324,17 @@ export async function initSearchStore() {
     registered.push(await listen<{ request_id: number; nodes_contacted: number; results_so_far: number; phase: string }>(
       'search-progress',
       (event) => {
-        const requestId = event.payload.request_id;
+        const requestId = validRequestId(event.payload?.request_id);
+        if (requestId === null) return;
         searchTabs.update((tabs) =>
           updateTabByRequestId(tabs, requestId, (t) => {
             if (!t.isSearching) return t;
             return {
               ...t,
               progress: {
-                nodes_contacted: event.payload.nodes_contacted,
-                results_so_far: event.payload.results_so_far,
-                phase: event.payload.phase,
+                nodes_contacted: validCount(event.payload?.nodes_contacted),
+                results_so_far: validCount(event.payload?.results_so_far),
+                phase: typeof event.payload?.phase === 'string' ? event.payload.phase : '',
               },
             };
           }),

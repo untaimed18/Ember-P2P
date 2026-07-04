@@ -785,7 +785,7 @@
               <button
                 type="button"
                 class="stat-link"
-                onclick={() => goto('/settings')}
+                onclick={() => void goto('/settings').catch((e) => console.warn('Failed to open settings:', e))}
                 title={m.kad_upnp_disabled_title()}
               >{m.kad_upnp_disabled()}</button>
             {:else}

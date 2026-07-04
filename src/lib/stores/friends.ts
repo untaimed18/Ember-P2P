@@ -29,6 +29,16 @@ export const isDiscoverable = writable(false);
 // actually want one.
 const SEARCH_TTL_MS = 60_000;
 const searchTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const FRIEND_HASH_RE = /^[0-9a-f]{32}$/i;
+
+function validFriendHash(raw: unknown): string | null {
+  return typeof raw === 'string' && FRIEND_HASH_RE.test(raw) ? raw.toLowerCase() : null;
+}
+
+function safeEventText(raw: unknown, max = 4096): string {
+  return typeof raw === 'string' ? raw.slice(0, max) : '';
+}
+
 function clearSearchTimer(hash: string) {
   const t = searchTimers.get(hash);
   if (t !== undefined) {
@@ -141,7 +151,8 @@ export async function initFriendsStore() {
   try {
     registered.push(
       await listen<{ user_hash: string }>('ember:friend-online', (event) => {
-        const hash = event.payload.user_hash;
+        const hash = validFriendHash(event.payload?.user_hash);
+        if (!hash) return;
         let wasOffline = false;
         onlineFriends.update((s) => {
           if (s.has(hash)) return s;
@@ -157,12 +168,16 @@ export async function initFriendsStore() {
     );
     registered.push(
       await listen<{ user_hash: string }>('ember:friend-offline', (event) => {
-        onlineFriends.update((s) => { const next = new Set(s); next.delete(event.payload.user_hash); return next; });
+        const hash = validFriendHash(event.payload?.user_hash);
+        if (!hash) return;
+        onlineFriends.update((s) => { const next = new Set(s); next.delete(hash); return next; });
       }),
     );
     registered.push(
       await listen<{ user_hash: string; direction: string; message?: string; timestamp?: number }>('ember:chat-message', (event) => {
         const p = event.payload;
+        const hash = validFriendHash(p?.user_hash);
+        if (!hash) return;
         if (p.direction !== 'received') return;
         // Suppress backend double-emits so the unread badge counts each
         // inbound message once (see `recentChatSigs` above).
@@ -170,7 +185,7 @@ export async function initFriendsStore() {
         for (const [k, exp] of recentChatSigs) {
           if (exp <= now) recentChatSigs.delete(k);
         }
-        const sig = `${p.user_hash}|${p.timestamp ?? ''}|${p.message ?? ''}`;
+        const sig = `${hash}|${p.timestamp ?? ''}|${safeEventText(p.message)}`;
         if (recentChatSigs.has(sig)) return;
         recentChatSigs.set(sig, now + CHAT_SIG_TTL_MS);
         // If the chat with this friend is open and focused, the
@@ -178,10 +193,10 @@ export async function initFriendsStore() {
         // `unreadCounts` would leave a phantom badge until the
         // tab loses focus and is reactivated. `ChatConversation`
         // separately marks the message read on the backend.
-        if (get(activeChatHash) === p.user_hash) return;
+        if (get(activeChatHash) === hash) return;
         unreadCounts.update((m) => {
           const next = new Map(m);
-          next.set(p.user_hash, (next.get(p.user_hash) || 0) + 1);
+          next.set(hash, (next.get(hash) || 0) + 1);
           return next;
         });
       }),
@@ -190,7 +205,10 @@ export async function initFriendsStore() {
       await listen<{ sender_hash: string; nickname: string; verified?: boolean }>(
         'ember:friend-request',
         (event) => {
-          const { sender_hash, nickname, verified } = event.payload;
+          const sender_hash = validFriendHash(event.payload?.sender_hash);
+          if (!sender_hash) return;
+          const nickname = safeEventText(event.payload?.nickname, 128);
+          const verified = event.payload?.verified;
           // Optimistic merge from the event payload so we don't pay
           // for a full DB round-trip on every inbound request. The
           // backend may emit the same logical request twice in quick
@@ -233,8 +251,10 @@ export async function initFriendsStore() {
     );
     registered.push(
       await listen<{ user_hash: string }>('ember:friend-confirmed', (event) => {
-        searchingFriends.update((s) => { const next = new Set(s); next.delete(event.payload.user_hash); return next; });
-        clearSearchTimer(event.payload.user_hash);
+        const hash = validFriendHash(event.payload?.user_hash);
+        if (!hash) return;
+        searchingFriends.update((s) => { const next = new Set(s); next.delete(hash); return next; });
+        clearSearchTimer(hash);
         // A confirm (manual accept or auto-confirm) can introduce a brand-new
         // mutual friend; refresh the name map so a later online toast can name
         // them.
@@ -243,22 +263,28 @@ export async function initFriendsStore() {
     );
     registered.push(
       await listen<{ discoverable: boolean; nodes: number }>('ember:friend-discoverable', (event) => {
-        isDiscoverable.set(event.payload.discoverable);
+        if (typeof event.payload?.discoverable === 'boolean') {
+          isDiscoverable.set(event.payload.discoverable);
+        }
       }),
     );
     registered.push(
       await listen<{ user_hash: string }>('ember:friend-searching', (event) => {
-        searchingFriends.update((s) => new Set([...s, event.payload.user_hash]));
+        const hash = validFriendHash(event.payload?.user_hash);
+        if (!hash) return;
+        searchingFriends.update((s) => new Set([...s, hash]));
         // Arm/refresh the auto-clear so a missing terminal event
         // (e.g. backend crash mid-search) doesn't strand the
         // spinner.
-        armSearchTimer(event.payload.user_hash);
+        armSearchTimer(hash);
       }),
     );
     registered.push(
       await listen<{ user_hash: string; reason?: string }>('ember:friend-search-failed', (event) => {
-        searchingFriends.update((s) => { const next = new Set(s); next.delete(event.payload.user_hash); return next; });
-        clearSearchTimer(event.payload.user_hash);
+        const hash = validFriendHash(event.payload?.user_hash);
+        if (!hash) return;
+        searchingFriends.update((s) => { const next = new Set(s); next.delete(hash); return next; });
+        clearSearchTimer(hash);
       }),
     );
   } catch (e) {
@@ -337,7 +363,13 @@ export function clearFriendSearch(friendHash: string) {
 }
 
 export function cleanupFriendsStore() {
-  for (const unlisten of unlisteners) unlisten();
+  for (const unlisten of unlisteners) {
+    try {
+      unlisten();
+    } catch (e) {
+      console.warn('Failed to unlisten friends store listener:', e);
+    }
+  }
   unlisteners = [];
   initialized = false;
   if (friendRequestRefetchTimer !== null) {
