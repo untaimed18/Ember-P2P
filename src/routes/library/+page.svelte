@@ -134,6 +134,7 @@
   }
 
   const COLLECTION_PICKER_DISPLAY_LIMIT = 500;
+  const LOADED_COLLECTION_DISPLAY_LIMIT = 1000;
 
   let collectionSearch = $state('');
   let collectionFilteredFiles = $derived.by(() => {
@@ -143,6 +144,9 @@
   });
   let displayedCollectionFiles = $derived.by(() =>
     collectionFilteredFiles.slice(0, COLLECTION_PICKER_DISPLAY_LIMIT)
+  );
+  let displayedLoadedCollectionFiles = $derived.by(() =>
+    loadedCollection ? loadedCollection.files.slice(0, LOADED_COLLECTION_DISPLAY_LIMIT) : []
   );
 
   function openCreateDialog(preselectHashes?: Iterable<string>) {
@@ -1956,6 +1960,14 @@
         {#if collectionLoading}
           <div class="coll-loading"><span class="scan-spinner"></span> {m.library_loading_collection()}</div>
         {:else if loadedCollection}
+          {#if loadedCollection.files.length > displayedLoadedCollectionFiles.length}
+            <div class="coll-pick-note">
+              {m.library_status_showing({
+                shown: displayedLoadedCollectionFiles.length.toLocaleString(),
+                total: loadedCollection.files.length.toLocaleString()
+              })}
+            </div>
+          {/if}
           <table class="compact-table coll-table">
             <thead>
               <tr>
@@ -1965,7 +1977,7 @@
               </tr>
             </thead>
             <tbody>
-              {#each loadedCollection.files as cf (cf.hash)}
+              {#each displayedLoadedCollectionFiles as cf (cf.hash)}
                 <tr>
                   <td title={cf.name}>{cf.name}</td>
                   <td class="coll-col-size">{formatSize(cf.size)}</td>
@@ -2567,6 +2579,7 @@
                     class="comment-input"
                     placeholder={m.library_add_comment_placeholder()}
                     bind:value={ourComment}
+                    maxlength="4096"
                     rows="2"
                     onkeydown={(e) => {
                       if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {

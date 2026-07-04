@@ -61,20 +61,27 @@ impl LocalIndex {
         self.rebuild_indices();
     }
 
-    pub fn reconcile_files_for_folders(&mut self, folders: &[String], discovered: Vec<FileInfo>) {
+    pub fn reconcile_files_for_folders(
+        &mut self,
+        folders: &[String],
+        discovered: Vec<FileInfo>,
+        remove_missing: bool,
+    ) {
         // Use case-normalized keys so a discovered file isn't dropped (then
         // re-added) just because its path casing differs from the stored one
         // on a case-insensitive filesystem.
-        let discovered_keys: HashSet<String> = discovered
-            .iter()
-            .map(|file| normalize_path_key(&file.path))
-            .collect();
-        self.files.retain(|file| {
-            !folders
+        if remove_missing {
+            let discovered_keys: HashSet<String> = discovered
                 .iter()
-                .any(|folder| crate::security::path_matches_dir(&file.path, folder))
-                || discovered_keys.contains(&normalize_path_key(&file.path))
-        });
+                .map(|file| normalize_path_key(&file.path))
+                .collect();
+            self.files.retain(|file| {
+                !folders
+                    .iter()
+                    .any(|folder| crate::security::path_matches_dir(&file.path, folder))
+                    || discovered_keys.contains(&normalize_path_key(&file.path))
+            });
+        }
         for file in discovered {
             self.upsert_file(file);
         }

@@ -269,6 +269,7 @@ export async function initSearchStore() {
     registered.push(await listen<{ request_id: number; results: SearchResult[] }>('search-results', (event) => {
       const requestId = event.payload.request_id;
       const incoming = event.payload.results;
+      if (!Array.isArray(incoming)) return;
       if (dev) {
         const origins = new Set(incoming.map((r) => r.result_origin).filter(Boolean));
         if (origins.size > 0) {

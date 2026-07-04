@@ -324,7 +324,9 @@ export async function initTransferStore() {
   try {
     await safeListen<Transfer>('transfer-started', (event) => {
       markEventUpdate();
-      const t = event.payload;
+      const narrowed = narrowStatus(event.payload?.status);
+      if (!narrowed) return;
+      const t = { ...event.payload, status: narrowed };
       transfers.update((list) => {
         if (list.some((x) => x.id === t.id)) return list;
         return [...list, t];

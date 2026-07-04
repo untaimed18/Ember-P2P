@@ -12,18 +12,25 @@ pub struct FileIndexer;
 
 const MAX_DISCOVERED_FILES: usize = 100_000;
 
+#[derive(Debug, Default)]
+pub struct DiscoveryResult {
+    pub files: Vec<FileInfo>,
+    pub truncated: bool,
+}
+
 impl FileIndexer {
     /// Quickly discover files in a directory -- metadata only, no hashing.
     /// Files are returned with empty hash/aich_hash so they can be shown in the
     /// UI immediately.  A temporary id is generated from the path so the file
     /// can be identified until its real ED2K hash is computed.
-    pub fn discover_directory(dir: &str) -> Vec<FileInfo> {
+    pub fn discover_directory(dir: &str) -> DiscoveryResult {
         let mut files = Vec::new();
+        let mut truncated = false;
         let path = Path::new(dir);
 
         if !path.exists() || !path.is_dir() {
             warn!("Directory does not exist or is not a directory: {dir}");
-            return files;
+            return DiscoveryResult { files, truncated };
         }
 
         info!("Discovering files in: {dir}");
@@ -77,6 +84,7 @@ impl FileIndexer {
                             warn!(
                                 "Stopping discovery in {dir}: reached file cap {MAX_DISCOVERED_FILES}"
                             );
+                            truncated = true;
                             break;
                         }
                     }
@@ -88,7 +96,7 @@ impl FileIndexer {
         }
 
         info!("Discovered {} files from {dir}", files.len());
-        files
+        DiscoveryResult { files, truncated }
     }
 
     /// Collect file metadata WITHOUT hashing (instant).

@@ -874,9 +874,7 @@ fn read_udp_search_tag(
             if let Ok(v) = cursor.read_u32::<LittleEndian>() {
                 match name_id {
                     0x02 => *file_size = (*file_size & 0xFFFF_FFFF_0000_0000) | v as u64,
-                    0x3A => {
-                        *file_size = (*file_size & 0x0000_0000_FFFF_FFFF) | ((v as u64) << 32)
-                    }
+                    0x3A => *file_size = (*file_size & 0x0000_0000_FFFF_FFFF) | ((v as u64) << 32),
                     _ => apply_udp_uint_tag(name_id, tag_name, v as u64, rating, media),
                 }
                 true
@@ -1013,6 +1011,13 @@ fn parse_search_results(payload: &[u8]) -> Option<ServerUdpResponse> {
             Ok(v) => v as usize,
             Err(_) => break,
         };
+        const MAX_DECLARED_RESULT_TAGS: usize = 4096;
+        if tag_count > MAX_DECLARED_RESULT_TAGS {
+            tracing::debug!(
+                "Dropping UDP search-result packet with excessive tag count {tag_count} (cap {MAX_DECLARED_RESULT_TAGS})"
+            );
+            break;
+        }
 
         let mut file_name = String::new();
         let mut file_size: u64 = 0;

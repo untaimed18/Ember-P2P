@@ -77,10 +77,16 @@ enum PeriodicSaveJob {
     Stats,
     Reputation,
     Known2,
+    Nodes,
 }
 
 struct PeriodicSaveResult {
     job: PeriodicSaveJob,
+    result: Result<(), String>,
+}
+
+struct SpamSaveResult {
+    generation: u64,
     result: Result<(), String>,
 }
 
@@ -99,6 +105,10 @@ struct NatProbeResult {
     reason: &'static str,
     info: ember::nat::NatInfo,
 }
+
+const PERIODIC_SAVE_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(300);
+const SHORT_IO_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(60);
+const NAT_PROBE_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(20);
 
 fn spawn_nat_probe(
     udp_socket: Arc<UdpSocket>,
@@ -437,7 +447,15 @@ async fn handle_epx_sources(
         }
         if let Some(ref mut broker) = state.connection_broker {
             let hash = ember::relay_attestation_hash(attestation);
-            broker.add_relay_candidate(attestation.relay_ip, attestation.relay_port, hash);
+            let relay_ember_hash =
+                ember::crypto::verifying_key_from_bytes(&attestation.ed25519_pubkey)
+                    .map(|vk| ember::crypto::node_id_from_public_key(&vk));
+            broker.add_relay_candidate(
+                attestation.relay_ip,
+                attestation.relay_port,
+                hash,
+                relay_ember_hash,
+            );
         }
     }
 
@@ -867,9 +885,16 @@ async fn send_kad_callback_req(
     // eMule BaseClient.cpp TryToConnect sends CallbackReq unencrypted
     // (`SendPacket(..., false, NULL, true, 0)`). Encrypting here breaks
     // delivery to buddies that expect a plain KADEMLIA_CALLBACK_REQ.
-    let _ = udp_socket.send_to(&packet, buddy_addr_raw).await;
-    let _ = udp_socket.send_to(&packet, buddy_addr_alt).await;
-    true
+    let mut sent_any = false;
+    match udp_socket.send_to(&packet, buddy_addr_raw).await {
+        Ok(_) => sent_any = true,
+        Err(e) => warn!("Failed to send KAD CallbackReq to {buddy_addr_raw}: {e}"),
+    }
+    match udp_socket.send_to(&packet, buddy_addr_alt).await {
+        Ok(_) => sent_any = true,
+        Err(e) => warn!("Failed to send KAD CallbackReq to {buddy_addr_alt}: {e}"),
+    }
+    sent_any
 }
 
 fn pending_download_retry_interval(search_count: u32) -> i64 {
@@ -1309,6 +1334,14 @@ async fn process_inbound_friend_request(
     peer_port: u16,
     verified: bool,
 ) {
+    enum FriendRequestDbOutcome {
+        AlreadyMutual,
+        Promoted,
+        PromotionSkipped,
+        Queued,
+        Failed(String),
+    }
+
     let hash_hex = hex::encode(req_hash);
     info!(
         "Processing inbound friend request from {} (nick='{}', ip={}:{}, verified={verified})",
@@ -1316,41 +1349,54 @@ async fn process_inbound_friend_request(
     );
     let db_q = db.clone();
     let h_q = hash_hex.clone();
-    let (is_friend, already_mutual) = tokio::task::spawn_blocking(move || {
-        db_q.get_friends_full()
+    let n_q = nickname.to_string();
+    let ip_q = peer_ip.to_string();
+    let db_outcome = tokio::task::spawn_blocking(move || {
+        let (is_friend, already_mutual) = db_q
+            .get_friends_full()
             .ok()
             .and_then(|rows| {
                 rows.into_iter()
                     .find(|(h, ..)| h == &h_q)
                     .map(|(_, _, _, _, _, _, mutual)| (true, mutual))
             })
-            .unwrap_or((false, false))
+            .unwrap_or((false, false));
+        if already_mutual {
+            FriendRequestDbOutcome::AlreadyMutual
+        } else if is_friend && !require_approval {
+            match db_q.set_friend_mutual(&h_q, &ip_q, peer_port) {
+                Ok(n) if n > 0 => FriendRequestDbOutcome::Promoted,
+                Ok(_) => FriendRequestDbOutcome::PromotionSkipped,
+                Err(e) => FriendRequestDbOutcome::Failed(e.to_string()),
+            }
+        } else {
+            match db_q.add_friend_request(&h_q, &n_q, &ip_q, peer_port, verified) {
+                Ok(()) => FriendRequestDbOutcome::Queued,
+                Err(e) => FriendRequestDbOutcome::Failed(e.to_string()),
+            }
+        }
     })
     .await
-    .unwrap_or((false, false));
-    if already_mutual {
-        info!(
-            "Friend {} already mutual — ignoring redundant EmberFriendRequest",
-            hash_hex
-        );
-    } else if is_friend && !require_approval {
-        // Auto-confirm: the user already added this peer and disabled "require
-        // approval", so a reciprocal request upgrades the friendship to mutual
-        // without prompting. Strangers (not already in our list) still fall
-        // through to the approval queue — we never auto-add an unknown peer.
-        info!(
-            "Auto-confirming friend {} (already added; approval not required)",
-            hash_hex
-        );
-        let db2 = db.clone();
-        let h2 = hash_hex.clone();
-        let ip2 = peer_ip.to_string();
-        let promoted =
-            tokio::task::spawn_blocking(move || db2.set_friend_mutual(&h2, &ip2, peer_port))
-                .await
-                .unwrap_or(Ok(0))
-                .unwrap_or(0);
-        if promoted > 0 {
+    .unwrap_or_else(|e| {
+        FriendRequestDbOutcome::Failed(format!("friend-request DB task failed: {e}"))
+    });
+
+    match db_outcome {
+        FriendRequestDbOutcome::AlreadyMutual => {
+            info!(
+                "Friend {} already mutual — ignoring redundant EmberFriendRequest",
+                hash_hex
+            );
+        }
+        FriendRequestDbOutcome::Promoted => {
+            // Auto-confirm: the user already added this peer and disabled "require
+            // approval", so a reciprocal request upgrades the friendship to mutual
+            // without prompting. Strangers (not already in our list) still fall
+            // through to the approval queue — we never auto-add an unknown peer.
+            info!(
+                "Auto-confirming friend {} (already added; approval not required)",
+                hash_hex
+            );
             if !online_friends.contains_key(&req_hash) {
                 online_friends.insert(req_hash, chrono::Utc::now().timestamp());
                 let _ = app_handle.emit(
@@ -1367,23 +1413,26 @@ async fn process_inbound_friend_request(
                 }),
             );
         }
-    } else {
-        info!("Queuing friend request from {} for user approval", hash_hex);
-        let db2 = db.clone();
-        let h2 = hash_hex.clone();
-        let n2 = nickname.to_string();
-        let ip2 = peer_ip.to_string();
-        let _ = tokio::task::spawn_blocking(move || {
-            db2.add_friend_request(&h2, &n2, &ip2, peer_port, verified)
-        });
-        let _ = app_handle.emit(
-            "ember:friend-request",
-            serde_json::json!({
-                "sender_hash": hash_hex,
-                "nickname": nickname,
-                "verified": verified,
-            }),
-        );
+        FriendRequestDbOutcome::PromotionSkipped => {
+            debug!(
+                "Friend {} promotion skipped because no DB row changed",
+                hash_hex
+            );
+        }
+        FriendRequestDbOutcome::Queued => {
+            info!("Queuing friend request from {} for user approval", hash_hex);
+            let _ = app_handle.emit(
+                "ember:friend-request",
+                serde_json::json!({
+                    "sender_hash": hash_hex,
+                    "nickname": nickname,
+                    "verified": verified,
+                }),
+            );
+        }
+        FriendRequestDbOutcome::Failed(e) => {
+            warn!("Failed to persist inbound friend request from {hash_hex}: {e}");
+        }
     }
 }
 
@@ -1620,14 +1669,20 @@ fn spawn_rendezvous_friend_lookup(
         // misleading `ember:friend-offline` / `ember:browse-error`
         // events for a peer who was never online from the user's
         // point of view.
-        let _ = ultx_fc
+        if let Err(e) = ultx_fc
             .send(upload_server::UploadEvent {
                 transfer_id: String::new(),
                 kind: upload_server::UploadEventKind::EmberFriendSearchFailed {
                     ember_hash: target_hash,
                 },
             })
-            .await;
+            .await
+        {
+            warn!(
+                "Failed to release rendezvous friend lookup slot for {}: {e}",
+                hex::encode(target_hash)
+            );
+        }
     });
 }
 
@@ -1738,14 +1793,21 @@ mod tests {
 
         let mut batch1 = vec![sample_search_result("aaaa"), sample_search_result("bbbb")];
         dedup_streamed_batch(&mut active, 42, &mut batch1);
-        assert_eq!(batch1.len(), 2, "first sighting of both hashes must pass through");
+        assert_eq!(
+            batch1.len(),
+            2,
+            "first sighting of both hashes must pass through"
+        );
 
         // "aaaa" reappears (a different node/server re-announcing the same
         // file); "cccc" is genuinely new.
         let mut batch2 = vec![sample_search_result("aaaa"), sample_search_result("cccc")];
         dedup_streamed_batch(&mut active, 42, &mut batch2);
         assert_eq!(
-            batch2.iter().map(|r| r.file.hash.as_str()).collect::<Vec<_>>(),
+            batch2
+                .iter()
+                .map(|r| r.file.hash.as_str())
+                .collect::<Vec<_>>(),
             vec!["cccc"],
             "already-streamed hash must be dropped, new hash must pass through"
         );
@@ -1760,7 +1822,11 @@ mod tests {
         let mut none_active: Option<ActiveSearchRequest> = None;
         let mut batch = vec![sample_search_result("aaaa")];
         dedup_streamed_batch(&mut none_active, 1, &mut batch);
-        assert_eq!(batch.len(), 1, "no active search at all must not filter anything");
+        assert_eq!(
+            batch.len(),
+            1,
+            "no active search at all must not filter anything"
+        );
 
         let mut active = Some(sample_active_search_request(1));
         let mut batch = vec![sample_search_result("aaaa")];
@@ -1791,7 +1857,10 @@ mod tests {
         ];
         dedup_streamed_batch(&mut active, 7, &mut batch);
         assert_eq!(
-            batch.iter().map(|r| r.file.hash.as_str()).collect::<Vec<_>>(),
+            batch
+                .iter()
+                .map(|r| r.file.hash.as_str())
+                .collect::<Vec<_>>(),
             vec!["brand-new"],
             "already-tracked hash must still be dropped even past the soft cap, \
              and a genuinely new hash must still pass through"
@@ -4552,6 +4621,31 @@ async fn flush_credit_state(
     }
 }
 
+fn spawn_credit_flush(
+    credit_manager: Arc<RwLock<CreditManager>>,
+    db: Arc<Database>,
+    data_dir: std::path::PathBuf,
+    cleanup_stale: bool,
+    in_flight: Arc<std::sync::atomic::AtomicBool>,
+) {
+    if in_flight
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        debug!("Skipping credit flush: previous flush is still in flight");
+        return;
+    }
+    tokio::spawn(async move {
+        flush_credit_state(&credit_manager, &db, &data_dir, cleanup_stale).await;
+        in_flight.store(false, std::sync::atomic::Ordering::Release);
+    });
+}
+
 fn server_entry_to_info(server: &ServerEntry) -> ServerInfo {
     ServerInfo {
         ip: server.ip.clone(),
@@ -4977,8 +5071,8 @@ fn apply_persistent_ip_ban(
     }
 }
 
-async fn peers_snapshot(state: &NetworkState, db: &Arc<Database>) -> Vec<PeerInfo> {
-    let mut peers: Vec<PeerInfo> = state
+fn routing_peers_snapshot(state: &NetworkState) -> Vec<PeerInfo> {
+    state
         .routing_table
         .all_contacts()
         .take(200)
@@ -4994,15 +5088,10 @@ async fn peers_snapshot(state: &NetworkState, db: &Arc<Database>) -> Vec<PeerInf
             files_shared: 0,
             banned: false,
         })
-        .collect();
+        .collect()
+}
 
-    let saved_peers = tokio::task::spawn_blocking({
-        let db = db.clone();
-        move || db.get_peers().unwrap_or_default()
-    })
-    .await
-    .unwrap_or_default();
-
+fn merge_saved_peers(mut peers: Vec<PeerInfo>, saved_peers: Vec<PeerInfo>) -> Vec<PeerInfo> {
     for saved in saved_peers {
         if let Some(existing) = peers.iter_mut().find(|peer| peer.id == saved.id) {
             if !saved.nickname.is_empty() {
@@ -6787,6 +6876,8 @@ pub async fn start_network(
         mpsc::unbounded_channel::<KnownMetSaveResult>();
     let (periodic_save_result_tx, mut periodic_save_result_rx) =
         mpsc::unbounded_channel::<PeriodicSaveResult>();
+    let (spam_save_result_tx, mut spam_save_result_rx) =
+        mpsc::unbounded_channel::<SpamSaveResult>();
     let (upnp_maintain_result_tx, mut upnp_maintain_result_rx) =
         mpsc::unbounded_channel::<UpnpMaintainResult>();
     let (rendezvous_register_result_tx, mut rendezvous_register_result_rx) =
@@ -6795,13 +6886,25 @@ pub async fn start_network(
         mpsc::unbounded_channel::<NatProbeResult>();
     let mut nat_probe_packet_tx: Option<mpsc::Sender<(Vec<u8>, SocketAddr)>> = None;
     let mut known_met_save_in_flight = false;
+    let mut known_met_save_started_at: Option<tokio::time::Instant> = None;
     let mut stats_save_in_flight = false;
+    let mut stats_save_started_at: Option<tokio::time::Instant> = None;
     let mut reputation_save_in_flight = false;
+    let mut reputation_save_started_at: Option<tokio::time::Instant> = None;
     let mut known2_save_in_flight = false;
+    let mut known2_save_started_at: Option<tokio::time::Instant> = None;
+    let mut nodes_save_in_flight = false;
+    let mut nodes_save_started_at: Option<tokio::time::Instant> = None;
+    let mut spam_save_in_flight = false;
+    let mut spam_save_started_at: Option<tokio::time::Instant> = None;
     let mut upnp_maintain_in_flight = false;
+    let mut upnp_maintain_started_at: Option<tokio::time::Instant> = None;
     let mut rendezvous_register_in_flight = false;
+    let mut rendezvous_register_started_at: Option<tokio::time::Instant> = None;
     let mut nat_probe_in_flight = false;
+    let mut nat_probe_started_at: Option<tokio::time::Instant> = None;
     let mut nat_probe_backoff_until: Option<tokio::time::Instant> = None;
+    let credit_flush_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut last_server_activity_at = chrono::Utc::now().timestamp();
     let mut last_kad_activity_at = chrono::Utc::now().timestamp();
     let mut last_cache_refresh_started_at = 0i64;
@@ -7257,6 +7360,7 @@ pub async fn start_network(
             })
         {
             nat_probe_in_flight = true;
+            nat_probe_started_at = Some(tokio::time::Instant::now());
             nat_probe_packet_tx = Some(spawn_nat_probe(
                 udp_socket.clone(),
                 nat_probe_result_tx.clone(),
@@ -8181,7 +8285,8 @@ pub async fn start_network(
                 if let DownloadEvent::EmberBrowseResponse { ember_hash: browse_ember_hash, ref entries } = event {
                     let hash_hex = hex::encode(browse_ember_hash);
                     let files: Vec<serde_json::Value> = entries.iter().map(|(hash, size, name)| {
-                        serde_json::json!({ "hash": hash, "size": size, "name": name })
+                        let clean_name = crate::security::sanitize_display_name(name);
+                        serde_json::json!({ "hash": hash, "size": size, "name": clean_name })
                     }).collect();
                     let _ = app_handle.emit("ember:browse-result", serde_json::json!({
                         "user_hash": hash_hex,
@@ -8848,7 +8953,9 @@ pub async fn start_network(
                 }
 
                 if let UploadEventKind::EmberBrowseRequest { ember_hash: browse_eh } = event.kind {
-                    if !settings.friend_browse_disabled {
+                    if !settings.friend_browse_disabled
+                        && friend_hashes.read().await.contains(&browse_eh)
+                    {
                         let hash_hex = hex::encode(browse_eh);
                         let files = {
                             let idx = local_index.read().await;
@@ -8916,7 +9023,8 @@ pub async fn start_network(
                 if let UploadEventKind::EmberBrowseResponse { ember_hash: browse_eh, ref entries } = event.kind {
                     let hash_hex = hex::encode(browse_eh);
                     let files: Vec<serde_json::Value> = entries.iter().map(|(hash, size, name)| {
-                        serde_json::json!({ "hash": hash, "size": size, "name": name })
+                        let clean_name = crate::security::sanitize_display_name(name);
+                        serde_json::json!({ "hash": hash, "size": size, "name": clean_name })
                     }).collect();
                     let _ = app_handle.emit("ember:browse-result", serde_json::json!({
                         "user_hash": hash_hex,
@@ -11406,6 +11514,7 @@ pub async fn start_network(
                         if !nat_probe_in_flight {
                             info!("External IP discovered via firewall check — scheduling initial NAT probe");
                             nat_probe_in_flight = true;
+                            nat_probe_started_at = Some(tokio::time::Instant::now());
                             nat_probe_packet_tx = Some(spawn_nat_probe(
                                 udp_socket.clone(),
                                 nat_probe_result_tx.clone(),
@@ -11685,10 +11794,24 @@ pub async fn start_network(
                                         // no gateway is known yet: `map_quic_port` then
                                         // just records the port so the periodic
                                         // `maintain` maps it once discovery succeeds.
-                                        if upnp_enabled {
-                                            if upnp_mappings.map_quic_port(bound_port).await {
-                                                tracing::info!("UPnP: QUIC UDP port {bound_port} mapped");
-                                            }
+                                        if upnp_enabled && !upnp_maintain_in_flight {
+                                            let mut mappings = upnp_mappings.clone();
+                                            let revision = mappings.revision();
+                                            let tx = upnp_maintain_result_tx.clone();
+                                            upnp_maintain_in_flight = true;
+                                            upnp_maintain_started_at =
+                                                Some(tokio::time::Instant::now());
+                                            tokio::spawn(async move {
+                                                let mapped = mappings.map_quic_port(bound_port).await;
+                                                if mapped {
+                                                    tracing::info!("UPnP: QUIC UDP port {bound_port} mapped");
+                                                }
+                                                let _ = tx.send(UpnpMaintainResult {
+                                                    revision,
+                                                    mappings,
+                                                    mapped,
+                                                });
+                                            });
                                         }
                                     }
                                     Err(e) => {
@@ -11768,6 +11891,7 @@ pub async fn start_network(
                             if settings.ember_native_enabled { Some(udp_port) } else { None };
                         let tx = rendezvous_register_result_tx.clone();
                         rendezvous_register_in_flight = true;
+                        rendezvous_register_started_at = Some(tokio::time::Instant::now());
                         tokio::spawn(async move {
                             let result =
                                 rendezvous::register(
@@ -11889,6 +12013,14 @@ pub async fn start_network(
                 // `external_ip` without resetting the registered flag we
                 // would otherwise hit `register()`'s required-IP contract
                 // and panic the spawned task.
+                if rendezvous_register_in_flight
+                    && rendezvous_register_started_at
+                        .is_some_and(|started| started.elapsed() > std::time::Duration::from_secs(60))
+                {
+                    warn!("Rendezvous registration exceeded watchdog timeout; allowing retry");
+                    rendezvous_register_in_flight = false;
+                    rendezvous_register_started_at = None;
+                }
                 if state.rendezvous_registered && !rendezvous_register_in_flight {
                     let needs_heartbeat = state.rendezvous_last_register
                         .map(|t| t.elapsed() >= std::time::Duration::from_secs(120))
@@ -11919,6 +12051,7 @@ pub async fn start_network(
                                 if settings.ember_native_enabled { Some(udp_port) } else { None };
                             let tx = rendezvous_register_result_tx.clone();
                             rendezvous_register_in_flight = true;
+                            rendezvous_register_started_at = Some(tokio::time::Instant::now());
                             tokio::spawn(async move {
                                 let result =
                                     rendezvous::register(
@@ -12610,6 +12743,7 @@ pub async fn start_network(
                 if state.nat_info.needs_reprobe() && state.external_ip.is_some() {
                     if !nat_probe_in_flight {
                         nat_probe_in_flight = true;
+                        nat_probe_started_at = Some(tokio::time::Instant::now());
                         nat_probe_packet_tx = Some(spawn_nat_probe(
                             udp_socket.clone(),
                             nat_probe_result_tx.clone(),
@@ -12910,7 +13044,7 @@ pub async fn start_network(
                                     }
                                 });
                             }
-                            ember::broker::BrokerEvent::StartRelay { ref attempt_key, source_ip, source_port, file_hash, relay_addr, relay_attestation_hash, .. } => {
+                            ember::broker::BrokerEvent::StartRelay { ref attempt_key, source_ip, source_port, file_hash, relay_addr, relay_attestation_hash, relay_ember_hash, .. } => {
                                 tracing::info!("Broker: initiating relay for {} -> {}:{} (relay={:?})", attempt_key, source_ip, source_port, relay_addr);
 
                                 let attempt_key_owned = attempt_key.clone();
@@ -12950,12 +13084,15 @@ pub async fn start_network(
                                             std::net::IpAddr::V4(relay_ip), relay_port,
                                         );
 
-                                        // `None` pin: relay candidates arrive via EPX carrying an
-                                        // attestation hash, not the relay peer's ember_hash, so the
-                                        // QUIC cert's node id can't be pinned here; fall back to the
-                                        // unpinned (but still Ember-cert-validated) verifier.
+                                        let relay_pin = relay_ember_hash.map(|hash| {
+                                            (
+                                                ed25519_pubkey.as_ref(),
+                                                ed25519_secret_key.as_ref(),
+                                                hash,
+                                            )
+                                        });
                                         match ember::relay::connect_to_peer_relay(
-                                            &endpoint, relay_addr, source_ip, source_port, &file_hash, relay_attestation_hash, None,
+                                            &endpoint, relay_addr, source_ip, source_port, &file_hash, relay_attestation_hash, relay_pin,
                                         ).await {
                                             Ok((send, recv)) => {
                                                 tracing::info!("Broker: peer relay connected via {relay_addr}");
@@ -15096,7 +15233,13 @@ pub async fn start_network(
 
             // Periodic credit save to database (with stale record cleanup)
             _ = credit_save_timer.tick() => {
-                flush_credit_state(&credit_manager, &db, &state.data_dir, true).await;
+                spawn_credit_flush(
+                    credit_manager.clone(),
+                    db.clone(),
+                    state.data_dir.clone(),
+                    true,
+                    credit_flush_in_flight.clone(),
+                );
             }
 
             // A4AF swap evaluation every 8 minutes
@@ -16790,6 +16933,7 @@ pub async fn start_network(
                                     if !nat_probe_in_flight {
                                         info!("External IP discovered via server HighID — scheduling initial NAT probe");
                                         nat_probe_in_flight = true;
+                                        nat_probe_started_at = Some(tokio::time::Instant::now());
                                         nat_probe_packet_tx = Some(spawn_nat_probe(
                                             udp_socket.clone(),
                                             nat_probe_result_tx.clone(),
@@ -17732,17 +17876,35 @@ pub async fn start_network(
                                         }
                                         break;
                                     }
-                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_es)) => {
-                                        warn!(
-                                            "Established-stream channel full for {tid}; dropping callback stream from {cb_peer_ip}:{cb_peer_port}",
-                                        );
-                                        // Stream value consumed by
-                                        // try_send and dropped here.
-                                        // Don't try other matching
-                                        // downloads — only one of
-                                        // them needed the stream and
-                                        // we already lost it.
-                                        break;
+                                    Err(tokio::sync::mpsc::error::TrySendError::Full(es)) => {
+                                        match tokio::time::timeout(
+                                            std::time::Duration::from_millis(250),
+                                            tx.reserve(),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(permit)) => {
+                                                permit.send(es);
+                                                info!(
+                                                    "Adopted LowID callback stream from {cb_peer_ip}:{cb_peer_port} into active download {tid} after bounded wait for {hash_hex}",
+                                                );
+                                                stream_dispatched = true;
+                                                break;
+                                            }
+                                            Ok(Err(_closed)) => {
+                                                debug!(
+                                                    "Established-stream channel closed for {tid} while waiting; trying next match",
+                                                );
+                                                closed_senders.push(tid.clone());
+                                                pending_stream = Some(es.stream);
+                                            }
+                                            Err(_) => {
+                                                warn!(
+                                                    "Established-stream channel full for {tid}; preserving callback stream for another match",
+                                                );
+                                                pending_stream = Some(es.stream);
+                                            }
+                                        }
                                     }
                                     Err(tokio::sync::mpsc::error::TrySendError::Closed(es)) => {
                                         debug!(
@@ -17821,10 +17983,25 @@ pub async fn start_network(
 
             // Periodic nodes.dat save to protect against crashes
             _ = nodes_save_timer.tick() => {
-                let contacts = state.routing_table.export_bootstrap_contacts(200);
-                let nodes_path = state.data_dir.join("nodes.dat");
-                if let Err(e) = bootstrap::save_nodes_dat(&nodes_path, &contacts) {
-                    error!("Failed periodic nodes.dat save: {e}");
+                if !nodes_save_in_flight {
+                    let contacts = state.routing_table.export_bootstrap_contacts(200);
+                    let nodes_path = state.data_dir.join("nodes.dat");
+                    let tx = periodic_save_result_tx.clone();
+                    nodes_save_in_flight = true;
+                    nodes_save_started_at = Some(tokio::time::Instant::now());
+                    tokio::spawn(async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            bootstrap::save_nodes_dat(&nodes_path, &contacts)
+                                .map_err(|e| e.to_string())
+                        })
+                        .await
+                        .map_err(|e| format!("nodes.dat save task failed: {e}"))
+                        .and_then(|r| r);
+                        let _ = tx.send(PeriodicSaveResult {
+                            job: PeriodicSaveJob::Nodes,
+                            result,
+                        });
+                    });
                 }
 
                 // Persist the Ember DHT routing table too (slice 7). Skip
@@ -17852,6 +18029,7 @@ pub async fn start_network(
                     let mut mappings = upnp_mappings.clone();
                     let tx = upnp_maintain_result_tx.clone();
                     upnp_maintain_in_flight = true;
+                    upnp_maintain_started_at = Some(tokio::time::Instant::now());
                     tokio::spawn(async move {
                         let mapped = mappings.maintain().await;
                         let _ = tx.send(UpnpMaintainResult {
@@ -17865,6 +18043,7 @@ pub async fn start_network(
 
             Some(result) = upnp_maintain_result_rx.recv() => {
                 upnp_maintain_in_flight = false;
+                upnp_maintain_started_at = None;
                 if result.revision == upnp_mappings.revision() {
                     let was_mapped = state.upnp_mapped;
                     upnp_mappings = result.mappings;
@@ -17906,6 +18085,7 @@ pub async fn start_network(
 
             Some(result) = nat_probe_result_rx.recv() => {
                 nat_probe_in_flight = false;
+                nat_probe_started_at = None;
                 nat_probe_packet_tx = None;
                 state.nat_info = result.info;
                 if state.nat_info.nat_type == ember::nat::NatType::Unknown {
@@ -17937,6 +18117,7 @@ pub async fn start_network(
 
             Some(result) = rendezvous_register_result_rx.recv() => {
                 rendezvous_register_in_flight = false;
+                rendezvous_register_started_at = None;
                 match result.result {
                     Ok(()) => {
                         state.rendezvous_registered = true;
@@ -18009,6 +18190,7 @@ pub async fn start_network(
 
             Some(result) = known_met_save_result_rx.recv() => {
                 known_met_save_in_flight = false;
+                known_met_save_started_at = None;
                 match result.result {
                     Ok(true) => known_files.mark_saved_if_generation(result.generation),
                     Ok(false) => {
@@ -18026,19 +18208,36 @@ pub async fn start_network(
                 let job_name = match result.job {
                     PeriodicSaveJob::Stats => {
                         stats_save_in_flight = false;
+                        stats_save_started_at = None;
                         "statistics"
                     }
                     PeriodicSaveJob::Reputation => {
                         reputation_save_in_flight = false;
+                        reputation_save_started_at = None;
                         "reputation.json"
                     }
                     PeriodicSaveJob::Known2 => {
                         known2_save_in_flight = false;
+                        known2_save_started_at = None;
                         "known2_64.met"
+                    }
+                    PeriodicSaveJob::Nodes => {
+                        nodes_save_in_flight = false;
+                        nodes_save_started_at = None;
+                        "nodes.dat"
                     }
                 };
                 if let Err(e) = result.result {
                     error!("Failed to save {job_name}: {e}");
+                }
+            }
+
+            Some(result) = spam_save_result_rx.recv() => {
+                spam_save_in_flight = false;
+                spam_save_started_at = None;
+                match result.result {
+                    Ok(()) => spam_filter.write().await.mark_saved(result.generation),
+                    Err(e) => warn!("Failed to save spam filter: {e}"),
                 }
             }
 
@@ -18049,6 +18248,7 @@ pub async fn start_network(
                     let db_for_save = db.clone();
                     let tx = periodic_save_result_tx.clone();
                     stats_save_in_flight = true;
+                    stats_save_started_at = Some(tokio::time::Instant::now());
                     tokio::spawn(async move {
                         let result = tokio::task::spawn_blocking(move || {
                             db_for_save.save_statistics(&pairs).map_err(|e| e.to_string())
@@ -18072,19 +18272,30 @@ pub async fn start_network(
                 // happens under the lock; the write is offloaded so the loop
                 // isn't parked on disk I/O, and `mark_saved(gen)` only clears
                 // dirty if no newer change landed meanwhile.
-                let spam_save = {
+                let spam_save = if !spam_save_in_flight {
                     let mut sf = spam_filter.write().await;
                     sf.take_save_data()
+                } else {
+                    None
                 };
                 if let Some((data, path, gen)) = spam_save {
+                    spam_save_in_flight = true;
+                    spam_save_started_at = Some(tokio::time::Instant::now());
+                    let tx = spam_save_result_tx.clone();
                     let ok = tokio::task::spawn_blocking(move || {
-                        crate::security::atomic_write(&path, data.as_bytes(), false).is_ok()
-                    })
-                    .await
-                    .unwrap_or(false);
-                    if ok {
-                        spam_filter.write().await.mark_saved(gen);
-                    }
+                        crate::security::atomic_write(&path, data.as_bytes(), false)
+                            .map_err(|e| e.to_string())
+                    });
+                    tokio::spawn(async move {
+                        let result = ok
+                            .await
+                            .map_err(|e| format!("spam filter save task failed: {e}"))
+                            .and_then(|r| r);
+                        let _ = tx.send(SpamSaveResult {
+                            generation: gen,
+                            result,
+                        });
+                    });
                 }
             }
 
@@ -18106,6 +18317,7 @@ pub async fn start_network(
                     let reputation_snapshot = state.reputation.clone();
                     let tx = periodic_save_result_tx.clone();
                     reputation_save_in_flight = true;
+                    reputation_save_started_at = Some(tokio::time::Instant::now());
                     tokio::spawn(async move {
                         let result = tokio::task::spawn_blocking(move || {
                             reputation_snapshot.save(&rep_path)
@@ -18123,12 +18335,21 @@ pub async fn start_network(
 
             // Periodic known.met save (every 120s)
             _ = known_met_save_timer.tick() => {
+                if known_met_save_in_flight
+                    && known_met_save_started_at
+                        .is_some_and(|started| started.elapsed() > std::time::Duration::from_secs(300))
+                {
+                    warn!("known.met save exceeded watchdog timeout; allowing next periodic retry");
+                    known_met_save_in_flight = false;
+                    known_met_save_started_at = None;
+                }
                 if known_files.is_dirty() && !known_met_save_in_flight {
                     let known_path = state.data_dir.join("known.met");
                     let generation = known_files.dirty_generation();
                     let mut snapshot = known_files.clone();
                     let tx = known_met_save_result_tx.clone();
                     known_met_save_in_flight = true;
+                    known_met_save_started_at = Some(tokio::time::Instant::now());
                     tokio::spawn(async move {
                         let result = tokio::task::spawn_blocking(move || {
                             snapshot.save(&known_path).map(|_| !snapshot.is_dirty())
@@ -18166,6 +18387,7 @@ pub async fn start_network(
                     let hash_sets = state.aich_hash_sets.clone();
                     let tx = periodic_save_result_tx.clone();
                     known2_save_in_flight = true;
+                    known2_save_started_at = Some(tokio::time::Instant::now());
                     tokio::spawn(async move {
                         let result = tokio::task::spawn_blocking(move || {
                             ed2k::aich::save_known2_met(&known2_path, &hash_sets)
@@ -18912,6 +19134,53 @@ pub async fn start_network(
                     }
                 }
 
+                let timed_out = |started: Option<tokio::time::Instant>, limit: std::time::Duration| {
+                    started.is_some_and(|started| started.elapsed() > limit)
+                };
+                if nodes_save_in_flight && timed_out(nodes_save_started_at, SHORT_IO_WATCHDOG) {
+                    warn!("Watchdog: nodes.dat save exceeded timeout; allowing next retry");
+                    nodes_save_in_flight = false;
+                    nodes_save_started_at = None;
+                }
+                if spam_save_in_flight && timed_out(spam_save_started_at, SHORT_IO_WATCHDOG) {
+                    warn!("Watchdog: spam-filter save exceeded timeout; allowing next retry");
+                    spam_save_in_flight = false;
+                    spam_save_started_at = None;
+                }
+                if stats_save_in_flight && timed_out(stats_save_started_at, PERIODIC_SAVE_WATCHDOG) {
+                    warn!("Watchdog: statistics save exceeded timeout; allowing next retry");
+                    stats_save_in_flight = false;
+                    stats_save_started_at = None;
+                }
+                if reputation_save_in_flight
+                    && timed_out(reputation_save_started_at, PERIODIC_SAVE_WATCHDOG)
+                {
+                    warn!("Watchdog: reputation save exceeded timeout; allowing next retry");
+                    reputation_save_in_flight = false;
+                    reputation_save_started_at = None;
+                }
+                if known2_save_in_flight && timed_out(known2_save_started_at, PERIODIC_SAVE_WATCHDOG) {
+                    warn!("Watchdog: known2_64.met save exceeded timeout; allowing next retry");
+                    known2_save_in_flight = false;
+                    known2_save_started_at = None;
+                }
+                if upnp_maintain_in_flight
+                    && timed_out(upnp_maintain_started_at, PERIODIC_SAVE_WATCHDOG)
+                {
+                    warn!("Watchdog: UPnP maintenance exceeded timeout; allowing next retry");
+                    upnp_maintain_in_flight = false;
+                    upnp_maintain_started_at = None;
+                }
+                if nat_probe_in_flight && timed_out(nat_probe_started_at, NAT_PROBE_WATCHDOG) {
+                    warn!("Watchdog: NAT probe exceeded timeout; allowing next retry");
+                    nat_probe_in_flight = false;
+                    nat_probe_started_at = None;
+                    nat_probe_packet_tx = None;
+                    nat_probe_backoff_until = Some(
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(300),
+                    );
+                }
+
                 if !state.pending_downloads.is_empty()
                     && state.stats.status != NetworkStatus::Disconnected
                     && now.saturating_sub(last_kad_activity_at) > 180
@@ -19542,16 +19811,14 @@ pub async fn start_network(
         )
         .await
         {
-            Ok(Some(result)) => {
-                match result.result {
-                    Ok(true) => known_files.mark_saved_if_generation(result.generation),
-                    Ok(false) => known_files.mark_save_failed(),
-                    Err(e) => {
-                        known_files.mark_save_failed();
-                        error!("Periodic known.met save (drained at shutdown) failed: {e}");
-                    }
+            Ok(Some(result)) => match result.result {
+                Ok(true) => known_files.mark_saved_if_generation(result.generation),
+                Ok(false) => known_files.mark_save_failed(),
+                Err(e) => {
+                    known_files.mark_save_failed();
+                    error!("Periodic known.met save (drained at shutdown) failed: {e}");
                 }
-            }
+            },
             Ok(None) => {}
             Err(_) => {
                 warn!(
@@ -19626,7 +19893,13 @@ pub async fn start_network(
             );
         }
     }
-    flush_credit_state(&credit_manager, &db, &state.data_dir, true).await;
+    spawn_credit_flush(
+        credit_manager.clone(),
+        db.clone(),
+        state.data_dir.clone(),
+        true,
+        credit_flush_in_flight.clone(),
+    );
     info!("Credit state saved on shutdown");
 
     let rep_path = state.data_dir.join("reputation.json");
@@ -21690,6 +21963,17 @@ async fn handle_udp_packet_inner(
         if data.len() >= 2 {
             let opcode = data[1];
             let payload = &data[2..];
+            let known_peer = state.routing_table.has_contact_ip(from_ipv4)
+                || state.flood_protection.has_recent_ip(from.ip());
+            if state
+                .flood_protection
+                .check_rate_limit_with_opcode(from.ip(), known_peer, opcode)
+            {
+                debug!(
+                    "Rate limit exceeded for eD2K UDP opcode 0x{opcode:02X} from {from}, dropping packet"
+                );
+                return;
+            }
 
             if opcode == OP_PORTTEST {
                 debug!("Received UDP Port Test from {from}");
@@ -21727,7 +22011,7 @@ async fn handle_udp_packet_inner(
                         )
                     })
                 };
-                let partial_file = if local_file.is_none() {
+                let partial_candidate = if local_file.is_none() {
                     let mgr = transfer_manager.read().await;
                     mgr.active.values().chain(mgr.queue.iter()).find_map(|t| {
                         if t.direction != TransferDirection::Download
@@ -21745,10 +22029,18 @@ async fn handle_udp_packet_inner(
                         if !part_path.exists() {
                             return None;
                         }
-                        let tracker =
-                            ed2k::part_tracker::PartTracker::new(t.total_size, &part_path);
-                        Some((t.total_size, tracker.serveable_parts()))
+                        Some((t.total_size, part_path))
                     })
+                } else {
+                    None
+                };
+                let partial_file = if let Some((total_size, part_path)) = partial_candidate {
+                    tokio::task::spawn_blocking(move || {
+                        let tracker = ed2k::part_tracker::PartTracker::new(total_size, &part_path);
+                        (total_size, tracker.serveable_parts())
+                    })
+                    .await
+                    .ok()
                 } else {
                     None
                 };
@@ -21801,7 +22093,9 @@ async fn handle_udp_packet_inner(
                     IpAddr::V6(v6) => v6.to_ipv4_mapped(),
                 };
                 if let Some(v4) = v4_opt {
-                    if let Some((file_hash, _)) = state.pending_udp_reasks.remove(&(v4, from.port())) {
+                    if let Some((file_hash, _)) =
+                        state.pending_udp_reasks.remove(&(v4, from.port()))
+                    {
                         if let Some(pfs) = state
                             .per_file_sources
                             .values_mut()
@@ -21921,19 +22215,9 @@ async fn handle_udp_packet_inner(
                     debug!("OP_REASKCALLBACKUDP from {from} rejected: special-use source IP");
                     return;
                 }
-                // Use the shared per-IP rate limiter. Layer 1 (per-IP
-                // per-opcode) is skipped automatically because 0x94
-                // isn't in `is_request_opcode`'s Kad set, but Layer 2
-                // (per-IP packet-rate cap) still applies — which is
-                // exactly the amplification gate we want here.
-                if state.flood_protection.check_rate_limit_with_opcode(
-                    from.ip(),
-                    false,
-                    ed2k::messages::OP_REASKCALLBACKUDP,
-                ) {
-                    debug!("OP_REASKCALLBACKUDP from {from} rate-limited");
-                    return;
-                }
+                // The common eD2K UDP ingress gate above already applied
+                // per-source flood protection for this opcode. Do not charge
+                // the packet twice here; the remaining gates are semantic.
                 let trailing = &payload[16..];
                 let forwarded = state
                     .buddy_manager
@@ -23330,7 +23614,11 @@ async fn handle_udp_packet_inner(
                         break;
                     }
                     if let Some(expr) = &search_expr {
-                        if !matches_search_expr_for_local_file(expr, &file.file_name, file.file_size) {
+                        if !matches_search_expr_for_local_file(
+                            expr,
+                            &file.file_name,
+                            file.file_size,
+                        ) {
                             continue;
                         }
                     }
@@ -24034,6 +24322,10 @@ async fn handle_udp_packet_inner(
                 std::net::IpAddr::V4(v4) => v4,
                 _ => return,
             };
+            if !state.firewall_checker.is_checking() {
+                debug!("Ignoring late FirewallUdp from {from}: no active firewall check");
+                return;
+            }
             if !state.firewall_checker.is_udp_firewall_check_ip(sender_ip) {
                 debug!("Ignoring unsolicited FirewallUdp from {from}");
                 return;
@@ -25550,7 +25842,16 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::GetPeersSnapshot { tx } => {
-            let _ = tx.send(peers_snapshot(state, db).await);
+            let peers = routing_peers_snapshot(state);
+            let db_for_peers = db.clone();
+            tokio::spawn(async move {
+                let saved_peers = tokio::task::spawn_blocking(move || {
+                    db_for_peers.get_peers().unwrap_or_default()
+                })
+                .await
+                .unwrap_or_default();
+                let _ = tx.send(merge_saved_peers(peers, saved_peers));
+            });
         }
 
         NetworkCommand::GetNetworkStatsSnapshot { tx } => {
@@ -26281,8 +26582,10 @@ async fn handle_command_inner(
             // while this command handler is still awaiting, since the
             // network task processes one command at a time.
             let default_path = state.data_dir.join("ipfilter.dat");
-            let placeholder =
-                IpFilter::new(state.ip_filter.is_enabled(), state.ip_filter.blocks_private());
+            let placeholder = IpFilter::new(
+                state.ip_filter.is_enabled(),
+                state.ip_filter.blocks_private(),
+            );
             let mut filter = std::mem::replace(&mut state.ip_filter, placeholder);
             let load_path = default_path.clone();
             filter = tokio::task::spawn_blocking(move || {
@@ -26367,7 +26670,11 @@ async fn handle_command_inner(
             }
         }
 
-        NetworkCommand::RemoveIpRange { start_ip, end_ip, tx } => {
+        NetworkCommand::RemoveIpRange {
+            start_ip,
+            end_ip,
+            tx,
+        } => {
             let removed = state.ip_filter.remove_range(&start_ip, &end_ip);
             if removed {
                 state
@@ -26396,7 +26703,22 @@ async fn handle_command_inner(
             if enabled && state.ip_filter.range_count() == 0 {
                 let default_path = state.data_dir.join("ipfilter.dat");
                 if default_path.exists() {
-                    let n = state.ip_filter.load_from_file(&default_path);
+                    let block_private = state.ip_filter.blocks_private();
+                    let mut filter = std::mem::replace(
+                        &mut state.ip_filter,
+                        IpFilter::new(enabled, block_private),
+                    );
+                    filter = tokio::task::spawn_blocking(move || {
+                        filter.load_from_file(&default_path);
+                        filter
+                    })
+                    .await
+                    .unwrap_or_else(|e| {
+                        error!("SetIpFilterEnabled load task failed: {e}");
+                        IpFilter::new(enabled, block_private)
+                    });
+                    let n = filter.range_count();
+                    state.ip_filter = filter;
                     info!(
                         "Loaded {n} IP filter entries on enable ({} ranges after merge)",
                         state.ip_filter.range_count()
@@ -27289,9 +27611,7 @@ async fn handle_command_inner(
                     if let Some(record) = known_files.find_by_hash_mut(&fh) {
                         record.is_shared = shared;
                         known_files.mark_dirty();
-                        debug!(
-                            "Updated is_shared={shared} for {file_hash_hex} in known.met"
-                        );
+                        debug!("Updated is_shared={shared} for {file_hash_hex} in known.met");
                     } else {
                         // Fire-and-forget `try_send` with no ack, same as
                         // `SetUploadPriority` — this is the only signal that
@@ -27317,8 +27637,11 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::SharedFilesChanged => {
-            let index = local_index.read().await;
-            for f in index.all_files() {
+            let all_index_files = {
+                let index = local_index.read().await;
+                index.all_files().to_vec()
+            };
+            for f in &all_index_files {
                 if let Ok(hash_bytes) = hex::decode(&f.hash) {
                     if hash_bytes.len() == 16 {
                         let mut fh = [0u8; 16];
@@ -27407,9 +27730,7 @@ async fn handle_command_inner(
                                 // hashing pass. spawn_blocking alone didn't
                                 // fix that: it only keeps the disk I/O off the
                                 // async worker threads, not off *this* task.
-                                if let Some(cached) =
-                                    fresh_part_hashes.write().await.remove(&fh)
-                                {
+                                if let Some(cached) = fresh_part_hashes.write().await.remove(&fh) {
                                     part_hashes = cached;
                                 } else {
                                     // Fallback for files whose part hashes
@@ -27456,8 +27777,7 @@ async fn handle_command_inner(
                 }
             }
             let mut seen_hashes = std::collections::HashSet::new();
-            let files: Vec<PublishableFile> = index
-                .all_files()
+            let files: Vec<PublishableFile> = all_index_files
                 .iter()
                 .filter(|f| f.shared)
                 .filter_map(|f| {
@@ -27564,8 +27884,7 @@ async fn handle_command_inner(
             if state.server_connected {
                 if let Some(conn) = state.server_connection.as_mut() {
                     let mut seen_offer_hashes = std::collections::HashSet::new();
-                    let mut offer_files: Vec<ed2k::server::OfferFile> = index
-                        .all_files()
+                    let mut offer_files: Vec<ed2k::server::OfferFile> = all_index_files
                         .iter()
                         .filter(|f| f.shared)
                         .filter_map(|f| {
@@ -28876,11 +29195,6 @@ async fn handle_download_event(
                 let mgr = transfer_manager.read().await;
                 mgr.get_transfer(&transfer_id).map(|t| t.total_size)
             };
-            if let Some(total_size) = final_total {
-                if let Err(e) = db.update_transfer_progress(&transfer_id, total_size, 100.0, 0) {
-                    warn!("DB update_transfer_progress (final) failed for {transfer_id}: {e}");
-                }
-            }
             db_progress_last_persist.remove(&transfer_id);
             if let Some(promoted) = {
                 let mut mgr = transfer_manager.write().await;
@@ -28903,23 +29217,50 @@ async fn handle_download_event(
             } else {
                 warn!("Completed event for transfer {transfer_id} not found in active set");
             }
-            if let Err(e) = db.update_transfer_status(&transfer_id, "completed") {
-                warn!("DB update_transfer_status('completed') failed for {transfer_id}: {e}");
-            }
 
-            {
+            let history_row = {
                 let mgr = transfer_manager.read().await;
-                if let Some(t) = mgr.get_transfer(&transfer_id) {
-                    if let Err(e) = db.record_download_history(
-                        &t.file_hash,
-                        &t.file_name,
-                        t.total_size,
+                mgr.get_transfer(&transfer_id)
+                    .map(|t| (t.file_hash.clone(), t.file_name.clone(), t.total_size))
+            };
+            let db_for_completion = db.clone();
+            let completion_transfer_id = transfer_id.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Some(total_size) = final_total {
+                    if let Err(e) = db_for_completion.update_transfer_progress(
+                        &completion_transfer_id,
+                        total_size,
+                        100.0,
+                        0,
+                    ) {
+                        warn!(
+                            "DB update_transfer_progress (final) failed for {completion_transfer_id}: {e}"
+                        );
+                    }
+                }
+                if let Err(e) =
+                    db_for_completion.update_transfer_status(&completion_transfer_id, "completed")
+                {
+                    warn!(
+                        "DB update_transfer_status('completed') failed for {completion_transfer_id}: {e}"
+                    );
+                }
+                if let Some((file_hash, file_name, total_size)) = history_row {
+                    if let Err(e) = db_for_completion.record_download_history(
+                        &file_hash,
+                        &file_name,
+                        total_size,
                         "completed",
                     ) {
                         tracing::warn!("Failed to record download history: {e}");
                     }
                 }
-            }
+                if remove_finished {
+                    if let Err(e) = db_for_completion.remove_transfer(&completion_transfer_id) {
+                        warn!("DB remove_transfer failed for {completion_transfer_id}: {e}");
+                    }
+                }
+            });
 
             let _ = app_handle.emit(
                 "transfer-complete",
@@ -28948,7 +29289,6 @@ async fn handle_download_event(
             if remove_finished {
                 let mut mgr = transfer_manager.write().await;
                 mgr.remove(&transfer_id);
-                let _ = db.remove_transfer(&transfer_id);
             }
         }
         DownloadEvent::Failed {
@@ -29283,6 +29623,9 @@ fn name_spam_penalty(name: &str) -> usize {
 fn convert_search_results(entries: &[kad::messages::SearchResultEntry]) -> Vec<SearchResult> {
     use crate::search::index::infer_file_type;
 
+    const MAX_KAD_SOURCE_ADDRS: usize = 500;
+    const MAX_KAD_AVAILABILITY: u32 = 5_000;
+
     struct ParsedEntry {
         hash: String,
         name: String,
@@ -29444,16 +29787,16 @@ fn convert_search_results(entries: &[kad::messages::SearchResultEntry]) -> Vec<S
                     }
                     TagName::Id(TAG_SOURCES) => {
                         if let Some(v) = tag.uint32_value() {
-                            sources_tag = v;
+                            sources_tag = v.min(MAX_KAD_AVAILABILITY);
                         } else if let TagValue::Uint16(v) = &tag.value {
-                            sources_tag = *v as u32;
+                            sources_tag = (*v as u32).min(MAX_KAD_AVAILABILITY);
                         }
                     }
                     TagName::Id(TAG_COMPLETE_SOURCES) => {
                         if let Some(v) = tag.uint32_value() {
-                            complete_sources_tag = v;
+                            complete_sources_tag = v.min(MAX_KAD_AVAILABILITY);
                         } else if let Some(v) = tag.uint16_value() {
-                            complete_sources_tag = v as u32;
+                            complete_sources_tag = (v as u32).min(MAX_KAD_AVAILABILITY);
                         }
                     }
                     TagName::Id(TAG_SOURCEIP) => {
@@ -29554,15 +29897,22 @@ fn convert_search_results(entries: &[kad::messages::SearchResultEntry]) -> Vec<S
                 &existing.result_origin,
                 crate::search::merge::ORIGIN_KAD,
             );
-            if !p.source_addr.is_empty() && !existing.source_addresses.contains(&p.source_addr) {
+            if !p.source_addr.is_empty()
+                && existing.source_addresses.len() < MAX_KAD_SOURCE_ADDRS
+                && !existing.source_addresses.contains(&p.source_addr)
+            {
                 existing.source_addresses.push(p.source_addr);
             }
             let acc = sources_accum.entry(p.hash.clone()).or_insert(0);
-            *acc += effective_sources;
+            *acc = acc
+                .saturating_add(effective_sources)
+                .min(MAX_KAD_AVAILABILITY);
             existing.availability = (*acc).max(existing.source_addresses.len() as u32);
 
             let cs = complete_accum.entry(p.hash.clone()).or_insert(0);
-            *cs += p.complete_sources_tag;
+            *cs = cs
+                .saturating_add(p.complete_sources_tag)
+                .min(MAX_KAD_AVAILABILITY);
             existing.file.complete_sources = *cs;
 
             if name_spam_penalty(&p.name) < name_spam_penalty(&existing.file.name) {
@@ -30210,7 +30560,12 @@ enum KadNumericOp {
 }
 
 fn parse_kad_search_expression(data: &[u8]) -> Option<KadSearchExpr> {
+    const MAX_KAD_SEARCH_EXPR_BYTES: usize = 16 * 1024;
+
     if data.is_empty() {
+        return None;
+    }
+    if data.len() > MAX_KAD_SEARCH_EXPR_BYTES {
         return None;
     }
     let mut cursor = Cursor::new(data);
@@ -30313,7 +30668,15 @@ fn read_kad_numeric_op(op: u8) -> std::io::Result<KadNumericOp> {
 }
 
 fn read_kad_search_string(cursor: &mut Cursor<&[u8]>) -> std::io::Result<String> {
+    const MAX_KAD_SEARCH_STRING_BYTES: usize = 1024;
+
     let len = ReadBytesExt::read_u16::<LittleEndian>(cursor)? as usize;
+    if len > MAX_KAD_SEARCH_STRING_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "search string exceeds length cap",
+        ));
+    }
     let start = cursor.position() as usize;
     let end = start.saturating_add(len);
     if end > cursor.get_ref().len() {
@@ -30328,7 +30691,15 @@ fn read_kad_search_string(cursor: &mut Cursor<&[u8]>) -> std::io::Result<String>
 }
 
 fn read_kad_search_tag_ref(cursor: &mut Cursor<&[u8]>) -> std::io::Result<SearchTagRef> {
+    const MAX_KAD_SEARCH_TAG_BYTES: usize = 128;
+
     let len = ReadBytesExt::read_u16::<LittleEndian>(cursor)? as usize;
+    if len > MAX_KAD_SEARCH_TAG_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "search tag name exceeds length cap",
+        ));
+    }
     let start = cursor.position() as usize;
     let end = start.saturating_add(len);
     if end > cursor.get_ref().len() {

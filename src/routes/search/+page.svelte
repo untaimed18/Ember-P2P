@@ -63,12 +63,14 @@
   // "latest" counter when batches query disjoint hash sets).
   let historyFetchGen = 0;
   const historyHashGen = new Map<string, number>();
+  const HISTORY_BATCH_LIMIT = 5_000;
 
   async function flushHistoryFetch() {
     historyFetchTimer = null;
     if (historyPendingHashes.size === 0) return;
-    const batch = [...historyPendingHashes];
-    historyPendingHashes.clear();
+    const batch = [...historyPendingHashes].slice(0, HISTORY_BATCH_LIMIT);
+    const remaining = historyPendingHashes.size > HISTORY_BATCH_LIMIT;
+    for (const h of batch) historyPendingHashes.delete(h);
     const myGen = ++historyFetchGen;
     for (const h of batch) historyHashGen.set(h, myGen);
     try {
@@ -93,6 +95,10 @@
         // Clear our gen claim too so a future batch can re-attempt
         // without the stale-gen filter rejecting its results.
         if (historyHashGen.get(h) === myGen) historyHashGen.delete(h);
+      }
+    } finally {
+      if (remaining && !destroyed && !historyFetchTimer) {
+        historyFetchTimer = setTimeout(flushHistoryFetch, 0);
       }
     }
   }
@@ -2446,7 +2452,7 @@
               <label for="note-rating">{m.search_rating_label()}</label>
               <input id="note-rating" type="number" min="0" max="5" bind:value={noteRating} />
               <label for="note-comment">{m.search_comment_label()}</label>
-              <input id="note-comment" type="text" bind:value={noteComment} placeholder={m.search_comment_placeholder()} />
+              <input id="note-comment" type="text" maxlength="4096" bind:value={noteComment} placeholder={m.search_comment_placeholder()} />
               <button onclick={handlePublishNote} disabled={publishingNote}>{publishingNote ? m.search_publishing() : m.search_publish_note()}</button>
               {#if publishMessage}
                 <span class={publishSuccess ? 'success-msg' : 'error-msg'}>{publishMessage}</span>

@@ -20,6 +20,8 @@ const TAG_UINT32: u8 = 0x03;
 const TAG_HASH: u8 = 0x01;
 const TAG_BLOB: u8 = 0x07;
 const AICH_BASE32_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+const MAX_COLLECTION_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_COLLECTION_FILES: usize = 100_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollectionFile {
@@ -38,6 +40,14 @@ pub struct Collection {
 
 impl Collection {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let metadata = std::fs::metadata(path)?;
+        if metadata.len() > MAX_COLLECTION_BYTES {
+            return Err(anyhow::anyhow!(
+                "Collection is too large ({} bytes > {} MiB cap)",
+                metadata.len(),
+                MAX_COLLECTION_BYTES / (1024 * 1024)
+            ));
+        }
         let data = std::fs::read(path)?;
         if data.len() < 8 {
             return Self::load_text(path);
@@ -93,10 +103,11 @@ impl Collection {
         }
 
         let file_count = cursor.read_u32::<LittleEndian>()? as usize;
-        if file_count > 100_000 {
+        if file_count > MAX_COLLECTION_FILES {
             return Err(anyhow::anyhow!(
-                "Collection too large: {} files (max 100,000)",
-                file_count
+                "Collection too large: {} files (max {})",
+                file_count,
+                MAX_COLLECTION_FILES
             ));
         }
         let mut files = Vec::with_capacity(file_count);
@@ -166,15 +177,12 @@ impl Collection {
         // allowed folder could OOM the process. The same 100,000 entry
         // cap mirrors the binary cap; the 32 MiB byte cap is generous
         // for any realistic curated link list.
-        const MAX_TEXT_BYTES: u64 = 32 * 1024 * 1024;
-        const MAX_TEXT_LINES: usize = 100_000;
-
         let metadata = std::fs::metadata(path)?;
-        if metadata.len() > MAX_TEXT_BYTES {
+        if metadata.len() > MAX_COLLECTION_BYTES {
             return Err(anyhow::anyhow!(
                 "Text collection is too large ({} bytes > {} MiB cap)",
                 metadata.len(),
-                MAX_TEXT_BYTES / (1024 * 1024)
+                MAX_COLLECTION_BYTES / (1024 * 1024)
             ));
         }
         let content = std::fs::read_to_string(path)?;
@@ -187,10 +195,10 @@ impl Collection {
         let mut line_count = 0usize;
         for line in content.lines() {
             line_count += 1;
-            if line_count > MAX_TEXT_LINES {
+            if line_count > MAX_COLLECTION_FILES {
                 return Err(anyhow::anyhow!(
                     "Text collection has too many lines (> {} max)",
-                    MAX_TEXT_LINES
+                    MAX_COLLECTION_FILES
                 ));
             }
             let line = line.trim();

@@ -6,11 +6,11 @@ use tracing::info;
 use zip::ZipArchive;
 
 use crate::app_state::AppState;
-use crate::commands::errors::{await_reply, coded, coded_ctx};
+use crate::commands::errors::{await_reply, coded, coded_ctx, CMD_REPLY_TIMEOUT};
 use crate::network::kad::ip_filter::IpFilterStats;
 use crate::network::NetworkCommand;
 
-const CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const CMD_TIMEOUT: std::time::Duration = CMD_REPLY_TIMEOUT;
 const DEFAULT_IPFILTER_ARCHIVE_URL: &str = "https://upd.emule-security.org/ipfilter.zip";
 const MAX_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
 
@@ -207,7 +207,11 @@ pub async fn remove_ip_filter_range(
     let (tx, rx) = oneshot::channel();
     state
         .network_tx
-        .send(NetworkCommand::RemoveIpRange { start_ip, end_ip, tx })
+        .send(NetworkCommand::RemoveIpRange {
+            start_ip,
+            end_ip,
+            tx,
+        })
         .await
         .map_err(|e| {
             coded_ctx(
@@ -797,7 +801,11 @@ pub async fn import_ipfilter_file(
         // wholesale into ipfilter.dat by the network-loop handler.
         // Enforce the same MAX_RESPONSE_BYTES cap here for consistency.
         let metadata = tokio::fs::metadata(&path).await.map_err(|e| {
-            coded_ctx("security_failed_to_stat_file", "Failed to read file metadata", e)
+            coded_ctx(
+                "security_failed_to_stat_file",
+                "Failed to read file metadata",
+                e,
+            )
         })?;
         if metadata.len() > MAX_RESPONSE_BYTES as u64 {
             return Err(coded_ctx(

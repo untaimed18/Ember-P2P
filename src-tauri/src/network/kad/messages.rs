@@ -717,7 +717,7 @@ pub fn encode_packet(msg: &KadMessage) -> io::Result<Vec<u8>> {
         let body = &payload[1..];
         let mut compressed_body = Vec::with_capacity(body.len());
         {
-            let mut encoder = ZlibEncoder::new(&mut compressed_body, Compression::best());
+            let mut encoder = ZlibEncoder::new(&mut compressed_body, Compression::fast());
             encoder.write_all(body)?;
             encoder.finish()?;
         }
@@ -1582,10 +1582,7 @@ mod request_wire_opcode_tests {
             None
         );
         assert_eq!(request_wire_opcode(&KadMessage::PublishResAck), None);
-        assert_eq!(
-            request_wire_opcode(&KadMessage::Pong { udp_port: 0 }),
-            None
-        );
+        assert_eq!(request_wire_opcode(&KadMessage::Pong { udp_port: 0 }), None);
         assert_eq!(
             request_wire_opcode(&KadMessage::FirewalledRes { ip: 0 }),
             None

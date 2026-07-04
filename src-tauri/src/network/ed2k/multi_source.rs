@@ -1067,7 +1067,11 @@ impl MultiSourceDownload {
         tokio::fs::create_dir_all(&completed_dir).await?;
 
         let part_path = temp_dir.join(format!("{}.part", self.transfer_id));
-        let mut pt = PartTracker::new(self.file_size, &part_path);
+        let file_size = self.file_size;
+        let load_path = part_path.clone();
+        let mut pt = tokio::task::spawn_blocking(move || PartTracker::new(file_size, &load_path))
+            .await
+            .map_err(|e| anyhow::anyhow!("part tracker load task failed: {e}"))?;
         pt.set_file_hash(self.file_hash);
         pt.set_file_name(&self.file_name);
         let tracker = Arc::new(RwLock::new(pt));
@@ -6818,7 +6822,7 @@ async fn download_parts_from_source(
                         } else {
                             bytes_received_for_other_parts += piece_len;
                         }
-                        let _ = progress_tx.send((_src_idx, piece_len as i64)).await;
+                        let _ = progress_tx.try_send((_src_idx, piece_len as i64));
                     }
                     (OP_EMULEPROT, OP_COMPRESSEDPART_I64) | (OP_EMULEPROT, OP_COMPRESSEDPART) => {
                         let (hash, start, compressed_total_size, compressed) = if opcode
@@ -6956,7 +6960,7 @@ async fn download_parts_from_source(
                         } else {
                             bytes_received_for_other_parts += piece_len;
                         }
-                        let _ = progress_tx.send((_src_idx, piece_len as i64)).await;
+                        let _ = progress_tx.try_send((_src_idx, piece_len as i64));
                     }
                     (OP_EMULEPROT, OP_AICHANSWER)
                         if (38..=38 + crate::network::ed2k::aich::MAX_AICH_RECOVERY_BYTES)
@@ -7856,11 +7860,11 @@ async fn download_parts_from_source(
                                 // not the whole session total. Subtracting
                                 // total_received over-rewinds progress and
                                 // breaks stall detection.
-                                let _ = progress_tx.send((_src_idx, -(part_len as i64))).await;
+                                let _ = progress_tx.try_send((_src_idx, -(part_len as i64)));
                                 PartHashOutcome::Mismatch
                             }
                         } else {
-                            let _ = progress_tx.send((_src_idx, -(part_len as i64))).await;
+                            let _ = progress_tx.try_send((_src_idx, -(part_len as i64)));
                             PartHashOutcome::Mismatch
                         }
                     } else {
@@ -7962,7 +7966,7 @@ async fn download_parts_from_source(
                     // we leave other parts' buckets intact (they verify
                     // independently).
                     per_part_credit.remove(&part_idx);
-                    let _ = progress_tx.send((_src_idx, 0i64)).await;
+                    let _ = progress_tx.try_send((_src_idx, 0i64));
                     if let Some(ref etx) = event_tx {
                         let _ = etx
                             .send(DownloadEvent::PartCorrupted {

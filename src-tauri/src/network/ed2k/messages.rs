@@ -1983,6 +1983,8 @@ pub struct MultiPacketRequest {
 ///   OP_REQUESTFILENAME (0x58) - no extra data
 ///   OP_SETREQFILEID    (0x4F) - no extra data
 pub fn parse_multipacket(payload: &[u8], opcode: u8) -> io::Result<MultiPacketRequest> {
+    const MAX_MULTIPACKET_SUBOPS: usize = 32;
+
     if payload.len() < 17 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -2012,6 +2014,12 @@ pub fn parse_multipacket(payload: &[u8], opcode: u8) -> io::Result<MultiPacketRe
     let mut sub_opcodes = Vec::new();
     let mut req_part_status: Option<(u16, Vec<u8>)> = None;
     while (cursor.position() as usize) < payload.len() {
+        if sub_opcodes.len() >= MAX_MULTIPACKET_SUBOPS {
+            tracing::debug!(
+                "parse_multipacket: reached sub-opcode cap ({MAX_MULTIPACKET_SUBOPS}), stopping parse"
+            );
+            break;
+        }
         let sub_op = cursor.read_u8()?;
         match sub_op {
             OP_REQUESTFILENAME => {
@@ -2022,6 +2030,14 @@ pub fn parse_multipacket(payload: &[u8], opcode: u8) -> io::Result<MultiPacketRe
                 let remaining = payload.len().saturating_sub(cursor.position() as usize);
                 if remaining >= 2 {
                     let part_count = cursor.read_u16::<LittleEndian>()? as usize;
+                    if part_count > MAX_REASK_PARTS {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "multipacket part count {part_count} exceeds maximum {MAX_REASK_PARTS}"
+                            ),
+                        ));
+                    }
                     let bitmap_bytes = (part_count + 7) / 8;
                     let pos = cursor.position() as usize;
                     if pos

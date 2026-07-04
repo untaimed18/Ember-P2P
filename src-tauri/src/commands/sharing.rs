@@ -14,6 +14,7 @@ const MAX_PATH_LEN: usize = 4 * 1024;
 /// Maximum file-id count in a single batch sharing operation. Bounds
 /// the IPC payload and the per-call DB transaction size.
 const MAX_BATCH_IDS: usize = 10_000;
+const MAX_SCAN_MISSING_RESULTS: usize = 10_000;
 /// Upper bound on the number of paths accepted by `remove_missing_files` in a
 /// single IPC call. Generous enough for any realistic library while bounding a
 /// compromised-webview payload (and the per-call stat loop / index lock hold).
@@ -333,18 +334,24 @@ pub async fn add_shared_folder(
         let _scan_guard = ScanGuard(scanning.clone());
 
         let discover_path = canonical_str.clone();
-        let mut discovered = match tokio::task::spawn_blocking(move || {
+        let discovery = match tokio::task::spawn_blocking(move || {
             FileIndexer::discover_directory(&discover_path)
         })
         .await
         {
-            Ok(files) => files,
+            Ok(result) => result,
             Err(e) => {
                 tracing::error!("Discovery failed for {path}: {e}");
                 cancel_flags.write().await.remove(&cancel_key);
                 return;
             }
         };
+        if discovery.truncated {
+            warn!(
+                "Discovery for {path} reached the per-folder file cap; additional files will be picked up by a later scan"
+            );
+        }
+        let mut discovered = discovery.files;
 
         let total_files = discovered.len();
         info!("Discovered {total_files} files in {path}");
@@ -1199,22 +1206,31 @@ pub async fn reload_shared_files(
         scanning.fetch_add(1, Ordering::Relaxed);
         let _scan_guard = ScanGuard(scanning.clone());
 
-        let mut discovered: Vec<FileInfo> = match tokio::task::spawn_blocking(move || {
-            let mut files = Vec::new();
-            for folder in &discovery_folders {
-                files.extend(FileIndexer::discover_directory(folder));
-            }
-            files
-        })
-        .await
-        {
-            Ok(files) => files,
-            Err(e) => {
-                tracing::error!("Reload discovery failed: {e}");
-                cancel_flags.write().await.remove(&reload_key);
-                return;
-            }
-        };
+        let (mut discovered, discovery_truncated): (Vec<FileInfo>, bool) =
+            match tokio::task::spawn_blocking(move || {
+                let mut files = Vec::new();
+                let mut truncated = false;
+                for folder in &discovery_folders {
+                    let result = FileIndexer::discover_directory(folder);
+                    truncated |= result.truncated;
+                    files.extend(result.files);
+                }
+                (files, truncated)
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    tracing::error!("Reload discovery failed: {e}");
+                    cancel_flags.write().await.remove(&reload_key);
+                    return;
+                }
+            };
+        if discovery_truncated {
+            warn!(
+                "Reload discovery reached the per-folder file cap; retaining existing entries not seen in this partial scan"
+            );
+        }
 
         let total_files = discovered.len();
 
@@ -1248,7 +1264,7 @@ pub async fn reload_shared_files(
 
         {
             let mut index = local_index.write().await;
-            index.reconcile_files_for_folders(&reloaded_folders, discovered);
+            index.reconcile_files_for_folders(&reloaded_folders, discovered, !discovery_truncated);
         }
         refresh_file_cache(&local_index, &file_cache).await;
 
@@ -1727,6 +1743,9 @@ pub async fn scan_missing_files(state: tauri::State<'_, AppState>) -> Result<Vec
         for p in paths {
             if !std::path::Path::new(&p).exists() {
                 missing.push(p);
+                if missing.len() >= MAX_SCAN_MISSING_RESULTS {
+                    break;
+                }
             }
         }
         missing

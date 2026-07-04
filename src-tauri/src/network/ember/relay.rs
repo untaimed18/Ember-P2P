@@ -101,6 +101,7 @@ const RELAY_MAX_BYTES_PER_DIRECTION: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_CONCURRENT_RELAY_SESSIONS: usize = 4;
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 const RELAY_MAX_DURATION: Duration = Duration::from_secs(7200);
+const MAX_WS_RELAY_FRAME: usize = 16 * 1024;
 
 /// A relay session between two LowID peers through an intermediary.
 #[derive(Debug)]
@@ -647,6 +648,15 @@ impl AsyncRead for WsStream {
                     use tokio_tungstenite::tungstenite::Message;
                     match msg {
                         Message::Binary(data) => {
+                            if data.len() > MAX_WS_RELAY_FRAME {
+                                return Poll::Ready(Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!(
+                                        "relay websocket frame too large: {} bytes",
+                                        data.len()
+                                    ),
+                                )));
+                            }
                             let to_copy = data.len().min(buf.remaining());
                             buf.put_slice(&data[..to_copy]);
                             if to_copy < data.len() {
@@ -686,8 +696,7 @@ impl AsyncWrite for WsStream {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        const MAX_WS_WRITE_FRAME: usize = 16 * 1024;
-        let write_len = buf.len().min(MAX_WS_WRITE_FRAME);
+        let write_len = buf.len().min(MAX_WS_RELAY_FRAME);
         let msg = Message::Binary(buf[..write_len].to_vec().into());
         match Sink::poll_ready(Pin::new(&mut self.inner), cx) {
             Poll::Ready(Ok(())) => match Sink::start_send(Pin::new(&mut self.inner), msg) {

@@ -9,6 +9,17 @@ import { addToast, removeToast, toastError, toastSuccess, toastWarning } from '$
 import * as m from '$lib/paraglide/messages';
 
 const STALE_NETWORK_MS = 12_000;
+const KNOWN_NETWORK_STATUSES = new Set<NetworkStats['status']>([
+  'disconnected',
+  'connecting',
+  'connected',
+]);
+
+function narrowNetworkStatus(raw: unknown): NetworkStats['status'] | undefined {
+  return typeof raw === 'string' && (KNOWN_NETWORK_STATUSES as Set<string>).has(raw)
+    ? (raw as NetworkStats['status'])
+    : undefined;
+}
 
 export const networkStats = writable<NetworkStats>({
   connected_peers: 0,
@@ -146,10 +157,12 @@ export async function initNetworkStore() {
   const registered: UnlistenFn[] = [];
   try {
     registered.push(await listen<string>('network-status', (event) => {
+      const status = narrowNetworkStatus(event.payload);
+      if (!status) return;
       lastEventUpdate = Date.now();
       lastNetworkUpdate = lastEventUpdate;
       networkStats.update((s) =>
-        withDerivedNetworkState({ ...s, status: event.payload as NetworkStats['status'] })
+        withDerivedNetworkState({ ...s, status })
       );
     }));
     registered.push(await listen<{ firewalled: boolean; external_ip: string; tcp_status?: string; udp_status?: string }>('firewall-status', (event) => {

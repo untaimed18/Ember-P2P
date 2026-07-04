@@ -30,6 +30,15 @@
       .filter((s) => s.length > 0 && s !== '/');
   }
 
+  function isAllowedServerListUrl(value: string): boolean {
+    try {
+      const url = new URL(value);
+      return url.protocol === 'https:' || url.protocol === 'http:';
+    } catch {
+      return false;
+    }
+  }
+
   async function handlePayload(raw: string) {
     const payload = raw.trim();
     const lower = payload.toLowerCase();
@@ -65,14 +74,14 @@
       } else if (lower.startsWith('ed2k://|serverlist|')) {
         const segs = ed2kSegments(payload); // ['serverlist', url]
         const url = segs[1] ?? '';
-        if (!url) {
+        if (!isAllowedServerListUrl(url)) {
           toastError(translateError(undefined));
           return;
         }
         const msg = await downloadServerMet(url);
         if (destroyed) return;
         toastSuccess(msg);
-      } else if (lower.endsWith('.emulecollection')) {
+      } else if (!lower.startsWith('ed2k://') && lower.endsWith('.emulecollection')) {
         const coll = await openCollectionFile(payload);
         if (destroyed) return;
         incomingCollection.set(coll);

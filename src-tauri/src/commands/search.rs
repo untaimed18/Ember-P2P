@@ -47,6 +47,7 @@ fn validate_spam_payload(
     file_name: &str,
     source_addresses: &[String],
     search_keywords: &[String],
+    server_ip: Option<&str>,
 ) -> Result<(), String> {
     if file_name.len() > MAX_MARK_SPAM_FILENAME {
         return Err(coded_ctx(
@@ -78,6 +79,15 @@ fn validate_spam_payload(
             format!("a search_keyword exceeds {MAX_MARK_SPAM_KEYWORD_LEN} bytes"),
             MAX_MARK_SPAM_KEYWORD_LEN,
         ));
+    }
+    if let Some(ip) = server_ip {
+        if ip.len() > 64 || ip.parse::<std::net::IpAddr>().is_err() {
+            return Err(coded_ctx(
+                "search_spam_invalid_server_ip",
+                "Invalid spam server IP",
+                ip,
+            ));
+        }
     }
     Ok(())
 }
@@ -343,22 +353,27 @@ pub async fn find_notes(
             .search_timeout_secs
             .clamp(SEARCH_TIMEOUT_MIN, SEARCH_TIMEOUT_MAX)
     };
-    let mut results = match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx)
-        .await
-    {
-        Ok(Ok(results)) => results,
-        Ok(Err(e)) => return Err(coded_ctx("search_notes_search_failed", "Notes search failed", e)),
-        Err(_) => {
-            // Without this, the KAD search stayed alive (holding a
-            // routing-table in-use ref and a search-manager slot) until its
-            // own lifetime expired, well after this call had already
-            // returned an error to the caller.
-            let _ = state
-                .network_tx
-                .try_send(NetworkCommand::CancelSearch { request_id });
-            return Err(format!("Notes search timed out after {timeout_secs}s"));
-        }
-    };
+    let mut results =
+        match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
+            Ok(Ok(results)) => results,
+            Ok(Err(e)) => {
+                return Err(coded_ctx(
+                    "search_notes_search_failed",
+                    "Notes search failed",
+                    e,
+                ))
+            }
+            Err(_) => {
+                // Without this, the KAD search stayed alive (holding a
+                // routing-table in-use ref and a search-manager slot) until its
+                // own lifetime expired, well after this call had already
+                // returned an error to the caller.
+                let _ = state
+                    .network_tx
+                    .try_send(NetworkCommand::CancelSearch { request_id });
+                return Err(format!("Notes search timed out after {timeout_secs}s"));
+            }
+        };
     enrich_results(&mut results, &state, &[], None).await;
     Ok(results)
 }
@@ -647,7 +662,12 @@ pub async fn mark_spam(
     if file_hash.len() != 32 || hex::decode(&file_hash).is_err() {
         return Err(coded("search_invalid_file_hash", "Invalid file hash"));
     }
-    validate_spam_payload(&file_name, &source_addresses, &search_keywords)?;
+    validate_spam_payload(
+        &file_name,
+        &source_addresses,
+        &search_keywords,
+        server_ip.as_deref(),
+    )?;
     let result = SearchResult {
         file: crate::types::FileInfo {
             id: file_hash.clone(),
@@ -763,7 +783,12 @@ pub async fn explain_spam_result(
     if file_hash.len() != 32 || hex::decode(&file_hash).is_err() {
         return Err(coded("search_invalid_file_hash", "Invalid file hash"));
     }
-    validate_spam_payload(&file_name, &source_addresses, &search_keywords)?;
+    validate_spam_payload(
+        &file_name,
+        &source_addresses,
+        &search_keywords,
+        server_ip.as_deref(),
+    )?;
     let result = SearchResult {
         file: crate::types::FileInfo {
             id: file_hash.clone(),

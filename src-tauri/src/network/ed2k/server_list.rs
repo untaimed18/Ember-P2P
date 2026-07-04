@@ -13,6 +13,7 @@ use tracing::{debug, info};
 const MAX_SERVER_TAG_NAME_LEN: usize = 256;
 const MAX_SERVER_TAG_STR_LEN: usize = 4096;
 const MAX_SERVER_MET_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_SERVER_LIST_ENTRIES: usize = 5_000;
 const ST_UDPFLAGS: u8 = 0x92;
 const ST_UDPKEY: u8 = 0x95;
 const ST_UDPKEYIP: u8 = 0x96;
@@ -265,6 +266,13 @@ impl ServerList {
             .iter()
             .any(|s| s.ip == entry.ip && s.port == entry.port)
         {
+            if self.servers.len() >= MAX_SERVER_LIST_ENTRIES {
+                debug!(
+                    "Ignoring server {}:{} because server list is at cap ({MAX_SERVER_LIST_ENTRIES})",
+                    entry.ip, entry.port
+                );
+                return;
+            }
             self.servers.push(entry);
             self.needs_sort = true;
         }
