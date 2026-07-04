@@ -237,6 +237,12 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
         "sys",
         "dev",
     ];
+    let is_filesystem_root = |path: &std::path::Path| {
+        path.has_root()
+            && !path
+                .components()
+                .any(|c| matches!(c, std::path::Component::Normal(_)))
+    };
     if !settings.download_folder.is_empty() {
         let path = std::path::Path::new(&settings.download_folder);
         if path
@@ -246,6 +252,19 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
             return Err(coded(
                 "settings_download_folder_parent_dir",
                 "Download folder must not contain '..' path components",
+            ));
+        }
+        if is_filesystem_root(path)
+            || path
+                .canonicalize()
+                .ok()
+                .as_deref()
+                .is_some_and(is_filesystem_root)
+        {
+            return Err(coded_ctx(
+                "settings_download_folder_root",
+                "Download folder must not be a filesystem root",
+                &settings.download_folder,
             ));
         }
         // Scan the literal path AND (best-effort) its canonical form. A
@@ -302,6 +321,19 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
             return Err(coded_ctx(
                 "settings_shared_folder_parent_dir",
                 "Shared folder must not contain '..' path components",
+                folder,
+            ));
+        }
+        if is_filesystem_root(path)
+            || path
+                .canonicalize()
+                .ok()
+                .as_deref()
+                .is_some_and(is_filesystem_root)
+        {
+            return Err(coded_ctx(
+                "settings_shared_folder_root",
+                "Cannot share a filesystem root",
                 folder,
             ));
         }

@@ -24,6 +24,9 @@
 
 use crate::network::kad::publish::extract_keywords;
 
+const MAX_QUERY_BYTES: usize = 16 * 1024;
+const MAX_PARSE_DEPTH: usize = 64;
+
 /// A parsed search query as a boolean tree of keyword terms.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryExpr {
@@ -129,6 +132,7 @@ impl QueryExpr {
 /// usable keyword (e.g. only sub-3-byte words). Operator-free queries are
 /// tokenized exactly like [`extract_keywords`] for full backward compatibility.
 pub fn parse(query: &str) -> Option<QueryExpr> {
+    let query = clamp_query(query);
     if !has_operators(query) {
         return fold_and(
             extract_keywords(query)
@@ -140,7 +144,7 @@ pub fn parse(query: &str) -> Option<QueryExpr> {
 
     let toks = lex(query);
     let mut parser = Parser { toks, pos: 0 };
-    if let Some(expr) = parser.parse_or() {
+    if let Some(expr) = parser.parse_or(0) {
         return Some(expr);
     }
 
@@ -152,6 +156,17 @@ pub fn parse(query: &str) -> Option<QueryExpr> {
             .map(QueryExpr::Term)
             .collect(),
     )
+}
+
+fn clamp_query(query: &str) -> &str {
+    if query.len() <= MAX_QUERY_BYTES {
+        return query;
+    }
+    let mut end = MAX_QUERY_BYTES;
+    while end > 0 && !query.is_char_boundary(end) {
+        end -= 1;
+    }
+    &query[..end]
 }
 
 /// Whether `query` contains anything that needs the boolean parser. Plain
@@ -304,11 +319,11 @@ impl Parser {
     }
 
     /// `or_expr := and_expr ( OR and_expr )*`
-    fn parse_or(&mut self) -> Option<QueryExpr> {
-        let mut left = self.parse_and();
+    fn parse_or(&mut self, depth: usize) -> Option<QueryExpr> {
+        let mut left = self.parse_and(depth);
         while matches!(self.peek(), Some(Tok::Or)) {
             self.advance();
-            let right = self.parse_and();
+            let right = self.parse_and(depth);
             left = match (left, right) {
                 (Some(l), Some(r)) => Some(QueryExpr::Or(Box::new(l), Box::new(r))),
                 (Some(l), None) => Some(l),
@@ -320,7 +335,7 @@ impl Parser {
     }
 
     /// `and_expr := ( NOT? primary )+` with implicit AND between primaries.
-    fn parse_and(&mut self) -> Option<QueryExpr> {
+    fn parse_and(&mut self, depth: usize) -> Option<QueryExpr> {
         let mut positives: Vec<QueryExpr> = Vec::new();
         let mut negatives: Vec<QueryExpr> = Vec::new();
         loop {
@@ -329,12 +344,12 @@ impl Parser {
                 Some(Tok::And) => self.advance(),
                 Some(Tok::Not) => {
                     self.advance();
-                    if let Some(p) = self.parse_primary() {
+                    if let Some(p) = self.parse_primary(depth) {
                         negatives.push(p);
                     }
                 }
                 Some(Tok::LParen) | Some(Tok::Word(_)) | Some(Tok::Phrase(_)) => {
-                    if let Some(p) = self.parse_primary() {
+                    if let Some(p) = self.parse_primary(depth) {
                         positives.push(p);
                     }
                 }
@@ -359,11 +374,15 @@ impl Parser {
     }
 
     /// `primary := '(' or_expr ')' | quoted | word`
-    fn parse_primary(&mut self) -> Option<QueryExpr> {
+    fn parse_primary(&mut self, depth: usize) -> Option<QueryExpr> {
         match self.peek() {
             Some(Tok::LParen) => {
                 self.advance();
-                let inner = self.parse_or();
+                if depth >= MAX_PARSE_DEPTH {
+                    self.skip_balanced_group();
+                    return None;
+                }
+                let inner = self.parse_or(depth + 1);
                 if matches!(self.peek(), Some(Tok::RParen)) {
                     self.advance();
                 }
@@ -390,6 +409,25 @@ impl Parser {
                 )
             }
             _ => None,
+        }
+    }
+
+    fn skip_balanced_group(&mut self) {
+        let mut nested = 1usize;
+        while let Some(tok) = self.peek() {
+            match tok {
+                Tok::LParen => nested += 1,
+                Tok::RParen => {
+                    nested = nested.saturating_sub(1);
+                    self.advance();
+                    if nested == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            self.advance();
         }
     }
 }
@@ -564,6 +602,24 @@ mod tests {
         let declared_len = u16::from_le_bytes([wire[1], wire[2]]) as usize;
         assert_eq!(declared_len, u16::MAX as usize);
         assert_eq!(wire.len(), 3 + declared_len);
+    }
+
+    #[test]
+    fn deeply_nested_boolean_query_falls_back_without_recursing_unbounded() {
+        let query = format!(
+            "{}alpha{}",
+            "(".repeat(MAX_PARSE_DEPTH + 16),
+            ")".repeat(MAX_PARSE_DEPTH + 16)
+        );
+        let expr = parse(&query).unwrap();
+        assert_eq!(expr, term("alpha"));
+    }
+
+    #[test]
+    fn very_long_query_is_clamped_before_boolean_parse() {
+        let query = format!("{} OR bravo", "alpha ".repeat(MAX_QUERY_BYTES));
+        let expr = parse(&query).unwrap();
+        assert!(expr.positive_terms().contains(&"alpha".to_string()));
     }
 
     #[test]

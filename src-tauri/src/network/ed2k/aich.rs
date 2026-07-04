@@ -128,7 +128,11 @@ pub(crate) fn hierarchical_root(all_leaves: &[[u8; 20]], file_size: u64) -> [u8;
 /// per part, in file order. Shared by [`hierarchical_root`] (master hash)
 /// and the AICH-recovery audit-path builder so both always agree on exactly
 /// the same per-part hashes.
-fn compute_all_part_hashes(all_leaves: &[[u8; 20]], file_size: u64, num_parts: usize) -> Vec<[u8; 20]> {
+fn compute_all_part_hashes(
+    all_leaves: &[[u8; 20]],
+    file_size: u64,
+    num_parts: usize,
+) -> Vec<[u8; 20]> {
     let part_is_left = compute_part_is_left(num_parts);
     let mut part_hashes: Vec<[u8; 20]> = Vec::with_capacity(num_parts);
     let mut offset = 0;
@@ -230,7 +234,13 @@ fn top_level_audit_path(
 /// hashes actually received on the wire, and whether its own accumulated
 /// hash is the left or right operand when recombining with each one.
 fn top_level_path_structure(num_parts: usize, target_part: usize) -> (u64, bool, Vec<(u64, bool)>) {
-    fn walk(len: usize, mut target: usize, id: u64, is_left: bool, out: &mut Vec<(u64, bool)>) -> (u64, bool) {
+    fn walk(
+        len: usize,
+        mut target: usize,
+        id: u64,
+        is_left: bool,
+        out: &mut Vec<(u64, bool)>,
+    ) -> (u64, bool) {
         if len <= 1 {
             return (id, is_left);
         }
@@ -323,7 +333,11 @@ fn blocks_in_part(file_size: u64, part_index: usize, num_parts: usize) -> usize 
         PARTSIZE as u64
     } else {
         let rem = file_size % PARTSIZE as u64;
-        if rem == 0 { PARTSIZE as u64 } else { rem }
+        if rem == 0 {
+            PARTSIZE as u64
+        } else {
+            rem
+        }
     };
     ((part_data_size + AICH_BLOCK_SIZE as u64 - 1) / AICH_BLOCK_SIZE as u64) as usize
 }
@@ -550,7 +564,8 @@ impl AICHRecoveryHashSet {
             return empty_envelope();
         }
 
-        let num_parts = (((self.file_size + PARTSIZE as u64 - 1) / PARTSIZE as u64) as usize).max(1);
+        let num_parts =
+            (((self.file_size + PARTSIZE as u64 - 1) / PARTSIZE as u64) as usize).max(1);
         if part_index >= num_parts {
             return empty_envelope();
         }
@@ -718,6 +733,7 @@ const KNOWN2_MET_VERSION: u8 = 0x02;
 /// 180 KiB per leaf), while preventing a corrupt local file from being slurped
 /// wholesale into RAM.
 const MAX_KNOWN2_MET_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_KNOWN2_LEAVES_PER_SET: usize = (MAX_KNOWN2_MET_BYTES as usize) / 20;
 
 /// Save AICH hash sets to known2_64.met (eMule SHAHashSet.cpp format).
 /// Format: version(u8) + repeated [master_hash(20) + hash_count(u32) + hashes(20*count)]
@@ -777,6 +793,15 @@ pub fn load_known2_met(path: &std::path::Path) -> std::io::Result<Vec<([u8; 20],
             data[offset + 3],
         ]) as usize;
         offset += 4;
+        if count > MAX_KNOWN2_LEAVES_PER_SET {
+            tracing::warn!(
+                "known2_64.met record at offset {} claims {} leaves, exceeding cap {}",
+                offset - 24,
+                count,
+                MAX_KNOWN2_LEAVES_PER_SET
+            );
+            break;
+        }
         // `count` is attacker-controlled only via local file tampering, but
         // compute the record end with checked arithmetic so a corrupt count can
         // never wrap `usize` (32-bit) and slip past the truncation guard into an
@@ -1033,8 +1058,13 @@ mod tests {
                 part_data.len(),
                 file_size as u64,
             )
-            .unwrap_or_else(|| panic!("recovery for part {part_index} should verify against master"));
-            assert!(corrupt.is_empty(), "part {part_index} should have no corrupt blocks");
+            .unwrap_or_else(|| {
+                panic!("recovery for part {part_index} should verify against master")
+            });
+            assert!(
+                corrupt.is_empty(),
+                "part {part_index} should have no corrupt blocks"
+            );
         }
 
         // Corrupt a block inside part 1 (the top-level "right" branch) and

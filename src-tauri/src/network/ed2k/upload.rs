@@ -83,7 +83,9 @@ impl EmberSessionHandle {
     /// True if the peer has been heard from recently enough to trust this
     /// session for a new send/reuse decision. See `EMBER_SESSION_FRESH_SECS`.
     pub fn is_fresh(&self) -> bool {
-        let last = self.last_activity.load(std::sync::atomic::Ordering::Relaxed);
+        let last = self
+            .last_activity
+            .load(std::sync::atomic::Ordering::Relaxed);
         chrono::Utc::now().timestamp().saturating_sub(last) < EMBER_SESSION_FRESH_SECS
     }
 
@@ -2793,8 +2795,7 @@ impl UploadHandler {
             // is captured as `first_packet` and replayed by the serve loop.
             let emule_payload =
                 build_emule_info(self.udp_port, obf_enabled, Some(&self.ember_hash), None);
-            let _ =
-                write_packet_async(&mut writer, OP_EMULEPROT, OP_EMULEINFO, &emule_payload).await;
+            write_packet_async(&mut writer, OP_EMULEPROT, OP_EMULEINFO, &emule_payload).await?;
             let mut first_packet: Option<(u8, u8, Vec<u8>)> = None;
             if let Ok(Ok((eproto, eopcode, epayload))) = tokio::time::timeout(
                 std::time::Duration::from_secs(OUTBOUND_SERVE_HANDSHAKE_SECS),
@@ -4811,7 +4812,22 @@ impl UploadHandler {
                             // serve path uses so the peer only ever asks for
                             // ranges we're willing to send.
                             if file.is_partial && file.size > 0 {
-                                let tracker = super::part_tracker::PartTracker::new(file.size, &file.path);
+                                let file_size = file.size;
+                                let part_path = file.path.clone();
+                                let fallback_path = part_path.clone();
+                                let tracker = tokio::task::spawn_blocking(move || {
+                                    super::part_tracker::PartTracker::new(file_size, &part_path)
+                                })
+                                .await
+                                .unwrap_or_else(|e| {
+                                    tracing::warn!(
+                                        "PartTracker load task failed for OP_FILESTATUS bitmap: {e}"
+                                    );
+                                    super::part_tracker::PartTracker::new_empty(
+                                        file_size,
+                                        &fallback_path,
+                                    )
+                                });
                                 for byte_idx in 0..bitmap_bytes {
                                     let mut byte = 0u8;
                                     for bit in 0..8 {
@@ -8641,8 +8657,7 @@ mod browse_answer_tests {
                 match tag_type {
                     0x02 => {
                         let str_len =
-                            u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap())
-                                as usize;
+                            u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap()) as usize;
                         pos += 2 + str_len;
                     }
                     0x03 => pos += 4,
@@ -8731,6 +8746,9 @@ mod ember_session_handle_tests {
     async fn evict_stale_ember_session_is_noop_when_absent() {
         let sessions: EmberSessionMap = Arc::new(RwLock::new(HashMap::new()));
         let evicted = evict_stale_ember_session(&sessions, &[0xCC; 16]).await;
-        assert!(!evicted, "evicting an absent hash must report false, not panic");
+        assert!(
+            !evicted,
+            "evicting an absent hash must report false, not panic"
+        );
     }
 }

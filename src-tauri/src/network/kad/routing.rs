@@ -210,10 +210,11 @@ impl RoutingBin {
         max_type: u8,
         target: &KadId,
         max_required: usize,
+        require_verified: bool,
         result: &mut BTreeMap<(KadId, Ipv4Addr, u16), KadContact>,
     ) {
         for c in &self.contacts {
-            if c.contact_type <= max_type && c.verified {
+            if c.contact_type <= max_type && (!require_verified || c.verified) {
                 let dist = target.xor_distance(&c.id);
                 result.insert((dist, c.ip, c.udp_port), c.clone());
             }
@@ -536,32 +537,53 @@ impl RoutingZone {
         target: &KadId,
         distance: &KadId,
         max_required: usize,
+        require_verified: bool,
         result: &mut BTreeMap<(KadId, Ipv4Addr, u16), KadContact>,
     ) {
         if let Some(bin) = &self.bin {
-            bin.get_closest_to(max_type, target, max_required, result);
+            bin.get_closest_to(max_type, target, max_required, require_verified, result);
             return;
         }
 
         if let Some(children) = &self.children {
             let closer = distance.get_bit_number(self.level);
             if closer == 0 {
-                children
-                    .0
-                    .get_closest_to(max_type, target, distance, max_required, result);
+                children.0.get_closest_to(
+                    max_type,
+                    target,
+                    distance,
+                    max_required,
+                    require_verified,
+                    result,
+                );
                 if result.len() < max_required {
-                    children
-                        .1
-                        .get_closest_to(max_type, target, distance, max_required, result);
+                    children.1.get_closest_to(
+                        max_type,
+                        target,
+                        distance,
+                        max_required,
+                        require_verified,
+                        result,
+                    );
                 }
             } else {
-                children
-                    .1
-                    .get_closest_to(max_type, target, distance, max_required, result);
+                children.1.get_closest_to(
+                    max_type,
+                    target,
+                    distance,
+                    max_required,
+                    require_verified,
+                    result,
+                );
                 if result.len() < max_required {
-                    children
-                        .0
-                        .get_closest_to(max_type, target, distance, max_required, result);
+                    children.0.get_closest_to(
+                        max_type,
+                        target,
+                        distance,
+                        max_required,
+                        require_verified,
+                        result,
+                    );
                 }
             }
         }
@@ -1208,7 +1230,7 @@ impl RoutingTable {
         let distance = self.local_id.xor_distance(target);
         let mut result = BTreeMap::new();
         self.root
-            .get_closest_to(max_type, target, &distance, count, &mut result);
+            .get_closest_to(max_type, target, &distance, count, true, &mut result);
         result.into_values().collect()
     }
 
@@ -1241,24 +1263,33 @@ impl RoutingTable {
         // unresponsive, guaranteeing one wasted round of probes.
         let remaining = count - verified.len();
         let verified_ids: HashSet<KadId> = verified.iter().map(|c| c.id).collect();
-        let all_contacts = self.all_contacts_vec();
-        let mut unverified: Vec<(KadId, &KadContact)> = all_contacts
-            .iter()
+        let unverified_candidates = self.find_closest_any(target, count);
+        let mut unverified: Vec<(KadId, KadContact)> = unverified_candidates
+            .into_iter()
             .filter(|c| !c.verified && !c.is_dead() && !verified_ids.contains(&c.id))
-            .map(|c| (target.xor_distance(&c.id), *c))
+            .map(|c| (target.xor_distance(&c.id), c))
             .collect();
         unverified.sort_by(|a, b| {
             a.1.is_udp_firewalled()
                 .cmp(&b.1.is_udp_firewalled())
                 .then_with(|| a.0.cmp(&b.0))
         });
-        verified.extend(
-            unverified
-                .into_iter()
-                .take(remaining)
-                .map(|(_, c)| c.clone()),
-        );
+        verified.extend(unverified.into_iter().take(remaining).map(|(_, c)| c));
         verified
+    }
+
+    fn find_closest_any(&self, target: &KadId, count: usize) -> Vec<KadContact> {
+        let distance = KadId::from_u32(0).xor_distance(target);
+        let mut result = BTreeMap::new();
+        self.root.get_closest_to(
+            CONTACT_TYPE_DEAD - 1,
+            target,
+            &distance,
+            count,
+            false,
+            &mut result,
+        );
+        result.into_values().collect()
     }
 
     /// Closest contacts to `target` by XOR distance, regardless of verified
@@ -1275,27 +1306,11 @@ impl RoutingTable {
     /// applies, just without that function's verified-first / prefer-
     /// non-firewalled reordering, which callers here don't want.
     pub fn find_closest(&self, target: &KadId, count: usize) -> Vec<KadContact> {
-        let all_contacts = self.all_contacts_vec();
-        let mut all: Vec<(KadId, &KadContact)> = all_contacts
-            .iter()
-            .filter(|c| !c.is_dead())
-            .map(|c| (target.xor_distance(&c.id), *c))
-            .collect();
-        all.sort_by(|a, b| a.0.cmp(&b.0));
-        all.into_iter()
-            .take(count)
-            .map(|(_, c)| c.clone())
-            .collect()
+        self.find_closest_any(target, count)
     }
 
     pub fn touch_contact_by_addr(&mut self, ip: Ipv4Addr, udp_port: u16) -> bool {
         self.root.touch_contact_by_addr(ip, udp_port)
-    }
-
-    fn all_contacts_vec(&self) -> Vec<&KadContact> {
-        let mut out = Vec::new();
-        self.root.collect_all_contacts(&mut out);
-        out
     }
 
     pub fn all_contacts(&self) -> impl Iterator<Item = &KadContact> {
@@ -1570,7 +1585,10 @@ mod find_closest_tests {
 
         let mut dead = contact(0x02, 2);
         dead.contact_type = CONTACT_TYPE_DEAD;
-        assert!(rt.insert(dead.clone()), "dead contact must still be insertable (as a live one that later died would be)");
+        assert!(
+            rt.insert(dead.clone()),
+            "dead contact must still be insertable (as a live one that later died would be)"
+        );
 
         let target = KadId([0x00; 16]);
         let closest = rt.find_closest(&target, 10);

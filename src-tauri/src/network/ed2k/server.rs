@@ -1575,6 +1575,13 @@ fn parse_search_result(payload: &[u8]) -> anyhow::Result<Vec<ServerSearchResult>
             Ok(v) => v,
             Err(_) => break,
         };
+        const MAX_DECLARED_RESULT_TAGS: u32 = 4096;
+        if tag_count > MAX_DECLARED_RESULT_TAGS {
+            debug!(
+                "Dropping search-result record with excessive tag count {tag_count} (cap {MAX_DECLARED_RESULT_TAGS})"
+            );
+            break;
+        }
         let mut tags = ServerResultTags::default();
 
         let tag_limit = tag_count.min(256);

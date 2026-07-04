@@ -31,6 +31,20 @@ use tokio::sync::{mpsc, oneshot};
 /// stuck disk eventually exerts backpressure rather than letting the queue
 /// grow unbounded.
 const WRITER_QUEUE_CAPACITY: usize = 4096;
+const MAX_WRITER_IO_BYTES: usize = 16 * 1024 * 1024;
+
+fn validate_range(offset: u64, len: usize) -> io::Result<()> {
+    if len > MAX_WRITER_IO_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("writer operation too large: {len} bytes"),
+        ));
+    }
+    offset
+        .checked_add(len as u64)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "writer range overflows"))?;
+    Ok(())
+}
 
 /// Operation submitted to the writer thread. Keep payloads owned (no
 /// borrows) so the worker thread can run independently.
@@ -139,6 +153,7 @@ impl PartFileWriter {
     /// Write `data` at `offset`. Awaits the worker's confirmation that the
     /// bytes hit the kernel (write returned). Does NOT fsync.
     pub async fn write(&self, offset: u64, data: Vec<u8>) -> io::Result<()> {
+        validate_range(offset, data.len())?;
         let (ack, ack_rx) = oneshot::channel();
         self.inner
             .tx
@@ -153,6 +168,7 @@ impl PartFileWriter {
     /// Read `len` bytes starting at `offset`.
     #[allow(dead_code)]
     pub async fn read(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        validate_range(offset, len)?;
         let (ack, ack_rx) = oneshot::channel();
         self.inner
             .tx
@@ -169,6 +185,7 @@ impl PartFileWriter {
     /// alongside the hash so callers can run AICH recovery on a hash
     /// mismatch without re-reading the part.
     pub async fn hash_part_md4(&self, offset: u64, len: usize) -> io::Result<(Vec<u8>, [u8; 16])> {
+        validate_range(offset, len)?;
         let (ack, ack_rx) = oneshot::channel();
         self.inner
             .tx

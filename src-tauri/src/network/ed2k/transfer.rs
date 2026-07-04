@@ -605,11 +605,9 @@ impl Ed2kDownload {
     ) -> anyhow::Result<std::path::PathBuf> {
         self.emit_source_detail(event_tx, "connecting", None, 0, 0, "", "")
             .await;
-        let _ = event_tx
-            .send(DownloadEvent::Verifying {
-                transfer_id: self.transfer_id.clone(),
-            })
-            .await;
+        let _ = event_tx.try_send(DownloadEvent::Verifying {
+            transfer_id: self.transfer_id.clone(),
+        });
         let final_path = finalize_zero_ed2k_file(
             &self.transfer_id,
             &self.file_name,
@@ -619,13 +617,11 @@ impl Ed2kDownload {
         .await?;
         self.emit_source_detail(event_tx, "completed", None, 0, 0, "", "")
             .await;
-        let _ = event_tx
-            .send(DownloadEvent::Progress {
-                transfer_id: self.transfer_id.clone(),
-                downloaded: 0,
-                total: 0,
-            })
-            .await;
+        let _ = event_tx.try_send(DownloadEvent::Progress {
+            transfer_id: self.transfer_id.clone(),
+            downloaded: 0,
+            total: 0,
+        });
         Ok(final_path)
     }
 
@@ -669,23 +665,21 @@ impl Ed2kDownload {
         available_parts: Option<u32>,
         total_parts: Option<u32>,
     ) {
-        let _ = event_tx
-            .send(DownloadEvent::SourceDetail {
-                transfer_id: self.transfer_id.clone(),
-                ip: self.source_addr.ip().to_string(),
-                port: self.source_addr.port(),
-                status: status.to_string(),
-                queue_rank,
-                speed,
-                transferred,
-                client_software: client_software.to_string(),
-                peer_name: peer_name.to_string(),
-                failure_kind: None,
-                available_parts,
-                total_parts,
-                country_code: self.country_code(),
-            })
-            .await;
+        let _ = event_tx.try_send(DownloadEvent::SourceDetail {
+            transfer_id: self.transfer_id.clone(),
+            ip: self.source_addr.ip().to_string(),
+            port: self.source_addr.port(),
+            status: status.to_string(),
+            queue_rank,
+            speed,
+            transferred,
+            client_software: client_software.to_string(),
+            peer_name: peer_name.to_string(),
+            failure_kind: None,
+            available_parts,
+            total_parts,
+            country_code: self.country_code(),
+        });
     }
 
     async fn emit_source_failed(
@@ -696,23 +690,21 @@ impl Ed2kDownload {
         client_software: &str,
         peer_name: &str,
     ) {
-        let _ = event_tx
-            .send(DownloadEvent::SourceDetail {
-                transfer_id: self.transfer_id.clone(),
-                ip: self.source_addr.ip().to_string(),
-                port: self.source_addr.port(),
-                status: "failed".to_string(),
-                queue_rank: None,
-                speed: 0,
-                transferred,
-                client_software: client_software.to_string(),
-                peer_name: peer_name.to_string(),
-                failure_kind: Some(classify_error(error)),
-                available_parts: None,
-                total_parts: None,
-                country_code: self.country_code(),
-            })
-            .await;
+        let _ = event_tx.try_send(DownloadEvent::SourceDetail {
+            transfer_id: self.transfer_id.clone(),
+            ip: self.source_addr.ip().to_string(),
+            port: self.source_addr.port(),
+            status: "failed".to_string(),
+            queue_rank: None,
+            speed: 0,
+            transferred,
+            client_software: client_software.to_string(),
+            peer_name: peer_name.to_string(),
+            failure_kind: Some(classify_error(error)),
+            available_parts: None,
+            total_parts: None,
+            country_code: self.country_code(),
+        });
     }
 
     /// Run a download on a pre-established connection (Hello handshake already done).
@@ -2660,7 +2652,12 @@ impl Ed2kDownload {
         let part_path = temp_dir.join(format!("{}.part", self.transfer_id));
         let final_path = completed_dir.join(&safe_name);
 
-        let mut tracker = PartTracker::new(self.file_size, &part_path);
+        let file_size = self.file_size;
+        let load_path = part_path.clone();
+        let mut tracker =
+            tokio::task::spawn_blocking(move || PartTracker::new(file_size, &load_path))
+                .await
+                .map_err(|e| anyhow::anyhow!("part tracker load task failed: {e}"))?;
         tracker.set_file_hash(self.file_hash);
         tracker.set_file_name(&self.file_name);
         if !part_hashes.is_empty() {
@@ -2960,7 +2957,7 @@ impl Ed2kDownload {
                             // command returns — without an explicit save here, up to
                             // `PERIODIC_SAVE_INTERVAL` (60s) of gap-tracking progress
                             // on the in-flight part would be silently lost on pause.
-                            tracker.save();
+                            super::part_tracker::save_snapshot_async(tracker.snapshot_for_save()).await;
                             anyhow::bail!("cancelled by user");
                         }
                         r = tokio::time::timeout(
@@ -3113,13 +3110,11 @@ impl Ed2kDownload {
                                 pending_credit_bytes.saturating_add(newly_written);
 
                             if last_progress_emit.elapsed() >= PROGRESS_EMIT_INTERVAL {
-                                let _ = event_tx
-                                    .send(DownloadEvent::Progress {
-                                        transfer_id: self.transfer_id.clone(),
-                                        downloaded: downloaded.min(self.file_size),
-                                        total: self.file_size,
-                                    })
-                                    .await;
+                                let _ = event_tx.try_send(DownloadEvent::Progress {
+                                    transfer_id: self.transfer_id.clone(),
+                                    downloaded: downloaded.min(self.file_size),
+                                    total: self.file_size,
+                                });
                                 last_progress_emit = std::time::Instant::now();
                             }
                         }
@@ -3235,13 +3230,11 @@ impl Ed2kDownload {
                                 pending_credit_bytes.saturating_add(newly_written);
 
                             if last_progress_emit.elapsed() >= PROGRESS_EMIT_INTERVAL {
-                                let _ = event_tx
-                                    .send(DownloadEvent::Progress {
-                                        transfer_id: self.transfer_id.clone(),
-                                        downloaded: downloaded.min(self.file_size),
-                                        total: self.file_size,
-                                    })
-                                    .await;
+                                let _ = event_tx.try_send(DownloadEvent::Progress {
+                                    transfer_id: self.transfer_id.clone(),
+                                    downloaded: downloaded.min(self.file_size),
+                                    total: self.file_size,
+                                });
                                 last_progress_emit = std::time::Instant::now();
                             }
                         }
@@ -3668,7 +3661,7 @@ impl Ed2kDownload {
                         "Part {} byte budget met but gaps remain — peer likely sent duplicate blocks, marking for retry",
                             part_idx
                         );
-                        tracker.save();
+                        super::part_tracker::save_snapshot_async(tracker.snapshot_for_save()).await;
                         continue;
                     }
                 }
@@ -3778,15 +3771,16 @@ impl Ed2kDownload {
                                             tracker.invalidate_range(gs, ge);
                                             invalidated += ge - gs;
                                         }
-                                        tracker.save();
+                                        super::part_tracker::save_snapshot_async(
+                                            tracker.snapshot_for_save(),
+                                        )
+                                        .await;
                                         downloaded = downloaded.saturating_sub(invalidated);
-                                        let _ = event_tx
-                                            .send(DownloadEvent::Progress {
-                                                transfer_id: self.transfer_id.clone(),
-                                                downloaded: downloaded.min(self.file_size),
-                                                total: self.file_size,
-                                            })
-                                            .await;
+                                        let _ = event_tx.try_send(DownloadEvent::Progress {
+                                            transfer_id: self.transfer_id.clone(),
+                                            downloaded: downloaded.min(self.file_size),
+                                            total: self.file_size,
+                                        });
                                         info!(
                                             "AICH narrowed part {} to {} bad 180KiB block(s), ~{} bytes to re-fetch",
                                             part_idx,
@@ -3816,7 +3810,7 @@ impl Ed2kDownload {
                         }
 
                         tracker.mark_incomplete(part_idx);
-                        tracker.save();
+                        super::part_tracker::save_snapshot_async(tracker.snapshot_for_save()).await;
                         downloaded = tracker.completed_bytes();
                         // D12: drop the pending credit tally — bytes that
                         // didn't verify earn this peer nothing. Silenced
@@ -3888,13 +3882,11 @@ impl Ed2kDownload {
                 }
                 // Force one Progress emit at part boundary so the UI sees
                 // verified-part jumps even if the throttle just fired.
-                let _ = event_tx
-                    .send(DownloadEvent::Progress {
-                        transfer_id: self.transfer_id.clone(),
-                        downloaded: downloaded.min(self.file_size),
-                        total: self.file_size,
-                    })
-                    .await;
+                let _ = event_tx.try_send(DownloadEvent::Progress {
+                    transfer_id: self.transfer_id.clone(),
+                    downloaded: downloaded.min(self.file_size),
+                    total: self.file_size,
+                });
                 last_progress_emit = std::time::Instant::now();
                 // Save .part.met off-runtime: snapshot under no lock, then
                 // run atomic_write on a blocking task. Avoids stalling the
@@ -3997,7 +3989,7 @@ impl Ed2kDownload {
             for i in 0..tracker.part_count {
                 tracker.mark_incomplete(i);
             }
-            tracker.save();
+            super::part_tracker::save_snapshot_async(tracker.snapshot_for_save()).await;
             warn!(
                 "Final hash failed for {} — re-opened all {} parts for retry",
                 self.file_name, tracker.part_count

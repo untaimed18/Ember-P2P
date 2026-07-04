@@ -523,7 +523,7 @@ pub async fn start_download(
 /// The UI can only ever select what's on screen, so this is generous; it
 /// exists purely to stop a buggy or hostile caller from handing us an
 /// unbounded list that would tie up the transfer manager lock in a long loop.
-const MAX_BATCH_TRANSFER_IDS: usize = 10_000;
+const MAX_BATCH_TRANSFER_IDS: usize = 500;
 
 fn check_batch_size(transfer_ids: &[String]) -> Result<(), String> {
     if transfer_ids.len() > MAX_BATCH_TRANSFER_IDS {
@@ -566,14 +566,10 @@ pub async fn cancel_transfers_batch(
         }
 
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        if let Err(e) = state
-            .network_tx
-            .send(NetworkCommand::CancelDownload {
-                transfer_id: transfer_id.clone(),
-                cleanup_ack: Some(ack_tx),
-            })
-            .await
-        {
+        if let Err(e) = state.network_tx.try_send(NetworkCommand::CancelDownload {
+            transfer_id: transfer_id.clone(),
+            cleanup_ack: Some(ack_tx),
+        }) {
             // Network task is gone: nothing will release the download's file
             // handle. We still clean up so the partial doesn't leak, but log it
             // — silently dropping this hid that the delete below runs without a
@@ -1125,19 +1121,29 @@ pub async fn set_transfer_priority(
             priority,
         ));
     }
+    let db = state.db.clone();
+    let tid = transfer_id.clone();
+    let prio = priority.clone();
+    tokio::task::spawn_blocking(move || db.update_transfer_priority(&tid, &prio))
+        .await
+        .map_err(|e| {
+            coded_ctx(
+                "transfers_priority_task_failed",
+                "Priority update failed",
+                e,
+            )
+        })?
+        .map_err(|e| {
+            coded_ctx(
+                "transfers_priority_persist_failed",
+                "Priority update failed",
+                e,
+            )
+        })?;
     {
         let mut manager = state.transfer_manager.write().await;
         manager.set_priority(&transfer_id, &priority);
     }
-    let db = state.db.clone();
-    let tid = transfer_id.clone();
-    let prio = priority.clone();
-    db_blocking(move || {
-        if let Err(e) = db.update_transfer_priority(&tid, &prio) {
-            tracing::warn!("Failed to persist transfer priority for {tid}: {e}");
-        }
-    })
-    .await;
     Ok(())
 }
 
@@ -1153,19 +1159,29 @@ pub async fn set_transfer_category(
             "Category name too long (max 256 bytes)",
         ));
     }
+    let db = state.db.clone();
+    let tid = transfer_id.clone();
+    let cat = category.clone();
+    tokio::task::spawn_blocking(move || db.update_transfer_category(&tid, &cat))
+        .await
+        .map_err(|e| {
+            coded_ctx(
+                "transfers_category_task_failed",
+                "Category update failed",
+                e,
+            )
+        })?
+        .map_err(|e| {
+            coded_ctx(
+                "transfers_category_persist_failed",
+                "Category update failed",
+                e,
+            )
+        })?;
     {
         let mut manager = state.transfer_manager.write().await;
         manager.set_category(&transfer_id, &category);
     }
-    let db = state.db.clone();
-    let tid = transfer_id.clone();
-    let cat = category.clone();
-    db_blocking(move || {
-        if let Err(e) = db.update_transfer_category(&tid, &cat) {
-            tracing::warn!("Failed to persist transfer category for {tid}: {e}");
-        }
-    })
-    .await;
     Ok(())
 }
 
@@ -1428,8 +1444,21 @@ pub async fn recover_archive(
             "Part file not found — download may not have started",
         ));
     }
+    let canonical_part = part_path
+        .canonicalize()
+        .map_err(|e| coded_ctx("transfers_part_path_invalid", "Invalid part file path", e))?;
+    let canonical_temp = std::path::PathBuf::from(&dl_folder)
+        .join("Temp")
+        .canonicalize()
+        .map_err(|e| coded_ctx("transfers_temp_path_invalid", "Invalid temp folder", e))?;
+    if !canonical_part.starts_with(&canonical_temp) {
+        return Err(coded(
+            "transfers_part_path_escapes_temp",
+            "Part file path escapes the temp folder",
+        ));
+    }
 
-    let pp = part_path.clone();
+    let pp = canonical_part.clone();
     let filled_ranges = tokio::task::spawn_blocking(move || {
         let tracker = crate::network::ed2k::part_tracker::PartTracker::new(file_size, &pp);
         tracker.filled_ranges()
@@ -1452,7 +1481,11 @@ pub async fn recover_archive(
 
     let fname = file_name.clone();
     let result = tokio::task::spawn_blocking(move || {
-        crate::network::ed2k::archive_recovery::recover_archive(&part_path, &fname, &filled_ranges)
+        crate::network::ed2k::archive_recovery::recover_archive(
+            &canonical_part,
+            &fname,
+            &filled_ranges,
+        )
     })
     .await
     .map_err(|e| coded_ctx("transfers_recovery_task_failed", "Recovery task failed", e))?

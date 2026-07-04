@@ -138,9 +138,9 @@
       // against any push events that landed in the meantime,
       // deduping by content tuple.
       (async () => {
-        const listenerOk = await setupListener(gen);
+        const listenerOk = await setupListener(gen, hash);
         if (gen !== loadGen) return;
-        await loadMessages(gen);
+        await loadMessages(gen, hash);
         if (gen === loadGen) liveError = !listenerOk;
       })();
       markAsRead();
@@ -160,14 +160,14 @@
     };
   });
 
-  async function setupListener(gen: number): Promise<boolean> {
+  async function setupListener(gen: number, hash: string): Promise<boolean> {
     if (gen !== loadGen) return false;
     if (unlisten) { unlisten(); unlisten = null; }
     let fn: UnlistenFn;
     try {
       fn = await listen<{ user_hash: string; message: string; direction: string; timestamp: number }>('ember:chat-message', (event) => {
         if (gen !== loadGen) return;
-        if (event.payload.user_hash === friendHash) {
+        if (event.payload.user_hash === hash) {
           // Dedup duplicate backend emits: inbound chat can be delivered on
           // both the download and upload event loops for the same logical
           // message. Compare the content tuple against the recent tail (a
@@ -206,11 +206,11 @@
     return true;
   }
 
-  async function loadMessages(gen: number) {
+  async function loadMessages(gen: number, hash: string) {
     loading = true;
     loadError = null;
     try {
-      const rows = await getChatMessages(friendHash, PAGE_SIZE);
+      const rows = await getChatMessages(hash, PAGE_SIZE);
       if (gen !== loadGen) return;
       hasMoreHistory = rows.length >= PAGE_SIZE;
       const snapshot = rows.reverse();
@@ -240,6 +240,7 @@
 
   async function loadOlderMessages() {
     if (loadingOlder || !hasMoreHistory || !friendHash) return;
+    const hash = friendHash;
     // Bound in-memory history. The rest stays in the DB; stopping here keeps
     // both the array and the rendered DOM from growing without limit on a very
     // long conversation.
@@ -256,7 +257,7 @@
         hasMoreHistory = false;
         return;
       }
-      const rows = await getChatMessages(friendHash, PAGE_SIZE, cursor);
+      const rows = await getChatMessages(hash, PAGE_SIZE, cursor);
       if (gen !== loadGen) return;
       if (rows.length === 0) {
         hasMoreHistory = false;
@@ -290,12 +291,13 @@
 
   async function retryLoad() {
     if (!friendHash) return;
+    const hash = friendHash;
     const gen = ++loadGen;
     if (unlisten) { unlisten(); unlisten = null; }
     liveError = false;
-    const listenerOk = await setupListener(gen);
+    const listenerOk = await setupListener(gen, hash);
     if (gen !== loadGen) return;
-    await loadMessages(gen);
+    await loadMessages(gen, hash);
     if (gen === loadGen) liveError = !listenerOk;
   }
 

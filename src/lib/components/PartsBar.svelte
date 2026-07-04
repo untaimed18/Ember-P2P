@@ -31,7 +31,8 @@
     title?: string;
   } = $props();
 
-  let count = $derived(Math.max(0, Math.floor(Number(partCount) || 0)));
+  const MAX_RENDERED_PARTS = 10_000;
+  let count = $derived(Math.min(MAX_RENDERED_PARTS, Math.max(0, Math.floor(Number(partCount) || 0))));
   let servedColor = $derived(color || 'var(--accent)');
   // Dark "peer already has" tone — clearly distinct from both the empty track
   // and the green served fill.

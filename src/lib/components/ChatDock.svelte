@@ -162,7 +162,7 @@
     // the right person. We DON'T close the dock — leaving it open
     // means the user can click the friend on /friends and see their
     // chat appear right next to the friend list.
-    goto('/friends');
+    void goto('/friends').catch((e) => console.warn('Failed to open Friends page:', e));
   }
 </script>
 

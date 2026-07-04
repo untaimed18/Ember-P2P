@@ -352,7 +352,12 @@ pub async fn run_friend_session_over_transport(
     .await
     {
         let mut sessions = ember_sessions.write().await;
-        sessions.remove(&peer_ember_hash);
+        let remove_current = sessions
+            .get(&peer_ember_hash)
+            .is_some_and(|current| current.tx.same_channel(&ember_session_handle.tx));
+        if remove_current {
+            sessions.remove(&peer_ember_hash);
+        }
         return Err(anyhow::Error::from(e).context("failed to send OP_EMBER_FRIEND_REQ"));
     }
 
@@ -566,7 +571,18 @@ pub async fn run_friend_session_over_transport(
 
         {
             let mut sessions = session_ember_sessions.write().await;
-            sessions.remove(&peer_ember_hash);
+            let remove_current = sessions
+                .get(&peer_ember_hash)
+                .is_some_and(|current| current.tx.same_channel(&session_ember_session_handle.tx));
+            if remove_current {
+                sessions.remove(&peer_ember_hash);
+            } else {
+                debug!(
+                    "Friend session to {} ended, but a newer session for {} is active; preserving it",
+                    addr,
+                    hex::encode(peer_ember_hash)
+                );
+            }
         }
         let _ = session_ul_event_tx
             .send(UploadEvent {
@@ -965,7 +981,8 @@ mod tests {
         let (client_r, client_w) = tokio::io::split(client);
         let (mut server_r, mut server_w) = tokio::io::split(server);
 
-        let ember_sessions: EmberSessionMap = Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let ember_sessions: EmberSessionMap =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
         let (ul_tx, mut ul_rx) = tokio::sync::mpsc::channel(16);
         let friend_hashes = Arc::new(RwLock::new(std::collections::HashSet::from([
             peer_ember_hash,
@@ -1004,31 +1021,51 @@ mod tests {
                 None,
                 &HelloOptions::default_for_udp_port(4672),
             );
-            write_packet(&mut server_w, OP_EDONKEYHEADER, OP_HELLOANSWER, &hello_answer)
-                .await
-                .unwrap();
+            write_packet(
+                &mut server_w,
+                OP_EDONKEYHEADER,
+                OP_HELLOANSWER,
+                &hello_answer,
+            )
+            .await
+            .unwrap();
 
             let (proto, opcode, _) = read_packet_inner(&mut server_r).await.unwrap();
             assert_eq!((proto, opcode), (OP_EMULEPROT, OP_EMULEINFO));
             let info_answer = build_emule_info(4672, false, None, None);
-            write_packet(&mut server_w, OP_EMULEPROT, OP_EMULEINFOANSWER, &info_answer)
-                .await
-                .unwrap();
+            write_packet(
+                &mut server_w,
+                OP_EMULEPROT,
+                OP_EMULEINFOANSWER,
+                &info_answer,
+            )
+            .await
+            .unwrap();
 
             let (proto, opcode, _) = read_packet_inner(&mut server_r).await.unwrap();
             assert_eq!((proto, opcode), (OP_EMULEPROT, OP_EMBER_HELLO));
             let ember_hello = build_ember_hello(&peer_ember_hash, "peer", Some(&peer_pk_bytes));
-            write_packet(&mut server_w, OP_EMULEPROT, OP_EMBER_HELLOANSWER, &ember_hello)
-                .await
-                .unwrap();
+            write_packet(
+                &mut server_w,
+                OP_EMULEPROT,
+                OP_EMBER_HELLOANSWER,
+                &ember_hello,
+            )
+            .await
+            .unwrap();
 
             let (proto, opcode, our_nonce) = read_packet_inner(&mut server_r).await.unwrap();
             assert_eq!((proto, opcode), (OP_EMULEPROT, OP_EMBER_AUTH_CHALLENGE));
             let mut peer_nonce = [0u8; 32];
             OsRng.fill_bytes(&mut peer_nonce);
-            write_packet(&mut server_w, OP_EMULEPROT, OP_EMBER_AUTH_CHALLENGE, &peer_nonce)
-                .await
-                .unwrap();
+            write_packet(
+                &mut server_w,
+                OP_EMULEPROT,
+                OP_EMBER_AUTH_CHALLENGE,
+                &peer_nonce,
+            )
+            .await
+            .unwrap();
             let sig = peer_sk.sign(&our_nonce);
             let mut resp = Vec::with_capacity(96);
             resp.extend_from_slice(&peer_pk_bytes);
@@ -1094,7 +1131,8 @@ mod tests {
         let (client_r, client_w) = tokio::io::split(client);
         let (mut server_r, mut server_w) = tokio::io::split(server);
 
-        let ember_sessions: EmberSessionMap = Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let ember_sessions: EmberSessionMap =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
         // Seed the map with a stale entry for this exact peer before the
         // dial starts — simulating a previous session whose connection
         // died silently without a clean teardown.
@@ -1104,7 +1142,10 @@ mod tests {
         // `upload.rs`) without depending on that exact constant here.
         stale_handle.backdate_for_test(3600);
         drop(dead_rx); // the "dead" side: receiver already gone
-        ember_sessions.write().await.insert(peer_ember_hash, stale_handle);
+        ember_sessions
+            .write()
+            .await
+            .insert(peer_ember_hash, stale_handle);
 
         let (ul_tx, mut ul_rx) = tokio::sync::mpsc::channel(16);
         let friend_hashes = Arc::new(RwLock::new(std::collections::HashSet::from([
@@ -1142,31 +1183,51 @@ mod tests {
                 None,
                 &HelloOptions::default_for_udp_port(4672),
             );
-            write_packet(&mut server_w, OP_EDONKEYHEADER, OP_HELLOANSWER, &hello_answer)
-                .await
-                .unwrap();
+            write_packet(
+                &mut server_w,
+                OP_EDONKEYHEADER,
+                OP_HELLOANSWER,
+                &hello_answer,
+            )
+            .await
+            .unwrap();
 
             let (proto, opcode, _) = read_packet_inner(&mut server_r).await.unwrap();
             assert_eq!((proto, opcode), (OP_EMULEPROT, OP_EMULEINFO));
             let info_answer = build_emule_info(4672, false, None, None);
-            write_packet(&mut server_w, OP_EMULEPROT, OP_EMULEINFOANSWER, &info_answer)
-                .await
-                .unwrap();
+            write_packet(
+                &mut server_w,
+                OP_EMULEPROT,
+                OP_EMULEINFOANSWER,
+                &info_answer,
+            )
+            .await
+            .unwrap();
 
             let (proto, opcode, _) = read_packet_inner(&mut server_r).await.unwrap();
             assert_eq!((proto, opcode), (OP_EMULEPROT, OP_EMBER_HELLO));
             let ember_hello = build_ember_hello(&peer_ember_hash, "peer", Some(&peer_pk_bytes));
-            write_packet(&mut server_w, OP_EMULEPROT, OP_EMBER_HELLOANSWER, &ember_hello)
-                .await
-                .unwrap();
+            write_packet(
+                &mut server_w,
+                OP_EMULEPROT,
+                OP_EMBER_HELLOANSWER,
+                &ember_hello,
+            )
+            .await
+            .unwrap();
 
             let (proto, opcode, our_nonce) = read_packet_inner(&mut server_r).await.unwrap();
             assert_eq!((proto, opcode), (OP_EMULEPROT, OP_EMBER_AUTH_CHALLENGE));
             let mut peer_nonce = [0u8; 32];
             OsRng.fill_bytes(&mut peer_nonce);
-            write_packet(&mut server_w, OP_EMULEPROT, OP_EMBER_AUTH_CHALLENGE, &peer_nonce)
-                .await
-                .unwrap();
+            write_packet(
+                &mut server_w,
+                OP_EMULEPROT,
+                OP_EMBER_AUTH_CHALLENGE,
+                &peer_nonce,
+            )
+            .await
+            .unwrap();
             let sig = peer_sk.sign(&our_nonce);
             let mut resp = Vec::with_capacity(96);
             resp.extend_from_slice(&peer_pk_bytes);

@@ -52,6 +52,11 @@ pub const MAX_PATTERNS: usize = 500;
 /// is generous and bounds the worst-case compile time.
 pub const MAX_PATTERN_LEN: usize = 256;
 
+/// Maximum AntiLeech.dat size accepted from disk. Real curated lists are
+/// kilobytes; this keeps a corrupted local file from being read fully into
+/// memory during startup or settings reload.
+pub const MAX_FILE_BYTES: u64 = 1 * 1024 * 1024;
+
 /// Memory budget passed to the `regex` crate when compiling a pattern.
 /// 1 MiB is the crate's default, named here so it's auditable in one
 /// place. Patterns whose compiled DFA exceeds this are rejected
@@ -262,6 +267,25 @@ impl AntiLeechFilter {
     /// the defaults — defaults are seeded explicitly the first time we
     /// create the file). Unreadable file → log + empty.
     pub fn load_from_file(path: &Path, enabled: bool) -> Self {
+        match std::fs::metadata(path) {
+            Ok(meta) if meta.len() > MAX_FILE_BYTES => {
+                warn!(
+                    "AntiLeech: refusing to read {} ({} bytes > {} byte cap)",
+                    path.display(),
+                    meta.len(),
+                    MAX_FILE_BYTES
+                );
+                return Self::default();
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Self::default();
+            }
+            Err(e) => {
+                warn!("AntiLeech: failed to stat {}: {e}", path.display());
+                return Self::default();
+            }
+        }
         let data = match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

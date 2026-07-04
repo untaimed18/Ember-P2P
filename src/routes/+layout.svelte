@@ -88,14 +88,15 @@
     // called `prevent_close`. Closing the dialog is enough.
   }
 
-  // Register all event listeners immediately — don't wait for onMount/render.
-  const storeInitPromise = Promise.all([
-    initNetworkStore(),
-    initTransferStore(),
-    initSearchStore(),
-    initFriendsStore(),
-    loadAppSettings(),
-  ]);
+  function initStores() {
+    return Promise.all([
+      initNetworkStore(),
+      initTransferStore(),
+      initSearchStore(),
+      initFriendsStore(),
+      loadAppSettings(),
+    ]);
+  }
 
   // The `close-requested` and `config-corrupt-recovered` listeners are
   // registered inside onMount (below) so they're torn down AND re-registered
@@ -154,7 +155,7 @@
       revealTimer = window.setTimeout(revealApp, waitMs);
     };
 
-    storeInitPromise
+    initStores()
       .then(async () => {
         if (mounted) {
           stopPoll = startStatsPoll();

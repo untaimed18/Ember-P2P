@@ -23,6 +23,7 @@
   let unlisten: UnlistenFn | null = null;
   let listenerGen = 0;
   let browseTimeout: ReturnType<typeof setTimeout> | undefined;
+  const MAX_BROWSE_FILES = 1_000;
   // M4: per-request gen used to disambiguate result/error events
   // from successive browses. Without it, a late error from request
   // N is dropped by the `loading` guard if request N+1 already
@@ -41,10 +42,11 @@
       // closed dialog could still fire IPC and corrupt the next
       // session's state.
       const gen = ++listenerGen;
+      const hash = friendHash;
       (async () => {
-        const ok = await setupListener(gen);
+        const ok = await setupListener(gen, hash);
         if (!ok || gen !== listenerGen || !open) return;
-        await requestBrowse();
+        await requestBrowse(hash);
       })();
     }
     return () => {
@@ -64,13 +66,13 @@
   /// `return`ed on failure but the caller still called
   /// `requestBrowse()` afterward — which then ran `error = null`
   /// and wiped the actionable error message before the user saw it.
-  async function setupListener(gen: number): Promise<boolean> {
+  async function setupListener(gen: number, hash: string): Promise<boolean> {
     if (unlisten) { unlisten(); unlisten = null; }
     if (unlistenError) { unlistenError(); unlistenError = null; }
     let fn: UnlistenFn;
     try {
       fn = await listen<{ user_hash: string; files: BrowseFileEntry[] }>('ember:browse-result', (event) => {
-        if (event.payload.user_hash !== friendHash) return;
+        if (event.payload.user_hash !== hash) return;
         // Only accept results while a browse is in flight. If
         // `currentBrowseGen` is 0 the event belongs to a previous
         // browse the user already dismissed; ignoring it stops a
@@ -80,7 +82,9 @@
         clearTimeout(browseTimeout);
         // Defensive: treat missing/invalid `files` as empty rather than
         // crashing the dialog if the backend ever emits a malformed payload.
-        files = Array.isArray(event.payload.files) ? event.payload.files : [];
+        files = Array.isArray(event.payload.files)
+          ? event.payload.files.slice(0, MAX_BROWSE_FILES)
+          : [];
         loading = false;
         // Successful result terminates this browse generation; a
         // later error for the same friend is most likely from a
@@ -100,7 +104,7 @@
     let errFn: UnlistenFn;
     try {
       errFn = await listen<{ user_hash: string; reason: string }>('ember:browse-error', (event) => {
-        if (event.payload.user_hash !== friendHash) return;
+        if (event.payload.user_hash !== hash) return;
         // M4: previously this guard required `loading`, which meant
         // an error that arrived shortly after a result was silently
         // dropped — including the common case where the backend
@@ -136,7 +140,7 @@
     return true;
   }
 
-  async function requestBrowse() {
+  async function requestBrowse(hash: string) {
     loading = true;
     error = null;
     downloadError = null;
@@ -149,7 +153,7 @@
     currentBrowseGen++;
     const myGen = currentBrowseGen;
     try {
-      await browseFriend(friendHash);
+      await browseFriend(hash);
       browseTimeout = setTimeout(() => {
         if (currentBrowseGen === myGen && loading) {
           loading = false;

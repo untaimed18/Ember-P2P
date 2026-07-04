@@ -826,6 +826,7 @@
   // matches any of: user_hash (full or truncated form the user might have
   // copied), last IP, country code, or — when the row is a friend — the
   // friend nickname. Empty filter passes through everything.
+  const KNOWN_CLIENT_DISPLAY_LIMIT = 1000;
   let filteredKnownClients = $derived.by(() => {
     const q = knownFilter.trim().toLowerCase();
     if (!q) return sortedKnownClients;
@@ -839,6 +840,9 @@
       return false;
     });
   });
+  let displayedKnownClients = $derived.by(() =>
+    filteredKnownClients.slice(0, KNOWN_CLIENT_DISPLAY_LIMIT)
+  );
 
   // Top-line stats for the Known Clients sub-toolbar. Computed off the
   // unfiltered list so the totals reflect the full ledger regardless of
@@ -3329,6 +3333,11 @@
                   {m.transfers_known_showing_label()} <strong>{filteredKnownClients.length}</strong>
                 </span>
               {/if}
+              {#if displayedKnownClients.length < filteredKnownClients.length}
+                <span class="known-stat known-stat-match" aria-live="polite">
+                  {m.transfers_known_showing_label()} <strong>{displayedKnownClients.length}</strong> / <strong>{filteredKnownClients.length}</strong>
+                </span>
+              {/if}
             </div>
           {/if}
         </div>
@@ -3380,7 +3389,7 @@
             </tr>
           </thead>
           <tbody>
-            {#each filteredKnownClients as kc (kc.user_hash)}
+            {#each displayedKnownClients as kc (kc.user_hash)}
               {@const isFriend = friendHashSet.has(kc.user_hash.toLowerCase())}
               {@const friendNick = isFriend ? friendNickById[kc.user_hash.toLowerCase()] : undefined}
               <tr class="client-row" class:client-row-friend={isFriend}>

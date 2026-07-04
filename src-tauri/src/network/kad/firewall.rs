@@ -276,6 +276,10 @@ impl FirewallChecker {
 
     /// Handle KADEMLIA2_FIREWALLUDP response.
     pub fn handle_udp_firewall_result(&mut self, success: bool) {
+        if !self.checking {
+            debug!("Ignoring late UDP firewall result outside an active check window");
+            return;
+        }
         self.udp_firewall_responses_received += 1;
         if success {
             self.udp_firewall_succeeded = true;
@@ -304,6 +308,8 @@ impl FirewallChecker {
         }
 
         self.checking = false;
+        self.pending_check_ips.clear();
+        self.pending_udp_check_ips.clear();
 
         // If no requests were sent at all this cycle, don't change any status --
         // we have no data to make a determination and shouldn't overwrite whatever

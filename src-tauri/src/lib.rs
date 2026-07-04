@@ -489,7 +489,14 @@ pub fn run() {
                 let mut all_discovered: Vec<crate::types::FileInfo> = Vec::new();
                 for handle in discovery_handles {
                     match handle.await {
-                        Ok(files) => all_discovered.extend(files),
+                        Ok(result) => {
+                            if result.truncated {
+                                tracing::warn!(
+                                    "Startup discovery reached the per-folder file cap; some files will wait for a later scan"
+                                );
+                            }
+                            all_discovered.extend(result.files);
+                        }
                         Err(e) => tracing::error!("discover_directory panicked for folder: {e}"),
                     }
                 }
