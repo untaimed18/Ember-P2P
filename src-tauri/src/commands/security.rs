@@ -7,7 +7,7 @@ use zip::ZipArchive;
 
 use crate::app_state::AppState;
 use crate::commands::errors::{await_reply, coded, coded_ctx, CMD_REPLY_TIMEOUT};
-use crate::network::kad::ip_filter::IpFilterStats;
+use crate::network::kad::ip_filter::{count_valid_entries, IpFilterStats};
 use crate::network::NetworkCommand;
 
 const CMD_TIMEOUT: std::time::Duration = CMD_REPLY_TIMEOUT;
@@ -381,6 +381,27 @@ pub async fn download_and_load_ipfilter(
             )
         })??;
 
+    // Validate *before* anything on disk or in memory is touched. Without
+    // this, a dead mirror serving an HTML error page (still a 200, so
+    // `error_for_status` doesn't catch it) or a truncated/corrupted archive
+    // would sail through straight to `atomic_write` + `ReloadIpFilter`,
+    // which faithfully replaces the working filter with an empty one —
+    // silently wiping out the user's protection while this command still
+    // reports success. Counting real entries first means a bad response
+    // can never overwrite a working ipfilter.dat.
+    let (extracted, entry_count) = tokio::task::spawn_blocking(move || {
+        let entry_count = count_valid_entries(&extracted, "dat");
+        (extracted, entry_count)
+    })
+    .await
+    .map_err(|e| coded_ctx("security_validation_task_failed", "Validation task failed", e))?;
+    if entry_count == 0 {
+        return Err(coded(
+            "security_ipfilter_no_valid_entries",
+            "Downloaded file does not contain any valid IP filter entries — keeping the existing filter",
+        ));
+    }
+
     let data_dir = crate::storage::paths::resolve_data_dir_with_app(&app);
     tokio::fs::create_dir_all(&data_dir).await.map_err(|e| {
         coded_ctx(
@@ -411,7 +432,6 @@ pub async fn download_and_load_ipfilter(
     }
 
     let byte_count = extracted.len();
-    let line_count = extracted.iter().filter(|&&b| b == b'\n').count();
 
     state
         .network_tx
@@ -467,7 +487,7 @@ pub async fn download_and_load_ipfilter(
     }
 
     let msg = format!(
-        "Downloaded, extracted, and loaded ipfilter.dat ({byte_count} bytes, ~{line_count} entries) — filter is now active"
+        "Downloaded, extracted, and loaded ipfilter.dat ({byte_count} bytes, {entry_count} entries) — filter is now active"
     );
     info!("{msg}");
     Ok(msg)
@@ -547,6 +567,22 @@ pub async fn update_ipfilter_from_url(
         bytes
     };
 
+    // Validate before writing anything — a user-supplied URL is even less
+    // trustworthy than the hard-coded default, and the same silent-wipe risk
+    // applies (see the comment in `download_and_load_ipfilter`).
+    let (filter_bytes, entry_count) = tokio::task::spawn_blocking(move || {
+        let entry_count = count_valid_entries(&filter_bytes, "dat");
+        (filter_bytes, entry_count)
+    })
+    .await
+    .map_err(|e| coded_ctx("security_validation_task_failed", "Validation task failed", e))?;
+    if entry_count == 0 {
+        return Err(coded(
+            "security_ipfilter_no_valid_entries",
+            "Downloaded file does not contain any valid IP filter entries — keeping the existing filter",
+        ));
+    }
+
     let data_dir = crate::storage::paths::resolve_data_dir_with_app(&app);
     tokio::fs::create_dir_all(&data_dir).await.map_err(|e| {
         coded_ctx(
@@ -574,7 +610,6 @@ pub async fn update_ipfilter_from_url(
     }
 
     let byte_count = filter_bytes.len();
-    let line_count = filter_bytes.iter().filter(|&&b| b == b'\n').count();
 
     state
         .network_tx
@@ -630,7 +665,7 @@ pub async fn update_ipfilter_from_url(
 
     let extracted_note = if is_zip { " (extracted from zip)" } else { "" };
     let msg = format!(
-        "Downloaded and loaded ipfilter.dat from {url}{extracted_note} ({byte_count} bytes, ~{line_count} entries) — filter is now active"
+        "Downloaded and loaded ipfilter.dat from {url}{extracted_note} ({byte_count} bytes, {entry_count} entries) — filter is now active"
     );
     info!("{msg}");
     Ok(msg)
@@ -731,7 +766,7 @@ pub async fn import_ipfilter_file(
         .map(|e| e.to_lowercase())
         .unwrap_or_default();
 
-    let load_path = if ext == "gz" || ext == "zip" {
+    let (load_path, entry_count) = if ext == "gz" || ext == "zip" {
         let data_dir = crate::storage::paths::resolve_data_dir_with_app(&app);
         tokio::fs::create_dir_all(&data_dir).await.map_err(|e| {
             coded_ctx(
@@ -777,6 +812,17 @@ pub async fn import_ipfilter_file(
             } else {
                 extract_ipfilter_from_zip(&raw)?
             };
+            // Validate before this is ever written to ipfilter.dat — see
+            // `download_and_load_ipfilter` for why a bad payload must never
+            // reach `atomic_write` (which would otherwise faithfully
+            // replace a working filter with an empty one).
+            let entry_count = count_valid_entries(&decompressed, "dat");
+            if entry_count == 0 {
+                return Err(coded(
+                    "security_ipfilter_no_valid_entries",
+                    "Selected file does not contain any valid IP filter entries — keeping the existing filter",
+                ));
+            }
             // Atomic write: prevents partial-file corruption on crash
             // mid-decompression-write. Already inside spawn_blocking,
             // so calling the sync helper directly is fine.
@@ -787,7 +833,7 @@ pub async fn import_ipfilter_file(
                     e,
                 )
             })?;
-            Ok::<std::path::PathBuf, String>(dest)
+            Ok::<(std::path::PathBuf, usize), String>((dest, entry_count))
         })
         .await
         .map_err(|e| coded_ctx("security_task_failed", "Task failed", e))??
@@ -818,7 +864,25 @@ pub async fn import_ipfilter_file(
                 ),
             ));
         }
-        path
+        // Validate before handing off to `ReloadIpFilter` — a file the user
+        // picked by mistake (wrong content, empty, corrupted) must not be
+        // allowed to clear the working filter. Bounded by the size check
+        // above.
+        let raw = tokio::fs::read(&path)
+            .await
+            .map_err(|e| coded_ctx("security_failed_to_read_file", "Failed to read file", e))?;
+        let entry_count = tokio::task::spawn_blocking(move || count_valid_entries(&raw, &ext))
+            .await
+            .map_err(|e| {
+                coded_ctx("security_validation_task_failed", "Validation task failed", e)
+            })?;
+        if entry_count == 0 {
+            return Err(coded(
+                "security_ipfilter_no_valid_entries",
+                "Selected file does not contain any valid IP filter entries — keeping the existing filter",
+            ));
+        }
+        (path, entry_count)
     };
 
     state
@@ -873,7 +937,9 @@ pub async fn import_ipfilter_file(
         }
     }
 
-    Ok("Imported and loaded IP filter — filter is now active".into())
+    Ok(format!(
+        "Imported and loaded IP filter ({entry_count} entries) — filter is now active"
+    ))
 }
 
 // ----- Anti-leech client filter commands -----------------------------
