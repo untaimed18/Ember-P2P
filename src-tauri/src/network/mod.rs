@@ -5792,7 +5792,7 @@ pub async fn start_network(
         async {
             let mut filter = IpFilter::new(ipf_enabled, ipf_block_private);
             if ipf_enabled && ipf_path.exists() {
-                filter.load_from_file(&ipf_path);
+                let _ = filter.load_from_file(&ipf_path);
             }
             filter
         },
@@ -7266,8 +7266,10 @@ pub async fn start_network(
                         if new_settings.ip_filter_enabled && state.ip_filter.range_count() == 0 {
                             let default_path = state.data_dir.join("ipfilter.dat");
                             if default_path.exists() {
-                                let n = state.ip_filter.load_from_file(&default_path);
-                                info!("Loaded {n} IP filter entries on enable ({} ranges after merge)", state.ip_filter.range_count());
+                                match state.ip_filter.load_from_file(&default_path) {
+                                    Some(n) => info!("Loaded {n} IP filter entries on enable ({} ranges after merge)", state.ip_filter.range_count()),
+                                    None => warn!("Failed to read ipfilter.dat on enable; filter stays empty until a valid file is available"),
+                                }
                             }
                         }
                         state.ip_filter.update_shared_snapshot(&state.shared_ip_filter);
@@ -7546,8 +7548,10 @@ pub async fn start_network(
                             if new_settings.ip_filter_enabled && state.ip_filter.range_count() == 0 {
                                 let default_path = state.data_dir.join("ipfilter.dat");
                                 if default_path.exists() {
-                                    let n = state.ip_filter.load_from_file(&default_path);
-                                    info!("Loaded {n} IP filter entries on enable ({} ranges after merge)", state.ip_filter.range_count());
+                                    match state.ip_filter.load_from_file(&default_path) {
+                                        Some(n) => info!("Loaded {n} IP filter entries on enable ({} ranges after merge)", state.ip_filter.range_count()),
+                                        None => warn!("Failed to read ipfilter.dat on enable; filter stays empty until a valid file is available"),
+                                    }
                                 }
                             }
                             state.ip_filter.update_shared_snapshot(&state.shared_ip_filter);
@@ -26620,8 +26624,18 @@ async fn handle_command_inner(
                         }
                     }
                 }
-                // Load from the (now updated) default path
-                filter.load_from_file(&load_path);
+                // Load from the (now updated) default path. A failed read
+                // (missing file, I/O error, corrupt header) leaves `filter`
+                // untouched — see `IpFilter::load_from_file` — so the
+                // previous ranges keep protecting the user instead of the
+                // reload silently emptying the filter.
+                match filter.load_from_file(&load_path) {
+                    Some(n) => info!("ReloadIpFilter: parsed {n} ranges from {load_path:?}"),
+                    None => warn!(
+                        "ReloadIpFilter: failed to read {load_path:?}; keeping the previous {} ranges",
+                        filter.range_count()
+                    ),
+                }
                 filter
             })
             .await
@@ -26709,7 +26723,9 @@ async fn handle_command_inner(
                         IpFilter::new(enabled, block_private),
                     );
                     filter = tokio::task::spawn_blocking(move || {
-                        filter.load_from_file(&default_path);
+                        if filter.load_from_file(&default_path).is_none() {
+                            warn!("Failed to read ipfilter.dat while enabling the filter; it will stay empty until a valid file is available");
+                        }
                         filter
                     })
                     .await

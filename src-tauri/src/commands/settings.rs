@@ -4,11 +4,12 @@ use tracing::info;
 use crate::app_state::AppState;
 use crate::commands::errors::{coded, coded_ctx};
 use crate::network::kad::bootstrap;
+use crate::network::kad::ip_filter::count_valid_entries;
 use crate::network::NetworkCommand;
 use crate::types::AppSettings;
 
 const NODES_DAT_URL: &str = "https://upd.emule-security.org/nodes.dat";
-const IPFILTER_URL: &str = "https://emuling.gitlab.io/ipfilter.dat";
+const IPFILTER_URL: &str = "https://upd.emule-security.org/ipfilter.dat";
 
 #[tauri::command]
 pub async fn get_settings(state: tauri::State<'_, AppState>) -> Result<AppSettings, String> {
@@ -696,6 +697,26 @@ pub async fn download_ipfilter(
         body
     };
 
+    // Validate before anything on disk or in memory is touched. Without
+    // this, a dead mirror serving an HTML error page (still a 200, so
+    // `error_for_status` doesn't catch it) would sail straight through to
+    // `atomic_write` + `ReloadIpFilter`, which faithfully replaces the
+    // working filter with an empty one — silently wiping out the user's
+    // protection while this command still reports success. See
+    // `commands::security::download_and_load_ipfilter` for the same fix.
+    let (bytes, entry_count) = tokio::task::spawn_blocking(move || {
+        let entry_count = count_valid_entries(&bytes, "dat");
+        (bytes, entry_count)
+    })
+    .await
+    .map_err(|e| coded_ctx("settings_validation_task_failed", "Validation task failed", e))?;
+    if entry_count == 0 {
+        return Err(coded(
+            "settings_ipfilter_no_valid_entries",
+            "Downloaded file does not contain any valid IP filter entries — keeping the existing filter",
+        ));
+    }
+
     let data_dir = crate::storage::paths::resolve_data_dir_with_app(&app);
     tokio::fs::create_dir_all(&data_dir).await.map_err(|e| {
         coded_ctx(
@@ -724,7 +745,6 @@ pub async fn download_ipfilter(
     }
 
     let byte_count = bytes.len();
-    let line_count = bytes.iter().filter(|&&b| b == b'\n').count();
 
     let reload_ok = state
         .network_tx
@@ -733,11 +753,11 @@ pub async fn download_ipfilter(
 
     let msg = if reload_ok {
         format!(
-            "Downloaded ipfilter.dat ({byte_count} bytes, ~{line_count} entries) — reloading filter now"
+            "Downloaded ipfilter.dat ({byte_count} bytes, {entry_count} entries) — reloading filter now"
         )
     } else {
         format!(
-            "Downloaded ipfilter.dat ({byte_count} bytes, ~{line_count} entries) — network busy, filter will load on restart"
+            "Downloaded ipfilter.dat ({byte_count} bytes, {entry_count} entries) — network busy, filter will load on restart"
         )
     };
     info!("{msg}");

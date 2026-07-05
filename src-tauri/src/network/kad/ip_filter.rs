@@ -136,87 +136,28 @@ impl IpFilter {
         }
     }
 
-    pub fn load_from_file(&mut self, path: &Path) -> usize {
+    /// Replace `self.blocked_ranges` with `new_ranges` after sorting,
+    /// merging overlaps, and carrying over hit counts for ranges that
+    /// survive the reload unchanged (same start/end).
+    ///
+    /// This is the *only* place that mutates `self.blocked_ranges` on a
+    /// (re)load path, and every loader below (`.dat`/`.txt`, `.p2p`, `.p2b`)
+    /// calls it only after it has fully and successfully read the new data.
+    /// That ordering is what guarantees a failed read (missing file, I/O
+    /// error, corrupt header) never leaves `self` with fewer ranges than it
+    /// started with — the old filter stays in effect until a fresh one is
+    /// actually in hand, "clear-then-fail" is impossible by construction.
+    fn commit_ranges(&mut self, mut new_ranges: Vec<IpRange>) -> usize {
         let saved_hits: std::collections::HashMap<(u32, u32), u64> = self
             .blocked_ranges
             .iter()
             .filter(|r| r.hits > 0)
             .map(|r| ((r.start, r.end), r.hits))
             .collect();
-        self.blocked_ranges.clear();
 
-        let ext = path
-            .extension()
-            .map(|e| e.to_string_lossy().to_lowercase())
-            .unwrap_or_default();
-
-        let count = match ext.as_str() {
-            "p2b" => self.load_p2b_file(path),
-            "p2p" => self.load_p2p_file(path),
-            _ => {
-                // K20: ipfilter.dat can legitimately be tens of MB and
-                // pathologically-large files (from buggy crawlers or
-                // malicious downloads) can be gigabytes. Read the file
-                // line-by-line with a hard per-line cap instead of
-                // slurping the whole thing into memory as a UTF-8
-                // String. A single oversized line gets dropped, not the
-                // entire file.
-                use std::io::BufRead;
-                let file = match std::fs::File::open(path) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        warn!("Failed to open ipfilter.dat: {e}");
-                        return 0;
-                    }
-                };
-                const MAX_LINE_BYTES: usize = 8 * 1024; // 8 KiB per line.
-                const MAX_LINES: usize = 5_000_000; // hard cap on parsed entries.
-                let reader = std::io::BufReader::new(file);
-                let mut count = 0usize;
-                let mut overlong_drops = 0usize;
-                for (lineno, line_res) in reader.lines().enumerate().take(MAX_LINES) {
-                    let line = match line_res {
-                        Ok(l) => l,
-                        Err(e) => {
-                            warn!(
-                                "Stopping ipfilter.dat parse after I/O error at line {}: {e}",
-                                lineno + 1
-                            );
-                            break;
-                        }
-                    };
-                    if line.len() > MAX_LINE_BYTES {
-                        overlong_drops += 1;
-                        continue;
-                    }
-                    let line = line.trim();
-                    if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
-                        continue;
-                    }
-                    if let Some(range) = parse_ipfilter_line(line) {
-                        self.blocked_ranges.push(range);
-                        count += 1;
-                    } else if let Some(range) = parse_p2p_line(line) {
-                        self.blocked_ranges.push(range);
-                        count += 1;
-                    }
-                }
-                if overlong_drops > 0 {
-                    warn!(
-                        "ipfilter.dat: dropped {overlong_drops} lines longer than {MAX_LINE_BYTES} bytes"
-                    );
-                }
-
-                self.blocked_ranges.sort_by_key(|r| r.start);
-                self.merge_overlapping();
-                info!(
-                    "Loaded {count} IP filter entries ({} ranges after merge) from {}",
-                    self.blocked_ranges.len(),
-                    path.display()
-                );
-                count
-            }
-        };
+        new_ranges.sort_by_key(|r| r.start);
+        self.blocked_ranges = new_ranges;
+        self.merge_overlapping();
 
         if !saved_hits.is_empty() {
             for r in &mut self.blocked_ranges {
@@ -225,7 +166,114 @@ impl IpFilter {
                 }
             }
         }
-        count
+        self.blocked_ranges.len()
+    }
+
+    /// (Re)load the filter from `path`, dispatching on extension: `.p2b` ->
+    /// PeerGuardian binary, `.p2p` -> PeerGuardian text, anything else ->
+    /// eMule `ipfilter.dat` / plain text.
+    ///
+    /// Returns `None` if the file could not be read at all (missing,
+    /// unreadable, truncated/corrupt binary header, etc.) — `self` is left
+    /// completely untouched in that case, so a bad path or a download gone
+    /// wrong can never wipe out a filter that was working. Returns
+    /// `Some(count)` with the number of ranges after merging once a new list
+    /// has actually been read (a readable-but-empty or all-invalid file
+    /// legitimately yields `Some(0)`; distinguishing that from "couldn't
+    /// read it" is the caller's job — see `count_valid_entries` for
+    /// pre-flight validation of downloaded/imported content).
+    pub fn load_from_file(&mut self, path: &Path) -> Option<usize> {
+        let ext = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+
+        match ext.as_str() {
+            "p2b" => self.load_p2b_file(path),
+            "p2p" => self.load_p2p_file(path),
+            _ => self.load_dat_file(path),
+        }
+    }
+
+    /// Load the eMule `ipfilter.dat` / plain-text format. Also accepts
+    /// PeerGuardian `.p2p`-style lines as a per-line fallback, since
+    /// real-world "ipfilter.dat" downloads sometimes ship that format under
+    /// a `.dat` name.
+    fn load_dat_file(&mut self, path: &Path) -> Option<usize> {
+        // K20: ipfilter.dat can legitimately be tens of MB and
+        // pathologically-large files (from buggy crawlers or
+        // malicious downloads) can be gigabytes. Read the file
+        // line-by-line with a hard per-line cap instead of
+        // slurping the whole thing into memory as a UTF-8
+        // String. A single oversized line gets dropped, not the
+        // entire file.
+        use std::io::BufRead;
+        let file = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(e) => {
+                warn!("Failed to open ipfilter.dat: {e}");
+                return None;
+            }
+        };
+        const MAX_LINE_BYTES: usize = 8 * 1024; // 8 KiB per line.
+        const MAX_LINES: usize = 5_000_000; // hard cap on parsed entries.
+        let mut reader = std::io::BufReader::new(file);
+        let mut new_ranges = Vec::new();
+        let mut count = 0usize;
+        let mut overlong_drops = 0usize;
+        let mut raw_line = Vec::new();
+        for lineno in 0..MAX_LINES {
+            raw_line.clear();
+            // Read raw bytes rather than `BufRead::lines()`: the latter
+            // hard-errors (and this loop used to abort entirely) on the
+            // first byte sequence that isn't valid UTF-8. Real-world
+            // ipfilter.dat mirrors occasionally carry a stray non-UTF8 byte
+            // in a description field; one bad byte at line 30,000 of 60,000
+            // shouldn't silently discard the other 30,000 good ranges. We
+            // decode lossily instead, matching `count_valid_entries`'s
+            // tolerance so pre-flight validation and the real load agree.
+            let read = match reader.read_until(b'\n', &mut raw_line) {
+                Ok(n) => n,
+                Err(e) => {
+                    warn!(
+                        "Stopping ipfilter.dat parse after I/O error at line {}: {e}",
+                        lineno + 1
+                    );
+                    break;
+                }
+            };
+            if read == 0 {
+                break; // EOF
+            }
+            if raw_line.len() > MAX_LINE_BYTES {
+                overlong_drops += 1;
+                continue;
+            }
+            let line = String::from_utf8_lossy(&raw_line);
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
+                continue;
+            }
+            if let Some(range) = parse_ipfilter_line(line) {
+                new_ranges.push(range);
+                count += 1;
+            } else if let Some(range) = parse_p2p_line(line) {
+                new_ranges.push(range);
+                count += 1;
+            }
+        }
+        if overlong_drops > 0 {
+            warn!(
+                "ipfilter.dat: dropped {overlong_drops} lines longer than {MAX_LINE_BYTES} bytes"
+            );
+        }
+
+        let final_count = self.commit_ranges(new_ranges);
+        info!(
+            "Loaded {count} IP filter entries ({final_count} ranges after merge) from {}",
+            path.display()
+        );
+        Some(final_count)
     }
 
     fn merge_overlapping(&mut self) {
@@ -438,7 +486,7 @@ impl IpFilter {
     }
 
     /// Load a PeerGuardian .p2p text file (format: "Description: IP1 - IP2")
-    pub fn load_p2p_file(&mut self, path: &Path) -> usize {
+    pub fn load_p2p_file(&mut self, path: &Path) -> Option<usize> {
         // Mirror the ipfilter.dat path: stream line-by-line with hard
         // per-line and total-line caps instead of slurping the whole file
         // into a String. A malicious/buggy multi-gigabyte list can't OOM us.
@@ -447,18 +495,24 @@ impl IpFilter {
             Ok(f) => f,
             Err(e) => {
                 warn!("Failed to read .p2p file: {e}");
-                return 0;
+                return None;
             }
         };
         const MAX_LINE_BYTES: usize = 8 * 1024; // 8 KiB per line.
         const MAX_LINES: usize = 5_000_000; // hard cap on parsed entries.
-        let reader = std::io::BufReader::new(file);
+        let mut reader = std::io::BufReader::new(file);
 
+        let mut new_ranges = Vec::new();
         let mut count = 0;
         let mut overlong_drops = 0usize;
-        for (lineno, line_res) in reader.lines().enumerate().take(MAX_LINES) {
-            let line = match line_res {
-                Ok(l) => l,
+        let mut raw_line = Vec::new();
+        for lineno in 0..MAX_LINES {
+            raw_line.clear();
+            // Lossy byte-level read, not `BufRead::lines()` — see
+            // `load_dat_file` for why a single non-UTF8 byte must not abort
+            // the whole parse.
+            let read = match reader.read_until(b'\n', &mut raw_line) {
+                Ok(n) => n,
                 Err(e) => {
                     warn!(
                         "Stopping .p2p parse after I/O error at line {}: {e}",
@@ -467,16 +521,20 @@ impl IpFilter {
                     break;
                 }
             };
-            if line.len() > MAX_LINE_BYTES {
+            if read == 0 {
+                break; // EOF
+            }
+            if raw_line.len() > MAX_LINE_BYTES {
                 overlong_drops += 1;
                 continue;
             }
+            let line = String::from_utf8_lossy(&raw_line);
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
                 continue;
             }
             if let Some(range) = parse_p2p_line(line) {
-                self.blocked_ranges.push(range);
+                new_ranges.push(range);
                 count += 1;
             }
         }
@@ -484,18 +542,16 @@ impl IpFilter {
             warn!(".p2p file: dropped {overlong_drops} lines longer than {MAX_LINE_BYTES} bytes");
         }
 
-        self.blocked_ranges.sort_by_key(|r| r.start);
-        self.merge_overlapping();
+        let final_count = self.commit_ranges(new_ranges);
         info!(
-            "Loaded {count} entries ({} ranges after merge) from .p2p file {}",
-            self.blocked_ranges.len(),
+            "Loaded {count} entries ({final_count} ranges after merge) from .p2p file {}",
             path.display()
         );
-        count
+        Some(final_count)
     }
 
     /// Load a PeerGuardian .p2b binary file (v1 or v2).
-    pub fn load_p2b_file(&mut self, path: &Path) -> usize {
+    pub fn load_p2b_file(&mut self, path: &Path) -> Option<usize> {
         // A .p2b stores tiny fixed-size records, so a legitimate full list is
         // comfortably under this cap. Refuse to slurp a pathologically large
         // (or malicious) file into memory.
@@ -506,34 +562,35 @@ impl IpFilter {
                     ".p2b file too large ({} bytes), refusing to load",
                     meta.len()
                 );
-                return 0;
+                return None;
             }
         }
         let data = match std::fs::read(path) {
             Ok(d) => d,
             Err(e) => {
                 warn!("Failed to read .p2b file: {e}");
-                return 0;
+                return None;
             }
         };
 
         if data.len() < 8 {
             warn!(".p2b file too small");
-            return 0;
+            return None;
         }
 
         if &data[0..4] != b"\xff\xff\xff\xff" || &data[4..7] != b"P2B" {
             warn!("Invalid .p2b header");
-            return 0;
+            return None;
         }
 
         let version = data[7];
         if version != 1 && version != 2 {
             warn!("Unsupported .p2b version: {version}");
-            return 0;
+            return None;
         }
 
         let mut pos = 8;
+        let mut new_ranges = Vec::new();
         let mut count = 0;
 
         while pos < data.len() {
@@ -556,7 +613,7 @@ impl IpFilter {
             pos += 4;
 
             if start <= end {
-                self.blocked_ranges.push(IpRange {
+                new_ranges.push(IpRange {
                     start,
                     end,
                     description: desc,
@@ -566,14 +623,12 @@ impl IpFilter {
             }
         }
 
-        self.blocked_ranges.sort_by_key(|r| r.start);
-        self.merge_overlapping();
+        let final_count = self.commit_ranges(new_ranges);
         info!(
-            "Loaded {count} entries ({} ranges after merge) from .p2b file {}",
-            self.blocked_ranges.len(),
+            "Loaded {count} entries ({final_count} ranges after merge) from .p2b file {}",
             path.display()
         );
-        count
+        Some(final_count)
     }
 }
 
@@ -698,6 +753,89 @@ fn parse_ipfilter_line(line: &str) -> Option<IpRange> {
         description,
         hits: 0,
     })
+}
+
+/// Count how many valid IP-filter entries `data` contains, without
+/// constructing or mutating an [`IpFilter`] and without touching disk.
+/// `ext_hint` selects the parser the same way [`IpFilter::load_from_file`]
+/// dispatches on a path's extension (`"p2b"` -> PeerGuardian binary,
+/// `"p2p"` -> PeerGuardian text, anything else -> eMule `ipfilter.dat` /
+/// plain text, which also accepts `.p2p`-style lines as a fallback).
+///
+/// This exists so a downloaded or imported payload can be sanity-checked
+/// *before* it's ever written over `ipfilter.dat` or handed to
+/// `ReloadIpFilter` — a corrupt response, an HTML error page from a dead
+/// mirror, or a truncated transfer parses to zero entries here, so the
+/// command handler can reject it up front instead of letting
+/// `load_from_file` faithfully replace a working filter with an empty one.
+/// See `commands::security::download_and_load_ipfilter` and friends.
+pub fn count_valid_entries(data: &[u8], ext_hint: &str) -> usize {
+    match ext_hint.to_ascii_lowercase().as_str() {
+        "p2b" => count_p2b_entries(data),
+        "p2p" => count_text_entries(data, false),
+        _ => count_text_entries(data, true),
+    }
+}
+
+/// Shared line-counting pass for the `.dat`/`.txt` and `.p2p` formats.
+/// `try_dat_format` mirrors `load_dat_file`'s fallback behavior (attempt the
+/// eMule parser, then the PeerGuardian one) versus `load_p2p_file`, which
+/// only ever accepts PeerGuardian-style lines.
+fn count_text_entries(data: &[u8], try_dat_format: bool) -> usize {
+    let mut count = 0;
+    for raw_line in data.split(|&b| b == b'\n') {
+        // Lossy decoding matches the tolerance real ipfilter.dat downloads
+        // need (non-UTF8 bytes occasionally show up in description fields);
+        // a strict UTF-8 requirement here would make this validator
+        // *stricter* than the loader it's meant to predict.
+        let line = String::from_utf8_lossy(raw_line);
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
+            continue;
+        }
+        let is_valid = if try_dat_format {
+            parse_ipfilter_line(line).is_some() || parse_p2p_line(line).is_some()
+        } else {
+            parse_p2p_line(line).is_some()
+        };
+        if is_valid {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Mirrors [`IpFilter::load_p2b_file`]'s header check and record walk
+/// without allocating descriptions or storing ranges.
+fn count_p2b_entries(data: &[u8]) -> usize {
+    if data.len() < 8 || &data[0..4] != b"\xff\xff\xff\xff" || &data[4..7] != b"P2B" {
+        return 0;
+    }
+    let version = data[7];
+    if version != 1 && version != 2 {
+        return 0;
+    }
+
+    let mut pos = 8;
+    let mut count = 0;
+    while pos < data.len() {
+        let name_end = match data[pos..].iter().position(|&b| b == 0) {
+            Some(e) => pos + e,
+            None => break,
+        };
+        pos = name_end + 1;
+        if pos + 8 > data.len() {
+            break;
+        }
+        let start = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += 4;
+        let end = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += 4;
+        if start <= end {
+            count += 1;
+        }
+    }
+    count
 }
 
 #[cfg(test)]
@@ -918,5 +1056,165 @@ mod tests {
         let stats = filter.get_stats();
         // 1 range hit + 2 special hits, none double-counted.
         assert_eq!(stats.total_hits, 3);
+    }
+
+    fn unique_temp_path(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "ember_ipfilter_test_{}_{}_{name}",
+            std::process::id(),
+            nanos,
+        ))
+    }
+
+    #[test]
+    fn test_load_from_file_fully_replaces_old_ranges() {
+        // The core guarantee behind "downloading a fresh filter removes the
+        // old one": reloading from a new file must not merge with whatever
+        // was already in memory, whether that's a previous download or a
+        // manually-added range.
+        let path = unique_temp_path("replace.dat");
+        std::fs::write(&path, "1.0.0.0 - 1.0.0.255 , 000 , First List\n")
+            .expect("write first ipfilter.dat");
+
+        let mut filter = IpFilter::new(true, false);
+        assert_eq!(filter.load_from_file(&path), Some(1));
+        assert!(filter.is_blocked(Ipv4Addr::new(1, 0, 0, 1)));
+
+        filter.add_range(
+            Ipv4Addr::new(9, 9, 9, 0),
+            Ipv4Addr::new(9, 9, 9, 255),
+            "manual".to_string(),
+        );
+        assert_eq!(filter.range_count(), 2);
+
+        std::fs::write(&path, "2.0.0.0 - 2.0.0.255 , 000 , Second List\n")
+            .expect("write second ipfilter.dat");
+        assert_eq!(filter.load_from_file(&path), Some(1));
+
+        assert_eq!(
+            filter.range_count(),
+            1,
+            "old ranges must not survive a fresh load"
+        );
+        assert!(
+            !filter.is_blocked(Ipv4Addr::new(1, 0, 0, 1)),
+            "stale range from the first file must be gone"
+        );
+        assert!(
+            !filter.is_blocked(Ipv4Addr::new(9, 9, 9, 1)),
+            "manually-added range must be gone after a fresh load"
+        );
+        assert!(
+            filter.is_blocked(Ipv4Addr::new(2, 0, 0, 1)),
+            "the fresh list's range must be active"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_load_from_file_tolerates_invalid_utf8_mid_file() {
+        // `BufRead::lines()` hard-errors (and used to abort the whole parse)
+        // on the first byte sequence that isn't valid UTF-8. A stray bad
+        // byte partway through a large real-world ipfilter.dat must not
+        // silently discard every range that came after it.
+        let path = unique_temp_path("invalid_utf8.dat");
+        let mut data = Vec::new();
+        data.extend_from_slice(b"1.0.0.0 - 1.0.0.255 , 000 , Before\n");
+        data.extend_from_slice(&[0xFF, 0xFE, b'\n']); // invalid UTF-8, own line
+        data.extend_from_slice(b"2.0.0.0 - 2.0.0.255 , 000 , After\n");
+        std::fs::write(&path, &data).expect("write ipfilter.dat with invalid utf8");
+
+        let mut filter = IpFilter::new(true, false);
+        assert_eq!(filter.load_from_file(&path), Some(2));
+        assert!(filter.is_blocked(Ipv4Addr::new(1, 0, 0, 1)));
+        assert!(
+            filter.is_blocked(Ipv4Addr::new(2, 0, 0, 1)),
+            "ranges after an invalid-UTF8 line must still load"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_load_from_file_missing_file_keeps_existing_ranges() {
+        let mut filter = IpFilter::new(true, false);
+        filter.add_range(
+            Ipv4Addr::new(1, 0, 0, 0),
+            Ipv4Addr::new(1, 0, 0, 255),
+            "keep me".to_string(),
+        );
+
+        let missing = unique_temp_path("does-not-exist.dat");
+        assert_eq!(filter.load_from_file(&missing), None);
+
+        // A failed read must never wipe out a working filter — "fail
+        // closed", not fail open — so a bad download/import path can't
+        // silently drop protection.
+        assert_eq!(filter.range_count(), 1);
+        assert!(filter.is_blocked(Ipv4Addr::new(1, 0, 0, 1)));
+    }
+
+    #[test]
+    fn test_load_from_file_corrupt_p2b_keeps_existing_ranges() {
+        let mut filter = IpFilter::new(true, false);
+        filter.add_range(
+            Ipv4Addr::new(1, 0, 0, 0),
+            Ipv4Addr::new(1, 0, 0, 255),
+            "keep me".to_string(),
+        );
+
+        let path = unique_temp_path("corrupt.p2b");
+        std::fs::write(&path, b"not a p2b file").expect("write corrupt p2b");
+        assert_eq!(filter.load_from_file(&path), None);
+        assert_eq!(
+            filter.range_count(),
+            1,
+            "a corrupt binary header must not clear the existing filter"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_count_valid_entries_dat_format() {
+        let data =
+            b"# comment\n1.0.0.0 - 1.0.0.255 , 000 , Blocked\n1.2.3.4 , 0 , Single host\n";
+        assert_eq!(count_valid_entries(data, "dat"), 2);
+    }
+
+    #[test]
+    fn test_count_valid_entries_rejects_garbage() {
+        // An HTML error page (or any content with no parseable lines) from a
+        // dead mirror must count as zero — this is what lets the download
+        // commands refuse to overwrite a working filter with garbage.
+        let html = b"<!DOCTYPE html>\n<html><body>404 Not Found</body></html>\n";
+        assert_eq!(count_valid_entries(html, "dat"), 0);
+        assert_eq!(count_valid_entries(b"", "dat"), 0);
+    }
+
+    #[test]
+    fn test_count_valid_entries_p2p_format() {
+        let data = b"Some List:1.0.0.0-1.0.0.255\nAnother:2.0.0.0-2.255.255.255\n";
+        assert_eq!(count_valid_entries(data, "p2p"), 2);
+    }
+
+    #[test]
+    fn test_count_valid_entries_p2b_format() {
+        // Build a minimal valid .p2b (v1) buffer by hand, mirroring
+        // `load_p2b_file`'s expected layout: magic + version, then a
+        // NUL-terminated description followed by 4-byte start/end (BE).
+        let mut data = Vec::new();
+        data.extend_from_slice(b"\xff\xff\xff\xffP2B");
+        data.push(1);
+        data.extend_from_slice(b"desc\0");
+        data.extend_from_slice(&1u32.to_be_bytes());
+        data.extend_from_slice(&10u32.to_be_bytes());
+        assert_eq!(count_valid_entries(&data, "p2b"), 1);
+        assert_eq!(count_valid_entries(b"not a p2b file", "p2b"), 0);
     }
 }
