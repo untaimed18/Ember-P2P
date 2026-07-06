@@ -3721,6 +3721,13 @@ struct NetworkState {
     ember_sessions: upload_server::EmberSessionMap,
     /// Shared flag: set to true when network is disconnected so the upload
     /// listener rejects new connections and terminates active sessions.
+    /// The upload TCP listener binds and starts accepting connections as
+    /// soon as `start_network` runs, independent of KAD/server connection
+    /// state, so this must be initialized to match `stats.status` /
+    /// `settings.auto_connect_kad` (see `start_network`) rather than
+    /// defaulting to `false` — otherwise a fresh launch (or any session
+    /// with auto-connect off) serves uploads to anyone who already knows
+    /// our IP:port while the UI still reads "Disconnected".
     upload_disconnected: Arc<std::sync::atomic::AtomicBool>,
     /// Whether we have successfully registered with the rendezvous server
     rendezvous_registered: bool,
@@ -4513,6 +4520,131 @@ async fn handle_server_disconnect(
         "server-status-changed",
         serde_json::json!({ "status": "disconnected" }),
     );
+}
+
+/// Establish a new eD2K server connection to `ip`:`port`, tearing down any
+/// existing connection/pending attempt first. Extracted from the body of
+/// `NetworkCommand::ConnectToServer` so `NetworkCommand::KadConnect` can
+/// call the exact same logic: by design, pressing Connect on the KAD page
+/// also brings up a default eD2K server alongside KAD (see the call site in
+/// `KadConnect`), and `start_network`'s boot sequence calls it too when
+/// `settings.auto_connect_server` is set. All three callers must behave
+/// identically, so this is the single place that logic lives.
+async fn initiate_server_connect(
+    state: &mut NetworkState,
+    settings: &AppSettings,
+    app_handle: &tauri::AppHandle,
+    shared_server_addr: &Arc<RwLock<Option<SocketAddr>>>,
+    ip: String,
+    port: u16,
+) {
+    state.server_auto_reconnect = true;
+    state.server_reconnect_failures = 0;
+    if let Some(handle) = state.pending_server_connect.take() {
+        handle.abort();
+    }
+    if let Some(conn) = state.server_connection.take() {
+        emit_server_log(app_handle, "Disconnecting from current server...");
+        conn.disconnect().await;
+        state.server_connected = false;
+        state.server_addr = None;
+        *shared_server_addr.write().await = None;
+        state.stats.server_status = "disconnected".to_string();
+        // See `handle_server_disconnect`: the next connection is a
+        // fresh session that hasn't seen any offer we sent before.
+        state.last_offer_files_signature = None;
+        let _ = app_handle.emit(
+            "server-status-changed",
+            serde_json::json!({ "status": "disconnected" }),
+        );
+    }
+    let user_hash = state.user_hash;
+    let nickname = settings.nickname.clone();
+    let tcp_port = state.tcp_port;
+    let obf_port = state
+        .server_list
+        .servers()
+        .iter()
+        .find(|s| s.ip == ip && s.port == port)
+        .map(|s| s.obfuscation_port_tcp)
+        .unwrap_or(0);
+    let obfuscation_enabled = state.obfuscation_enabled;
+    let ip_clone = ip.clone();
+    let app_for_connect = app_handle.clone();
+    // Pre-set server addr so upload handler can detect HighID port test callbacks
+    if let Ok(ip_addr) = ip.parse::<std::net::IpAddr>() {
+        *shared_server_addr.write().await = Some(SocketAddr::new(ip_addr, port));
+    }
+    info!("Connecting to ed2k server {ip}:{port} (background)...");
+    emit_server_log(app_handle, &format!("Connecting to {ip}:{port}..."));
+    state.stats.server_status = "connecting".to_string();
+    let _ = app_handle.emit(
+        "server-status-changed",
+        serde_json::json!({ "status": "connecting" }),
+    );
+    state.pending_server_connect = Some(tokio::spawn(async move {
+        let result = async {
+            const MAX_LOGIN_ATTEMPTS: u32 = 3;
+            let mut last_err = String::new();
+            for attempt in 0..MAX_LOGIN_ATTEMPTS {
+                if attempt > 0 {
+                    info!("Retrying server {ip_clone}:{port} (attempt {})", attempt + 1);
+                    emit_server_log(&app_for_connect, &format!("Retrying ({})...", attempt + 1));
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+                let (mut conn, resolved_addr) = match try_connect_server(&ip_clone, port, obf_port, &app_for_connect, false, obfuscation_enabled).await {
+                    Ok(r) => r,
+                    Err(e) => { last_err = format!("Connect failed: {e}"); continue; }
+                };
+                if attempt == 0 {
+                    emit_server_log(
+                        &app_for_connect,
+                        &format!("Sending login request (client TCP port {tcp_port})..."),
+                    );
+                }
+                match conn.login(&user_hash, &nickname, tcp_port).await {
+                    Ok(session) => return Ok((conn, session, resolved_addr)),
+                    Err(login_err) if conn.is_encrypted() => {
+                        debug!("Encrypted login to {ip_clone}:{port} failed: {login_err}, falling back to plain TCP");
+                        emit_server_log(
+                            &app_for_connect,
+                            &format!("Encrypted login failed ({login_err}), trying plain TCP..."),
+                        );
+                        drop(conn);
+                        let plain_addr = tokio::net::lookup_host((ip_clone.as_str(), port))
+                            .await
+                            .map_err(|e| format!("Plain fallback resolve failed: {e}"))?
+                            .find(|addr| addr.is_ipv4())
+                            .ok_or_else(|| format!("No IPv4 address for plain fallback {ip_clone}:{port}"))?;
+                        let mut plain_conn = Ed2kServerConnection::connect(plain_addr)
+                            .await
+                            .map_err(|e| format!("Plain fallback connect failed: {e}"))?;
+                        emit_server_log(
+                            &app_for_connect,
+                            &format!("Sending login over plain TCP (port {tcp_port})..."),
+                        );
+                        match plain_conn.login(&user_hash, &nickname, tcp_port).await {
+                            Ok(session) => return Ok((plain_conn, session, plain_addr)),
+                            Err(e) => { last_err = format!("Plain TCP login failed: {e}"); continue; }
+                        }
+                    }
+                    Err(e) => { last_err = format!("Login failed: {e}"); continue; }
+                }
+            }
+            Err(last_err)
+        }.await;
+        let addr = result
+            .as_ref()
+            .ok()
+            .map(|(_, _, resolved_addr)| *resolved_addr)
+            .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port));
+        ServerConnectResult {
+            addr,
+            ip,
+            port,
+            result: result.map(|(conn, session, _)| (conn, session)),
+        }
+    }));
 }
 
 async fn flush_credit_state(
@@ -6117,7 +6249,19 @@ pub async fn start_network(
         online_friends: HashMap::new(),
         recent_ember_chat: HashMap::new(),
         ember_sessions: Arc::new(RwLock::new(HashMap::new())),
-        upload_disconnected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        // Mirror the `stats.status` initialization above: the upload
+        // listener binds and starts accepting TCP connections immediately
+        // (see `start_upload_server`), well before this task has actually
+        // reached KAD or an eD2K server. Defaulting this to `false`
+        // ("uploads allowed") left a fresh launch — or any session with
+        // auto-connect disabled — silently servable by any peer that
+        // already knows our IP:port from a prior session, even while the
+        // UI still read "Disconnected". Only `NetworkCommand::KadConnect`
+        // clears this flag, so it must start set unless we're already
+        // auto-connecting.
+        upload_disconnected: Arc::new(std::sync::atomic::AtomicBool::new(
+            !settings.auto_connect_kad,
+        )),
         rendezvous_registered: false,
         rendezvous_last_register: None,
         outbound_session_tasks: HashMap::new(),
@@ -6541,6 +6685,33 @@ pub async fn start_network(
     let active_port_tests: Arc<tokio::sync::Mutex<HashMap<std::net::IpAddr, mpsc::Sender<()>>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let shared_server_addr: Arc<RwLock<Option<SocketAddr>>> = Arc::new(RwLock::new(None));
+
+    // Mirrors the `auto_connect_kad` boot check above, but for the eD2K
+    // server — independent of it, since a user may want one without the
+    // other. Defaults to off: connecting to a server is still real network
+    // activity (see `upload_disconnected`'s boot-time fix) and shouldn't
+    // happen before the user has asked for it in any way. This is separate
+    // from the always-on "pressing Connect also brings up a server"
+    // behavior in `NetworkCommand::KadConnect` — that's a deliberate
+    // pairing tied to the explicit button press, not to this setting.
+    if settings.auto_connect_server {
+        let next = state
+            .server_list
+            .get_next_server()
+            .map(|s| (s.ip.clone(), s.port));
+        if let Some((server_ip, server_port)) = next {
+            initiate_server_connect(
+                &mut state,
+                &settings,
+                &app_handle,
+                &shared_server_addr,
+                server_ip,
+                server_port,
+            )
+            .await;
+        }
+    }
+
     let shared_ember_payload: ember::SharedEmberPayload =
         Arc::new(RwLock::new(Arc::new(Vec::new())));
     let ember_payload_generation: ember::EmberPayloadGeneration =
@@ -26830,6 +27001,35 @@ async fn handle_command_inner(
             // which runs once we have verified contacts (table_size >= 10).
             // Sending checks here against stale nodes.dat contacts produces
             // false Firewalled results because those contacts may be offline.
+
+            // Design decision: pressing Connect brings up a default eD2K
+            // server alongside KAD (eMule Security by default — it's the
+            // only built-in "High" priority entry, so `get_next_server`
+            // picks it first) rather than requiring a second, separate
+            // action on the Servers page. Only kick this off when we're
+            // not already connected to / mid-handshake with a server —
+            // this must never yank the user off a server they picked
+            // themselves or are already using.
+            if state.server_connection.is_none()
+                && !state.server_connected
+                && state.pending_server_connect.is_none()
+            {
+                let next = state
+                    .server_list
+                    .get_next_server()
+                    .map(|s| (s.ip.clone(), s.port));
+                if let Some((server_ip, server_port)) = next {
+                    initiate_server_connect(
+                        state,
+                        settings,
+                        app_handle,
+                        shared_server_addr,
+                        server_ip,
+                        server_port,
+                    )
+                    .await;
+                }
+            }
         }
 
         NetworkCommand::KadDisconnect => {
@@ -27125,6 +27325,13 @@ async fn handle_command_inner(
                                 info!("Sent bootstrap request to {addr}");
                                 if state.stats.status == NetworkStatus::Disconnected {
                                     state.stats.status = NetworkStatus::Connecting;
+                                    // Same rule as `KadConnect`: this is the
+                                    // one path that actually moves us off
+                                    // Disconnected, so the upload listener
+                                    // must be told at the same moment.
+                                    state
+                                        .upload_disconnected
+                                        .store(false, std::sync::atomic::Ordering::Relaxed);
                                 }
                                 Ok(format!(
                                     "Bootstrap request sent to {addr} — contacts will appear as they respond"
@@ -27226,18 +27433,26 @@ async fn handle_command_inner(
                                                                         .await;
                                                                 }
                                                             }
-                                                            info!(
-                                                                "Loaded {count} contacts from URL, bootstrapping"
-                                                            );
-                                                            if state.stats.status
-                                                                == NetworkStatus::Disconnected
-                                                            {
-                                                                state.stats.status =
-                                                                    NetworkStatus::Connecting;
-                                                            }
-                                                            Ok(format!(
-                                                                "Loaded {count} contacts from nodes.dat"
-                                                            ))
+                                            info!(
+                                                "Loaded {count} contacts from URL, bootstrapping"
+                                            );
+                                            if state.stats.status
+                                                == NetworkStatus::Disconnected
+                                            {
+                                                state.stats.status =
+                                                    NetworkStatus::Connecting;
+                                                // See `KadBootstrapIp`: keep
+                                                // the upload gate in sync
+                                                // with every path off
+                                                // Disconnected.
+                                                state.upload_disconnected.store(
+                                                    false,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                );
+                                            }
+                                            Ok(format!(
+                                                "Loaded {count} contacts from nodes.dat"
+                                            ))
                                                         }
                                                     }
                                                 }
@@ -27285,6 +27500,11 @@ async fn handle_command_inner(
             info!("Sent bootstrap requests to {actually_sent}/{send_count} connected contacts");
             if state.stats.status == NetworkStatus::Disconnected && actually_sent > 0 {
                 state.stats.status = NetworkStatus::Connecting;
+                // See `KadBootstrapIp`: keep the upload gate in sync with
+                // every path off Disconnected.
+                state
+                    .upload_disconnected
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
             }
             let _ = tx.send(if actually_sent > 0 {
                 Ok(actually_sent)
@@ -27383,113 +27603,8 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::ConnectToServer { ip, port } => {
-            state.server_auto_reconnect = true;
-            state.server_reconnect_failures = 0;
-            if let Some(handle) = state.pending_server_connect.take() {
-                handle.abort();
-            }
-            if let Some(conn) = state.server_connection.take() {
-                emit_server_log(app_handle, "Disconnecting from current server...");
-                conn.disconnect().await;
-                state.server_connected = false;
-                state.server_addr = None;
-                *shared_server_addr.write().await = None;
-                state.stats.server_status = "disconnected".to_string();
-                // See `handle_server_disconnect`: the next connection is a
-                // fresh session that hasn't seen any offer we sent before.
-                state.last_offer_files_signature = None;
-                let _ = app_handle.emit(
-                    "server-status-changed",
-                    serde_json::json!({ "status": "disconnected" }),
-                );
-            }
-            let user_hash = state.user_hash;
-            let nickname = settings.nickname.clone();
-            let tcp_port = state.tcp_port;
-            let obf_port = state
-                .server_list
-                .servers()
-                .iter()
-                .find(|s| s.ip == ip && s.port == port)
-                .map(|s| s.obfuscation_port_tcp)
-                .unwrap_or(0);
-            let obfuscation_enabled = state.obfuscation_enabled;
-            let ip_clone = ip.clone();
-            let app_for_connect = app_handle.clone();
-            // Pre-set server addr so upload handler can detect HighID port test callbacks
-            if let Ok(ip_addr) = ip.parse::<std::net::IpAddr>() {
-                *shared_server_addr.write().await = Some(SocketAddr::new(ip_addr, port));
-            }
-            info!("Connecting to ed2k server {ip}:{port} (background)...");
-            emit_server_log(app_handle, &format!("Connecting to {ip}:{port}..."));
-            state.stats.server_status = "connecting".to_string();
-            let _ = app_handle.emit(
-                "server-status-changed",
-                serde_json::json!({ "status": "connecting" }),
-            );
-            state.pending_server_connect = Some(tokio::spawn(async move {
-                let result = async {
-                    const MAX_LOGIN_ATTEMPTS: u32 = 3;
-                    let mut last_err = String::new();
-                    for attempt in 0..MAX_LOGIN_ATTEMPTS {
-                        if attempt > 0 {
-                            info!("Retrying server {ip_clone}:{port} (attempt {})", attempt + 1);
-                            emit_server_log(&app_for_connect, &format!("Retrying ({})...", attempt + 1));
-                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                        }
-                        let (mut conn, resolved_addr) = match try_connect_server(&ip_clone, port, obf_port, &app_for_connect, false, obfuscation_enabled).await {
-                            Ok(r) => r,
-                            Err(e) => { last_err = format!("Connect failed: {e}"); continue; }
-                        };
-                        if attempt == 0 {
-                            emit_server_log(
-                                &app_for_connect,
-                                &format!("Sending login request (client TCP port {tcp_port})..."),
-                            );
-                        }
-                        match conn.login(&user_hash, &nickname, tcp_port).await {
-                            Ok(session) => return Ok((conn, session, resolved_addr)),
-                            Err(login_err) if conn.is_encrypted() => {
-                                debug!("Encrypted login to {ip_clone}:{port} failed: {login_err}, falling back to plain TCP");
-                                emit_server_log(
-                                    &app_for_connect,
-                                    &format!("Encrypted login failed ({login_err}), trying plain TCP..."),
-                                );
-                                drop(conn);
-                                let plain_addr = tokio::net::lookup_host((ip_clone.as_str(), port))
-                                    .await
-                                    .map_err(|e| format!("Plain fallback resolve failed: {e}"))?
-                                    .find(|addr| addr.is_ipv4())
-                                    .ok_or_else(|| format!("No IPv4 address for plain fallback {ip_clone}:{port}"))?;
-                                let mut plain_conn = Ed2kServerConnection::connect(plain_addr)
-                                    .await
-                                    .map_err(|e| format!("Plain fallback connect failed: {e}"))?;
-                                emit_server_log(
-                                    &app_for_connect,
-                                    &format!("Sending login over plain TCP (port {tcp_port})..."),
-                                );
-                                match plain_conn.login(&user_hash, &nickname, tcp_port).await {
-                                    Ok(session) => return Ok((plain_conn, session, plain_addr)),
-                                    Err(e) => { last_err = format!("Plain TCP login failed: {e}"); continue; }
-                                }
-                            }
-                            Err(e) => { last_err = format!("Login failed: {e}"); continue; }
-                        }
-                    }
-                    Err(last_err)
-                }.await;
-                let addr = result
-                    .as_ref()
-                    .ok()
-                    .map(|(_, _, resolved_addr)| *resolved_addr)
-                    .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port));
-                ServerConnectResult {
-                    addr,
-                    ip,
-                    port,
-                    result: result.map(|(conn, session, _)| (conn, session)),
-                }
-            }));
+            initiate_server_connect(state, settings, app_handle, shared_server_addr, ip, port)
+                .await;
         }
 
         NetworkCommand::DisconnectServer => {
