@@ -112,30 +112,6 @@ impl IpFilter {
         }
     }
 
-    /// Transfer accumulated hit counts from another IpFilter (used when replacing the filter instance).
-    #[allow(dead_code)]
-    pub fn transfer_hits_from(&mut self, old: &IpFilter) {
-        let old_total = old.total_range_hits.load(Ordering::Relaxed);
-        let old_special = old.total_special_hits.load(Ordering::Relaxed);
-        self.total_range_hits
-            .fetch_add(old_total, Ordering::Relaxed);
-        self.total_special_hits
-            .fetch_add(old_special, Ordering::Relaxed);
-
-        let mut old_hits: std::collections::HashMap<(u32, u32), u64> =
-            std::collections::HashMap::new();
-        for r in &old.blocked_ranges {
-            if r.hits > 0 {
-                old_hits.insert((r.start, r.end), r.hits);
-            }
-        }
-        for r in &mut self.blocked_ranges {
-            if let Some(&hits) = old_hits.get(&(r.start, r.end)) {
-                r.hits = hits;
-            }
-        }
-    }
-
     /// Replace `self.blocked_ranges` with `new_ranges` after sorting,
     /// merging overlaps, and carrying over hit counts for ranges that
     /// survive the reload unchanged (same start/end).

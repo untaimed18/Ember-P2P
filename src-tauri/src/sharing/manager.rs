@@ -28,12 +28,6 @@ pub fn set_global_preview_priority(enabled: bool) {
     GLOBAL_PREVIEW_PRIORITY.store(enabled, Ordering::Release);
 }
 
-/// Current global preview-priority preference.
-#[allow(dead_code)]
-pub fn global_preview_priority() -> bool {
-    GLOBAL_PREVIEW_PRIORITY.load(Ordering::Acquire)
-}
-
 pub struct TransferControl {
     cancelled: AtomicBool,
     paused: AtomicBool,

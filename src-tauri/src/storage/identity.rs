@@ -103,18 +103,6 @@ impl NodeIdentity {
         KadId(self.kad_id)
     }
 
-    /// Return the Ed25519 signing key reconstructed from stored secret bytes.
-    #[allow(dead_code)]
-    pub fn signing_key(&self) -> SigningKey {
-        crypto::signing_key_from_bytes(&self.ed25519_secret_key)
-    }
-
-    /// Return the Ed25519 verifying (public) key reconstructed from stored bytes.
-    #[allow(dead_code)]
-    pub fn verifying_key(&self) -> Option<ed25519_dalek::VerifyingKey> {
-        crypto::verifying_key_from_bytes(&self.ed25519_public_key)
-    }
-
     /// Load identity from disk, or generate and save a new one.
     ///
     /// Identity loss silently rotates `user_hash` / `ember_hash`, which breaks
