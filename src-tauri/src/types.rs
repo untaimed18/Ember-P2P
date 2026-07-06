@@ -591,7 +591,11 @@ pub struct AppSettings {
     /// Automatically connect to KAD on startup (eMule: "Autoconnect" for Kad)
     #[serde(default)]
     pub auto_connect_kad: bool,
-    /// Automatically connect to an ed2k server on startup (eMule: "Autoconnect" for server)
+    /// Automatically connect to an ed2k server on startup (eMule: "Autoconnect" for server),
+    /// independent of `auto_connect_kad`. Defaults to `false`: unlike the KAD
+    /// Connect button, which always brings up a default server alongside it
+    /// by design (see `NetworkCommand::KadConnect`), a server should not be
+    /// contacted before the user has taken *some* connecting action.
     #[serde(default)]
     pub auto_connect_server: bool,
     /// Maximum sources tracked per file (eMule: maxsourceperfile, default 400)
@@ -998,7 +1002,16 @@ impl Default for AppSettings {
             add_servers_from_clients: true,
             server_list_path: String::new(),
             auto_connect_kad: false,
-            auto_connect_server: true,
+            // Matches `auto_connect_kad`: a fresh launch shouldn't reach out
+            // to any network on its own. This used to default to `true`
+            // here while `#[serde(default)]` (used once a settings.json
+            // already exists but predates this field) fell back to
+            // `bool::default() == false` — two different defaults for the
+            // same field depending on whether this is a brand-new install
+            // or an upgrade. Connecting to a server is real, visible network
+            // activity (see `NetworkState::upload_disconnected`), so it must
+            // not happen before the user asks for it either way.
+            auto_connect_server: false,
             max_sources_per_file: 400,
             max_connections: 500,
             add_downloads_paused: false,
@@ -1131,6 +1144,35 @@ mod tests {
         assert!(
             !parsed.launch_maximized,
             "launch_maximized should default to false when absent"
+        );
+    }
+
+    /// `auto_connect_server` used to default to `true` in `impl Default`
+    /// while `#[serde(default)]` (used when an existing settings.json
+    /// predates the field) fell back to `bool::default() == false` — a
+    /// fresh install and an upgrade disagreed on whether a server connects
+    /// automatically on startup. Both paths must agree, and connecting to a
+    /// network automatically is significant enough behavior that "off"
+    /// is the only safe shared default (see `auto_connect_kad`, which this
+    /// mirrors).
+    #[test]
+    fn auto_connect_server_defaults_to_off_via_both_paths() {
+        assert!(
+            !AppSettings::default().auto_connect_server,
+            "impl Default for AppSettings must default auto_connect_server to false"
+        );
+
+        let mut value =
+            serde_json::to_value(AppSettings::default()).expect("serialize default settings");
+        value
+            .as_object_mut()
+            .expect("AppSettings serializes to a JSON object")
+            .remove("auto_connect_server");
+        let parsed: AppSettings = serde_json::from_value(value)
+            .expect("config without the auto_connect_server key must deserialize");
+        assert!(
+            !parsed.auto_connect_server,
+            "auto_connect_server should default to false when absent from a saved config"
         );
     }
 }
