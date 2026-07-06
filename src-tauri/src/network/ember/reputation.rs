@@ -179,6 +179,14 @@ impl ReputationManager {
     }
 
     /// Get a peer's current score, applying decay first.
+    ///
+    /// Unused outside tests today: the periodic `reputation_timer` in
+    /// network/mod.rs already calls `maybe_decay()` directly every 60s, so
+    /// nothing on the hot path needs the decay-then-read behavior this
+    /// wraps (see that timer's own comment). Kept as the mutable
+    /// counterpart to `score()` for a future caller that wants a
+    /// guaranteed-fresh value without waiting on the periodic tick.
+    #[allow(dead_code)]
     pub fn get_score(&mut self, node_id: &[u8; 16]) -> i32 {
         self.maybe_decay();
         self.peers
