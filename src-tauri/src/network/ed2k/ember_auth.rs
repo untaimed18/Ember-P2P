@@ -102,10 +102,6 @@ impl EmberAuthState {
         matches!(self, EmberAuthState::Verified)
     }
 
-    #[allow(dead_code)]
-    pub fn is_terminal(&self) -> bool {
-        matches!(self, EmberAuthState::Verified | EmberAuthState::Failed)
-    }
 }
 
 /// Outbound packets the dispatcher should write back to the peer in

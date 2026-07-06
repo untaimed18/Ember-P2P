@@ -82,18 +82,32 @@ enum PendingHandshake {
 /// Result of processing an incoming Ember packet.
 pub enum IncomingResult {
     /// A decrypted DHT message from a peer with an established session.
+    ///
+    /// `from` / `remote_noise_pub` go unread today: the only wired-up
+    /// caller (`dispatch_incoming`) already has the peer address from its
+    /// own argument and has no need yet for the pubkey. Kept for a future
+    /// direct caller of the lower-level `process_incoming` (see its doc
+    /// comment above its definition).
+    #[allow(dead_code)]
     Message {
         from: SocketAddr,
         remote_noise_pub: [u8; 32],
         payload: Vec<u8>,
     },
     /// Handshake progressed; one or more response packets need to be sent.
+    ///
+    /// `to` goes unread for the same reason as `Message::from` above.
+    #[allow(dead_code)]
     HandshakeResponse {
         to: SocketAddr,
         packets: Vec<Vec<u8>>,
     },
     /// Handshake completed; response packets to send, plus any buffered messages
     /// the peer embedded in the handshake.
+    ///
+    /// `peer` / `remote_noise_pub` go unread for the same reason as
+    /// `Message`'s fields above.
+    #[allow(dead_code)]
     HandshakeComplete {
         peer: SocketAddr,
         remote_noise_pub: [u8; 32],
@@ -264,6 +278,7 @@ impl EmberTransport {
     }
 
     /// Check if we have an established session with a peer.
+    #[allow(dead_code)]
     pub fn has_session(&self, addr: &SocketAddr) -> bool {
         self.sessions.contains_key(addr)
     }
@@ -389,6 +404,7 @@ impl EmberTransport {
     }
 
     /// Remove an existing session for a peer (e.g., on disconnect).
+    #[allow(dead_code)]
     pub fn remove_session(&mut self, addr: &SocketAddr) {
         self.sessions.remove(addr);
         self.pending.remove(addr);

@@ -4,11 +4,11 @@ pub mod nat;
 pub mod quic;
 pub mod relay;
 
-// Ember-native modules below are still dormant. `reputation` is the exception:
-// it is persisted and consulted by the live eD2K/EPX paths in network/mod.rs.
-#[allow(dead_code)]
+// `reputation` is persisted and consulted by the live eD2K/EPX paths in
+// network/mod.rs (ban/credit events); `transport` backs the Ember UDP
+// control-message dispatch (Ping/ExchangeRequest, is_ember_packet routing)
+// used by those same paths.
 pub mod reputation;
-#[allow(dead_code)]
 pub mod transport;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};

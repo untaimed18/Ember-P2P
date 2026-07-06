@@ -46,6 +46,10 @@ pub enum ReputationEvent {
     Timeout,
     SuccessfulHandshake,
     ProtocolViolation,
+    /// Reserved for scoring a peer's DHT/KAD query responses once that
+    /// traffic is wired to report reputation events; `SCORE_DHT_RESPONSE`
+    /// already exists for it but nothing constructs this variant yet.
+    #[allow(dead_code)]
     DhtResponse,
 }
 

@@ -369,11 +369,6 @@ impl FirewallChecker {
         self.udp_status == FirewallStatus::Firewalled
     }
 
-    #[allow(dead_code)]
-    pub fn tcp_status_known(&self) -> bool {
-        self.tcp_status != FirewallStatus::Unknown
-    }
-
     pub fn external_ip(&self) -> Option<Ipv4Addr> {
         self.confirmed_external_ip
     }
