@@ -177,16 +177,26 @@
 
   let downloadError: string | null = $state(null);
   let downloadedHashes: Set<string> = $state(new Set());
+  // Tracks hashes with a `startDownload` call currently in flight. The
+  // `downloadedHashes` guard alone only prevents a re-click AFTER the first
+  // call resolves — a fast double-click on the download button fires both
+  // clicks before either `await` settles, so both would call `startDownload`
+  // for the same file without this.
+  let downloadingHashes: Set<string> = $state(new Set());
 
   async function downloadFile(file: BrowseFileEntry) {
-    if (downloadedHashes.has(file.hash)) return;
+    if (downloadedHashes.has(file.hash) || downloadingHashes.has(file.hash)) return;
     downloadError = null;
+    downloadingHashes = new Set(downloadingHashes).add(file.hash);
     try {
       await startDownload(file.hash, file.name, file.size, friendLastIp, friendLastPort);
-      downloadedHashes.add(file.hash);
-      downloadedHashes = new Set(downloadedHashes);
+      downloadedHashes = new Set(downloadedHashes).add(file.hash);
     } catch (e: unknown) {
       downloadError = translateError(e, m.browse_download_failed());
+    } finally {
+      const next = new Set(downloadingHashes);
+      next.delete(file.hash);
+      downloadingHashes = next;
     }
   }
 
@@ -272,7 +282,13 @@
                         </svg>
                       </span>
                     {:else}
-                      <button class="dl-btn" onclick={() => downloadFile(file)} title={m.browse_download()} aria-label={m.browse_download()}>
+                      <button
+                        class="dl-btn"
+                        onclick={() => downloadFile(file)}
+                        disabled={downloadingHashes.has(file.hash)}
+                        title={m.browse_download()}
+                        aria-label={m.browse_download()}
+                      >
                         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                           <path d="M8 2v9M4 8l4 4 4-4"/><line x1="3" y1="14" x2="13" y2="14"/>
                         </svg>
@@ -455,6 +471,16 @@
   .dl-btn:hover {
     background: var(--accent-dim);
     color: var(--accent);
+  }
+
+  .dl-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  .dl-btn:disabled:hover {
+    background: transparent;
+    color: var(--text-muted);
   }
 
   .dl-btn svg {

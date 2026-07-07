@@ -33,6 +33,10 @@ export const activeSearchTabId = writable<string | null>(null);
 let initialized = false;
 let unlisteners: UnlistenFn[] = [];
 let searchNonce = 0;
+// Bumped by `cleanupSearchStore`; see the matching comment in
+// `stores/network.ts` for why `initSearchStore` needs to re-check this
+// after its async listener registration before adopting the results.
+let storeEpoch = 0;
 
 export function newSearchNonce(): number {
   searchNonce += 1;
@@ -232,7 +236,15 @@ function flushSearchResults() {
   flushRaf = null;
   flushTimeout = null;
   if (pendingByRequest.size === 0) return;
-  const batch = pendingByRequest;
+  // Snapshot-and-clear the buffer up front rather than iterating the live
+  // `pendingByRequest` reference and clearing it afterward. Both currently
+  // execute back-to-back with no `await` between them, so nothing can slip
+  // a new batch in between today — but aliasing instead of snapshotting
+  // means any future change that adds an await (or a re-entrant caller)
+  // would start silently dropping results. Matches the snapshot pattern
+  // `flushProgress` already uses in `stores/transfers.ts`.
+  const batch = new Map(pendingByRequest);
+  pendingByRequest.clear();
   searchTabs.update((tabs) => {
     let next = tabs;
     for (const [requestId, incoming] of batch) {
@@ -243,7 +255,6 @@ function flushSearchResults() {
     }
     return next;
   });
-  batch.clear();
 }
 
 function scheduleFlush() {
@@ -263,6 +274,7 @@ export async function initSearchStore() {
   if (initialized) return;
 
   initialized = true;
+  const myEpoch = storeEpoch;
   const registered: UnlistenFn[] = [];
   try {
     // `search-results` events are coalesced per request id across one
@@ -328,7 +340,12 @@ export async function initSearchStore() {
         if (requestId === null) return;
         searchTabs.update((tabs) =>
           updateTabByRequestId(tabs, requestId, (t) => {
-            if (!t.isSearching) return t;
+            // A server retry runs with `isSearching === false` (only
+            // `retryRequestId` is set), so it must still accept progress —
+            // otherwise retry progress is silently dropped on the floor even
+            // though the retry is genuinely in flight and results/complete
+            // events for it merge normally.
+            if (!t.isSearching && t.retryRequestId !== requestId) return t;
             return {
               ...t,
               progress: {
@@ -347,10 +364,18 @@ export async function initSearchStore() {
     console.error('Failed to initialize search store listeners:', e);
     throw e;
   }
+  if (myEpoch !== storeEpoch) {
+    // `cleanupSearchStore` ran while we were still registering (dev HMR
+    // remount / rapid re-init). Unlisten what we just added rather than
+    // adopting orphaned listeners into an already-torn-down store.
+    for (const u of registered) u();
+    return;
+  }
   unlisteners.push(...registered);
 }
 
 export function cleanupSearchStore() {
+  storeEpoch++;
   for (const unlisten of unlisteners) unlisten();
   unlisteners = [];
   initialized = false;

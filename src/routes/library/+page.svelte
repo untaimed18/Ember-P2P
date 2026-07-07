@@ -441,18 +441,27 @@
       // library — not the filtered view — so this only prunes truly-gone
       // paths, never rows merely hidden by an active filter. Without this the
       // bulk-bar count and later bulk ops could reference ghost paths.
-      if (checkedPaths.size > 0) {
+      if (checkedPaths.size > 0 || selectedPath) {
         const present = new Set(newFiles.map((f) => f.path));
-        let removed = false;
-        const nextChecked = new Set<string>();
-        for (const p of checkedPaths) {
-          if (present.has(p)) nextChecked.add(p);
-          else removed = true;
+        if (checkedPaths.size > 0) {
+          let removed = false;
+          const nextChecked = new Set<string>();
+          for (const p of checkedPaths) {
+            if (present.has(p)) nextChecked.add(p);
+            else removed = true;
+          }
+          if (removed) {
+            checkedPaths = nextChecked;
+            if (lastClickedPath && !present.has(lastClickedPath)) lastClickedPath = null;
+          }
         }
-        if (removed) {
-          checkedPaths = nextChecked;
-          if (lastClickedPath && !present.has(lastClickedPath)) lastClickedPath = null;
-        }
+        // `selectedFile`/the details drawer derive from `selectedPath`
+        // (`{#if selectedFile}`), so a stale path here doesn't show a
+        // broken drawer — but it does leave keyboard nav (arrow keys)
+        // computing its current index as -1 and jumping to row 0
+        // unexpectedly, and Space/Enter/Delete acting as if nothing is
+        // selected until the user clicks a row again.
+        if (selectedPath && !present.has(selectedPath)) selectedPath = null;
       }
     } catch (e) {
       if (mounted && e instanceof Error && e.message !== 'timeout') {
@@ -1318,11 +1327,15 @@
     // Ignore shortcuts while a modal is open.
     if (createCollectionOpen) return;
 
-    // Ctrl/Cmd+A selects all visible.
+    // Ctrl/Cmd+A selects all visible. Merge into the existing selection
+    // (matching `toggleCheckAll`) rather than replacing it — selections are
+    // designed to persist across filter changes (see `checkedHiddenCount`),
+    // so a blanket `new Set()` here would silently drop any checks hidden by
+    // the current filter.
     if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && (e.key === 'a' || e.key === 'A')) {
       if (sortedFiles.length === 0) return;
       e.preventDefault();
-      checkedPaths = new Set(sortedFiles.map(f => f.path));
+      checkedPaths = new Set([...checkedPaths, ...sortedFiles.map(f => f.path)]);
       lastClickedPath = null;
       return;
     }

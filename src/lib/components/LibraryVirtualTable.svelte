@@ -154,10 +154,22 @@
     const rowBottom = rowTop + ROW_HEIGHT;
     const viewTop = scrollContainer.scrollTop;
     const viewBottom = viewTop + scrollContainer.clientHeight;
+    let newTop: number | null = null;
     if (rowTop < viewTop) {
-      scrollContainer.scrollTop = rowTop;
+      newTop = rowTop;
     } else if (rowBottom > viewBottom) {
-      scrollContainer.scrollTop = rowBottom - scrollContainer.clientHeight;
+      newTop = rowBottom - scrollContainer.clientHeight;
+    }
+    if (newTop !== null) {
+      scrollContainer.scrollTop = newTop;
+      // Mirror `onTableScroll`'s effect on `scrollTop` immediately instead
+      // of waiting for the native `scroll` event's rAF callback. Keyboard
+      // navigation calls this synchronously before the next paint, so
+      // without this `virtualSlice` would still be computed from the old
+      // `scrollTop` for one frame — the newly-selected row could land in
+      // the just-scrolled-past overscan gap and flash unhighlighted.
+      scrollTop = newTop;
+      if (headerWrap) headerWrap.scrollLeft = scrollContainer.scrollLeft;
     }
   }
 

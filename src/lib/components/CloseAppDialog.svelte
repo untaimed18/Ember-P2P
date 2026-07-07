@@ -10,6 +10,7 @@
   import * as m from '$lib/paraglide/messages';
   import { fade, scale } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
+  import { inertBackground } from '$lib/a11y';
 
   let {
     open = $bindable(false),
@@ -24,23 +25,36 @@
   } = $props();
 
   let dialogEl: HTMLDivElement | undefined = $state(undefined);
+  let overlayEl: HTMLDivElement | undefined = $state(undefined);
   let trayBtn: HTMLButtonElement | undefined = $state(undefined);
   let remember = $state(false);
   // Element focused before the dialog opened, restored on close.
   let returnFocusEl: HTMLElement | null = null;
   const instanceId = Math.random().toString(36).slice(2, 10);
+  // Guards Hide/Exit/Cancel against a second click landing during the
+  // ~150-200ms outro transition, while the buttons are still mounted and
+  // clickable (see `actionTaken` reset below). Without this, a fast
+  // double-click could fire both `onhide` and `onexit` for the same close
+  // request.
+  let actionTaken = $state(false);
 
   function handleHide() {
+    if (actionTaken) return;
+    actionTaken = true;
     onhide?.(remember);
     open = false;
   }
 
   function handleExit() {
+    if (actionTaken) return;
+    actionTaken = true;
     onexit?.(remember);
     open = false;
   }
 
   function handleCancel() {
+    if (actionTaken) return;
+    actionTaken = true;
     oncancel?.();
     open = false;
   }
@@ -74,6 +88,7 @@
       // tick from the previous session doesn't silently flip the saved
       // preference on the next close.
       remember = false;
+      actionTaken = false;
       const active = typeof document !== 'undefined' ? document.activeElement : null;
       if (active instanceof HTMLElement && active !== document.body) returnFocusEl = active;
       requestAnimationFrame(() => {
@@ -92,21 +107,17 @@
   });
 
   // Make the rest of the page inert while the dialog is up, matching the
-  // behaviour of `ConfirmDialog`.
+  // behaviour of `ConfirmDialog`. SvelteKit mounts the whole app under a
+  // single `display: contents` wrapper `<div>` (see `src/app.html`), so
+  // `document.body.children` is just that one element — the previous
+  // implementation's `child.querySelector('.close-overlay')` skip-check
+  // always matched *that* wrapper (since the overlay renders inside it)
+  // and inerted nothing, leaving the sidebar/page reachable by Tab/click
+  // behind this dialog. `inertBackground` walks up from the overlay through
+  // its real ancestor chain and inerts siblings at each level instead.
   $effect(() => {
-    if (!open || typeof document === 'undefined') return;
-    const body = document.body;
-    const previous: { el: Element; had: boolean }[] = [];
-    for (const child of Array.from(body.children)) {
-      if (child.querySelector('.close-overlay')) continue;
-      previous.push({ el: child, had: child.hasAttribute('inert') });
-      child.setAttribute('inert', '');
-    }
-    return () => {
-      for (const { el, had } of previous) {
-        if (!had) el.removeAttribute('inert');
-      }
-    };
+    if (!open || !overlayEl) return;
+    return inertBackground(overlayEl);
   });
 </script>
 
@@ -114,6 +125,7 @@
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <div
     class="close-overlay"
+    bind:this={overlayEl}
     role="dialog"
     aria-modal="true"
     aria-labelledby="close-title-{instanceId}"
@@ -137,9 +149,9 @@
         <span>{m.close_dialog_remember()}</span>
       </label>
       <div class="dialog-actions">
-        <button class="ghost" onclick={handleCancel}>{m.common_cancel()}</button>
-        <button class="exit-btn" onclick={handleExit}>{m.close_dialog_exit()}</button>
-        <button bind:this={trayBtn} class="primary" onclick={handleHide}>
+        <button class="ghost" onclick={handleCancel} disabled={actionTaken}>{m.common_cancel()}</button>
+        <button class="exit-btn" onclick={handleExit} disabled={actionTaken}>{m.close_dialog_exit()}</button>
+        <button bind:this={trayBtn} class="primary" onclick={handleHide} disabled={actionTaken}>
           {m.close_dialog_minimize()}
         </button>
       </div>

@@ -66,6 +66,13 @@ let initialized = false;
 let unlisteners: UnlistenFn[] = [];
 let lastEventUpdate = 0;
 let lastPollOkAt = 0;
+// Bumped by `cleanupNetworkStore`. `initNetworkStore` snapshots this at the
+// start of its async setup and checks it again after every await point, so
+// a cleanup that runs while init is still registering listeners / awaiting
+// the initial `getNetworkStats()` (dev HMR remount, or any rapid
+// reinit/teardown cycle) can't leave orphaned listeners installed or write
+// stale data into a store that's already been reset.
+let storeEpoch = 0;
 // Last UPnP mapped state we surfaced, so we only toast on transitions.
 // `null` until the backend's startup `upnp-status` event arrives: that first
 // event sets the baseline (warning if it failed, silence if it succeeded —
@@ -160,6 +167,7 @@ function withDerivedNetworkState(stats: NetworkStats, now = Date.now()): Network
 export async function initNetworkStore() {
   if (initialized) return;
   initialized = true;
+  const myEpoch = storeEpoch;
 
   const registered: UnlistenFn[] = [];
   try {
@@ -173,15 +181,21 @@ export async function initNetworkStore() {
       );
     }));
     registered.push(await listen<{ firewalled: boolean; external_ip: string; tcp_status?: string; udp_status?: string }>('firewall-status', (event) => {
+      const p = event.payload;
+      // Defensive: this event only ever comes from our own backend, but a
+      // malformed/partial payload shouldn't be able to stamp non-string
+      // garbage into `external_ip` or flip `firewalled` to a truthy
+      // non-boolean — validate shape like `narrowNetworkStatus` does above.
+      if (!p || typeof p.firewalled !== 'boolean' || typeof p.external_ip !== 'string') return;
       lastEventUpdate = Date.now();
       lastNetworkUpdate = lastEventUpdate;
       networkStats.update((s) => ({
         ...withDerivedNetworkState({
           ...s,
-          firewalled: event.payload.firewalled,
-          external_ip: event.payload.external_ip,
-          tcp_status: event.payload.tcp_status ?? s.tcp_status,
-          udp_status: event.payload.udp_status ?? s.udp_status,
+          firewalled: p.firewalled,
+          external_ip: p.external_ip,
+          tcp_status: p.tcp_status ?? s.tcp_status,
+          udp_status: p.udp_status ?? s.udp_status,
         }),
       }));
     }));
@@ -200,9 +214,18 @@ export async function initNetworkStore() {
       tcp_port: number;
       udp_port: number;
     }>('upnp-status', (event) => {
+      const p = event.payload;
+      // Same defensive shape check as `firewall-status` above — `mapped` in
+      // particular drives both the store and the toast branches below, so a
+      // missing/non-boolean payload must bail before either runs.
+      if (!p || typeof p.mapped !== 'boolean') return;
       lastEventUpdate = Date.now();
       lastNetworkUpdate = lastEventUpdate;
-      const { mapped, gateway_found, auto_disabled, tcp_port, udp_port } = event.payload;
+      const mapped = p.mapped;
+      const gateway_found = p.gateway_found === true;
+      const auto_disabled = p.auto_disabled === true;
+      const tcp_port = typeof p.tcp_port === 'number' ? p.tcp_port : 0;
+      const udp_port = typeof p.udp_port === 'number' ? p.udp_port : 0;
       networkStats.update((s) => withDerivedNetworkState({ ...s, upnp_mapped: mapped }));
 
       if (auto_disabled) {
@@ -287,10 +310,20 @@ export async function initNetworkStore() {
     initialized = false;
     throw e;
   }
+  if (myEpoch !== storeEpoch) {
+    // `cleanupNetworkStore` ran while we were still registering listeners
+    // (dev HMR remount / rapid re-init — not normal navigation, since
+    // `+layout.svelte` mounts this store once for the app's lifetime).
+    // Unlisten everything we just registered instead of adopting orphaned
+    // listeners into a store that's already been torn down.
+    for (const u of registered) u();
+    return;
+  }
   unlisteners.push(...registered);
 
   try {
     const stats = await getNetworkStats();
+    if (myEpoch !== storeEpoch) return;
     lastPollOkAt = Date.now();
     lastNetworkUpdate = lastPollOkAt;
     syncServerStatus(stats);
@@ -313,6 +346,7 @@ export async function initNetworkStore() {
 }
 
 export function cleanupNetworkStore() {
+  storeEpoch++;
   for (const unlisten of unlisteners) unlisten();
   unlisteners = [];
   initialized = false;
