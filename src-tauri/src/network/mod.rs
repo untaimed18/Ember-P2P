@@ -675,6 +675,31 @@ const MAX_UDP_SOURCE_QUEUE: usize = 500;
 /// 100–200 servers fit without truncation.
 const MAX_UDP_SEARCH_QUEUE: usize = 500;
 
+/// Extra safety margin (seconds) added on top of the queued-packet drain
+/// estimate to compute `ActiveSearchRequest::udp_search_deadline`. Covers
+/// the post-drain grace window (`search_timeout_secs / 10`, clamped 10-30s)
+/// plus headroom for a few of its resets by legitimately slow stragglers
+/// before the hard deadline steps in.
+const UDP_SEARCH_HARD_DEADLINE_BUFFER_SECS: i64 = 90;
+
+/// Whether the UDP global-search leg should be force-completed this tick.
+/// True once the post-drain quiet-period grace expires (`server_udp_search_age`
+/// exceeds `udp_grace_secs` — this counter resets on every non-empty
+/// `SearchResult` batch, letting a genuinely slow server keep contributing)
+/// OR once `now` reaches the absolute `udp_search_deadline` set when the leg
+/// was queued, whichever comes first. The deadline is what actually bounds a
+/// server (or spoofed sender) that keeps trickling results forever.
+fn udp_search_leg_should_complete(
+    server_udp_search_age: u32,
+    udp_grace_secs: u64,
+    now: i64,
+    udp_search_deadline: i64,
+) -> bool {
+    let grace_expired = u64::from(server_udp_search_age) > udp_grace_secs;
+    let hard_deadline_passed = now >= udp_search_deadline;
+    grace_expired || hard_deadline_passed
+}
+
 /// Minimum number of *verified* routing-table contacts before we report the
 /// KAD status as `Connected`. `routing_table.len()` also counts unverified
 /// contacts (e.g. loaded from `nodes.dat` or learned from FindNode responses
@@ -1771,12 +1796,37 @@ mod tests {
             kad_pending: true,
             udp_pending: false,
             ember_pending: false,
+            udp_search_deadline: 0,
             file_type_filter: None,
             keywords: Vec::new(),
             server_ip: None,
             server_result_count: 0,
             streamed_hashes: std::collections::HashSet::new(),
         }
+    }
+
+    #[test]
+    fn udp_search_leg_completes_once_grace_period_expires() {
+        // Age already past the grace threshold, deadline still far away:
+        // ordinary quiet-period completion, not the hard deadline.
+        assert!(udp_search_leg_should_complete(31, 30, 1_000, 1_000_000));
+        assert!(!udp_search_leg_should_complete(30, 30, 1_000, 1_000_000));
+    }
+
+    #[test]
+    fn udp_search_leg_completes_at_hard_deadline_despite_fresh_results() {
+        // Age keeps getting reset to 0 (as it would by a trickle of real or
+        // spoofed SearchResult batches), so the grace timer alone would
+        // never fire — but `now` has reached the absolute deadline set when
+        // the leg was queued, so the leg must still complete.
+        assert!(udp_search_leg_should_complete(0, 30, 5_000, 5_000));
+        assert!(udp_search_leg_should_complete(0, 30, 5_001, 5_000));
+        assert!(!udp_search_leg_should_complete(0, 30, 4_999, 5_000));
+    }
+
+    #[test]
+    fn udp_search_leg_stays_open_when_neither_condition_met() {
+        assert!(!udp_search_leg_should_complete(5, 30, 1_000, 2_000));
     }
 
     /// Regression guard for the KAD/server streaming cross-batch dedup fix:
@@ -3217,6 +3267,17 @@ struct ActiveSearchRequest {
     /// `search-complete`; cleared when the Ember results are emitted or the
     /// lookup expires.
     ember_pending: bool,
+    /// Absolute unix timestamp after which the UDP global-search leg is
+    /// force-completed regardless of `server_udp_search_age`. That age
+    /// counter resets to 0 every time a non-empty `SearchResult` batch
+    /// arrives (see the `ServerUdpResponse::SearchResult` handler) so a
+    /// straggler server can still contribute — intentional — but without
+    /// an absolute ceiling a server (or a spoofed sender, since UDP
+    /// search replies carry no auth) that keeps trickling results
+    /// indefinitely would keep `udp_pending`, and so the whole search's
+    /// `search-complete` event, alive forever. Only meaningful while
+    /// `udp_pending` is true; see `UDP_SEARCH_HARD_DEADLINE_BUFFER_SECS`.
+    udp_search_deadline: i64,
     file_type_filter: Option<String>,
     /// Keywords extracted from the original query, used by the spam-filter
     /// scorer when streamed results arrive from the network event loop.
@@ -9440,7 +9501,21 @@ pub async fn start_network(
                         // straggler UDP replies, and users who lower it a
                         // floor so the leg isn't cut off unreasonably fast.
                         let udp_grace_secs = (settings.search_timeout_secs / 10).clamp(10, 30);
-                        if u64::from(state.server_udp_search_age) > udp_grace_secs {
+                        let now = chrono::Utc::now().timestamp();
+                        if udp_search_leg_should_complete(
+                            state.server_udp_search_age,
+                            udp_grace_secs,
+                            now,
+                            active.udp_search_deadline,
+                        ) {
+                            if now >= active.udp_search_deadline
+                                && u64::from(state.server_udp_search_age) <= udp_grace_secs
+                            {
+                                debug!(
+                                    "UDP global search for request {}: hard deadline reached while results kept arriving",
+                                    active.request_id
+                                );
+                            }
                             active.udp_pending = false;
                             udp_finished_request = Some(active.request_id);
                             state.udp_search_queue.clear();
@@ -24838,6 +24913,7 @@ async fn handle_command_inner(
                 kad_pending: false,
                 udp_pending: false,
                 ember_pending: false,
+                udp_search_deadline: 0,
                 file_type_filter: file_type_filter.clone(),
                 keywords: Vec::new(),
                 server_ip: state.server_addr.map(|a| a.ip().to_string()),
@@ -24948,6 +25024,14 @@ async fn handle_command_inner(
                 if !state.udp_search_queue.is_empty() {
                     active_request.udp_pending = true;
                     state.server_udp_search_age = 0;
+                    // One second per queued packet safely exceeds the real
+                    // ~750ms `udp_search_timer` send throttle (eMule
+                    // UDPSEARCHSPEED), so this comfortably covers the worst
+                    // case where every queued server must be drained before
+                    // the post-drain grace period even starts counting.
+                    active_request.udp_search_deadline = chrono::Utc::now().timestamp()
+                        + state.udp_search_queue.len() as i64
+                        + UDP_SEARCH_HARD_DEADLINE_BUFFER_SECS;
                     info!(
                         "UDP global search queued for {} servers",
                         state.udp_search_queue.len()
