@@ -41,8 +41,18 @@
   // users land back where they were (mirrors ChatDock's return-focus pattern).
   let returnFocusEl: HTMLElement | null = null;
   const instanceId = Math.random().toString(36).slice(2, 10);
+  // Guards against a second click firing `onconfirm`/`oncancel` again
+  // while the dialog is still mounted during its ~150-200ms outro
+  // transition (Svelte keeps transitioning-out elements, and their
+  // listeners, live in the DOM until the transition finishes). A fast
+  // double-click on a destructive action (cancel transfer, clear
+  // completed, remove friend, ...) would otherwise invoke the callback
+  // twice. Reset whenever the dialog (re)opens.
+  let actionTaken = $state(false);
 
   function handleConfirm() {
+    if (actionTaken) return;
+    actionTaken = true;
     // Run the callback first so it sees the dialog still mounted and any
     // parent-owned state remains valid. Flipping `open` before the callback
     // can let the parent teardown (remove bindings, unmount the dialog)
@@ -52,6 +62,8 @@
   }
 
   function handleCancel() {
+    if (actionTaken) return;
+    actionTaken = true;
     oncancel?.();
     open = false;
   }
@@ -81,6 +93,7 @@
 
   $effect(() => {
     if (open) {
+      actionTaken = false;
       const active = typeof document !== 'undefined' ? document.activeElement : null;
       if (active instanceof HTMLElement && active !== document.body) returnFocusEl = active;
       requestAnimationFrame(() => {
@@ -134,9 +147,9 @@
       <p id="confirm-message-{instanceId}">{message}</p>
       <div class="dialog-actions">
         {#if !alert}
-          <button class="ghost" onclick={handleCancel}>{cancelLabel}</button>
+          <button class="ghost" onclick={handleCancel} disabled={actionTaken}>{cancelLabel}</button>
         {/if}
-        <button bind:this={confirmBtn} class={danger ? 'danger' : ''} onclick={handleConfirm}>{confirmLabel}</button>
+        <button bind:this={confirmBtn} class={danger ? 'danger' : ''} onclick={handleConfirm} disabled={actionTaken}>{confirmLabel}</button>
       </div>
     </div>
   </div>

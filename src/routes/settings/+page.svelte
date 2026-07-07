@@ -187,8 +187,6 @@
     }
   }
 
-  let hasUnsavedChanges = $derived(settings ? JSON.stringify(settings) !== originalSettings : false);
-
   let unmounted = false;
   onMount(() => {
     refreshSpamStats();
@@ -260,48 +258,67 @@
   }
 
   /** Validate and clamp numeric fields to the ranges documented in AppSettings.
-   *  Returns null on success or an error message. Mutates `s` in place. */
-  function validateSettings(s: AppSettings): string | null {
+   *  Returns an error message on hard failure (mutates nothing in that case).
+   *  Otherwise mutates `s` in place and reports whether any numeric field was
+   *  outside its valid range and silently adjusted, so the caller can tell
+   *  the user rather than saving a different value than what they typed with
+   *  no feedback at all. */
+  function validateSettings(s: AppSettings): { error: string | null; adjusted: boolean } {
     if (!s.nickname.trim()) {
-      return m.settings_validation_nickname_empty();
+      return { error: m.settings_validation_nickname_empty(), adjusted: false };
     }
     // Mirror the backend's 128-byte cap (commands/settings.rs) so an oversized
     // nickname is rejected here with a clear message instead of only failing on
     // save. `maxlength` on the input is a coarse char guard; this is the
     // authoritative byte check (multi-byte UTF-8 can exceed it).
     if (new TextEncoder().encode(s.nickname).length > 128) {
-      return m.error_settings_nickname_too_long();
+      return { error: m.error_settings_nickname_too_long(), adjusted: false };
     }
     if (!s.download_folder.trim()) {
-      return m.settings_validation_folder_empty();
+      return { error: m.settings_validation_folder_empty(), adjusted: false };
     }
-    s.tcp_port = clampInt(s.tcp_port, 1, 65535, 4662);
-    s.udp_port = clampInt(s.udp_port, 1, 65535, 4672);
+    let adjusted = false;
+    // Thin wrappers around the shared clamp helpers that additionally flag
+    // `adjusted` when the clamped result differs from what was actually
+    // typed (including "unparseable/empty" — that path returns `fallback`,
+    // which reliably differs from a NaN `original`).
+    const ci = (v: unknown, min: number, max: number, fallback: number): number => {
+      const result = clampInt(v, min, max, fallback);
+      if (result !== (typeof v === 'number' ? v : parseInt(String(v ?? ''), 10))) adjusted = true;
+      return result;
+    };
+    const cn = (v: unknown, max: number, fallback: number): number => {
+      const result = clampNonNegInt(v, max, fallback);
+      if (result !== (typeof v === 'number' ? v : parseInt(String(v ?? ''), 10))) adjusted = true;
+      return result;
+    };
+    s.tcp_port = ci(s.tcp_port, 1, 65535, 4662);
+    s.udp_port = ci(s.udp_port, 1, 65535, 4672);
     // TCP and UDP are separate protocols on the OS and on the IGD/UPnP
     // side, so reusing the same port number for both is fully supported
     // (eMule has always allowed this too). This matters for users on a
     // VPN that only forwards a single port for both protocols. The only
     // thing we still require is that the port is in the 1-65535 range.
-    s.max_upload_speed = clampNonNegInt(s.max_upload_speed, 2_147_483_647, 0);
-    s.max_download_speed = clampNonNegInt(s.max_download_speed, 2_147_483_647, 0);
-    s.max_concurrent_downloads = clampInt(s.max_concurrent_downloads, 1, 50, 3);
-    s.max_concurrent_uploads = clampInt(s.max_concurrent_uploads, 1, 50, 4);
-    s.max_sources_per_file = clampInt(s.max_sources_per_file, 1, 2000, 1000);
-    s.max_connections = clampInt(s.max_connections, 1, 2000, 500);
-    s.download_queue_wait_secs = clampInt(s.download_queue_wait_secs, 60, 14400, 600);
-    s.multisource_retry_rounds = clampInt(s.multisource_retry_rounds, 1, 20, 3);
-    s.download_part_retry_rounds = clampInt(s.download_part_retry_rounds, 1, 20, 3);
-    s.max_download_file_size_gib = clampInt(s.max_download_file_size_gib, 1, 16384, 4096);
-    s.search_timeout_secs = clampInt(s.search_timeout_secs, 30, 600, 120);
-    s.max_friends = clampInt(s.max_friends, 1, 500, 100);
-    return null;
+    s.max_upload_speed = cn(s.max_upload_speed, 2_147_483_647, 0);
+    s.max_download_speed = cn(s.max_download_speed, 2_147_483_647, 0);
+    s.max_concurrent_downloads = ci(s.max_concurrent_downloads, 1, 50, 3);
+    s.max_concurrent_uploads = ci(s.max_concurrent_uploads, 1, 50, 4);
+    s.max_sources_per_file = ci(s.max_sources_per_file, 1, 2000, 1000);
+    s.max_connections = ci(s.max_connections, 1, 2000, 500);
+    s.download_queue_wait_secs = ci(s.download_queue_wait_secs, 60, 14400, 600);
+    s.multisource_retry_rounds = ci(s.multisource_retry_rounds, 1, 20, 3);
+    s.download_part_retry_rounds = ci(s.download_part_retry_rounds, 1, 20, 3);
+    s.max_download_file_size_gib = ci(s.max_download_file_size_gib, 1, 16384, 4096);
+    s.search_timeout_secs = ci(s.search_timeout_secs, 30, 600, 120);
+    s.max_friends = ci(s.max_friends, 1, 500, 100);
+    return { error: null, adjusted };
   }
 
   async function handleSave() {
     if (!settings || saving) return;
-    const validationError = validateSettings(settings);
-    if (validationError) {
-      showSaveMsg(validationError, true, 5000);
+    const validation = validateSettings(settings);
+    if (validation.error) {
+      showSaveMsg(validation.error, true, 5000);
       return;
     }
     // Snapshot the previous port values BEFORE we overwrite
@@ -321,19 +338,34 @@
     }
     saving = true;
     saveMessage = null;
+    // Deep-clone at save-start, and send/compare against that clone rather
+    // than the live `settings` object for the rest of this function. `settings`
+    // stays bound to the form inputs while `updateSettings` is in flight, so
+    // without this a mid-flight edit could change what gets attributed as
+    // "saved" — leaving `originalSettings` (and the tcp/udp restart-prompt
+    // comparison below) reflecting whatever `settings` drifted to by the time
+    // the await resolves, not what this save actually persisted.
     const snapshot = JSON.stringify(settings);
+    const toSave = JSON.parse(snapshot) as AppSettings;
     try {
-      const result = await updateSettings(settings);
+      const result = await updateSettings(toSave);
       // Keep the process-wide settings cache in step with the just-saved
       // values so runtime consumers (friend online-notification toast, chat
       // "disabled" state) react immediately instead of next launch.
-      setAppSettings($state.snapshot(settings));
+      setAppSettings(toSave);
       originalSettings = snapshot;
       // Reflect the dev-console preference immediately so the sidebar link
       // appears/disappears without waiting for a reload.
-      emberDevToolsEnabled.set(!!settings.ember_dev_tools_enabled);
-      const isWarn = result.toLowerCase().includes('restart');
-      showSaveMsg(result, isWarn, isWarn ? 8000 : 3000);
+      emberDevToolsEnabled.set(!!toSave.ember_dev_tools_enabled);
+      // `validation.adjusted` means at least one numeric field was outside
+      // its valid range and got silently clamped by `validateSettings`
+      // above — surface that alongside the normal save result instead of
+      // saving a different value than what was typed with no feedback.
+      const message = validation.adjusted
+        ? `${result} ${m.settings_values_adjusted()}`
+        : result;
+      const isWarn = result.toLowerCase().includes('restart') || validation.adjusted;
+      showSaveMsg(message, isWarn, isWarn ? 8000 : 3000);
 
       // Compare the snapshot we took above against the saved settings.
       // The TCP/UDP ports drive `start_upload_server` (TCP listen socket)
@@ -341,26 +373,26 @@
       // app startup, so a hot save here updates the persisted value but
       // not the running listener. Prompt the user to restart.
       const tcpChanged =
-        previousTcpPort !== undefined && previousTcpPort !== settings.tcp_port;
+        previousTcpPort !== undefined && previousTcpPort !== toSave.tcp_port;
       const udpChanged =
-        previousUdpPort !== undefined && previousUdpPort !== settings.udp_port;
+        previousUdpPort !== undefined && previousUdpPort !== toSave.udp_port;
       if (tcpChanged || udpChanged) {
         if (tcpChanged && udpChanged) {
           pendingRestartReason = m.settings_restart_reason_both({
             tcp_from: String(previousTcpPort),
-            tcp_to: String(settings.tcp_port),
+            tcp_to: String(toSave.tcp_port),
             udp_from: String(previousUdpPort),
-            udp_to: String(settings.udp_port),
+            udp_to: String(toSave.udp_port),
           });
         } else if (tcpChanged) {
           pendingRestartReason = m.settings_restart_reason_tcp_only({
             from: String(previousTcpPort),
-            to: String(settings.tcp_port),
+            to: String(toSave.tcp_port),
           });
         } else {
           pendingRestartReason = m.settings_restart_reason_udp_only({
             from: String(previousUdpPort),
-            to: String(settings.udp_port),
+            to: String(toSave.udp_port),
           });
         }
         showRestartPrompt = true;
@@ -524,6 +556,26 @@
   let antileechMessage: { kind: 'ok' | 'warn' | 'err'; text: string } | null = $state(null);
   let antileechCompileErrors: Array<[string, string]> = $state([]);
   let antileechLoaded = $state(false);
+  // The anti-leech textarea has its own dedicated Save button
+  // (`handleSaveAntileech`) and isn't part of `settings`, so it needs its
+  // own dirty check folded into `hasUnsavedChanges` above — otherwise edits
+  // here are invisible to the "unsaved changes" indicator, `beforeunload`,
+  // and Discard (which reverts `antileechDraft` in `resetChanges` below,
+  // but stayed disabled unless `settings` itself also had changes).
+  let antileechDraftDirty = $derived.by(() => {
+    // Narrow via a local const first — TS doesn't reliably narrow a
+    // `$state`-backed getter read directly inside a ternary the way it
+    // would a plain variable.
+    const snap = antileechSnapshot;
+    return antileechLoaded && snap ? antileechDraft !== snap.patterns.join('\n') : false;
+  });
+  // Declared here (rather than alongside `settings`/`originalSettings`
+  // above) so `antileechDraftDirty`'s declaration precedes its use — Svelte's
+  // `$derived` is lazy and immune to ordering at runtime, but the type
+  // checker still applies plain TDZ analysis to the referenced binding.
+  let hasUnsavedChanges = $derived(
+    (settings ? JSON.stringify(settings) !== originalSettings : false) || antileechDraftDirty
+  );
 
   async function loadAntileech() {
     antileechMessage = null;

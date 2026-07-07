@@ -568,7 +568,6 @@
   let spamThreshold = $derived(spamProfile === 'aggressive' ? 45 : spamProfile === 'relaxed' ? 80 : 60);
 
   let serverHintDismissedTabs = $state(new Set<string>());
-  let serverRetryPending = $state(false);
 
   function hasServerOrigin(r: SearchResult): boolean {
     return (r.result_origin || '').includes('Server');
@@ -593,8 +592,12 @@
     return null;
   });
 
+  // `activeTab.retryRequestId` (rather than a separate global flag) is the
+  // source of truth for "a server retry is pending" — it's per-tab, so a
+  // retry running on another tab can no longer block this one, and it's
+  // impossible for it to drift out of sync with the tab it describes.
   let serverRetryAllowed = $derived(
-    !!serverNoResultsHint && $serverStatus === 'connected' && !serverRetryPending
+    !!serverNoResultsHint && $serverStatus === 'connected' && activeTab?.retryRequestId == null
   );
 
   function hasSearchFilters(filters: import('$lib/api/search').SearchFilters | undefined, fileType?: string): boolean {
@@ -609,11 +612,10 @@
   }
 
   async function retryServerSearch() {
-    if (!activeTab || serverRetryPending || $serverStatus !== 'connected') return;
+    if (!activeTab || activeTab.retryRequestId != null || $serverStatus !== 'connected') return;
     const tabQuery = activeTab.query;
     const tabId = activeTab.id;
     if (!tabQuery.trim() && !hasSearchFilters(activeTab.filters, activeTab.fileType || undefined)) return;
-    serverRetryPending = true;
     // Keep the tab's canonical requestId unchanged so late streaming events
     // for the original search still land in the correct tab. The retry runs
     // under its own nonce; we attach it as the tab's secondary request id so
@@ -665,7 +667,6 @@
       // fire a late rejection) after the search resolves first.
       if (retryTimeout) clearTimeout(retryTimeout);
       clearRetryRequestId(tabId);
-      serverRetryPending = false;
     }
   }
 
@@ -1114,21 +1115,24 @@
     }
   }
 
-  async function stopSearch() {
-    const t = activeTab;
+  // `tabId` defaults to the active tab (toolbar Stop button), but a search
+  // running in a background tab previously had no way to be stopped without
+  // switching to it first — the tab strip's per-tab stop control below
+  // passes its own tab's id explicitly.
+  async function stopSearch(tabId?: string) {
+    const t = tabId != null ? get(searchTabs).find((tab) => tab.id === tabId) ?? null : activeTab;
     if (!t) return;
     // Nothing to stop if neither the primary search nor a server retry
     // is in flight.
     if (!t.isSearching && t.retryRequestId == null) return;
     const retryRequestId = t.retryRequestId;
-    // Detach the retry routing and clear the page-local "retrying" flag
-    // synchronously, BEFORE awaiting the cancel round-trips. The in-flight
-    // `retryServerSearch()` promise guards on the tab still carrying its
-    // retry id, so clearing it here ensures a stopped retry can't merge late
-    // results or flash a toast once `search_files` resolves on cancel.
+    // Detach the retry routing synchronously, BEFORE awaiting the cancel
+    // round-trips. The in-flight `retryServerSearch()` promise guards on the
+    // tab still carrying its retry id, so clearing it here ensures a stopped
+    // retry can't merge late results or flash a toast once `search_files`
+    // resolves on cancel.
     if (retryRequestId != null) {
       clearRetryRequestId(t.id);
-      serverRetryPending = false;
     }
     if (t.isSearching) {
       clearSearchTimeoutForRequest(t.requestId);
@@ -1326,6 +1330,15 @@
   async function download(result: SearchResult) {
     const key = resultKey(result);
     if (downloadPending[key]) return;
+    // The row's download button disables itself once `getDownloadTransfer`
+    // finds a match (see its "mirrors `download()`'s early-exit checks"
+    // comment below), but double-click and the context-menu "Download" item
+    // both call this directly without checking first. Without this, either
+    // path fires a redundant `startDownload` for a file that's already an
+    // active transfer — harmless server-side (`already_queued: true`), but
+    // it's an extra IPC round-trip and toast the disabled button exists
+    // specifically to prevent.
+    if (getDownloadTransfer(result)) return;
 
     const networkAddresses = (result.source_addresses ?? []).filter(
       (a) => a && a !== 'local'
@@ -1735,7 +1748,7 @@
     <!-- Also show Stop while a server retry is in flight (isSearching is
          false then, but retryRequestId is set) so the user can cancel it;
          stopSearch already cancels the retry leg. -->
-    <button class="stop-btn" onclick={stopSearch}>{m.common_stop()}</button>
+    <button class="stop-btn" onclick={() => stopSearch()}>{m.common_stop()}</button>
   {:else}
     <button onclick={() => handleSearch(barQuery)}>{m.search_title()}</button>
   {/if}
@@ -1757,17 +1770,37 @@
           tabindex={tab.id === $activeSearchTabId ? 0 : -1}
         >
           <span class="search-tab-label">{shortenTabLabel(tab.query)}</span>
-          <span class="search-tab-meta" aria-label={tab.isSearching ? m.search_in_progress_aria() : m.search_results_aria({ count: tab.results.length })}>
-            {#if tab.isSearching}
+          <!-- A server retry runs with `isSearching === false` (only
+               `retryRequestId` is set — see the `SearchTab` type), so this
+               must check both; otherwise a tab retrying in the background
+               looks idle: static result count, no spinner. -->
+          <span class="search-tab-meta" aria-label={(tab.isSearching || tab.retryRequestId != null) ? m.search_in_progress_aria() : m.search_results_aria({ count: tab.results.length })}>
+            {#if tab.isSearching || tab.retryRequestId != null}
               {m.search_searching_label()}
             {:else}
               {tab.results.length}
             {/if}
           </span>
-          {#if tab.isSearching}
+          {#if tab.isSearching || tab.retryRequestId != null}
             <span class="search-tab-spinner" aria-hidden="true"></span>
           {/if}
         </button>
+        {#if tab.isSearching || tab.retryRequestId != null}
+          <!-- Lets a search running in a background tab be stopped without
+               switching to it first — the toolbar Stop button only ever
+               acts on `activeTab`. -->
+          <button
+            type="button"
+            class="search-tab-stop"
+            onclick={() => stopSearch(tab.id)}
+            title={m.search_stop_tab()}
+            aria-label={m.search_stop_tab_aria()}
+          >
+            <svg viewBox="0 0 14 14" width="10" height="10" fill="currentColor" aria-hidden="true">
+              <rect x="2" y="2" width="10" height="10" rx="1.5"/>
+            </svg>
+          </button>
+        {/if}
         <button
           type="button"
           class="search-tab-close"
@@ -1980,7 +2013,7 @@
       <div class="server-hint-actions">
         {#if serverRetryAllowed}
           <button class="server-retry-btn" onclick={retryServerSearch}>{m.search_retry_server()}</button>
-        {:else if serverRetryPending}
+        {:else if activeTab?.retryRequestId != null}
           <button class="server-retry-btn" disabled>{m.search_retrying()}</button>
         {/if}
         <button class="ghost" onclick={() => { if (activeTab?.id) { const next = new Set(serverHintDismissedTabs); next.add(activeTab.id); serverHintDismissedTabs = next; } }}>{m.common_dismiss()}</button>
@@ -1998,7 +2031,7 @@
       <p>{m.search_empty_title()}</p>
       <p class="hint">{m.search_empty_hint()}</p>
     </div>
-  {:else if activeTab?.isSearching && searchResultsList.length === 0}
+  {:else if (activeTab?.isSearching || activeTab?.retryRequestId != null) && searchResultsList.length === 0}
     <div class="empty-state">
       <p>{m.search_searching_network()}</p>
       {#if activeTab.progress}
@@ -2011,7 +2044,7 @@
         </p>
       {/if}
     </div>
-  {:else if searchResultsList.length === 0 && !activeTab?.isSearching}
+  {:else if searchResultsList.length === 0 && !activeTab?.isSearching && activeTab?.retryRequestId == null}
     <div class="empty-state">
       <div class="icon" aria-hidden="true">
         <svg viewBox="0 0 48 48" width="48" height="48" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -2620,6 +2653,36 @@
     to {
       transform: rotate(360deg);
     }
+  }
+
+  .search-tab-stop {
+    width: 26px;
+    padding: 0;
+    border: none;
+    border-left: 1px solid var(--border);
+    background: transparent;
+    color: var(--text-muted);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: color 0.15s ease, background-color 0.15s ease, opacity 0.12s ease;
+    opacity: 0.55;
+  }
+
+  .search-tab:hover .search-tab-stop,
+  .search-tab.active .search-tab-stop {
+    opacity: 1;
+  }
+
+  .search-tab-stop:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+
+  .search-tab-stop:hover {
+    color: var(--accent);
+    background: var(--bg-hover);
   }
 
   .search-tab-close {

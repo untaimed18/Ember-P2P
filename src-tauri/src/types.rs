@@ -136,7 +136,13 @@ pub struct Transfer {
     /// Category name (eMule: category tabs)
     #[serde(default)]
     pub category: String,
-    /// Upload: how long client waited in queue (ms) (eMule: GetWaitTime)
+    /// Upload: how long client waited in queue before the slot was granted,
+    /// in **seconds** (eMule: GetWaitTime). A fixed snapshot taken once at
+    /// grant time, not a live counter — unlike `upload_time` below, this is
+    /// never updated again for the life of the row. The frontend multiplies
+    /// by 1000 before formatting; keep this doc's unit in sync with
+    /// `UploadEventKind::Started::wait_seconds`, which is where the value
+    /// actually comes from.
     #[serde(default)]
     pub wait_time: u64,
     /// Upload: how long the upload has been active (ms) (eMule: GetUpStartTimeDelay)

@@ -112,6 +112,10 @@ function notifyFriendOnline(hash: string): void {
 
 let initialized = false;
 let unlisteners: UnlistenFn[] = [];
+// Bumped by `cleanupFriendsStore`; see the matching comment in
+// `stores/network.ts` for why `initFriendsStore` re-checks this after each
+// await in its (long) async setup chain before writing to any store.
+let storeEpoch = 0;
 
 // Coalesces bursts of `ember:friend-request` events into a single
 // `getFriendRequests` IPC call. The optimistic merge in the event
@@ -146,6 +150,7 @@ function scheduleFriendRequestRefetch() {
 export async function initFriendsStore() {
   if (initialized) return;
   initialized = true;
+  const myEpoch = storeEpoch;
 
   const registered: UnlistenFn[] = [];
   try {
@@ -293,15 +298,28 @@ export async function initFriendsStore() {
     console.error('Failed to initialize friends store listeners:', e);
     throw e;
   }
+  if (myEpoch !== storeEpoch) {
+    // `cleanupFriendsStore` ran while we were still registering (dev HMR
+    // remount / rapid re-init). Unlisten what we just added rather than
+    // adopting orphaned listeners into an already-torn-down store.
+    for (const u of registered) u();
+    return;
+  }
   unlisteners.push(...registered);
 
+  // Every await below re-checks `myEpoch` before touching a store: a
+  // cleanup that lands between two of these calls must not let the later
+  // one's response repopulate a store that was just reset for the next
+  // init cycle.
   try {
     const reqs = await getFriendRequests();
+    if (myEpoch !== storeEpoch) return;
     friendRequests.set(reqs);
   } catch { /* backend not ready yet */ }
 
   try {
     const counts = await getUnreadMessageCounts();
+    if (myEpoch !== storeEpoch) return;
     // Merge rather than replace: the `ember:chat-message` listener is
     // registered above, so an inbound message that lands during init has
     // already bumped `unreadCounts`. A blind `set` would drop that live
@@ -325,11 +343,13 @@ export async function initFriendsStore() {
   // event would carry, so the UI is correct on first paint.
   try {
     const discoverable = await isFriendDiscoverable();
+    if (myEpoch !== storeEpoch) return;
     isDiscoverable.set(discoverable);
   } catch { /* backend not ready yet */ }
 
   // Seed the name map used by online toasts.
   await refreshFriendNames();
+  if (myEpoch !== storeEpoch) return;
 
   // Seed the online set from the backend's current view so friends don't all
   // show offline (chat/browse disabled) until the next `ember:friend-online`
@@ -338,6 +358,7 @@ export async function initFriendsStore() {
   // these pre-online friends don't trigger "came online" toasts.
   try {
     const online = await getOnlineFriends();
+    if (myEpoch !== storeEpoch) return;
     onlineFriends.update((s) => new Set([...s, ...online]));
   } catch { /* backend not ready yet */ }
 }
@@ -363,6 +384,7 @@ export function clearFriendSearch(friendHash: string) {
 }
 
 export function cleanupFriendsStore() {
+  storeEpoch++;
   for (const unlisten of unlisteners) {
     try {
       unlisten();

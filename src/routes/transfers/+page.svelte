@@ -484,17 +484,35 @@
 
   async function refreshExpandedSourceDetails(transferId: string) {
     const requestId = sourceDetailRequestId;
+    // Same "did a push event land during the await" detection as
+    // `toggleSourceDetail` above, and for the same reason: `expandedSources`
+    // is reassigned on every mutating update from the `transfer-source-detail`
+    // handler, so identity inequality after the await reliably means a push
+    // arrived mid-fetch.
+    const preFetchSources = expandedSources;
     try {
       const sources = await getTransferSources(transferId);
       if (expandedTransferId !== transferId || requestId !== sourceDetailRequestId) return;
-
-      // Backend source-search handlers may update TransferManager without
-      // emitting per-row events. Merge a fresh snapshot so an already-open
-      // drawer shows newly discovered sources without requiring collapse/expand.
-      const byKey = new Map<string, SourceInfo>();
-      for (const s of sources) byKey.set(`${s.ip}:${s.port}`, s);
-      for (const s of expandedSources) byKey.set(`${s.ip}:${s.port}`, s);
-      expandedSources = Array.from(byKey.values());
+      if (expandedSources === preFetchSources) {
+        // Nothing changed during the fetch — the backend just finished
+        // writing this transfer's source list (that's what triggers this
+        // refresh), so the snapshot is authoritative for both membership
+        // and fields. Replace outright. The previous union-by-key merge
+        // here never dropped peers the backend removed (zombie rows lingered
+        // in the drawer indefinitely) and let a stale existing row shadow
+        // the fresh snapshot's value on any key collision.
+        expandedSources = sources;
+      } else {
+        // A push landed mid-fetch and is strictly newer than the snapshot
+        // for whichever row(s) it touched. Same precedence as
+        // `toggleSourceDetail`: push rows win on collision. The snapshot
+        // still governs membership, so a peer the backend has since
+        // dropped is not resurrected just because a push happened to touch
+        // it moments earlier.
+        const liveByKey = new Map<string, SourceInfo>();
+        for (const s of expandedSources) liveByKey.set(`${s.ip}:${s.port}`, s);
+        expandedSources = sources.map((s) => liveByKey.get(`${s.ip}:${s.port}`) ?? s);
+      }
     } catch {
       // Keep the live event-fed rows if this opportunistic refresh fails.
     }
@@ -700,6 +718,19 @@
   // request's promise resolves first).
   let uploadQueueGen = 0;
   let knownClientsGen = 0;
+  // Consecutive-failure counters for the *first* load only (reset on any
+  // success). If the very first snapshot keeps failing — e.g. the tab is
+  // opened right after launch, before the network task's command loop is
+  // serving requests yet — `*Loaded` would otherwise stay `false` forever
+  // and the empty-state cell shows a permanent spinner instead of ever
+  // settling. Polling keeps retrying regardless of this counter, so once
+  // the backend catches up the real data still replaces the empty state
+  // with no user action needed; this only bounds how long we keep
+  // insisting on "loading" before showing it as (probably temporarily)
+  // empty.
+  let uploadQueueFailCount = 0;
+  let knownClientsFailCount = 0;
+  const LOAD_GIVE_UP_AFTER = 3;
 
   async function refreshUploadQueue() {
     const gen = ++uploadQueueGen;
@@ -708,10 +739,15 @@
       if (!mounted || gen !== uploadQueueGen) return;
       uploadQueueClients = data;
       uploadQueueLoaded = true;
+      uploadQueueFailCount = 0;
     } catch (e) {
       // Network task may be momentarily busy (try_send full). Leave the
       // last good snapshot in place rather than flashing the table empty.
       console.warn('Failed to refresh upload queue:', e);
+      if (!mounted || gen !== uploadQueueGen) return;
+      if (!uploadQueueLoaded && ++uploadQueueFailCount >= LOAD_GIVE_UP_AFTER) {
+        uploadQueueLoaded = true;
+      }
     }
   }
   async function refreshKnownClients() {
@@ -721,6 +757,7 @@
       if (!mounted || gen !== knownClientsGen) return;
       knownClients = data;
       knownClientsLoaded = true;
+      knownClientsFailCount = 0;
       // Kick off reputation refresh for the just-loaded roster. Runs
       // off-cycle because `get_peer_reputation` may return `null` for
       // peers the tracker hasn't seen yet, which is common for known
@@ -731,6 +768,10 @@
       void refreshReputations(knownClients.map((k) => k.user_hash));
     } catch (e) {
       console.warn('Failed to refresh known clients:', e);
+      if (!mounted || gen !== knownClientsGen) return;
+      if (!knownClientsLoaded && ++knownClientsFailCount >= LOAD_GIVE_UP_AFTER) {
+        knownClientsLoaded = true;
+      }
     }
   }
 
@@ -2849,7 +2890,7 @@
                   {:else if column.key === 'last_seen_complete'}
                     <td class="date-cell">{t.last_seen_complete ? formatDate(t.last_seen_complete) : '\u2014'}</td>
                   {:else if column.key === 'last_received'}
-                    <td class="date-cell">{'\u2014'}</td>
+                    <td class="date-cell">{t.last_received ? formatDate(t.last_received) : '\u2014'}</td>
                   {:else if column.key === 'category'}
                     <td class="cat-cell">{t.category || '\u2014'}</td>
                   {:else if column.key === 'started_at'}

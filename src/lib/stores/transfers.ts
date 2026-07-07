@@ -165,6 +165,10 @@ let initialized = false;
 let unlisteners: UnlistenFn[] = [];
 let pollInterval: ReturnType<typeof setInterval> | null = null;
 let pollConsumers = 0;
+// Bumped by `cleanupTransferStore`; see the matching comment in
+// `stores/network.ts` for why `initTransferStore` re-checks this after its
+// async listener registration and the trailing `getTransfers()` call.
+let storeEpoch = 0;
 
 // Pending progress payloads per transfer id. We keep the newest payload
 // and the first-seen timestamp so that a `transfer-progress` that arrives
@@ -193,6 +197,19 @@ let flushTimeout: ReturnType<typeof setTimeout> | null = null;
  *  win the race. */
 const recentlyRemovedUploads = new Map<string, number>();
 const REMOVED_UPLOAD_TTL_MS = 10_000;
+
+/**
+ * Wall-clock time each row most recently entered a reversible side state
+ * (paused/stopped/insufficient) via a `transfer-status` event. `isMoreAdvancedStatus`
+ * always lets a poll's API status override one of these, on the assumption that
+ * a snapshot is at least as fresh as the stored status — true for a snapshot
+ * taken after the pause, but NOT for one already in flight (the poll races a
+ * 4s timeout) when the user paused. The poll merge below compares this against
+ * when THAT poll started (not when it resolved) to tell the two cases apart,
+ * so a `getTransfers()` response captured before the pause can't resurrect
+ * the row as `active` for the ~3s until the next poll/event corrects it.
+ */
+const reversibleStateEnteredAt = new Map<string, number>();
 function markUploadRemoved(id: string) {
   recentlyRemovedUploads.set(id, Date.now() + REMOVED_UPLOAD_TTL_MS);
 }
@@ -296,6 +313,7 @@ function flushProgress() {
 export async function initTransferStore() {
   if (initialized) return;
   initialized = true;
+  const myEpoch = storeEpoch;
 
   // Sequential `await listen(...)` with explicit rollback instead of
   // `Promise.all`. With Promise.all, a single rejected `listen` after
@@ -346,6 +364,10 @@ export async function initTransferStore() {
     await safeListen<TransferEventPayload>('transfer-complete', (event) => {
       markEventUpdate();
       const { id, direction } = event.payload;
+      // Row is terminal from here on — reversible-state tracking no longer
+      // applies (a stale entry wouldn't cause wrong merges, since a terminal
+      // event status already wins on its own, but there's no reason to keep it).
+      reversibleStateEnteredAt.delete(id);
       transfers.update((list) => {
         // Find the row (if any) so we can decide whether to drop it
         // outright (uploads) or simply mark it completed (downloads).
@@ -386,6 +408,7 @@ export async function initTransferStore() {
     await safeListen<TransferEventPayload>('transfer-failed', (event) => {
       markEventUpdate();
       const { id, error, failure_kind, failure_stage, direction } = event.payload;
+      reversibleStateEnteredAt.delete(id);
       transfers.update((list) => {
         const existing = list.find((t) => t.id === id);
         const isUpload = direction === 'upload' || existing?.direction === 'upload';
@@ -447,6 +470,11 @@ export async function initTransferStore() {
               // until an explicit reset (remove / cancel).
               if (!(isTerminal(t.status) && t.status !== narrowed)) {
                 updated.status = narrowed;
+                if (narrowed === 'paused' || narrowed === 'stopped' || narrowed === 'insufficient') {
+                  reversibleStateEnteredAt.set(id, Date.now());
+                } else {
+                  reversibleStateEnteredAt.delete(id);
+                }
               }
             }
             // Paused / stopped rows are not transferring — zero the speed in the
@@ -576,10 +604,20 @@ export async function initTransferStore() {
     initialized = false;
     throw e;
   }
+  if (myEpoch !== storeEpoch) {
+    // `cleanupTransferStore` ran while we were still registering (dev HMR
+    // remount / rapid re-init). Unlisten what we just added rather than
+    // adopting orphaned listeners into an already-torn-down store.
+    for (const u of registered) {
+      try { u(); } catch { /* ignore */ }
+    }
+    return;
+  }
   unlisteners.push(...registered);
 
   try {
     const all = await getTransfers();
+    if (myEpoch !== storeEpoch) return;
     transfers.update((current) => {
       const currentById = new Map(current.map((t) => [t.id, t]));
       const merged = all.map((apiItem) => {
@@ -656,8 +694,14 @@ const missingFromApiSince = new Map<string, number>();
 const ZOMBIE_GRACE_MS = 12_000;
 
 export function cleanupTransferStore() {
+  storeEpoch++;
   for (const unlisten of unlisteners) unlisten();
   unlisteners = [];
+  // Without this, a reinit's first poll tick (up to 3s later) would still
+  // see the previous session's `lastEventUpdate` and could defer under the
+  // `< 2000`ms freshness gate in `startTransferPoll`, delaying the first
+  // reconcile after a fresh init for no reason.
+  lastEventUpdate = 0;
   if (pollInterval !== null) {
     clearInterval(pollInterval);
     pollInterval = null;
@@ -667,6 +711,7 @@ export function cleanupTransferStore() {
   pendingProgress.clear();
   recentlyRemovedUploads.clear();
   missingFromApiSince.clear();
+  reversibleStateEnteredAt.clear();
   // Cancel any flush queued for the next frame/tick so it can't run against a
   // store we've just reset (or a subsequently re-initialised one).
   if (flushRaf !== null) {
@@ -757,6 +802,11 @@ export function startTransferPoll() {
     if (!pollPumpOnNextVisible && Date.now() - lastEventUpdate < 2000) return;
     pollPumpOnNextVisible = false;
     busy = true;
+    // Captured before the IPC call so the merge below can tell whether THIS
+    // poll's snapshot was already in flight when a pause/stop/insufficient
+    // transition landed (see `reversibleStateEnteredAt`), not just whether
+    // the poll resolved before or after — it always resolves after.
+    const pollStartedAt = Date.now();
     let pollTimeout: ReturnType<typeof setTimeout> | undefined;
     try {
       const all = await Promise.race([
@@ -780,7 +830,19 @@ export function startTransferPoll() {
           .map((apiItem) => {
             const eventItem = currentById.get(apiItem.id);
             if (!eventItem) return apiItem;
-            const preferEvent = isMoreAdvancedStatus(eventItem.status, apiItem.status);
+            // This specific `getTransfers()` snapshot was already in flight
+            // when the row most recently entered paused/stopped/insufficient
+            // — it necessarily predates that transition, so it must not be
+            // allowed to downgrade the row back to whatever it showed
+            // before. `isMoreAdvancedStatus` otherwise always defers to the
+            // API for these reversible states, on the (usually correct, but
+            // not here) assumption that the snapshot is at least as fresh as
+            // the event.
+            const enteredReversibleAt = reversibleStateEnteredAt.get(apiItem.id);
+            const snapshotPredatesReversibleEntry =
+              enteredReversibleAt != null && enteredReversibleAt > pollStartedAt;
+            const preferEvent =
+              snapshotPredatesReversibleEntry || isMoreAdvancedStatus(eventItem.status, apiItem.status);
             const status = preferEvent ? eventItem.status : apiItem.status;
             return {
               ...apiItem,

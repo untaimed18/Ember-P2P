@@ -988,6 +988,8 @@
   "search_searching_label": "Searching",
   "search_close_tab": "Close tab",
   "search_close_tab_aria": "Close search tab",
+  "search_stop_tab": "Stop search",
+  "search_stop_tab_aria": "Stop this tab's search",
   "search_filter_results": "Filter Results",
   "search_filter_text_placeholder": "Type to filter results (supports: rock -live)",
   "search_clear_filter_text": "Clear filter text",
@@ -1719,6 +1721,7 @@
 
   "settings_validation_nickname_empty": "Nickname cannot be empty.",
   "settings_validation_folder_empty": "Download folder cannot be empty.",
+  "settings_values_adjusted": "One or more values were outside their valid range and have been adjusted.",
   "settings_save_failed": "Failed to save settings",
   "settings_restart_failed": "Restart failed: {error}. Please close and reopen Ember manually for the new ports to take effect.",
   "settings_restart_deferred": "Settings saved. The new port(s) will take effect the next time you launch Ember.",
