@@ -826,7 +826,7 @@
   }
 
   .hashing-label {
-    color: var(--warning, #e0a030);
+    color: var(--warning);
     font-size: 11px;
     font-style: italic;
   }
@@ -884,13 +884,13 @@
   /* Missing files: path no longer resolves on disk. Dim the row and tint the
      name so broken shares stand out passively (not just under the filter). */
   .row-missing .cell-name {
-    color: var(--danger, #e74c3c);
+    color: var(--danger);
   }
   .row-missing :global(td:not(.cell-name)) {
     opacity: 0.55;
   }
   .missing-icon {
-    color: var(--danger, #e74c3c);
+    color: var(--danger);
     vertical-align: -1px;
     margin-right: 3px;
     flex-shrink: 0;
@@ -938,8 +938,8 @@
     font-size: 12px;
   }
   .col-ctx-item:hover {
-    background: var(--accent, #3498db);
-    color: #fff;
+    background: var(--bg-hover);
+    color: var(--text-primary);
   }
   .col-ctx-sep {
     height: 1px;

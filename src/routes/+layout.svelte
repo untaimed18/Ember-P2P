@@ -345,7 +345,7 @@
     z-index: 10000;
     padding: 8px 16px;
     background: var(--accent);
-    color: #fff;
+    color: var(--on-accent);
     text-decoration: none;
     font-weight: 600;
     font-size: 13px;

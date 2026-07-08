@@ -170,28 +170,28 @@
   }
 
   .dot.connected {
-    background: #22c55e;
-    box-shadow: 0 0 4px #22c55e80;
+    background: var(--status-connected);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--status-connected) 18%, transparent);
   }
 
   .dot.connecting {
-    background: #eab308;
-    box-shadow: 0 0 4px #eab30880;
+    background: var(--status-connecting);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--status-connecting) 18%, transparent);
   }
 
   .dot.disconnected, .dot.inactive {
-    background: #ef4444;
-    box-shadow: 0 0 4px #ef444480;
+    background: var(--status-disconnected);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--status-disconnected) 16%, transparent);
   }
 
   .dot.active {
-    background: #22c55e;
-    box-shadow: 0 0 4px #22c55e80;
+    background: var(--status-connected);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--status-connected) 18%, transparent);
   }
 
   .dot.idle {
-    background: #eab308;
-    box-shadow: 0 0 4px #eab30880;
+    background: var(--status-connecting);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--status-connecting) 18%, transparent);
   }
 
   .status-item {

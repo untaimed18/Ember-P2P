@@ -15,9 +15,16 @@
   --accent-hover: #1565d8;
   --accent-dim: #d2e3fc;
   --accent-halo: #d2e3fc;
+  --on-accent: #ffffff;
+  --on-success: #ffffff;
+  --on-warning: #1a1c24;
+  --on-danger: #ffffff;
   --success: #34a853;
   --warning: #ea8600;
   --danger: #d93025;
+  --status-connected: var(--success);
+  --status-connecting: var(--warning);
+  --status-disconnected: var(--danger);
 
   /* Nominal category colors — distinct hues (not tied to the success/
      warning/danger/accent semantics above) so independent badges shown
@@ -47,6 +54,8 @@
 
   --shadow-sm: 0 1px 2px rgba(0,0,0,0.06);
   --shadow-md: 0 2px 6px rgba(0,0,0,0.08);
+  --shadow-lg: 0 8px 24px rgba(0,0,0,0.12);
+  --overlay-bg: rgba(0, 0, 0, 0.45);
 
   --transition-fast: 0.1s;
   --transition-normal: 0.15s;
@@ -74,27 +83,34 @@
  * *very* quiet; depth is carried by the bg layering and subtle shadows.
  */
 [data-theme="dark"] {
-  --bg-primary: #0d0f12;    /* app canvas (deepest) */
-  --bg-secondary: #15181d;  /* panels, cards, sidebars */
-  --bg-surface: #1a1e24;    /* elevated cards, stat boxes */
-  --bg-tertiary: #1f242b;   /* nested surfaces, alt inputs */
-  --bg-hover: #252a33;      /* hover / selected rows */
-  --bg-input: #101317;      /* inputs — slightly inset below panels */
+  --bg-primary: #111418;    /* app canvas (deepest) */
+  --bg-secondary: #181c22;  /* panels, cards, sidebars */
+  --bg-surface: #1d2229;    /* elevated cards, stat boxes */
+  --bg-tertiary: #242a32;   /* nested surfaces, alt inputs */
+  --bg-hover: #2a313b;      /* hover / selected rows */
+  --bg-input: #14181e;      /* inputs — slightly inset below panels */
 
-  --text-primary: #e7e9ec;
-  --text-secondary: #a3a8b2;
-  --text-muted: #6c7079;
-  --text-accent: #8fb8eb;
+  --text-primary: #e4e8ed;
+  --text-secondary: #a8aeb8;
+  --text-muted: #737985;
+  --text-accent: #9abfec;
 
   /* Accent: desaturated sky-blue — legible, pro, not electric. */
   --accent: #6ea3dc;
   --accent-hover: #88b8ea;
   --accent-dim: #1e3a5c;            /* muted navy for alt buttons / selection */
   --accent-halo: rgba(110, 163, 220, 0.26); /* translucent glow for focus rings */
+  --on-accent: #10151b;
+  --on-success: #10151b;
+  --on-warning: #10151b;
+  --on-danger: #10151b;
 
   --success: #5fc27b;
   --warning: #e0a84d;
   --danger: #dc6e62;
+  --status-connected: var(--success);
+  --status-connecting: var(--warning);
+  --status-disconnected: var(--danger);
 
   /* Lighter/desaturated variants of the nominal category colors above,
      following the same dark-mode lightening treatment as success/warning/
@@ -107,15 +123,17 @@
   --priority-auto: #9ccc65;
 
   /* Borders are barely there — 4–5% lighter than the bg they sit against. */
-  --border: #232830;
-  --border-light: #2e343e;
+  --border: #2a3038;
+  --border-light: #363d47;
 
   /* Deeper, more diffuse shadows so elevated surfaces visibly lift. */
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.45);
-  --shadow-md: 0 6px 18px rgba(0, 0, 0, 0.55);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.32);
+  --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.38);
+  --shadow-lg: 0 18px 52px rgba(0, 0, 0, 0.46);
+  --overlay-bg: rgba(9, 12, 16, 0.56);
 
-  --bg-disabled: #171a1f;
-  --text-disabled: #4a4f58;
+  --bg-disabled: #1a1f25;
+  --text-disabled: #565d68;
 }
 
 /*
@@ -137,12 +155,12 @@
 
 :where([data-theme="dark"]) button {
   background: var(--accent);
-  color: #0d0f12;
+  color: var(--on-accent);
   font-weight: 600;
 }
 :where([data-theme="dark"]) button:hover:not(:disabled) {
   background: var(--accent-hover);
-  color: #0d0f12;
+  color: var(--on-accent);
 }
 :where([data-theme="dark"]) button.ghost {
   background: transparent;
@@ -155,27 +173,27 @@
 }
 :where([data-theme="dark"]) button.danger {
   background: var(--danger);
-  color: #0d0f12;
+  color: var(--on-danger);
 }
 :where([data-theme="dark"]) button.danger:hover:not(:disabled) {
-  background: #e28a80;
+  background: color-mix(in srgb, var(--danger) 82%, #ffffff);
 }
 
 /* Softer, more controlled scrollbars for dark. */
 [data-theme="dark"] * {
-  scrollbar-color: #2e343e #0d0f12;
+  scrollbar-color: var(--border-light) var(--bg-primary);
 }
 [data-theme="dark"] ::-webkit-scrollbar-track {
   background: transparent;
 }
 [data-theme="dark"] ::-webkit-scrollbar-thumb {
-  background: #2a2f38;
+  background: var(--border);
   border: 2px solid transparent;
   background-clip: padding-box;
   border-radius: 6px;
 }
 [data-theme="dark"] ::-webkit-scrollbar-thumb:hover {
-  background: #3a404a;
+  background: var(--border-light);
   background-clip: padding-box;
 }
 
@@ -250,7 +268,7 @@ button {
   border-radius: var(--radius-sm);
   padding: 6px 14px;
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   transition:
     background-color var(--transition-normal) ease,
     color var(--transition-normal) ease,
@@ -261,7 +279,7 @@ button {
 
 button:hover {
   background: var(--accent-hover);
-  color: #fff;
+  color: var(--on-accent);
 }
 
 button:active:not(:disabled) {
@@ -282,7 +300,7 @@ button:disabled {
 
 button.danger {
   background: var(--danger);
-  color: #fff;
+  color: var(--on-danger);
 }
 
 button.danger:hover {
@@ -603,7 +621,7 @@ tr:hover td {
 /* Dark mode: shadow needs to be darker than the dark canvas to register. */
 [data-theme="dark"] .scroll-shadows,
 [data-theme="dark"] .page-content {
-  --scroll-shadow: rgba(0, 0, 0, 0.5);
+  --scroll-shadow: rgba(0, 0, 0, 0.34);
 }
 
 .stat-card {
@@ -684,7 +702,7 @@ h4 { font-size: 14px; font-weight: 600; color: var(--text-primary); }
 .confirm-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.45);
+  background: var(--overlay-bg);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -708,7 +726,7 @@ h4 { font-size: 14px; font-weight: 600; color: var(--text-primary); }
  * three-dimensional one.
  */
 [data-theme="dark"] :is(.confirm-overlay, .about-overlay) {
-  background: rgba(8, 10, 13, 0.45);
+  background: var(--overlay-bg);
   backdrop-filter: blur(6px) saturate(1.15);
   -webkit-backdrop-filter: blur(6px) saturate(1.15);
 }
@@ -719,7 +737,7 @@ h4 { font-size: 14px; font-weight: 600; color: var(--text-primary); }
 [data-theme="dark"] :is(.confirm-dialog, .about-panel) {
   box-shadow:
     inset 0 1px 0 0 rgba(255, 255, 255, 0.05),
-    0 16px 48px rgba(0, 0, 0, 0.55);
+    var(--shadow-lg);
 }
 [data-theme="dark"] .stat-card {
   box-shadow:

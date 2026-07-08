@@ -768,7 +768,7 @@
   }
   .toggle-switch input:checked + .switch-track::after {
     transform: translateX(14px);
-    background: #fff;
+    background: var(--bg-secondary);
   }
   .toggle-switch:hover .switch-track {
     border-color: var(--accent);

@@ -566,8 +566,8 @@
   }
 
   .conv-status.online {
-    background: color-mix(in srgb, var(--success, #2eb56d) 16%, transparent);
-    color: var(--success, #2eb56d);
+    background: color-mix(in srgb, var(--success) 16%, transparent);
+    color: var(--success);
   }
 
   .conv-status.offline {
@@ -681,7 +681,7 @@
   .conv-bubble.sent {
     align-self: flex-end;
     background: var(--accent);
-    color: #fff;
+    color: var(--on-accent);
     border-bottom-right-radius: 4px;
   }
 
@@ -760,7 +760,7 @@
     border: none;
     border-radius: var(--radius-sm);
     background: var(--accent);
-    color: #fff;
+    color: var(--on-accent);
     cursor: pointer;
     display: flex;
     align-items: center;

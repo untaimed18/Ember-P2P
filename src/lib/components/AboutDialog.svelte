@@ -206,7 +206,7 @@
     border-radius: var(--radius-md);
     border: 1px solid var(--border);
     background: var(--accent);
-    color: #fff;
+    color: var(--on-accent);
     cursor: pointer;
     transition: opacity var(--transition-normal), filter var(--transition-normal);
   }

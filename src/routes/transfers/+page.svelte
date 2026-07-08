@@ -1174,7 +1174,7 @@
     if (t.status === 'failed') return 'var(--danger)';
     if (t.status === 'paused' || t.status === 'stopped') return 'var(--warning)';
     if (t.status === 'verifying' || t.status === 'completing' || t.status === 'completed') {
-      return 'var(--success, #2ecc71)';
+      return 'var(--success)';
     }
     if (t.status === 'active') {
       if (t.health === 'stalled') return 'var(--danger)';
@@ -2864,7 +2864,7 @@
                     <td class="progress-cell">
                       <ProgressBar
                         value={t.progress}
-                        color={t.status === 'failed' ? 'var(--danger, #e74c3c)' : 'var(--success, #2ecc71)'}
+                        color={t.status === 'failed' ? 'var(--danger)' : 'var(--success)'}
                       />
                     </td>
                   {:else if column.key === 'sources'}
@@ -2978,7 +2978,7 @@
        backend snapshots (`get_upload_queue`, `get_known_clients`) polled
        only while the matching tab is visible — see the `$effect`s above. -->
   <div class="pane uploads-pane" style="flex: 1;">
-    <div class="pane-toolbar">
+    <div class="pane-toolbar tabs-bar">
       <!--
         ARIA tablist semantics: each `<button>` is a `tab` inside a
         `tablist`, the active tab gets `aria-selected="true"` and a
@@ -3907,7 +3907,7 @@
     align-items: center;
     justify-content: space-between;
     padding: 3px 8px;
-    background: color-mix(in srgb, var(--bg-secondary) 90%, #c8c8c8 10%);
+    background: color-mix(in srgb, var(--bg-secondary) 90%, var(--bg-surface) 10%);
     border-bottom: 1px solid var(--border);
     flex-shrink: 0;
     gap: 6px;
@@ -3957,11 +3957,11 @@
     border-style: solid;
   }
   .tb-btn.danger-outline {
-    border-color: var(--danger, #e74c3c);
-    color: var(--danger, #e74c3c);
+    border-color: var(--danger);
+    color: var(--danger);
   }
   .tb-btn.danger-outline:hover {
-    background: color-mix(in srgb, var(--danger, #e74c3c) 12%, var(--bg-primary));
+    background: color-mix(in srgb, var(--danger) 12%, var(--bg-primary));
   }
   .pane-content {
     flex: 1;
@@ -3969,42 +3969,86 @@
     min-height: 0;
   }
 
-  /* --- Bottom pane tabs (eMule style) --- */
+  /* --- Bottom pane tabs --- */
+  .pane-toolbar.tabs-bar {
+    padding: 5px 8px 0;
+    background: linear-gradient(
+      to bottom,
+      color-mix(in srgb, var(--bg-secondary) 96%, var(--bg-primary)),
+      color-mix(in srgb, var(--bg-secondary) 82%, var(--bg-primary))
+    );
+  }
   .bottom-tabs {
     display: flex;
-    gap: 0;
+    align-items: stretch;
+    gap: 4px;
+    min-width: 0;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .bottom-tabs::-webkit-scrollbar {
+    display: none;
   }
   .tab-btn {
     position: relative;
-    font-size: 11px;
-    padding: 3px 10px;
-    border: 1px solid var(--border);
+    display: inline-flex;
+    align-items: center;
+    font-size: 11.5px;
+    font-family: inherit;
+    min-height: 30px;
+    padding: 6px 13px 7px;
+    border: 1px solid transparent;
     border-bottom: none;
-    border-radius: 0;
-    background: var(--bg-primary);
-    color: var(--text-muted);
+    border-radius: var(--radius-md) var(--radius-md) 0 0;
+    background: transparent;
+    color: var(--text-secondary);
     cursor: pointer;
-    transition: background 0.15s, color 0.15s;
-    margin-right: -1px;
+    white-space: nowrap;
+    transition:
+      background-color 0.15s ease,
+      border-color 0.15s ease,
+      color 0.15s ease,
+      box-shadow 0.15s ease;
   }
   .tab-btn:hover {
-    background: var(--bg-hover);
+    background: color-mix(in srgb, var(--bg-hover) 80%, transparent);
+    border-color: color-mix(in srgb, var(--border) 70%, transparent);
     color: var(--text-primary);
   }
+  .tab-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
   .tab-btn.active {
-    background: var(--bg-secondary);
+    background: linear-gradient(
+      to bottom,
+      color-mix(in srgb, var(--bg-secondary) 84%, var(--accent-dim)),
+      var(--bg-primary)
+    );
+    border-color: var(--border);
+    border-bottom-color: var(--bg-primary);
     color: var(--text-primary);
-    font-weight: 500;
-    border-bottom: 1px solid var(--bg-secondary);
+    font-weight: 600;
+    box-shadow: 0 -1px 0 color-mix(in srgb, var(--accent) 45%, transparent);
   }
   .tab-btn.active::before {
     content: '';
     position: absolute;
     top: 0;
+    left: 8px;
+    right: 8px;
+    height: 2px;
+    border-radius: 0 0 999px 999px;
+    background: var(--accent);
+  }
+  .tab-btn.active::after {
+    content: '';
+    position: absolute;
     left: 0;
     right: 0;
-    height: 2px;
-    background: var(--accent);
+    bottom: -1px;
+    height: 1px;
+    background: var(--bg-primary);
   }
 
   /* --- Splitter --- */
@@ -4199,9 +4243,9 @@
     font-weight: 600;
     line-height: 16px;
     white-space: nowrap;
-    color: var(--accent, #4caf50);
-    background: color-mix(in srgb, var(--accent, #4caf50) 16%, transparent);
-    border: 1px solid color-mix(in srgb, var(--accent, #4caf50) 40%, transparent);
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
     vertical-align: middle;
   }
   .num-cell {
@@ -4401,23 +4445,23 @@
     vertical-align: middle;
   }
   .st-active { color: var(--accent); }
-  .st-verifying { color: var(--success, #2ecc71); }
-  .st-completing { color: var(--success, #2ecc71); }
+  .st-verifying { color: var(--success); }
+  .st-completing { color: var(--success); }
   .st-searching { color: var(--warning); }
   .st-queued { color: var(--text-muted); }
   .st-paused { color: var(--warning); }
   .st-stopped { color: var(--text-muted); }
-  .st-completed { color: var(--success, #2ecc71); }
-  .st-failed { color: var(--danger, #e74c3c); }
+  .st-completed { color: var(--success); }
+  .st-failed { color: var(--danger); }
   .st-hashing { color: var(--text-secondary); }
-  .st-insufficient { color: var(--danger, #e74c3c); }
+  .st-insufficient { color: var(--danger); }
   .st-noneneeded { color: var(--text-muted); }
   /* SecIdent status badge colours used in Queued + Known Clients tabs.
      Verified is the only "good" state; Failed and BadGuy are red flags
      for credit accounting. Unknown is the default/no-handshake state. */
-  .ident-verified { color: var(--success, #2ecc71); }
-  .ident-failed { color: var(--danger, #e74c3c); }
-  .ident-badguy { color: var(--danger, #e74c3c); }
+  .ident-verified { color: var(--success); }
+  .ident-failed { color: var(--danger); }
+  .ident-badguy { color: var(--danger); }
   .ident-needed { color: var(--warning); }
   .ident-unknown { color: var(--text-muted); }
 
@@ -4439,9 +4483,9 @@
     white-space: nowrap;
   }
   .rep-badge-trusted {
-    color: var(--success, #2ecc71);
-    background: color-mix(in srgb, var(--success, #2ecc71) 14%, transparent);
-    border-color: color-mix(in srgb, var(--success, #2ecc71) 34%, transparent);
+    color: var(--success);
+    background: color-mix(in srgb, var(--success) 14%, transparent);
+    border-color: color-mix(in srgb, var(--success) 34%, transparent);
   }
   .rep-badge-neutral {
     color: var(--text-muted);
@@ -4454,9 +4498,9 @@
     border-color: color-mix(in srgb, var(--warning) 34%, transparent);
   }
   .rep-badge-banned {
-    color: var(--danger, #e74c3c);
-    background: color-mix(in srgb, var(--danger, #e74c3c) 14%, transparent);
-    border-color: color-mix(in srgb, var(--danger, #e74c3c) 34%, transparent);
+    color: var(--danger);
+    background: color-mix(in srgb, var(--danger) 14%, transparent);
+    border-color: color-mix(in srgb, var(--danger) 34%, transparent);
   }
   .rep-badge-unknown {
     color: var(--text-muted);
@@ -4468,7 +4512,7 @@
   .mono { font-family: var(--font-mono, ui-monospace, 'Cascadia Code', Consolas, monospace); font-size: 11px; }
   .failure-hint {
     font-size: 10px;
-    color: var(--danger, #e74c3c);
+    color: var(--danger);
     overflow: hidden;
     text-overflow: ellipsis;
     max-width: 120px;
@@ -4482,8 +4526,8 @@
     padding: 0;
     border-radius: 0;
   }
-  .prio-release { color: #e09830; font-weight: 700; }
-  .prio-high { color: var(--danger, #e74c3c); }
+  .prio-release { color: var(--warning); font-weight: 700; }
+  .prio-high { color: var(--danger); }
   .prio-normal { color: var(--text-secondary); }
   /* L8: distinguish prio-low from prio-verylow visually — prior rules
      only differed in opacity and were hard to tell apart at a glance. */
@@ -4585,8 +4629,8 @@
     justify-content: space-between;
     padding: 6px 16px;
     background: var(--bg-secondary);
-    border-bottom: 1px solid var(--danger, #e74c3c);
-    color: var(--danger, #e74c3c);
+    border-bottom: 1px solid var(--danger);
+    color: var(--danger);
     font-size: 12px;
     flex-shrink: 0;
   }
@@ -4597,8 +4641,8 @@
     justify-content: space-between;
     padding: 6px 16px;
     background: var(--bg-secondary);
-    border-bottom: 1px solid var(--success, #2ecc71);
-    color: var(--success, #2ecc71);
+    border-bottom: 1px solid var(--success);
+    color: var(--success);
     font-size: 12px;
     flex-shrink: 0;
   }
@@ -4642,7 +4686,7 @@
   }
   .ctx-item:hover:not(:disabled) { background: var(--bg-hover); }
   .ctx-item:disabled { opacity: 0.5; cursor: default; }
-  .ctx-item.danger { color: var(--danger, #e74c3c); }
+  .ctx-item.danger { color: var(--danger); }
   .ctx-item.has-sub { display: flex; justify-content: space-between; }
   .ctx-shortcut {
     font-size: 10px;
@@ -4815,8 +4859,8 @@
     outline: none;
   }
   .known-hash-btn.copied {
-    background: color-mix(in srgb, var(--success, #2ecc71) 14%, transparent);
-    color: var(--success, #2ecc71);
+    background: color-mix(in srgb, var(--success) 14%, transparent);
+    color: var(--success);
   }
   .known-friend-dot {
     width: 7px;
@@ -4845,7 +4889,7 @@
     font-family: var(--font-sans, inherit);
     font-size: 10px;
     font-weight: 600;
-    color: var(--success, #2ecc71);
+    color: var(--success);
     text-transform: uppercase;
     letter-spacing: 0.4px;
   }
@@ -4891,13 +4935,13 @@
     background: var(--text-muted);
   }
   .src-dot-connecting { background: var(--warning); box-shadow: 0 0 3px var(--warning); }
-  .src-dot-wait_callback { background: #c9a227; box-shadow: 0 0 3px #c9a227; }
-  .src-dot-queued { background: #e09830; box-shadow: 0 0 3px #e09830; }
+  .src-dot-wait_callback { background: var(--warning); box-shadow: 0 0 3px color-mix(in srgb, var(--warning) 45%, transparent); }
+  .src-dot-queued { background: var(--warning); box-shadow: 0 0 3px color-mix(in srgb, var(--warning) 45%, transparent); }
   .src-dot-queue_full { background: var(--text-muted); }
   .src-dot-no_needed_parts { background: var(--text-muted); }
   .src-dot-transferring { background: var(--accent); box-shadow: 0 0 4px color-mix(in srgb, var(--accent) 60%, transparent); }
-  .src-dot-completed { background: var(--success, #2ecc71); box-shadow: 0 0 3px color-mix(in srgb, var(--success) 50%, transparent); }
-  .src-dot-failed { background: var(--danger, #e74c3c); }
+  .src-dot-completed { background: var(--success); box-shadow: 0 0 3px color-mix(in srgb, var(--success) 50%, transparent); }
+  .src-dot-failed { background: var(--danger); }
   .source-flag {
     line-height: 1;
     width: 18px;
@@ -4974,12 +5018,12 @@
     background: color-mix(in srgb, var(--warning) 10%, transparent);
   }
   .src-st-wait_callback {
-    color: #c9a227;
-    background: color-mix(in srgb, #c9a227 12%, transparent);
+    color: var(--warning);
+    background: color-mix(in srgb, var(--warning) 12%, transparent);
   }
   .src-st-queued {
-    color: #e09830;
-    background: color-mix(in srgb, #e09830 12%, transparent);
+    color: var(--warning);
+    background: color-mix(in srgb, var(--warning) 12%, transparent);
   }
   .src-st-queue_full,
   .src-st-no_needed_parts {
@@ -4991,12 +5035,12 @@
     background: color-mix(in srgb, var(--accent) 12%, transparent);
   }
   .src-st-completed {
-    color: var(--success, #2ecc71);
-    background: color-mix(in srgb, var(--success, #2ecc71) 10%, transparent);
+    color: var(--success);
+    background: color-mix(in srgb, var(--success) 10%, transparent);
   }
   .src-st-failed {
-    color: var(--danger, #e74c3c);
-    background: color-mix(in srgb, var(--danger, #e74c3c) 10%, transparent);
+    color: var(--danger);
+    background: color-mix(in srgb, var(--danger) 10%, transparent);
   }
   .source-failed-note {
     font-style: italic;
@@ -5032,9 +5076,9 @@
     font-variant-numeric: tabular-nums;
   }
   .ss-xfer { color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); }
-  .ss-queued { color: #e09830; background: color-mix(in srgb, #e09830 10%, transparent); }
+  .ss-queued { color: var(--warning); background: color-mix(in srgb, var(--warning) 10%, transparent); }
   .ss-connect { color: var(--warning); background: color-mix(in srgb, var(--warning) 10%, transparent); }
-  .ss-wait-callback { color: #c9a227; background: color-mix(in srgb, #c9a227 12%, transparent); }
+  .ss-wait-callback { color: var(--warning); background: color-mix(in srgb, var(--warning) 12%, transparent); }
   .ss-other { color: var(--text-muted); background: color-mix(in srgb, var(--text-muted) 8%, transparent); }
-  .ss-failed { color: var(--danger, #e74c3c); background: color-mix(in srgb, var(--danger, #e74c3c) 8%, transparent); }
+  .ss-failed { color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, transparent); }
 </style>

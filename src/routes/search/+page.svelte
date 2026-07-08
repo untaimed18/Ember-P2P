@@ -2710,7 +2710,7 @@
   }
 
   .search-tab-close:hover {
-    color: var(--danger, #e74c3c);
+    color: var(--danger);
     background: var(--bg-hover);
   }
 
@@ -3002,7 +3002,7 @@
     border: none;
     border-radius: var(--radius-md);
     background: var(--accent);
-    color: #fff;
+    color: var(--on-accent);
     cursor: pointer;
     transition: opacity 0.15s;
   }
@@ -3172,26 +3172,26 @@
   }
 
   .in-library {
-    background: color-mix(in srgb, var(--accent, #3b82f6) 20%, transparent);
-    color: var(--accent, #3b82f6);
+    background: color-mix(in srgb, var(--accent) 20%, transparent);
+    color: var(--accent);
   }
 
   .history-completed {
-    background: color-mix(in srgb, var(--success, #22c55e) 20%, transparent);
-    color: var(--success, #22c55e);
+    background: color-mix(in srgb, var(--success) 20%, transparent);
+    color: var(--success);
   }
 
   .history-cancelled {
-    background: color-mix(in srgb, var(--warning, #f59e0b) 20%, transparent);
-    color: var(--warning, #f59e0b);
+    background: color-mix(in srgb, var(--warning) 20%, transparent);
+    color: var(--warning);
   }
 
   :global(tr.in-library-row:not(.row-checked):not(:hover) td) {
-    color: var(--accent, #3b82f6);
+    color: var(--accent);
   }
 
   :global(tr.history-cancelled-row:not(.row-checked):not(:hover) td) {
-    color: var(--warning, #f59e0b);
+    color: var(--warning);
   }
 
   .search-results-table th {
@@ -3260,8 +3260,8 @@
   }
 
   .stop-btn {
-    background: var(--danger, #e74c3c);
-    color: #fff;
+    background: var(--danger);
+    color: var(--on-danger);
     border: none;
     border-radius: var(--radius-md);
     padding: 8px 18px;
@@ -3301,7 +3301,7 @@
   }
 
   .success-msg {
-    color: var(--success, #2ecc71);
+    color: var(--success);
     font-size: 11px;
     margin-left: 8px;
   }
@@ -3309,10 +3309,10 @@
   .search-readiness-hint {
     padding: 9px 20px;
     font-size: 12px;
-    color: var(--warning, #c9a227);
+    color: var(--warning);
     background: var(--bg-secondary);
     border-bottom: 1px solid var(--border);
-    border-left: 3px solid var(--warning, #c9a227);
+    border-left: 3px solid var(--warning);
   }
 
   .search-readiness-muted {
@@ -3325,9 +3325,9 @@
     justify-content: space-between;
     padding: 10px 20px;
     background: var(--bg-secondary);
-    border-bottom: 1px solid var(--danger, #e74c3c);
-    border-left: 3px solid var(--danger, #e74c3c);
-    color: var(--danger, #e74c3c);
+    border-bottom: 1px solid var(--danger);
+    border-left: 3px solid var(--danger);
+    color: var(--danger);
     font-size: 13px;
   }
 
@@ -3338,9 +3338,9 @@
     gap: 12px;
     padding: 8px 20px;
     background: var(--bg-secondary);
-    border-bottom: 1px solid var(--warning, #f39c12);
-    border-left: 3px solid var(--warning, #f39c12);
-    color: var(--text-secondary, #aaa);
+    border-bottom: 1px solid var(--warning);
+    border-left: 3px solid var(--warning);
+    color: var(--text-secondary);
     font-size: 12px;
     line-height: 1.4;
   }
@@ -3356,17 +3356,17 @@
     padding: 3px 10px;
     font-size: 11px;
     font-weight: 600;
-    border: 1px solid var(--warning, #f39c12);
+    border: 1px solid var(--warning);
     border-radius: var(--radius-md);
-    background: color-mix(in srgb, var(--warning, #f39c12) 15%, transparent);
-    color: var(--warning, #f39c12);
+    background: color-mix(in srgb, var(--warning) 15%, transparent);
+    color: var(--warning);
     cursor: pointer;
     transition: background 0.15s, opacity 0.15s;
     white-space: nowrap;
   }
 
   .server-retry-btn:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--warning, #f39c12) 25%, transparent);
+    background: color-mix(in srgb, var(--warning) 25%, transparent);
   }
 
   .server-retry-btn:disabled {
@@ -3680,41 +3680,41 @@
     line-height: 1.3;
   }
   .dl-badge-success {
-    background: color-mix(in srgb, var(--success, #2ecc71) 18%, transparent);
-    color: var(--success, #2ecc71);
+    background: color-mix(in srgb, var(--success) 18%, transparent);
+    color: var(--success);
   }
   .dl-badge-active {
-    background: color-mix(in srgb, var(--accent, #3498db) 18%, transparent);
-    color: var(--accent, #3498db);
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+    color: var(--accent);
   }
   .dl-badge-progress {
-    background: color-mix(in srgb, var(--accent, #3498db) 12%, transparent);
-    color: var(--accent, #3498db);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--accent);
   }
   .dl-badge-warning {
-    background: color-mix(in srgb, var(--warning, #f39c12) 18%, transparent);
-    color: var(--warning, #f39c12);
+    background: color-mix(in srgb, var(--warning) 18%, transparent);
+    color: var(--warning);
   }
   .dl-badge-danger {
-    background: color-mix(in srgb, var(--danger, #e74c3c) 18%, transparent);
-    color: var(--danger, #e74c3c);
+    background: color-mix(in srgb, var(--danger) 18%, transparent);
+    color: var(--danger);
   }
   .dl-badge-neutral {
-    background: color-mix(in srgb, var(--text-secondary, #aaa) 12%, transparent);
-    color: var(--text-secondary, #aaa);
+    background: color-mix(in srgb, var(--text-secondary) 12%, transparent);
+    color: var(--text-secondary);
   }
 
   .row-dl-completed {
-    background: color-mix(in srgb, var(--success, #2ecc71) 5%, transparent) !important;
+    background: color-mix(in srgb, var(--success) 5%, transparent) !important;
   }
   .row-dl-active {
-    background: color-mix(in srgb, var(--accent, #3498db) 5%, transparent) !important;
+    background: color-mix(in srgb, var(--accent) 5%, transparent) !important;
   }
   .row-dl-queued {
-    background: color-mix(in srgb, var(--text-secondary, #aaa) 4%, transparent) !important;
+    background: color-mix(in srgb, var(--text-secondary) 4%, transparent) !important;
   }
   .row-dl-failed {
-    background: color-mix(in srgb, var(--danger, #e74c3c) 5%, transparent) !important;
+    background: color-mix(in srgb, var(--danger) 5%, transparent) !important;
   }
 
   .context-menu-backdrop {

@@ -67,13 +67,13 @@
     padding: 10px 12px 10px 14px;
     border-radius: var(--radius-md, 8px);
     font-size: 13px;
-    color: #fff;
+    color: var(--on-accent);
     box-shadow: var(--shadow-md, 0 4px 12px rgba(0, 0, 0, 0.15));
   }
-  .toast-success { background: var(--success, #22c55e); }
-  .toast-error { background: var(--danger, #ef4444); }
-  .toast-warning { background: var(--warning, #f59e0b); color: #1a1a1a; }
-  .toast-info { background: var(--accent, #3b82f6); }
+  .toast-success { background: var(--success); color: var(--on-success); }
+  .toast-error { background: var(--danger); color: var(--on-danger); }
+  .toast-warning { background: var(--warning); color: var(--on-warning); }
+  .toast-info { background: var(--accent); color: var(--on-accent); }
   .toast-icon {
     display: inline-flex;
     align-items: center;

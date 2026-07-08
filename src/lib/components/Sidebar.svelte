@@ -729,7 +729,7 @@
     padding: 0 5px;
     border-radius: 9px;
     background: var(--accent);
-    color: #fff;
+    color: var(--on-accent);
     font-size: 10px;
     font-weight: 700;
     display: inline-flex;
@@ -745,7 +745,7 @@
      badge stays for transfer counts (steady-state work). */
   .nav-badge.nav-badge-attention {
     background: var(--warning);
-    color: #1a1a1a;
+    color: var(--on-warning);
   }
 
   /* Transfers nav item: split the single count into direction-coded activity
@@ -815,17 +815,17 @@
   }
 
   .nav-dot.connected {
-    background: #3ccf6d;
+    background: var(--status-connected);
     box-shadow:
-      0 0 0 2px color-mix(in srgb, #3ccf6d 22%, transparent),
-      0 0 8px color-mix(in srgb, #3ccf6d 55%, transparent);
+      0 0 0 2px color-mix(in srgb, var(--status-connected) 18%, transparent),
+      0 0 6px color-mix(in srgb, var(--status-connected) 28%, transparent);
   }
 
   .nav-dot.connecting {
-    background: #f0b93f;
+    background: var(--status-connecting);
     box-shadow:
-      0 0 0 2px color-mix(in srgb, #f0b93f 22%, transparent),
-      0 0 8px color-mix(in srgb, #f0b93f 55%, transparent);
+      0 0 0 2px color-mix(in srgb, var(--status-connecting) 18%, transparent),
+      0 0 6px color-mix(in srgb, var(--status-connecting) 30%, transparent);
     animation: nav-dot-pulse 1.5s ease-in-out infinite;
   }
 
@@ -836,22 +836,22 @@
   }
 
   .nav-dot.disconnected {
-    background: #e06a5f;
+    background: var(--status-disconnected);
     box-shadow:
-      0 0 0 2px color-mix(in srgb, #e06a5f 18%, transparent),
-      0 0 6px color-mix(in srgb, #e06a5f 40%, transparent);
+      0 0 0 2px color-mix(in srgb, var(--status-disconnected) 16%, transparent),
+      0 0 5px color-mix(in srgb, var(--status-disconnected) 24%, transparent);
   }
 
   @keyframes nav-dot-pulse {
     0%, 100% {
       box-shadow:
-        0 0 0 2px color-mix(in srgb, #f0b93f 22%, transparent),
-        0 0 8px color-mix(in srgb, #f0b93f 55%, transparent);
+        0 0 0 2px color-mix(in srgb, var(--status-connecting) 18%, transparent),
+        0 0 6px color-mix(in srgb, var(--status-connecting) 30%, transparent);
     }
     50% {
       box-shadow:
-        0 0 0 4px color-mix(in srgb, #f0b93f 10%, transparent),
-        0 0 14px color-mix(in srgb, #f0b93f 40%, transparent);
+        0 0 0 4px color-mix(in srgb, var(--status-connecting) 8%, transparent),
+        0 0 10px color-mix(in srgb, var(--status-connecting) 22%, transparent);
     }
   }
 </style>

@@ -275,7 +275,7 @@
     border-radius: 999px;
     background: linear-gradient(
       to bottom,
-      color-mix(in srgb, var(--bg-input) 95%, #fff 5%),
+      color-mix(in srgb, var(--bg-input) 95%, var(--bg-surface) 5%),
       var(--bg-input)
     );
     box-shadow: var(--shadow-sm);
@@ -449,7 +449,7 @@
   }
 
   .recent-remove:hover {
-    color: var(--danger, #e74c3c);
+    color: var(--danger);
     background: var(--bg-hover);
   }
 </style>
