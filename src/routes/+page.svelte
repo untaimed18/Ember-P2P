@@ -1081,8 +1081,8 @@
     justify-content: space-between;
     padding: 8px 20px;
     background: var(--bg-secondary);
-    border-bottom: 1px solid var(--danger, #e74c3c);
-    color: var(--danger, #e74c3c);
+    border-bottom: 1px solid var(--danger);
+    color: var(--danger);
     font-size: 13px;
   }
 
@@ -1285,7 +1285,7 @@
     color: inherit;
     outline: none;
   }
-  .form-input:focus { border-color: var(--accent, #3498db); }
+  .form-input:focus { border-color: var(--accent); }
 
   /* Bootstrap modal */
   .bootstrap-modal {

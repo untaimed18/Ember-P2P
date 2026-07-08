@@ -377,8 +377,8 @@
   }
 
   .dock-tab.online .dock-tab-presence {
-    background: #3ccf6d;
-    box-shadow: 0 0 0 2px color-mix(in srgb, #3ccf6d 22%, transparent);
+    background: var(--status-connected);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--status-connected) 18%, transparent);
   }
 
   .dock-tab-name {
@@ -390,7 +390,7 @@
 
   .dock-tab-unread {
     background: var(--accent);
-    color: #fff;
+    color: var(--on-accent);
     font-size: 10px;
     font-weight: 700;
     padding: 1px 6px;

@@ -85,7 +85,7 @@
     width: 18px;
     height: 18px;
     border-radius: 50%;
-    background: #fff;
+    background: var(--bg-secondary);
     box-shadow: 0 1px 3px rgba(0,0,0,0.2);
     transition: transform 0.2s ease;
   }

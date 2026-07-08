@@ -628,13 +628,13 @@
   .progress-dot.active .dot {
     border-color: var(--accent);
     background: var(--accent);
-    color: #fff;
+    color: var(--on-accent);
   }
 
   .progress-dot.done .dot {
     border-color: var(--success);
     background: var(--success);
-    color: #fff;
+    color: var(--on-success);
   }
 
   .dot-label {
@@ -859,7 +859,7 @@
 
   .browse-btn:hover {
     background: var(--accent);
-    color: #fff;
+    color: var(--on-accent);
   }
 
   .fields-row {
@@ -980,13 +980,13 @@
   }
 
   .dark-preview {
-    background: #1a1a2e;
+    background: #111418;
   }
 
   .dark-preview .tp-sidebar {
     width: 30%;
-    background: #16213e;
-    border-right: 1px solid #2a3456;
+    background: #181c22;
+    border-right: 1px solid #2a3038;
   }
 
   .dark-preview .tp-main {
@@ -997,14 +997,14 @@
   .dark-preview .tp-bar {
     height: 8px;
     border-radius: 3px;
-    background: #0f3460;
+    background: #1e3a5c;
     margin-bottom: 6px;
   }
 
   .dark-preview .tp-row {
     height: 6px;
     border-radius: 2px;
-    background: #253255;
+    background: #2a313b;
     margin-bottom: 4px;
   }
 
@@ -1128,7 +1128,7 @@
     border: none;
     border-radius: var(--radius-sm);
     background: var(--accent);
-    color: #fff;
+    color: var(--on-accent);
     font-size: 14px;
     font-weight: 600;
     cursor: pointer;

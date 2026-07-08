@@ -1731,8 +1731,8 @@
     display: inline-block;
     width: 14px;
     height: 14px;
-    border: 2px solid rgba(255,255,255,0.3);
-    border-top-color: #fff;
+    border: 2px solid color-mix(in srgb, currentColor 30%, transparent);
+    border-top-color: currentColor;
     border-radius: 50%;
     animation: spin 0.6s linear infinite;
   }
@@ -2089,13 +2089,13 @@
 
   .action-btn.primary {
     background: var(--accent);
-    color: #fff;
+    color: var(--on-accent);
     border-color: var(--accent);
   }
 
   .action-btn.primary:hover {
     filter: brightness(1.06);
-    color: #fff;
+    color: var(--on-accent);
   }
 
   .about-value {
@@ -2112,7 +2112,7 @@
 
   .feedback.success { color: var(--success); }
   .feedback.error { color: var(--danger); }
-  .feedback.warning { color: var(--warning, #f0a020); }
+  .feedback.warning { color: var(--warning); }
 
   /* ── Anti-Leech filter editor ────────────────────── */
   .antileech-block {
@@ -2159,12 +2159,12 @@
     margin-top: 6px;
     padding: 8px 10px;
     background: var(--bg-secondary);
-    border: 1px solid var(--danger, #e74c3c);
+    border: 1px solid var(--danger);
     border-radius: var(--radius-sm);
     font-size: 12px;
   }
   .antileech-errors-title {
-    color: var(--danger, #e74c3c);
+    color: var(--danger);
     font-weight: 600;
     margin-bottom: 4px;
   }
@@ -2256,14 +2256,14 @@
 
   /* Dark swatch colors */
   .dark-swatch {
-    background: #1a1a2e;
+    background: #111418;
   }
   .dark-swatch .swatch-sidebar {
-    background: #16213e;
-    border-right: 1px solid #2a3456;
+    background: #181c22;
+    border-right: 1px solid #2a3038;
   }
   .dark-swatch .swatch-line {
-    background: #2a3456;
+    background: #2a313b;
   }
 
   .swatch-check {
@@ -2274,7 +2274,7 @@
     height: 18px;
     border-radius: 50%;
     background: var(--accent);
-    color: #fff;
+    color: var(--on-accent);
     font-size: 11px;
     display: flex;
     align-items: center;
@@ -2350,7 +2350,7 @@
 
   .behavior-card.selected .behavior-icon {
     background: var(--accent);
-    color: #fff;
+    color: var(--on-accent);
   }
 
   .behavior-title {
@@ -2374,7 +2374,7 @@
     height: 18px;
     border-radius: 50%;
     background: var(--accent);
-    color: #fff;
+    color: var(--on-accent);
     font-size: 11px;
     font-weight: 700;
     display: flex;
@@ -2458,7 +2458,7 @@
     border-radius: 6px;
     border: none;
     background: var(--accent);
-    color: #fff;
+    color: var(--on-accent);
     cursor: pointer;
   }
 

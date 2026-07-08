@@ -262,7 +262,7 @@
 
   .dialog-actions .primary {
     background: var(--accent);
-    color: #fff;
+    color: var(--on-accent);
     border: 1px solid var(--accent);
   }
 

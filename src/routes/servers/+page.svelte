@@ -1176,7 +1176,7 @@
 
   .server-icon.connected-icon {
     background: var(--accent);
-    color: #fff;
+    color: var(--on-accent);
   }
 
   .ip-cell {
@@ -1382,7 +1382,7 @@
   }
 
   .ctx-item.danger {
-    color: var(--danger, #e74c3c);
+    color: var(--danger);
   }
 
   .ctx-sep {
@@ -1396,7 +1396,7 @@
     width: 10px;
     height: 10px;
     border: 2px solid var(--border);
-    border-top-color: var(--accent, #3498db);
+    border-top-color: var(--accent);
     border-radius: 50%;
     animation: spin 0.8s linear infinite;
     vertical-align: middle;
@@ -1417,13 +1417,13 @@
   }
 
   .badge.connected {
-    background: rgba(46, 204, 113, 0.15);
-    color: #2ecc71;
+    background: color-mix(in srgb, var(--success) 15%, transparent);
+    color: var(--success);
   }
 
   .badge.connecting {
-    background: rgba(52, 152, 219, 0.15);
-    color: var(--accent, #3498db);
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+    color: var(--accent);
   }
 
   .badge.disconnected {
@@ -1432,15 +1432,15 @@
   }
 
   .badge.lowid {
-    background: rgba(231, 76, 60, 0.15);
-    color: #e74c3c;
+    background: color-mix(in srgb, var(--danger) 15%, transparent);
+    color: var(--danger);
     font-size: 10px;
     padding: 1px 6px;
   }
 
   .badge.highid {
-    background: rgba(46, 204, 113, 0.15);
-    color: #2ecc71;
+    background: color-mix(in srgb, var(--success) 15%, transparent);
+    color: var(--success);
     font-size: 10px;
     padding: 1px 6px;
   }

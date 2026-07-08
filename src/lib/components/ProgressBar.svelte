@@ -74,7 +74,7 @@
   }
 
   .progress-text-fill {
-    color: #fff;
+    color: var(--on-accent);
     z-index: 2;
     transition: clip-path 0.3s ease;
   }

@@ -1009,7 +1009,7 @@
 
   .my-id-copy:hover {
     background: var(--accent);
-    color: white;
+    color: var(--on-accent);
   }
 
   .my-id-copy.copied {
@@ -1526,7 +1526,7 @@
   }
 
   .status-searching {
-    color: var(--warning, #eab308);
+    color: var(--warning);
     font-weight: 500;
     animation: badge-pulse 2s ease-in-out infinite;
   }
@@ -1569,7 +1569,7 @@
     height: 14px;
     border-radius: 7px;
     background: var(--danger);
-    color: white;
+    color: var(--on-danger);
     font-size: 9px;
     font-weight: 700;
     display: inline-flex;
@@ -1612,7 +1612,7 @@
     height: 18px;
     border-radius: 9px;
     background: var(--accent);
-    color: white;
+    color: var(--on-accent);
     font-size: 10px;
     font-weight: 700;
     padding: 0 5px;
@@ -1697,14 +1697,14 @@
     flex-shrink: 0;
   }
   .request-badge-verified {
-    background: color-mix(in srgb, var(--success, #2ecc71) 18%, transparent);
-    color: var(--success, #2ecc71);
-    border: 1px solid color-mix(in srgb, var(--success, #2ecc71) 40%, transparent);
+    background: color-mix(in srgb, var(--success) 18%, transparent);
+    color: var(--success);
+    border: 1px solid color-mix(in srgb, var(--success) 40%, transparent);
   }
   .request-badge-unverified {
-    background: color-mix(in srgb, var(--warning, #e0a23b) 14%, transparent);
-    color: var(--warning, #e0a23b);
-    border: 1px solid color-mix(in srgb, var(--warning, #e0a23b) 35%, transparent);
+    background: color-mix(in srgb, var(--warning) 14%, transparent);
+    color: var(--warning);
+    border: 1px solid color-mix(in srgb, var(--warning) 35%, transparent);
   }
 
   .request-actions {
@@ -1718,7 +1718,7 @@
     border: none;
     border-radius: var(--radius-md);
     background: var(--accent);
-    color: white;
+    color: var(--on-accent);
     font-size: 11px;
     font-weight: 600;
     font-family: inherit;
@@ -1779,8 +1779,8 @@
 
   /* --- Firewall warning banner --- */
   .firewall-banner {
-    background: color-mix(in srgb, var(--warning, #eab308) 8%, var(--bg-surface));
-    border: 1px solid color-mix(in srgb, var(--warning, #eab308) 40%, var(--border));
+    background: color-mix(in srgb, var(--warning) 8%, var(--bg-surface));
+    border: 1px solid color-mix(in srgb, var(--warning) 40%, var(--border));
     color: var(--text-secondary);
     padding: 12px 16px;
     border-radius: var(--radius-lg);
@@ -1803,7 +1803,7 @@
     width: 20px;
     height: 20px;
     flex-shrink: 0;
-    color: var(--warning, #eab308);
+    color: var(--warning);
     margin-top: 1px;
   }
 
@@ -1813,15 +1813,15 @@
   }
 
   .firewall-text strong {
-    color: var(--warning, #eab308);
+    color: var(--warning);
   }
 
   .firewall-recheck {
     padding: 5px 14px;
-    border: 1px solid color-mix(in srgb, var(--warning, #eab308) 50%, var(--border));
+    border: 1px solid color-mix(in srgb, var(--warning) 50%, var(--border));
     border-radius: var(--radius-md);
     background: transparent;
-    color: var(--warning, #eab308);
+    color: var(--warning);
     font-size: 11px;
     font-weight: 600;
     font-family: inherit;
@@ -1834,13 +1834,13 @@
   .firewall-recheck-error {
     margin-left: 10px;
     font-size: 11px;
-    color: var(--danger, #ef4444);
+    color: var(--danger);
     align-self: center;
     flex-basis: 100%;
   }
 
   .firewall-recheck:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--warning, #eab308) 15%, transparent);
+    background: color-mix(in srgb, var(--warning) 15%, transparent);
   }
 
   .firewall-recheck:disabled {
