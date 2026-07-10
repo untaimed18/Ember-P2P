@@ -1,5 +1,6 @@
 import { writable } from 'svelte/store';
 import { browser } from '$app/environment';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 
 export type Theme = 'light' | 'dark';
 
@@ -21,8 +22,22 @@ function applyThemeToDOM(t: Theme) {
   document.documentElement.setAttribute('data-theme', t);
 }
 
-export function applyTheme(t: Theme) {
+function applyThemeToNativeWindow(t: Theme) {
+  // The browser-only Vite preview does not expose Tauri's IPC bridge.
+  // Guard it so theme development outside the desktop shell remains usable.
+  if (!browser || !('__TAURI_INTERNALS__' in window)) return;
+  void getCurrentWindow().setTheme(t).catch((error) => {
+    console.warn('Failed to apply native window theme:', error);
+  });
+}
+
+function applyResolvedTheme(t: Theme) {
   applyThemeToDOM(t);
+  applyThemeToNativeWindow(t);
+}
+
+export function applyTheme(t: Theme) {
+  applyResolvedTheme(t);
   if (browser) localStorage.setItem(STORAGE_KEY, t);
 }
 
@@ -38,7 +53,7 @@ let themeCleanup: (() => void) | null = null;
 
 export function initTheme() {
   const t = getInitialTheme();
-  applyThemeToDOM(t);
+  applyResolvedTheme(t);
   theme.set(t);
   // Important: do NOT persist `t` here. The OS-tracking branch in the
   // matchMedia handler below uses "is `STORAGE_KEY` unset?" as the
@@ -59,7 +74,7 @@ export function initTheme() {
       const userChose = localStorage.getItem(STORAGE_KEY);
       if (!userChose) {
         const next: Theme = e.matches ? 'dark' : 'light';
-        applyThemeToDOM(next);
+        applyResolvedTheme(next);
         theme.set(next);
       }
     };

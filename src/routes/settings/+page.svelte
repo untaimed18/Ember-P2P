@@ -2279,26 +2279,26 @@
 
   /* Light swatch colors */
   .light-swatch {
-    background: #f5f6fa;
+    background: var(--preview-light-canvas);
   }
   .light-swatch .swatch-sidebar {
-    background: #ffffff;
-    border-right: 1px solid #dadce0;
+    background: var(--preview-light-panel);
+    border-right: 1px solid var(--preview-light-border);
   }
   .light-swatch .swatch-line {
-    background: #dadce0;
+    background: var(--preview-light-border);
   }
 
   /* Dark swatch colors */
   .dark-swatch {
-    background: #111418;
+    background: var(--preview-dark-canvas);
   }
   .dark-swatch .swatch-sidebar {
-    background: #181c22;
-    border-right: 1px solid #2a3038;
+    background: var(--preview-dark-panel);
+    border-right: 1px solid var(--preview-dark-border);
   }
   .dark-swatch .swatch-line {
-    background: #2a313b;
+    background: var(--preview-dark-hover);
   }
 
   .swatch-check {
@@ -2656,7 +2656,7 @@
   .restart-spinner {
     width: 40px;
     height: 40px;
-    border: 4px solid rgba(255, 255, 255, 0.15);
+    border: 4px solid color-mix(in srgb, var(--border-light) 45%, transparent);
     border-top-color: var(--accent);
     border-radius: 50%;
     animation: spin 0.7s linear infinite;

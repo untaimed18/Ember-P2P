@@ -166,13 +166,12 @@
     z-index: 10000;
     display: grid;
     place-items: center;
-    background: rgba(0, 0, 0, 0.5);
+    background: var(--overlay-bg);
     padding: 20px;
   }
 
   /* Frosted backdrop in dark mode, matching ConfirmDialog/AboutDialog. */
   :global([data-theme='dark']) .close-overlay {
-    background: rgba(8, 10, 13, 0.45);
     backdrop-filter: blur(6px) saturate(1.15);
     -webkit-backdrop-filter: blur(6px) saturate(1.15);
   }
@@ -182,7 +181,9 @@
     background: var(--bg-secondary);
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
-    box-shadow: var(--shadow-lg);
+    box-shadow:
+      inset 0 1px 0 var(--surface-highlight),
+      var(--shadow-lg);
     padding: 22px 24px 18px;
     display: flex;
     flex-direction: column;

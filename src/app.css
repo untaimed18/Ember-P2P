@@ -22,6 +22,11 @@
   --success: #34a853;
   --warning: #ea8600;
   --danger: #d93025;
+  --danger-hover: #c62828;
+  --badge-success-text: color-mix(in srgb, var(--success) 85%, #000);
+  --badge-warning-text: color-mix(in srgb, var(--warning) 80%, #000);
+  --badge-danger-text: color-mix(in srgb, var(--danger) 85%, #000);
+  --badge-accent-text: color-mix(in srgb, var(--accent) 85%, #000);
   --status-connected: var(--success);
   --status-connecting: var(--warning);
   --status-disconnected: var(--danger);
@@ -38,6 +43,7 @@
   --priority-verylow: #888888;
   --priority-low: #5599bb;
   --priority-auto: #7cb342;
+  --stat-ratio: #9c27b0;
 
   --border: #dadce0;
   --border-light: #c4c9d4;
@@ -55,6 +61,9 @@
   --shadow-sm: 0 1px 2px rgba(0,0,0,0.06);
   --shadow-md: 0 2px 6px rgba(0,0,0,0.08);
   --shadow-lg: 0 8px 24px rgba(0,0,0,0.12);
+  --shadow-panel-left: -4px 0 18px rgba(0,0,0,0.12);
+  --shadow-up-sm: 0 -2px 6px -4px rgba(0,0,0,0.16);
+  --surface-highlight: transparent;
   --overlay-bg: rgba(0, 0, 0, 0.45);
 
   --transition-fast: 0.1s;
@@ -63,6 +72,20 @@
 
   --bg-disabled: #e8ecf4;
   --text-disabled: #8890a8;
+
+  /* Theme preview swatches must show both palettes regardless of the
+     currently active theme, so keep their miniature palette here rather
+     than duplicating literals across Settings and Setup Wizard. */
+  --preview-light-canvas: #f5f6fa;
+  --preview-light-panel: #ffffff;
+  --preview-light-border: #dadce0;
+  --preview-light-surface: #e8ecf4;
+  --preview-light-hover: #eceef5;
+  --preview-dark-canvas: #111418;
+  --preview-dark-panel: #181c22;
+  --preview-dark-border: #2a3038;
+  --preview-dark-hover: #2a313b;
+  --preview-dark-accent-dim: #1e3a5c;
 
   font-family: var(--font-sans);
   font-size: 14px;
@@ -108,6 +131,11 @@
   --success: #5fc27b;
   --warning: #e0a84d;
   --danger: #dc6e62;
+  --danger-hover: color-mix(in srgb, var(--danger) 82%, #ffffff);
+  --badge-success-text: color-mix(in srgb, var(--success) 70%, #ffffff);
+  --badge-warning-text: color-mix(in srgb, var(--warning) 70%, #ffffff);
+  --badge-danger-text: color-mix(in srgb, var(--danger) 70%, #ffffff);
+  --badge-accent-text: color-mix(in srgb, var(--accent) 70%, #ffffff);
   --status-connected: var(--success);
   --status-connecting: var(--warning);
   --status-disconnected: var(--danger);
@@ -121,6 +149,7 @@
   --priority-verylow: #9a9fa8;
   --priority-low: #7fb6d9;
   --priority-auto: #9ccc65;
+  --stat-ratio: #c792d9;
 
   /* Borders are barely there — 4–5% lighter than the bg they sit against. */
   --border: #2a3038;
@@ -130,6 +159,9 @@
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.32);
   --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.38);
   --shadow-lg: 0 18px 52px rgba(0, 0, 0, 0.46);
+  --shadow-panel-left: -8px 0 30px rgba(0, 0, 0, 0.38);
+  --shadow-up-sm: 0 -4px 12px -6px rgba(0, 0, 0, 0.42);
+  --surface-highlight: rgba(255, 255, 255, 0.05);
   --overlay-bg: rgba(9, 12, 16, 0.56);
 
   --bg-disabled: #1a1f25;
@@ -176,7 +208,7 @@
   color: var(--on-danger);
 }
 :where([data-theme="dark"]) button.danger:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--danger) 82%, #ffffff);
+  background: var(--danger-hover);
 }
 
 /* Softer, more controlled scrollbars for dark. */
@@ -304,7 +336,7 @@ button.danger {
 }
 
 button.danger:hover {
-  background: #c62828;
+  background: var(--danger-hover);
 }
 
 button.ghost {
@@ -468,27 +500,27 @@ tr:hover td {
 .badge.highid {
   background: color-mix(in srgb, var(--success) 15%, transparent);
   border-color: color-mix(in srgb, var(--success) 30%, transparent);
-  color: color-mix(in srgb, var(--success) 85%, #000);
+  color: var(--badge-success-text);
 }
 .badge.connecting,
 .badge.paused,
 .badge.upload {
   background: color-mix(in srgb, var(--warning) 15%, transparent);
   border-color: color-mix(in srgb, var(--warning) 30%, transparent);
-  color: color-mix(in srgb, var(--warning) 80%, #000);
+  color: var(--badge-warning-text);
 }
 .badge.disconnected,
 .badge.failed,
 .badge.lowid {
   background: color-mix(in srgb, var(--danger) 15%, transparent);
   border-color: color-mix(in srgb, var(--danger) 30%, transparent);
-  color: color-mix(in srgb, var(--danger) 85%, #000);
+  color: var(--badge-danger-text);
 }
 .badge.active,
 .badge.download {
   background: color-mix(in srgb, var(--accent) 15%, transparent);
   border-color: color-mix(in srgb, var(--accent) 30%, transparent);
-  color: color-mix(in srgb, var(--accent) 85%, #000);
+  color: var(--badge-accent-text);
 }
 .badge.queued,
 .badge.searching {
@@ -503,35 +535,35 @@ tr:hover td {
  * recipe (tinted background, colored border, semantic text) is
  * identical — only the contrast values differ per-theme.
  */
-[data-theme="dark"] .badge.connected,
-[data-theme="dark"] .badge.completed,
-[data-theme="dark"] .badge.highid {
+:where([data-theme="dark"]) .badge.connected,
+:where([data-theme="dark"]) .badge.completed,
+:where([data-theme="dark"]) .badge.highid {
   background: color-mix(in srgb, var(--success) 18%, transparent);
   border-color: color-mix(in srgb, var(--success) 32%, transparent);
-  color: #8fd9a3;
+  color: var(--badge-success-text);
 }
-[data-theme="dark"] .badge.connecting,
-[data-theme="dark"] .badge.paused,
-[data-theme="dark"] .badge.upload {
+:where([data-theme="dark"]) .badge.connecting,
+:where([data-theme="dark"]) .badge.paused,
+:where([data-theme="dark"]) .badge.upload {
   background: color-mix(in srgb, var(--warning) 18%, transparent);
   border-color: color-mix(in srgb, var(--warning) 32%, transparent);
-  color: #f0c37a;
+  color: var(--badge-warning-text);
 }
-[data-theme="dark"] .badge.disconnected,
-[data-theme="dark"] .badge.failed,
-[data-theme="dark"] .badge.lowid {
+:where([data-theme="dark"]) .badge.disconnected,
+:where([data-theme="dark"]) .badge.failed,
+:where([data-theme="dark"]) .badge.lowid {
   background: color-mix(in srgb, var(--danger) 18%, transparent);
   border-color: color-mix(in srgb, var(--danger) 32%, transparent);
-  color: #ea9388;
+  color: var(--badge-danger-text);
 }
-[data-theme="dark"] .badge.active,
-[data-theme="dark"] .badge.download {
+:where([data-theme="dark"]) .badge.active,
+:where([data-theme="dark"]) .badge.download {
   background: color-mix(in srgb, var(--accent) 18%, transparent);
   border-color: color-mix(in srgb, var(--accent) 32%, transparent);
-  color: #a6c7ea;
+  color: var(--badge-accent-text);
 }
-[data-theme="dark"] .badge.queued,
-[data-theme="dark"] .badge.searching {
+:where([data-theme="dark"]) .badge.queued,
+:where([data-theme="dark"]) .badge.searching {
   background: color-mix(in srgb, var(--text-muted) 22%, transparent);
   border-color: color-mix(in srgb, var(--text-muted) 38%, transparent);
   color: var(--text-secondary);
@@ -716,7 +748,9 @@ h4 { font-size: 14px; font-weight: 600; color: var(--text-primary); }
   min-width: 340px;
   max-width: 450px;
   overflow: hidden;
-  box-shadow: 0 8px 32px rgba(0,0,0,0.24);
+  box-shadow:
+    inset 0 1px 0 var(--surface-highlight),
+    var(--shadow-lg);
 }
 
 /*
@@ -736,12 +770,12 @@ h4 { font-size: 14px; font-weight: 600; color: var(--text-primary); }
 }
 [data-theme="dark"] :is(.confirm-dialog, .about-panel) {
   box-shadow:
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.05),
+    inset 0 1px 0 var(--surface-highlight),
     var(--shadow-lg);
 }
 [data-theme="dark"] .stat-card {
   box-shadow:
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.04),
+    inset 0 1px 0 color-mix(in srgb, var(--surface-highlight) 80%, transparent),
     var(--shadow-sm);
 }
 .confirm-dialog h3 {

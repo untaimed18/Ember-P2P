@@ -4654,7 +4654,7 @@
     background: var(--bg-secondary);
     border: 1px solid var(--border);
     border-radius: 2px;
-    box-shadow: 0 4px 16px rgba(0,0,0,0.25);
+    box-shadow: var(--shadow-lg);
     padding: 4px 0;
     min-width: 180px;
   }
@@ -4707,7 +4707,7 @@
     background: var(--bg-secondary);
     border: 1px solid var(--border);
     border-radius: 2px;
-    box-shadow: 0 4px 16px rgba(0,0,0,0.25);
+    box-shadow: var(--shadow-lg);
     padding: 4px 0;
     min-width: 100px;
   }

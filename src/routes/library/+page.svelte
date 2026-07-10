@@ -2732,7 +2732,7 @@
     padding: 22px 28px;
     text-align: center;
     color: var(--text-primary);
-    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+    box-shadow: var(--shadow-lg);
     max-width: 360px;
   }
   .dnd-icon { color: var(--accent); margin-bottom: 6px; }
@@ -3266,7 +3266,7 @@
     border-radius: 4px;
     padding: 4px 0;
     min-width: 180px;
-    box-shadow: 0 4px 16px rgba(0,0,0,.35);
+    box-shadow: var(--shadow-lg);
     font-size: 12px;
     transform-origin: top left;
     animation: ctx-menu-pop 0.12s ease;
@@ -3311,7 +3311,7 @@
     border-radius: 4px;
     padding: 4px 0;
     min-width: 140px;
-    box-shadow: 0 4px 16px rgba(0,0,0,.35);
+    box-shadow: var(--shadow-lg);
   }
   .ctx-submenu.ctx-submenu-left {
     left: auto;
@@ -3468,7 +3468,7 @@
   .bulk-action-bar {
     border-top: 1px solid var(--border);
     background: color-mix(in srgb, var(--accent-dim) 22%, var(--bg-secondary));
-    box-shadow: 0 -2px 6px -4px rgba(0, 0, 0, 0.25);
+    box-shadow: var(--shadow-up-sm);
     padding: 8px 14px;
     display: flex;
     align-items: center;
@@ -3928,7 +3928,7 @@
   }
   .coll-table td {
     padding: 4px 10px;
-    border-bottom: 1px solid var(--border-light, rgba(255,255,255,0.04));
+    border-bottom: 1px solid var(--border-light);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -3941,7 +3941,7 @@
     position: fixed;
     inset: 0;
     z-index: 10000;
-    background: rgba(0, 0, 0, 0.5);
+    background: var(--overlay-bg);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -3952,8 +3952,8 @@
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
     box-shadow:
-      inset 0 1px 0 0 rgba(255, 255, 255, 0.05),
-      0 16px 48px rgba(0, 0, 0, 0.45);
+      inset 0 1px 0 var(--surface-highlight),
+      var(--shadow-lg);
     display: flex;
     flex-direction: column;
     max-height: 80vh;
@@ -4028,7 +4028,7 @@
     font-size: 12px;
     border: 1px solid var(--border);
     border-radius: 4px;
-    background: var(--bg-secondary);
+    background: var(--bg-input);
     color: inherit;
     outline: none;
   }

@@ -309,13 +309,12 @@
   .browse-overlay {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.4);
+    background: var(--overlay-bg);
     z-index: 999;
     animation: browse-fade-in 0.15s ease;
   }
 
   :global([data-theme='dark']) .browse-overlay {
-    background: rgba(8, 10, 13, 0.45);
     backdrop-filter: blur(6px) saturate(1.15);
     -webkit-backdrop-filter: blur(6px) saturate(1.15);
   }
@@ -334,7 +333,9 @@
     z-index: 1000;
     display: flex;
     flex-direction: column;
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+    box-shadow:
+      inset 0 1px 0 var(--surface-highlight),
+      var(--shadow-lg);
     animation: browse-pop-in 0.2s ease;
   }
 

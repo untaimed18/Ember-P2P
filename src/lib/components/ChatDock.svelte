@@ -293,7 +293,7 @@
     z-index: 1000;
     display: flex;
     flex-direction: column;
-    box-shadow: -4px 0 24px rgba(0, 0, 0, 0.2);
+    box-shadow: var(--shadow-panel-left);
     outline: none;
   }
 

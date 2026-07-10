@@ -464,7 +464,7 @@
        discrete app icon against the sidebar panel. */
     box-shadow:
       0 0 0 1px var(--border),
-      0 2px 6px rgba(0, 0, 0, 0.28);
+      var(--shadow-sm);
   }
 
   .logo-wordmark {

@@ -1359,7 +1359,7 @@
     background: var(--bg-secondary);
     border: 1px solid var(--border);
     border-radius: var(--radius-md, 6px);
-    box-shadow: var(--shadow-lg, 0 4px 12px rgba(0,0,0,0.15));
+    box-shadow: var(--shadow-lg);
     padding: 4px 0;
     min-width: 180px;
   }
@@ -1427,8 +1427,9 @@
   }
 
   .badge.disconnected {
-    background: rgba(200, 200, 200, 0.1);
-    color: var(--text-muted);
+    background: color-mix(in srgb, var(--text-muted) 18%, transparent);
+    border-color: color-mix(in srgb, var(--text-muted) 32%, transparent);
+    color: var(--text-secondary);
   }
 
   .badge.lowid {

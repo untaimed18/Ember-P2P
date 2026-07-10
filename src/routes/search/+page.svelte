@@ -3016,11 +3016,6 @@
     cursor: not-allowed;
   }
 
-  :global([data-theme="dark"]) .bulk-download-btn {
-    background: var(--accent-dim);
-    color: var(--text-primary);
-  }
-
   .bulk-clear-btn {
     font-size: 12px;
     padding: 5px 10px;
@@ -3663,8 +3658,8 @@
      non-color signal — we already have a "Spam" badge in the name
      cell). A left-border accent in the warning hue carries the row's
      status without painting the whole cell. */
-  :global(tr.spam-row) {
-    opacity: 0.7;
+  :global(tr.spam-row td) {
+    color: var(--text-muted);
   }
   :global(tr.spam-row td:first-child) {
     box-shadow: inset 3px 0 0 0 var(--warning);
