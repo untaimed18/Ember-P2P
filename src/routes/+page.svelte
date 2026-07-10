@@ -659,11 +659,13 @@
               {#each virtualContacts.visible as contact, i (contact.id)}
                 <tr class="virtual-row" class:row-alt={(virtualContacts.startIdx + i) % 2 === 1}>
                   <td class="contact-id">
-                    <!-- svelte-ignore a11y_no_static_element_interactions -->
-                    <span class="cell-content" title={m.kad_double_click_to_copy({ value: contact.id })} ondblclick={() => copyText(contact.id, m.kad_copied_contact_id())}>{contact.id}</span>
-                    <button class="ghost copy-btn" aria-label={m.kad_copy_id()} onclick={() => copyText(contact.id, m.kad_copied_contact_id())} title={m.kad_copy_id()}>
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-                    </button>
+                    <div class="contact-cell-inner">
+                      <!-- svelte-ignore a11y_no_static_element_interactions -->
+                      <span class="cell-content" title={m.kad_double_click_to_copy({ value: contact.id })} ondblclick={() => copyText(contact.id, m.kad_copied_contact_id())}>{contact.id}</span>
+                      <button class="ghost copy-btn" aria-label={m.kad_copy_id()} onclick={() => copyText(contact.id, m.kad_copied_contact_id())} title={m.kad_copy_id()}>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                      </button>
+                    </div>
                   </td>
                   <td>
                     <span class="contact-type type-{contact.bootstrap ? 'bootstrap' : contact.type}" class:unverified={!contact.ip_verified && contact.type < 3 && !contact.bootstrap}>
@@ -672,11 +674,13 @@
                     </span>
                   </td>
                   <td class="distance">
-                    <!-- svelte-ignore a11y_no_static_element_interactions -->
-                    <span class="cell-content" title={m.kad_double_click_to_copy({ value: contact.distance })} ondblclick={() => copyText(contact.distance, m.kad_copied_distance())}>{contact.distance}</span>
-                    <button class="ghost copy-btn" aria-label={m.kad_copy_distance()} onclick={() => copyText(contact.distance, m.kad_copied_distance())} title={m.kad_copy_distance()}>
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-                    </button>
+                    <div class="contact-cell-inner">
+                      <!-- svelte-ignore a11y_no_static_element_interactions -->
+                      <span class="cell-content" title={m.kad_double_click_to_copy({ value: contact.distance })} ondblclick={() => copyText(contact.distance, m.kad_copied_distance())}>{contact.distance}</span>
+                      <button class="ghost copy-btn" aria-label={m.kad_copy_distance()} onclick={() => copyText(contact.distance, m.kad_copied_distance())} title={m.kad_copy_distance()}>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                      </button>
+                    </div>
                   </td>
                 </tr>
               {/each}
@@ -1575,13 +1579,10 @@
   /*
    * `.contact-id` and `.distance` are reused by the Searches table's
    * Key column (monospace hex + muted color). The Contacts table
-   * additionally wants a flex layout so the hover-revealed Copy button
-   * can sit on the right edge — but turning `<td>` into `display: flex`
-   * breaks table column alignment everywhere else the class is used.
-   *
-   * Solution: keep the base style as plain table-cell, and only switch
-   * to flex layout when the cell has a `.cell-content` + `.copy-btn`
-   * wrapper inside (i.e. only the Contacts table rows).
+   * additionally needs a flex layout so the hover-revealed Copy button
+   * can sit on the right edge. Keep the `<td>` as a native table cell so
+   * row borders and backgrounds remain continuous, and apply flex only
+   * to the inner wrapper used by Contacts rows.
    */
   .contact-id {
     font-family: var(--font-mono);
@@ -1595,15 +1596,16 @@
     color: var(--text-secondary);
   }
 
-  .contact-id:has(> .copy-btn),
-  .distance:has(> .copy-btn) {
+  .contact-cell-inner {
     display: flex;
     align-items: center;
     justify-content: space-between;
+    min-width: 0;
   }
 
   .cell-content {
     flex: 1;
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
   }
