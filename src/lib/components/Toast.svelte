@@ -68,7 +68,7 @@
     border-radius: var(--radius-md, 8px);
     font-size: 13px;
     color: var(--on-accent);
-    box-shadow: var(--shadow-md, 0 4px 12px rgba(0, 0, 0, 0.15));
+    box-shadow: var(--shadow-md);
   }
   .toast-success { background: var(--success); color: var(--on-success); }
   .toast-error { background: var(--danger); color: var(--on-danger); }
@@ -99,9 +99,6 @@
   }
   .toast-close:hover {
     opacity: 1;
-    background: rgba(255, 255, 255, 0.18);
-  }
-  .toast-warning .toast-close:hover {
-    background: rgba(0, 0, 0, 0.1);
+    background: color-mix(in srgb, currentColor 18%, transparent);
   }
 </style>

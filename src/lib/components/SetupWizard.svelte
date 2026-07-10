@@ -980,13 +980,13 @@
   }
 
   .dark-preview {
-    background: #111418;
+    background: var(--preview-dark-canvas);
   }
 
   .dark-preview .tp-sidebar {
     width: 30%;
-    background: #181c22;
-    border-right: 1px solid #2a3038;
+    background: var(--preview-dark-panel);
+    border-right: 1px solid var(--preview-dark-border);
   }
 
   .dark-preview .tp-main {
@@ -997,14 +997,14 @@
   .dark-preview .tp-bar {
     height: 8px;
     border-radius: 3px;
-    background: #1e3a5c;
+    background: var(--preview-dark-accent-dim);
     margin-bottom: 6px;
   }
 
   .dark-preview .tp-row {
     height: 6px;
     border-radius: 2px;
-    background: #2a313b;
+    background: var(--preview-dark-hover);
     margin-bottom: 4px;
   }
 
@@ -1013,13 +1013,13 @@
   }
 
   .light-preview {
-    background: #f5f6fa;
+    background: var(--preview-light-canvas);
   }
 
   .light-preview .tp-sidebar {
     width: 30%;
-    background: #ffffff;
-    border-right: 1px solid #dadce0;
+    background: var(--preview-light-panel);
+    border-right: 1px solid var(--preview-light-border);
   }
 
   .light-preview .tp-main {
@@ -1030,14 +1030,14 @@
   .light-preview .tp-bar {
     height: 8px;
     border-radius: 3px;
-    background: #e8ecf4;
+    background: var(--preview-light-surface);
     margin-bottom: 6px;
   }
 
   .light-preview .tp-row {
     height: 6px;
     border-radius: 2px;
-    background: #eceef5;
+    background: var(--preview-light-hover);
     margin-bottom: 4px;
   }
 

@@ -912,7 +912,7 @@
     border-radius: 4px;
     padding: 4px 0;
     min-width: 220px;
-    box-shadow: 0 4px 16px rgba(0,0,0,.35);
+    box-shadow: var(--shadow-lg);
     font-size: 12px;
   }
   .col-ctx-title {

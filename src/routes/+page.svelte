@@ -1220,7 +1220,7 @@
     position: fixed;
     inset: 0;
     z-index: 10000;
-    background: rgba(0, 0, 0, 0.5);
+    background: var(--overlay-bg);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1230,8 +1230,8 @@
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
     box-shadow:
-      inset 0 1px 0 0 rgba(255, 255, 255, 0.05),
-      0 16px 48px rgba(0, 0, 0, 0.45);
+      inset 0 1px 0 var(--surface-highlight),
+      var(--shadow-lg);
     display: flex;
     flex-direction: column;
     max-height: 80vh;
@@ -1281,7 +1281,7 @@
     font-size: 12px;
     border: 1px solid var(--border);
     border-radius: 4px;
-    background: var(--bg-secondary);
+    background: var(--bg-input);
     color: inherit;
     outline: none;
   }
@@ -1706,13 +1706,13 @@
   .badge.open {
     background: color-mix(in srgb, var(--success) 15%, transparent);
     border-color: color-mix(in srgb, var(--success) 30%, transparent);
-    color: color-mix(in srgb, var(--success) 85%, #000);
+    color: var(--badge-success-text);
   }
 
   .badge.firewalled {
     background: color-mix(in srgb, var(--warning) 15%, transparent);
     border-color: color-mix(in srgb, var(--warning) 30%, transparent);
-    color: color-mix(in srgb, var(--warning) 80%, #000);
+    color: var(--badge-warning-text);
   }
 
   .badge.unknown {
@@ -1724,24 +1724,7 @@
   .badge.stopping {
     background: color-mix(in srgb, var(--warning) 15%, transparent);
     border-color: color-mix(in srgb, var(--warning) 30%, transparent);
-    color: color-mix(in srgb, var(--warning) 80%, #000);
-  }
-
-  :global([data-theme="dark"]) .badge.open {
-    background: color-mix(in srgb, var(--success) 18%, transparent);
-    border-color: color-mix(in srgb, var(--success) 32%, transparent);
-    color: #8fd9a3;
-  }
-  :global([data-theme="dark"]) .badge.firewalled,
-  :global([data-theme="dark"]) .badge.stopping {
-    background: color-mix(in srgb, var(--warning) 18%, transparent);
-    border-color: color-mix(in srgb, var(--warning) 32%, transparent);
-    color: #f0c37a;
-  }
-  :global([data-theme="dark"]) .badge.unknown {
-    background: color-mix(in srgb, var(--text-muted) 22%, transparent);
-    border-color: color-mix(in srgb, var(--text-muted) 38%, transparent);
-    color: var(--text-secondary);
+    color: var(--badge-warning-text);
   }
 
   /* Per-row Cancel button: small ghost variant that lines up with the

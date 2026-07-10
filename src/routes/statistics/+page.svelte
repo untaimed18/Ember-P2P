@@ -471,8 +471,7 @@
   .down-icon  { background: color-mix(in srgb, var(--accent)  14%, transparent); color: var(--accent); }
   .up-icon    { background: color-mix(in srgb, var(--success) 14%, transparent); color: var(--success); }
   .time-icon  { background: color-mix(in srgb, var(--warning) 14%, transparent); color: var(--warning); }
-  .ratio-icon { background: rgba(156, 39, 176, 0.12); color: #9c27b0; }
-  :global([data-theme="dark"]) .ratio-icon { background: rgba(186, 104, 200, 0.18); color: #c792d9; }
+  .ratio-icon { background: color-mix(in srgb, var(--stat-ratio) 14%, transparent); color: var(--stat-ratio); }
   .hero-body { display: flex; flex-direction: column; min-width: 0; }
   .hero-value {
     font-size: 1.25rem;
@@ -626,8 +625,7 @@
   .oh-server { background: var(--accent); }
   .oh-kad    { background: var(--success); }
   .oh-srcex  { background: var(--warning); }
-  .oh-freq   { background: #9c27b0; }
-  :global([data-theme="dark"]) .oh-freq { background: #ba68c8; }
+  .oh-freq   { background: var(--stat-ratio); }
   .oh-empty {
     text-align: center;
     color: var(--text-muted);

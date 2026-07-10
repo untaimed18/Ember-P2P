@@ -167,7 +167,7 @@
   .shortcut-overlay {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.45);
+    background: var(--overlay-bg);
     z-index: 10000;
     display: flex;
     align-items: center;
@@ -175,7 +175,6 @@
     backdrop-filter: blur(2px);
   }
   :global([data-theme="dark"]) .shortcut-overlay {
-    background: rgba(8, 10, 13, 0.55);
     backdrop-filter: blur(6px) saturate(1.15);
   }
 
@@ -183,18 +182,14 @@
     background: var(--bg-secondary);
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
-    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.35);
+    box-shadow:
+      inset 0 1px 0 var(--surface-highlight),
+      var(--shadow-lg);
     width: min(640px, calc(100vw - 40px));
     max-height: min(80vh, 720px);
     display: flex;
     flex-direction: column;
   }
-  :global([data-theme="dark"]) .shortcut-panel {
-    box-shadow:
-      inset 0 1px 0 0 rgba(255, 255, 255, 0.05),
-      0 16px 48px rgba(0, 0, 0, 0.55);
-  }
-
   .shortcut-header {
     display: flex;
     align-items: center;
@@ -304,14 +299,13 @@
     font-weight: 600;
     color: var(--text-primary);
     line-height: 1;
-    box-shadow: 0 1px 0 rgba(0, 0, 0, 0.04);
+    box-shadow:
+      inset 0 1px 0 var(--surface-highlight),
+      var(--shadow-sm);
   }
 
   :global([data-theme="dark"]) kbd {
     background: var(--bg-tertiary);
-    box-shadow:
-      inset 0 1px 0 0 rgba(255, 255, 255, 0.04),
-      0 1px 0 rgba(0, 0, 0, 0.3);
   }
 
   .shortcut-footer {
