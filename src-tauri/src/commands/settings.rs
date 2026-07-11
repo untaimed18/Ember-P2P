@@ -431,10 +431,18 @@ pub async fn update_settings(
             .map_err(|e| coded_ctx("settings_validation_task_failed", "Validation failed", e))??;
     }
 
+    let _settings_save_guard = state.settings_save_lock.lock().await;
     let old_settings = {
         let config = state.config.read().await;
         config.settings.clone()
     };
+    if settings.settings_revision != old_settings.settings_revision {
+        return Err(coded(
+            "settings_stale_revision",
+            "Settings changed in another window or command; reload and apply your changes again",
+        ));
+    }
+    settings.settings_revision = old_settings.settings_revision.saturating_add(1);
 
     let port_changed =
         settings.tcp_port != old_settings.tcp_port || settings.udp_port != old_settings.udp_port;
@@ -719,7 +727,13 @@ pub async fn download_ipfilter(
         (bytes, entry_count)
     })
     .await
-    .map_err(|e| coded_ctx("settings_validation_task_failed", "Validation task failed", e))?;
+    .map_err(|e| {
+        coded_ctx(
+            "settings_validation_task_failed",
+            "Validation task failed",
+            e,
+        )
+    })?;
     if entry_count == 0 {
         return Err(coded(
             "settings_ipfilter_no_valid_entries",
@@ -831,12 +845,14 @@ pub async fn set_close_behavior(
             "Close behavior must be 'ask', 'tray', or 'exit'",
         ));
     }
+    let _settings_save_guard = state.settings_save_lock.lock().await;
     // Persist before committing the in-memory change (see update_settings) so
     // a failed write can't leave the live close-behavior diverged from disk.
     let (new_settings, save_data) = {
         let config = state.config.read().await;
         let mut new_settings = config.settings.clone();
         new_settings.close_to_tray_behavior = normalized.clone();
+        new_settings.settings_revision = config.settings.settings_revision.saturating_add(1);
         let data = config.prepare_save_settings(&new_settings).map_err(|e| {
             coded_ctx(
                 "settings_serialize_failed",

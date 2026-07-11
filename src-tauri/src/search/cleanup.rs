@@ -6,6 +6,55 @@ pub const DEFAULT_CLEANUP_STRINGS: &str =
 
 const COMMENT_URL_PATTERNS: &[&str] = &["http://", "https://", "ftp://", "www.", "ftp."];
 
+/// Removes every (possibly cascading) occurrence of `pat_lower`
+/// (already-lowercased) from `chars`, case-insensitively — the same
+/// fixpoint as "find the leftmost match, remove it, repeat until none
+/// remain" — but in a single O(len(chars)) pass instead of one O(len)
+/// rescan *per removal*.
+///
+/// Implemented as a stack: each source char is pushed, then we check
+/// whether the stack's last `pat_char_len` chars now spell out the
+/// pattern; if so we pop them instead of keeping them. Removing a
+/// match can make the chars just before and after it adjacent, which
+/// can immediately form a *new* match (e.g. pattern "aa" on "a"+"a"+"a"
+/// removes the first two, leaving "a"+"a" adjacent, which then also
+/// matches) — restarting the scan from scratch handles that correctly
+/// but is what made the old loop quadratic; the stack handles it for
+/// free, since the next char pushed is always compared against
+/// whatever the *current* stack top is, which already reflects every
+/// removal so far. Every char is pushed and popped at most once, so
+/// this is O(len(chars) * pat_char_len) total — pat_char_len is a
+/// small bounded constant (cleanup strings are short words), so this
+/// is effectively linear in the filename length.
+///
+/// This matters because eD2k filenames are fully attacker-controlled
+/// (any peer can publish any filename for a shared/searched file): a
+/// filename engineered with many repeated short cleanup-pattern
+/// instances (e.g. thousands of "www." in a row) drove the old
+/// per-removal-rescan loop to quadratic time, i.e. remotely-triggered
+/// CPU cost on every UI render of the crafted name.
+fn remove_all_case_insensitive(chars: &[char], pat_lower: &str) -> Vec<char> {
+    let pat_char_len = pat_lower.chars().count();
+    if pat_char_len == 0 {
+        return chars.to_vec();
+    }
+    let mut stack: Vec<char> = Vec::with_capacity(chars.len());
+    for &c in chars {
+        stack.push(c);
+        if stack.len() >= pat_char_len {
+            let tail_start = stack.len() - pat_char_len;
+            let tail_matches = stack[tail_start..]
+                .iter()
+                .flat_map(|c| c.to_lowercase())
+                .eq(pat_lower.chars());
+            if tail_matches {
+                stack.truncate(tail_start);
+            }
+        }
+    }
+    stack
+}
+
 /// Clean up a filename for display. Removes promotional text, replaces separators
 /// with spaces, strips bracketed ads, and applies title case.
 pub fn cleanup_filename(name: &str, cleanup_strings: &[String]) -> String {
@@ -22,23 +71,10 @@ pub fn cleanup_filename(name: &str, cleanup_strings: &[String]) -> String {
         if pat_lower.is_empty() {
             continue;
         }
-        let pat_char_len = pat_lower.chars().count();
-        loop {
-            let lower = result.to_lowercase();
-            if let Some(byte_pos) = lower.find(&pat_lower) {
-                let char_offset = lower[..byte_pos].chars().count();
-                let chars: Vec<char> = result.chars().collect();
-                if char_offset + pat_char_len > chars.len() {
-                    break;
-                }
-                result = chars[..char_offset].iter().collect::<String>()
-                    + &chars[char_offset + pat_char_len..]
-                        .iter()
-                        .collect::<String>();
-            } else {
-                break;
-            }
-        }
+        let chars: Vec<char> = result.chars().collect();
+        result = remove_all_case_insensitive(&chars, &pat_lower)
+            .into_iter()
+            .collect();
     }
 
     result = replace_dots_with_spaces(&result);
@@ -65,27 +101,67 @@ pub fn cleanup_filename(name: &str, cleanup_strings: &[String]) -> String {
     }
 }
 
+/// Removes every occurrence of `pat_lower` (already-lowercased) from
+/// `s`, together with everything from the start of that occurrence up
+/// to (but not including) the next whitespace character — i.e. "drop
+/// the whole URL-like word". Same result as the old find-one /
+/// remove-one / restart-from-byte-0 loop, but a single left-to-right
+/// pass instead of re-lowercasing and re-scanning the *entire
+/// remaining string* after every removal.
+///
+/// Unlike `remove_all_case_insensitive` above, this doesn't need
+/// stack/cascading logic: every removed span stops right at a
+/// whitespace char (or the string's end), and none of
+/// `COMMENT_URL_PATTERNS` contain whitespace, so a removal can never
+/// glue two non-whitespace runs together and create a *new* pattern
+/// match at the join point. A single forward pass therefore finds
+/// every match a from-scratch restart would have found.
+///
+/// Comment strings are just as attacker-controlled as filenames (any
+/// peer can attach any comment to a shared file), so the same
+/// quadratic-blowup concern applies — a comment packed with many
+/// short "wordN " tokens each starting with one of these patterns
+/// drove the old loop to quadratic time.
+fn remove_url_words_case_insensitive(s: &str, pat_lower: &str) -> String {
+    if pat_lower.is_empty() {
+        return s.to_string();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let lower_chars: Vec<char> = s.to_lowercase().chars().collect();
+    // Case-folding essentially never changes char count for the
+    // ASCII-only patterns here, but if it ever does for some exotic
+    // input, positions in `lower_chars` can't be safely mapped back
+    // onto `chars` — bail out unchanged rather than risk misaligned
+    // indexing.
+    if lower_chars.len() != chars.len() {
+        return s.to_string();
+    }
+    let pat_chars: Vec<char> = pat_lower.chars().collect();
+    let pat_len = pat_chars.len();
+    let n = chars.len();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < n {
+        if i + pat_len <= n && lower_chars[i..i + pat_len] == pat_chars[..] {
+            let mut j = i;
+            while j < n && !chars[j].is_whitespace() {
+                j += 1;
+            }
+            i = j;
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Strip URLs and URL-like patterns from a comment string.
 pub fn strip_comment_urls(comment: &str) -> String {
     let mut result = comment.to_string();
     for pattern in COMMENT_URL_PATTERNS {
         let pat_lower = pattern.to_lowercase();
-        loop {
-            let lower = result.to_lowercase();
-            let Some(lower_start) = lower.find(&pat_lower) else {
-                break;
-            };
-            let char_offset = lower[..lower_start].chars().count();
-            let start: usize = result.chars().take(char_offset).map(|c| c.len_utf8()).sum();
-            if start >= result.len() {
-                break;
-            }
-            let end = result[start..]
-                .find(|c: char| c.is_whitespace())
-                .map(|pos| start + pos)
-                .unwrap_or(result.len());
-            result.replace_range(start..end, "");
-        }
+        result = remove_url_words_case_insensitive(&result, &pat_lower);
     }
     collapse_spaces(&result)
 }
@@ -306,5 +382,57 @@ mod tests {
     fn test_short_bracket_kept() {
         let result = cleanup_filename("Song [HD] remix.mp3", &default_cleanup());
         assert!(result.contains("[HD]"));
+    }
+
+    #[test]
+    fn test_cascading_pattern_removal_matches_naive_fixpoint() {
+        // Removing one match can make the chars on either side
+        // adjacent, forming a *new* match — verify the stack-based
+        // single pass still finds cascaded matches, e.g. "aa" applied
+        // to "aaaa" must fully collapse (a naive single left-to-right
+        // greedy scan without cascading would stop early and leave
+        // "aa" remnants when the removal boundaries don't align this
+        // way, e.g. patterns overlapping at odd offsets).
+        let chars: Vec<char> = "aaaa".chars().collect();
+        let result: String = remove_all_case_insensitive(&chars, "aa")
+            .into_iter()
+            .collect();
+        assert_eq!(result, "");
+
+        let chars: Vec<char> = "aabb".chars().collect();
+        let result: String = remove_all_case_insensitive(&chars, "ab")
+            .into_iter()
+            .collect();
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_many_repeated_patterns_still_fully_removed() {
+        // Regression test for the O(N^2) blowup (C3): a filename
+        // stuffed with thousands of repeated cleanup-pattern instances
+        // used to make `cleanup_filename` quadratic in length. This
+        // both checks correctness (every instance is still removed)
+        // and, since the test suite has an overall timeout, implicitly
+        // guards against the quadratic behaviour regressing.
+        let stem = "www.".repeat(5000);
+        let name = format!("{stem}real_title.mp3");
+        let result = cleanup_filename(&name, &default_cleanup());
+        assert!(!result.to_lowercase().contains("www"));
+        assert!(result.contains("Real Title"));
+    }
+
+    #[test]
+    fn test_strip_comment_urls_many_tokens() {
+        // Many separate short URL-like tokens in a row — regression
+        // test for the same O(N^2) blowup class in
+        // `strip_comment_urls`.
+        let mut comment = String::new();
+        for i in 0..5000 {
+            comment.push_str(&format!("www.spam{i}.com "));
+        }
+        comment.push_str("this part should survive");
+        let result = strip_comment_urls(&comment);
+        assert!(!result.to_lowercase().contains("www"));
+        assert!(result.contains("this part should survive"));
     }
 }

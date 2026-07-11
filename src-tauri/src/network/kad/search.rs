@@ -1141,6 +1141,16 @@ impl SearchManager {
         )
     }
 
+    fn search_importance(search_type: SearchType) -> u8 {
+        match search_type {
+            SearchType::StoreFile | SearchType::StoreKeyword | SearchType::StoreNotes => 0,
+            SearchType::FindNode | SearchType::FindBuddy => 1,
+            SearchType::FindKeyword
+            | SearchType::FindSource { .. }
+            | SearchType::FindNotes { .. } => 2,
+        }
+    }
+
     pub fn new() -> Self {
         SearchManager {
             next_id: 1,
@@ -1168,8 +1178,11 @@ impl SearchManager {
             }
         }
 
-        // Prevent search storms: if too many active searches, evict oldest completed ones
-        // and reject low-priority new searches.
+        // Prevent search storms. Completed rows do not count toward
+        // `active_count`, so evicting only those could never make room at the
+        // active cap. Reap them first for memory hygiene, then evict the
+        // oldest least-important live search when it is no more important
+        // than the new request.
         const MAX_ACTIVE_SEARCHES: usize = 20;
         let active = self.active_count();
         if active >= MAX_ACTIVE_SEARCHES {
@@ -1192,11 +1205,42 @@ impl SearchManager {
                 }
             }
             if self.active_count() >= MAX_ACTIVE_SEARCHES {
-                debug!(
-                    "Rejecting search ({search_type:?}): {} active searches at cap",
-                    self.active_count()
-                );
-                return SearchId(0);
+                let new_importance = Self::search_importance(search_type);
+                let eviction = self
+                    .active
+                    .iter()
+                    .filter(|(_, state)| {
+                        !state.completed
+                            && Self::search_importance(state.search_type) <= new_importance
+                    })
+                    .min_by_key(|(_, state)| {
+                        (
+                            Self::search_importance(state.search_type),
+                            state.started_at,
+                            state.id.0,
+                        )
+                    })
+                    .map(|(id, _)| *id);
+
+                if let Some(id) = eviction {
+                    if let Some(state) = self.active.remove(&id) {
+                        let old_key = (state.target, state.search_type.kind());
+                        if self.target_map.get(&old_key) == Some(&id) {
+                            self.target_map.remove(&old_key);
+                        }
+                        self.pending_release.extend(state.in_use_ids);
+                        debug!(
+                            "Evicted oldest lower/equal-priority search {} ({:?}) to start {:?}",
+                            id.0, state.search_type, search_type
+                        );
+                    }
+                } else {
+                    debug!(
+                        "Rejecting search ({search_type:?}): {} more-important active searches at cap",
+                        self.active_count()
+                    );
+                    return SearchId(0);
+                }
             }
         }
 

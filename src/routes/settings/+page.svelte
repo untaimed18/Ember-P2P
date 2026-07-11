@@ -275,6 +275,33 @@
     if (!s.download_folder.trim()) {
       return { error: m.settings_validation_folder_empty(), adjusted: false };
     }
+    s.rendezvous_url = s.rendezvous_url.trim();
+    if (new TextEncoder().encode(s.rendezvous_url).length > 2048) {
+      return {
+        error: m.error_settings_rendezvous_url_too_long({ detail: '2048' }),
+        adjusted: false,
+      };
+    }
+    if (s.rendezvous_url) {
+      let rendezvous: URL;
+      try {
+        rendezvous = new URL(s.rendezvous_url);
+      } catch {
+        return { error: m.error_settings_rendezvous_url_no_host(), adjusted: false };
+      }
+      if (rendezvous.protocol !== 'https:') {
+        return { error: m.error_settings_rendezvous_url_not_https(), adjusted: false };
+      }
+      if (!rendezvous.hostname) {
+        return { error: m.error_settings_rendezvous_url_no_host(), adjusted: false };
+      }
+      if (rendezvous.username || rendezvous.password) {
+        return {
+          error: m.error_settings_rendezvous_url_has_credentials(),
+          adjusted: false,
+        };
+      }
+    }
     let adjusted = false;
     // Thin wrappers around the shared clamp helpers that additionally flag
     // `adjusted` when the clamped result differs from what was actually
@@ -351,7 +378,8 @@
       // values so runtime consumers (friend online-notification toast, chat
       // "disabled" state) react immediately instead of next launch.
       setAppSettings(toSave);
-      originalSettings = snapshot;
+      settings.settings_revision = toSave.settings_revision;
+      originalSettings = JSON.stringify(toSave);
       // `validation.adjusted` means at least one numeric field was outside
       // its valid range and got silently clamped by `validateSettings`
       // above — surface that alongside the normal save result instead of
@@ -760,6 +788,47 @@
     settings.close_to_tray_behavior = behavior;
   }
 
+  function handleRadioGroupKey(
+    event: KeyboardEvent,
+    values: string[],
+    current: string,
+    select: (value: string) => void,
+  ) {
+    let nextIndex: number;
+    const currentIndex = Math.max(0, values.indexOf(current));
+    switch (event.key) {
+      case 'ArrowRight':
+      case 'ArrowDown':
+        nextIndex = (currentIndex + 1) % values.length;
+        break;
+      case 'ArrowLeft':
+      case 'ArrowUp':
+        nextIndex = (currentIndex - 1 + values.length) % values.length;
+        break;
+      case 'Home':
+        nextIndex = 0;
+        break;
+      case 'End':
+        nextIndex = values.length - 1;
+        break;
+      default:
+        return;
+    }
+    event.preventDefault();
+    const next = values[nextIndex];
+    select(next);
+    const group = (event.currentTarget as HTMLElement).closest('[role="radiogroup"]');
+    requestAnimationFrame(() => {
+      const radios = group?.querySelectorAll<HTMLElement>('[role="radio"]') ?? [];
+      Array.from(radios)
+        .find((radio) => radio.dataset.radioValue === next)
+        ?.focus();
+    });
+  }
+
+  const languageRadioValues = ['system', ...locales];
+  const closeBehaviorValues = ['ask', 'tray', 'exit'];
+
   $effect(() => {
     activeSection;
     untrack(() => {
@@ -946,10 +1015,19 @@
               <button
                 type="button"
                 role="radio"
+                data-radio-value="system"
+                tabindex={followingSystem ? 0 : -1}
                 aria-checked={followingSystem}
                 class="behavior-card lang-card"
                 class:selected={followingSystem}
                 onclick={pickSystemLocale}
+                onkeydown={(e) =>
+                  handleRadioGroupKey(
+                    e,
+                    languageRadioValues,
+                    followingSystem ? 'system' : currentLocale,
+                    (value) => value === 'system' ? pickSystemLocale() : pickLocale(value as Locale),
+                  )}
               >
                 <span class="behavior-title">{m.settings_language_system()}</span>
                 <span class="behavior-desc">{languageLabel(systemPreviewLocale)}</span>
@@ -959,10 +1037,19 @@
                 <button
                   type="button"
                   role="radio"
+                  data-radio-value={loc}
+                  tabindex={!followingSystem && currentLocale === loc ? 0 : -1}
                   aria-checked={!followingSystem && currentLocale === loc}
                   class="behavior-card lang-card"
                   class:selected={!followingSystem && currentLocale === loc}
                   onclick={() => pickLocale(loc)}
+                  onkeydown={(e) =>
+                    handleRadioGroupKey(
+                      e,
+                      languageRadioValues,
+                      followingSystem ? 'system' : currentLocale,
+                      (value) => value === 'system' ? pickSystemLocale() : pickLocale(value as Locale),
+                    )}
                 >
                   <span class="behavior-title">{languageLabel(loc)}</span>
                   <span class="behavior-desc">{loc.toUpperCase()}</span>
@@ -991,10 +1078,19 @@
               <button
                 type="button"
                 role="radio"
+                data-radio-value="ask"
+                tabindex={settings.close_to_tray_behavior === 'ask' ? 0 : -1}
                 aria-checked={settings.close_to_tray_behavior === 'ask'}
                 class="behavior-card"
                 class:selected={settings.close_to_tray_behavior === 'ask'}
                 onclick={() => pickCloseBehavior('ask')}
+                onkeydown={(e) =>
+                  handleRadioGroupKey(
+                    e,
+                    closeBehaviorValues,
+                    settings?.close_to_tray_behavior ?? 'ask',
+                    (value) => pickCloseBehavior(value as 'ask' | 'tray' | 'exit'),
+                  )}
               >
                 <span class="behavior-icon" aria-hidden="true">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
@@ -1011,10 +1107,19 @@
               <button
                 type="button"
                 role="radio"
+                data-radio-value="tray"
+                tabindex={settings.close_to_tray_behavior === 'tray' ? 0 : -1}
                 aria-checked={settings.close_to_tray_behavior === 'tray'}
                 class="behavior-card"
                 class:selected={settings.close_to_tray_behavior === 'tray'}
                 onclick={() => pickCloseBehavior('tray')}
+                onkeydown={(e) =>
+                  handleRadioGroupKey(
+                    e,
+                    closeBehaviorValues,
+                    settings?.close_to_tray_behavior ?? 'ask',
+                    (value) => pickCloseBehavior(value as 'ask' | 'tray' | 'exit'),
+                  )}
               >
                 <span class="behavior-icon" aria-hidden="true">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
@@ -1032,10 +1137,19 @@
               <button
                 type="button"
                 role="radio"
+                data-radio-value="exit"
+                tabindex={settings.close_to_tray_behavior === 'exit' ? 0 : -1}
                 aria-checked={settings.close_to_tray_behavior === 'exit'}
                 class="behavior-card"
                 class:selected={settings.close_to_tray_behavior === 'exit'}
                 onclick={() => pickCloseBehavior('exit')}
+                onkeydown={(e) =>
+                  handleRadioGroupKey(
+                    e,
+                    closeBehaviorValues,
+                    settings?.close_to_tray_behavior ?? 'ask',
+                    (value) => pickCloseBehavior(value as 'ask' | 'tray' | 'exit'),
+                  )}
               >
                 <span class="behavior-icon" aria-hidden="true">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
@@ -1086,6 +1200,36 @@
             <label for="max-dl-gib">{m.settings_max_file_size_label()}</label>
             <input id="max-dl-gib" type="number" min="1" max="16384" bind:value={settings.max_download_file_size_gib} />
             <span class="hint">{m.settings_max_file_size_hint()}</span>
+          </div>
+
+          <div class="field-row">
+            <div class="field half">
+              <label for="max-sources-per-file">{m.settings_max_sources_per_file_label()}</label>
+              <input id="max-sources-per-file" type="number" min="1" max="2000" bind:value={settings.max_sources_per_file} />
+              <span class="hint">{m.settings_max_sources_per_file_hint()}</span>
+            </div>
+            <div class="field half">
+              <label for="max-connections">{m.settings_max_connections_label()}</label>
+              <input id="max-connections" type="number" min="1" max="2000" bind:value={settings.max_connections} />
+              <span class="hint">{m.settings_max_connections_hint()}</span>
+            </div>
+          </div>
+          <div class="field">
+            <label for="download-queue-wait">{m.settings_download_queue_wait_label()}</label>
+            <input id="download-queue-wait" type="number" min="60" max="14400" bind:value={settings.download_queue_wait_secs} />
+            <span class="hint">{m.settings_download_queue_wait_hint()}</span>
+          </div>
+          <div class="field-row">
+            <div class="field half">
+              <label for="multisource-retries">{m.settings_multisource_retries_label()}</label>
+              <input id="multisource-retries" type="number" min="1" max="20" bind:value={settings.multisource_retry_rounds} />
+              <span class="hint">{m.settings_multisource_retries_hint()}</span>
+            </div>
+            <div class="field half">
+              <label for="download-part-retries">{m.settings_download_part_retries_label()}</label>
+              <input id="download-part-retries" type="number" min="1" max="20" bind:value={settings.download_part_retry_rounds} />
+              <span class="hint">{m.settings_download_part_retries_hint()}</span>
+            </div>
           </div>
 
           <div class="field toggle-row">
@@ -1580,6 +1724,18 @@
             <label for="max-friends">{m.settings_max_friends_label()}</label>
             <input id="max-friends" type="number" min="1" max="500" bind:value={settings.max_friends} />
             <span class="hint">{m.settings_max_friends_hint()}</span>
+          </div>
+          <div class="field">
+            <label for="rendezvous-url">{m.settings_rendezvous_url_label()}</label>
+            <input
+              id="rendezvous-url"
+              type="url"
+              maxlength="2048"
+              bind:value={settings.rendezvous_url}
+              placeholder={m.settings_rendezvous_url_placeholder()}
+              spellcheck="false"
+            />
+            <span class="hint">{m.settings_rendezvous_url_hint()}</span>
           </div>
 
         </div>

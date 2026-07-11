@@ -29,6 +29,20 @@ impl Drop for ScanGuard {
 
 static RELOAD_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+async fn remove_cancel_flag_if_current(
+    flags: &Arc<RwLock<std::collections::HashMap<String, Arc<AtomicBool>>>>,
+    key: &str,
+    ours: &Arc<AtomicBool>,
+) {
+    let mut flags = flags.write().await;
+    if flags
+        .get(key)
+        .is_some_and(|current| Arc::ptr_eq(current, ours))
+    {
+        flags.remove(key);
+    }
+}
+
 use crate::app_state::AppState;
 use crate::commands::errors::{coded, coded_ctx};
 use crate::network::NetworkCommand;
@@ -255,6 +269,7 @@ pub async fn add_shared_folder(
     // Case-insensitive on Windows: `Vec::contains` is case-sensitive, so adding
     // `C:\Media` then `c:\media` would store both, double-scan, and make later
     // unshare/remove (which use paths_equal_ignore_case) inconsistent.
+    let settings_save_guard = state.settings_save_lock.lock().await;
     let save_data = {
         let config = state.config.read().await;
         if config
@@ -267,6 +282,7 @@ pub async fn add_shared_folder(
         } else {
             let mut new_settings = config.settings.clone();
             new_settings.shared_folders.push(canonical_str.clone());
+            new_settings.settings_revision = config.settings.settings_revision.saturating_add(1);
             Some(
                 config
                     .prepare_save_settings(&new_settings)
@@ -297,7 +313,9 @@ pub async fn add_shared_folder(
         {
             config.settings.shared_folders.push(canonical_str.clone());
         }
+        config.settings.settings_revision = config.settings.settings_revision.saturating_add(1);
     }
+    drop(settings_save_guard);
     {
         let mut live = state.upload_shared_folders.write().await;
         if !live
@@ -318,6 +336,7 @@ pub async fn add_shared_folder(
     let file_cache = state.cached_shared_files.clone();
     let network_tx = state.network_tx.clone();
     let scanning = state.scanning_count.clone();
+    let scan_coordination = state.scan_coordination.clone();
     let cancel_flags = state.hash_cancel_flags.clone();
     let fresh_part_hashes = state.fresh_part_hashes.clone();
     let config = state.config.clone();
@@ -330,6 +349,7 @@ pub async fn add_shared_folder(
         .insert(cancel_key.clone(), cancel_flag.clone());
 
     let scan_handle = tokio::spawn(async move {
+        let _coordination_guard = scan_coordination.lock().await;
         scanning.fetch_add(1, Ordering::Relaxed);
         let _scan_guard = ScanGuard(scanning.clone());
 
@@ -342,7 +362,7 @@ pub async fn add_shared_folder(
             Ok(result) => result,
             Err(e) => {
                 tracing::error!("Discovery failed for {path}: {e}");
-                cancel_flags.write().await.remove(&cancel_key);
+                remove_cancel_flag_if_current(&cancel_flags, &cancel_key, &cancel_flag).await;
                 return;
             }
         };
@@ -362,7 +382,7 @@ pub async fn add_shared_folder(
         };
         if cancel_flag.load(Ordering::Relaxed) || !still_shared {
             info!("Hashing cancelled during discovery for {path}");
-            cancel_flags.write().await.remove(&cancel_key);
+            remove_cancel_flag_if_current(&cancel_flags, &cancel_key, &cancel_flag).await;
             let _ = app.emit(
                 "file-hash-progress",
                 serde_json::json!({ "done": true, "current": 0, "total": 0, "file_name": "" }),
@@ -384,7 +404,7 @@ pub async fn add_shared_folder(
             if cancel_flag.load(Ordering::Relaxed) {
                 drop(index);
                 info!("Hashing cancelled before indexing for {path}");
-                cancel_flags.write().await.remove(&cancel_key);
+                remove_cancel_flag_if_current(&cancel_flags, &cancel_key, &cancel_flag).await;
                 let _ = app.emit(
                     "file-hash-progress",
                     serde_json::json!({ "done": true, "current": 0, "total": 0, "file_name": "" }),
@@ -445,7 +465,13 @@ pub async fn add_shared_folder(
             .await;
 
             match hash_result {
-                Ok(Ok(Ok((ed2k_hash, aich_hash, part_hashes)))) => {
+                Ok(Ok(Ok((
+                    ed2k_hash,
+                    aich_hash,
+                    part_hashes,
+                    hashed_size,
+                    hashed_modified_at,
+                )))) => {
                     debug!(
                         "Hash complete: {} -> {}",
                         file.name,
@@ -455,6 +481,8 @@ pub async fn add_shared_folder(
                     updated_file.id = ed2k_hash.clone();
                     updated_file.hash = ed2k_hash;
                     updated_file.aich_hash = aich_hash;
+                    updated_file.size = hashed_size;
+                    updated_file.modified_at = hashed_modified_at;
 
                     let still_shared = {
                         let cfg = config.read().await;
@@ -555,7 +583,7 @@ pub async fn add_shared_folder(
         if let Err(e) = network_tx.try_send(NetworkCommand::SharedFilesChanged) {
             warn!("Failed to queue SharedFilesChanged: {e}");
         }
-        cancel_flags.write().await.remove(&cancel_key);
+        remove_cancel_flag_if_current(&cancel_flags, &cancel_key, &cancel_flag).await;
 
         let from_known = total_files.saturating_sub(total_to_hash);
         if was_cancelled {
@@ -634,34 +662,27 @@ pub async fn remove_shared_folder(
     // Use `canonical_path` for every comparison.
     {
         let flags = state.hash_cancel_flags.read().await;
-        for (key, flag) in flags.iter() {
-            if paths_equal_ignore_case(key, &canonical_path) {
-                flag.store(true, Ordering::Relaxed);
-            }
+        // Scans are single-flight. Cancel whichever generation currently owns
+        // the scan guard (startup/reload/per-folder), then wait for it below
+        // before removing index entries. Path-only cancellation missed the
+        // synthetic `__startup__`/`__reload_*` keys and allowed a late scan
+        // write to resurrect this folder.
+        for flag in flags.values() {
+            flag.store(true, Ordering::Relaxed);
         }
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
-    loop {
-        let still_active = state
-            .hash_cancel_flags
-            .read()
-            .await
-            .keys()
-            .any(|key| paths_equal_ignore_case(key, &canonical_path));
-        if !still_active || std::time::Instant::now() >= deadline {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
+    let scan_coordination_guard = state.scan_coordination.lock().await;
 
     // Persist the removal to disk before committing it in-memory or to the live
     // upload list, so a failed write can't drop a folder that's still saved.
+    let settings_save_guard = state.settings_save_lock.lock().await;
     let save_data = {
         let config = state.config.read().await;
         let mut new_settings = config.settings.clone();
         new_settings
             .shared_folders
             .retain(|f| !paths_equal_ignore_case(f, &canonical_path));
+        new_settings.settings_revision = config.settings.settings_revision.saturating_add(1);
         config
             .prepare_save_settings(&new_settings)
             .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?
@@ -681,7 +702,9 @@ pub async fn remove_shared_folder(
             .settings
             .shared_folders
             .retain(|f| !paths_equal_ignore_case(f, &canonical_path));
+        config.settings.settings_revision = config.settings.settings_revision.saturating_add(1);
     }
+    drop(settings_save_guard);
     {
         let mut live = state.upload_shared_folders.write().await;
         live.retain(|f| !paths_equal_ignore_case(f, &canonical_path));
@@ -692,6 +715,7 @@ pub async fn remove_shared_folder(
         index.remove_files_by_path_prefix(&canonical_path);
     }
     refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
+    drop(scan_coordination_guard);
 
     // Stop watching the removed folder.
     if let Some(watcher) = state.shared_folder_watcher.as_ref() {
@@ -859,6 +883,7 @@ pub async fn set_folder_priority(
             ));
         }
     }
+    let settings_save_guard = state.settings_save_lock.lock().await;
     {
         let config = state.config.read().await;
         if !config
@@ -887,6 +912,7 @@ pub async fn set_folder_priority(
                 .folder_priorities
                 .insert(folder_path.clone(), priority.clone());
         }
+        new_settings.settings_revision = config.settings.settings_revision.saturating_add(1);
         config
             .prepare_save_settings(&new_settings)
             .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?
@@ -912,7 +938,9 @@ pub async fn set_folder_priority(
                 .folder_priorities
                 .insert(folder_path.clone(), priority.clone());
         }
+        config.settings.settings_revision = config.settings.settings_revision.saturating_add(1);
     }
+    drop(settings_save_guard);
     // Clearing only stops the default from being re-applied; existing files
     // keep whatever priority they currently have.
     if clearing {
@@ -1177,6 +1205,7 @@ pub async fn reload_shared_files(
     let file_cache = state.cached_shared_files.clone();
     let network_tx = state.network_tx.clone();
     let scanning = state.scanning_count.clone();
+    let scan_coordination = state.scan_coordination.clone();
     let cancel_flags = state.hash_cancel_flags.clone();
     let fresh_part_hashes = state.fresh_part_hashes.clone();
     let config = state.config.clone();
@@ -1203,6 +1232,7 @@ pub async fn reload_shared_files(
     }
 
     let scan_handle = tokio::spawn(async move {
+        let _coordination_guard = scan_coordination.lock().await;
         scanning.fetch_add(1, Ordering::Relaxed);
         let _scan_guard = ScanGuard(scanning.clone());
 
@@ -1222,7 +1252,7 @@ pub async fn reload_shared_files(
                 Ok(result) => result,
                 Err(e) => {
                     tracing::error!("Reload discovery failed: {e}");
-                    cancel_flags.write().await.remove(&reload_key);
+                    remove_cancel_flag_if_current(&cancel_flags, &reload_key, &cancel_flag).await;
                     return;
                 }
             };
@@ -1251,7 +1281,7 @@ pub async fn reload_shared_files(
 
         if cancel_flag.load(Ordering::Relaxed) {
             info!("Reload cancelled during discovery");
-            cancel_flags.write().await.remove(&reload_key);
+            remove_cancel_flag_if_current(&cancel_flags, &reload_key, &cancel_flag).await;
             let _ = app.emit(
                 "file-hash-progress",
                 serde_json::json!({ "done": true, "current": 0, "total": 0, "file_name": "" }),
@@ -1317,7 +1347,13 @@ pub async fn reload_shared_files(
             .await;
 
             match hash_result {
-                Ok(Ok(Ok((ed2k_hash, aich_hash, part_hashes)))) => {
+                Ok(Ok(Ok((
+                    ed2k_hash,
+                    aich_hash,
+                    part_hashes,
+                    hashed_size,
+                    hashed_modified_at,
+                )))) => {
                     debug!(
                         "Reload hash complete: {} -> {}",
                         file.name,
@@ -1327,6 +1363,8 @@ pub async fn reload_shared_files(
                     updated_file.id = ed2k_hash.clone();
                     updated_file.hash = ed2k_hash;
                     updated_file.aich_hash = aich_hash;
+                    updated_file.size = hashed_size;
+                    updated_file.modified_at = hashed_modified_at;
 
                     let still_shared = {
                         let cfg = config.read().await;
@@ -1424,7 +1462,7 @@ pub async fn reload_shared_files(
         if let Err(e) = network_tx.try_send(NetworkCommand::SharedFilesChanged) {
             warn!("Failed to queue SharedFilesChanged on reload: {e}");
         }
-        cancel_flags.write().await.remove(&reload_key);
+        remove_cancel_flag_if_current(&cancel_flags, &reload_key, &cancel_flag).await;
 
         let from_known = total_files.saturating_sub(total_to_hash);
         info!(

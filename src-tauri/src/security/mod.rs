@@ -621,8 +621,7 @@ pub fn atomic_write(final_path: &Path, data: &[u8], restrict: bool) -> std::io::
             // replacement, and only then drop the backup. On any failure we
             // restore the original, so the destination is never lost.
             let _ = e;
-            let backup = final_path.with_extension("ember-replace-bak");
-            let _ = std::fs::remove_file(&backup);
+            let backup = unique_tmp_path(final_path).with_extension("ember-replace-bak");
             match std::fs::rename(final_path, &backup) {
                 Ok(()) => {
                     if let Err(retry_err) = std::fs::rename(&tmp, final_path) {
@@ -746,7 +745,7 @@ pub fn sanitize_filename(name: &str) -> String {
         .chars()
         .map(|c| match c {
             '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            c if c.is_control() => '_',
+            c if c.is_control() || is_invisible_or_bidi_control(c) => '_',
             c => c,
         })
         .collect::<String>();

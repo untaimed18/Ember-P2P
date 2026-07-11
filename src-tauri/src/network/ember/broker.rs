@@ -439,12 +439,7 @@ impl ConnectionBroker {
         self.relay_candidates
             .iter()
             .filter(|c| c.last_seen.elapsed() < stale_threshold)
-            .min_by_key(|c| {
-                (
-                    c.relay_sessions,
-                    std::cmp::Reverse(c.last_seen.elapsed().as_secs()),
-                )
-            })
+            .min_by_key(|c| (c.relay_sessions, c.last_seen.elapsed().as_secs()))
     }
 
     /// Clean up expired attempts. Called periodically from the main loop.

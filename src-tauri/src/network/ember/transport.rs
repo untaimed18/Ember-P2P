@@ -39,6 +39,11 @@ const MAX_SESSIONS: usize = 4096;
 
 /// Maximum concurrent pending handshakes.
 const MAX_PENDING: usize = 512;
+const DECRYPT_FAILURE_THRESHOLD: u8 = 2;
+const DECRYPT_FAILURE_WINDOW: Duration = Duration::from_secs(10);
+const RECOVERY_COOLDOWN: Duration = Duration::from_secs(30);
+const HANDSHAKE_REPLAY_WINDOW: Duration = Duration::from_secs(30);
+const MAX_RECENT_HANDSHAKES: usize = 4096;
 
 /// Largest Ember UDP datagram we will parse. Valid Noise handshake and
 /// transport packets are far smaller than this; the cap prevents an oversized
@@ -50,6 +55,8 @@ struct NoiseSession {
     transport: snow::TransportState,
     remote_noise_pub: [u8; 32],
     last_activity: Instant,
+    decrypt_failures: u8,
+    last_decrypt_failure: Option<Instant>,
 }
 
 /// In-progress handshake awaiting a response.
@@ -250,6 +257,8 @@ pub struct EmberTransport {
     local_noise_pub: [u8; 32],
     sessions: HashMap<SocketAddr, NoiseSession>,
     pending: HashMap<SocketAddr, PendingHandshake>,
+    last_recovery: HashMap<SocketAddr, Instant>,
+    recent_handshakes: HashMap<SocketAddr, ([u8; 32], Instant)>,
 }
 
 impl EmberTransport {
@@ -259,6 +268,8 @@ impl EmberTransport {
             local_noise_pub,
             sessions: HashMap::new(),
             pending: HashMap::new(),
+            last_recovery: HashMap::new(),
+            recent_handshakes: HashMap::new(),
         }
     }
 
@@ -307,6 +318,33 @@ impl EmberTransport {
 
         let pkt_type = data[2];
         let payload = &data[HEADER_LEN..];
+
+        // Reject exact initiation replays without blocking legitimate
+        // same-key refreshes: every real Noise initiation carries a fresh
+        // ephemeral and therefore a distinct ciphertext fingerprint.
+        if matches!(pkt_type, PKT_IK_INIT | PKT_XX_MSG1) {
+            let fingerprint = *blake3::hash(data).as_bytes();
+            if self.recent_handshakes.get(&from).is_some_and(|(seen, at)| {
+                *seen == fingerprint && at.elapsed() < HANDSHAKE_REPLAY_WINDOW
+            }) {
+                debug!("Ignoring replayed Ember handshake initiation from {from}");
+                return IncomingResult::Rejected;
+            }
+            if !self.recent_handshakes.contains_key(&from)
+                && self.recent_handshakes.len() >= MAX_RECENT_HANDSHAKES
+            {
+                if let Some(oldest) = self
+                    .recent_handshakes
+                    .iter()
+                    .min_by_key(|(_, (_, at))| *at)
+                    .map(|(addr, _)| *addr)
+                {
+                    self.recent_handshakes.remove(&oldest);
+                }
+            }
+            self.recent_handshakes
+                .insert(from, (fingerprint, Instant::now()));
+        }
 
         match pkt_type {
             PKT_IK_INIT => self.handle_ik_init(from, payload),
@@ -401,6 +439,10 @@ impl EmberTransport {
             };
             now.duration_since(created) < Duration::from_secs(30)
         });
+        self.last_recovery
+            .retain(|_, at| now.duration_since(*at) < SESSION_TIMEOUT);
+        self.recent_handshakes
+            .retain(|_, (_, at)| now.duration_since(*at) < HANDSHAKE_REPLAY_WINDOW);
     }
 
     /// Remove an existing session for a peer (e.g., on disconnect).
@@ -418,6 +460,8 @@ impl EmberTransport {
     pub fn cleanup_all(&mut self) {
         self.sessions.clear();
         self.pending.clear();
+        self.last_recovery.clear();
+        self.recent_handshakes.clear();
     }
 
     /// Drive the Noise state machine for an inbound UDP packet and
@@ -621,6 +665,8 @@ impl EmberTransport {
                 transport,
                 remote_noise_pub,
                 last_activity: Instant::now(),
+                decrypt_failures: 0,
+                last_decrypt_failure: None,
             },
         );
         // Clear any stale pending handshake for this address (e.g. an
@@ -707,6 +753,8 @@ impl EmberTransport {
                 transport,
                 remote_noise_pub,
                 last_activity: Instant::now(),
+                decrypt_failures: 0,
+                last_decrypt_failure: None,
             },
         );
         trace!("IK handshake completed (initiator) with {from}");
@@ -885,6 +933,8 @@ impl EmberTransport {
                 transport,
                 remote_noise_pub,
                 last_activity: Instant::now(),
+                decrypt_failures: 0,
+                last_decrypt_failure: None,
             },
         );
         trace!("XX handshake completed (initiator) with {from}");
@@ -984,6 +1034,8 @@ impl EmberTransport {
                 transport,
                 remote_noise_pub,
                 last_activity: Instant::now(),
+                decrypt_failures: 0,
+                last_decrypt_failure: None,
             },
         );
         trace!(
@@ -1008,28 +1060,90 @@ impl EmberTransport {
     // ── Transport (post-handshake encrypted messages) ──
 
     fn handle_transport(&mut self, from: SocketAddr, data: &[u8]) -> IncomingResult {
-        let session = match self.sessions.get_mut(&from) {
-            Some(s) => s,
+        let mut payload_buf = vec![0u8; data.len()];
+        let decrypt_result = match self.sessions.get_mut(&from) {
+            Some(session) => {
+                let remote_noise_pub = session.remote_noise_pub;
+                match session.transport.read_message(data, &mut payload_buf) {
+                    Ok(len) => {
+                        session.last_activity = Instant::now();
+                        session.decrypt_failures = 0;
+                        session.last_decrypt_failure = None;
+                        Ok((len, remote_noise_pub))
+                    }
+                    Err(e) => {
+                        let now = Instant::now();
+                        session.decrypt_failures = if session
+                            .last_decrypt_failure
+                            .is_some_and(|at| now.duration_since(at) <= DECRYPT_FAILURE_WINDOW)
+                        {
+                            session.decrypt_failures.saturating_add(1)
+                        } else {
+                            1
+                        };
+                        session.last_decrypt_failure = Some(now);
+                        Err((e, remote_noise_pub, session.decrypt_failures))
+                    }
+                }
+            }
             None => {
                 debug!("Ember transport packet from {from} with no session");
                 return IncomingResult::Rejected;
             }
         };
 
-        let mut payload_buf = vec![0u8; data.len()];
-        match session.transport.read_message(data, &mut payload_buf) {
-            Ok(len) => {
-                session.last_activity = Instant::now();
-                IncomingResult::Message {
-                    from,
-                    remote_noise_pub: session.remote_noise_pub,
-                    payload: payload_buf[..len].to_vec(),
+        match decrypt_result {
+            Ok((len, remote_noise_pub)) => IncomingResult::Message {
+                from,
+                remote_noise_pub,
+                payload: payload_buf[..len].to_vec(),
+            },
+            Err((e, remote_noise_pub, failures)) => {
+                debug!(
+                    "Ember transport decrypt failed from {from}: {e} \
+                     (consecutive failures: {failures})"
+                );
+                // One forged/replayed datagram must not tear down an
+                // authenticated session. A real nonce gap will make the next
+                // legitimate packet fail too, reaching this threshold and
+                // triggering the existing automatic IK recovery.
+                if failures < DECRYPT_FAILURE_THRESHOLD {
+                    return IncomingResult::Rejected;
                 }
-            }
-            Err(e) => {
-                debug!("Ember transport decrypt failed from {from}: {e}");
+                if self
+                    .last_recovery
+                    .get(&from)
+                    .is_some_and(|at| at.elapsed() < RECOVERY_COOLDOWN)
+                {
+                    debug!("Rate-limiting Ember transport recovery for {from}");
+                    return IncomingResult::Rejected;
+                }
+                self.last_recovery.insert(from, Instant::now());
                 self.sessions.remove(&from);
-                IncomingResult::Rejected
+                self.pending.remove(&from);
+
+                // Noise transport nonces are implicit and strictly ordered.
+                // A lost/reordered UDP datagram therefore invalidates this
+                // session, but it must not leave Ember control traffic dead
+                // until a manual retry. We already authenticated and retained
+                // the peer's static Noise key, so immediately begin a fresh IK
+                // handshake. This changes only Ember-native recovery behavior;
+                // eD2K/KAD packet framing never enters this transport.
+                match self.start_ik_handshake(from, &remote_noise_pub, &[]) {
+                    OutgoingResult::HandshakeStarted { packet } => {
+                        IncomingResult::HandshakeResponse {
+                            to: from,
+                            packets: vec![packet],
+                        }
+                    }
+                    OutgoingResult::Error(start_err) => {
+                        debug!("Ember transport re-handshake failed for {from}: {start_err}");
+                        IncomingResult::Rejected
+                    }
+                    OutgoingResult::Ready { .. } | OutgoingResult::Queued => {
+                        IncomingResult::Rejected
+                    }
+                }
             }
         }
     }
@@ -1159,6 +1273,71 @@ mod tests {
             }
             _ => panic!("expected Message"),
         }
+    }
+
+    #[test]
+    fn dropped_transport_packet_triggers_ik_recovery() {
+        let (alice_priv, alice_pub) = make_keypair();
+        let (bob_priv, bob_pub) = make_keypair();
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        let init = match alice.prepare_outgoing(bob_addr, Some(&bob_pub), b"bootstrap") {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            _ => panic!("expected IK start"),
+        };
+        let response = match bob.process_incoming(&init, alice_addr) {
+            IncomingResult::HandshakeComplete {
+                packets_to_send, ..
+            } => packets_to_send,
+            _ => panic!("expected IK responder completion"),
+        };
+        assert!(matches!(
+            alice.process_incoming(&response[0], bob_addr),
+            IncomingResult::HandshakeComplete { .. }
+        ));
+
+        // Drop nonce N, then deliver nonce N+1. Bob cannot decrypt it with
+        // Noise's implicit UDP nonce and should answer with a fresh IK init.
+        assert!(matches!(
+            alice.prepare_outgoing(bob_addr, Some(&bob_pub), b"dropped"),
+            OutgoingResult::Ready { .. }
+        ));
+        let after_gap = match alice.prepare_outgoing(bob_addr, Some(&bob_pub), b"after gap") {
+            OutgoingResult::Ready { packet } => packet,
+            _ => panic!("expected established transport packet"),
+        };
+        assert!(matches!(
+            bob.process_incoming(&after_gap, alice_addr),
+            IncomingResult::Rejected
+        ));
+        assert!(
+            bob.has_session(&alice_addr),
+            "one unauthenticated failure must not tear down the session"
+        );
+        let after_gap_again =
+            match alice.prepare_outgoing(bob_addr, Some(&bob_pub), b"after gap again") {
+                OutgoingResult::Ready { packet } => packet,
+                _ => panic!("expected established transport packet"),
+            };
+        let recovery_init = match bob.process_incoming(&after_gap_again, alice_addr) {
+            IncomingResult::HandshakeResponse { packets, .. } => packets,
+            _ => panic!("sustained nonce gap must trigger an IK recovery handshake"),
+        };
+        let recovery_response = match alice.process_incoming(&recovery_init[0], bob_addr) {
+            IncomingResult::HandshakeComplete {
+                packets_to_send, ..
+            } => packets_to_send,
+            _ => panic!("existing peer must accept same-key IK refresh"),
+        };
+        assert!(matches!(
+            bob.process_incoming(&recovery_response[0], alice_addr),
+            IncomingResult::HandshakeComplete { .. }
+        ));
+        assert!(alice.has_session(&bob_addr));
+        assert!(bob.has_session(&alice_addr));
     }
 
     #[test]

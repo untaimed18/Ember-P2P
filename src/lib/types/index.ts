@@ -381,6 +381,10 @@ export interface AppSettings {
    *  cleared. Defaults to true. */
   save_search_history: boolean;
   setup_complete: boolean;
+  /** Internal migration marker; preserve when round-tripping settings. */
+  default_shared_folder_seeded: boolean;
+  /** Monotonic optimistic-concurrency token for settings saves. */
+  settings_revision: number;
   /** Require approval before granting friend-slot priority */
   friend_require_approval: boolean;
   /** Disable incoming chat messages from friends */

@@ -225,8 +225,8 @@ pub async fn download_server_met(
         .map_err(|e| coded_ctx("server_met_parse_failed", "Failed to parse server.met", e))?;
 
     let msg = format!(
-        "Downloaded server.met: {} added, {} updated, {} filtered",
-        stats.added, stats.updated, stats.filtered
+        "Downloaded server.met: {} added, {} updated, {} filtered, {} dropped at capacity",
+        stats.added, stats.updated, stats.filtered, stats.at_capacity
     );
     info!("{msg}");
     Ok(msg)

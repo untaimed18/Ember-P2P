@@ -242,6 +242,7 @@ pub async fn set_ip_filter_enabled(
     state: tauri::State<'_, AppState>,
     enabled: bool,
 ) -> Result<(), String> {
+    let _settings_save_guard = state.settings_save_lock.lock().await;
     // Persist *before* applying the runtime change (reversed from the
     // original order). `SetIpFilterEnabled` is a fire-and-forget bool flip
     // with no ack, so there's no way to roll the network task's live state
@@ -255,6 +256,7 @@ pub async fn set_ip_filter_enabled(
         let config = state.config.read().await;
         let mut new_settings = config.settings.clone();
         new_settings.ip_filter_enabled = enabled;
+        new_settings.settings_revision = config.settings.settings_revision.saturating_add(1);
         let data = config
             .prepare_save_settings(&new_settings)
             .map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?;
@@ -292,6 +294,7 @@ pub async fn set_block_private_ips(
     state: tauri::State<'_, AppState>,
     block_private: bool,
 ) -> Result<(), String> {
+    let _settings_save_guard = state.settings_save_lock.lock().await;
     // Persist before applying the runtime change — see set_ip_filter_enabled
     // for why this order avoids a config/runtime divergence window on save
     // failure.
@@ -299,6 +302,7 @@ pub async fn set_block_private_ips(
         let config = state.config.read().await;
         let mut new_settings = config.settings.clone();
         new_settings.block_private_ips = block_private;
+        new_settings.settings_revision = config.settings.settings_revision.saturating_add(1);
         let data = config
             .prepare_save_settings(&new_settings)
             .map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?;
@@ -394,7 +398,13 @@ pub async fn download_and_load_ipfilter(
         (extracted, entry_count)
     })
     .await
-    .map_err(|e| coded_ctx("security_validation_task_failed", "Validation task failed", e))?;
+    .map_err(|e| {
+        coded_ctx(
+            "security_validation_task_failed",
+            "Validation task failed",
+            e,
+        )
+    })?;
     if entry_count == 0 {
         return Err(coded(
             "security_ipfilter_no_valid_entries",
@@ -458,6 +468,7 @@ pub async fn download_and_load_ipfilter(
             )
         })?;
 
+    let _settings_save_guard = state.settings_save_lock.lock().await;
     {
         // Persist before committing the in-memory flag (see
         // set_ip_filter_enabled). The runtime filter was already enabled above.
@@ -465,6 +476,7 @@ pub async fn download_and_load_ipfilter(
             let config = state.config.read().await;
             let mut new_settings = config.settings.clone();
             new_settings.ip_filter_enabled = true;
+            new_settings.settings_revision = config.settings.settings_revision.saturating_add(1);
             let data = config.prepare_save_settings(&new_settings).map_err(|e| {
                 coded_ctx("security_failed_to_save_config", "Failed to save config", e)
             })?;
@@ -575,7 +587,13 @@ pub async fn update_ipfilter_from_url(
         (filter_bytes, entry_count)
     })
     .await
-    .map_err(|e| coded_ctx("security_validation_task_failed", "Validation task failed", e))?;
+    .map_err(|e| {
+        coded_ctx(
+            "security_validation_task_failed",
+            "Validation task failed",
+            e,
+        )
+    })?;
     if entry_count == 0 {
         return Err(coded(
             "security_ipfilter_no_valid_entries",
@@ -635,6 +653,7 @@ pub async fn update_ipfilter_from_url(
             )
         })?;
 
+    let _settings_save_guard = state.settings_save_lock.lock().await;
     {
         // Persist before committing the in-memory flag (see
         // set_ip_filter_enabled). The runtime filter was already enabled above.
@@ -642,6 +661,7 @@ pub async fn update_ipfilter_from_url(
             let config = state.config.read().await;
             let mut new_settings = config.settings.clone();
             new_settings.ip_filter_enabled = true;
+            new_settings.settings_revision = config.settings.settings_revision.saturating_add(1);
             let data = config.prepare_save_settings(&new_settings).map_err(|e| {
                 coded_ctx("security_failed_to_save_config", "Failed to save config", e)
             })?;
@@ -874,7 +894,11 @@ pub async fn import_ipfilter_file(
         let entry_count = tokio::task::spawn_blocking(move || count_valid_entries(&raw, &ext))
             .await
             .map_err(|e| {
-                coded_ctx("security_validation_task_failed", "Validation task failed", e)
+                coded_ctx(
+                    "security_validation_task_failed",
+                    "Validation task failed",
+                    e,
+                )
             })?;
         if entry_count == 0 {
             return Err(coded(
@@ -909,6 +933,7 @@ pub async fn import_ipfilter_file(
             )
         })?;
 
+    let _settings_save_guard = state.settings_save_lock.lock().await;
     {
         // Persist before committing the in-memory flag (see
         // set_ip_filter_enabled). The runtime filter was already enabled above.
@@ -916,6 +941,7 @@ pub async fn import_ipfilter_file(
             let config = state.config.read().await;
             let mut new_settings = config.settings.clone();
             new_settings.ip_filter_enabled = true;
+            new_settings.settings_revision = config.settings.settings_revision.saturating_add(1);
             let data = config.prepare_save_settings(&new_settings).map_err(|e| {
                 coded_ctx("security_failed_to_save_config", "Failed to save config", e)
             })?;
@@ -1015,6 +1041,7 @@ pub async fn set_antileech_enabled(
     state: tauri::State<'_, AppState>,
     enabled: bool,
 ) -> Result<(), String> {
+    let _settings_save_guard = state.settings_save_lock.lock().await;
     // Persist the toggle before applying the runtime change. Unlike the older
     // one-way IP-filter command, this command has an ack, so we can avoid
     // returning an error after the live filter has already changed.
@@ -1023,6 +1050,7 @@ pub async fn set_antileech_enabled(
         let old_settings = cfg.settings.clone();
         let mut new_settings = cfg.settings.clone();
         new_settings.antileech_enabled = enabled;
+        new_settings.settings_revision = cfg.settings.settings_revision.saturating_add(1);
         let old_data = cfg
             .prepare_save_settings(&old_settings)
             .map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?;

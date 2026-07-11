@@ -556,6 +556,36 @@ mod tests {
         let payload = build_sending_part_32(hash, 2000, 1000, &[]);
         assert!(parse_sending_part_32(&payload).is_err());
     }
+
+    #[test]
+    fn concurrent_completed_files_claim_distinct_names() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-final-name-race-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first_part = dir.join("first.part");
+        let second_part = dir.join("second.part");
+        let target = dir.join("same-name.bin");
+        std::fs::write(&first_part, b"first").unwrap();
+        std::fs::write(&second_part, b"second").unwrap();
+
+        let (first_final, second_final) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| move_part_to_final(&first_part, &target).unwrap());
+            let second = scope.spawn(|| move_part_to_final(&second_part, &target).unwrap());
+            (first.join().unwrap(), second.join().unwrap())
+        });
+
+        assert_ne!(first_final, second_final);
+        let mut contents = [
+            std::fs::read(first_final).unwrap(),
+            std::fs::read(second_final).unwrap(),
+        ];
+        contents.sort();
+        assert_eq!(contents, [b"first".to_vec(), b"second".to_vec()]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 impl Ed2kDownload {
@@ -3049,6 +3079,7 @@ impl Ed2kDownload {
                             // path then serves as safe). The transfer counters below
                             // still account the full piece.
                             let fill_subranges = tracker.fillable_subranges(start, end);
+                            let mut newly_written = 0u64;
                             if !fill_subranges.is_empty() {
                                 // Per-file writer thread serializes the writes for
                                 // us; await is just an mpsc round-trip.
@@ -3065,8 +3096,14 @@ impl Ed2kDownload {
                                         .map_err(|e| anyhow::anyhow!("part write at {gs}: {e}"))?;
                                 }
 
-                                // Update byte-level gap tracker for mid-part resume
-                                tracker.fill_range(start, end);
+                                // Derive accounting from the tracker's atomic
+                                // state transition, not from the pre-write
+                                // snapshot. This remains correct if this path
+                                // is later shared by multiple source workers.
+                                newly_written = fill_subranges
+                                    .iter()
+                                    .map(|&(gs, ge)| tracker.fill_range(gs, ge))
+                                    .sum();
 
                                 if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
                                     let _ = event_tx
@@ -3095,8 +3132,6 @@ impl Ed2kDownload {
                             // `tracker.completed_bytes()` correction. `total_received`
                             // still tracks wire bytes — the round's exit condition
                             // compares it against what the peer announced it would send.
-                            let newly_written: u64 =
-                                fill_subranges.iter().map(|(gs, ge)| ge - gs).sum();
                             total_received += piece_len;
                             downloaded += newly_written;
                             blocks_received_in_current_req += 1;
@@ -3184,6 +3219,7 @@ impl Ed2kDownload {
                             // cross-part block from clobbering verified bytes.
                             let fill_subranges =
                                 tracker.fillable_subranges(start, start + piece_len);
+                            let mut newly_written = 0u64;
                             if !fill_subranges.is_empty() {
                                 for &(gs, ge) in &fill_subranges {
                                     let off = (gs - start) as usize;
@@ -3193,7 +3229,10 @@ impl Ed2kDownload {
                                         .await
                                         .map_err(|e| anyhow::anyhow!("part write at {gs}: {e}"))?;
                                 }
-                                tracker.fill_range(start, start + piece_len);
+                                newly_written = fill_subranges
+                                    .iter()
+                                    .map(|&(gs, ge)| tracker.fill_range(gs, ge))
+                                    .sum();
 
                                 if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
                                     let _ = event_tx
@@ -3215,8 +3254,6 @@ impl Ed2kDownload {
                             // advance displayed progress and speed; duplicate/overlap
                             // blocks add wire bytes (counted in `total_received` for
                             // the round-exit check) but no new data.
-                            let newly_written: u64 =
-                                fill_subranges.iter().map(|(gs, ge)| ge - gs).sum();
                             total_received += piece_len;
                             downloaded += newly_written;
                             blocks_received_in_current_req += 1;
@@ -4237,78 +4274,102 @@ pub(super) async fn finalize_zero_ed2k_file(
     Ok(actual_final)
 }
 
-fn is_cross_device_error(e: &std::io::Error) -> bool {
-    #[cfg(windows)]
-    {
-        matches!(e.raw_os_error(), Some(17))
-    } // ERROR_NOT_SAME_DEVICE
-    #[cfg(not(windows))]
-    {
-        matches!(e.raw_os_error(), Some(18))
-    } // EXDEV
-}
-
-/// eMule-style filename deduplication: if `base` already exists, try
-/// `stem (1).ext`, `stem (2).ext`, … up to 9999 before giving up.
-pub(crate) fn dedup_path(base: &std::path::Path) -> std::path::PathBuf {
-    if !base.exists() {
-        return base.to_path_buf();
-    }
-    let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
-    let ext = base.extension().and_then(|s| s.to_str());
-    let parent = base.parent().unwrap_or(base);
-    for i in 1..=9999u32 {
-        let candidate = if let Some(ext) = ext {
-            parent.join(format!("{stem} ({i}).{ext}"))
-        } else {
-            parent.join(format!("{stem} ({i})"))
-        };
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    let fallback = if let Some(ext) = ext {
-        parent.join(format!("{stem} (10000).{ext}"))
-    } else {
-        parent.join(format!("{stem} (10000)"))
-    };
-    fallback
-}
-
 /// Move (or copy+delete) a `.part` file to its final destination, deduplicating
 /// the filename if the target already exists.  Returns the actual final path.
 pub(crate) fn move_part_to_final(
     part_path: &std::path::Path,
     target: &std::path::Path,
 ) -> anyhow::Result<std::path::PathBuf> {
-    let final_path = dedup_path(target);
-    if let Err(e) = std::fs::rename(part_path, &final_path) {
-        if is_cross_device_error(&e) {
-            // Cross-device fallback: copy into the final location,
-            // then try to delete the source. The download is
-            // *complete* the moment the copy succeeds — if the
-            // remove fails (e.g. the upload server is still serving
-            // a chunk from this .part on Windows, or the filesystem
-            // is briefly read-only), we log it and leave the orphan
-            // for the startup sweep to reap on next launch. Failing
-            // the whole move here would mark a perfectly-good
-            // completed download as Failed in the UI even though the
-            // user's bytes are safely on disk.
-            std::fs::copy(part_path, &final_path)?;
-            if let Err(rm_err) = std::fs::remove_file(part_path) {
-                tracing::warn!(
-                    "Cross-device move: copied {} -> {} but failed to remove the source .part: {}. \
-                     Orphan will be cleaned by the next startup sweep.",
-                    part_path.display(),
-                    final_path.display(),
-                    rm_err,
-                );
+    // `exists()` followed by `rename()` is not an atomic name claim. On
+    // Windows the loser fails despite having a complete .part; on Unix,
+    // rename can replace the winner. Hard-linking claims an absent destination
+    // atomically without replacement and remains O(1) on the common same-volume
+    // path. Filesystems without hard-link support fall back to an exclusive
+    // create+copy, which is also collision-safe.
+    for suffix in 0..=10_000u32 {
+        let final_path = dedup_candidate(target, suffix);
+        match std::fs::hard_link(part_path, &final_path) {
+            Ok(()) => {
+                remove_completed_part_best_effort(part_path, &final_path, "linked");
+                return Ok(final_path);
             }
-        } else {
-            return Err(e.into());
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists || final_path.exists() => {
+                continue;
+            }
+            Err(_) => match copy_exclusive(part_path, &final_path) {
+                Ok(()) => {
+                    remove_completed_part_best_effort(part_path, &final_path, "copied");
+                    return Ok(final_path);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists || final_path.exists() => {
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            },
         }
     }
-    Ok(final_path)
+    anyhow::bail!(
+        "Could not allocate a unique completed filename for {}",
+        target.display()
+    )
+}
+
+fn dedup_candidate(base: &std::path::Path, suffix: u32) -> std::path::PathBuf {
+    if suffix == 0 {
+        return base.to_path_buf();
+    }
+    let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+    let ext = base.extension().and_then(|s| s.to_str());
+    let parent = base.parent().unwrap_or(base);
+    if let Some(ext) = ext {
+        parent.join(format!("{stem} ({suffix}).{ext}"))
+    } else {
+        parent.join(format!("{stem} ({suffix})"))
+    }
+}
+
+fn copy_exclusive(
+    source_path: &std::path::Path,
+    destination_path: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut source = std::fs::File::open(source_path)?;
+    let mut destination = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination_path)?;
+    if let Err(e) = std::io::copy(&mut source, &mut destination)
+        .and_then(|_| destination.flush())
+        .and_then(|_| destination.sync_all())
+    {
+        drop(destination);
+        let _ = std::fs::remove_file(destination_path);
+        return Err(e);
+    }
+    if let Ok(metadata) = source.metadata() {
+        let _ = std::fs::set_permissions(destination_path, metadata.permissions());
+    }
+    Ok(())
+}
+
+fn remove_completed_part_best_effort(
+    part_path: &std::path::Path,
+    final_path: &std::path::Path,
+    method: &str,
+) {
+    // The download is complete once the final path exists. If an upload still
+    // has the .part open on Windows, leave the harmless orphan for the startup
+    // sweep instead of marking valid downloaded bytes as failed.
+    if let Err(e) = std::fs::remove_file(part_path) {
+        tracing::warn!(
+            "Completed-file move: {method} {} -> {} but failed to remove the source .part: {}. \
+             Orphan will be cleaned by the next startup sweep.",
+            part_path.display(),
+            final_path.display(),
+            e,
+        );
+    }
 }
 
 /// Verify that peer-supplied part MD4s combine to the ed2k file hash (eMule `CFileIdentifier` / hashset handling).

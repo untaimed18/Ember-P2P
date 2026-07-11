@@ -669,9 +669,17 @@ pub struct AppSettings {
     /// Whether the first-time setup wizard has been completed
     #[serde(default)]
     pub setup_complete: bool,
+    /// Internal migration marker: the default Downloads share has already
+    /// been considered. Once true, startup must not recreate a folder the
+    /// user subsequently removed.
+    #[serde(default)]
+    pub default_shared_folder_seeded: bool,
+    /// Monotonic optimistic-concurrency token for whole-settings saves.
+    #[serde(default)]
+    pub settings_revision: u64,
 
     /// Require approval before granting friend-slot priority to new friend requests
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub friend_require_approval: bool,
     /// Disable incoming chat messages from friends
     #[serde(default)]
@@ -1056,6 +1064,8 @@ impl Default for AppSettings {
             search_timeout_secs: default_search_timeout_secs(),
             save_search_history: true,
             setup_complete: false,
+            default_shared_folder_seeded: false,
+            settings_revision: 0,
             friend_require_approval: true,
             friend_chat_disabled: false,
             friend_browse_disabled: false,

@@ -11,7 +11,7 @@ use crate::sharing::manager::TransferManager;
 use crate::sharing::watcher::SharedFoldersWatcher;
 use crate::storage::config::AppConfig;
 use crate::storage::database::Database;
-use crate::storage::known_files::KnownFileList;
+use crate::storage::identity::NodeIdentity;
 use crate::storage::statistics::TransferStats;
 use crate::types::{FileInfo, KadContactInfo};
 
@@ -24,7 +24,12 @@ pub type SharedFriendHashes = Arc<RwLock<std::collections::HashSet<[u8; 16]>>>;
 pub struct AppState {
     pub network_tx: mpsc::Sender<NetworkCommand>,
     pub db: Arc<Database>,
+    /// Process-wide persistent identity loaded exactly once during setup.
+    pub identity: Arc<NodeIdentity>,
     pub config: Arc<RwLock<AppConfig>>,
+    /// Serializes each read/modify/persist/commit settings transaction so
+    /// concurrent commands cannot overwrite one another with stale clones.
+    pub settings_save_lock: Arc<tokio::sync::Mutex<()>>,
     pub local_index: Arc<RwLock<LocalIndex>>,
     pub bandwidth_limiter: Arc<BandwidthLimiter>,
     pub transfer_manager: Arc<RwLock<TransferManager>>,
@@ -33,6 +38,9 @@ pub struct AppState {
     pub bw_shutdown: Arc<std::sync::atomic::AtomicBool>,
     /// Number of folder scans currently running in the background.
     pub scanning_count: Arc<AtomicUsize>,
+    /// Single-flight guard shared by startup, per-folder, and watcher reload
+    /// scans. Index mutations from different scan generations must not overlap.
+    pub scan_coordination: Arc<tokio::sync::Mutex<()>>,
     /// Per-folder cancellation flags for background hashing tasks.
     /// Key = folder path (or "__reload__" / "__startup__" for special tasks).
     pub hash_cancel_flags: Arc<RwLock<HashMap<String, Arc<AtomicBool>>>>,
@@ -65,13 +73,6 @@ pub struct AppState {
     pub upload_shared_folders: SharedFolderList,
     /// Live friend user-hash set shared with the upload server for friend-slot priority.
     pub friend_hashes: SharedFriendHashes,
-    /// Shared known-file list (eMule known.met) so sharing commands and the
-    /// network loop both work from memory instead of re-reading from disk.
-    /// ember-V2's network task doesn't currently read through AppState for
-    /// this list (it loads its own copy), but the field is kept so
-    /// sharing-side code can grow into it without a schema change.
-    #[allow(dead_code)]
-    pub known_files: Arc<RwLock<KnownFileList>>,
     /// Filesystem watcher over the currently shared folders. `None` if the
     /// OS-level watcher could not be initialised at startup; in that case
     /// the app still works but users must reload manually after changes.

@@ -34,6 +34,29 @@ fn firewall_rule_exists(rule_name: &str) -> bool {
 }
 
 fn firewall_rule_has_port(rule_name: &str, port: u16) -> bool {
+    // PowerShell exposes stable object properties regardless of the Windows
+    // display language, unlike netsh's localized column labels.
+    let escaped_name = rule_name.replace('\'', "''");
+    let script = format!(
+        "Get-NetFirewallRule -DisplayName '{escaped_name}' -ErrorAction Stop | \
+         Get-NetFirewallPortFilter | ForEach-Object {{ $_.LocalPort }}"
+    );
+    if let Ok(output) = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .creation_flags(0x08000000)
+        .output()
+    {
+        if output.status.success() {
+            let expected = port.to_string();
+            return String::from_utf8_lossy(&output.stdout)
+                .split(|c: char| c.is_whitespace() || c == ',')
+                .any(|value| value.trim() == expected);
+        }
+    }
+
+    // Fallback for stripped-down Windows environments without the firewall
+    // PowerShell module. Keep the legacy English parser rather than treating
+    // every rule as stale.
     let output = Command::new("netsh")
         .args([
             "advfirewall",

@@ -327,6 +327,9 @@ pub struct SpamDatabase {
 
 pub struct SpamFilter {
     db: SpamDatabase,
+    /// Runtime-only features aligned with `db.spam_similar_names`; avoids
+    /// tokenizing every learned name once per search result.
+    similar_name_features: Vec<(usize, HashSet<String>)>,
     data_path: std::path::PathBuf,
     dirty: bool,
     /// Monotonic mutation counter. Bumped on every change that sets `dirty`.
@@ -446,12 +449,24 @@ impl SpamFilter {
         } else {
             SpamDatabase::default()
         };
-        Self {
+        let mut filter = Self {
             db,
+            similar_name_features: Vec::new(),
             data_path,
             dirty: false,
             gen: 0,
-        }
+        };
+        filter.rebuild_similar_name_features();
+        filter
+    }
+
+    fn rebuild_similar_name_features(&mut self) {
+        self.similar_name_features = self
+            .db
+            .spam_similar_names
+            .iter()
+            .map(|name| (name.chars().count(), token_set(name)))
+            .collect();
     }
 
     /// Mark the database dirty and advance the mutation counter so an
@@ -523,6 +538,7 @@ impl SpamFilter {
     /// a blocking thread rather than under the async lock.
     pub fn reset(&mut self) {
         self.db = SpamDatabase::default();
+        self.similar_name_features.clear();
         self.mark_dirty();
         info!("Spam filter database reset");
     }
@@ -598,11 +614,11 @@ impl SpamFilter {
             // the Jaccard check.
             let stripped_chars = stripped.chars().count();
             let stripped_tokens = token_set(&stripped);
-            for similar in &self.db.spam_similar_names {
-                let similar_chars = similar.chars().count();
-                let max_chars = stripped_chars.max(similar_chars);
+            for (index, similar) in self.db.spam_similar_names.iter().enumerate() {
+                let (similar_chars, similar_tokens) = &self.similar_name_features[index];
+                let max_chars = stripped_chars.max(*similar_chars);
                 let length_ok = max_chars > 0
-                    && (stripped_chars.abs_diff(similar_chars) as f64) / (max_chars as f64) < 0.30;
+                    && (stripped_chars.abs_diff(*similar_chars) as f64) / (max_chars as f64) < 0.30;
                 let sim = if length_ok {
                     normalized_levenshtein(&stripped, similar)
                 } else {
@@ -623,7 +639,7 @@ impl SpamFilter {
                     ));
                     break;
                 } else {
-                    let jac = jaccard(&stripped_tokens, &token_set(similar));
+                    let jac = jaccard(&stripped_tokens, similar_tokens);
                     if jac >= SIMILAR_NAME_JACCARD_HIT {
                         score += SPAM_SIMILARNAME_NEARHIT;
                         reasons.push(format!("Reordered spam pattern ({:.0}% token match, +{SPAM_SIMILARNAME_NEARHIT})", jac * 100.0));
@@ -862,6 +878,7 @@ impl SpamFilter {
             }
         }
 
+        self.rebuild_similar_name_features();
         self.mark_dirty();
         info!("Marked as spam: {} ({})", name, result.file.hash);
     }

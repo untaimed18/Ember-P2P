@@ -25,6 +25,7 @@ pub struct ServerMergeStats {
     pub added: usize,
     pub updated: usize,
     pub filtered: usize,
+    pub at_capacity: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +33,7 @@ pub enum AddServerOutcome {
     Added,
     Duplicate,
     Filtered,
+    AtCapacity,
 }
 
 #[derive(Debug, Clone)]
@@ -334,6 +336,13 @@ impl ServerList {
             debug!("Server {}:{} blocked by IP filter", entry.ip, entry.port);
             return AddServerOutcome::Filtered;
         }
+        if self.servers.len() >= MAX_SERVER_LIST_ENTRIES {
+            debug!(
+                "Ignoring server {}:{} because server list is at cap ({MAX_SERVER_LIST_ENTRIES})",
+                entry.ip, entry.port
+            );
+            return AddServerOutcome::AtCapacity;
+        }
         self.servers.push(entry);
         self.needs_sort = true;
         AddServerOutcome::Added
@@ -362,6 +371,7 @@ impl ServerList {
         let mut added = 0;
         let mut filtered = 0;
         let mut duplicate = 0;
+        let mut at_capacity = 0;
         for _ in 0..count {
             let ip_raw = match cursor.read_u32::<LittleEndian>() {
                 Ok(v) => v,
@@ -382,14 +392,16 @@ impl ServerList {
                 AddServerOutcome::Added => added += 1,
                 AddServerOutcome::Filtered => filtered += 1,
                 AddServerOutcome::Duplicate => duplicate += 1,
+                AddServerOutcome::AtCapacity => at_capacity += 1,
             }
         }
         // Always summarise the push if it carried anything actionable —
         // before, a list of 27 entries that were all IP-filtered would
         // produce 27 INFO lines and no aggregate. Now: one line.
-        if added > 0 || filtered > 0 {
+        if added > 0 || filtered > 0 || at_capacity > 0 {
             info!(
-                "Server list push: {added} added, {filtered} blocked by IP filter, {duplicate} duplicate (out of {count})",
+                "Server list push: {added} added, {filtered} blocked by IP filter, \
+                 {duplicate} duplicate, {at_capacity} dropped at capacity (out of {count})",
             );
         }
         added
@@ -918,6 +930,10 @@ impl ServerList {
                 }
             }
 
+            if self.servers.len() >= MAX_SERVER_LIST_ENTRIES {
+                stats.at_capacity += 1;
+                continue;
+            }
             self.servers.push(entry);
             stats.added += 1;
         }
@@ -926,8 +942,9 @@ impl ServerList {
             self.needs_sort = true;
         }
         info!(
-            "Merged server.met data: {} added, {} updated, {} filtered ({} total in file)",
-            stats.added, stats.updated, stats.filtered, count
+            "Merged server.met data: {} added, {} updated, {} filtered, {} dropped at capacity \
+             ({} total in file)",
+            stats.added, stats.updated, stats.filtered, stats.at_capacity, count
         );
         Ok(stats)
     }

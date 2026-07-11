@@ -77,13 +77,21 @@ num-bigint-dig = "0.8"
 opener = "0.8.4"
 crc32fast = "1.5.0"
 zeroize = { version = "1", features = ["derive"] }
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
 snow = "0.9"
 chacha20poly1305 = "0.10"
 lz4_flex = "0.11"
 quinn = "0.11"
 rcgen = "0.13"
 rustls = { version = "0.23", features = ["ring"] }
+# Used to robustly parse a peer's QUIC/TLS certificate and extract its
+# real SubjectPublicKeyInfo (see `network::ember::quic`'s
+# `EmberCertVerifier`) instead of pattern-matching bytes in the DER —
+# a hand-rolled byte search is spoofable (an attacker can plant a
+# decoy match earlier in a self-crafted certificate), whereas a real
+# ASN.1/DER parser walks the actual certificate structure and cannot
+# be fooled that way.
+x509-cert = { version = "0.2", default-features = false }
 strsim = "0.11"
 zip = "2"
 fs2 = "0.4"
