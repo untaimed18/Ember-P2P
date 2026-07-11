@@ -23,6 +23,8 @@
   let error: string | null = $state(null);
   let successMsg: string | null = $state(null);
   let confirmRemoveAll = $state(false);
+  let confirmRemoveOpen = $state(false);
+  let pendingRemoveServers: ServerInfo[] = $state([]);
   let logMessages: string[] = $state([]);
 
   // Add server form
@@ -343,7 +345,12 @@
     }
   }
 
-  async function handleRemoveServer(server: ServerInfo) {
+  function handleRemoveServer(server: ServerInfo) {
+    pendingRemoveServers = [server];
+    confirmRemoveOpen = true;
+  }
+
+  async function doRemoveServer(server: ServerInfo) {
     error = null;
     try {
       const msg = await removeServer(server.ip, server.port);
@@ -497,9 +504,13 @@
     }
   }
 
-  async function handleRemoveSelected() {
+  function handleRemoveSelected() {
+    pendingRemoveServers = servers.filter(s => selectedServers.has(serverKey(s)));
+    if (pendingRemoveServers.length > 0) confirmRemoveOpen = true;
+  }
+
+  async function doRemoveSelected(toRemove: ServerInfo[]) {
     error = null;
-    const toRemove = servers.filter(s => selectedServers.has(serverKey(s)));
     const results = await Promise.allSettled(
       toRemove.map(s => removeServer(s.ip, s.port))
     );
@@ -518,6 +529,13 @@
       flash(removedMsg);
     }
     await refresh();
+  }
+
+  async function confirmPendingRemoval() {
+    const pending = pendingRemoveServers;
+    pendingRemoveServers = [];
+    if (pending.length === 1) await doRemoveServer(pending[0]);
+    else if (pending.length > 1) await doRemoveSelected(pending);
   }
 
   function toggleSort(col: string) {
@@ -966,6 +984,15 @@
   confirmLabel={m.servers_remove_all()}
   danger={true}
   onconfirm={doRemoveAll}
+/>
+<ConfirmDialog
+  bind:open={confirmRemoveOpen}
+  title={m.servers_confirm_remove_title()}
+  message={m.servers_confirm_remove_message({ count: pendingRemoveServers.length })}
+  confirmLabel={m.common_remove()}
+  danger={true}
+  onconfirm={confirmPendingRemoval}
+  oncancel={() => (pendingRemoveServers = [])}
 />
 
 <style>

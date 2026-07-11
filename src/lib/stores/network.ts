@@ -7,6 +7,7 @@ import { getSettings, updateSettings } from '$lib/api/settings';
 import { setAppSettings } from '$lib/stores/settings';
 import { addToast, removeToast, toastError, toastSuccess, toastWarning } from '$lib/stores/toast';
 import * as m from '$lib/paraglide/messages';
+import { translateError } from '$lib/i18n';
 
 const STALE_NETWORK_MS = 12_000;
 const KNOWN_NETWORK_STATUSES = new Set<NetworkStats['status']>([
@@ -270,7 +271,7 @@ export async function initNetworkStore() {
       const message = typeof event.payload?.message === 'string' ? event.payload.message : '';
       if (!message) return;
       lastEventUpdate = Date.now();
-      networkError.set(message);
+      networkError.set(translateError(message, message));
     }));
     // Fatal network errors come directly from the network-task supervisor
     // in `lib.rs` — the payload is a bare redacted string (not an object).
@@ -285,10 +286,11 @@ export async function initNetworkStore() {
       const message = typeof event.payload === 'string'
         ? event.payload
         : 'Network error: network task stopped.';
-      networkError.set(message);
+      const translated = translateError(message, message);
+      networkError.set(translated);
       // Long duration (15 s) — fatal failures deserve more than the
       // default 8 s of a regular error toast.
-      toastError(m.toast_network_stopped({ message }));
+      toastError(m.toast_network_stopped({ message: translated }));
     }));
     // Non-fatal warnings from network start-up / ongoing operation (e.g.
     // UDP port already in use → auto-rebound to a different port). These
@@ -298,7 +300,7 @@ export async function initNetworkStore() {
     registered.push(await listen<{ message: string }>('network-warning', (event) => {
       const msg = event.payload?.message;
       if (msg) {
-        toastWarning(msg);
+        toastWarning(translateError(msg, msg));
       }
     }));
     registered.push(await listen<{ status: ServerStatus }>('server-status-changed', (event) => {

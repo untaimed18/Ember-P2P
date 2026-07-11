@@ -531,7 +531,9 @@
 
   function resultKey(result: SearchResult): string {
     if (result.file.hash) return result.file.hash;
-    return `nohash:${result.result_origin}:${result.file.name}:${result.file.size}`;
+    if (result.file.id?.startsWith('pending:')) return `nohash-id:${result.file.id}`;
+    if (result.file.path) return `nohash-path:${result.file.path}`;
+    return `nohash:${result.file.name}:${result.file.size}`;
   }
 
   function inferSearchTypeFromExtension(extension: string | null | undefined): string {

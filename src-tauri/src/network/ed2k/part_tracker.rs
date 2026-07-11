@@ -230,7 +230,6 @@ impl PartTracker {
         }
     }
 
-
     /// Mark a byte range as not received (e.g. AICH-identified bad 180 KiB blocks inside a part).
     pub fn invalidate_range(&mut self, start: u64, end: u64) {
         self.add_gap(start, end);

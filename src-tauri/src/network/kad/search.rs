@@ -59,36 +59,7 @@ pub enum SearchType {
     StoreNotes,
 }
 
-/// K13: discriminator used as part of the `target_map` key so two
-/// searches that share a KadId (e.g. `FindSource` + `StoreFile` on the
-/// same file-hash target) do not collide and starve each other of
-/// dispatches. Mirrors `SearchType` discriminants without payload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SearchKind {
-    FindNode,
-    FindKeyword,
-    FindSource,
-    FindNotes,
-    FindBuddy,
-    StoreFile,
-    StoreKeyword,
-    StoreNotes,
-}
-
 impl SearchType {
-    pub fn kind(&self) -> SearchKind {
-        match self {
-            SearchType::FindNode => SearchKind::FindNode,
-            SearchType::FindKeyword => SearchKind::FindKeyword,
-            SearchType::FindSource { .. } => SearchKind::FindSource,
-            SearchType::FindNotes { .. } => SearchKind::FindNotes,
-            SearchType::FindBuddy => SearchKind::FindBuddy,
-            SearchType::StoreFile => SearchKind::StoreFile,
-            SearchType::StoreKeyword => SearchKind::StoreKeyword,
-            SearchType::StoreNotes => SearchKind::StoreNotes,
-        }
-    }
-
     /// Whether this search kind issues `SEARCH_*_REQ` and therefore expects
     /// `KADEMLIA2_SEARCH_RES` (0x3B) replies. Only the fetch-capable `Find*`
     /// kinds do; `FindNode`/`FindBuddy` walk with `KADEMLIA2_REQ` and the
@@ -549,11 +520,13 @@ impl SearchState {
             }
         }
 
-        for c in &contacts {
-            self.store_sent.insert(c.id);
-            self.tried.insert((c.ip, c.udp_port), c.id);
-        }
         contacts
+    }
+
+    pub fn mark_publish_sent(&mut self, contact: &KadContact) {
+        self.store_sent.insert(contact.id);
+        self.tried
+            .insert((contact.ip, contact.udp_port), contact.id);
     }
 
     /// Build a fetch-phase message (keyword/source/notes search request) for a
@@ -1118,9 +1091,9 @@ fn is_lan_ip(ip: std::net::Ipv4Addr) -> bool {
 pub struct SearchManager {
     next_id: u64,
     pub active: HashMap<SearchId, SearchState>,
-    /// K13: keyed by (target, kind) so concurrent `FindSource` +
-    /// `StoreFile` on the same file-hash target don't collide.
-    target_map: HashMap<(KadId, SearchKind), SearchId>,
+    /// Keyed by the full search type so concurrent `FindSource` requests for
+    /// the same hash but different file sizes cannot overwrite each other.
+    target_map: HashMap<(KadId, SearchType), SearchId>,
     /// Contact IDs that need to be marked in-use on the routing table.
     /// Accumulated by start_search, drained by the caller via `drain_in_use_ids`.
     pending_in_use: Vec<KadId>,
@@ -1167,7 +1140,7 @@ impl SearchManager {
         search_type: SearchType,
         initial_contacts: Vec<KadContact>,
     ) -> SearchId {
-        let key = (target, search_type.kind());
+        let key = (target, search_type);
         if Self::reuses_existing_search(search_type) {
             if let Some(existing_id) = self.target_map.get(&key) {
                 if let Some(state) = self.active.get(existing_id) {
@@ -1194,7 +1167,7 @@ impl SearchManager {
                 .collect();
             for id in completed {
                 if let Some(s) = self.active.remove(&id) {
-                    let k = (s.target, s.search_type.kind());
+                    let k = (s.target, s.search_type);
                     if self.target_map.get(&k) == Some(&id) {
                         self.target_map.remove(&k);
                     }
@@ -1224,7 +1197,7 @@ impl SearchManager {
 
                 if let Some(id) = eviction {
                     if let Some(state) = self.active.remove(&id) {
-                        let old_key = (state.target, state.search_type.kind());
+                        let old_key = (state.target, state.search_type);
                         if self.target_map.get(&old_key) == Some(&id) {
                             self.target_map.remove(&old_key);
                         }
@@ -1422,7 +1395,7 @@ impl SearchManager {
         let mut released_ids = Vec::new();
         for &id in &to_remove {
             if let Some(state) = self.active.remove(&id) {
-                let k = (state.target, state.search_type.kind());
+                let k = (state.target, state.search_type);
                 if self.target_map.get(&k) == Some(&id) {
                     self.target_map.remove(&k);
                 }
@@ -1455,7 +1428,7 @@ impl SearchManager {
         let mut released_ids = Vec::new();
         for &id in &to_remove {
             if let Some(state) = self.active.remove(&id) {
-                let k = (state.target, state.search_type.kind());
+                let k = (state.target, state.search_type);
                 if self.target_map.get(&k) == Some(&id) {
                     self.target_map.remove(&k);
                 }
@@ -1489,7 +1462,7 @@ impl SearchManager {
 
     pub fn remove(&mut self, id: &SearchId) -> Option<SearchState> {
         if let Some(state) = self.active.remove(id) {
-            let k = (state.target, state.search_type.kind());
+            let k = (state.target, state.search_type);
             if self.target_map.get(&k) == Some(id) {
                 self.target_map.remove(&k);
             }
@@ -1629,6 +1602,9 @@ mod tests {
                 "lookup-time store publishing should still respect ALPHA batches"
             );
             published += batch.len();
+            for contact in &batch {
+                state.mark_publish_sent(contact);
+            }
         }
 
         assert_eq!(published, STORE_PUBLISH_TARGET_TOTAL);
@@ -1637,6 +1613,19 @@ mod tests {
             state.next_publish_candidates().is_empty(),
             "eMule caps store publishes at 10 target nodes per search"
         );
+    }
+
+    #[test]
+    fn failed_publish_attempt_does_not_consume_target_slot() {
+        let target = near_kad_id(0);
+        let mut state = SearchState::new(SearchId(1), target, SearchType::StoreFile);
+        let contact = contact(near_kad_id(1), 1);
+        state.responded_during_lookup.insert(contact.id);
+        state.closest.push(contact.clone());
+
+        assert_eq!(state.next_publish_candidates()[0].id, contact.id);
+        assert_eq!(state.next_publish_candidates()[0].id, contact.id);
+        assert!(state.store_sent.is_empty());
     }
 
     #[test]
@@ -1728,7 +1717,7 @@ mod tests {
 
         assert_ne!(first, second);
         assert_eq!(
-            manager.target_map.get(&(target, SearchKind::FindKeyword)),
+            manager.target_map.get(&(target, SearchType::FindKeyword)),
             Some(&second),
             "target_map should point to newest search for response routing"
         );

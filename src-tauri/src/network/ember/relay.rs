@@ -27,30 +27,11 @@ const MSG_RELAY_REJECT: u8 = 0x06;
 /// indirectly by reqwest's default response cap and the very small
 /// JSON shapes these endpoints accept; if a future endpoint needs
 /// larger bodies, add an explicit `bytes_per_response` cap here.
-fn relay_http_client() -> reqwest::Client {
-    match reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .no_proxy()
-        .https_only(true)
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            // Fall back rather than panicking, but keep the proxy-bypass and
-            // timeout (only the TLS-backend-dependent `https_only` is at risk
-            // of failing). The HTTPS requirement itself is still enforced
-            // independently by `require_https` at every call site, so even
-            // this degraded client can't be used against a plain-HTTP URL.
-            tracing::debug!(
-                "relay http client builder failed ({e}); falling back to a no-proxy timeout client"
-            );
-            reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .no_proxy()
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new())
-        }
-    }
+async fn relay_http_client(rendezvous_url: &str) -> Result<reqwest::Client, String> {
+    let (_, host, addrs) = crate::security::validate_fetch_url(rendezvous_url)
+        .await
+        .map_err(|e| format!("rendezvous URL rejected: {e}"))?;
+    crate::security::build_pinned_client(&host, &addrs)
 }
 
 /// Defense-in-depth: refuse to contact a non-HTTPS rendezvous/relay URL.
@@ -426,7 +407,7 @@ pub async fn register_punch(
 ) -> Result<(), String> {
     require_https(rendezvous_url)?;
     let url = format!("{}/punch", rendezvous_url);
-    let client = relay_http_client();
+    let client = relay_http_client(rendezvous_url).await?;
     let resp = client
         .post(&url)
         .json(&serde_json::json!({
@@ -462,7 +443,7 @@ pub async fn register_punch(
 pub async fn poll_punch(rendezvous_url: &str, our_id: &str) -> Result<Option<PunchInfo>, String> {
     require_https(rendezvous_url)?;
     let url = format!("{}/punch/{}", rendezvous_url, our_id);
-    let client = relay_http_client();
+    let client = relay_http_client(rendezvous_url).await?;
     let resp = client
         .get(&url)
         .timeout(Duration::from_secs(10))
@@ -766,15 +747,7 @@ async fn read_relay_control(
 /// operator's node as an SSRF / internal-port-scan proxy into its own LAN.
 /// Only public unicast targets are dialable.
 fn is_public_relay_target(ip: Ipv4Addr) -> bool {
-    !(ip.is_private()
-        || ip.is_loopback()
-        || ip.is_link_local()
-        || ip.is_unspecified()
-        || ip.is_broadcast()
-        || ip.is_multicast()
-        || ip.is_documentation()
-        // 0.0.0.0/8 ("this network") — not covered by the helpers above.
-        || ip.octets()[0] == 0)
+    !crate::security::is_special_use_v4(ip)
 }
 
 /// Maximum number of in-flight QUIC accept tasks. The semaphore is
@@ -1233,7 +1206,7 @@ pub async fn post_relay_invite(
 ) -> Result<(), String> {
     require_https(rendezvous_url)?;
     let url = format!("{}/relay-invite", rendezvous_url.trim_end_matches('/'));
-    let client = relay_http_client();
+    let client = relay_http_client(rendezvous_url).await?;
     let resp = client
         .post(&url)
         .json(&serde_json::json!({
@@ -1261,7 +1234,7 @@ pub async fn poll_relay_invites(rendezvous_url: &str, our_id: &str) -> Result<Ve
         rendezvous_url.trim_end_matches('/'),
         our_id
     );
-    let client = relay_http_client();
+    let client = relay_http_client(rendezvous_url).await?;
     let resp = client
         .get(&url)
         .timeout(Duration::from_secs(10))

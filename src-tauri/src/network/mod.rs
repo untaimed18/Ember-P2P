@@ -2785,6 +2785,10 @@ pub enum NetworkCommand {
         file_hash_hex: String,
         priority: u8,
     },
+    SetUploadPriorities {
+        file_hashes: Vec<String>,
+        priority: u8,
+    },
     ConnectToServer {
         ip: String,
         port: u16,
@@ -5539,16 +5543,22 @@ fn antileech_set_patterns(
     state: &NetworkState,
     patterns: Vec<String>,
 ) -> Result<crate::types::AntiLeechReplaceResult, String> {
-    let errors = {
-        let mut f = state.antileech.write();
-        f.replace_patterns(patterns)
-    };
-    {
-        let f = state.antileech.read();
-        if let Err(e) = f.save_to_file(&antileech_file_path(state)) {
-            return Err(format!("Filter updated in memory but persist failed: {e}"));
-        }
+    let explicitly_empty = patterns.iter().all(|pattern| {
+        let pattern = pattern.trim();
+        pattern.is_empty() || pattern.starts_with('#')
+    });
+    let enabled = state.antileech.read().enabled();
+    let (replacement, errors) =
+        crate::security::antileech::AntiLeechFilter::from_patterns(patterns, enabled);
+    if !explicitly_empty && replacement.pattern_count() == 0 {
+        return Err(
+            "Every anti-leech pattern was invalid; the current filter was preserved".into(),
+        );
     }
+    if let Err(e) = replacement.save_to_file(&antileech_file_path(state)) {
+        return Err(format!("Failed to persist anti-leech patterns: {e}"));
+    }
+    *state.antileech.write() = replacement;
     Ok(crate::types::AntiLeechReplaceResult {
         snapshot: antileech_snapshot(state),
         compile_errors: errors
@@ -5953,20 +5963,15 @@ pub async fn start_network(
     publish_manager.noise_pub = identity.noise_public_key;
 
     // Load bootstrap contacts from the app's own nodes.dat.
-    // K3: if the file format is the older "no verified bit" variant we
-    // can safely trust its contents (the user saved it from a previous
-    // live session — not an attacker-supplied URL). For the modern
-    // format, respect the per-contact verified byte on the wire.
+    // Legacy files carry no verification bit, so contacts must re-earn
+    // verification through the normal Hello/ACK flow.
     let nodes_dat_path = data_dir.join("nodes.dat");
     let mut boot_contacts = if nodes_dat_path.exists() {
         match bootstrap::load_nodes_dat_with_format(&nodes_dat_path) {
-            Ok((mut cs, bootstrap::NodesDatFormat::LegacyNoVerified)) => {
-                for c in &mut cs {
-                    c.verified = true;
-                }
+            Ok((cs, bootstrap::NodesDatFormat::LegacyNoVerified)) => {
                 if !cs.is_empty() {
                     info!(
-                        "Trusting {} contacts from legacy (no-verified-bit) on-disk nodes.dat",
+                        "Loaded {} unverified contacts from legacy nodes.dat",
                         cs.len()
                     );
                 }
@@ -9617,7 +9622,21 @@ pub async fn start_network(
                                         let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                                         if let Ok(packet) = messages::encode_packet(&msg) {
                                             state.flood_protection.track_request(addr, opcode);
-                                            let _ = send_kad_packet(&udp_socket, &packet, addr, &state, &contact.id).await;
+                                            if send_kad_packet(
+                                                &udp_socket,
+                                                &packet,
+                                                addr,
+                                                &state,
+                                                &contact.id,
+                                            )
+                                            .await
+                                            .is_ok()
+                                            {
+                                                if let Some(sent_search) =
+                                                    state.search_manager.get_mut(&sid)
+                                                {
+                                                    sent_search.mark_publish_sent(contact);
+                                                }
                                             if let Some(target) = publish_target {
                                                 let now_ts = chrono::Utc::now().timestamp();
                                                 let pending = state
@@ -9628,6 +9647,7 @@ pub async fn start_network(
                                                 pending.1 = now_ts;
                                                 pending.2 = true;
                                                 pending.3 = pending.3.saturating_add(1);
+                                            }
                                             }
                                         }
                                     }
@@ -9658,7 +9678,23 @@ pub async fn start_network(
                                             let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                                             if let Ok(packet) = messages::encode_packet(msg) {
                                                 state.flood_protection.track_request(addr, opcode);
-                                                let _ = send_kad_packet(&udp_socket, &packet, addr, &state, &contact.id).await;
+                                                if send_kad_packet(
+                                                    &udp_socket,
+                                                    &packet,
+                                                    addr,
+                                                    &state,
+                                                    &contact.id,
+                                                )
+                                                .await
+                                                .is_err()
+                                                {
+                                                    continue;
+                                                }
+                                                if let Some(sent_search) =
+                                                    state.search_manager.get_mut(&sid)
+                                                {
+                                                    sent_search.mark_publish_sent(contact);
+                                                }
                                                 let now_ts = chrono::Utc::now().timestamp();
                                                 let pending = state
                                                     .publish_pending
@@ -13216,6 +13252,14 @@ pub async fn start_network(
                                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                                         match ember::relay::poll_punch(&rv_url, &our_id).await {
                                             Ok(Some(info)) => {
+                                                if info.from_id != target_id {
+                                                    tracing::debug!(
+                                                        "Broker: ignoring punch response from unexpected id {} (wanted {})",
+                                                        info.from_id,
+                                                        target_id,
+                                                    );
+                                                    continue;
+                                                }
                                                 if let Ok(ip) = info.ip.parse::<std::net::IpAddr>() {
                                                     // Validate the rendezvous-relayed target before we
                                                     // dial it over QUIC. The punch endpoint is a peer's
@@ -20413,14 +20457,27 @@ pub async fn start_network(
             );
         }
     }
-    spawn_credit_flush(
-        credit_manager.clone(),
-        db.clone(),
-        state.data_dir.clone(),
-        true,
-        credit_flush_in_flight.clone(),
-    );
-    info!("Credit state saved on shutdown");
+    let wait_for_credit_flush = async {
+        while credit_flush_in_flight.load(std::sync::atomic::Ordering::Acquire) {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    };
+    if tokio::time::timeout(std::time::Duration::from_secs(5), wait_for_credit_flush)
+        .await
+        .is_err()
+    {
+        warn!("Timed out waiting for the periodic credit flush during shutdown");
+    } else {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            flush_credit_state(&credit_manager, &db, &state.data_dir, true),
+        )
+        .await
+        {
+            Ok(()) => info!("Credit state saved on shutdown"),
+            Err(_) => warn!("Credit state save timed out during shutdown"),
+        }
+    }
 
     let rep_path = state.data_dir.join("reputation.json");
     if let Err(e) = state.reputation.save(&rep_path) {
@@ -21229,6 +21286,12 @@ async fn handle_ember_native_udp_inner(
             }
         }
         Some(EmberControlMessage::ExchangeRequest) => {
+            if !state.ember_transport.peer_is_ik_authenticated(&from) {
+                debug!(
+                    "ember-udp: refusing EPX exchange request from unauthenticated XX session {from}"
+                );
+                return;
+            }
             state.ember_diagnostics.ember_exchange_requests_received = state
                 .ember_diagnostics
                 .ember_exchange_requests_received
@@ -24088,9 +24151,11 @@ async fn handle_udp_packet_inner(
             // USS RTT measurement: if this Pong is from our USS ping target, compute RTT
             if let Some(sent_at) = state.pending_uss_pings.remove(&from) {
                 let rtt_ms = sent_at.elapsed().as_secs_f64() * 1000.0;
-                if let Ok(mut queue) = state.uss_rtt_queue.try_lock() {
-                    queue.push_back(rtt_ms);
-                }
+                state
+                    .uss_rtt_queue
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push_back(rtt_ms);
                 state.uss_missed_pongs = 0;
                 debug!("USS RTT from {from}: {rtt_ms:.1}ms");
             }
@@ -27295,19 +27360,13 @@ async fn handle_command_inner(
             let _ = app_handle.emit("network-status", NetworkStatus::Connecting);
 
             // Reload routing table from saved nodes.dat (eMule recreates RoutingZone on Start).
-            // K3: trust the legacy on-disk format for convenience; the
-            // modern format carries per-contact verified bits which we
-            // respect as-is.
+            // Legacy contacts have no verified bit and remain unverified
+            // until the normal Hello/ACK flow promotes them.
             let nodes_path = state.data_dir.join("nodes.dat");
             if state.routing_table.is_empty() {
                 if nodes_path.exists() {
                     match bootstrap::load_nodes_dat_with_format(&nodes_path) {
-                        Ok((mut saved, fmt)) => {
-                            if fmt == bootstrap::NodesDatFormat::LegacyNoVerified {
-                                for c in &mut saved {
-                                    c.verified = true;
-                                }
-                            }
+                        Ok((saved, _fmt)) => {
                             for c in &saved {
                                 state.routing_table.insert(c.clone());
                             }
@@ -28081,6 +28140,28 @@ async fn handle_command_inner(
                 Err(e) => {
                     warn!("SetUploadPriority: invalid hex hash {file_hash_hex}: {e}");
                 }
+            }
+        }
+        NetworkCommand::SetUploadPriorities {
+            file_hashes,
+            priority,
+        } => {
+            let mut updated = false;
+            for file_hash_hex in file_hashes {
+                if let Ok(hash_bytes) = hex::decode(&file_hash_hex) {
+                    if hash_bytes.len() != 16 {
+                        continue;
+                    }
+                    let mut file_hash = [0u8; 16];
+                    file_hash.copy_from_slice(&hash_bytes);
+                    if let Some(record) = known_files.find_by_hash_mut(&file_hash) {
+                        record.upload_priority = priority;
+                        updated = true;
+                    }
+                }
+            }
+            if updated {
+                known_files.mark_dirty();
             }
         }
 

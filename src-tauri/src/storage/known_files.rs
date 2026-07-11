@@ -107,7 +107,20 @@ impl KnownFileList {
         match std::fs::read(path) {
             Ok(data) => {
                 if let Err(e) = list.parse_known_met(&data) {
-                    warn!("Failed to parse known.met: {e}");
+                    let backup = path.with_extension(format!(
+                        "met.{}.corrupt",
+                        chrono::Utc::now().format("%Y%m%d%H%M%S")
+                    ));
+                    if let Err(backup_error) = std::fs::copy(path, &backup) {
+                        warn!("Failed to preserve corrupt known.met: {backup_error}");
+                    } else {
+                        crate::security::restrict_file_permissions(&backup);
+                    }
+                    warn!(
+                        "Failed to parse known.met: {e}; starting with an empty catalog (backup: {})",
+                        backup.display()
+                    );
+                    list = Self::new();
                 }
             }
             Err(e) => warn!("Failed to read known.met: {e}"),
@@ -118,7 +131,7 @@ impl KnownFileList {
 
     fn parse_known_met(&mut self, data: &[u8]) -> anyhow::Result<()> {
         if data.len() < 5 {
-            return Ok(());
+            anyhow::bail!("known.met is truncated");
         }
         let mut cursor = Cursor::new(data);
         let version = cursor.read_u8()?;
@@ -829,7 +842,9 @@ pub fn migrate_aich_v2(data_dir: &Path) {
             if let Err(e) = list.save(&known_met) {
                 // Don't write the marker: a failed save means the stale roots
                 // are still on disk, so we must retry on the next startup.
-                warn!("AICH v2 migration: failed to rewrite known.met ({e}); will retry next startup");
+                warn!(
+                    "AICH v2 migration: failed to rewrite known.met ({e}); will retry next startup"
+                );
                 return;
             }
             info!(

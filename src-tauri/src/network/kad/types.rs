@@ -1011,9 +1011,8 @@ mod kad_tag_wire_layout_tests {
         buf.extend_from_slice(&sentinel.to_le_bytes());
 
         let mut cursor = std::io::Cursor::new(&buf);
-        let parsed = read_tag_list(&mut cursor).expect(
-            "a >32-tag list must still parse successfully, just with surplus tags dropped",
-        );
+        let parsed = read_tag_list(&mut cursor)
+            .expect("a >32-tag list must still parse successfully, just with surplus tags dropped");
         assert_eq!(
             parsed.len(),
             MAX_TAG_LIST_SIZE,

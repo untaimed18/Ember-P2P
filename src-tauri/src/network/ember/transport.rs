@@ -72,6 +72,7 @@ struct NoiseSession {
     transport: snow::StatelessTransportState,
     remote_noise_pub: [u8; 32],
     last_activity: Instant,
+    ik_authenticated: bool,
     /// Next nonce to stamp on an outbound transport packet (monotonic).
     send_nonce: u64,
     /// Highest accepted inbound nonce.
@@ -82,11 +83,16 @@ struct NoiseSession {
 }
 
 impl NoiseSession {
-    fn new(transport: snow::StatelessTransportState, remote_noise_pub: [u8; 32]) -> Self {
+    fn new(
+        transport: snow::StatelessTransportState,
+        remote_noise_pub: [u8; 32],
+        ik_authenticated: bool,
+    ) -> Self {
         Self {
             transport,
             remote_noise_pub,
             last_activity: Instant::now(),
+            ik_authenticated,
             send_nonce: 0,
             recv_high: 0,
             recv_window: 0,
@@ -429,6 +435,12 @@ impl EmberTransport {
     #[allow(dead_code)]
     pub fn has_session(&self, addr: &SocketAddr) -> bool {
         self.sessions.contains_key(addr)
+    }
+
+    pub fn peer_is_ik_authenticated(&self, addr: &SocketAddr) -> bool {
+        self.sessions
+            .get(addr)
+            .is_some_and(|session| session.ik_authenticated)
     }
 
     /// Process an incoming Ember-encrypted UDP packet.
@@ -780,7 +792,7 @@ impl EmberTransport {
             self.evict_oldest_session();
         }
         self.sessions
-            .insert(from, NoiseSession::new(transport, remote_noise_pub));
+            .insert(from, NoiseSession::new(transport, remote_noise_pub, true));
         // Clear any stale pending handshake for this address (e.g. an
         // earlier XX attempt we initiated before this IK init arrived).
         // Left in place, it lingers until the 30s pending-cleanup sweep
@@ -857,7 +869,7 @@ impl EmberTransport {
                 return IncomingResult::Rejected;
             }
         };
-        let mut session = NoiseSession::new(transport, remote_noise_pub);
+        let mut session = NoiseSession::new(transport, remote_noise_pub, true);
 
         // Send queued messages
         let mut packets = Vec::new();
@@ -1056,7 +1068,7 @@ impl EmberTransport {
                 return IncomingResult::Rejected;
             }
         };
-        let mut session = NoiseSession::new(transport, remote_noise_pub);
+        let mut session = NoiseSession::new(transport, remote_noise_pub, false);
 
         // Send remaining queued messages (skip first, it was in msg3 payload)
         let mut packets = vec![resp_buf];
@@ -1135,7 +1147,7 @@ impl EmberTransport {
                 return IncomingResult::Rejected;
             }
         };
-        let mut session = NoiseSession::new(transport, remote_noise_pub);
+        let mut session = NoiseSession::new(transport, remote_noise_pub, false);
 
         // Drain any application payloads that the local app tried to
         // send while we were still in the msg2→msg3 window. Each one

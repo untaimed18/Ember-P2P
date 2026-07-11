@@ -133,6 +133,18 @@ fn copy_missing_entries(src_dir: &Path, dst_dir: &Path) -> std::io::Result<()> {
         if dst.exists() {
             if meta.is_dir() && dst.is_dir() {
                 copy_missing_entries(&src, &dst)?;
+            } else if meta.is_file() && dst.is_file() {
+                let dst_meta = std::fs::metadata(&dst)?;
+                let source_is_newer = meta
+                    .modified()
+                    .ok()
+                    .zip(dst_meta.modified().ok())
+                    .is_some_and(|(source, target)| source > target);
+                if meta.len() > 0
+                    && (dst_meta.len() == 0 || (source_is_newer && meta.len() > dst_meta.len()))
+                {
+                    replace_stale_migration_file(&src, &dst, meta.len())?;
+                }
             }
             continue;
         }
@@ -144,6 +156,33 @@ fn copy_missing_entries(src_dir: &Path, dst_dir: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn replace_stale_migration_file(src: &Path, dst: &Path, expected_len: u64) -> std::io::Result<()> {
+    let seq = MIGRATION_COPY_SEQ.fetch_add(1, Ordering::Relaxed);
+    let file_name = dst
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "file".into());
+    let backup = dst
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(".{file_name}.{seq}.pre-migration.bak"));
+    std::fs::rename(dst, &backup)?;
+    match copy_file_atomically(src, dst, expected_len) {
+        Ok(()) => {
+            tracing::warn!(
+                "Replaced stale canonical data file {} with newer legacy copy; previous file preserved at {}",
+                dst.display(),
+                backup.display()
+            );
+            Ok(())
+        }
+        Err(error) => {
+            let _ = std::fs::rename(&backup, dst);
+            Err(error)
+        }
+    }
 }
 
 fn copy_file_atomically(src: &Path, dst: &Path, expected_len: u64) -> std::io::Result<()> {

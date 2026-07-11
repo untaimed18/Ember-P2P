@@ -3414,9 +3414,32 @@ impl UploadHandler {
                         continue;
                     };
                     let match_idx = if matches!(key, PendingKadCallbackKey::SourceUserHash(_)) {
-                        // eMule's WAITCALLBACKKAD client is matched by user hash; the
-                        // TCP port in the callback Hello is not reliable enough to gate it.
-                        (!entries.is_empty()).then_some(0)
+                        if entries.len() == 1 {
+                            Some(0)
+                        } else {
+                            // One firewalled source can serve several files.
+                            // Prefer a matching advertised TCP port when present;
+                            // otherwise attach the callback to the most recently
+                            // registered request rather than arbitrary Vec[0].
+                            let by_port = (peer_hello_port > 0).then(|| {
+                                entries
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, entry)| {
+                                        entry.expected_tcp_port == 0
+                                            || entry.expected_tcp_port == peer_hello_port
+                                    })
+                                    .max_by_key(|(_, entry)| entry.registered_at)
+                                    .map(|(idx, _)| idx)
+                            });
+                            by_port.flatten().or_else(|| {
+                                entries
+                                    .iter()
+                                    .enumerate()
+                                    .max_by_key(|(_, entry)| entry.registered_at)
+                                    .map(|(idx, _)| idx)
+                            })
+                        }
                     } else {
                         entries.iter().position(|e| {
                             peer_hello_port == 0
@@ -3507,7 +3530,7 @@ impl UploadHandler {
             } else {
                 0
             };
-            if peer_hello_port > 0 {
+            {
                 let server_callback_file = {
                     let server_addr = self.shared_server_addr.read().await;
                     if let Some(addr) = *server_addr {
@@ -4607,7 +4630,7 @@ impl UploadHandler {
             match (proto, opcode) {
                 (OP_EMULEPROT, OP_PUBLICKEY) if payload.len() >= 2 => {
                     let key_len = payload[0] as usize;
-                    if key_len > 0 && payload.len() >= 1 + key_len {
+                    if key_len > 0 && payload.len() > key_len {
                         let mut cm = self.credit_manager.write().await;
                         cm.set_public_key(peer_user_hash, payload[1..1 + key_len].to_vec());
                         cm.set_ident_state(peer_user_hash, super::credits::IdentState::Needed);
@@ -5033,7 +5056,7 @@ impl UploadHandler {
                         .load(std::sync::atomic::Ordering::Relaxed);
 
                     let dynamic_slots = self.compute_dynamic_slot_count();
-                    let mut removed_queue_join_time: Option<std::time::Instant> = None;
+                    let mut removed_queue_entry: Option<QueueEntry> = None;
                     let should_accept = if current_active >= dynamic_slots {
                         false
                     } else {
@@ -5060,7 +5083,7 @@ impl UploadHandler {
                             let mut queue = self.upload_queue.lock().await;
                             if let Some(pos) = queue.iter().position(|e| e.identity == queue_identity) {
                                 let removed = queue.remove(pos);
-                                removed_queue_join_time = Some(removed.join_time);
+                                removed_queue_entry = Some(removed);
                             }
                             true
                         } else {
@@ -5120,7 +5143,7 @@ impl UploadHandler {
                                     let mut queue = self.upload_queue.lock().await;
                                     if let Some(pos) = queue.iter().position(|e| e.identity == queue_identity) {
                                         let removed = queue.remove(pos);
-                                        removed_queue_join_time = Some(removed.join_time);
+                                        removed_queue_entry = Some(removed);
                                     }
                                     true
                                 }
@@ -5138,8 +5161,14 @@ impl UploadHandler {
                     // race we fall through to the queue path (which re-inserts the
                     // entry that the `should_accept` scoring may have removed).
                     let should_accept = should_accept && slot_guard.try_activate(dynamic_slots);
-                    if let Some(join_time) = removed_queue_join_time {
-                        queue_join_time = join_time;
+                    if let Some(removed) = removed_queue_entry {
+                        queue_join_time = removed.join_time;
+                        if !should_accept {
+                            let mut queue = self.upload_queue.lock().await;
+                            if !queue.iter().any(|entry| entry.identity == removed.identity) {
+                                queue.push(removed);
+                            }
+                        }
                     }
 
                     if !should_accept {

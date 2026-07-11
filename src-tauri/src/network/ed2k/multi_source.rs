@@ -214,7 +214,24 @@ static GLOBAL_DL_CONN_LIMITER: std::sync::OnceLock<GlobalConnLimiter> = std::syn
 struct GlobalConnLimiter {
     sem: Arc<tokio::sync::Semaphore>,
     current_max: std::sync::atomic::AtomicUsize,
+    desired_max: std::sync::atomic::AtomicUsize,
+    in_use: std::sync::atomic::AtomicUsize,
+    notify: tokio::sync::Notify,
     resize_lock: std::sync::Mutex<()>,
+}
+
+struct GlobalConnPermit {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    limiter: &'static GlobalConnLimiter,
+}
+
+impl Drop for GlobalConnPermit {
+    fn drop(&mut self) {
+        self.limiter
+            .in_use
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.limiter.notify.notify_waiters();
+    }
 }
 
 impl GlobalConnLimiter {
@@ -223,6 +240,9 @@ impl GlobalConnLimiter {
         Self {
             sem: Arc::new(tokio::sync::Semaphore::new(max)),
             current_max: std::sync::atomic::AtomicUsize::new(max),
+            desired_max: std::sync::atomic::AtomicUsize::new(max),
+            in_use: std::sync::atomic::AtomicUsize::new(0),
+            notify: tokio::sync::Notify::new(),
             resize_lock: std::sync::Mutex::new(()),
         }
     }
@@ -234,6 +254,7 @@ impl GlobalConnLimiter {
         // guarded region only touches the semaphore + counter, both of which
         // stay consistent regardless of where a previous panic landed.
         let _g = self.resize_lock.lock().unwrap_or_else(|p| p.into_inner());
+        self.desired_max.store(new_max, Ordering::SeqCst);
         let cur = self.current_max.load(Ordering::SeqCst);
         if new_max > cur {
             self.sem.add_permits(new_max - cur);
@@ -255,6 +276,7 @@ impl GlobalConnLimiter {
             }
             self.current_max.store(cur - removed, Ordering::SeqCst);
         }
+        self.notify.notify_waiters();
     }
 }
 
@@ -315,8 +337,8 @@ pub fn pathb_event_counts() -> (u64, u64, u64) {
 pub fn global_dl_conn_stats() -> Option<(usize, usize, u64, u64)> {
     use std::sync::atomic::Ordering;
     let l = GLOBAL_DL_CONN_LIMITER.get()?;
-    let max = l.current_max.load(Ordering::SeqCst);
-    let in_use = max.saturating_sub(l.sem.available_permits());
+    let max = l.desired_max.load(Ordering::SeqCst);
+    let in_use = l.in_use.load(Ordering::SeqCst);
     Some((
         in_use,
         max,
@@ -329,9 +351,10 @@ pub fn global_dl_conn_stats() -> Option<(usize, usize, u64, u64)> {
 /// connection slot is in use). Used by trickle-source rotation to confirm the
 /// slot it would free is actually contended before dropping a slow source.
 fn global_dl_conn_contended() -> bool {
-    GLOBAL_DL_CONN_LIMITER
-        .get()
-        .map_or(false, |l| l.sem.available_permits() == 0)
+    GLOBAL_DL_CONN_LIMITER.get().map_or(false, |l| {
+        l.in_use.load(std::sync::atomic::Ordering::Acquire)
+            >= l.desired_max.load(std::sync::atomic::Ordering::Acquire)
+    })
 }
 
 /// Acquire one global download-connection permit, waiting if the cap is hit.
@@ -347,12 +370,12 @@ fn global_dl_conn_contended() -> bool {
 /// small reserve; `low`/`verylow` leave a larger one. A bounded max-wait keeps
 /// low-priority downloads from being starved forever when pressure persists —
 /// they still make progress, just yield slots to higher-priority files first.
-async fn acquire_global_dl_conn(priority_ord: u8) -> Option<tokio::sync::OwnedSemaphorePermit> {
+async fn acquire_global_dl_conn(priority_ord: u8) -> Option<GlobalConnPermit> {
     use std::sync::atomic::Ordering;
     let l = GLOBAL_DL_CONN_LIMITER.get()?;
     GLOBAL_DL_ACQUIRE_COUNT.fetch_add(1, Ordering::Relaxed);
 
-    let max = l.current_max.load(Ordering::SeqCst);
+    let max = l.desired_max.load(Ordering::SeqCst);
     let reserve = match priority_ord {
         4 | 5 => 0,                                    // high / release
         2 | 3 => (max / 5).min(max.saturating_sub(1)), // normal / auto (~20%)
@@ -362,17 +385,43 @@ async fn acquire_global_dl_conn(priority_ord: u8) -> Option<tokio::sync::OwnedSe
         const MAX_RESERVE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
         let start = std::time::Instant::now();
         let mut counted = false;
-        while l.sem.available_permits() <= reserve && start.elapsed() < MAX_RESERVE_WAIT {
+        while max.saturating_sub(l.in_use.load(Ordering::Acquire)) <= reserve
+            && start.elapsed() < MAX_RESERVE_WAIT
+        {
             if !counted {
                 GLOBAL_DL_CONTENDED_COUNT.fetch_add(1, Ordering::Relaxed);
                 counted = true;
             }
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
-    } else if l.sem.available_permits() == 0 {
+    } else if l.in_use.load(Ordering::Acquire) >= max {
         GLOBAL_DL_CONTENDED_COUNT.fetch_add(1, Ordering::Relaxed);
     }
-    l.sem.clone().acquire_owned().await.ok()
+    loop {
+        let desired = l.desired_max.load(Ordering::Acquire);
+        let active = l.in_use.load(Ordering::Acquire);
+        if active < desired {
+            if l.in_use
+                .compare_exchange(active, active + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                match l.sem.clone().acquire_owned().await {
+                    Ok(permit) => {
+                        return Some(GlobalConnPermit {
+                            _permit: permit,
+                            limiter: l,
+                        })
+                    }
+                    Err(_) => {
+                        l.in_use.fetch_sub(1, Ordering::AcqRel);
+                        return None;
+                    }
+                }
+            }
+            continue;
+        }
+        l.notify.notified().await;
+    }
 }
 
 /// Trickle-source rotation floor. A source that has delivered data but then
@@ -1313,8 +1362,10 @@ impl MultiSourceDownload {
             }
         }
 
-        // Shared part hashes for per-part verification (populated by first source)
-        let part_hashes: Arc<RwLock<Vec<[u8; 16]>>> = Arc::new(RwLock::new(Vec::new()));
+        // Seed live verification from resumed .part.met metadata; a peer may
+        // refresh this later, but resume must not wait for another hashset.
+        let resumed_part_hashes = tracker.read().await.part_hashes().to_vec();
+        let part_hashes: Arc<RwLock<Vec<[u8; 16]>>> = Arc::new(RwLock::new(resumed_part_hashes));
         // Trusted AICH master from HashSet2 (first peer to provide it wins).
         let shared_aich_master: Arc<RwLock<Option<[u8; 20]>>> = Arc::new(RwLock::new(None));
 
@@ -3489,6 +3540,24 @@ fn append_compressed_chunk_ms(
     }
 }
 
+async fn install_verified_part_hashes(
+    shared_part_hashes: &Arc<RwLock<Vec<[u8; 16]>>>,
+    tracker: &Arc<RwLock<PartTracker>>,
+    hashes: Vec<[u8; 16]>,
+) {
+    let installed = {
+        let mut shared = shared_part_hashes.write().await;
+        if shared.is_empty() {
+            *shared = hashes;
+        }
+        shared.clone()
+    };
+    let mut tracker = tracker.write().await;
+    if tracker.part_hashes().is_empty() {
+        tracker.set_part_hashes(installed);
+    }
+}
+
 async fn download_parts_from_source(
     _src_idx: usize,
     source: &DownloadSource,
@@ -3689,7 +3758,7 @@ async fn download_parts_from_source(
     // Held for the whole outbound source lifetime; dropped on return (or on
     // a Path B detach) to release the machine-wide connection slot. Stays
     // `None` for adopted inbound streams, which open no outbound connection.
-    let mut _global_conn_permit: Option<tokio::sync::OwnedSemaphorePermit> = None;
+    let mut _global_conn_permit: Option<GlobalConnPermit> = None;
 
     if let Some(es) = pre_established {
         // Pre-established (KAD/server callback) path: the upload-side
@@ -4337,7 +4406,7 @@ async fn download_parts_from_source(
             }
             (OP_EMULEPROT, OP_PUBLICKEY) if payload.len() >= 2 => {
                 let key_len = payload[0] as usize;
-                if payload.len() >= 1 + key_len && key_len > 0 {
+                if payload.len() > key_len && key_len > 0 {
                     if let Some(cm) = &credit_mgr {
                         let mut cm = cm.write().await;
                         cm.set_public_key(peer_user_hash, payload[1..1 + key_len].to_vec());
@@ -5636,10 +5705,8 @@ async fn download_parts_from_source(
                                 _src_idx
                             );
                             if super::transfer::verify_hashset(&file_hash, &hashes, file_size) {
-                                let mut ph = shared_part_hashes.write().await;
-                                if ph.is_empty() {
-                                    *ph = hashes;
-                                }
+                                install_verified_part_hashes(&shared_part_hashes, &tracker, hashes)
+                                    .await;
                             } else {
                                 warn!(
                                     "Hashset from source {} failed verification, discarding",
@@ -5677,10 +5744,12 @@ async fn download_parts_from_source(
                                     .unwrap_or(false);
                                 if md4_ok {
                                     if let Some(hashes) = resp.md4_hashes {
-                                        let mut ph = shared_part_hashes.write().await;
-                                        if ph.is_empty() {
-                                            *ph = hashes;
-                                        }
+                                        install_verified_part_hashes(
+                                            &shared_part_hashes,
+                                            &tracker,
+                                            hashes,
+                                        )
+                                        .await;
                                     }
                                     if let Some(root) = resp.aich_master_hash {
                                         let mut am = shared_aich_master.write().await;
@@ -6441,76 +6510,80 @@ async fn download_parts_from_source(
                 // indicator had already flipped red at the 60s
                 // ACTIVE_STALLED threshold.
                 let hard_deadline = tokio::time::Instant::now() + read_timeout;
-                let read_result: Result<anyhow::Result<(u8, u8, Vec<u8>)>, ()> = {
-                    let mut read_fut = std::pin::pin!(read_packet_async_ms(&mut *reader));
-                    let timeout_fut = tokio::time::sleep_until(hard_deadline);
-                    tokio::pin!(timeout_fut);
-                    let mut stall_check = tokio::time::interval(std::time::Duration::from_secs(2));
-                    stall_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                    // Consume the immediate first tick so the first real
-                    // stall-check fires 2s after we start waiting, not
-                    // instantly (which would spam an emit on every
-                    // packet).
-                    stall_check.tick().await;
+                let read_result: Result<anyhow::Result<(u8, u8, Vec<u8>)>, ()> =
+                    if let Some(packet) = auth_deferred.pop_front() {
+                        Ok(Ok(packet))
+                    } else {
+                        let mut read_fut = std::pin::pin!(read_packet_async_ms(&mut *reader));
+                        let timeout_fut = tokio::time::sleep_until(hard_deadline);
+                        tokio::pin!(timeout_fut);
+                        let mut stall_check =
+                            tokio::time::interval(std::time::Duration::from_secs(2));
+                        stall_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        // Consume the immediate first tick so the first real
+                        // stall-check fires 2s after we start waiting, not
+                        // instantly (which would spam an emit on every
+                        // packet).
+                        stall_check.tick().await;
 
-                    loop {
-                        tokio::select! {
-                            biased;
-                            // User Stop/Cancel (or a network disconnect) landed
-                            // while we're actively downloading from this source.
-                            // Mirror eMule's CPartFile::PauseFile, which sends
-                            // OP_CANCELTRANSFER to every DS_DOWNLOADING peer so the
-                            // uploader frees our slot immediately rather than
-                            // waiting to notice the dropped TCP socket. Best-effort
-                            // + time-boxed so a wedged socket can't delay the stop,
-                            // then bail (the outer task `select!` grace window lets
-                            // this finish before it would force-drop the future).
-                            // Fires on Pause too: eMule's PauseFile notifies every
-                            // DS_DOWNLOADING source, so a paused active transfer
-                            // also frees the uploader's slot (the transfer's source
-                            // knowledge is kept by `PauseDownload` for fast resume).
-                            _ = control.wait_cancel_or_pause() => {
-                                let _ = tokio::time::timeout(
-                                    std::time::Duration::from_millis(400),
-                                    write_packet_async_ms(
-                                        &mut *writer, OP_EDONKEYHEADER, OP_CANCELTRANSFER, &[],
-                                    ),
-                                ).await;
-                                anyhow::bail!("cancelled by user");
-                            }
-                            // `read_packet_async_ms` returns `Result<_, io::Error>`;
-                            // hoist into `anyhow::Error` here so the outer
-                            // match arms stay aligned with the error-kind
-                            // classification that the rest of the receive
-                            // loop uses.
-                            res = &mut read_fut => break Ok(res.map_err(anyhow::Error::from)),
-                            _ = &mut timeout_fut => break Err(()),
-                            _ = stall_check.tick() => {
-                                // Emit a fresh `transferring` update
-                                // with recalculated speed (which will
-                                // trend toward 0 as the byte window
-                                // ages out). The same logic that runs
-                                // after packet processing below — just
-                                // triggered on a timer so the UI gets
-                                // updates during silence.
-                                let elapsed = speed_start.elapsed();
-                                if elapsed.as_millis() >= 2000 {
-                                    measured_speed =
-                                        (speed_bytes as u128 * 1000
-                                            / elapsed.as_millis().max(1))
-                                            as u64;
-                                    speed_bytes = 0;
-                                    speed_start = std::time::Instant::now();
-                                    emit_source!(
-                                        if got_any_data { "transferring" } else { "stalled" },
-                                        None,
-                                        measured_speed
-                                    );
+                        loop {
+                            tokio::select! {
+                                biased;
+                                // User Stop/Cancel (or a network disconnect) landed
+                                // while we're actively downloading from this source.
+                                // Mirror eMule's CPartFile::PauseFile, which sends
+                                // OP_CANCELTRANSFER to every DS_DOWNLOADING peer so the
+                                // uploader frees our slot immediately rather than
+                                // waiting to notice the dropped TCP socket. Best-effort
+                                // + time-boxed so a wedged socket can't delay the stop,
+                                // then bail (the outer task `select!` grace window lets
+                                // this finish before it would force-drop the future).
+                                // Fires on Pause too: eMule's PauseFile notifies every
+                                // DS_DOWNLOADING source, so a paused active transfer
+                                // also frees the uploader's slot (the transfer's source
+                                // knowledge is kept by `PauseDownload` for fast resume).
+                                _ = control.wait_cancel_or_pause() => {
+                                    let _ = tokio::time::timeout(
+                                        std::time::Duration::from_millis(400),
+                                        write_packet_async_ms(
+                                            &mut *writer, OP_EDONKEYHEADER, OP_CANCELTRANSFER, &[],
+                                        ),
+                                    ).await;
+                                    anyhow::bail!("cancelled by user");
+                                }
+                                // `read_packet_async_ms` returns `Result<_, io::Error>`;
+                                // hoist into `anyhow::Error` here so the outer
+                                // match arms stay aligned with the error-kind
+                                // classification that the rest of the receive
+                                // loop uses.
+                                res = &mut read_fut => break Ok(res.map_err(anyhow::Error::from)),
+                                _ = &mut timeout_fut => break Err(()),
+                                _ = stall_check.tick() => {
+                                    // Emit a fresh `transferring` update
+                                    // with recalculated speed (which will
+                                    // trend toward 0 as the byte window
+                                    // ages out). The same logic that runs
+                                    // after packet processing below — just
+                                    // triggered on a timer so the UI gets
+                                    // updates during silence.
+                                    let elapsed = speed_start.elapsed();
+                                    if elapsed.as_millis() >= 2000 {
+                                        measured_speed =
+                                            (speed_bytes as u128 * 1000
+                                                / elapsed.as_millis().max(1))
+                                                as u64;
+                                        speed_bytes = 0;
+                                        speed_start = std::time::Instant::now();
+                                        emit_source!(
+                                            if got_any_data { "transferring" } else { "stalled" },
+                                            None,
+                                            measured_speed
+                                        );
+                                    }
                                 }
                             }
                         }
-                    }
-                };
+                    };
 
                 let (proto, opcode, payload) = match read_result {
                     Ok(Ok(pkt)) => {
@@ -7809,6 +7882,7 @@ async fn download_parts_from_source(
                                             file_hash,
                                             part_idx,
                                             master_hash,
+                                            &mut auth_deferred,
                                         )
                                         .await;
                                     }
@@ -8557,6 +8631,7 @@ async fn wait_for_aich_recovery_answer_ms<R: AsyncReadExt + Unpin + ?Sized>(
     file_hash: &[u8; 16],
     part_idx: usize,
     expected_master: [u8; 20],
+    deferred_packets: &mut std::collections::VecDeque<(u8, u8, Vec<u8>)>,
 ) -> Option<Vec<u8>> {
     use super::messages::{OP_AICHANSWER, OP_EMULEPROT};
 
@@ -8581,6 +8656,10 @@ async fn wait_for_aich_recovery_answer_ms<R: AsyncReadExt + Unpin + ?Sized>(
                         return Some(payload[38..].to_vec());
                     }
                 }
+                if deferred_packets.len() >= 64 {
+                    return None;
+                }
+                deferred_packets.push_back((proto, opcode, payload));
             }
             Ok(Err(_)) => return None,
             Err(_) => {}

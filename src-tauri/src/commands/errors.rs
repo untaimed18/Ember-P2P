@@ -77,6 +77,18 @@ pub fn coded_ctx(
 /// reply yet short enough that the user gets a clear error instead of a
 /// permanent spinner.
 pub const CMD_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub const CMD_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+pub async fn bounded_send<T: Send>(
+    sender: &tokio::sync::mpsc::Sender<T>,
+    command: T,
+) -> Result<(), String> {
+    match tokio::time::timeout(CMD_SEND_TIMEOUT, sender.send(command)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(coded("network_busy", "The network task is unavailable")),
+        Err(_) => Err(coded("network_timeout", "The network is not responding")),
+    }
+}
 
 /// Await a oneshot reply from the network task with [`CMD_REPLY_TIMEOUT`].
 ///

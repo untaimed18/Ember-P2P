@@ -38,14 +38,14 @@ fn opcode_limit(opcode: u8) -> u32 {
         0x45 => 8,  // PublishNotesReq
         0x50 => 3,  // FirewalledReq
         0x51 => 5,  // FindBuddyReq — was falling through to the 5-request
-                    // default anyway, but named explicitly so this stays a
-                    // deliberate choice (buddy discovery can retry a few
-                    // times per search) rather than an accidental gap.
-        0x52 => 5,  // CallbackReq — same rationale as FindBuddyReq: a
-                    // firewalled source may need several callback attempts
-                    // in one serving session.
-        0x53 => 3,  // Firewalled2Req
-        0x60 => 3,  // Ping
+        // default anyway, but named explicitly so this stays a
+        // deliberate choice (buddy discovery can retry a few
+        // times per search) rather than an accidental gap.
+        0x52 => 5, // CallbackReq — same rationale as FindBuddyReq: a
+        // firewalled source may need several callback attempts
+        // in one serving session.
+        0x53 => 3, // Firewalled2Req
+        0x60 => 3, // Ping
         _ => DEFAULT_OPCODE_LIMIT,
     }
 }

@@ -1,5 +1,5 @@
 use crate::app_state::AppState;
-use crate::commands::errors::{coded, coded_ctx};
+use crate::commands::errors::{bounded_send, coded, coded_ctx};
 use crate::network::ed2k::collection::{Collection, CollectionFile};
 use crate::types::{Transfer, TransferDirection, TransferStatus};
 use tauri::Emitter;
@@ -382,9 +382,9 @@ pub async fn download_collection_files(
         let _ = app.emit("transfer-started", &persisted_transfer);
 
         if active_now && !add_paused {
-            if let Err(e) = state
-                .network_tx
-                .send(crate::network::NetworkCommand::StartDownload {
+            if let Err(e) = bounded_send(
+                &state.network_tx,
+                crate::network::NetworkCommand::StartDownload {
                     file_hash: file.hash,
                     file_name: safe_name,
                     file_size: file.size,
@@ -396,8 +396,9 @@ pub async fn download_collection_files(
                     extra_sources: Vec::new(),
                     transfer_id: transfer_id.clone(),
                     control,
-                })
-                .await
+                },
+            )
+            .await
             {
                 tracing::warn!(
                     "Failed to send StartDownload for collection entry '{}': {e}",

@@ -36,6 +36,7 @@ pub const KADEMLIA_FIREWALLED_ACK_RES: u8 = 0x59;
 pub const KADEMLIA2_PING: u8 = 0x60;
 pub const KADEMLIA2_PONG: u8 = 0x61;
 pub const KADEMLIA2_FIREWALLUDP: u8 = 0x62;
+const MAX_SEARCH_TERMS_BYTES: usize = 4 * 1024;
 
 // Legacy Kad1.0 opcodes (for decode fallback)
 pub const KADEMLIA_BOOTSTRAP_REQ_OLD: u8 = 0x00;
@@ -416,6 +417,16 @@ fn decode_message(opcode: u8, cursor: &mut Cursor<&[u8]>) -> io::Result<KadMessa
                 0
             };
             let search_terms = if start_position & 0x8000 != 0 {
+                let remaining = cursor
+                    .get_ref()
+                    .len()
+                    .saturating_sub(cursor.position() as usize);
+                if remaining > MAX_SEARCH_TERMS_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "KAD search expression exceeds size limit",
+                    ));
+                }
                 let mut terms = Vec::new();
                 cursor.read_to_end(&mut terms).unwrap_or(0);
                 terms

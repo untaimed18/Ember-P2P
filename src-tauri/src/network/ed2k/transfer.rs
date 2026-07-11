@@ -2963,39 +2963,43 @@ impl Ed2kDownload {
                             .max(std::time::Duration::from_secs(1))
                     };
 
-                    let read_outcome = tokio::select! {
-                        biased;
-                        // User Stop/Cancel (or a network disconnect) landed
-                        // while we're actively downloading from this callback
-                        // source. Mirror eMule's CPartFile::PauseFile: send
-                        // OP_CANCELTRANSFER so the uploader frees our slot
-                        // immediately rather than waiting to notice the dropped
-                        // TCP socket. Best-effort + time-boxed, then bail.
-                        // Fires on Pause too (eMule's PauseFile notifies every
-                        // DS_DOWNLOADING source); the Failed handler ignores the
-                        // resulting unwind because the transfer is already
-                        // marked Paused.
-                        _ = self.control.wait_cancel_or_pause() => {
-                            let _ = tokio::time::timeout(
-                                std::time::Duration::from_millis(400),
-                                write_packet_async(
-                                    &mut writer, OP_EDONKEYHEADER, OP_CANCELTRANSFER, &[],
-                                ),
-                            ).await;
-                            // This callback/single-source path isn't registered in
-                            // `tracker_registry` (only multi-source downloads are), so
-                            // `PauseDownload`'s `save_registered_part_tracker` is a
-                            // no-op here and the task is `abort()`'d right after this
-                            // command returns — without an explicit save here, up to
-                            // `PERIODIC_SAVE_INTERVAL` (60s) of gap-tracking progress
-                            // on the in-flight part would be silently lost on pause.
-                            super::part_tracker::save_snapshot_async(tracker.snapshot_for_save()).await;
-                            anyhow::bail!("cancelled by user");
+                    let read_outcome = if let Some(packet) = auth_deferred.pop_front() {
+                        Ok(Ok(packet))
+                    } else {
+                        tokio::select! {
+                            biased;
+                            // User Stop/Cancel (or a network disconnect) landed
+                            // while we're actively downloading from this callback
+                            // source. Mirror eMule's CPartFile::PauseFile: send
+                            // OP_CANCELTRANSFER so the uploader frees our slot
+                            // immediately rather than waiting to notice the dropped
+                            // TCP socket. Best-effort + time-boxed, then bail.
+                            // Fires on Pause too (eMule's PauseFile notifies every
+                            // DS_DOWNLOADING source); the Failed handler ignores the
+                            // resulting unwind because the transfer is already
+                            // marked Paused.
+                            _ = self.control.wait_cancel_or_pause() => {
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_millis(400),
+                                    write_packet_async(
+                                        &mut writer, OP_EDONKEYHEADER, OP_CANCELTRANSFER, &[],
+                                    ),
+                                ).await;
+                                // This callback/single-source path isn't registered in
+                                // `tracker_registry` (only multi-source downloads are), so
+                                // `PauseDownload`'s `save_registered_part_tracker` is a
+                                // no-op here and the task is `abort()`'d right after this
+                                // command returns — without an explicit save here, up to
+                                // `PERIODIC_SAVE_INTERVAL` (60s) of gap-tracking progress
+                                // on the in-flight part would be silently lost on pause.
+                                super::part_tracker::save_snapshot_async(tracker.snapshot_for_save()).await;
+                                anyhow::bail!("cancelled by user");
+                            }
+                            r = tokio::time::timeout(
+                                read_timeout,
+                                read_packet_async(&mut reader),
+                            ) => r,
                         }
-                        r = tokio::time::timeout(
-                            read_timeout,
-                            read_packet_async(&mut reader),
-                        ) => r,
                     };
                     let (proto, opcode, payload) = match read_outcome {
                         Ok(Ok(pkt)) => pkt,
@@ -3780,6 +3784,7 @@ impl Ed2kDownload {
                                             &self.file_hash,
                                             part_idx,
                                             master_hash,
+                                            &mut auth_deferred,
                                         )
                                         .await;
                                     }
@@ -4631,6 +4636,7 @@ async fn wait_for_aich_recovery_answer<R: AsyncReadExt + Unpin + ?Sized>(
     file_hash: &[u8; 16],
     part_idx: usize,
     expected_master: [u8; 20],
+    deferred_packets: &mut std::collections::VecDeque<(u8, u8, Vec<u8>)>,
 ) -> Option<Vec<u8>> {
     const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
     let deadline = tokio::time::Instant::now() + MAX_WAIT;
@@ -4658,6 +4664,10 @@ async fn wait_for_aich_recovery_answer<R: AsyncReadExt + Unpin + ?Sized>(
                         hex::encode(ans_hash)
                     );
                 }
+                if deferred_packets.len() >= 64 {
+                    return None;
+                }
+                deferred_packets.push_back((proto, opcode, payload));
             }
             Ok(Err(_)) => return None,
             Err(_) => {}

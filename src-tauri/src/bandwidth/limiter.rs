@@ -543,9 +543,9 @@ mod tests {
         let bw = BandwidthLimiter::new(100, 100);
         bw.set_uss_active(true);
         bw.set_upload_limit(30); // USS throttle in effect
-        // Saving "Unlimited" (0) is an explicit user override and must win
-        // immediately, not stay pinned at the USS-throttled rate until USS
-        // decides to release.
+                                 // Saving "Unlimited" (0) is an explicit user override and must win
+                                 // immediately, not stay pinned at the USS-throttled rate until USS
+                                 // decides to release.
         bw.set_configured_limits(0, 100);
         assert_eq!(bw.configured_upload_rate(), 0);
         assert_eq!(bw.effective_upload_rate(), 0);

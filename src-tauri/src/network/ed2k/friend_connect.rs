@@ -269,10 +269,11 @@ pub async fn run_friend_session_over_transport(
             );
         }
     };
+    let mut deferred_auth_packets = std::collections::VecDeque::new();
     let ember_pop_verified = if our_have_keys {
         let our_pk = ed25519_pubkey.unwrap();
         let our_sk = ed25519_secret_key.unwrap();
-        perform_ember_auth(
+        perform_ember_auth_buffered(
             &mut reader,
             &mut writer,
             &our_pk,
@@ -280,6 +281,7 @@ pub async fn run_friend_session_over_transport(
             &peer_pk,
             Some(&peer_ember_hash),
             addr,
+            &mut deferred_auth_packets,
         )
         .await?;
         true
@@ -411,6 +413,11 @@ pub async fn run_friend_session_over_transport(
         let (pkt_tx, mut pkt_rx) =
             tokio::sync::mpsc::channel::<std::io::Result<(u8, u8, Vec<u8>)>>(8);
         let reader_task = tokio::spawn(async move {
+            while let Some(packet) = deferred_auth_packets.pop_front() {
+                if pkt_tx.send(Ok(packet)).await.is_err() {
+                    return;
+                }
+            }
             loop {
                 let res = read_packet_inner(&mut reader).await;
                 let is_err = res.is_err();
@@ -1500,125 +1507,10 @@ async fn read_packet_with_timeout<R: AsyncReadExt + Unpin + ?Sized>(
 /// sign the received nonce with their Ed25519 key and send the signature as
 /// `OP_EMBER_AUTH_RESPONSE` (32-byte pubkey + 64-byte signature).
 ///
-/// Verification checks:
-///   1. `BLAKE3(peer_pubkey)[0..16] == peer_ember_hash` (identity binding)
-///   2. The signature over our nonce is valid under the peer's public key
+/// Ember authentication for callers that must preserve intervening
+/// non-AUTH packets while waiting for the challenge and response.
 ///
-/// Exposed as `pub(crate)` so the regular download/upload TCP loops in
-/// `upload.rs` and `multi_source.rs` can run the same authoritative
-/// challenge-response immediately after an `OP_EMBER_HELLO` /
-/// `OP_EMBER_HELLOANSWER` exchange reveals the peer's pubkey — without
-/// waiting for a dedicated friend-connect session. Reader/writer are
-/// generic so callers pass whatever stream pair they already have
-/// (RC4-wrapped or plain, buffered or not).
-pub(crate) async fn perform_ember_auth<R, W>(
-    reader: &mut R,
-    writer: &mut W,
-    our_pubkey: &[u8; 32],
-    our_secret_key: &[u8; 32],
-    peer_pubkey: &[u8; 32],
-    peer_ember_hash: Option<&[u8; 16]>,
-    addr: SocketAddr,
-) -> anyhow::Result<()>
-where
-    // `?Sized` lets the multi_source download loop pass a
-    // `&mut dyn AsyncRead/AsyncWrite` (from a `Box<dyn ...>`) without
-    // having to unbox first. Concrete-type callers (friend_connect,
-    // buffered readers) still work unchanged.
-    R: AsyncReadExt + Unpin + ?Sized,
-    W: AsyncWriteExt + Unpin + ?Sized,
-{
-    // Verify peer pubkey matches their advertised ember_hash
-    if let Some(expected_hash) = peer_ember_hash {
-        let peer_vk = VerifyingKey::from_bytes(peer_pubkey)
-            .map_err(|e| anyhow::anyhow!("invalid peer Ed25519 pubkey: {e}"))?;
-        let derived_hash = crypto::node_id_from_public_key(&peer_vk);
-        if derived_hash != *expected_hash {
-            anyhow::bail!(
-                "Ember auth: peer pubkey does not match ember_hash (derived={}, advertised={})",
-                hex::encode(derived_hash),
-                hex::encode(expected_hash)
-            );
-        }
-    }
-
-    // Generate and send our challenge nonce
-    let mut our_nonce = [0u8; 32];
-    OsRng.fill_bytes(&mut our_nonce);
-    write_packet(writer, OP_EMULEPROT, OP_EMBER_AUTH_CHALLENGE, &our_nonce).await?;
-
-    // Read peer's challenge nonce, tolerating interleaved packets.
-    //
-    // The peer (typically `upload.rs`) emits proactive opcodes
-    // immediately after its OP_EMBER_HELLO — most notably
-    // `OP_SECIDENTSTATE` from `maybe_send_secident_challenge`,
-    // which sits in the TCP stream ahead of the peer's CHALLENGE
-    // response. A strict "next packet must be CHALLENGE" read
-    // would consume + reject that SecIdent frame and abort
-    // friend-connect for every Ember-to-Ember dial. We instead
-    // read up to a small bounded number of packets and accept
-    // the first one that's actually our CHALLENGE; non-matching
-    // packets are logged and dropped (acceptable here because
-    // friend-connect is short-lived and doesn't process SecIdent
-    // or other peer-initiated opcodes itself — multi_source uses
-    // `perform_ember_auth_buffered` instead).
-    let peer_nonce_payload = read_specific_auth_packet(
-        reader,
-        OP_EMBER_AUTH_CHALLENGE,
-        32,
-        addr,
-        "AUTH_CHALLENGE",
-        |_, _, _| {},
-    )
-    .await?;
-
-    // Sign the peer's nonce with our key and send response (pubkey + signature)
-    let signing_key = SigningKey::from_bytes(our_secret_key);
-    let signature = sign_auth_nonce(&signing_key, &peer_nonce_payload);
-    let mut response = Vec::with_capacity(96);
-    response.extend_from_slice(our_pubkey);
-    response.extend_from_slice(&signature.to_bytes());
-    write_packet(writer, OP_EMULEPROT, OP_EMBER_AUTH_RESPONSE, &response).await?;
-
-    // Read peer's response (32-byte pubkey + 64-byte signature),
-    // again tolerating intervening unrelated packets per the
-    // same rationale as the CHALLENGE read above.
-    let peer_response = read_specific_auth_packet(
-        reader,
-        OP_EMBER_AUTH_RESPONSE,
-        96,
-        addr,
-        "AUTH_RESPONSE",
-        |_, _, _| {},
-    )
-    .await?;
-
-    let resp_pubkey: [u8; 32] = peer_response[..32].try_into().unwrap();
-    if resp_pubkey != *peer_pubkey {
-        anyhow::bail!("Ember auth: response pubkey doesn't match EmuleInfo pubkey from {addr}");
-    }
-
-    let peer_vk = VerifyingKey::from_bytes(peer_pubkey)
-        .map_err(|e| anyhow::anyhow!("invalid peer Ed25519 pubkey: {e}"))?;
-    let sig_bytes: [u8; 64] = peer_response[32..96].try_into().unwrap();
-    let peer_sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-    if !verify_auth_nonce_compat(&peer_vk, &our_nonce, &peer_sig) {
-        anyhow::bail!("Ember auth: signature verification failed for {addr}");
-    }
-
-    info!(
-        "Ember auth: verified peer {} at {}",
-        hex::encode(&peer_pubkey[..8]),
-        addr
-    );
-    Ok(())
-}
-
-/// Buffered variant of [`perform_ember_auth`] for callers that cannot
-/// safely drop intervening non-AUTH packets.
-///
-/// Identical to `perform_ember_auth` except that any packet read off
-/// the stream while waiting for `OP_EMBER_AUTH_CHALLENGE` /
+/// Any packet read off the stream while waiting for `OP_EMBER_AUTH_CHALLENGE` /
 /// `OP_EMBER_AUTH_RESPONSE` is appended to `deferred_packets` so the
 /// caller can re-dispatch it through its main loop. This is what
 /// unblocks the multi-source download path: the uploader sends
