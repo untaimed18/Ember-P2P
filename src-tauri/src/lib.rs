@@ -1077,7 +1077,7 @@ pub fn run() {
 
                     let tx = state.network_tx.clone();
                     const SHUTDOWN_WAIT: std::time::Duration =
-                        std::time::Duration::from_secs(20);
+                        std::time::Duration::from_secs(45);
                     const SHUTDOWN_SEND_WAIT: std::time::Duration =
                         std::time::Duration::from_secs(2);
                     let start = std::time::Instant::now();

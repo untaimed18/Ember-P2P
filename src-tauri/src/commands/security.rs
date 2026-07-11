@@ -6,13 +6,58 @@ use tracing::info;
 use zip::ZipArchive;
 
 use crate::app_state::AppState;
-use crate::commands::errors::{await_reply, coded, coded_ctx, CMD_REPLY_TIMEOUT};
+use crate::commands::errors::{await_reply, bounded_send, coded, coded_ctx, CMD_REPLY_TIMEOUT};
 use crate::network::kad::ip_filter::{count_valid_entries, IpFilterStats};
 use crate::network::NetworkCommand;
 
 const CMD_TIMEOUT: std::time::Duration = CMD_REPLY_TIMEOUT;
 const DEFAULT_IPFILTER_ARCHIVE_URL: &str = "https://upd.emule-security.org/ipfilter.zip";
 const MAX_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
+
+async fn persist_ip_filter_enabled(
+    state: &tauri::State<'_, AppState>,
+) -> Result<crate::types::AppSettings, String> {
+    let _settings_save_guard = state.settings_save_lock.lock().await;
+    let (previous_settings, new_settings, save_data) = {
+        let config = state.config.read().await;
+        let previous_settings = config.settings.clone();
+        let mut new_settings = previous_settings.clone();
+        new_settings.ip_filter_enabled = true;
+        new_settings.settings_revision = config.settings.settings_revision.saturating_add(1);
+        let data = config
+            .prepare_save_settings(&new_settings)
+            .map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?;
+        (previous_settings, new_settings, data)
+    };
+    tokio::task::spawn_blocking(move || {
+        crate::storage::config::AppConfig::write_to_disk(&save_data.0, &save_data.1, &save_data.2)
+    })
+    .await
+    .map_err(|e| coded_ctx("security_save_task_failed", "Save task failed", e))?
+    .map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?;
+    state.config.write().await.settings = new_settings;
+    Ok(previous_settings)
+}
+
+async fn restore_settings_after_send_failure(
+    state: &tauri::State<'_, AppState>,
+    previous_settings: crate::types::AppSettings,
+) -> Result<(), String> {
+    let save_data = {
+        let config = state.config.read().await;
+        config
+            .prepare_save_settings(&previous_settings)
+            .map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?
+    };
+    tokio::task::spawn_blocking(move || {
+        crate::storage::config::AppConfig::write_to_disk(&save_data.0, &save_data.1, &save_data.2)
+    })
+    .await
+    .map_err(|e| coded_ctx("security_save_task_failed", "Save task failed", e))?
+    .map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?;
+    state.config.write().await.settings = previous_settings;
+    Ok(())
+}
 
 fn extract_ipfilter_from_zip(zip_bytes: &[u8]) -> Result<Vec<u8>, String> {
     let cursor = Cursor::new(zip_bytes);
@@ -167,15 +212,15 @@ pub async fn add_ip_filter_range(
         ));
     }
 
-    state
-        .network_tx
-        .send(NetworkCommand::AddIpRange {
+    bounded_send(
+        &state.network_tx,
+        NetworkCommand::AddIpRange {
             start_ip,
             end_ip,
             description,
-        })
-        .await
-        .map_err(|e| coded_ctx("security_failed_to_add_range", "Failed to add range", e))?;
+        },
+    )
+    .await?;
 
     Ok(())
 }
@@ -205,21 +250,15 @@ pub async fn remove_ip_filter_range(
     }
 
     let (tx, rx) = oneshot::channel();
-    state
-        .network_tx
-        .send(NetworkCommand::RemoveIpRange {
+    bounded_send(
+        &state.network_tx,
+        NetworkCommand::RemoveIpRange {
             start_ip,
             end_ip,
             tx,
-        })
-        .await
-        .map_err(|e| {
-            coded_ctx(
-                "security_failed_to_remove_range",
-                "Failed to remove range",
-                e,
-            )
-        })?;
+        },
+    )
+    .await?;
 
     let removed = await_reply(
         rx,
@@ -252,15 +291,16 @@ pub async fn set_ip_filter_enabled(
     // failure bails out before touching runtime state at all, so nothing
     // ever diverges; a channel-send failure after a successful save just
     // means the already-correct persisted value takes effect on next start.
-    let (new_settings, save_data) = {
+    let (previous_settings, new_settings, save_data) = {
         let config = state.config.read().await;
-        let mut new_settings = config.settings.clone();
+        let previous_settings = config.settings.clone();
+        let mut new_settings = previous_settings.clone();
         new_settings.ip_filter_enabled = enabled;
         new_settings.settings_revision = config.settings.settings_revision.saturating_add(1);
         let data = config
             .prepare_save_settings(&new_settings)
             .map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?;
-        (new_settings, data)
+        (previous_settings, new_settings, data)
     };
     tokio::task::spawn_blocking(move || {
         crate::storage::config::AppConfig::write_to_disk(&save_data.0, &save_data.1, &save_data.2)
@@ -269,17 +309,15 @@ pub async fn set_ip_filter_enabled(
     .map_err(|e| coded_ctx("security_save_task_failed", "Save task failed", e))?
     .map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?;
 
-    state
-        .network_tx
-        .send(NetworkCommand::SetIpFilterEnabled { enabled })
-        .await
-        .map_err(|e| {
-            coded_ctx(
-                "security_failed_to_update_filter",
-                "Failed to update filter",
-                e,
-            )
-        })?;
+    if let Err(error) = bounded_send(
+        &state.network_tx,
+        NetworkCommand::SetIpFilterEnabled { enabled },
+    )
+    .await
+    {
+        restore_settings_after_send_failure(&state, previous_settings).await?;
+        return Err(error);
+    }
 
     {
         let mut config = state.config.write().await;
@@ -298,15 +336,16 @@ pub async fn set_block_private_ips(
     // Persist before applying the runtime change — see set_ip_filter_enabled
     // for why this order avoids a config/runtime divergence window on save
     // failure.
-    let (new_settings, save_data) = {
+    let (previous_settings, new_settings, save_data) = {
         let config = state.config.read().await;
-        let mut new_settings = config.settings.clone();
+        let previous_settings = config.settings.clone();
+        let mut new_settings = previous_settings.clone();
         new_settings.block_private_ips = block_private;
         new_settings.settings_revision = config.settings.settings_revision.saturating_add(1);
         let data = config
             .prepare_save_settings(&new_settings)
             .map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?;
-        (new_settings, data)
+        (previous_settings, new_settings, data)
     };
     tokio::task::spawn_blocking(move || {
         crate::storage::config::AppConfig::write_to_disk(&save_data.0, &save_data.1, &save_data.2)
@@ -315,17 +354,15 @@ pub async fn set_block_private_ips(
     .map_err(|e| coded_ctx("security_save_task_failed", "Save task failed", e))?
     .map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?;
 
-    state
-        .network_tx
-        .send(NetworkCommand::SetBlockPrivateIps { block_private })
-        .await
-        .map_err(|e| {
-            coded_ctx(
-                "security_failed_to_update_filter",
-                "Failed to update filter",
-                e,
-            )
-        })?;
+    if let Err(error) = bounded_send(
+        &state.network_tx,
+        NetworkCommand::SetBlockPrivateIps { block_private },
+    )
+    .await
+    {
+        restore_settings_after_send_failure(&state, previous_settings).await?;
+        return Err(error);
+    }
 
     {
         let mut config = state.config.write().await;
@@ -442,60 +479,23 @@ pub async fn download_and_load_ipfilter(
     }
 
     let byte_count = extracted.len();
-
-    state
-        .network_tx
-        .send(NetworkCommand::ReloadIpFilter { path: filter_path })
+    let previous_settings = persist_ip_filter_enabled(&state).await?;
+    let apply_result = async {
+        bounded_send(
+            &state.network_tx,
+            NetworkCommand::ReloadIpFilter { path: filter_path },
+        )
+        .await?;
+        bounded_send(
+            &state.network_tx,
+            NetworkCommand::SetIpFilterEnabled { enabled: true },
+        )
         .await
-        .map_err(|e| {
-            coded_ctx(
-                "security_failed_to_reload_filter",
-                "Failed to reload filter",
-                e,
-            )
-        })?;
-
-    // Also enable the filter if it wasn't already
-    state
-        .network_tx
-        .send(NetworkCommand::SetIpFilterEnabled { enabled: true })
-        .await
-        .map_err(|e| {
-            coded_ctx(
-                "security_failed_to_enable_filter",
-                "Failed to enable filter",
-                e,
-            )
-        })?;
-
-    let _settings_save_guard = state.settings_save_lock.lock().await;
-    {
-        // Persist before committing the in-memory flag (see
-        // set_ip_filter_enabled). The runtime filter was already enabled above.
-        let (new_settings, save_data) = {
-            let config = state.config.read().await;
-            let mut new_settings = config.settings.clone();
-            new_settings.ip_filter_enabled = true;
-            new_settings.settings_revision = config.settings.settings_revision.saturating_add(1);
-            let data = config.prepare_save_settings(&new_settings).map_err(|e| {
-                coded_ctx("security_failed_to_save_config", "Failed to save config", e)
-            })?;
-            (new_settings, data)
-        };
-        tokio::task::spawn_blocking(move || {
-            crate::storage::config::AppConfig::write_to_disk(
-                &save_data.0,
-                &save_data.1,
-                &save_data.2,
-            )
-        })
-        .await
-        .map_err(|e| coded_ctx("security_save_task_failed", "Save task failed", e))?
-        .map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?;
-        {
-            let mut config = state.config.write().await;
-            config.settings = new_settings;
-        }
+    }
+    .await;
+    if let Err(error) = apply_result {
+        restore_settings_after_send_failure(&state, previous_settings).await?;
+        return Err(error);
     }
 
     let msg = format!(
@@ -628,59 +628,23 @@ pub async fn update_ipfilter_from_url(
     }
 
     let byte_count = filter_bytes.len();
-
-    state
-        .network_tx
-        .send(NetworkCommand::ReloadIpFilter { path: filter_path })
+    let previous_settings = persist_ip_filter_enabled(&state).await?;
+    let apply_result = async {
+        bounded_send(
+            &state.network_tx,
+            NetworkCommand::ReloadIpFilter { path: filter_path },
+        )
+        .await?;
+        bounded_send(
+            &state.network_tx,
+            NetworkCommand::SetIpFilterEnabled { enabled: true },
+        )
         .await
-        .map_err(|e| {
-            coded_ctx(
-                "security_failed_to_reload_filter",
-                "Failed to reload filter",
-                e,
-            )
-        })?;
-
-    state
-        .network_tx
-        .send(NetworkCommand::SetIpFilterEnabled { enabled: true })
-        .await
-        .map_err(|e| {
-            coded_ctx(
-                "security_failed_to_enable_filter",
-                "Failed to enable filter",
-                e,
-            )
-        })?;
-
-    let _settings_save_guard = state.settings_save_lock.lock().await;
-    {
-        // Persist before committing the in-memory flag (see
-        // set_ip_filter_enabled). The runtime filter was already enabled above.
-        let (new_settings, save_data) = {
-            let config = state.config.read().await;
-            let mut new_settings = config.settings.clone();
-            new_settings.ip_filter_enabled = true;
-            new_settings.settings_revision = config.settings.settings_revision.saturating_add(1);
-            let data = config.prepare_save_settings(&new_settings).map_err(|e| {
-                coded_ctx("security_failed_to_save_config", "Failed to save config", e)
-            })?;
-            (new_settings, data)
-        };
-        tokio::task::spawn_blocking(move || {
-            crate::storage::config::AppConfig::write_to_disk(
-                &save_data.0,
-                &save_data.1,
-                &save_data.2,
-            )
-        })
-        .await
-        .map_err(|e| coded_ctx("security_save_task_failed", "Save task failed", e))?
-        .map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?;
-        {
-            let mut config = state.config.write().await;
-            config.settings = new_settings;
-        }
+    }
+    .await;
+    if let Err(error) = apply_result {
+        restore_settings_after_send_failure(&state, previous_settings).await?;
+        return Err(error);
     }
 
     let extracted_note = if is_zip { " (extracted from zip)" } else { "" };
@@ -908,59 +872,23 @@ pub async fn import_ipfilter_file(
         }
         (path, entry_count)
     };
-
-    state
-        .network_tx
-        .send(NetworkCommand::ReloadIpFilter { path: load_path })
+    let previous_settings = persist_ip_filter_enabled(&state).await?;
+    let apply_result = async {
+        bounded_send(
+            &state.network_tx,
+            NetworkCommand::ReloadIpFilter { path: load_path },
+        )
+        .await?;
+        bounded_send(
+            &state.network_tx,
+            NetworkCommand::SetIpFilterEnabled { enabled: true },
+        )
         .await
-        .map_err(|e| {
-            coded_ctx(
-                "security_failed_to_reload_filter",
-                "Failed to reload filter",
-                e,
-            )
-        })?;
-
-    state
-        .network_tx
-        .send(NetworkCommand::SetIpFilterEnabled { enabled: true })
-        .await
-        .map_err(|e| {
-            coded_ctx(
-                "security_failed_to_enable_filter",
-                "Failed to enable filter",
-                e,
-            )
-        })?;
-
-    let _settings_save_guard = state.settings_save_lock.lock().await;
-    {
-        // Persist before committing the in-memory flag (see
-        // set_ip_filter_enabled). The runtime filter was already enabled above.
-        let (new_settings, save_data) = {
-            let config = state.config.read().await;
-            let mut new_settings = config.settings.clone();
-            new_settings.ip_filter_enabled = true;
-            new_settings.settings_revision = config.settings.settings_revision.saturating_add(1);
-            let data = config.prepare_save_settings(&new_settings).map_err(|e| {
-                coded_ctx("security_failed_to_save_config", "Failed to save config", e)
-            })?;
-            (new_settings, data)
-        };
-        tokio::task::spawn_blocking(move || {
-            crate::storage::config::AppConfig::write_to_disk(
-                &save_data.0,
-                &save_data.1,
-                &save_data.2,
-            )
-        })
-        .await
-        .map_err(|e| coded_ctx("security_save_task_failed", "Save task failed", e))?
-        .map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?;
-        {
-            let mut config = state.config.write().await;
-            config.settings = new_settings;
-        }
+    }
+    .await;
+    if let Err(error) = apply_result {
+        restore_settings_after_send_failure(&state, previous_settings).await?;
+        return Err(error);
     }
 
     Ok(format!(

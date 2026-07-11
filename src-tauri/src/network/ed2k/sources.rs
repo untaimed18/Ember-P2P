@@ -439,7 +439,12 @@ impl PerFileSourceList {
     }
 
     /// Bump the reask timer after a successful `CallbackReq` send.
-    pub fn mark_callback_requested(&mut self, ip: Ipv4Addr, port: u16, user_hash: Option<[u8; 16]>) {
+    pub fn mark_callback_requested(
+        &mut self,
+        ip: Ipv4Addr,
+        port: u16,
+        user_hash: Option<[u8; 16]>,
+    ) {
         if let Some(s) = self.find_mut(ip, port, user_hash) {
             s.last_asked = Instant::now();
         }
@@ -697,8 +702,14 @@ impl PerFileSourceList {
         }
     }
 
-    fn find(&self, ip: Ipv4Addr, port: u16, user_hash: Option<[u8; 16]>) -> Option<&DownloadSourceEntry> {
-        self.resolve_idx(ip, port, user_hash).map(|i| &self.sources[i])
+    fn find(
+        &self,
+        ip: Ipv4Addr,
+        port: u16,
+        user_hash: Option<[u8; 16]>,
+    ) -> Option<&DownloadSourceEntry> {
+        self.resolve_idx(ip, port, user_hash)
+            .map(|i| &self.sources[i])
     }
 
     fn find_mut(
@@ -1653,7 +1664,7 @@ impl SourceManager {
                     .any(|e| {
                         now.saturating_sub(e.last_seen) < SOURCE_EXPIRY_SECS
                             && e.client_id > 0
-                            && e.tcp_port == tcp_port
+                            && (tcp_port == 0 || e.tcp_port == tcp_port)
                             && e.server_ip == server_ip
                             && e.server_port == server_port
                     })
@@ -1671,7 +1682,7 @@ impl SourceManager {
                         .any(|e| {
                             now.saturating_sub(e.last_seen) < SOURCE_EXPIRY_SECS
                                 && e.client_id > 0
-                                && e.tcp_port == tcp_port
+                                && (tcp_port == 0 || e.tcp_port == tcp_port)
                                 && e.server_ip == server_ip
                                 && e.server_port == server_port
                                 && e.user_hash == hash
@@ -2046,10 +2057,7 @@ mod tests {
         // able to inflate `self.sources` past MAX_TRACKED_FILES, since each
         // file record costs only 18 bytes regardless of how many sources it
         // lists.
-        let dir = std::env::temp_dir().join(format!(
-            "ember_sources_test_{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("ember_sources_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("sources_cap_test.met");
 
@@ -2080,10 +2088,7 @@ mod tests {
 
     #[test]
     fn load_from_disk_skips_special_use_ips() {
-        let dir = std::env::temp_dir().join(format!(
-            "ember_sources_test2_{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("ember_sources_test2_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("sources_ipfilter_test.met");
 
@@ -2094,7 +2099,7 @@ mod tests {
         let fh = [0x77u8; 16];
         buf.extend_from_slice(&fh);
         buf.extend_from_slice(&1u16.to_le_bytes()); // src_count = 1
-        // One 43-byte source record with a loopback IP (127.0.0.1).
+                                                    // One 43-byte source record with a loopback IP (127.0.0.1).
         buf.extend_from_slice(&[127, 0, 0, 1]); // ip
         buf.extend_from_slice(&4662u16.to_le_bytes()); // tcp_port
         buf.extend_from_slice(&4672u16.to_le_bytes()); // udp_port

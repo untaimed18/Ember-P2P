@@ -52,7 +52,9 @@ function newTabId(): string {
 
 function resultKey(result: SearchResult): string {
   if (result.file.hash) return result.file.hash;
-  return `nohash:${result.result_origin}:${result.file.name}:${result.file.size}`;
+  if (result.file.id?.startsWith('pending:')) return `nohash-id:${result.file.id}`;
+  if (result.file.path) return `nohash-path:${result.file.path}`;
+  return `nohash:${result.file.name}:${result.file.size}`;
 }
 
 function combineOrigin(a: string, b: string): string {
@@ -87,8 +89,8 @@ function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResu
     source_addresses: mergedAddresses,
     rating: incoming.rating ?? existing.rating,
     comment: incoming.comment ?? existing.comment,
-    spam_rating: Math.max(existing.spam_rating ?? 0, incoming.spam_rating ?? 0),
-    is_spam: existing.is_spam || incoming.is_spam,
+    spam_rating: incoming.spam_rating ?? existing.spam_rating,
+    is_spam: incoming.is_spam,
     clean_name: incoming.clean_name || existing.clean_name,
     result_origin: combineOrigin(existing.result_origin || '', incoming.result_origin || ''),
   };

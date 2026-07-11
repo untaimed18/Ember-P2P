@@ -17,12 +17,11 @@
   let showNotes = $state(false);
 
   const visible = $derived(
-    !$updater.dismissed &&
-      ($updater.phase === 'available' ||
-        $updater.phase === 'downloading' ||
-        $updater.phase === 'installing' ||
-        $updater.phase === 'ready' ||
-        ($updater.phase === 'error' && $updater.version !== null)),
+    (!$updater.dismissed && $updater.phase === 'available') ||
+      $updater.phase === 'downloading' ||
+      $updater.phase === 'installing' ||
+      $updater.phase === 'ready' ||
+      ($updater.phase === 'error' && $updater.version !== null),
   );
 
   const percent = $derived(

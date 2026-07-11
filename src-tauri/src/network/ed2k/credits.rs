@@ -423,7 +423,20 @@ impl CreditManager {
                     }
                 }
             }
-            tracing::warn!("Corrupt cryptkey.dat, regenerating keypair");
+            let backup = key_path.with_extension(format!(
+                "dat.{}.corrupt",
+                chrono::Utc::now().format("%Y%m%d%H%M%S")
+            ));
+            if let Err(e) = std::fs::copy(&key_path, &backup) {
+                tracing::warn!("Failed to preserve corrupt cryptkey.dat: {e}");
+            } else {
+                crate::security::restrict_file_permissions(&backup);
+            }
+            tracing::error!(
+                "cryptkey.dat is corrupt; SecIdent remains disabled and the keypair was NOT regenerated"
+            );
+            self.crypto_available = false;
+            return;
         }
 
         let (public_key, private_key) = generate_rsa_keypair();

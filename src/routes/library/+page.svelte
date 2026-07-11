@@ -43,6 +43,7 @@
   import IconX from '$lib/components/IconX.svelte';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
+  import { inertBackground, trapTabKey } from '$lib/a11y';
 
   let folders: string[] = $state([]);
   let folderPriorities: Record<string, string> = $state({});
@@ -99,6 +100,13 @@
   let collectionLoading = $state(false);
   let downloadingCollection = $state(false);
   let createCollectionOpen = $state(false);
+  let createCollectionOverlay: HTMLDivElement | undefined = $state(undefined);
+  let createCollectionModal: HTMLDivElement | undefined = $state(undefined);
+  let createCollectionReturnFocus: HTMLElement | null = null;
+  $effect(() => {
+    if (!createCollectionOpen || !createCollectionOverlay) return;
+    return inertBackground(createCollectionOverlay);
+  });
   let newCollName = $state('');
   let newCollAuthor = $state('');
   let selectedFileHashes: Set<string> = $state(new Set());
@@ -172,12 +180,27 @@
   );
 
   function openCreateDialog(preselectHashes?: Iterable<string>) {
+    const active = typeof document !== 'undefined' ? document.activeElement : null;
+    createCollectionReturnFocus =
+      active instanceof HTMLElement && active !== document.body ? active : null;
     newCollName = '';
     newCollAuthor = '';
     selectedFileHashes = new Set(preselectHashes ?? []);
     collectionSearch = '';
     newCollFormat = 'binary';
     createCollectionOpen = true;
+    requestAnimationFrame(() => {
+      createCollectionModal?.querySelector<HTMLInputElement>('#coll-name')?.focus();
+    });
+  }
+
+  function closeCreateDialog() {
+    createCollectionOpen = false;
+    const target = createCollectionReturnFocus;
+    createCollectionReturnFocus = null;
+    requestAnimationFrame(() => {
+      if (target && document.contains(target)) target.focus();
+    });
   }
 
   function openCreateDialogFromSelection() {
@@ -253,7 +276,7 @@
       }
       const msg = await createCollection(newCollName.trim(), newCollAuthor.trim(), collFiles, outputPath, isBinary);
       toastSuccess(msg || m.library_collection_created({ name: newCollName.trim(), count: collFiles.length }));
-      createCollectionOpen = false;
+      closeCreateDialog();
     } catch (e: unknown) {
       toastError(toErr(e));
     } finally {
@@ -624,6 +647,7 @@
   }
 
   let stopConfirmVisible = $state(false);
+  let stoppingHashing = $state(false);
 
   function handleStopRequest() {
     stopConfirmVisible = true;
@@ -635,11 +659,12 @@
 
   async function handleStopConfirm() {
     stopConfirmVisible = false;
-    scanning = false;
-    hashProgress = null;
-    stoppedByUser = true;
+    stoppingHashing = true;
     try {
       await stopHashing();
+      scanning = false;
+      hashProgress = null;
+      stoppedByUser = true;
       // Keep `stoppedByUser` true: it's exactly what gates the "Resume
       // hashing" banner. Clearing it here (the old behaviour) meant the
       // banner never appeared after a successful stop, so a half-hashed
@@ -648,6 +673,8 @@
       if (mounted) await refresh();
     } catch (e: unknown) {
       if (mounted) error = toErr(e);
+    } finally {
+      stoppingHashing = false;
     }
   }
 
@@ -1343,7 +1370,7 @@
     if (typing) return;
 
     // Ignore shortcuts while a modal is open.
-    if (createCollectionOpen) return;
+    if (createCollectionOpen || confirmOpen) return;
 
     // Ctrl/Cmd+A selects all visible. Merge into the existing selection
     // (matching `toggleCheckAll`) rather than replacing it — selections are
@@ -1489,7 +1516,16 @@
           }
           break;
         }
-        case 'unshare': await unshareFile(f.path, f.hash || undefined); await refresh(); break;
+        case 'unshare': {
+          const confirmed = await askConfirm(
+            m.library_confirm_unshare_file({ name: f.name }),
+            m.library_unshare_file_title(),
+          );
+          if (!confirmed) break;
+          await unshareFile(f.path, f.hash || undefined);
+          await refresh();
+          break;
+        }
         case 'share': await shareFile(f.path); await refresh(); break;
         case 'republish': {
           if (!f.hash || !f.shared) break;
@@ -2035,8 +2071,11 @@
 
 {#if createCollectionOpen}
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-  <div class="modal-overlay" role="dialog" aria-modal="true" tabindex="-1" onkeydown={(e) => {
-    if (e.key === 'Escape') { createCollectionOpen = false; return; }
+  <div class="modal-overlay" bind:this={createCollectionOverlay} role="dialog" aria-modal="true" tabindex="-1" onclick={(e) => {
+    if (e.target === e.currentTarget) closeCreateDialog();
+  }} onkeydown={(e) => {
+    if (e.key === 'Escape') { closeCreateDialog(); return; }
+    trapTabKey(e, createCollectionModal);
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
       if (!!newCollName.trim() && selectedFileHashes.size > 0 && !creatingCollection) {
         e.preventDefault();
@@ -2044,10 +2083,10 @@
       }
     }
   }}>
-    <div class="modal-content create-coll-modal">
+    <div class="modal-content create-coll-modal" bind:this={createCollectionModal}>
       <div class="modal-header">
         <span class="modal-title">{m.library_create_collection()}</span>
-        <button class="ghost modal-close" onclick={() => createCollectionOpen = false} aria-label={m.common_close()}><IconX size={15} /></button>
+        <button class="ghost modal-close" onclick={closeCreateDialog} aria-label={m.common_close()}><IconX size={15} /></button>
       </div>
       <div class="modal-body">
         <div class="form-row">
@@ -2124,7 +2163,7 @@
         </div>
       </div>
       <div class="modal-footer">
-        <button class="ghost" onclick={() => createCollectionOpen = false}>{m.common_cancel()}</button>
+        <button class="ghost" onclick={closeCreateDialog}>{m.common_cancel()}</button>
         <button
           disabled={!newCollName.trim() || selectedFileHashes.size === 0 || creatingCollection}
           onclick={handleCreateCollection}
@@ -2353,17 +2392,21 @@
 
   <!-- Main: file list -->
   <div class="file-list-area">
-    {#if scanning || hashProgress}
+    {#if stoppingHashing || scanning || hashProgress}
       <div class="scan-banner">
         <span class="scan-spinner"></span>
         <span class="scan-text">
-          {#if hashProgress}
+          {#if stoppingHashing}
+            {m.library_stopping_hashing()}
+          {:else if hashProgress}
             {m.library_hashing_file({ current: hashProgress.current, total: hashProgress.total, name: hashProgress.file_name })}
           {:else}
             {m.library_scanning_files()}
           {/if}
         </span>
-        <button class="scan-btn stop-btn" onclick={handleStopRequest}>{m.common_stop()}</button>
+        {#if !stoppingHashing}
+          <button class="scan-btn stop-btn" onclick={handleStopRequest}>{m.common_stop()}</button>
+        {/if}
       </div>
     {/if}
     {#if stopConfirmVisible}
@@ -2373,7 +2416,7 @@
         <button class="scan-btn stop-btn" onclick={handleStopConfirm}>{m.common_stop()}</button>
       </div>
     {/if}
-    {#if stoppedByUser && !scanning && !stopConfirmVisible}
+    {#if stoppedByUser && !stoppingHashing && !scanning && !stopConfirmVisible}
       <div class="scan-banner resume-banner">
         <span class="scan-text">{m.library_hashing_stopped()}</span>
         <button class="scan-btn resume-btn" onclick={handleResume}>{m.library_resume_hashing()}</button>

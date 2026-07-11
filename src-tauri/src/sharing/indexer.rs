@@ -71,6 +71,8 @@ impl FileIndexer {
                 if name.ends_with(".part")
                     || name.ends_with(".part.met")
                     || name.ends_with(".met.tmp")
+                    || (name.starts_with('.') && name.ends_with(".tmp"))
+                    || name.ends_with(".migration-tmp")
                     || name.ends_with(".bak")
                 {
                     continue;

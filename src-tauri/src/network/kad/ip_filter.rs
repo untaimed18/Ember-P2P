@@ -1158,8 +1158,7 @@ mod tests {
 
     #[test]
     fn test_count_valid_entries_dat_format() {
-        let data =
-            b"# comment\n1.0.0.0 - 1.0.0.255 , 000 , Blocked\n1.2.3.4 , 0 , Single host\n";
+        let data = b"# comment\n1.0.0.0 - 1.0.0.255 , 000 , Blocked\n1.2.3.4 , 0 , Single host\n";
         assert_eq!(count_valid_entries(data, "dat"), 2);
     }
 

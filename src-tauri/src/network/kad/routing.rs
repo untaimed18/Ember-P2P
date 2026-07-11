@@ -1279,7 +1279,7 @@ impl RoutingTable {
     }
 
     fn find_closest_any(&self, target: &KadId, count: usize) -> Vec<KadContact> {
-        let distance = KadId::from_u32(0).xor_distance(target);
+        let distance = self.local_id.xor_distance(target);
         let mut result = BTreeMap::new();
         self.root.get_closest_to(
             CONTACT_TYPE_DEAD - 1,

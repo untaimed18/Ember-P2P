@@ -229,11 +229,9 @@ pub async fn search_files(
     }
     let (tx, rx) = oneshot::channel();
 
-    let keywords: Vec<String> = query
-        .split_whitespace()
-        .filter(|w| !w.is_empty())
-        .map(|w| w.to_lowercase())
-        .collect();
+    let keywords = crate::search::query::parse(query.trim())
+        .map(|expression| expression.positive_terms())
+        .unwrap_or_default();
 
     let (local_hits, timeout_secs) = {
         let (li, c) = tokio::join!(state.local_index.read(), state.config.read(),);

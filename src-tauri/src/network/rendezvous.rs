@@ -4,8 +4,6 @@ use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
-const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
 // ---------------------------------------------------------------------------
 // Rendezvous-protocol Ed25519 signing. Mirrors the verification helpers
 // in `rendezvous-server/src/main.rs`. The server pins each id to its
@@ -141,12 +139,11 @@ pub fn hashed_id(ember_hash: &[u8; 16]) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .no_proxy()
-        .https_only(true)
-        .build()
+async fn client(rendezvous_url: &str) -> Result<reqwest::Client, String> {
+    let (_, host, addrs) = crate::security::validate_fetch_url(rendezvous_url)
+        .await
+        .map_err(|e| format!("rendezvous URL rejected: {e}"))?;
+    crate::security::build_pinned_client(&host, &addrs)
         .map_err(|e| format!("failed to build hardened rendezvous HTTP client: {e}"))
 }
 
@@ -234,7 +231,8 @@ pub async fn register(
         "ts": ts,
         "sig": hex::encode(sig.to_bytes()),
     });
-    let resp = client()?
+    let resp = client(base_url)
+        .await?
         .post(&url)
         .json(&body)
         .send()
@@ -297,7 +295,8 @@ pub async fn lookup(
     let id = hashed_id(friend_hash);
     let id_raw = sha256_id_raw(friend_hash);
     let url = format!("{}/lookup/{}", base_url.trim_end_matches('/'), id);
-    let resp = client()?
+    let resp = client(base_url)
+        .await?
         .get(&url)
         .send()
         .await
@@ -494,7 +493,8 @@ pub async fn unregister(
     let id_raw = sha256_id_raw(ember_hash);
     let ts = current_timestamp();
     let sig = sign_unregister(secret_key, &id_raw, ts);
-    let resp = client()?
+    let resp = client(base_url)
+        .await?
         .delete(&url)
         .json(&serde_json::json!({
             "id": id,

@@ -1,6 +1,5 @@
 /// Filename cleanup matching eMule's CleanupFilename from OtherFunctions.cpp.
 /// This is for display only -- the actual filename on disk is not modified.
-
 pub const DEFAULT_CLEANUP_STRINGS: &str =
     "http|www.|.com|.de|.org|.net|shared|powered|sponsored|sharelive|filedonkey";
 

@@ -19,6 +19,7 @@ use axum::{
     Json, Router,
 };
 use ed25519_dalek::{Signature, VerifyingKey};
+use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
@@ -310,12 +311,11 @@ struct PunchEntry {
 ///
 /// Replaces the older single-direction relay where peer1's WS frames
 /// were silently dropped. The bridge is now genuinely full-duplex.
+type RelayPeerChannel = (tokio::sync::mpsc::Sender<Vec<u8>>, Arc<AtomicUsize>);
+
 struct RelaySessionEntry {
     peer1_inbox_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
-    peer2_announce_tx: Option<
-        tokio::sync::oneshot::Sender<(tokio::sync::mpsc::Sender<Vec<u8>>, Arc<AtomicUsize>)>,
-    >,
-    #[allow(dead_code)]
+    peer2_announce_tx: Option<tokio::sync::oneshot::Sender<RelayPeerChannel>>,
     first_ip: IpAddr,
     created_at: Instant,
 }
@@ -483,6 +483,14 @@ async fn remember_signed_request(state: &AppState, key: [u8; 32]) -> bool {
 
 fn validate_hex_id(id: &str) -> bool {
     id.len() == 64 && id.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn synthetic_endpoint_id_ip(id: &str) -> Option<Ipv4Addr> {
+    if !validate_hex_id(id) || !id[..52].bytes().all(|byte| byte == b'0') {
+        return None;
+    }
+    let raw = u32::from_str_radix(&id[52..60], 16).ok()?;
+    Some(Ipv4Addr::from(raw))
 }
 
 /// Returns true only for IPv4 addresses safe to register as a
@@ -1093,7 +1101,14 @@ async fn relay_invite_post(
     let list = invites.entry(target.clone()).or_default();
 
     if list.len() >= MAX_RELAY_INVITES_PER_TARGET {
-        return StatusCode::TOO_MANY_REQUESTS;
+        if let Some(oldest) = list
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, invite)| invite.created_at)
+            .map(|(index, _)| index)
+        {
+            list.remove(oldest);
+        }
     }
 
     list.push(RelayInvite {
@@ -1129,6 +1144,14 @@ async fn relay_invite_poll(
     let client_ip = extract_client_ip(&headers, addr);
     if !check_rate_limit(&state, client_ip).await {
         return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    let expected_ip = synthetic_endpoint_id_ip(&id).ok_or(StatusCode::BAD_REQUEST)?;
+    let caller_v4 = match client_ip {
+        IpAddr::V4(ip) => Some(ip),
+        IpAddr::V6(ip) => ip.to_ipv4_mapped(),
+    };
+    if caller_v4 != Some(expected_ip) {
+        return Err(StatusCode::FORBIDDEN);
     }
 
     let key = id.to_lowercase();
@@ -1175,8 +1198,30 @@ async fn relay_ws(
         return StatusCode::BAD_REQUEST.into_response();
     }
     let client_ip = extract_client_ip(&headers, addr);
-    ws.on_upgrade(move |socket| handle_relay_ws(socket, state, session_id, client_ip))
+    if !check_rate_limit(&state, client_ip).await {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
+    ws.max_frame_size(1024 * 1024)
+        .max_message_size(1024 * 1024)
+        .on_upgrade(move |socket| handle_relay_ws_guarded(socket, state, session_id, client_ip))
         .into_response()
+}
+
+async fn handle_relay_ws_guarded(
+    socket: WebSocket,
+    state: AppState,
+    session_id: String,
+    client_ip: IpAddr,
+) {
+    let cleanup_state = state.clone();
+    let cleanup_session = session_id.clone();
+    let result =
+        std::panic::AssertUnwindSafe(handle_relay_ws(socket, state, session_id, client_ip))
+            .catch_unwind()
+            .await;
+    if result.is_err() {
+        cleanup_relay(&cleanup_state, &cleanup_session, client_ip).await;
+    }
 }
 
 async fn handle_relay_ws(
@@ -1577,9 +1622,25 @@ async fn sweep_expired(state: AppState) {
         // Sweep stale relay sessions (created but never bridged)
         {
             let mut relays = state.relay_sessions.write().await;
-            let relay_before = relays.len();
+            let removed_ips: Vec<IpAddr> = relays
+                .values()
+                .filter(|entry| now.duration_since(entry.created_at) >= RELAY_SESSION_TIMEOUT)
+                .map(|entry| entry.first_ip)
+                .collect();
             relays.retain(|_, e| now.duration_since(e.created_at) < RELAY_SESSION_TIMEOUT);
-            let relay_removed = relay_before - relays.len();
+            drop(relays);
+            if !removed_ips.is_empty() {
+                let mut counts = state.relay_ip_counts.write().await;
+                for ip in &removed_ips {
+                    if let Some(count) = counts.get_mut(ip) {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            counts.remove(ip);
+                        }
+                    }
+                }
+            }
+            let relay_removed = removed_ips.len();
             if relay_removed > 0 {
                 info!("swept {} stale relay sessions", relay_removed);
             }

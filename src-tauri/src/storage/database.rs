@@ -53,14 +53,14 @@ impl Database {
         let conn = Connection::open(&db_path)?;
         crate::security::restrict_file_permissions(&db_path);
 
-        let quick_check: String = conn.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
+        let quick_check: String = conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
         if !quick_check.eq_ignore_ascii_case("ok") {
             return Err(CorruptDatabase(quick_check).into());
         }
 
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;\
-             PRAGMA synchronous=NORMAL;\
+             PRAGMA synchronous=FULL;\
              PRAGMA foreign_keys=ON;\
              PRAGMA secure_delete=ON;\
              PRAGMA auto_vacuum=INCREMENTAL;\
@@ -1414,9 +1414,10 @@ impl Database {
     }
 
     pub fn add_friend(&self, user_hash: &str, nickname: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
         let now = chrono::Utc::now().timestamp();
-        conn.execute(
+        tx.execute(
             "INSERT INTO friends (user_hash, nickname, added_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(user_hash) DO UPDATE SET nickname = excluded.nickname",
             params![user_hash, nickname, now],
@@ -1925,9 +1926,10 @@ impl Database {
         } else {
             file_name
         };
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
         let now = chrono::Utc::now().timestamp();
-        conn.execute(
+        tx.execute(
             "INSERT INTO download_history (file_hash, file_name, file_size, status, timestamp)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(file_hash) DO UPDATE SET
@@ -1943,7 +1945,7 @@ impl Database {
                 now
             ],
         )?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM download_history WHERE file_hash IN (
                 SELECT file_hash FROM download_history
                 ORDER BY timestamp DESC
@@ -1951,6 +1953,7 @@ impl Database {
             )",
             params![MAX_DOWNLOAD_HISTORY_ROWS],
         )?;
+        tx.commit()?;
         Ok(())
     }
 

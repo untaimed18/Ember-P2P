@@ -446,6 +446,17 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
             }
         }
     }
+    for (index, folder) in settings.shared_folders.iter().enumerate() {
+        if let Some(other) = settings.shared_folders[index + 1..].iter().find(|other| {
+            shared_paths_overlap(std::path::Path::new(folder), std::path::Path::new(other))
+        }) {
+            return Err(coded_ctx(
+                "settings_shared_folder_overlap",
+                "Shared folders must not overlap",
+                format!("{folder} and {other}"),
+            ));
+        }
+    }
     Ok(())
 }
 

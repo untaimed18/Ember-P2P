@@ -174,7 +174,11 @@ impl CorruptionBlackBox {
         if let Some(blocks) = self.records.get_mut(file_hash) {
             let mut result = Vec::with_capacity(blocks.len());
             for block in blocks.drain(..) {
-                if block.verified || block.corrupt || block.start >= part_end || block.end <= part_start {
+                if block.verified
+                    || block.corrupt
+                    || block.start >= part_end
+                    || block.end <= part_start
+                {
                     result.push(block);
                     continue;
                 }

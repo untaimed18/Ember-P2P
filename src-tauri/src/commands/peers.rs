@@ -1,7 +1,7 @@
 use std::net::{IpAddr, SocketAddr};
 
 use crate::app_state::AppState;
-use crate::commands::errors::{await_reply, coded, coded_ctx};
+use crate::commands::errors::{await_reply, bounded_send, coded, coded_ctx};
 use crate::network::{NetworkCommand, PeerReputationInfo, ReputationStatsInfo};
 use crate::types::EmberDiagnostics;
 use crate::types::*;
@@ -318,15 +318,15 @@ pub async fn send_chat_message(
     let canonical = user_hash_hex.to_lowercase();
     let hash = parse_user_hash(&canonical)?;
     let (tx, rx) = tokio::sync::oneshot::channel();
-    state
-        .network_tx
-        .send(NetworkCommand::SendChatMessage {
+    bounded_send(
+        &state.network_tx,
+        NetworkCommand::SendChatMessage {
             ember_hash: hash,
             message: cleaned,
             tx,
-        })
-        .await
-        .map_err(|_| coded("peers_network_unavailable", "Network unavailable"))?;
+        },
+    )
+    .await?;
     await_reply(rx, "peers_no_response", "No response").await?
 }
 
@@ -575,14 +575,14 @@ pub async fn retry_friend_search(
     let canonical = user_hash_hex.to_lowercase();
     let hash = parse_user_hash(&canonical)?;
     let (tx, rx) = tokio::sync::oneshot::channel();
-    state
-        .network_tx
-        .send(NetworkCommand::RetryFriendSearch {
+    bounded_send(
+        &state.network_tx,
+        NetworkCommand::RetryFriendSearch {
             ember_hash: hash,
             tx,
-        })
-        .await
-        .map_err(|_| coded("peers_network_unavailable", "Network unavailable"))?;
+        },
+    )
+    .await?;
     await_reply(rx, "peers_no_response", "No response").await?
 }
 
@@ -594,14 +594,14 @@ pub async fn browse_friend(
     let canonical = user_hash_hex.to_lowercase();
     let hash = parse_user_hash(&canonical)?;
     let (tx, rx) = tokio::sync::oneshot::channel();
-    state
-        .network_tx
-        .send(NetworkCommand::BrowseFriend {
+    bounded_send(
+        &state.network_tx,
+        NetworkCommand::BrowseFriend {
             ember_hash: hash,
             tx,
-        })
-        .await
-        .map_err(|_| coded("peers_network_unavailable", "Network unavailable"))?;
+        },
+    )
+    .await?;
     await_reply(rx, "peers_no_response", "No response").await?
 }
 

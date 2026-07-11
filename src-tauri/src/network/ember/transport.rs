@@ -55,6 +55,7 @@ struct NoiseSession {
     transport: snow::TransportState,
     remote_noise_pub: [u8; 32],
     last_activity: Instant,
+    ik_authenticated: bool,
     decrypt_failures: u8,
     last_decrypt_failure: Option<Instant>,
 }
@@ -292,6 +293,12 @@ impl EmberTransport {
     #[allow(dead_code)]
     pub fn has_session(&self, addr: &SocketAddr) -> bool {
         self.sessions.contains_key(addr)
+    }
+
+    pub fn peer_is_ik_authenticated(&self, addr: &SocketAddr) -> bool {
+        self.sessions
+            .get(addr)
+            .is_some_and(|session| session.ik_authenticated)
     }
 
     /// Process an incoming Ember-encrypted UDP packet.
@@ -665,6 +672,7 @@ impl EmberTransport {
                 transport,
                 remote_noise_pub,
                 last_activity: Instant::now(),
+                ik_authenticated: true,
                 decrypt_failures: 0,
                 last_decrypt_failure: None,
             },
@@ -753,6 +761,7 @@ impl EmberTransport {
                 transport,
                 remote_noise_pub,
                 last_activity: Instant::now(),
+                ik_authenticated: true,
                 decrypt_failures: 0,
                 last_decrypt_failure: None,
             },
@@ -933,6 +942,7 @@ impl EmberTransport {
                 transport,
                 remote_noise_pub,
                 last_activity: Instant::now(),
+                ik_authenticated: false,
                 decrypt_failures: 0,
                 last_decrypt_failure: None,
             },
@@ -1034,6 +1044,7 @@ impl EmberTransport {
                 transport,
                 remote_noise_pub,
                 last_activity: Instant::now(),
+                ik_authenticated: false,
                 decrypt_failures: 0,
                 last_decrypt_failure: None,
             },

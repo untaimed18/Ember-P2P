@@ -33,7 +33,8 @@ const KEYWORD_REPUBLISH_SAFETY_MARGIN_SECS: i64 = 2 * 3600;
 fn keyword_republish_interval(backoff_shift: u32) -> i64 {
     let shift = backoff_shift.min(4);
     let uncapped = REPUBLISH_KEYWORD_SECS.saturating_mul(1_i64 << shift);
-    uncapped.min(super::store::KEYWORD_TTL_SECS.saturating_sub(KEYWORD_REPUBLISH_SAFETY_MARGIN_SECS))
+    uncapped
+        .min(super::store::KEYWORD_TTL_SECS.saturating_sub(KEYWORD_REPUBLISH_SAFETY_MARGIN_SECS))
 }
 
 /// Bit set in the `"ember"` source-publish tag when this client speaks
@@ -198,7 +199,9 @@ impl PublishManager {
         // `keyword_index` never accumulates entries for keywords the file
         // no longer matches.
         if let Some(old) = self.records.get(&file.file_hash) {
-            if old.file.file_name != file.file_name || old.file.keyword_publishable != file.keyword_publishable {
+            if old.file.file_name != file.file_name
+                || old.file.keyword_publishable != file.keyword_publishable
+            {
                 self.remove_file_from_keyword_index(&old.file.clone());
             }
         }
@@ -676,14 +679,12 @@ impl PublishManager {
     /// used to add up to an O(keywords × files) sweep per tick.
     fn keyword_has_publishable_files(&self, keyword: &str) -> bool {
         let hash = keyword_to_kad_id(keyword);
-        self.keyword_index
-            .get(&hash)
-            .is_some_and(|file_hashes| {
-                file_hashes
-                    .iter()
-                    .filter_map(|h| self.records.get(h))
-                    .any(|record| record.file.keyword_publishable)
-            })
+        self.keyword_index.get(&hash).is_some_and(|file_hashes| {
+            file_hashes
+                .iter()
+                .filter_map(|h| self.records.get(h))
+                .any(|record| record.file.keyword_publishable)
+        })
     }
 }
 
@@ -1168,7 +1169,10 @@ mod tests {
         assert_eq!(hits[0].file_hash, matching.file_hash);
 
         let misses = p.files_for_keyword(&keyword_to_kad_id("nonexistent"));
-        assert!(misses.is_empty(), "an unpublished keyword must return no files");
+        assert!(
+            misses.is_empty(),
+            "an unpublished keyword must return no files"
+        );
     }
 
     /// A file registered with `keyword_publishable: false` (e.g. an
@@ -1223,7 +1227,8 @@ mod tests {
         });
 
         assert!(
-            p.files_for_keyword(&keyword_to_kad_id("original")).is_empty(),
+            p.files_for_keyword(&keyword_to_kad_id("original"))
+                .is_empty(),
             "the old keyword must no longer resolve to the renamed file"
         );
         assert_eq!(
@@ -1252,13 +1257,19 @@ mod tests {
             keyword_publishable: true,
             last_source_publish: 0,
         });
-        assert_eq!(p.files_for_keyword(&keyword_to_kad_id("removable")).len(), 1);
+        assert_eq!(
+            p.files_for_keyword(&keyword_to_kad_id("removable")).len(),
+            1
+        );
 
         p.remove_file(&hash);
 
-        assert!(p.files_for_keyword(&keyword_to_kad_id("removable")).is_empty());
+        assert!(p
+            .files_for_keyword(&keyword_to_kad_id("removable"))
+            .is_empty());
         assert!(
-            !p.keyword_index.contains_key(&keyword_to_kad_id("removable")),
+            !p.keyword_index
+                .contains_key(&keyword_to_kad_id("removable")),
             "an empty keyword bucket must be dropped entirely, not left as an empty Vec/Set"
         );
     }

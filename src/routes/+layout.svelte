@@ -14,7 +14,7 @@
   import { initTransferStore, cleanupTransferStore, startTransferPoll } from '$lib/stores/transfers';
   import { initSearchStore, cleanupSearchStore } from '$lib/stores/search';
   import { initFriendsStore, cleanupFriendsStore } from '$lib/stores/friends';
-  import { loadAppSettings, clearAppSettings } from '$lib/stores/settings';
+  import { loadAppSettings, clearAppSettings, setAppSettings } from '$lib/stores/settings';
   import { initTheme, cleanupTheme } from '$lib/stores/theme';
   import { applyDocumentLang, translateError } from '$lib/i18n';
   import * as m from '$lib/paraglide/messages';
@@ -44,7 +44,8 @@
   let wizardSettings: AppSettings | null = $state(null);
   let showCloseDialog = $state(false);
 
-  async function onWizardComplete(_updated: AppSettings) {
+  async function onWizardComplete(updated: AppSettings) {
+    setAppSettings(updated);
     showWizard = false;
     wizardSettings = null;
   }
@@ -57,6 +58,7 @@
     if (remember) {
       try {
         await setCloseBehavior('tray');
+        setAppSettings(await getSettings());
       } catch (e) {
         console.error('Failed to persist close-to-tray preference:', e);
       }
@@ -72,6 +74,7 @@
     if (remember) {
       try {
         await setCloseBehavior('exit');
+        setAppSettings(await getSettings());
       } catch (e) {
         console.error('Failed to persist exit-on-close preference:', e);
       }
@@ -200,6 +203,7 @@
           if (!mounted) return;
 
           if (settings) {
+            setAppSettings(settings);
             if (!settings.setup_complete) {
               wizardSettings = settings;
               showWizard = true;

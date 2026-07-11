@@ -44,7 +44,7 @@ async fn remove_cancel_flag_if_current(
 }
 
 use crate::app_state::AppState;
-use crate::commands::errors::{coded, coded_ctx};
+use crate::commands::errors::{bounded_send, coded, coded_ctx};
 use crate::network::NetworkCommand;
 use crate::search::index::LocalIndex;
 use crate::sharing::indexer::FileIndexer;
@@ -69,12 +69,18 @@ pub(crate) async fn refresh_file_cache(
             let cached = cache.read().await;
             cached
                 .iter()
-                .map(|file| (file.path.clone(), (file.shared_kad, file.shared_ed2k)))
+                .map(|file| {
+                    (
+                        crate::search::index::normalize_path_key(&file.path),
+                        (file.shared_kad, file.shared_ed2k),
+                    )
+                })
                 .collect::<std::collections::HashMap<_, _>>()
         },);
     let mut snap = snap_raw;
     for file in &mut snap {
-        if let Some((shared_kad, shared_ed2k)) = previous_flags.get(&file.path) {
+        let key = crate::search::index::normalize_path_key(&file.path);
+        if let Some((shared_kad, shared_ed2k)) = previous_flags.get(&key) {
             file.shared_kad = file.shared && !file.hash.is_empty() && *shared_kad;
             file.shared_ed2k = file.shared && !file.hash.is_empty() && *shared_ed2k;
         }
@@ -1076,24 +1082,14 @@ pub async fn batch_set_priority(
     };
     if count > 0 {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        // Mirror each priority change into `known.met`. Use `try_send`
-        // so the bulk action doesn't block when the network channel is
-        // briefly saturated; the search index is still authoritative
-        // for live priority and a future SharedFilesChanged reconciles.
-        let prio_u8 = priority_str_to_u8(&priority);
-        for hash in hashes {
-            if state
-                .network_tx
-                .try_send(NetworkCommand::SetUploadPriority {
-                    file_hash_hex: hash,
-                    priority: prio_u8,
-                })
-                .is_err()
-            {
-                warn!("Network channel full during batch priority push");
-                break;
-            }
-        }
+        bounded_send(
+            &state.network_tx,
+            NetworkCommand::SetUploadPriorities {
+                file_hashes: hashes,
+                priority: priority_str_to_u8(&priority),
+            },
+        )
+        .await?;
         info!(
             "Batch set priority to {priority} for {count}/{} files",
             file_paths.len()

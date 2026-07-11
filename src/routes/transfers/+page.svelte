@@ -391,6 +391,11 @@
     infoTimers.push(setTimeout(() => (transferInfo = null), 5000));
   }
   let confirmCancel: { open: boolean; id: string; name: string } = $state({ open: false, id: '', name: '' });
+  let confirmBan: { open: boolean; userHash: string; name: string } = $state({
+    open: false,
+    userHash: '',
+    name: '',
+  });
   let confirmClearCompleted = $state(false);
   // D27: confirmation + in-flight tracker for archive recovery, which
   // can take noticeable time for large partials and isn't reversible.
@@ -1652,9 +1657,12 @@
         }
         case 'ban_user': {
           if (!t.user_hash) { transferError = m.transfers_no_user_hash(); break; }
-          await banPeer(t.user_hash);
-          showInfo(m.transfers_banned_user({ name: t.peer_name || t.user_hash.slice(0, 8) + '\u2026' }));
-          break;
+          confirmBan = {
+            open: true,
+            userHash: t.user_hash,
+            name: t.peer_name || t.user_hash.slice(0, 8) + '\u2026',
+          };
+          return;
         }
       }
     } catch (e: unknown) { transferError = toErrorMsg(e); }
@@ -2539,7 +2547,7 @@
   // filter box or confirm dialogs.
   const target = e.target as HTMLElement | null;
   const inEditable = target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
-  if (inEditable || ctxMenu || confirmCancel.open || confirmClearCompleted || confirmBatchCancel.open || confirmRecover.open) return;
+  if (inEditable || ctxMenu || confirmCancel.open || confirmBan.open || confirmClearCompleted || confirmBatchCancel.open || confirmRecover.open) return;
   if (filteredActiveDownloads.length === 0) return;
   const currentId = selectedDownloadIds[selectedDownloadIds.length - 1];
   const idx = currentId ? filteredActiveDownloads.findIndex((t) => t.id === currentId) : -1;
@@ -3798,6 +3806,21 @@
   confirmLabel={m.transfers_confirm_cancel_label()}
   danger={true}
   onconfirm={async () => { try { await cancelTransfer(confirmCancel.id); speedHistory.delete(confirmCancel.id); transfers.update((list) => list.filter((x) => x.id !== confirmCancel.id)); } catch (e: unknown) { transferError = toErrorMsg(e); } }}
+/>
+<ConfirmDialog
+  bind:open={confirmBan.open}
+  title={m.transfers_confirm_ban_title()}
+  message={m.transfers_confirm_ban_message({ name: confirmBan.name })}
+  confirmLabel={m.transfers_ctx_ban_user()}
+  danger={true}
+  onconfirm={async () => {
+    try {
+      await banPeer(confirmBan.userHash);
+      showInfo(m.transfers_banned_user({ name: confirmBan.name }));
+    } catch (e: unknown) {
+      transferError = toErrorMsg(e);
+    }
+  }}
 />
 
 <ConfirmDialog

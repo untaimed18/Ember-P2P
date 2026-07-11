@@ -10,6 +10,7 @@
   import { updateSettings as saveSettings, downloadNodesDat, downloadIpfilter } from '$lib/api/settings';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
+  import { inertBackground, trapTabKey } from '$lib/a11y';
 
   function fmtSpeedShort(bytesPerSec: number): string {
     return bytesPerSec > 0
@@ -45,6 +46,23 @@
   let saving = $state(false);
   let saveError = $state('');
   let relaunching = $state(false);
+  let overlayEl: HTMLDivElement | undefined = $state(undefined);
+  let cardEl: HTMLDivElement | undefined = $state(undefined);
+
+  $effect(() => {
+    if (!overlayEl) return;
+    return inertBackground(overlayEl);
+  });
+  $effect(() => {
+    step;
+    requestAnimationFrame(() => {
+      cardEl
+        ?.querySelector<HTMLElement>(
+          'input:not([disabled]), button:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        )
+        ?.focus();
+    });
+  });
 
   type DlStatus = 'idle' | 'pending' | 'ok' | 'error';
   let dlNodesStatus = $state<DlStatus>('idle');
@@ -239,8 +257,16 @@
   </div>
 </div>
 {:else}
-<div class="wizard-overlay" role="dialog" aria-modal="true" aria-label={m.wizard_aria()}>
-  <div class="wizard-card" class:transitioning>
+<div
+  class="wizard-overlay"
+  bind:this={overlayEl}
+  role="dialog"
+  aria-modal="true"
+  aria-label={m.wizard_aria()}
+  tabindex="-1"
+  onkeydown={(event) => trapTabKey(event, cardEl)}
+>
+  <div class="wizard-card" class:transitioning bind:this={cardEl}>
     <!-- Progress -->
     <div class="wizard-progress">
       {#each stepLabels as label, i}

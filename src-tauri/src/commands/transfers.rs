@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use tauri::Emitter;
 
 use crate::app_state::AppState;
-use crate::commands::errors::{await_reply, coded, coded_ctx, CMD_REPLY_TIMEOUT};
+use crate::commands::errors::{await_reply, bounded_send, coded, coded_ctx, CMD_REPLY_TIMEOUT};
 use crate::network::NetworkCommand;
 use crate::sharing::manager::TransferControl;
 use crate::types::*;
@@ -123,9 +123,9 @@ pub(crate) async fn start_promoted_downloads(state: &AppState, promoted: &[Trans
             manager.register_control(&transfer.id, control.clone());
             control
         };
-        if let Err(e) = state
-            .network_tx
-            .send(NetworkCommand::StartDownload {
+        if let Err(e) = bounded_send(
+            &state.network_tx,
+            NetworkCommand::StartDownload {
                 file_hash: transfer.file_hash.clone(),
                 file_name: transfer.file_name.clone(),
                 file_size: transfer.total_size,
@@ -137,8 +137,9 @@ pub(crate) async fn start_promoted_downloads(state: &AppState, promoted: &[Trans
                 extra_sources: Vec::new(),
                 transfer_id: transfer.id.clone(),
                 control,
-            })
-            .await
+            },
+        )
+        .await
         {
             tracing::warn!("Failed to start promoted download {}: {e}", transfer.id);
             let mut manager = state.transfer_manager.write().await;
@@ -472,9 +473,9 @@ pub async fn start_download(
         });
     }
 
-    if let Err(e) = state
-        .network_tx
-        .send(NetworkCommand::StartDownload {
+    if let Err(e) = bounded_send(
+        &state.network_tx,
+        NetworkCommand::StartDownload {
             file_hash,
             file_name,
             file_size,
@@ -483,8 +484,9 @@ pub async fn start_download(
             extra_sources: parsed_extras,
             transfer_id: transfer_id.clone(),
             control,
-        })
-        .await
+        },
+    )
+    .await
     {
         // The network channel is gone, so this transfer will never start.
         // It was already enqueued as active and occupies a download slot;
@@ -650,12 +652,13 @@ pub async fn pause_transfer(
         // frontend zeroes the row's speed on a paused/stopped status event.
         emit_transfer_status(&app, &transfer_id, status);
     }
-    let _ = state
-        .network_tx
-        .send(NetworkCommand::PauseDownload {
+    let _ = bounded_send(
+        &state.network_tx,
+        NetworkCommand::PauseDownload {
             transfer_id: transfer_id.clone(),
-        })
-        .await;
+        },
+    )
+    .await;
     start_promoted_downloads(&state, &promoted).await;
     Ok(())
 }
@@ -679,13 +682,14 @@ pub async fn stop_transfer(
     // Reflect the Stop in the UI immediately (eMule CPartFile::StopFile updates
     // synchronously); otherwise the row lingers as Active until the next poll.
     emit_transfer_status(&app, &transfer_id, &TransferStatus::Stopped);
-    let _ = state
-        .network_tx
-        .send(NetworkCommand::CancelDownload {
+    let _ = bounded_send(
+        &state.network_tx,
+        NetworkCommand::CancelDownload {
             transfer_id: transfer_id.clone(),
             cleanup_ack: None,
-        })
-        .await;
+        },
+    )
+    .await;
     start_promoted_downloads(&state, &promoted).await;
     Ok(())
 }
@@ -979,13 +983,14 @@ pub async fn cancel_transfer(
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
     let (_, dl_folder) = tokio::join!(
         async {
-            let _ = state
-                .network_tx
-                .send(NetworkCommand::CancelDownload {
+            let _ = bounded_send(
+                &state.network_tx,
+                NetworkCommand::CancelDownload {
                     transfer_id: transfer_id.clone(),
                     cleanup_ack: Some(ack_tx),
-                })
-                .await;
+                },
+            )
+            .await;
         },
         async {
             let config = state.config.read().await;
@@ -1038,13 +1043,14 @@ pub async fn remove_transfer(
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
     let (_, dl_folder) = tokio::join!(
         async {
-            let _ = state
-                .network_tx
-                .send(NetworkCommand::CancelDownload {
+            let _ = bounded_send(
+                &state.network_tx,
+                NetworkCommand::CancelDownload {
                     transfer_id: transfer_id.clone(),
                     cleanup_ack: Some(ack_tx),
-                })
-                .await;
+                },
+            )
+            .await;
         },
         async {
             let config = state.config.read().await;
@@ -1273,12 +1279,13 @@ pub async fn pause_all_transfers(
         (statuses, all_ids)
     };
     for id in &pause_ids {
-        let _ = state
-            .network_tx
-            .send(NetworkCommand::PauseDownload {
+        let _ = bounded_send(
+            &state.network_tx,
+            NetworkCommand::PauseDownload {
                 transfer_id: id.clone(),
-            })
-            .await;
+            },
+        )
+        .await;
     }
     // Immediate UI feedback for every paused row (see pause_transfer).
     for (id, status) in &statuses {
