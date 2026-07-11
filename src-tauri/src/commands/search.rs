@@ -371,7 +371,11 @@ pub async fn find_notes(
                 let _ = state
                     .network_tx
                     .try_send(NetworkCommand::CancelSearch { request_id });
-                return Err(format!("Notes search timed out after {timeout_secs}s"));
+                return Err(coded_ctx(
+                    "search_timed_out",
+                    format!("Notes search timed out after {timeout_secs}s"),
+                    timeout_secs,
+                ));
             }
         };
     enrich_results(&mut results, &state, &[], None).await;
@@ -416,7 +420,11 @@ pub async fn find_sources(
             let _ = state
                 .network_tx
                 .try_send(NetworkCommand::CancelSearch { request_id });
-            Err(format!("Source search timed out after {timeout_secs}s"))
+            Err(coded_ctx(
+                "search_timed_out",
+                format!("Source search timed out after {timeout_secs}s"),
+                timeout_secs,
+            ))
         }
     }
 }

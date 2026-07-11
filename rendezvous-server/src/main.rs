@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -10,8 +10,8 @@ use std::{
 
 use axum::{
     extract::{
-        ConnectInfo, Path, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
+        ConnectInfo, Path, State,
     },
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
@@ -68,17 +68,29 @@ fn timestamp_fresh(ts: i64) -> bool {
 
 fn decode_hex_pubkey(s: &str) -> Option<[u8; 32]> {
     let mut out = [0u8; 32];
-    if hex::decode_to_slice(s, &mut out).is_ok() { Some(out) } else { None }
+    if hex::decode_to_slice(s, &mut out).is_ok() {
+        Some(out)
+    } else {
+        None
+    }
 }
 
 fn decode_hex_sig(s: &str) -> Option<[u8; 64]> {
     let mut out = [0u8; 64];
-    if hex::decode_to_slice(s, &mut out).is_ok() { Some(out) } else { None }
+    if hex::decode_to_slice(s, &mut out).is_ok() {
+        Some(out)
+    } else {
+        None
+    }
 }
 
 fn decode_hex_id(s: &str) -> Option<[u8; 32]> {
     let mut out = [0u8; 32];
-    if hex::decode_to_slice(s, &mut out).is_ok() { Some(out) } else { None }
+    if hex::decode_to_slice(s, &mut out).is_ok() {
+        Some(out)
+    } else {
+        None
+    }
 }
 
 /// Re-derive the rendezvous id from a pubkey and check it matches the
@@ -94,7 +106,9 @@ fn pubkey_matches_id(pubkey: &[u8; 32], claimed_id: &str) -> bool {
 }
 
 fn ed25519_verify(pubkey: &[u8; 32], message: &[u8], sig: &[u8; 64]) -> bool {
-    let Ok(vk) = VerifyingKey::from_bytes(pubkey) else { return false };
+    let Ok(vk) = VerifyingKey::from_bytes(pubkey) else {
+        return false;
+    };
     let signature = Signature::from_bytes(sig);
     // verify_strict rejects malleable signatures and small-subgroup
     // attacks; the strict flavour is what the protocol audit
@@ -102,7 +116,13 @@ fn ed25519_verify(pubkey: &[u8; 32], message: &[u8], sig: &[u8; 64]) -> bool {
     vk.verify_strict(message, &signature).is_ok()
 }
 
-fn build_register_msg(id_raw: &[u8; 32], port: u16, ip4: [u8; 4], pubkey: &[u8; 32], ts: i64) -> Vec<u8> {
+fn build_register_msg(
+    id_raw: &[u8; 32],
+    port: u16,
+    ip4: [u8; 4],
+    pubkey: &[u8; 32],
+    ts: i64,
+) -> Vec<u8> {
     let mut m = Vec::with_capacity(RDV_DOMAIN.len() + 1 + 32 + 2 + 4 + 32 + 8);
     m.extend_from_slice(RDV_DOMAIN);
     m.push(OP_REGISTER);
@@ -154,6 +174,7 @@ const MAX_PUNCH_PER_MINUTE: u64 = 60;
 /// from many IPs to fill more slots, which is also bounded by
 /// `MAX_GLOBAL_RELAY_SESSIONS` upstream).
 const MAX_PUNCH_PER_TARGET: usize = 8;
+const MAX_PUNCH_REQUESTS_TOTAL: usize = 100_000;
 /// Per-IP relay session cap. Was `2`, which was the cause of every
 /// `WebSocket protocol error: Sending after closing is not allowed`
 /// failure the Ember client saw on adoption: the server accepts the
@@ -215,6 +236,8 @@ const RELAY_SESSION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// need to scale with the bandwidth/duration changes above.
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RELAY_INVITES_PER_TARGET: usize = 8;
+const MAX_RELAY_INVITE_TARGETS: usize = 50_000;
+const MAX_RELAY_INVITES_TOTAL: usize = 100_000;
 const RELAY_INVITE_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
@@ -251,6 +274,21 @@ struct PresenceEntry {
     /// at worst it points a dialer at a dead port on that same host. An
     /// entry needs BOTH this and `noise_pub` to be bootstrap-eligible.
     ember_port: Option<u16>,
+    /// Timestamp the registrant signed (`body.ts` from the accepted
+    /// `/register` call). Returned verbatim in `/lookup` responses so
+    /// callers can reconstruct and verify the exact signed message —
+    /// see `sig` below.
+    ts: i64,
+    /// The Ed25519 signature the registrant produced over
+    /// `RDV_DOMAIN || OP_REGISTER || id_raw || port_le || ipv4 || pubkey || ts_le`
+    /// at registration time. Replayed back verbatim in `/lookup`
+    /// responses: this is what lets a looker-upper cryptographically
+    /// confirm the (ip, port, pubkey, ts) tuple was produced by
+    /// whoever holds the private key for this id, and was not
+    /// substituted or fabricated by the rendezvous server itself. The
+    /// server has no long-term signing key of its own for this
+    /// purpose — it only ever relays the registrant's own proof.
+    sig: [u8; 64],
 }
 
 #[derive(Clone)]
@@ -379,6 +417,21 @@ struct RegisterRequest {
 struct LookupResponse {
     ip: String,
     port: u16,
+    /// Hex-encoded Ed25519 pubkey the registrant signed with. The
+    /// caller must confirm this pubkey actually derives to the id it
+    /// looked up (same `pubkey -> ember_hash -> id` chain as
+    /// registration) before trusting anything else in this response.
+    pubkey: String,
+    /// Timestamp the registrant signed (see `PresenceEntry::ts`).
+    ts: i64,
+    /// Hex-encoded Ed25519 signature over
+    /// `RDV_DOMAIN || OP_REGISTER || sha256_id_raw || port_le || ipv4 || pubkey || ts_le`,
+    /// produced by the registrant at registration time and replayed
+    /// verbatim here. The caller verifies it against `pubkey` to
+    /// confirm this exact (ip, port, pubkey, ts) tuple was actually
+    /// produced by the id's owner, not fabricated by the rendezvous
+    /// server.
+    sig: String,
 }
 
 #[derive(Deserialize)]
@@ -410,10 +463,18 @@ fn extract_client_ip(headers: &HeaderMap, addr: SocketAddr) -> IpAddr {
 
 async fn check_rate_limit(state: &AppState, ip: IpAddr) -> bool {
     let mut limits = state.rate_limits.write().await;
-    if limits.len() >= MAX_RATE_ENTRIES && !limits.contains_key(&ip) {
-        return false;
-    }
     let now = Instant::now();
+    if limits.len() >= MAX_RATE_ENTRIES && !limits.contains_key(&ip) {
+        // Same rationale as the store cap in `register`: purge
+        // entries that are stale by the sweep's own definition before
+        // failing closed on a brand-new IP, so a map that's merely
+        // full of old churn doesn't 429 every first-time caller until
+        // the next sweep cycle happens to run.
+        limits.retain(|_, entry| now.duration_since(entry.window_start) < RATE_WINDOW * 2);
+        if limits.len() >= MAX_RATE_ENTRIES && !limits.contains_key(&ip) {
+            return false;
+        }
+    }
     let entry = limits.entry(ip).or_insert(RateEntry {
         count: 0,
         window_start: now,
@@ -452,6 +513,77 @@ async fn remember_signed_request(state: &AppState, key: [u8; 32]) -> bool {
 
 fn validate_hex_id(id: &str) -> bool {
     id.len() == 64 && id.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Returns true only for IPv4 addresses safe to register as a
+/// friend-reachable presence address: not unspecified, loopback,
+/// multicast, broadcast, link-local, private (RFC 1918), or one of
+/// the CGN / documentation / benchmark / reserved ranges that aren't
+/// covered by the stable `is_private()`/`is_documentation()` helpers.
+/// Mirrors (and is intentionally duplicated from, for locality) the
+/// client-side filter in `src-tauri/src/network/rendezvous.rs::is_routable_public_v4`
+/// — keep the two in sync if either changes. The client re-checks
+/// this independently as defense-in-depth, but the server is the
+/// first line of defense: rejecting non-routable addresses here means
+/// they never enter the presence map at all.
+fn is_routable_public_v4(ip: Ipv4Addr) -> bool {
+    if ip.is_unspecified()
+        || ip.is_loopback()
+        || ip.is_multicast()
+        || ip.is_broadcast()
+        || ip.is_link_local()
+        || ip.is_private()
+        || ip.is_documentation()
+    {
+        return false;
+    }
+    let octets = ip.octets();
+    // 0.0.0.0/8 (already covered by is_unspecified for /32, but block
+    // the whole /8 per RFC 1122).
+    if octets[0] == 0 {
+        return false;
+    }
+    // 100.64.0.0/10 — Carrier-grade NAT (RFC 6598). Not reserved by
+    // `is_private()` in stable Rust.
+    if octets[0] == 100 && (64..=127).contains(&octets[1]) {
+        return false;
+    }
+    // 240.0.0.0/4 — reserved/future use.
+    if octets[0] >= 240 {
+        return false;
+    }
+    // 198.18.0.0/15 — benchmark.
+    if octets[0] == 198 && (octets[1] == 18 || octets[1] == 19) {
+        return false;
+    }
+    true
+}
+
+/// IPv6 counterpart to `is_routable_public_v4`. Rejects unspecified,
+/// loopback, multicast, unique-local (`fc00::/7`), and unicast
+/// link-local (`fe80::/10`) addresses. Stable `std` doesn't yet expose
+/// `is_unique_local`/`is_unicast_link_local` for `Ipv6Addr`, so those
+/// two ranges are matched on the leading segment directly. IPv4-mapped
+/// (`::ffff:0:0/96`) addresses are unwrapped and re-checked against
+/// the V4 filter, so a client can't smuggle a non-routable V4 address
+/// past this filter by presenting it in mapped-V6 form.
+fn is_routable_public_v6(ip: Ipv6Addr) -> bool {
+    if let Some(mapped) = ip.to_ipv4_mapped() {
+        return is_routable_public_v4(mapped);
+    }
+    if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+        return false;
+    }
+    let seg0 = ip.segments()[0];
+    // fc00::/7 — unique local addresses (RFC 4193).
+    if seg0 & 0xfe00 == 0xfc00 {
+        return false;
+    }
+    // fe80::/10 — link-local unicast.
+    if seg0 & 0xffc0 == 0xfe80 {
+        return false;
+    }
+    true
 }
 
 fn validate_relay_session_id(id: &str) -> bool {
@@ -533,14 +665,13 @@ async fn register(
     //     CGN / docs / 240.0.0.0/4) still applies, so an attacker
     //     can't point rendezvous at e.g. 127.0.0.1 to make friends
     //     dial themselves.
-    let body_ip_parsed = match body.ip
+    let body_ip_parsed = match body
+        .ip
         .as_deref()
         .and_then(|s| s.parse::<IpAddr>().ok())
         .filter(|ip| match ip {
-            IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_unspecified()
-                && !v4.is_private() && !v4.is_link_local(),
-            IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified()
-                && !v6.is_multicast(),
+            IpAddr::V4(v4) => is_routable_public_v4(*v4),
+            IpAddr::V6(v6) => is_routable_public_v6(*v6),
         }) {
         Some(ip) => ip,
         None => {
@@ -592,6 +723,8 @@ async fn register(
         pubkey,
         noise_pub,
         ember_port,
+        ts: body.ts,
+        sig: sig_bytes,
     };
 
     let mut store = state.store.write().await;
@@ -605,7 +738,18 @@ async fn register(
             return StatusCode::FORBIDDEN;
         }
     } else if store.len() >= MAX_STORE_ENTRIES {
-        return StatusCode::SERVICE_UNAVAILABLE;
+        // Before failing closed on a brand-new id, opportunistically
+        // purge already-expired entries — a map that's merely full of
+        // stale junk (normal churn between sweep cycles) shouldn't
+        // lock out legitimate new registrants the same way a genuine
+        // sustained flood would. This is cheap (O(n) scan, no
+        // allocation beyond the retain) and bounded to the same work
+        // the periodic sweep already does every `SWEEP_INTERVAL`.
+        let now = Instant::now();
+        store.retain(|_, e| e.expires_at > now);
+        if store.len() >= MAX_STORE_ENTRIES {
+            return StatusCode::SERVICE_UNAVAILABLE;
+        }
     }
     store.insert(key, entry);
     // debug!, not info!: per-request lines include the client IP and a
@@ -613,7 +757,12 @@ async fn register(
     // user across log aggregations. Drop into debug so operators can
     // still get this with `RUST_LOG=ember_rendezvous=debug` when
     // troubleshooting, but the default log stream stays free of PII.
-    debug!("registered {} ip={} (conn={})", &body.id[..8], presence_ip, client_ip);
+    debug!(
+        "registered {} ip={} (conn={})",
+        &body.id[..8],
+        presence_ip,
+        client_ip
+    );
     StatusCode::OK
 }
 
@@ -641,6 +790,9 @@ async fn lookup(
             Ok(Json(LookupResponse {
                 ip: entry.ip.to_string(),
                 port: entry.port,
+                pubkey: hex::encode(entry.pubkey),
+                ts: entry.ts,
+                sig: hex::encode(entry.sig),
             }))
         }
         _ => {
@@ -674,19 +826,25 @@ async fn unregister(
         return StatusCode::TOO_MANY_REQUESTS;
     }
 
-    let mut store = state.store.write().await;
-    if let Some(entry) = store.get(&body.id.to_lowercase()) {
+    let id = body.id.to_lowercase();
+    let pubkey = state.store.read().await.get(&id).map(|entry| entry.pubkey);
+    if let Some(pubkey) = pubkey {
         // Verify the signature with the pinned pubkey rather than
         // trusting `client_ip == entry.conn_ip` (which CGN /
         // proxy-mismatch / new ISP session breaks). The signature is
         // the only authority that survives address churn.
         let msg = build_unregister_msg(&id_raw, body.ts);
-        if ed25519_verify(&entry.pubkey, &msg, &sig_bytes) {
-            if !remember_signed_request(&state, signed_request_replay_key(&msg, &sig_bytes)).await
-            {
+        if ed25519_verify(&pubkey, &msg, &sig_bytes) {
+            if !remember_signed_request(&state, signed_request_replay_key(&msg, &sig_bytes)).await {
                 return StatusCode::CONFLICT;
             }
-            store.remove(&body.id.to_lowercase());
+            // Crypto and replay-cache work is deliberately outside the global
+            // presence write lock. Re-check the pinned key before removal in
+            // case the entry was refreshed while verification ran.
+            let mut store = state.store.write().await;
+            if store.get(&id).is_some_and(|entry| entry.pubkey == pubkey) {
+                store.remove(&id);
+            }
             debug!("unregistered {} from {}", &body.id[..8], client_ip);
             return StatusCode::OK;
         }
@@ -713,6 +871,42 @@ struct PunchResponse {
     ip: String,
     port: u16,
     nat_type: u8,
+}
+
+fn prune_expired_punches(punches: &mut HashMap<(String, String), PunchEntry>, now: Instant) {
+    punches.retain(|_, entry| now.duration_since(entry.created_at) < PUNCH_TTL);
+}
+
+fn prune_expired_relay_invites(invites: &mut HashMap<String, Vec<RelayInvite>>, now: Instant) {
+    invites.retain(|_, list| {
+        list.retain(|invite| now.duration_since(invite.created_at) < RELAY_INVITE_TTL);
+        !list.is_empty()
+    });
+}
+
+fn relay_invite_count(invites: &HashMap<String, Vec<RelayInvite>>) -> usize {
+    invites.values().map(Vec::len).sum()
+}
+
+fn evict_oldest_relay_invite(invites: &mut HashMap<String, Vec<RelayInvite>>) -> bool {
+    let oldest = invites
+        .iter()
+        .flat_map(|(target, list)| {
+            list.iter()
+                .enumerate()
+                .map(move |(index, invite)| (target.clone(), index, invite.created_at))
+        })
+        .min_by_key(|(_, _, created_at)| *created_at);
+    let Some((target, index, _)) = oldest else {
+        return false;
+    };
+    if let Some(list) = invites.get_mut(&target) {
+        list.remove(index);
+        if list.is_empty() {
+            invites.remove(&target);
+        }
+    }
+    true
 }
 
 /// Register a hole-punch request targeting another peer.
@@ -749,10 +943,15 @@ async fn punch_register(
     // `lookup` / `relay-invite` from the same IP.
     {
         let mut limits = state.punch_rate_limits.write().await;
-        if limits.len() >= MAX_RATE_ENTRIES && !limits.contains_key(&client_ip) {
-            return StatusCode::TOO_MANY_REQUESTS;
-        }
         let now = Instant::now();
+        if limits.len() >= MAX_RATE_ENTRIES && !limits.contains_key(&client_ip) {
+            // See `check_rate_limit` for rationale: purge stale
+            // entries before failing closed on a brand-new IP.
+            limits.retain(|_, entry| now.duration_since(entry.window_start) < RATE_WINDOW * 2);
+            if limits.len() >= MAX_RATE_ENTRIES && !limits.contains_key(&client_ip) {
+                return StatusCode::TOO_MANY_REQUESTS;
+            }
+        }
         let entry = limits.entry(client_ip).or_insert(RateEntry {
             count: 0,
             window_start: now,
@@ -779,10 +978,22 @@ async fn punch_register(
     };
 
     let mut punches = state.punch_requests.write().await;
+    let now = entry.created_at;
+    prune_expired_punches(&mut punches, now);
+    let key = (target.clone(), from.clone());
+    if !punches.contains_key(&key) && punches.len() >= MAX_PUNCH_REQUESTS_TOTAL {
+        if let Some(oldest_key) = punches
+            .iter()
+            .min_by_key(|(_, pending)| pending.created_at)
+            .map(|(key, _)| key.clone())
+        {
+            punches.remove(&oldest_key);
+        }
+    }
     // Enforce per-target cap. If we'd exceed it (and this isn't a
     // refresh of an existing (target, from) entry), evict the oldest
     // entry for this target to make room.
-    if !punches.contains_key(&(target.clone(), from.clone())) {
+    if !punches.contains_key(&key) {
         let count_for_target = punches.keys().filter(|(t, _)| t == &target).count();
         if count_for_target >= MAX_PUNCH_PER_TARGET {
             if let Some(oldest_key) = punches
@@ -795,9 +1006,14 @@ async fn punch_register(
             }
         }
     }
-    punches.insert((target.clone(), from.clone()), entry);
+    punches.insert(key, entry);
     drop(punches);
-    info!("punch registered: {} -> {} from {}", &from[..8], &target[..8], client_ip);
+    debug!(
+        "punch registered: {} -> {} from {}",
+        &from[..8],
+        &target[..8],
+        client_ip
+    );
     StatusCode::OK
 }
 
@@ -824,7 +1040,7 @@ async fn punch_poll(
     let now = Instant::now();
 
     // Remove expired entries while we're here.
-    punches.retain(|_, e| now.duration_since(e.created_at) < PUNCH_TTL);
+    prune_expired_punches(&mut punches, now);
 
     // Each call returns the oldest pending punch for this target and
     // removes only that one entry. Other pending punches for the same
@@ -839,7 +1055,7 @@ async fn punch_poll(
         .map(|(k, _)| k.clone());
     match oldest.and_then(|k| punches.remove(&k)) {
         Some(entry) => {
-            info!("punch poll hit: {} from {}", &target[..8], client_ip);
+            debug!("punch poll hit: {} from {}", &target[..8], client_ip);
             Ok(Json(PunchResponse {
                 from_id: entry.from_id,
                 ip: entry.from_ip.to_string(),
@@ -892,10 +1108,31 @@ async fn relay_invite_post(
 
     let target = body.target_id.to_lowercase();
     let mut invites = state.relay_invites.write().await;
-    let list = invites.entry(target.clone()).or_default();
-
     let now = Instant::now();
-    list.retain(|i| now.duration_since(i.created_at) < RELAY_INVITE_TTL);
+    prune_expired_relay_invites(&mut invites, now);
+
+    if !invites.contains_key(&target) && invites.len() >= MAX_RELAY_INVITE_TARGETS {
+        if let Some(oldest_target) = invites
+            .iter()
+            .filter_map(|(target, list)| {
+                list.iter()
+                    .map(|invite| invite.created_at)
+                    .min()
+                    .map(|created_at| (target.clone(), created_at))
+            })
+            .min_by_key(|(_, created_at)| *created_at)
+            .map(|(target, _)| target)
+        {
+            invites.remove(&oldest_target);
+        }
+    }
+    while relay_invite_count(&invites) >= MAX_RELAY_INVITES_TOTAL {
+        if !evict_oldest_relay_invite(&mut invites) {
+            break;
+        }
+    }
+
+    let list = invites.entry(target.clone()).or_default();
 
     if list.len() >= MAX_RELAY_INVITES_PER_TARGET {
         return StatusCode::TOO_MANY_REQUESTS;
@@ -905,7 +1142,12 @@ async fn relay_invite_post(
         session_id: body.session_id.clone(),
         created_at: now,
     });
-    info!("relay invite stored for {} session={} from {}", &target[..8], &body.session_id[..8.min(body.session_id.len())], client_ip);
+    debug!(
+        "relay invite stored for {} session={} from {}",
+        &target[..8],
+        &body.session_id[..8.min(body.session_id.len())],
+        client_ip
+    );
     StatusCode::OK
 }
 
@@ -940,12 +1182,19 @@ async fn relay_invite_poll(
             let results: Vec<RelayInviteResponse> = list
                 .into_iter()
                 .filter(|i| now.duration_since(i.created_at) < RELAY_INVITE_TTL)
-                .map(|i| RelayInviteResponse { session_id: i.session_id })
+                .map(|i| RelayInviteResponse {
+                    session_id: i.session_id,
+                })
                 .collect();
             if results.is_empty() {
                 Err(StatusCode::NOT_FOUND)
             } else {
-                info!("relay invite poll: {} invites for {} from {}", results.len(), &key[..8], client_ip);
+                debug!(
+                    "relay invite poll: {} invites for {} from {}",
+                    results.len(),
+                    &key[..8],
+                    client_ip
+                );
                 Ok(Json(results))
             }
         }
@@ -988,7 +1237,10 @@ async fn handle_relay_ws(
         let global_total: usize = counts.values().sum();
         if global_total >= MAX_GLOBAL_RELAY_SESSIONS {
             drop(counts);
-            info!("relay rejected: global cap reached ({} sessions)", global_total);
+            info!(
+                "relay rejected: global cap reached ({} sessions)",
+                global_total
+            );
             let _ = socket.send(Message::Close(None)).await;
             return;
         }
@@ -996,7 +1248,10 @@ async fn handle_relay_ws(
         if *entry >= MAX_RELAY_SESSIONS_PER_IP {
             let current = *entry;
             drop(counts);
-            info!("relay rejected: {} already has {} sessions", client_ip, current);
+            debug!(
+                "relay rejected: {} already has {} sessions",
+                client_ip, current
+            );
             let _ = socket.send(Message::Close(None)).await;
             return;
         }
@@ -1040,7 +1295,11 @@ async fn handle_relay_ws(
             cleanup_relay(&state, &session_id, client_ip).await;
             return;
         }
-        info!("relay session {} bridged (peer2={})", &session_id[..8.min(session_id.len())], client_ip);
+        debug!(
+            "relay session {} bridged (peer2={})",
+            &session_id[..8.min(session_id.len())],
+            client_ip
+        );
         bridge_relay(
             socket,
             peer1_inbox_tx,
@@ -1055,18 +1314,27 @@ async fn handle_relay_ws(
         // First peer — set up the rendezvous slot and run the peer1
         // loop until peer2 joins (announce_rx fires) or we time out.
         let (peer1_inbox_tx, peer1_inbox_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-        let (peer2_announce_tx, peer2_announce_rx) =
-            tokio::sync::oneshot::channel::<(tokio::sync::mpsc::Sender<Vec<u8>>, Arc<AtomicUsize>)>();
+        let (peer2_announce_tx, peer2_announce_rx) = tokio::sync::oneshot::channel::<(
+            tokio::sync::mpsc::Sender<Vec<u8>>,
+            Arc<AtomicUsize>,
+        )>();
 
-        sessions.insert(session_id.clone(), RelaySessionEntry {
-            peer1_inbox_tx: Some(peer1_inbox_tx),
-            peer2_announce_tx: Some(peer2_announce_tx),
-            first_ip: client_ip,
-            created_at: Instant::now(),
-        });
+        sessions.insert(
+            session_id.clone(),
+            RelaySessionEntry {
+                peer1_inbox_tx: Some(peer1_inbox_tx),
+                peer2_announce_tx: Some(peer2_announce_tx),
+                first_ip: client_ip,
+                created_at: Instant::now(),
+            },
+        );
         drop(sessions);
 
-        info!("relay session {} created (peer1={})", &session_id[..8.min(session_id.len())], client_ip);
+        debug!(
+            "relay session {} created (peer1={})",
+            &session_id[..8.min(session_id.len())],
+            client_ip
+        );
 
         run_peer1_loop(socket, peer1_inbox_rx, peer2_announce_rx, &session_id).await;
         cleanup_relay(&state, &session_id, client_ip).await;

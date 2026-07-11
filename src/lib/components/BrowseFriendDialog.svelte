@@ -5,6 +5,7 @@
   import { startDownload } from '$lib/api/transfers';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
+  import { inertBackground, trapTabKey } from '$lib/a11y';
 
   interface Props {
     open: boolean;
@@ -24,6 +25,7 @@
   let listenerGen = 0;
   let browseTimeout: ReturnType<typeof setTimeout> | undefined;
   const MAX_BROWSE_FILES = 1_000;
+  const instanceId = Math.random().toString(36).slice(2, 10);
   // M4: per-request gen used to disambiguate result/error events
   // from successive browses. Without it, a late error from request
   // N is dropped by the `loading` guard if request N+1 already
@@ -201,16 +203,39 @@
   }
 
   function handleKeydown(e: KeyboardEvent) {
-    if (e.key === 'Escape') onclose();
+    if (e.key === 'Escape') {
+      onclose();
+      return;
+    }
+    trapTabKey(e, modalEl);
   }
 
-  // The keydown handler lives on the modal, but the modal isn't focused
-  // when it opens — so Escape did nothing until the user tabbed/clicked
-  // into the dialog. Focus it on open so Escape works immediately (other
-  // dialogs in this app do the same).
   let modalEl: HTMLDivElement | undefined = $state(undefined);
+  let dialogRootEl: HTMLDivElement | undefined = $state(undefined);
+  let returnFocusEl: HTMLElement | null = null;
+
   $effect(() => {
-    if (open && modalEl) modalEl.focus();
+    if (open) {
+      const active = typeof document !== 'undefined' ? document.activeElement : null;
+      if (active instanceof HTMLElement && active !== document.body) returnFocusEl = active;
+      requestAnimationFrame(() => {
+        modalEl?.querySelector<HTMLButtonElement>('button:not([disabled])')?.focus();
+      });
+    }
+    return () => {
+      if (!open && returnFocusEl) {
+        const el = returnFocusEl;
+        returnFocusEl = null;
+        requestAnimationFrame(() => {
+          if (typeof document !== 'undefined' && document.contains(el)) el.focus();
+        });
+      }
+    };
+  });
+
+  $effect(() => {
+    if (!open || !dialogRootEl) return;
+    return inertBackground(dialogRootEl);
   });
 
   onDestroy(() => {
@@ -222,85 +247,95 @@
 
 <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
 {#if open}
-  <!-- svelte-ignore a11y_click_events_have_key_events -->
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="browse-overlay" onclick={onclose}></div>
-  <!-- svelte-ignore a11y_interactive_supports_focus -->
-  <div class="browse-modal" role="dialog" tabindex="-1" bind:this={modalEl} onkeydown={handleKeydown}>
-    <div class="browse-header">
-      <h3>{m.browse_title_prefix()} <bdi>{friendName || friendHash.slice(0, 8) + '\u2026'}</bdi></h3>
-      <button class="browse-close" onclick={onclose} title={m.common_close()} aria-label={m.common_close()}>
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-          <line x1="4" y1="4" x2="12" y2="12"/><line x1="12" y1="4" x2="4" y2="12"/>
-        </svg>
-      </button>
-    </div>
+  <div bind:this={dialogRootEl}>
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div class="browse-overlay" onclick={onclose}></div>
+    <!-- svelte-ignore a11y_interactive_supports_focus -->
+    <div
+      class="browse-modal"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="browse-title-{instanceId}"
+      tabindex="-1"
+      bind:this={modalEl}
+      onkeydown={handleKeydown}
+    >
+      <div class="browse-header">
+        <h3 id="browse-title-{instanceId}">{m.browse_title_prefix()} <bdi>{friendName || friendHash.slice(0, 8) + '\u2026'}</bdi></h3>
+        <button class="browse-close" onclick={onclose} title={m.common_close()} aria-label={m.common_close()}>
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <line x1="4" y1="4" x2="12" y2="12"/><line x1="12" y1="4" x2="4" y2="12"/>
+          </svg>
+        </button>
+      </div>
 
-    <div class="browse-body">
-      {#if loading}
-        <div class="browse-status">{m.browse_requesting()}</div>
-      {:else if error}
-        <div class="browse-error">{error}</div>
-      {:else if files.length === 0}
-        <div class="browse-status">{m.browse_no_files()}</div>
-      {:else}
-        {#if downloadError}
-          <div class="browse-error" style="margin-bottom: 8px">{downloadError}</div>
-        {/if}
-        <div class="browse-count">
-          {files.length === 1 ? m.browse_count_one() : m.browse_count_other({ count: files.length })}
-        </div>
-        <div class="browse-table-wrap">
-          <table class="browse-table">
-            <thead>
-              <tr>
-                <th class="col-name">{m.browse_col_name()}</th>
-                <th class="col-size">{m.browse_col_size()}</th>
-                <th class="col-action"></th>
-              </tr>
-            </thead>
-            <tbody>
-              {#each files as file (file.hash)}
+      <div class="browse-body">
+        {#if loading}
+          <div class="browse-status">{m.browse_requesting()}</div>
+        {:else if error}
+          <div class="browse-error">{error}</div>
+        {:else if files.length === 0}
+          <div class="browse-status">{m.browse_no_files()}</div>
+        {:else}
+          {#if downloadError}
+            <div class="browse-error" style="margin-bottom: 8px">{downloadError}</div>
+          {/if}
+          <div class="browse-count">
+            {files.length === 1 ? m.browse_count_one() : m.browse_count_other({ count: files.length })}
+          </div>
+          <div class="browse-table-wrap">
+            <table class="browse-table">
+              <thead>
                 <tr>
-                  <!--
-                    M14: file names come from the remote peer and
-                    can contain RTL/LTR override characters that
-                    reorder neighbouring elements ("Trojan Source"
-                    style spoof). `<bdi>` isolates each name's
-                    bidi influence to the cell, so a malicious
-                    name can't reverse the size column or action
-                    button next to it. The text itself is still
-                    rendered exactly as written.
-                  -->
-                  <td class="col-name" title={file.name}><bdi>{file.name}</bdi></td>
-                  <td class="col-size">{formatSize(file.size)}</td>
-                  <td class="col-action">
-                    {#if downloadedHashes.has(file.hash)}
-                      <span class="dl-done" title={m.browse_queued()} aria-label={m.browse_queued()}>
-                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                          <polyline points="3 8 7 12 13 4"/>
-                        </svg>
-                      </span>
-                    {:else}
-                      <button
-                        class="dl-btn"
-                        onclick={() => downloadFile(file)}
-                        disabled={downloadingHashes.has(file.hash)}
-                        title={m.browse_download()}
-                        aria-label={m.browse_download()}
-                      >
-                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                          <path d="M8 2v9M4 8l4 4 4-4"/><line x1="3" y1="14" x2="13" y2="14"/>
-                        </svg>
-                      </button>
-                    {/if}
-                  </td>
+                  <th class="col-name">{m.browse_col_name()}</th>
+                  <th class="col-size">{m.browse_col_size()}</th>
+                  <th class="col-action"></th>
                 </tr>
-              {/each}
-            </tbody>
-          </table>
-        </div>
-      {/if}
+              </thead>
+              <tbody>
+                {#each files as file (file.hash)}
+                  <tr>
+                    <!--
+                      M14: file names come from the remote peer and
+                      can contain RTL/LTR override characters that
+                      reorder neighbouring elements ("Trojan Source"
+                      style spoof). `<bdi>` isolates each name's
+                      bidi influence to the cell, so a malicious
+                      name can't reverse the size column or action
+                      button next to it. The text itself is still
+                      rendered exactly as written.
+                    -->
+                    <td class="col-name" title={file.name}><bdi>{file.name}</bdi></td>
+                    <td class="col-size">{formatSize(file.size)}</td>
+                    <td class="col-action">
+                      {#if downloadedHashes.has(file.hash)}
+                        <span class="dl-done" title={m.browse_queued()} aria-label={m.browse_queued()}>
+                          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <polyline points="3 8 7 12 13 4"/>
+                          </svg>
+                        </span>
+                      {:else}
+                        <button
+                          class="dl-btn"
+                          onclick={() => downloadFile(file)}
+                          disabled={downloadingHashes.has(file.hash)}
+                          title={m.browse_download()}
+                          aria-label={m.browse_download()}
+                        >
+                          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M8 2v9M4 8l4 4 4-4"/><line x1="3" y1="14" x2="13" y2="14"/>
+                          </svg>
+                        </button>
+                      {/if}
+                    </td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        {/if}
+      </div>
     </div>
   </div>
 {/if}

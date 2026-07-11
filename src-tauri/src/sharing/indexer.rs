@@ -173,7 +173,22 @@ impl FileIndexer {
     pub fn hash_file_cancellable(
         path: &Path,
         cancelled: &AtomicBool,
-    ) -> anyhow::Result<(String, String, Vec<[u8; 16]>)> {
-        hash_file_combined_cancellable(path, cancelled)
+    ) -> anyhow::Result<(String, String, Vec<[u8; 16]>, u64, i64)> {
+        let before = std::fs::symlink_metadata(path)?;
+        if before.is_symlink() {
+            anyhow::bail!("refusing to hash symlink: {}", path.display());
+        }
+        let before_modified = before.modified().ok();
+        let (ed2k, aich, part_hashes) = hash_file_combined_cancellable(path, cancelled)?;
+        let after = std::fs::symlink_metadata(path)?;
+        let after_modified = after.modified().ok();
+        if before.len() != after.len() || before_modified != after_modified {
+            anyhow::bail!("file changed while hashing: {}", path.display());
+        }
+        let modified_at = after_modified
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        Ok((ed2k, aich, part_hashes, after.len(), modified_at))
     }
 }

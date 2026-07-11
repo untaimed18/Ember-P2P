@@ -9,7 +9,7 @@ use crate::types::AppSettings;
 /// original settings stay recoverable, returning the backup path on success.
 /// Uses a timestamp + counter so repeated failures within the same wall-clock
 /// second don't clobber a previous backup.
-fn backup_corrupt_config(config_path: &Path, reason: &str) -> Option<PathBuf> {
+fn backup_corrupt_config(config_path: &Path, reason: &str) -> anyhow::Result<PathBuf> {
     let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
     let mut bak = config_path.with_extension(format!("json.{ts}.bak"));
     let mut n = 1u32;
@@ -22,17 +22,24 @@ fn backup_corrupt_config(config_path: &Path, reason: &str) -> Option<PathBuf> {
             "config.json {reason}; reset to defaults. Original preserved at {}",
             bak.display()
         );
-        Some(bak)
+        Ok(bak)
     } else if std::fs::copy(config_path, &bak).is_ok() {
-        let _ = std::fs::remove_file(config_path);
+        std::fs::remove_file(config_path).map_err(|e| {
+            anyhow::anyhow!(
+                "Copied unreadable config.json to {}, but could not remove the original: {e}",
+                bak.display()
+            )
+        })?;
         tracing::warn!(
             "config.json {reason}; reset to defaults. Original copied to {}",
             bak.display()
         );
-        Some(bak)
+        Ok(bak)
     } else {
-        tracing::warn!("config.json {reason}; reset to defaults (backup attempt failed)");
-        None
+        anyhow::bail!(
+            "config.json {reason}, and it could not be moved or copied to a backup; \
+             refusing to overwrite the only recoverable copy"
+        )
     }
 }
 
@@ -81,29 +88,51 @@ impl AppConfig {
 
         let config_existed = config_path.exists();
         let mut corrupt_backup: Option<PathBuf> = None;
+        let mut config_missing_during_read = false;
         let mut config_changed = false;
         let mut settings = if config_existed {
-            let data = std::fs::read_to_string(&config_path)?;
-            match serde_json::from_str::<AppSettings>(&data) {
+            let data = match std::fs::read_to_string(&config_path) {
+                Ok(data) => Some(data),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // The file vanished between `exists()` and the read. Treat
+                    // this exactly like a fresh install rather than failing
+                    // startup on a harmless TOCTOU race.
+                    config_missing_during_read = true;
+                    config_changed = true;
+                    None
+                }
+                Err(e) => {
+                    let backup =
+                        backup_corrupt_config(&config_path, &format!("could not be read ({e})"))?;
+                    corrupt_backup = Some(backup);
+                    config_changed = true;
+                    None
+                }
+            };
+            match data.as_deref().map(serde_json::from_str::<AppSettings>) {
+                None => AppSettings::default(),
                 // Parsed cleanly *and* passes the same validation enforced on
                 // every save. Re-validating here stops a hand-edited or
                 // downgraded config.json with out-of-range values (e.g.
                 // `tcp_port: 0`) from reaching bind/connection logic. App-written
                 // configs always pass, so this only trips on foreign input —
                 // which we treat like corruption: preserve and reset.
-                Ok(s) => match crate::commands::settings::validate_settings(&s) {
+                Some(Ok(s)) => match crate::commands::settings::validate_settings(&s) {
                     Ok(()) => s,
                     Err(e) => {
-                        corrupt_backup = backup_corrupt_config(
+                        corrupt_backup = Some(backup_corrupt_config(
                             &config_path,
                             &format!("has invalid settings ({e})"),
-                        );
+                        )?);
                         config_changed = true;
                         AppSettings::default()
                     }
                 },
-                Err(e) => {
-                    corrupt_backup = backup_corrupt_config(&config_path, &format!("corrupt ({e})"));
+                Some(Err(e)) => {
+                    corrupt_backup = Some(backup_corrupt_config(
+                        &config_path,
+                        &format!("corrupt ({e})"),
+                    )?);
                     config_changed = true;
                     AppSettings::default()
                 }
@@ -145,23 +174,33 @@ impl AppConfig {
             }
         }
 
-        if !settings.download_folder.is_empty() {
-            let completed_path = std::path::Path::new(&settings.download_folder).join("Downloads");
-            let completed_dir = completed_path.to_string_lossy().to_string();
-            let already_shared = settings.shared_folders.iter().any(|f| {
-                let a = std::path::Path::new(f);
-                let b = &completed_path;
-                paths_likely_equal(a, b)
-                    || a.canonicalize()
-                        .ok()
-                        .zip(b.canonicalize().ok())
-                        .map_or(false, |(ca, cb)| ca == cb)
-            });
-            if !already_shared {
-                tracing::info!("Adding default shared folder: {completed_dir}");
-                settings.shared_folders.push(completed_dir);
-                config_changed = true;
+        // Seed the default share once, not on every launch. Existing configs
+        // from builds predating this marker are marked as already considered:
+        // those builds always seeded the folder themselves, so an absent entry
+        // means the user deliberately removed it and must be respected.
+        if !settings.default_shared_folder_seeded {
+            let should_seed =
+                !config_existed || config_missing_during_read || corrupt_backup.is_some();
+            if should_seed && !settings.download_folder.is_empty() {
+                let completed_path =
+                    std::path::Path::new(&settings.download_folder).join("Downloads");
+                let completed_dir = completed_path.to_string_lossy().to_string();
+                let already_shared = settings.shared_folders.iter().any(|f| {
+                    let a = std::path::Path::new(f);
+                    let b = &completed_path;
+                    paths_likely_equal(a, b)
+                        || a.canonicalize()
+                            .ok()
+                            .zip(b.canonicalize().ok())
+                            .is_some_and(|(ca, cb)| ca == cb)
+                });
+                if !already_shared {
+                    tracing::info!("Adding default shared folder: {completed_dir}");
+                    settings.shared_folders.push(completed_dir);
+                }
             }
+            settings.default_shared_folder_seeded = true;
+            config_changed = true;
         }
 
         if config_changed {

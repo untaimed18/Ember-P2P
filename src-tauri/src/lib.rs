@@ -202,6 +202,19 @@ pub fn run() {
                 e
             })?;
             let settings = config.settings.clone();
+            // Load the persistent identity once before commands or the network
+            // task can run. Re-reading/creating it independently at several
+            // call sites allowed concurrent first-run callers to generate
+            // different identities and race their atomic writes.
+            let identity = Arc::new(
+                storage::identity::NodeIdentity::load_or_create(
+                    &storage::paths::resolve_data_dir_with_app(&app_handle),
+                )
+                .map_err(|e| {
+                    tracing::error!("Failed to load node identity: {e}");
+                    e
+                })?,
+            );
             // If config.json was corrupt and reset to defaults, surface it to the
             // user once the webview has mounted (the file is preserved as a .bak).
             let corrupt_backup = config.corrupt_backup.clone();
@@ -253,6 +266,7 @@ pub fn run() {
 
             let bw_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let scanning_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let scan_coordination = Arc::new(tokio::sync::Mutex::new(()));
 
             let cached_peers: Arc<RwLock<Vec<crate::types::PeerInfo>>> = Arc::new(RwLock::new(Vec::new()));
             let cached_stats: Arc<RwLock<crate::types::NetworkStats>> = Arc::new(RwLock::new(crate::types::NetworkStats::default()));
@@ -299,40 +313,29 @@ pub fn run() {
                 settings.shared_folders.clone(),
             );
 
-            // known.met in-memory list. ember-V2's network module currently
-            // doesn't consume this (see `start_network` signature), but
-            // sharing/indexer and some cherry-picked commands still read it
-            // via `AppState::known_files`, so we materialise it here rather
-            // than leaking `Option<...>` all over the struct.
             // One-time AICH migration: invalidate multi-part AICH root hashes
             // computed before the SHAHashSet part-boundary fix so they get
             // recomputed on this startup's hashing pass. Must run before ANY
-            // known.met consumer loads the file — the AppState copy just below,
-            // the indexer/hashing task, and the network task — so they all see
-            // the cleared roots. Guarded by a marker file, so it's a no-op on
-            // every subsequent launch.
+            // known.met consumer loads the file so the indexer/hashing task and
+            // network task both see the cleared roots. Guarded by a marker file.
             {
                 let data_dir = storage::paths::resolve_data_dir_with_app(&app_handle);
                 storage::known_files::migrate_aich_v2(&data_dir);
             }
 
-            let known_files = {
-                let data_dir = storage::paths::resolve_data_dir_with_app(&app_handle);
-                Arc::new(RwLock::new(storage::known_files::KnownFileList::load(
-                    &data_dir.join("known.met"),
-                )))
-            };
-
             app.manage(AppState {
                 network_tx,
                 db: db.clone(),
+                identity: identity.clone(),
                 config: Arc::new(RwLock::new(config)),
+                settings_save_lock: Arc::new(tokio::sync::Mutex::new(())),
                 local_index: local_index.clone(),
                 bandwidth_limiter: bandwidth_limiter.clone(),
                 transfer_manager: transfer_manager.clone(),
                 shutdown_complete,
                 bw_shutdown: bw_shutdown.clone(),
                 scanning_count: scanning_count.clone(),
+                scan_coordination: scan_coordination.clone(),
                 cached_contacts,
                 cached_transfer_stats,
                 cached_shared_files: cached_shared_files.clone(),
@@ -341,7 +344,6 @@ pub fn run() {
                 spam_filter: spam_filter.clone(),
                 upload_shared_folders: upload_shared_folders.clone(),
                 friend_hashes: friend_hashes.clone(),
-                known_files,
                 shared_folder_watcher,
                 background_scans: Arc::new(RwLock::new(std::collections::HashMap::new())),
                 background_scan_seq: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -457,6 +459,7 @@ pub fn run() {
             let index_clone = local_index.clone();
             let shared_folders = settings.shared_folders.clone();
             let startup_scanning = scanning_count.clone();
+            let startup_scan_coordination = scan_coordination.clone();
             let csf = cached_shared_files.clone();
             let startup_app = app_handle.clone();
             let net_tx = startup_network_tx;
@@ -467,6 +470,7 @@ pub fn run() {
                     info!("Indexed 0 files from 0 shared folders");
                     return;
                 }
+                let _coordination_guard = startup_scan_coordination.lock().await;
 
                 struct StartupScanGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
                 impl Drop for StartupScanGuard {
@@ -631,12 +635,20 @@ pub fn run() {
                     ).await;
 
                     match hash_result {
-                        Ok(Ok(Ok((ed2k_hash, aich_hash, part_hashes)))) => {
+                        Ok(Ok(Ok((
+                            ed2k_hash,
+                            aich_hash,
+                            part_hashes,
+                            hashed_size,
+                            hashed_modified_at,
+                        )))) => {
                             tracing::debug!("Startup hash complete: {} -> {}", file.name, &ed2k_hash[..ed2k_hash.len().min(8)]);
                             let mut updated = file.clone();
                             updated.id = ed2k_hash.clone();
                             updated.hash = ed2k_hash;
                             updated.aich_hash = aich_hash;
+                            updated.size = hashed_size;
+                            updated.modified_at = hashed_modified_at;
                             let still_shared = {
                                 let state = startup_app.state::<AppState>();
                                 let cfg = state.config.read().await;
@@ -772,12 +784,14 @@ pub fn run() {
             let bw_rtt = uss_rtt_queue.clone();
             let bw_uss_flag = uss_enabled_flag.clone();
             let net_spam = spam_filter.clone();
+            let net_identity = identity.clone();
             let net_handle_err = app_handle.clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = network::start_network(
                     net_handle,
                     network_rx,
                     settings,
+                    net_identity,
                     net_index,
                     net_fresh_part_hashes,
                     net_db,
@@ -1070,13 +1084,34 @@ pub fn run() {
                     }
 
                     let tx = state.network_tx.clone();
-                    match tx.blocking_send(network::NetworkCommand::Shutdown) {
-                        Ok(()) => info!("Sent shutdown command to network, waiting for save..."),
-                        Err(e) => tracing::warn!("Failed to send shutdown command: {e}"),
-                    }
+                    const SHUTDOWN_WAIT: std::time::Duration =
+                        std::time::Duration::from_secs(20);
+                    const SHUTDOWN_SEND_WAIT: std::time::Duration =
+                        std::time::Duration::from_secs(2);
+                    let start = std::time::Instant::now();
+                    let mut command = network::NetworkCommand::Shutdown;
+                    let shutdown_sent = loop {
+                        match tx.try_send(command) {
+                            Ok(()) => {
+                                info!("Sent shutdown command to network, waiting for save...");
+                                break true;
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(returned))
+                                if start.elapsed() < SHUTDOWN_SEND_WAIT =>
+                            {
+                                command = returned;
+                                std::thread::sleep(std::time::Duration::from_millis(10));
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to send shutdown command within bounded window: {e}"
+                                );
+                                break false;
+                            }
+                        }
+                    };
 
                     let flag = state.shutdown_complete.clone();
-                    let start = std::time::Instant::now();
                     // Must exceed the network task's bounded teardown budget so
                     // we don't return (and let the process exit) while .part.met
                     // saves are still in flight: the teardown caps its variable
@@ -1085,8 +1120,7 @@ pub fn run() {
                     // (nodes.dat/known.met/stats). The common case sets the flag
                     // in well under a second, so this ceiling only bites if the
                     // network is genuinely stuck.
-                    const SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
-                    while !flag.load(std::sync::atomic::Ordering::Acquire) {
+                    while shutdown_sent && !flag.load(std::sync::atomic::Ordering::Acquire) {
                         if start.elapsed() > SHUTDOWN_WAIT {
                             tracing::warn!(
                                 "Network shutdown timed out after {}s",

@@ -137,9 +137,9 @@ impl AntiLeechFilter {
         // can detect overflow without iterating an unbounded source.
         let raw: Vec<String> = patterns
             .into_iter()
-            .take(MAX_PATTERNS + 1)
             .map(|p| p.trim().to_string())
             .filter(|p| !p.is_empty() && !p.starts_with('#'))
+            .take(MAX_PATTERNS + 1)
             .collect();
         let mut errors: Vec<(String, regex::Error)> = Vec::new();
         let mut accepted: Vec<String> = Vec::with_capacity(raw.len().min(MAX_PATTERNS));
@@ -175,19 +175,18 @@ impl AntiLeechFilter {
                 ));
                 continue;
             }
-            // Force case-insensitive matching unless the pattern already
-            // has its own `(?i)` / inline flag. Most user patterns are
+            // Force case-insensitive matching at the builder level. Inline
+            // groups such as `(?:...)` and `(?P<name>...)` are structural,
+            // not flag declarations, and must not accidentally disable the
+            // default. An explicit `(?-i:...)` can still opt a subexpression
+            // back into case-sensitive matching. Most user patterns are
             // brand names ("VeryCD", "MagicMule") and the user shouldn't
             // have to remember to add the flag. We compile each pattern
             // standalone with an explicit `size_limit` so a pathological
             // regex that would compile to a multi-MB DFA is rejected
             // here instead of slowing the upload hot path.
-            let normalised = if pat.starts_with("(?") {
-                pat.clone()
-            } else {
-                format!("(?i){pat}")
-            };
-            let compile_result = regex::RegexBuilder::new(&normalised)
+            let compile_result = regex::RegexBuilder::new(pat)
+                .case_insensitive(true)
                 .size_limit(REGEX_SIZE_LIMIT)
                 .dfa_size_limit(REGEX_SIZE_LIMIT)
                 .build();
@@ -199,25 +198,12 @@ impl AntiLeechFilter {
         let set = if accepted.is_empty() {
             None
         } else {
-            // We rebuild the (?i)-prefixed list here because `RegexSet`
-            // compiles its own copy of the patterns; re-using the
-            // already-prefixed strings keeps `set` and `individual` in
-            // sync index-for-index.
-            let prefixed: Vec<String> = accepted
-                .iter()
-                .map(|p| {
-                    if p.starts_with("(?") {
-                        p.clone()
-                    } else {
-                        format!("(?i){p}")
-                    }
-                })
-                .collect();
             // Same size cap on the combined RegexSet. If the overall
             // automaton would be huge despite each individual pattern
             // fitting, we'd rather warn and run with no filter than
             // burn a peer-facing CPU budget.
-            let build_result = RegexSetBuilder::new(&prefixed)
+            let build_result = RegexSetBuilder::new(&accepted)
+                .case_insensitive(true)
                 .size_limit(REGEX_SIZE_LIMIT)
                 .dfa_size_limit(REGEX_SIZE_LIMIT)
                 .build();

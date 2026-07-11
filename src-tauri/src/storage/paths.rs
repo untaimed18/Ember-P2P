@@ -21,6 +21,7 @@
 //! logs but speak to the same local rendezvous server.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tauri::Manager;
 
@@ -29,6 +30,7 @@ use tauri::Manager;
 /// logs). When set to a non-empty path, the directory is created on
 /// demand and used in place of the Tauri / ProjectDirs default.
 pub const EMBER_DATA_DIR_ENV: &str = "EMBER_DATA_DIR";
+static MIGRATION_COPY_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Read the env override, returning `None` if the variable is unset or
 /// empty. Whitespace-only values are also treated as unset; this
@@ -138,11 +140,62 @@ fn copy_missing_entries(src_dir: &Path, dst_dir: &Path) -> std::io::Result<()> {
         if meta.is_dir() {
             copy_missing_entries(&src, &dst)?;
         } else if meta.is_file() {
-            std::fs::copy(&src, &dst)?;
-            crate::security::restrict_file_permissions(&dst);
+            copy_file_atomically(&src, &dst, meta.len())?;
         }
     }
     Ok(())
+}
+
+fn copy_file_atomically(src: &Path, dst: &Path, expected_len: u64) -> std::io::Result<()> {
+    use std::io::{Read, Write};
+
+    let seq = MIGRATION_COPY_SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let file_name = dst
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "file".into());
+    let tmp = dst
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(".{file_name}.{pid}.{seq}.migration-tmp"));
+
+    let result = (|| {
+        let mut source = std::fs::File::open(src)?;
+        let mut target = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        let copied = std::io::copy(&mut source, &mut target)?;
+        target.flush()?;
+        target.sync_all()?;
+        if copied != expected_len || source.metadata()?.len() != expected_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "legacy migration source changed while copying {}",
+                    src.display()
+                ),
+            ));
+        }
+        // Read one byte at EOF to make the completed stream check explicit.
+        let mut trailing = [0u8; 1];
+        if source.read(&mut trailing)? != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "legacy migration copied an unstable source",
+            ));
+        }
+        drop(target);
+        crate::security::restrict_file_permissions(&tmp);
+        std::fs::rename(&tmp, dst)?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 fn paths_equivalent(a: &Path, b: &Path) -> bool {

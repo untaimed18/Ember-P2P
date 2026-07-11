@@ -661,6 +661,8 @@ pub async fn cancel_transfers_batch(
 ) -> Result<(), String> {
     check_batch_size(&transfer_ids)?;
     let mut promoted_by_id: HashMap<String, Transfer> = HashMap::new();
+    let mut pending_acks = Vec::with_capacity(transfer_ids.len());
+    let mut cleanup_ids = Vec::with_capacity(transfer_ids.len());
     for transfer_id in transfer_ids {
         let (promoted, cancelled_info) = {
             let mut manager = state.transfer_manager.write().await;
@@ -695,19 +697,35 @@ pub async fn cancel_transfers_batch(
             tracing::warn!(
                 "cancel_transfers_batch: network task unavailable for {transfer_id}; deleting partial without teardown ack ({e})"
             );
-        } else if tokio::time::timeout(CMD_REPLY_TIMEOUT, ack_rx)
-            .await
-            .is_err()
-        {
-            // Teardown didn't ack within the window; the worker may still hold
-            // the .part handle. We proceed (bounded wait; eMule always deletes),
-            // but surface it so a delete/replace error on Windows is explainable
-            // rather than a silent race.
-            tracing::warn!(
-                "cancel_transfers_batch: cleanup ack timed out for {transfer_id}; deleting partial may race a slow teardown"
-            );
+        } else {
+            pending_acks.push((transfer_id.clone(), ack_rx));
         }
+        cleanup_ids.push(transfer_id);
+    }
 
+    // Wait for every teardown concurrently under one global deadline. The old
+    // per-item timeout made a 500-row batch wait up to ~83 minutes.
+    let waits = futures::future::join_all(
+        pending_acks
+            .into_iter()
+            .map(|(transfer_id, ack_rx)| async move { (transfer_id, ack_rx.await) }),
+    );
+    match tokio::time::timeout(CMD_REPLY_TIMEOUT, waits).await {
+        Ok(results) => {
+            for (transfer_id, result) in results {
+                if result.is_err() {
+                    tracing::warn!(
+                        "cancel_transfers_batch: cleanup ack channel closed for {transfer_id}"
+                    );
+                }
+            }
+        }
+        Err(_) => tracing::warn!(
+            "cancel_transfers_batch: one or more cleanup acks timed out; partial deletion may race a slow teardown"
+        ),
+    }
+
+    for transfer_id in cleanup_ids {
         let dl_folder = {
             let config = state.config.read().await;
             config.settings.download_folder.clone()

@@ -438,6 +438,7 @@ export function startStatsPoll() {
     if (statsPollInFlight) return;
     statsPumpOnNextVisible = false;
     statsPollInFlight = true;
+    const epoch = storeEpoch;
     let pollTimeout: ReturnType<typeof setTimeout> | undefined;
     try {
       const stats = await Promise.race([
@@ -446,6 +447,7 @@ export function startStatsPoll() {
           pollTimeout = setTimeout(() => reject('timeout'), 4000);
         }),
       ]);
+      if (epoch !== storeEpoch) return;
       lastPollOkAt = Date.now();
       lastNetworkUpdate = lastPollOkAt;
       syncServerStatus(stats);
@@ -457,9 +459,6 @@ export function startStatsPoll() {
         if (current.firewalled && !merged.firewalled && merged.external_ip === '') {
           merged.firewalled = current.firewalled;
         }
-        if (current.buddy_status !== 'none' && merged.buddy_status === 'none') {
-          merged.buddy_status = current.buddy_status;
-        }
         if (!merged.tcp_status && current.tcp_status) {
           merged.tcp_status = current.tcp_status;
         }
@@ -469,7 +468,9 @@ export function startStatsPoll() {
         return withDerivedNetworkState(merged);
       });
     } catch {
-      networkStats.update((current) => withDerivedNetworkState(current));
+      if (epoch === storeEpoch) {
+        networkStats.update((current) => withDerivedNetworkState(current));
+      }
     } finally {
       // Clear the race watchdog so the loser timer doesn't linger.
       if (pollTimeout) clearTimeout(pollTimeout);

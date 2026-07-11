@@ -1385,7 +1385,9 @@ pub(crate) fn score_queue_entry(
     } else {
         emule_score
     };
-    if cm.has_download_bonus(user_hash) {
+    let has_download_bonus = cm.has_download_bonus(user_hash)
+        || (use_ember && cm.has_ember_download_bonus(ember_pubkey.expect("guarded by use_ember")));
+    if has_download_bonus {
         score *= DOWNLOAD_BONUS_MULTIPLIER;
     }
     if emule_version > 0 && emule_version <= 0x19 {
@@ -5151,6 +5153,12 @@ impl UploadHandler {
                         // advance mid-session as the peer's auth packets
                         // arrive.
                         let is_verified_friend = is_friend && ember_auth_state.is_verified();
+                        // Global scoring lock order: credit manager → local
+                        // index → upload queue. Every scoring path follows this
+                        // order so concurrent rank/admission work cannot form an
+                        // AB-BA deadlock.
+                        let cm = self.credit_manager.read().await;
+                        let idx_snap = self.local_index.read().await;
                         let mut queue = self.upload_queue.lock().await;
                         let rank = if let Some(pos) =
                             queue.iter().position(|e| e.identity == queue_identity)
@@ -5174,8 +5182,6 @@ impl UploadHandler {
                             if queue[pos].ember_pubkey.is_none() {
                                 queue[pos].ember_pubkey = hello_caps.ember_pubkey;
                             }
-                            let cm = self.credit_manager.read().await;
-                            let idx_snap = self.local_index.read().await;
                             let my_score = score_queue_entry(
                                 &cm, &idx_snap, &peer_user_hash,
                                 current_file_hash.unwrap_or([0u8; 16]),
@@ -5188,8 +5194,6 @@ impl UploadHandler {
                                 &cm, &idx_snap, &queue,
                                 &queue_identity, my_score, queue[pos].join_time,
                             );
-                            drop(cm);
-                            drop(idx_snap);
                             rank_val
                         } else if queue
                             .iter()
@@ -5214,17 +5218,19 @@ impl UploadHandler {
                                 MAX_QUEUE_ENTRIES_PER_IP,
                             );
                             drop(queue);
+                            drop(idx_snap);
+                            drop(cm);
                             write_packet_async(&mut writer, OP_EMULEPROT, OP_QUEUEFULL, &[]).await?;
                             break;
                         } else if queue.len() >= HARD_UPLOAD_QUEUE_SIZE {
                             debug!("Upload queue at hard limit ({HARD_UPLOAD_QUEUE_SIZE}), sending OP_QUEUEFULL to {peer_addr}");
                             drop(queue);
+                            drop(idx_snap);
+                            drop(cm);
                             write_packet_async(&mut writer, OP_EMULEPROT, OP_QUEUEFULL, &[]).await?;
                             break;
                         } else if queue.len() >= MAX_UPLOAD_QUEUE_SIZE {
                             // m7: Soft-to-hard zone – only admit if above-average score
-                            let cm = self.credit_manager.read().await;
-                            let idx_snap = self.local_index.read().await;
                             let new_fh = current_file_hash.unwrap_or([0u8; 16]);
                             let ember_verified = ember_auth_state.is_verified();
                             let new_score = score_queue_entry(
@@ -5249,10 +5255,6 @@ impl UploadHandler {
                                     )
                                 })
                                 .collect();
-                            // Scores are captured; the credit/index locks are no
-                            // longer needed for this branch.
-                            drop(cm);
-                            drop(idx_snap);
                             let avg_score = if entry_scores.is_empty() {
                                 0.0
                             } else {
@@ -5294,12 +5296,12 @@ impl UploadHandler {
                             } else {
                                 debug!("Upload queue in soft-hard zone, peer score {new_score:.1} below avg {avg_score:.1}, rejecting {peer_addr}");
                                 drop(queue);
+                                drop(idx_snap);
+                                drop(cm);
                                 write_packet_async(&mut writer, OP_EMULEPROT, OP_QUEUEFULL, &[]).await?;
                                 break;
                             }
                         } else {
-                            let cm = self.credit_manager.read().await;
-                            let idx_snap = self.local_index.read().await;
                             let new_fh = current_file_hash.unwrap_or([0u8; 16]);
                             let join_time = queue_join_time;
                             let ember_verified = ember_auth_state.is_verified();
@@ -5327,11 +5329,11 @@ impl UploadHandler {
                                 &cm, &idx_snap, &queue,
                                 &queue_identity, my_score, join_time,
                             );
-                            drop(cm);
-                            drop(idx_snap);
                             rank_val
                         };
                         drop(queue);
+                        drop(idx_snap);
+                        drop(cm);
                         // eMule OP_QUEUERANKING (UploadClient.cpp:633): 12 bytes = rank(u16) + 10 zeros
                         let mut qr_payload = Vec::with_capacity(12);
                         qr_payload.extend_from_slice(&rank.to_le_bytes());
@@ -6328,12 +6330,12 @@ impl UploadHandler {
                         && last_preempt_check.elapsed().as_secs() >= 10
                     {
                         last_preempt_check = std::time::Instant::now();
+                        let cm = self.credit_manager.read().await;
+                        let idx_snap = self.local_index.read().await;
                         let queue = self.upload_queue.lock().await;
                         if queue.is_empty() {
                             false
                         } else {
-                            let cm = self.credit_manager.read().await;
-                            let idx_snap = self.local_index.read().await;
                             let my_fh = current_file_hash.unwrap_or([0u8; 16]);
                             // See queue-insertion site above: friend
                             // priority only counts when PoP has landed
@@ -6455,6 +6457,8 @@ impl UploadHandler {
                             // with friend priority; if auth never
                             // completed, they re-enter as a regular peer.
                             let is_verified_friend = is_friend && ember_auth_state.is_verified();
+                            let cm = self.credit_manager.read().await;
+                            let idx_snap = self.local_index.read().await;
                             let mut queue = self.upload_queue.lock().await;
                             if let Some(entry) =
                                 queue.iter_mut().find(|e| e.identity == queue_identity)
@@ -6500,8 +6504,6 @@ impl UploadHandler {
                                 true
                             } else if queue.len() < HARD_UPLOAD_QUEUE_SIZE {
                                 // m7: Soft-to-hard zone – re-admit after session with score check
-                                let cm = self.credit_manager.read().await;
-                                let idx_snap = self.local_index.read().await;
                                 let new_fh = current_file_hash.unwrap_or([0u8; 16]);
                                 let ember_verified = ember_auth_state.is_verified();
                                 let new_score = score_queue_entry(
@@ -6521,8 +6523,6 @@ impl UploadHandler {
                                     }).sum();
                                     total / queue.len() as f64
                                 };
-                                drop(cm);
-                                drop(idx_snap);
                                 if new_score >= avg_score {
                                     queue.push(QueueEntry {
                                         identity: queue_identity.clone(),

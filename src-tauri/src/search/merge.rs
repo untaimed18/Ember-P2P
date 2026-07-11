@@ -14,6 +14,10 @@ pub const ORIGIN_EMBER: &str = "Ember";
 fn result_key(r: &SearchResult) -> String {
     if !r.file.hash.is_empty() {
         r.file.hash.clone()
+    } else if r.file.id.starts_with("pending:") {
+        format!("nohash-id:{}", r.file.id)
+    } else if !r.file.path.is_empty() {
+        format!("nohash-path:{}", r.file.path)
     } else {
         format!("nohash:{}:{}", r.file.name, r.file.size)
     }

@@ -5726,10 +5726,96 @@ fn maybe_spawn_ember_cold_bootstrap(
     });
 }
 
+fn apply_network_settings(
+    state: &mut NetworkState,
+    settings: &mut AppSettings,
+    new_settings: AppSettings,
+    ember_boot_tx: &mpsc::Sender<Vec<ember::dht::EmberContact>>,
+) {
+    state.obfuscation_enabled = new_settings.obfuscation_enabled;
+    state.obfuscation_enabled_shared.store(
+        new_settings.obfuscation_enabled,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    state.skip_compress_video_shared.store(
+        new_settings.skip_compress_video,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    state.filter_incoming_shared.store(
+        new_settings.filter_incoming_connections,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    state.share_browsing_shared.store(
+        new_settings.allow_shared_files_browse,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    state.uss_enabled_flag.store(
+        new_settings.uss_enabled,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    state.upload_max_slots.store(
+        new_settings.max_concurrent_uploads as usize,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    ed2k::multi_source::set_global_download_conn_limit(new_settings.max_connections as usize);
+    crate::sharing::manager::set_global_preview_priority(new_settings.preview_priority_all);
+    if !new_settings.uss_enabled {
+        state.uss_host = None;
+        state.pending_uss_pings.clear();
+    }
+    if state.ip_filter.is_enabled() != new_settings.ip_filter_enabled {
+        state.ip_filter.set_enabled(new_settings.ip_filter_enabled);
+        if new_settings.ip_filter_enabled && state.ip_filter.range_count() == 0 {
+            let default_path = state.data_dir.join("ipfilter.dat");
+            if default_path.exists() {
+                match state.ip_filter.load_from_file(&default_path) {
+                    Some(n) => info!(
+                        "Loaded {n} IP filter entries on enable ({} ranges after merge)",
+                        state.ip_filter.range_count()
+                    ),
+                    None => warn!(
+                        "Failed to read ipfilter.dat on enable; filter stays empty until a valid file is available"
+                    ),
+                }
+            }
+        }
+        state
+            .ip_filter
+            .update_shared_snapshot(&state.shared_ip_filter);
+    }
+    if state.ip_filter.blocks_private() != new_settings.block_private_ips {
+        state
+            .ip_filter
+            .set_block_private(new_settings.block_private_ips);
+        state
+            .ip_filter
+            .update_shared_snapshot(&state.shared_ip_filter);
+    }
+    let ember_turned_on = !settings.ember_native_enabled && new_settings.ember_native_enabled;
+    if settings.ember_native_enabled && !new_settings.ember_native_enabled {
+        ember_disable_cleanup(state);
+    }
+    info!(
+        "Network settings updated: obfuscation={}, uss={}, nickname={}, max_uploads={}, ip_filter={}, block_private={}, ember_native={}",
+        new_settings.obfuscation_enabled,
+        new_settings.uss_enabled,
+        new_settings.nickname,
+        new_settings.max_concurrent_uploads,
+        new_settings.ip_filter_enabled,
+        new_settings.block_private_ips,
+        new_settings.ember_native_enabled,
+    );
+    *settings = new_settings;
+    if ember_turned_on {
+        maybe_spawn_ember_cold_bootstrap(settings, state, ember_boot_tx, "settings-toggle");
+    }
+}
+
 pub async fn start_network(
     app_handle: tauri::AppHandle,
     mut cmd_rx: mpsc::Receiver<NetworkCommand>,
     mut settings: AppSettings,
+    identity: Arc<crate::storage::identity::NodeIdentity>,
     local_index: Arc<RwLock<LocalIndex>>,
     fresh_part_hashes: Arc<RwLock<HashMap<[u8; 16], Vec<[u8; 16]>>>>,
     db: Arc<Database>,
@@ -5759,7 +5845,6 @@ pub async fn start_network(
         crate::geoip::load(&resource_dir)
     };
 
-    let identity = crate::storage::identity::NodeIdentity::load_or_create(&data_dir)?;
     let local_id = identity.kad_id();
     let user_hash = identity.user_hash;
     let ember_hash = identity.ember_hash;
@@ -7431,116 +7516,26 @@ pub async fn start_network(
 
     let loop_panic = std::panic::AssertUnwindSafe(async {
     loop {
-        // Drain ALL pending commands first (priority over UDP) to prevent UI freezes.
-        // Commands from the Tauri frontend must never be starved by high UDP traffic.
+        // Give frontend commands priority, but cap each batch so a full IPC
+        // channel cannot starve UDP, timers, and transfer events indefinitely.
+        const MAX_COMMANDS_PER_ITERATION: usize = 128;
         let mut shutting_down = false;
-        while let Ok(cmd) = cmd_rx.try_recv() {
+        for _ in 0..MAX_COMMANDS_PER_ITERATION {
+            let Ok(cmd) = cmd_rx.try_recv() else {
+                break;
+            };
             match cmd {
                 NetworkCommand::Shutdown => {
                     shutting_down = true;
                     break;
                 }
                 NetworkCommand::UpdateSettings { settings: new_settings } => {
-                    state.obfuscation_enabled = new_settings.obfuscation_enabled;
-                    state.obfuscation_enabled_shared.store(
-                        new_settings.obfuscation_enabled,
-                        std::sync::atomic::Ordering::Relaxed,
+                    apply_network_settings(
+                        &mut state,
+                        &mut settings,
+                        new_settings,
+                        &ember_boot_tx,
                     );
-                    state.skip_compress_video_shared.store(
-                        new_settings.skip_compress_video,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    state.filter_incoming_shared.store(
-                        new_settings.filter_incoming_connections,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    state.share_browsing_shared.store(
-                        new_settings.allow_shared_files_browse,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    state.uss_enabled_flag.store(new_settings.uss_enabled, std::sync::atomic::Ordering::Relaxed);
-                    state.upload_max_slots.store(
-                        new_settings.max_concurrent_uploads as usize,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    // Hot-reload the machine-wide download-connection cap so
-                    // the Settings page's "max connections" takes effect
-                    // without a restart (grows immediately; shrinks as live
-                    // connections free up).
-                    ed2k::multi_source::set_global_download_conn_limit(
-                        new_settings.max_connections as usize,
-                    );
-                    // Hot-reload the global preview-priority preference so the
-                    // Settings toggle takes effect immediately for all
-                    // in-flight downloads (next chunk selection).
-                    crate::sharing::manager::set_global_preview_priority(
-                        new_settings.preview_priority_all,
-                    );
-                    if !new_settings.uss_enabled {
-                        state.uss_host = None;
-                        state.pending_uss_pings.clear();
-                    }
-                    // Hot-reload the IP filter toggles. Without this, the
-                    // Settings page's IP-filter and block-private toggles
-                    // would be persisted to disk but the live `state.ip_filter`
-                    // would keep enforcing the previous mode until restart.
-                    // The dedicated Security-page commands push the same way
-                    // (`SetIpFilterEnabled` / `SetBlockPrivateIps`); doing it
-                    // here too keeps both UIs in sync after a save.
-                    if state.ip_filter.is_enabled() != new_settings.ip_filter_enabled {
-                        state.ip_filter.set_enabled(new_settings.ip_filter_enabled);
-                        // A session that started disabled never loaded the
-                        // on-disk ranges (boot only reads ipfilter.dat when
-                        // enabled). Enabling here without loading would leave
-                        // the filter active but empty. Mirror the
-                        // SetIpFilterEnabled handler: load the persisted file
-                        // when we're enabling and have no ranges yet.
-                        if new_settings.ip_filter_enabled && state.ip_filter.range_count() == 0 {
-                            let default_path = state.data_dir.join("ipfilter.dat");
-                            if default_path.exists() {
-                                match state.ip_filter.load_from_file(&default_path) {
-                                    Some(n) => info!("Loaded {n} IP filter entries on enable ({} ranges after merge)", state.ip_filter.range_count()),
-                                    None => warn!("Failed to read ipfilter.dat on enable; filter stays empty until a valid file is available"),
-                                }
-                            }
-                        }
-                        state.ip_filter.update_shared_snapshot(&state.shared_ip_filter);
-                    }
-                    if state.ip_filter.blocks_private() != new_settings.block_private_ips {
-                        state.ip_filter.set_block_private(new_settings.block_private_ips);
-                        state.ip_filter.update_shared_snapshot(&state.shared_ip_filter);
-                    }
-                    // Reset Ember transport state when the feature flag flips
-                    // off, so sessions established during the "on" period
-                    // cannot decrypt traffic if the user re-enables it later
-                    // (different harness session, different intent).
-                    // Capture the off→on transition before `settings` is
-                    // overwritten below, so we can kick a cold bootstrap —
-                    // the toggle joins the DHT without needing a restart.
-                    let ember_turned_on =
-                        !settings.ember_native_enabled && new_settings.ember_native_enabled;
-                    if settings.ember_native_enabled && !new_settings.ember_native_enabled {
-                        ember_disable_cleanup(&mut state);
-                    }
-                    info!(
-                        "Network settings updated: obfuscation={}, uss={}, nickname={}, max_uploads={}, ip_filter={}, block_private={}, ember_native={}",
-                        new_settings.obfuscation_enabled,
-                        new_settings.uss_enabled,
-                        new_settings.nickname,
-                        new_settings.max_concurrent_uploads,
-                        new_settings.ip_filter_enabled,
-                        new_settings.block_private_ips,
-                        new_settings.ember_native_enabled,
-                    );
-                    settings = new_settings;
-                    if ember_turned_on {
-                        maybe_spawn_ember_cold_bootstrap(
-                            &settings,
-                            &state,
-                            &ember_boot_tx,
-                            "settings-toggle",
-                        );
-                    }
                 }
                 cmd => {
                     handle_command(
@@ -7740,82 +7735,12 @@ pub async fn start_network(
                     // (obfuscation toggle, USS toggle, max-uploads slider all
                     // had no effect until the next message woke the loop).
                     Some(NetworkCommand::UpdateSettings { settings: new_settings }) => {
-                        state.obfuscation_enabled = new_settings.obfuscation_enabled;
-                        state.obfuscation_enabled_shared.store(
-                            new_settings.obfuscation_enabled,
-                            std::sync::atomic::Ordering::Relaxed,
+                        apply_network_settings(
+                            &mut state,
+                            &mut settings,
+                            new_settings,
+                            &ember_boot_tx,
                         );
-                        state.skip_compress_video_shared.store(
-                            new_settings.skip_compress_video,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                        state.filter_incoming_shared.store(
-                            new_settings.filter_incoming_connections,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                        state.share_browsing_shared.store(
-                            new_settings.allow_shared_files_browse,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                        state.uss_enabled_flag.store(
-                            new_settings.uss_enabled,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                        state.upload_max_slots.store(
-                            new_settings.max_concurrent_uploads as usize,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                        if !new_settings.uss_enabled {
-                            state.uss_host = None;
-                            state.pending_uss_pings.clear();
-                        }
-                        // Same hot-reload as the try_recv arm above — including
-                        // load-on-enable: a session that started disabled never
-                        // read ipfilter.dat (boot only loads it when enabled), so
-                        // enabling here without loading would leave the filter
-                        // active but EMPTY (fail-open for every blocked range)
-                        // until the next restart.
-                        if state.ip_filter.is_enabled() != new_settings.ip_filter_enabled {
-                            state.ip_filter.set_enabled(new_settings.ip_filter_enabled);
-                            if new_settings.ip_filter_enabled && state.ip_filter.range_count() == 0 {
-                                let default_path = state.data_dir.join("ipfilter.dat");
-                                if default_path.exists() {
-                                    match state.ip_filter.load_from_file(&default_path) {
-                                        Some(n) => info!("Loaded {n} IP filter entries on enable ({} ranges after merge)", state.ip_filter.range_count()),
-                                        None => warn!("Failed to read ipfilter.dat on enable; filter stays empty until a valid file is available"),
-                                    }
-                                }
-                            }
-                            state.ip_filter.update_shared_snapshot(&state.shared_ip_filter);
-                        }
-                        if state.ip_filter.blocks_private() != new_settings.block_private_ips {
-                            state.ip_filter.set_block_private(new_settings.block_private_ips);
-                            state.ip_filter.update_shared_snapshot(&state.shared_ip_filter);
-                        }
-                        let ember_turned_on =
-                            !settings.ember_native_enabled && new_settings.ember_native_enabled;
-                        if settings.ember_native_enabled && !new_settings.ember_native_enabled {
-                            ember_disable_cleanup(&mut state);
-                        }
-                        info!(
-                            "Network settings updated (recv): obfuscation={}, uss={}, nickname={}, max_uploads={}, ip_filter={}, block_private={}, ember_native={}",
-                            new_settings.obfuscation_enabled,
-                            new_settings.uss_enabled,
-                            new_settings.nickname,
-                            new_settings.max_concurrent_uploads,
-                            new_settings.ip_filter_enabled,
-                            new_settings.block_private_ips,
-                            new_settings.ember_native_enabled,
-                        );
-                        settings = new_settings;
-                        if ember_turned_on {
-                            maybe_spawn_ember_cold_bootstrap(
-                                &settings,
-                                &state,
-                                &ember_boot_tx,
-                                "settings-toggle",
-                            );
-                        }
                     }
                     Some(cmd) => {
                         handle_command(
@@ -8670,10 +8595,17 @@ pub async fn start_network(
                                 } else {
                                     ember::reputation::ReputationEvent::Timeout
                                 };
-                                let newly_banned = state.reputation.record_event(&uh, rep_event);
-                                if newly_banned {
+                                let (node_banned, ip_banned) =
+                                    state.reputation.record_event_with_ip(&uh, v4, rep_event);
+                                if node_banned || ip_banned {
                                     if state.banned_ips.insert(v4) {
-                                        warn!("Reputation ban: banning IP {} (user_hash {})", v4, hex::encode(&uh));
+                                        warn!(
+                                            "Reputation ban: banning IP {} (user_hash {}, node_ban={}, ip_ban={})",
+                                            v4,
+                                            hex::encode(&uh),
+                                            node_banned,
+                                            ip_banned,
+                                        );
                                     }
                                     if let Ok(mut shared) = shared_banned_ips.write() {
                                         *shared = state.banned_ips.clone();
@@ -8728,11 +8660,31 @@ pub async fn start_network(
                     // case without punishing an innocent connection.
                     if contributors.len() <= 1 {
                         if let Some(ref uh) = sender_user_hash {
-                            let newly_banned = state.reputation.record_event(uh, ember::reputation::ReputationEvent::CorruptData);
-                            if newly_banned {
+                            let contributor_ip = contributors.iter().next().copied();
+                            let (node_banned, ip_banned) = if let Some(ip) = contributor_ip {
+                                state.reputation.record_event_with_ip(
+                                    uh,
+                                    ip,
+                                    ember::reputation::ReputationEvent::CorruptData,
+                                )
+                            } else {
+                                (
+                                    state.reputation.record_event(
+                                        uh,
+                                        ember::reputation::ReputationEvent::CorruptData,
+                                    ),
+                                    false,
+                                )
+                            };
+                            if node_banned || ip_banned {
                                 let sm = source_manager.read().await;
-                                let ips = sm.find_ips_by_user_hash(uh);
+                                let mut ips = sm.find_ips_by_user_hash(uh);
                                 drop(sm);
+                                if let Some(ip) = contributor_ip {
+                                    if !ips.contains(&ip) {
+                                        ips.push(ip);
+                                    }
+                                }
                                 for ip in ips {
                                     if state.banned_ips.insert(ip) {
                                         warn!("Reputation ban: banning IP {} (user_hash {})", ip, hex::encode(uh));
@@ -8753,8 +8705,13 @@ pub async fn start_network(
                     // per-user-hash enforcement) is governed by reputation.json,
                     // mirroring the other reputation-driven IP bans.
                     if let Some(ref uh) = sender_user_hash {
-                        let newly_banned = state.reputation.record_event(uh, ember::reputation::ReputationEvent::ProtocolViolation);
-                        if newly_banned {
+                        let (node_banned, ip_banned) =
+                            state.reputation.record_event_with_ip(
+                                uh,
+                                sender_ip,
+                                ember::reputation::ReputationEvent::ProtocolViolation,
+                            );
+                        if node_banned || ip_banned {
                             if state.banned_ips.insert(sender_ip) {
                                 warn!("Reputation ban: banning IP {} (protocol violation, user_hash {})", sender_ip, hex::encode(uh));
                             }
@@ -9324,12 +9281,34 @@ pub async fn start_network(
 
                 // Reputation: record upload-side events
                 match &event.kind {
-                    UploadEventKind::Started { user_hash: Some(ref uh_hex), .. } => {
+                    UploadEventKind::Started {
+                        user_hash: Some(ref uh_hex),
+                        ref peer_addr,
+                        ..
+                    } => {
                         if let Ok(bytes) = hex::decode(uh_hex) {
                             if bytes.len() == 16 {
                                 let mut uh = [0u8; 16];
                                 uh.copy_from_slice(&bytes);
-                                state.reputation.record_event(&uh, ember::reputation::ReputationEvent::SuccessfulHandshake);
+                                if let Some(ip) = peer_addr
+                                    .parse::<SocketAddr>()
+                                    .ok()
+                                    .and_then(|addr| match addr.ip() {
+                                        std::net::IpAddr::V4(ip) => Some(ip),
+                                        _ => None,
+                                    })
+                                {
+                                    state.reputation.record_event_with_ip(
+                                        &uh,
+                                        ip,
+                                        ember::reputation::ReputationEvent::SuccessfulHandshake,
+                                    );
+                                } else {
+                                    state.reputation.record_event(
+                                        &uh,
+                                        ember::reputation::ReputationEvent::SuccessfulHandshake,
+                                    );
+                                }
                             }
                         }
                     }
@@ -9341,7 +9320,23 @@ pub async fn start_network(
                                     if bytes.len() == 16 {
                                         let mut uh = [0u8; 16];
                                         uh.copy_from_slice(&bytes);
-                                        state.reputation.record_event(&uh, ember::reputation::ReputationEvent::SuccessfulChunk);
+                                        if let Some(ip) = t
+                                            .peer_id
+                                            .split(':')
+                                            .next()
+                                            .and_then(|value| value.parse::<Ipv4Addr>().ok())
+                                        {
+                                            state.reputation.record_event_with_ip(
+                                                &uh,
+                                                ip,
+                                                ember::reputation::ReputationEvent::SuccessfulChunk,
+                                            );
+                                        } else {
+                                            state.reputation.record_event(
+                                                &uh,
+                                                ember::reputation::ReputationEvent::SuccessfulChunk,
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -9368,8 +9363,22 @@ pub async fn start_network(
                             })
                         };
                         if let Some((uh, peer_ip)) = peer_info {
-                            let newly_banned = state.reputation.record_event(&uh, ember::reputation::ReputationEvent::FailedChunk);
-                            if newly_banned {
+                            let (node_banned, ip_banned) = if let Some(ip) = peer_ip {
+                                state.reputation.record_event_with_ip(
+                                    &uh,
+                                    ip,
+                                    ember::reputation::ReputationEvent::FailedChunk,
+                                )
+                            } else {
+                                (
+                                    state.reputation.record_event(
+                                        &uh,
+                                        ember::reputation::ReputationEvent::FailedChunk,
+                                    ),
+                                    false,
+                                )
+                            };
+                            if node_banned || ip_banned {
                                 // Ban every known IP for this user hash (not just
                                 // the one address on the transfer row) so a
                                 // multi-homed peer can't keep going from another
@@ -9483,6 +9492,7 @@ pub async fn start_network(
 
             // Periodic search polling
             _ = search_poll_timer.tick() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 let mut udp_finished_request = None;
                 if let Some(active) = state.active_search_request.as_mut() {
                     if active.udp_pending {
@@ -9529,7 +9539,7 @@ pub async fn start_network(
                 if let Some(request_id) = udp_finished_request {
                     maybe_finish_active_search(&mut state, &app_handle, request_id);
                 }
-                if state.stats.status == NetworkStatus::Disconnected { continue; }
+                if state.stats.status == NetworkStatus::Disconnected { return; }
                 let new_in_use = state.search_manager.drain_pending_in_use();
                 if !new_in_use.is_empty() {
                     state.routing_table.mark_contacts_in_use(&new_in_use);
@@ -11555,11 +11565,16 @@ pub async fn start_network(
                 if !stopped_sids.is_empty() {
                     finalize_removed_searches(&mut state, &app_handle, &stopped_sids, &stopped_in_use);
                 }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'search_poll_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             // Periodic bootstrap (eMule BigTimer style)
             _ = bootstrap_timer.tick() => {
-                if state.stats.status == NetworkStatus::Disconnected { continue; }
+                let __panic_result = std::panic::AssertUnwindSafe(async {
+                if state.stats.status == NetworkStatus::Disconnected { return; }
                 let table_size = state.routing_table.len();
 
                 if table_size == 0 {
@@ -12007,7 +12022,7 @@ pub async fn start_network(
                             broker_tx,
                         );
 
-                        match ember::quic::generate_self_signed_cert(&ember_hash) {
+                        match ember::quic::generate_self_signed_cert(&ed25519_secret_key) {
                             Ok((cert_der, key_der)) => {
                                 match ember::quic::build_server_client_endpoint(
                                     &cert_der,
@@ -12202,10 +12217,15 @@ pub async fn start_network(
                 }
 
                 state.stats.connected_peers = count;
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'bootstrap_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             // Periodic publishing
             _ = publish_timer.tick() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 // Ember DHT source publishing (slice 9) runs independently of
                 // KAD connectivity, so it must come before the KAD-status gate
                 // and the KAD-routing-table check below: it works on a
@@ -12230,7 +12250,7 @@ pub async fn start_network(
                 )
                 .await;
 
-                if state.stats.status == NetworkStatus::Disconnected { continue; }
+                if state.stats.status == NetworkStatus::Disconnected { return; }
                 if state.routing_table.is_empty() {
                     debug!("Skipping publish cycle: routing table is empty");
                 } else {
@@ -12575,6 +12595,10 @@ pub async fn start_network(
                 }
 
                 } // end is_empty guard
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'publish_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             // eMule-compatible Kad publish scheduler. The 60s publish_timer
@@ -12583,13 +12607,14 @@ pub async fn start_network(
             // most one source, one keyword, and one note store per tick while
             // respecting the local eMule per-type active-search caps.
             _ = kad_publish_timer.tick() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 const KADEMLIA_TOTAL_STORE_SRC: usize = 4;
                 const KADEMLIA_TOTAL_STORE_KEY: usize = 3;
                 const KADEMLIA_TOTAL_STORE_NOTES: usize = 1;
                 const REPUBLISH_NOTE_SECS: i64 = 24 * 3600;
 
                 if state.stats.status == NetworkStatus::Disconnected || state.routing_table.is_empty() {
-                    continue;
+                    return;
                 }
 
                 // eMule `CSharedFileList::Publish()` examines exactly one
@@ -12719,6 +12744,10 @@ pub async fn start_network(
                         }
                     }
                 }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'kad_publish_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             // Publish-pipeline health heartbeat (10s). Only logs when at
@@ -12728,7 +12757,8 @@ pub async fn start_network(
             // PublishRes packets are flowing seconds after publishes are
             // sent — not 60s later.
             _ = publish_health_timer.tick() => {
-                if state.stats.status == NetworkStatus::Disconnected { continue; }
+                let __panic_result = std::panic::AssertUnwindSafe(async {
+                if state.stats.status == NetworkStatus::Disconnected { return; }
                 let cur = PublishHealthSnapshot {
                     confirmed: state.publish_confirmed,
                     pending: state.publish_pending.len(),
@@ -12765,6 +12795,10 @@ pub async fn start_network(
                     );
                 }
                 last_publish_health = cur;
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'publish_health_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             // UDP source-discovery health heartbeat (30s). Like the
@@ -12777,7 +12811,8 @@ pub async fn start_network(
             // many beats means servers aren't replying (firewall,
             // missing UDP obfuscation, dead servers).
             _ = udp_discovery_health_timer.tick() => {
-                if state.stats.status == NetworkStatus::Disconnected { continue; }
+                let __panic_result = std::panic::AssertUnwindSafe(async {
+                if state.stats.status == NetworkStatus::Disconnected { return; }
                 let cur = UdpDiscoveryHealthSnapshot {
                     sent: state.udp_discovery_sent,
                     send_errs: state.udp_discovery_send_errs,
@@ -12870,11 +12905,16 @@ pub async fn start_network(
                     }
                 }
                 last_udp_discovery_health = cur;
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'udp_discovery_health_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             // Cleanup stale searches, expired DHT entries, and unconfirmed publishes
             _ = cleanup_timer.tick() => {
-                if state.stats.status == NetworkStatus::Disconnected { continue; }
+                let __panic_result = std::panic::AssertUnwindSafe(async {
+                if state.stats.status == NetworkStatus::Disconnected { return; }
                 let (removed_sids, released_in_use) = state.search_manager.cleanup(120);
                 finalize_removed_searches(&mut state, &app_handle, &removed_sids, &released_in_use);
                 state.dht_store.cleanup_expired();
@@ -13098,6 +13138,10 @@ pub async fn start_network(
                         debug!("Retrying unconfirmed publish for target {} (peer {})", key.0, key.1);
                     }
                 }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'cleanup_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             // Broker tick + event drain. Used to live inside the
@@ -13114,7 +13158,8 @@ pub async fn start_network(
             // one `try_recv()` (returns `Empty` instantly) plus a
             // hashmap walk over at most `MAX_ACTIVE_ATTEMPTS` entries.
             _ = broker_timer.tick() => {
-                if state.stats.status == NetworkStatus::Disconnected { continue; }
+                let __panic_result = std::panic::AssertUnwindSafe(async {
+                if state.stats.status == NetworkStatus::Disconnected { return; }
 
                 if let Some(ref mut broker) = state.connection_broker {
                     broker.tick().await;
@@ -13334,13 +13379,35 @@ pub async fn start_network(
                                             std::net::IpAddr::V4(relay_ip), relay_port,
                                         );
 
-                                        let relay_pin = relay_ember_hash.map(|hash| {
-                                            (
-                                                ed25519_pubkey.as_ref(),
-                                                ed25519_secret_key.as_ref(),
-                                                hash,
-                                            )
+                                        // `pin` for `connect_to_peer_relay` must be *our own*
+                                        // QUIC cert/key DER bytes (proving to the relay who
+                                        // we are) paired with the *relay's* expected node id
+                                        // (so our verifier confirms we actually reached that
+                                        // relay, not an impostor). This used to pass our raw
+                                        // 32-byte Ed25519 identity key bytes directly as if
+                                        // they were DER-encoded cert/key material — rustls
+                                        // would fail to parse them as X.509/PKCS8 on every
+                                        // single pinned relay attempt, so pinned peer-relay
+                                        // connects never succeeded. Derive a real (cert_der,
+                                        // key_der) pair from our identity key on demand
+                                        // instead — cheap and deterministic, see
+                                        // `generate_self_signed_cert`'s doc comment.
+                                        let relay_pin_material = relay_ember_hash.and_then(|hash| {
+                                            match ember::quic::generate_self_signed_cert(&ed25519_secret_key) {
+                                                Ok(cert_and_key) => Some((cert_and_key, hash)),
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        "Broker: failed to derive QUIC cert for relay pin, connecting unpinned: {e}"
+                                                    );
+                                                    None
+                                                }
+                                            }
                                         });
+                                        let relay_pin = relay_pin_material
+                                            .as_ref()
+                                            .map(|((cert_der, key_der), hash)| {
+                                                (cert_der.as_slice(), key_der.as_slice(), *hash)
+                                            });
                                         match ember::relay::connect_to_peer_relay(
                                             &endpoint, relay_addr, source_ip, source_port, &file_hash, relay_attestation_hash, relay_pin,
                                         ).await {
@@ -13604,20 +13671,30 @@ pub async fn start_network(
                         }
                     }
                 }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'broker_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             // eMule Consolidate: merge sparse sibling leaf zones every 45 minutes
             _ = consolidate_timer.tick() => {
-                if state.stats.status == NetworkStatus::Disconnected { continue; }
+                let __panic_result = std::panic::AssertUnwindSafe(async {
+                if state.stats.status == NetworkStatus::Disconnected { return; }
                 let merged = state.routing_table.consolidate();
                 if merged > 0 {
                     debug!("Consolidated {merged} zone pairs");
+                }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'consolidate_timer' panicked: {}", describe_panic(&*__p));
                 }
             }
 
             // eMule CKademlia::Process big timer: RandomLookup at most once per tick (~100ms cadence).
             _ = kad_process_timer.tick() => {
-                if state.stats.status == NetworkStatus::Disconnected { continue; }
+                let __panic_result = std::panic::AssertUnwindSafe(async {
+                if state.stats.status == NetworkStatus::Disconnected { return; }
                 let now_bt = chrono::Utc::now().timestamp();
                 if let Some(target) =
                     state
@@ -13641,10 +13718,15 @@ pub async fn start_network(
                         }
                     }
                 }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'kad_process_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             // Throttled UDP global search: send one packet per 750ms tick
             _ = udp_search_timer.tick() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 if let Some((packet, addr)) = state.udp_search_queue.pop_front() {
                     let sock = server_udp.socket_handle();
                     if let Err(e) = sock.send_to(&packet, addr).await {
@@ -13658,6 +13740,10 @@ pub async fn start_network(
                         debug!("UDP global search: all servers queried");
                     }
                 }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'udp_search_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             // Paced UDP source-request drain: up to UDP_SOURCE_BURST_PER_TICK
@@ -13669,6 +13755,7 @@ pub async fn start_network(
             // within the first second. See the timer-definition comment
             // for the rate rationale.
             _ = udp_source_timer.tick() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 for _ in 0..UDP_SOURCE_BURST_PER_TICK {
                     let Some((packet, addr)) = state.udp_source_queue.pop_front() else {
                         break;
@@ -13730,11 +13817,16 @@ pub async fn start_network(
                         }
                     }
                 }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'udp_source_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             // SmallTimer (eMule): probe expired contacts with HELLO_REQ, remove dead
             _ = small_timer.tick() => {
-                if state.stats.status == NetworkStatus::Disconnected { continue; }
+                let __panic_result = std::panic::AssertUnwindSafe(async {
+                if state.stats.status == NetworkStatus::Disconnected { return; }
 
                 // eMule KADEMLIADISCONNECTDELAY: if no valid KAD contact for 20 minutes,
                 // transition back to Connecting so bootstrap re-engages.
@@ -13822,11 +13914,16 @@ pub async fn start_network(
                     .await;
                 }
 
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'small_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             // Buddy system: find a relay buddy if firewalled (always-on, like eMule)
             _ = buddy_timer.tick() => {
-                if state.stats.status == NetworkStatus::Disconnected { continue; }
+                let __panic_result = std::panic::AssertUnwindSafe(async {
+                if state.stats.status == NetworkStatus::Disconnected { return; }
                 let tcp_fw = state.firewall_checker.tcp_status();
                 let udp_fw = state.firewall_checker.udp_status();
                 // eMule (ClientList.cpp:604-629): a buddy is only useful while we
@@ -13986,10 +14083,15 @@ pub async fn start_network(
                     }
                 }
 
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'buddy_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             // Cleanup flood protection tracking and cap peer nicknames
             _ = flood_cleanup_timer.tick() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 state.flood_protection.cleanup();
 
                 // Prevent unbounded growth of peer_nicknames
@@ -14099,10 +14201,15 @@ pub async fn start_network(
                 // peer activity instead of accumulating until the cap
                 // forces eviction.
                 state.ember_transport.cleanup();
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'flood_cleanup_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             // Retry source search for pending downloads (eMule: never auto-fail, search forever)
             _ = pathb_stats_timer.tick() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 if let Some((in_use, max, acquires, contended)) =
                     ed2k::multi_source::global_dl_conn_stats()
                 {
@@ -14123,8 +14230,13 @@ pub async fn start_network(
                         );
                     }
                 }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'pathb_stats_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
             _ = source_retry_timer.tick() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 let now = chrono::Utc::now().timestamp();
                 let kad_available = state.stats.status != NetworkStatus::Disconnected;
                 let server_connected = state.server_connected;
@@ -14355,7 +14467,7 @@ pub async fn start_network(
                 // there is no network to search. Avoids burning retry budget on startup
                 // before any connection is established.
                 if !kad_available && !server_connected {
-                    continue;
+                    return;
                 }
 
                 let mut to_retry: Vec<(String, u32)> = Vec::new();
@@ -15479,10 +15591,15 @@ pub async fn start_network(
                         }
                     }
                 }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'source_retry_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             // Periodic credit save to database (with stale record cleanup)
             _ = credit_save_timer.tick() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 spawn_credit_flush(
                     credit_manager.clone(),
                     db.clone(),
@@ -15490,11 +15607,16 @@ pub async fn start_network(
                     true,
                     credit_flush_in_flight.clone(),
                 );
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'credit_save_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             // A4AF swap evaluation every 8 minutes
             _ = a4af_timer.tick() => {
-                if state.stats.status == NetworkStatus::Disconnected { continue; }
+                let __panic_result = std::panic::AssertUnwindSafe(async {
+                if state.stats.status == NetworkStatus::Disconnected { return; }
                 let mut file_priorities: HashMap<[u8; 16], ed2k::a4af::FileSwapInfo> = HashMap::new();
                 let mut dl_hashes_vec: Vec<[u8; 16]> = Vec::new();
                 for (tid, pd) in &state.pending_downloads {
@@ -15748,10 +15870,15 @@ pub async fn start_network(
                     let mut a4af = a4af_shared.write().await;
                     a4af.cleanup_stale(3600);
                 }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'a4af_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             // ed2k server keep-alive, message polling, and auto-reconnect (non-blocking)
             _ = server_timer.tick() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 if state.server_connected {
                     let mut pending_lowid_callbacks: Vec<([u8; 16], u32)> = Vec::new();
                     let mut finished_search_requests: Vec<u64> = Vec::new();
@@ -16576,10 +16703,15 @@ pub async fn start_network(
                     }
                     } // elapsed_ok
                 }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'server_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             // Ping the next server in the list via UDP to get user/file counts
             _ = server_udp_ping_timer.tick() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 let server_count = state.server_list.len();
                 if server_count > 0 {
                     let idx = server_udp_ping_idx % server_count;
@@ -17064,6 +17196,10 @@ pub async fn start_network(
                             }
                         }
                     }
+                }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'server_udp_ping_timer' panicked: {}", describe_panic(&*__p));
                 }
             }
 
@@ -17795,6 +17931,7 @@ pub async fn start_network(
 
             // Accept incoming buddy connections forwarded from the upload listener
             buddy_conn = buddy_conn_rx.recv() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 if let Some((peer_hash, callback_check, reader, writer)) = buddy_conn {
                     let peer_id = KadId(peer_hash);
                     if let Some(rx) = state.buddy_manager.accept_buddy_connection(peer_id, callback_check, reader, writer) {
@@ -17802,11 +17939,16 @@ pub async fn start_network(
                         info!("Accepted incoming buddy connection from {}", peer_id);
                     }
                 }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'buddy_conn_rx' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             // Handle callback connections: firewalled source connected back to us
             // (KAD buddy relay or server LowID callback via OP_CALLBACKREQUEST)
             cb_conn = kad_callback_rx.recv() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 if let Some(parts) = cb_conn {
                     let hash_hex = hex::encode(parts.file_hash);
                     let active_parts: Option<upload_server::KadCallbackParts> =
@@ -17988,7 +18130,7 @@ pub async fn start_network(
                             debug!(
                                 "Dropping LowID callback from {cb_peer_ip}:{cb_peer_port} for {hash_hex}: peer is reputation-banned",
                             );
-                            continue;
+                            return;
                         }
 
                         let server_info = state.server_addr.and_then(|sa| {
@@ -18216,9 +18358,14 @@ pub async fn start_network(
                         }
                     }
                 }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'kad_callback_rx' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             udp_fw_req = udp_fw_check_rx.recv() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 if let Some(req) = udp_fw_req {
                     send_kad_udp_firewall_result(
                         &udp_socket,
@@ -18229,10 +18376,15 @@ pub async fn start_network(
                         req.receiver_udp_key,
                     ).await;
                 }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'udp_fw_check_rx' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             // Periodic nodes.dat save to protect against crashes
             _ = nodes_save_timer.tick() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 if !nodes_save_in_flight {
                     let contacts = state.routing_table.export_bootstrap_contacts(200);
                     let nodes_path = state.data_dir.join("nodes.dat");
@@ -18253,7 +18405,6 @@ pub async fn start_network(
                         });
                     });
                 }
-
                 // Persist the Ember DHT routing table too (slice 7). Skip
                 // when empty so we don't churn a zero-contact file over a
                 // previously-populated one.
@@ -18266,6 +18417,10 @@ pub async fn start_network(
                         error!("Failed periodic nodes_ember.dat save: {e}");
                     }
                 }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'nodes_save_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             // UPnP maintenance: renew leases before expiry, retry gateway
@@ -18274,6 +18429,7 @@ pub async fn start_network(
             // the dashboard doesn't show a stale value for the rest of the
             // session.
             _ = upnp_renew_timer.tick() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 if upnp_enabled && !upnp_maintain_in_flight {
                     let revision = upnp_mappings.revision();
                     let mut mappings = upnp_mappings.clone();
@@ -18289,9 +18445,14 @@ pub async fn start_network(
                         });
                     });
                 }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'upnp_renew_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             Some(result) = upnp_maintain_result_rx.recv() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 upnp_maintain_in_flight = false;
                 upnp_maintain_started_at = None;
                 if result.revision == upnp_mappings.revision() {
@@ -18331,9 +18492,14 @@ pub async fn start_network(
                 } else {
                     debug!("Discarding stale UPnP maintenance result after mapping state changed");
                 }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'upnp_maintain_result_rx' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             Some(result) = nat_probe_result_rx.recv() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 nat_probe_in_flight = false;
                 nat_probe_started_at = None;
                 nat_probe_packet_tx = None;
@@ -18363,9 +18529,14 @@ pub async fn start_network(
                     ctx.nat_type = state.nat_info.nat_type;
                     ctx.external_addr = state.nat_info.external_addr;
                 }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'nat_probe_result_rx' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             Some(result) = rendezvous_register_result_rx.recv() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 rendezvous_register_in_flight = false;
                 rendezvous_register_started_at = None;
                 match result.result {
@@ -18397,10 +18568,15 @@ pub async fn start_network(
                         );
                     }
                 }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'rendezvous_register_result_rx' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             // Statistics rate recording (every second)
             _ = stats_timer.tick() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 stats_manager.session_down_counter.store(bandwidth_limiter.total_downloaded(), std::sync::atomic::Ordering::Relaxed);
                 stats_manager.session_up_counter.store(bandwidth_limiter.total_uploaded(), std::sync::atomic::Ordering::Relaxed);
                 // Fold peer-to-peer SX bytes (OP_REQUESTSOURCES /
@@ -18436,9 +18612,14 @@ pub async fn start_network(
                         }),
                     );
                 }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'stats_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             Some(result) = known_met_save_result_rx.recv() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 known_met_save_in_flight = false;
                 known_met_save_started_at = None;
                 match result.result {
@@ -18452,9 +18633,14 @@ pub async fn start_network(
                         error!("Failed to save known.met: {e}");
                     }
                 }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'known_met_save_result_rx' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             Some(result) = periodic_save_result_rx.recv() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 let job_name = match result.job {
                     PeriodicSaveJob::Stats => {
                         stats_save_in_flight = false;
@@ -18480,19 +18666,29 @@ pub async fn start_network(
                 if let Err(e) = result.result {
                     error!("Failed to save {job_name}: {e}");
                 }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'periodic_save_result_rx' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             Some(result) = spam_save_result_rx.recv() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 spam_save_in_flight = false;
                 spam_save_started_at = None;
                 match result.result {
                     Ok(()) => spam_filter.write().await.mark_saved(result.generation),
                     Err(e) => warn!("Failed to save spam filter: {e}"),
                 }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'spam_save_result_rx' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             // Periodic statistics save (every 60s — see stats_save_timer)
             _ = stats_save_timer.tick() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 if !stats_save_in_flight {
                     let pairs = stats_manager.cumulative_save_pairs();
                     let db_for_save = db.clone();
@@ -18547,6 +18743,10 @@ pub async fn start_network(
                         });
                     });
                 }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'stats_save_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             // Periodic reputation maintenance (every 60s: lift expired
@@ -18556,12 +18756,18 @@ pub async fn start_network(
             // nothing on the hot path calls `get_score` (the only other
             // decay trigger), so without this scores never decayed.
             _ = reputation_timer.tick() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 state.reputation.lift_expired_bans();
                 state.reputation.maybe_decay();
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'reputation_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             // Periodic reputation save (every 5 minutes)
             _ = reputation_save_timer.tick() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 if !reputation_save_in_flight {
                     let rep_path = state.data_dir.join("reputation.json");
                     let reputation_snapshot = state.reputation.clone();
@@ -18581,10 +18787,15 @@ pub async fn start_network(
                         });
                     });
                 }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'reputation_save_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             // Periodic known.met save (every 120s)
             _ = known_met_save_timer.tick() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 if known_met_save_in_flight
                     && known_met_save_started_at
                         .is_some_and(|started| started.elapsed() > std::time::Duration::from_secs(300))
@@ -18666,21 +18877,31 @@ pub async fn start_network(
                         MAX_AICH_ROOT_MAP_SOFT_CAP,
                     );
                 }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'known_met_save_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             // Dead source cleanup (every 5 minutes)
             _ = dead_source_timer.tick() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 state.dead_sources.cleanup();
                 let count = state.dead_sources.len();
                 if count > 0 {
                     debug!("Dead source list: {count} blocked sources");
                 }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'dead_source_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             // Ember Peer Exchange: rebuild shared payload from active downloads + known sources
             _ = ember_refresh_timer.tick() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 if !state.ember_payload_dirty {
-                    continue;
+                    return;
                 }
                 // Also look up AICH roots from local shared file index
                 {
@@ -18958,9 +19179,14 @@ pub async fn start_network(
                 *shared_ember_payload.write().await = Arc::new(payload);
                 ember_payload_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 state.ember_payload_dirty = false;
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'ember_refresh_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             _ = ember_search_timer.tick() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 // Cheap when idle: the maps are empty unless an iterative
                 // lookup, a publish, or a maintenance liveness ping is in
                 // flight.
@@ -18971,7 +19197,7 @@ pub async fn start_network(
                     && state.ember_dht_maint_pings.is_empty()
                     && state.ember_pending_source_injections.is_empty()
                 {
-                    continue;
+                    return;
                 }
 
                 let now = std::time::Instant::now();
@@ -19225,9 +19451,14 @@ pub async fn start_network(
                         maybe_finish_active_search(&mut state, &app_handle, request_id);
                     }
                 }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'ember_search_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             _ = ember_maintenance_timer.tick() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 // Background health loop. Skip entirely when the transport
                 // is off or the table is empty (nothing to refresh, ping,
                 // or republish). `force = false`: honour the staleness
@@ -19242,6 +19473,10 @@ pub async fn start_network(
                 {
                     let _ = run_ember_maintenance(&udp_socket, &mut state, false).await;
                 }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'ember_maintenance_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             // Cold-start bootstrap contacts arrived from the rendezvous
@@ -19250,6 +19485,7 @@ pub async fn start_network(
             // discover our neighbourhood and the table fills out — the
             // native equivalent of KAD's initial bootstrap lookup.
             Some(contacts) = ember_boot_rx.recv() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 let n = contacts.len();
                 let before = state.ember_dht.contact_count();
                 state.ember_dht.load_contacts(contacts);
@@ -19267,15 +19503,20 @@ pub async fn start_network(
                         drive_ember_search(&udp_socket, &mut state, search_id).await;
                     }
                 }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'ember_boot_rx' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             _ = source_count_sync_timer.tick() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 let hashes = {
                     let index = local_index.read().await;
                     index.all_hashes()
                 };
                 if hashes.is_empty() {
-                    continue;
+                    return;
                 }
                 let sm = source_manager.read().await;
                 let mut updates: Vec<(String, [u8; 16], u32)> = Vec::new();
@@ -19354,9 +19595,14 @@ pub async fn start_network(
                         *s_files.write().await = file_snap;
                     });
                 }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'source_count_sync_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             _ = watchdog_timer.tick() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 let now = chrono::Utc::now().timestamp();
 
                 if state.server_connected
@@ -19445,10 +19691,15 @@ pub async fn start_network(
                     );
                     last_kad_activity_at = now;
                 }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'watchdog_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             // Periodic UDP source requests (eMule UDPSERVERREASKTIME)
             _ = server_udp_source_timer.tick() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 let mut all_for_udp: Vec<([u8; 16], u64)> = state.pending_downloads.values()
                     .filter(|pd| !pd.control.is_cancelled() && !pd.control.is_paused())
                     .filter_map(|pd| {
@@ -19481,7 +19732,7 @@ pub async fn start_network(
                     }
                 }
 
-                if all_for_udp.is_empty() { continue; }
+                if all_for_udp.is_empty() { return; }
                 let total_downloads = all_for_udp.len();
                 // Filter out files that already have enough sources
                 let mut need_sources: Vec<([u8; 16], u64)> = Vec::new();
@@ -19506,12 +19757,17 @@ pub async fn start_network(
                 }
                 debug!("Periodic UDP source sweep for {} downloads ({} need sources)",
                     total_downloads, need_sources.len());
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'server_udp_source_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             // eMule ProcessLocalRequests(): batch TCP OP_GETSOURCES over the
             // active server connection every 4 min, up to 15 per frame.
             _ = server_tcp_source_timer.tick() => {
-                if !state.server_connected || state.server_connection.is_none() { continue; }
+                let __panic_result = std::panic::AssertUnwindSafe(async {
+                if !state.server_connected || state.server_connection.is_none() { return; }
 
                 const MAX_TCP_GETSOURCES_PER_FRAME: usize = 15;
 
@@ -19552,7 +19808,7 @@ pub async fn start_network(
                     }
                 }
 
-                if all_downloads.is_empty() { continue; }
+                if all_downloads.is_empty() { return; }
 
                 // Prioritize files with fewer sources
                 all_downloads.sort_by_key(|(_, _, _, sc)| *sc);
@@ -19586,14 +19842,19 @@ pub async fn start_network(
                 if sent > 0 {
                     info!("TCP source batch: sent OP_GETSOURCES for {sent}/{batch_size} downloads (cursor at {}/{})", state.server_tcp_getsources_cursor, total);
                 }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'server_tcp_source_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             // USS: send a KAD Ping to the selected host for RTT measurement
             _ = uss_ping_timer.tick() => {
-                if state.stats.status == NetworkStatus::Disconnected { continue; }
+                let __panic_result = std::panic::AssertUnwindSafe(async {
+                if state.stats.status == NetworkStatus::Disconnected { return; }
                 if !state.uss_enabled_flag.load(std::sync::atomic::Ordering::Relaxed) {
                     state.uss_host = None;
-                    continue;
+                    return;
                 }
                 let now_ts = chrono::Utc::now().timestamp();
 
@@ -19634,15 +19895,20 @@ pub async fn start_network(
                         state.uss_missed_pongs += 1;
                     }
                 }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'uss_ping_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
 
             // Refresh shared peer/stats caches for frontend reads (non-blocking)
             _ = cache_refresh_timer.tick() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
                 // Skip if previous write task hasn't finished yet — avoids
                 // accumulating queued writers on the RwLocks which would starve
                 // Tauri IPC read handlers and freeze the UI.
                 if cache_write_handle.as_ref().is_some_and(|h| !h.is_finished()) {
-                    continue;
+                    return;
                 }
 
                 // Collect raw contact data quickly (no hex/distance computation).
@@ -19885,6 +20151,10 @@ pub async fn start_network(
                     *s_conn.write().await = cached_conn_srv;
                     *s_tstats.write().await = cached_tstats;
                 }));
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'cache_refresh_timer' panicked: {}", describe_panic(&*__p));
+                }
             }
         }
 
@@ -27733,6 +28003,9 @@ async fn handle_command_inner(
                         AddServerOutcome::Filtered => {
                             Err(format!("Server {ip}:{port} is blocked by the IP filter"))
                         }
+                        AddServerOutcome::AtCapacity => Err(format!(
+                            "Server list is full; remove an entry before adding {ip}:{port}"
+                        )),
                     }
                 }
             };

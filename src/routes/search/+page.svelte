@@ -864,6 +864,12 @@
   let someFilteredChecked = $derived(
     filteredResults.some((r) => checkedKeys.has(resultKey(r)))
   );
+  let selectAllCheckbox: HTMLInputElement | undefined = $state(undefined);
+  $effect(() => {
+    if (selectAllCheckbox) {
+      selectAllCheckbox.indeterminate = someFilteredChecked && !allFilteredChecked;
+    }
+  });
   // Keep the checked set confined to currently-visible results. A row can
   // be checked and then hidden by a filter change; without this the bulk
   // toolbar would count it ("N selected") while `downloadChecked` — which
@@ -2109,8 +2115,8 @@
           <th class="col-check">
             <input
               type="checkbox"
+              bind:this={selectAllCheckbox}
               checked={allFilteredChecked}
-              indeterminate={someFilteredChecked && !allFilteredChecked}
               onchange={toggleCheckAll}
               aria-label={m.search_select_all_results()}
               title={m.search_select_all_results()}

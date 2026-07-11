@@ -64,6 +64,7 @@ const FREQUENCY_MS: Record<UpdateCheckFrequency, number> = {
 // from Settings → About also updates it, since that makes an automatic
 // check redundant until the configured interval elapses again.
 const LAST_CHECK_STORAGE_KEY = 'ember.updater.lastCheckedAt';
+const DISMISSED_VERSION_STORAGE_KEY = 'ember.updater.dismissedVersion';
 
 function readLastCheckedAt(): number {
   try {
@@ -83,6 +84,22 @@ function recordCheckedNow(): void {
   } catch {
     // Quota or storage failure — worst case we check more often than the
     // configured frequency on this device; not worth surfacing to the user.
+  }
+}
+
+function readDismissedVersion(): string | null {
+  try {
+    return localStorage.getItem(DISMISSED_VERSION_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function recordDismissedVersion(version: string): void {
+  try {
+    localStorage.setItem(DISMISSED_VERSION_STORAGE_KEY, version);
+  } catch {
+    // In-memory dismissal still works for this session.
   }
 }
 
@@ -160,7 +177,7 @@ export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<
         downloaded: 0,
         total: null,
         error: null,
-        dismissed: false,
+        dismissed: readDismissedVersion() === found.version,
       });
       return true;
     }
@@ -228,5 +245,8 @@ export async function restartToUpdate(): Promise<void> {
 
 /** Hide the banner for the current version without cancelling anything. */
 export function dismissNotice(): void {
-  updater.update((s) => ({ ...s, dismissed: true }));
+  updater.update((s) => {
+    if (s.version) recordDismissedVersion(s.version);
+    return { ...s, dismissed: true };
+  });
 }

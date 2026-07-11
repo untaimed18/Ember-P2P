@@ -374,6 +374,13 @@
     ipScrollTop = 0;
   }
 
+  function sortOnKey(event: KeyboardEvent, action: () => void) {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      action();
+    }
+  }
+
   function sortArrow(col: string): string {
     if (sortBy !== col) return ' \u00A0';
     return sortAsc ? ' \u25B2' : ' \u25BC';
@@ -543,25 +550,31 @@
             <tr>
               <th
                 class="sortable col-range"
+                tabindex="0"
                 role="columnheader"
                 aria-sort={ariaSort('range')}
                 onclick={() => toggleSort('range')}
+                onkeydown={(e) => sortOnKey(e, () => toggleSort('range'))}
               >
                 <span class="th-content">{m.security_col_ip_range()}{sortArrow('range')}</span>
               </th>
               <th
                 class="sortable col-desc"
+                tabindex="0"
                 role="columnheader"
                 aria-sort={ariaSort('description')}
                 onclick={() => toggleSort('description')}
+                onkeydown={(e) => sortOnKey(e, () => toggleSort('description'))}
               >
                 <span class="th-content">{m.security_col_description()}{sortArrow('description')}</span>
               </th>
               <th
                 class="sortable col-hits"
+                tabindex="0"
                 role="columnheader"
                 aria-sort={ariaSort('hits')}
                 onclick={() => toggleSort('hits')}
+                onkeydown={(e) => sortOnKey(e, () => toggleSort('hits'))}
               >
                 <span class="th-content">{m.security_col_hits()}{sortArrow('hits')}</span>
               </th>
@@ -949,6 +962,10 @@
   .ip-table th.sortable:hover {
     color: var(--text-primary);
     background: var(--bg-hover);
+  }
+  .ip-table th.sortable:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
   }
   .th-content {
     display: block;

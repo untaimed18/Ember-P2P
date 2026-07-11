@@ -210,6 +210,8 @@ const REMOVED_UPLOAD_TTL_MS = 10_000;
  * the row as `active` for the ~3s until the next poll/event corrects it.
  */
 const reversibleStateEnteredAt = new Map<string, number>();
+const sourceCountsUpdatedAt = new Map<string, number>();
+const LIVE_SOURCE_EVENT_GRACE_MS = 6_000;
 function markUploadRemoved(id: string) {
   recentlyRemovedUploads.set(id, Date.now() + REMOVED_UPLOAD_TTL_MS);
 }
@@ -498,6 +500,8 @@ export async function initTransferStore() {
               if (liveIncoming > 0 || liveCurrent === 0 || statusChanged) {
                 if (active_sources !== undefined) updated.active_sources = active_sources;
                 if (queued_sources !== undefined) updated.queued_sources = queued_sources;
+                if (liveIncoming > 0) sourceCountsUpdatedAt.set(id, Date.now());
+                else sourceCountsUpdatedAt.delete(id);
               }
             }
             if (failure_reason !== undefined) updated.failure_reason = failure_reason;
@@ -578,7 +582,14 @@ export async function initTransferStore() {
             // Discovery refreshes often send an updated total with 0/0
             // live counts; don't stomp live counters the multi-source
             // worker is still reporting.
-            const preserveLive = newLive === 0 && prevLive > 0;
+            const now = Date.now();
+            const lastLiveUpdate = sourceCountsUpdatedAt.get(id) ?? 0;
+            const preserveLive =
+              newLive === 0 &&
+              prevLive > 0 &&
+              now - lastLiveUpdate < LIVE_SOURCE_EVENT_GRACE_MS;
+            if (newLive > 0) sourceCountsUpdatedAt.set(id, now);
+            else if (!preserveLive) sourceCountsUpdatedAt.delete(id);
             return {
               ...t,
               sources: Math.max(sources, t.sources),
@@ -712,6 +723,7 @@ export function cleanupTransferStore() {
   recentlyRemovedUploads.clear();
   missingFromApiSince.clear();
   reversibleStateEnteredAt.clear();
+  sourceCountsUpdatedAt.clear();
   // Cancel any flush queued for the next frame/tick so it can't run against a
   // store we've just reset (or a subsequently re-initialised one).
   if (flushRaf !== null) {
@@ -802,6 +814,7 @@ export function startTransferPoll() {
     if (!pollPumpOnNextVisible && Date.now() - lastEventUpdate < 2000) return;
     pollPumpOnNextVisible = false;
     busy = true;
+    const epoch = storeEpoch;
     // Captured before the IPC call so the merge below can tell whether THIS
     // poll's snapshot was already in flight when a pause/stop/insufficient
     // transition landed (see `reversibleStateEnteredAt`), not just whether
@@ -815,6 +828,7 @@ export function startTransferPoll() {
           pollTimeout = setTimeout(() => reject('timeout'), 4000);
         }),
       ]);
+      if (epoch !== storeEpoch) return;
       transfers.update((current) => {
         const now = Date.now();
         pruneRemovedUploads(now);
@@ -844,6 +858,20 @@ export function startTransferPoll() {
             const preferEvent =
               snapshotPredatesReversibleEntry || isMoreAdvancedStatus(eventItem.status, apiItem.status);
             const status = preferEvent ? eventItem.status : apiItem.status;
+            const apiActive = apiItem.active_sources ?? 0;
+            const apiQueued = apiItem.queued_sources ?? 0;
+            const eventActive = eventItem.active_sources ?? 0;
+            const eventQueued = eventItem.queued_sources ?? 0;
+            const preserveFreshEventCounts =
+              apiActive + apiQueued === 0 &&
+              eventActive + eventQueued > 0 &&
+              now - (sourceCountsUpdatedAt.get(apiItem.id) ?? 0) <
+                LIVE_SOURCE_EVENT_GRACE_MS;
+            if (apiActive + apiQueued > 0) {
+              sourceCountsUpdatedAt.set(apiItem.id, now);
+            } else if (!preserveFreshEventCounts) {
+              sourceCountsUpdatedAt.delete(apiItem.id);
+            }
             return {
               ...apiItem,
               status,
@@ -858,8 +886,8 @@ export function startTransferPoll() {
               failure_kind: eventItem.failure_kind ?? apiItem.failure_kind,
               failure_stage: eventItem.failure_stage ?? apiItem.failure_stage,
               sources: Math.max(apiItem.sources ?? 0, eventItem.sources ?? 0),
-              active_sources: Math.max(apiItem.active_sources ?? 0, eventItem.active_sources ?? 0),
-              queued_sources: Math.max(apiItem.queued_sources ?? 0, eventItem.queued_sources ?? 0),
+              active_sources: preserveFreshEventCounts ? eventActive : apiActive,
+              queued_sources: preserveFreshEventCounts ? eventQueued : apiQueued,
             };
           })
           .map(snapCompletedDownload);

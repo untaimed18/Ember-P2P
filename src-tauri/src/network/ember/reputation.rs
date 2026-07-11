@@ -30,12 +30,16 @@ const DECAY_FACTOR: f64 = 0.95;
 
 /// Reputation threshold below which a peer is banned.
 const BAN_THRESHOLD: i32 = -200;
+/// IP correlation is intentionally more conservative than identity bans to
+/// avoid penalising unrelated peers behind the same NAT.
+const IP_BAN_THRESHOLD: i32 = -400;
 
 /// How long a ban lasts.
 const BAN_DURATION: Duration = Duration::from_secs(24 * 3600);
 
 /// Maximum number of tracked peers (evict oldest low-reputation entries).
 const MAX_TRACKED_PEERS: usize = 10_000;
+const MAX_TRACKED_IPS: usize = 10_000;
 
 /// Represents a tracked event type for reputation scoring.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -77,6 +81,47 @@ pub struct PeerReputation {
     pub last_interaction: u64,
     pub first_seen: u64,
     pub banned_until: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpReputation {
+    pub ip: [u8; 4],
+    pub score: i32,
+    pub last_interaction: u64,
+    pub banned_until: Option<u64>,
+}
+
+impl IpReputation {
+    fn new(ip: [u8; 4], now: u64) -> Self {
+        Self {
+            ip,
+            score: DEFAULT_REPUTATION,
+            last_interaction: now,
+            banned_until: None,
+        }
+    }
+
+    fn apply_event(&mut self, event: ReputationEvent, now: u64) {
+        self.score = (self.score + event.score_delta()).clamp(MIN_REPUTATION, MAX_REPUTATION);
+        self.last_interaction = now;
+        if self.score <= IP_BAN_THRESHOLD {
+            self.banned_until = Some(now + BAN_DURATION.as_secs());
+        }
+    }
+
+    fn is_banned(&self, now: u64) -> bool {
+        self.banned_until.is_some_and(|until| now < until)
+    }
+
+    fn apply_decay(&mut self, intervals: u32) {
+        if intervals == 0 || self.score == 0 {
+            return;
+        }
+        let factor = DECAY_FACTOR.powi(intervals.min(10_000) as i32);
+        self.score = (self.score as f64 * factor)
+            .round()
+            .clamp(MIN_REPUTATION as f64, MAX_REPUTATION as f64) as i32;
+    }
 }
 
 impl PeerReputation {
@@ -142,12 +187,15 @@ impl PeerReputation {
 struct PersistedReputation {
     last_decay: u64,
     peers: Vec<PeerReputation>,
+    #[serde(default)]
+    ips: Vec<IpReputation>,
 }
 
 /// Manages reputation scores for all known peers.
 #[derive(Clone)]
 pub struct ReputationManager {
     peers: HashMap<[u8; 16], PeerReputation>,
+    ips: HashMap<[u8; 4], IpReputation>,
     last_decay: u64,
 }
 
@@ -155,6 +203,7 @@ impl ReputationManager {
     pub fn new() -> Self {
         Self {
             peers: HashMap::new(),
+            ips: HashMap::new(),
             last_decay: now_secs(),
         }
     }
@@ -192,6 +241,33 @@ impl ReputationManager {
         self.peers
             .get(node_id)
             .map_or(DEFAULT_REPUTATION, |p| p.score)
+    }
+
+    /// Record the same event against both the freely-rotatable node identity
+    /// and the observed IPv4 address. The stricter IP threshold means normal
+    /// NAT-sharing peers are not banned for a handful of failures, while a
+    /// Sybil that rotates keys for every violation still accumulates one
+    /// address-level score.
+    pub fn record_event_with_ip(
+        &mut self,
+        node_id: &[u8; 16],
+        ip: std::net::Ipv4Addr,
+        event: ReputationEvent,
+    ) -> (bool, bool) {
+        let node_banned = self.record_event(node_id, event);
+        let now = now_secs();
+        let key = ip.octets();
+        let entry = self
+            .ips
+            .entry(key)
+            .or_insert_with(|| IpReputation::new(key, now));
+        let was_banned = entry.is_banned(now);
+        entry.apply_event(event, now);
+        let ip_banned = !was_banned && entry.is_banned(now);
+        if self.ips.len() > MAX_TRACKED_IPS {
+            self.evict_stale_ips();
+        }
+        (node_banned, ip_banned)
     }
 
     /// Get a peer's score without triggering decay (for use in immutable contexts).
@@ -251,6 +327,12 @@ impl ReputationManager {
                 }
             }
         }
+        for ip in self.ips.values_mut() {
+            if ip.banned_until.is_some_and(|until| now >= until) {
+                ip.banned_until = None;
+                ip.score = (ip.score / 2).max(IP_BAN_THRESHOLD + 1);
+            }
+        }
     }
 
     /// Apply periodic score decay toward zero.
@@ -265,6 +347,9 @@ impl ReputationManager {
         for peer in self.peers.values_mut() {
             peer.apply_decay(intervals);
         }
+        for ip in self.ips.values_mut() {
+            ip.apply_decay(intervals);
+        }
     }
 
     /// Save reputation data to disk as JSON.
@@ -272,9 +357,10 @@ impl ReputationManager {
         let persisted = PersistedReputation {
             last_decay: self.last_decay,
             peers: self.peers.values().cloned().collect(),
+            ips: self.ips.values().cloned().collect(),
         };
-        let json = serde_json::to_string(&persisted)
-            .map_err(|e| format!("reputation serialize: {e}"))?;
+        let json =
+            serde_json::to_string(&persisted).map_err(|e| format!("reputation serialize: {e}"))?;
         // Atomic (temp file + fsync + rename) like `known.met` and the
         // credit/key material below — this file is rewritten every 5
         // minutes for the life of any active session, so a crash or
@@ -314,21 +400,20 @@ impl ReputationManager {
         // Prefer the current wrapped format (carries `last_decay` so decay
         // for elapsed offline time can be applied below); fall back to the
         // legacy bare-array format from before `last_decay` was persisted.
-        let (entries, persisted_last_decay) = match serde_json::from_str::<PersistedReputation>(
-            &data,
-        ) {
-            Ok(p) => (p.peers, Some(p.last_decay)),
-            Err(_) => match serde_json::from_str::<Vec<PeerReputation>>(&data) {
-                Ok(e) => (e, None),
-                Err(e) => {
-                    tracing::warn!(
-                        "reputation load failed to parse {}: {e}; starting fresh",
-                        path.display()
-                    );
-                    return Self::new();
-                }
-            },
-        };
+        let (entries, ip_entries, persisted_last_decay) =
+            match serde_json::from_str::<PersistedReputation>(&data) {
+                Ok(p) => (p.peers, p.ips, Some(p.last_decay)),
+                Err(_) => match serde_json::from_str::<Vec<PeerReputation>>(&data) {
+                    Ok(e) => (e, Vec::new(), None),
+                    Err(e) => {
+                        tracing::warn!(
+                            "reputation load failed to parse {}: {e}; starting fresh",
+                            path.display()
+                        );
+                        return Self::new();
+                    }
+                },
+            };
 
         let now = now_secs();
         let max_ban = now.saturating_add(BAN_DURATION.as_secs() + 3600);
@@ -342,6 +427,16 @@ impl ReputationManager {
                     .map(|until| if until > max_ban { max_ban } else { until });
             newest_interaction = newest_interaction.max(entry.last_interaction);
             peers.insert(entry.node_id, entry);
+        }
+        let mut ips = HashMap::with_capacity(ip_entries.len());
+        for mut entry in ip_entries {
+            entry.score = entry.score.clamp(MIN_REPUTATION, MAX_REPUTATION);
+            entry.banned_until =
+                entry
+                    .banned_until
+                    .map(|until| if until > max_ban { max_ban } else { until });
+            newest_interaction = newest_interaction.max(entry.last_interaction);
+            ips.insert(entry.ip, entry);
         }
 
         // Decay scores for time elapsed while the app was offline. Without
@@ -360,10 +455,14 @@ impl ReputationManager {
             for peer in peers.values_mut() {
                 peer.apply_decay(intervals);
             }
+            for ip in ips.values_mut() {
+                ip.apply_decay(intervals);
+            }
         }
 
         let mut mgr = Self {
             peers,
+            ips,
             last_decay: now,
         };
         // Defensive: enforce the per-load size cap too in case the
@@ -372,7 +471,34 @@ impl ReputationManager {
         if mgr.peers.len() > MAX_TRACKED_PEERS {
             mgr.evict_stale();
         }
+        if mgr.ips.len() > MAX_TRACKED_IPS {
+            mgr.evict_stale_ips();
+        }
         mgr
+    }
+
+    fn evict_stale_ips(&mut self) {
+        if self.ips.len() <= MAX_TRACKED_IPS {
+            return;
+        }
+        let now = now_secs();
+        let mut entries: Vec<([u8; 4], bool, i32, u64)> = self
+            .ips
+            .iter()
+            .map(|(ip, record)| {
+                (
+                    *ip,
+                    record.is_banned(now),
+                    record.score,
+                    record.last_interaction,
+                )
+            })
+            .collect();
+        // Preserve active bans; otherwise evict lowest-value, stalest rows.
+        entries.sort_by_key(|(_, banned, score, last)| (*banned, *score, *last));
+        for (ip, _, _, _) in entries.into_iter().take(self.ips.len() - MAX_TRACKED_IPS) {
+            self.ips.remove(&ip);
+        }
     }
 
     /// Remove the oldest, lowest-scoring peers to stay under the limit.
@@ -594,6 +720,7 @@ mod tests {
         let persisted = PersistedReputation {
             last_decay: stale_last_decay,
             peers: vec![peer],
+            ips: Vec::new(),
         };
         std::fs::write(&path, serde_json::to_string(&persisted).unwrap())
             .expect("write persisted reputation");
@@ -619,6 +746,24 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(loaded.tracked_count(), 1);
+    }
+
+    #[test]
+    fn rotating_node_ids_still_accumulate_ip_reputation() {
+        let mut manager = ReputationManager::new();
+        let ip = std::net::Ipv4Addr::new(203, 0, 113, 9);
+        let mut ip_banned = false;
+        for index in 0..25u8 {
+            let mut node_id = [0u8; 16];
+            node_id[0] = index;
+            let (_, newly_ip_banned) =
+                manager.record_event_with_ip(&node_id, ip, ReputationEvent::ProtocolViolation);
+            ip_banned |= newly_ip_banned;
+        }
+        assert!(
+            ip_banned,
+            "rotating free identities must not reset address-level abuse history"
+        );
     }
 
     #[test]

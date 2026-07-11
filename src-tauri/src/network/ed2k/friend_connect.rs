@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Context;
-use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -10,6 +10,7 @@ use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+use super::ember_auth::{sign_auth_nonce, verify_auth_nonce_compat};
 use super::messages::*;
 use super::upload::{EmberSessionHandle, EmberSessionMap, UploadEvent, UploadEventKind};
 use crate::network::ember::crypto;
@@ -904,6 +905,7 @@ use super::multi_source::parse_browse_response;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::Signer;
 
     /// With an empty `rendezvous_url`, `connect_friend_with_fallback` must
     /// behave exactly like the old TCP-only `open_and_run_friend_session`
@@ -1572,7 +1574,7 @@ where
 
     // Sign the peer's nonce with our key and send response (pubkey + signature)
     let signing_key = SigningKey::from_bytes(our_secret_key);
-    let signature = signing_key.sign(&peer_nonce_payload);
+    let signature = sign_auth_nonce(&signing_key, &peer_nonce_payload);
     let mut response = Vec::with_capacity(96);
     response.extend_from_slice(our_pubkey);
     response.extend_from_slice(&signature.to_bytes());
@@ -1600,9 +1602,9 @@ where
         .map_err(|e| anyhow::anyhow!("invalid peer Ed25519 pubkey: {e}"))?;
     let sig_bytes: [u8; 64] = peer_response[32..96].try_into().unwrap();
     let peer_sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-    peer_vk.verify_strict(&our_nonce, &peer_sig).map_err(|e| {
-        anyhow::anyhow!("Ember auth: signature verification failed for {addr}: {e}")
-    })?;
+    if !verify_auth_nonce_compat(&peer_vk, &our_nonce, &peer_sig) {
+        anyhow::bail!("Ember auth: signature verification failed for {addr}");
+    }
 
     info!(
         "Ember auth: verified peer {} at {}",
@@ -1672,7 +1674,7 @@ where
     .await?;
 
     let signing_key = SigningKey::from_bytes(our_secret_key);
-    let signature = signing_key.sign(&peer_nonce_payload);
+    let signature = sign_auth_nonce(&signing_key, &peer_nonce_payload);
     let mut response = Vec::with_capacity(96);
     response.extend_from_slice(our_pubkey);
     response.extend_from_slice(&signature.to_bytes());
@@ -1697,9 +1699,9 @@ where
         .map_err(|e| anyhow::anyhow!("invalid peer Ed25519 pubkey: {e}"))?;
     let sig_bytes: [u8; 64] = peer_response[32..96].try_into().unwrap();
     let peer_sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-    peer_vk.verify_strict(&our_nonce, &peer_sig).map_err(|e| {
-        anyhow::anyhow!("Ember auth: signature verification failed for {addr}: {e}")
-    })?;
+    if !verify_auth_nonce_compat(&peer_vk, &our_nonce, &peer_sig) {
+        anyhow::bail!("Ember auth: signature verification failed for {addr}");
+    }
 
     info!(
         "Ember auth (buffered): verified peer {} at {} ({} deferred packet(s) captured)",

@@ -827,6 +827,13 @@ impl CreditManager {
         self.ember_credits.get(pub_key)
     }
 
+    pub fn has_ember_download_bonus(&self, pub_key: &[u8; 32]) -> bool {
+        self.ember_credits
+            .get(pub_key)
+            .map(|record| record.downloaded > 1_048_576)
+            .unwrap_or(false)
+    }
+
     pub fn all_ember_records(&self) -> Vec<&EmberCreditRecord> {
         self.ember_credits.values().collect()
     }

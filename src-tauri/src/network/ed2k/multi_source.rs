@@ -6722,15 +6722,15 @@ async fn download_parts_from_source(
                         // upload path then serves as "safe"), with corruption only caught
                         // at the final whole-file hash. Trimming the write to actual gaps
                         // preserves verified bytes; `fill_range` below stays idempotent.
-                        let fill_subranges = {
-                            let t = tracker.read().await;
-                            t.fillable_subranges(start, end)
-                        };
-                        if !fill_subranges.is_empty() {
-                            // D20: only commit the fill_range to the tracker if every
-                            // sub-range disk write actually succeeded. The PartFileWriter
-                            // serializes the writes for us — this `await` is just an mpsc
-                            // round-trip, not a global file lock acquisition.
+                        // Keep the tracker write guard across the serialized
+                        // disk write. Otherwise another source can fill the
+                        // same gap after our snapshot but before this await,
+                        // letting us overwrite its bytes and claim duplicate
+                        // credit. The writer never locks the tracker, so this
+                        // ordering cannot form a lock cycle.
+                        let (fill_subranges, newly_written, write_ok) = {
+                            let mut t = tracker.write().await;
+                            let fill_subranges = t.fillable_subranges(start, end);
                             let mut write_ok = true;
                             for &(gs, ge) in &fill_subranges {
                                 let off = (gs - start) as usize;
@@ -6739,32 +6739,37 @@ async fn download_parts_from_source(
                                     output.write(gs, data[off..off + len].to_vec()).await
                                 {
                                     tracing::warn!(
-                                    "source {_src_idx}: disk write failed at start={gs} ({len} bytes): {e}"
-                                );
+                                        "source {_src_idx}: disk write failed at start={gs} ({len} bytes): {e}"
+                                    );
                                     write_ok = false;
                                     break;
                                 }
                             }
-                            if !write_ok {
-                                consecutive_bad_blocks += 1;
-                                if consecutive_bad_blocks >= MAX_CONSECUTIVE_BAD_BLOCKS {
-                                    anyhow::bail!(
-                                        "source {_src_idx} had {consecutive_bad_blocks} consecutive disk write failures, disconnecting"
-                                    );
-                                }
-                                continue;
+                            let newly_written = if write_ok {
+                                fill_subranges
+                                    .iter()
+                                    .map(|&(gs, ge)| t.fill_range(gs, ge))
+                                    .sum()
+                            } else {
+                                0
+                            };
+                            (fill_subranges, newly_written, write_ok)
+                        };
+                        if !write_ok {
+                            consecutive_bad_blocks += 1;
+                            if consecutive_bad_blocks >= MAX_CONSECUTIVE_BAD_BLOCKS {
+                                anyhow::bail!(
+                                    "source {_src_idx} had {consecutive_bad_blocks} consecutive disk write failures, disconnecting"
+                                );
                             }
-
+                            continue;
+                        }
+                        if !fill_subranges.is_empty() {
+                            // D20: only commit the fill_range to the tracker if every
+                            // sub-range disk write actually succeeded. The PartFileWriter
+                            // serializes the writes for us — this `await` is just an mpsc
+                            // round-trip, not a global file lock acquisition.
                             consecutive_bad_blocks = 0;
-
-                            // Update byte-level gap tracker for mid-part resume.
-                            // Only reached when the disk write succeeded.
-                            {
-                                let mut t = tracker.write().await;
-                                for &(gs, ge) in &fill_subranges {
-                                    t.fill_range(gs, ge);
-                                }
-                            }
 
                             if let (Some(ref etx), std::net::IpAddr::V4(v4)) =
                                 (&event_tx, addr.ip())
@@ -6812,8 +6817,6 @@ async fn download_parts_from_source(
                         // sub-ranges), never the full wire piece: a duplicate or
                         // overlapping block contributes no new data and must not
                         // inflate the peer's credit ledger.
-                        let newly_written: u64 =
-                            fill_subranges.iter().map(|(gs, ge)| ge - gs).sum();
                         let block_part = (start / PARTSIZE) as usize;
                         *per_part_credit.entry(block_part).or_insert(0) += newly_written;
                         if block_part == part_idx {
@@ -6880,11 +6883,9 @@ async fn download_parts_from_source(
                         // cross-part) compressed block must not clobber bytes we
                         // already have, including verified bytes of an adjacent part
                         // (which the upload path would then serve as "safe").
-                        let fill_subranges = {
-                            let t = tracker.read().await;
-                            t.fillable_subranges(start, start + piece_len)
-                        };
-                        if !fill_subranges.is_empty() {
+                        let (fill_subranges, newly_written, write_ok) = {
+                            let mut t = tracker.write().await;
+                            let fill_subranges = t.fillable_subranges(start, start + piece_len);
                             let mut write_ok = true;
                             for &(gs, ge) in &fill_subranges {
                                 let off = (gs - start) as usize;
@@ -6900,24 +6901,27 @@ async fn download_parts_from_source(
                                     break;
                                 }
                             }
-                            if !write_ok {
-                                consecutive_bad_blocks += 1;
-                                if consecutive_bad_blocks >= MAX_CONSECUTIVE_BAD_BLOCKS {
-                                    anyhow::bail!(
-                                        "source {_src_idx} had {consecutive_bad_blocks} consecutive compressed disk write failures, disconnecting"
-                                    );
-                                }
-                                continue;
+                            let newly_written = if write_ok {
+                                fill_subranges
+                                    .iter()
+                                    .map(|&(gs, ge)| t.fill_range(gs, ge))
+                                    .sum()
+                            } else {
+                                0
+                            };
+                            (fill_subranges, newly_written, write_ok)
+                        };
+                        if !write_ok {
+                            consecutive_bad_blocks += 1;
+                            if consecutive_bad_blocks >= MAX_CONSECUTIVE_BAD_BLOCKS {
+                                anyhow::bail!(
+                                    "source {_src_idx} had {consecutive_bad_blocks} consecutive compressed disk write failures, disconnecting"
+                                );
                             }
-
+                            continue;
+                        }
+                        if !fill_subranges.is_empty() {
                             consecutive_bad_blocks = 0;
-
-                            {
-                                let mut t = tracker.write().await;
-                                for &(gs, ge) in &fill_subranges {
-                                    t.fill_range(gs, ge);
-                                }
-                            }
 
                             if let (Some(ref etx), std::net::IpAddr::V4(v4)) =
                                 (&event_tx, addr.ip())
@@ -6950,8 +6954,6 @@ async fn download_parts_from_source(
                         // Per-part credit bucket; see uncompressed branch
                         // above for rationale. Credit only the bytes actually
                         // written (gap-overlap), not the full decompressed piece.
-                        let newly_written: u64 =
-                            fill_subranges.iter().map(|(gs, ge)| ge - gs).sum();
                         let block_part = (start / PARTSIZE) as usize;
                         *per_part_credit.entry(block_part).or_insert(0) += newly_written;
                         if block_part == part_idx {

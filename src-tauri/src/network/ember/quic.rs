@@ -2,9 +2,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use ed25519_dalek::pkcs8::EncodePrivateKey;
+use ed25519_dalek::SigningKey;
 use quinn::{ClientConfig, Endpoint, EndpointConfig, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tracing::{debug, info};
+
+use super::crypto::node_id_from_public_key;
 
 /// Idle timeout for QUIC connections.
 const IDLE_TIMEOUT_SECS: u64 = 120;
@@ -34,13 +38,53 @@ const SEND_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
 const UDP_RECV_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const UDP_SEND_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
-/// Generate a self-signed TLS certificate for QUIC using the Ember node ID
-/// as the subject CN.
-pub fn generate_self_signed_cert(ember_node_id: &[u8; 16]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
-    let cn = format!("ember-{}", hex::encode(ember_node_id));
-    let subject_alt_names = vec![cn];
-    let rcgen::CertifiedKey { cert, key_pair } =
-        rcgen::generate_simple_self_signed(subject_alt_names)?;
+/// Builds an `rcgen::KeyPair` directly from an Ember node's real Ed25519
+/// identity secret key, instead of generating a fresh throwaway key.
+/// This is what lets the QUIC certificate's key be a real, verifiable
+/// extension of the peer's identity (see [`extract_ember_ed25519_pubkey`]
+/// and the verifiers below) rather than an arbitrary self-asserted label
+/// with no cryptographic relationship to any specific node id.
+fn ember_quic_keypair(secret_key: &[u8; 32]) -> anyhow::Result<rcgen::KeyPair> {
+    let signing_key = SigningKey::from_bytes(secret_key);
+    let pkcs8_doc = signing_key
+        .to_pkcs8_der()
+        .map_err(|e| anyhow::anyhow!("failed to PKCS8-encode Ed25519 identity key: {e}"))?;
+    let pkcs8_der = PrivatePkcs8KeyDer::from(pkcs8_doc.as_bytes());
+    Ok(rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
+        &pkcs8_der,
+        &rcgen::PKCS_ED25519,
+    )?)
+}
+
+/// Generate a self-signed TLS certificate for QUIC, signed with the
+/// node's *real* Ed25519 identity keypair (`secret_key`).
+///
+/// Earlier versions generated a fresh, random keypair here and merely
+/// wrote the node id as a text label (`ember-{hex}`) into the cert's
+/// SAN. That label was never cryptographically bound to the key
+/// actually used in the TLS handshake — `rcgen::generate_simple_self_signed`
+/// accepts *any* string as the SAN regardless of what key it signs
+/// with, so any peer could mint a cert claiming to be any node id
+/// (see `EmberCertVerifier`'s doc comment for the full writeup of why
+/// that made per-peer pinning a no-op). Signing with the actual
+/// identity key closes that gap: the verifiers below derive the
+/// peer's node id from the certificate's real SubjectPublicKeyInfo —
+/// the key TLS already proves the peer possesses via the handshake
+/// signature — instead of trusting a self-asserted string.
+///
+/// Deterministic and cheap (no per-call randomness needed for the key
+/// itself — Ed25519 signing is deterministic per RFC 8032), so callers
+/// can regenerate this on demand from the stable identity key rather
+/// than needing to cache/plumb the result through long-lived state.
+pub fn generate_self_signed_cert(secret_key: &[u8; 32]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    let key_pair = ember_quic_keypair(secret_key)?;
+    let verifying_key = SigningKey::from_bytes(secret_key).verifying_key();
+    let node_id = node_id_from_public_key(&verifying_key);
+    // No longer load-bearing for security (see doc comment above), but
+    // keeps the cert human-diagnosable and gives the verifiers a cheap
+    // sanity label before they fall back to real SPKI extraction.
+    let cn = format!("ember-{}", hex::encode(node_id));
+    let cert = rcgen::CertificateParams::new(vec![cn])?.self_signed(&key_pair)?;
     let cert_der = cert.der().to_vec();
     let key_der = key_pair.serialized_der().to_vec();
 
@@ -110,10 +154,11 @@ fn build_server_config(cert_der: &[u8], key_der: &[u8]) -> anyhow::Result<Server
 /// Create the client-side QUIC configuration.
 ///
 /// `expected_node_id` is the target peer's ember node id when known
-/// at connect time, in which case the verifier pins the cert's
-/// `ember-{hex}` SAN to that id (true per-peer authentication, MITM-
-/// safe). When `None`, the verifier still requires the cert to be a
-/// well-formed Ember self-signed cert (smoke-test only — no
+/// at connect time, in which case the verifier pins the cert's real
+/// SubjectPublicKeyInfo (not a self-asserted label) to that id — true
+/// per-peer authentication, MITM-safe (see `EmberCertVerifier`). When
+/// `None`, the verifier still requires the cert to be a well-formed
+/// Ember self-signed Ed25519 cert (smoke-test only — no
 /// authentication, but rejects external CAs / random certs an
 /// on-path attacker might inject).
 pub fn build_client_config(
@@ -168,56 +213,81 @@ fn bind_tuned_udp(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
     Ok(socket)
 }
 
-/// Extract the first SAN / CN that follows our `ember-{32 hex chars}`
-/// convention from a DER-encoded certificate. Returns the 32-hex
-/// suffix on success, `None` otherwise. We deliberately don't pull in
-/// a full X.509 parser: rcgen-issued Ember certs put the SAN in
-/// `subject_alt_names`, which the cert encodes verbatim. A linear
-/// byte search for the marker prefix is sufficient for the smoke
-/// check we need here.
-fn extract_ember_san_hex(cert_der: &[u8]) -> Option<String> {
-    const PREFIX: &[u8] = b"ember-";
-    let mut i = 0usize;
-    while i + PREFIX.len() + 32 <= cert_der.len() {
-        if &cert_der[i..i + PREFIX.len()] == PREFIX {
-            let candidate = &cert_der[i + PREFIX.len()..i + PREFIX.len() + 32];
-            if candidate.iter().all(|c| c.is_ascii_hexdigit()) {
-                return Some(String::from_utf8_lossy(candidate).to_string());
-            }
-        }
-        i += 1;
+/// Parse a DER-encoded X.509 certificate and extract its real
+/// SubjectPublicKeyInfo as a raw 32-byte Ed25519 public key.
+///
+/// Returns `None` if the certificate doesn't parse, or its SPKI isn't
+/// an Ed25519 key (OID `1.3.101.112`) with the expected 32-byte
+/// encoding. This walks the actual ASN.1 structure via `x509-cert`
+/// (Certificate -> TBSCertificate -> SubjectPublicKeyInfo) rather than
+/// pattern-matching bytes: a byte-search approach (as this function
+/// used to be, searching for an `ember-{hex}` SAN marker) can be
+/// fooled by a self-crafted certificate that plants a decoy match
+/// earlier in the DER (e.g. inside an extension or the subject DN),
+/// which would matter a lot here since the result feeds directly into
+/// a security decision (`EmberCertVerifier`) rather than a diagnostic
+/// label. A real structural parse has no such ambiguity: the SPKI is
+/// whatever field is *structurally* in that position, full stop.
+fn extract_ember_ed25519_pubkey(cert_der: &[u8]) -> Option<[u8; 32]> {
+    use x509_cert::der::Decode;
+    let cert = x509_cert::Certificate::from_der(cert_der).ok()?;
+    let spki = &cert.tbs_certificate.subject_public_key_info;
+    if spki.algorithm.oid != ed25519_dalek::pkcs8::ALGORITHM_OID {
+        return None;
     }
-    None
+    let raw = spki.subject_public_key.raw_bytes();
+    <[u8; 32]>::try_from(raw).ok()
+}
+
+/// Derives an Ember node id from a certificate's real SubjectPublicKeyInfo,
+/// i.e. the same key TLS already proved the presenting peer possesses
+/// (via the handshake signature check in `verify_tls1{2,3}_signature`
+/// below). This is the actual cryptographic binding: unlike a
+/// self-asserted SAN string, a peer cannot claim a node id here without
+/// also being able to complete a TLS handshake using that exact key.
+fn cert_node_id(cert_der: &[u8]) -> Option<[u8; 16]> {
+    let raw_pubkey = extract_ember_ed25519_pubkey(cert_der)?;
+    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&raw_pubkey).ok()?;
+    Some(node_id_from_public_key(&verifying_key))
 }
 
 /// Certificate verifier for QUIC connections to Ember peers.
 ///
 /// Behaviour:
-/// - If `expected_node_id` is `Some(nid)`, the cert's first
-///   `ember-{32 hex chars}` SAN/CN must hex-match `nid`. This is a
-///   real per-peer pin: an MITM can't substitute their own
-///   self-signed cert because it would carry a different CN.
-/// - If `expected_node_id` is `None`, we still require the cert to
-///   look like an Ember self-signed cert (the prefix is present and
-///   the suffix is 32 hex chars). This is a smoke check, not
+/// - If `expected_node_id` is `Some(nid)`, the cert's real
+///   SubjectPublicKeyInfo (extracted via [`cert_node_id`], not a
+///   self-asserted string) must hash to `nid`. Combined with the
+///   handshake-signature check below — which proves the peer actually
+///   holds the private key for that exact SPKI — this is a real
+///   per-peer cryptographic pin: an attacker cannot substitute their
+///   own cert, because doing so would require either breaking Ed25519
+///   or finding a BLAKE3 preimage that hashes to `nid`, not merely
+///   writing a different label into a self-signed cert. (An earlier
+///   version of this verifier only compared a plaintext `ember-{hex}`
+///   SAN string against `nid` — since `generate_self_signed_cert` used
+///   to sign with a *fresh random* key regardless of what string was
+///   requested, that check was purely self-asserted and gave zero
+///   actual authentication; see `generate_self_signed_cert`'s doc
+///   comment for the fix.)
+/// - If `expected_node_id` is `None`, we still require the cert's SPKI
+///   to parse as a well-formed Ed25519 key. This is a smoke check, not
 ///   authentication — but it does reject the all-too-easy "trust any
 ///   cert any CA ever issued" failure mode that the prior
-///   `SkipServerVerification` allowed. Per-peer pinning will replace
-///   the smoke path once all QUIC connect sites know their target's
-///   `ember_node_id` at connect time (broker/relay candidates today
-///   come in via unauthenticated rendezvous and EPX channels, so we
-///   don't always have the node_id).
+///   `SkipServerVerification` allowed. Per-peer pinning replaces the
+///   smoke path whenever the QUIC connect site knows its target's
+///   `ember_node_id` ahead of time (broker/relay candidates discovered
+///   via unauthenticated rendezvous/EPX channels often don't, so they
+///   fall back to the smoke path).
 ///
-/// In all cases the TLS handshake signature is now verified against the
+/// In all cases the TLS handshake signature is verified against the
 /// presented end-entity certificate's public key (see
 /// `verify_tls1{2,3}_signature` below) using the active crypto provider's
 /// algorithms — so the channel is cryptographically bound to a peer that
-/// actually holds the cert's private key. An on-path attacker can no longer
-/// splice a forged or substring-only cert without that key. What the
-/// unpinned path still cannot do is prove the key belongs to a *specific*
-/// node_id (that needs `expected_node_id`); the node_id↔key binding is
-/// established out-of-band by the eMule/Ember TCP layer's mutual Ed25519
-/// proof-of-possession, on which file-transfer integrity solely depends.
+/// actually holds the cert's private key. For the unpinned smoke-check
+/// path, that still doesn't prove the key belongs to a *specific*
+/// node_id; the node_id↔key binding there is established out-of-band by
+/// the eMule/Ember TCP layer's mutual Ed25519 proof-of-possession, on
+/// which file-transfer integrity solely depends in that case.
 #[derive(Debug)]
 struct EmberCertVerifier {
     expected_node_id: Option<[u8; 16]>,
@@ -238,16 +308,17 @@ impl rustls::client::danger::ServerCertVerifier for EmberCertVerifier {
         _ocsp_response: &[u8],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        let Some(hex_id) = extract_ember_san_hex(end_entity.as_ref()) else {
+        let Some(actual_node_id) = cert_node_id(end_entity.as_ref()) else {
             return Err(rustls::Error::General(
-                "ember cert: no `ember-{hex}` marker found in certificate".into(),
+                "ember cert: SubjectPublicKeyInfo is not a well-formed Ed25519 key".into(),
             ));
         };
         if let Some(nid) = self.expected_node_id {
-            let expected = hex::encode(nid);
-            if !hex_id.eq_ignore_ascii_case(&expected) {
+            if actual_node_id != nid {
                 return Err(rustls::Error::General(format!(
-                    "ember cert: pinned node_id mismatch (expected {expected}, got {hex_id})"
+                    "ember cert: pinned node_id mismatch (expected {}, got {})",
+                    hex::encode(nid),
+                    hex::encode(actual_node_id)
                 )));
             }
         }
@@ -299,9 +370,9 @@ impl rustls::server::danger::ClientCertVerifier for EmberClientCertVerifier {
         _intermediates: &[CertificateDer<'_>],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
-        if extract_ember_san_hex(end_entity.as_ref()).is_none() {
+        if cert_node_id(end_entity.as_ref()).is_none() {
             return Err(rustls::Error::General(
-                "ember client cert: no `ember-{hex}` marker found in certificate".into(),
+                "ember client cert: SubjectPublicKeyInfo is not a well-formed Ed25519 key".into(),
             ));
         }
         Ok(rustls::server::danger::ClientCertVerified::assertion())
@@ -405,18 +476,24 @@ pub fn build_server_client_endpoint(
 /// Connect to a peer over an existing endpoint, optionally pinning the peer's
 /// Ember node id into the TLS verifier.
 ///
-/// When `pin` is `Some((cert_der, key_der, node_id))`, a per-connection client
-/// config is built whose verifier requires the peer's certificate to carry the
-/// matching `ember-{hex}` SAN — true MITM-safe per-peer authentication. When
-/// `pin` is `None`, the endpoint's default (unpinned smoke-test) client config
-/// is used. `None` is the graceful fallback for broker/relay candidates
+/// `pin`, when `Some`, is `(our_cert_der, our_key_der, expected_peer_node_id)`:
+/// `our_cert_der`/`our_key_der` are the DER bytes of *our own* client
+/// certificate — normally freshly produced by
+/// `generate_self_signed_cert(&our_ed25519_secret_key)`, since that's cheap
+/// and deterministic — NOT the peer's. `expected_peer_node_id` is the only
+/// part that identifies who we expect to reach. A per-connection client
+/// config is then built whose verifier requires the *peer's* certificate to
+/// carry a SubjectPublicKeyInfo that hashes to `expected_peer_node_id` (see
+/// `EmberCertVerifier`) — true MITM-safe per-peer authentication. When `pin`
+/// is `None`, the endpoint's default (unpinned smoke-test) client config is
+/// used. `None` is the graceful fallback for broker/relay candidates
 /// discovered via unauthenticated rendezvous/EPX, where the target's Ember node
 /// id isn't known at QUIC-connect time — the KAD source record advertises the
 /// peer's Noise public key, not its `ember_hash`, and the node↔key binding is
 /// established out-of-band by the eMule/Ember TCP Ed25519 proof-of-possession.
-/// Callers that *do* know the target node id (e.g. a future
-/// `(ip,port)→ember_hash` discovery cache) pass `Some` to upgrade the channel
-/// to authenticated pinning without any change to this transport layer.
+/// Callers that *do* know the target node id pass `Some` to upgrade the
+/// channel to authenticated pinning without any change to this transport
+/// layer.
 pub async fn connect_pinned(
     endpoint: &Endpoint,
     addr: SocketAddr,
@@ -436,21 +513,56 @@ pub async fn connect_pinned(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::rngs::OsRng;
+
+    fn random_secret_key() -> [u8; 32] {
+        SigningKey::generate(&mut OsRng).to_bytes()
+    }
+
+    fn node_id_for(secret_key: &[u8; 32]) -> [u8; 16] {
+        node_id_from_public_key(&SigningKey::from_bytes(secret_key).verifying_key())
+    }
 
     #[test]
     fn generate_cert_succeeds() {
-        let node_id = [0xAA; 16];
-        let (cert, key) = generate_self_signed_cert(&node_id).unwrap();
+        let secret_key = random_secret_key();
+        let (cert, key) = generate_self_signed_cert(&secret_key).unwrap();
         assert!(!cert.is_empty());
         assert!(!key.is_empty());
     }
 
+    #[test]
+    fn cert_node_id_matches_the_signing_key_used() {
+        // The core property C2's fix relies on: the node id recovered from
+        // a cert is derived from the *actual signing key*, not a
+        // separately-suppliable label.
+        let secret_key = random_secret_key();
+        let (cert_der, _key_der) = generate_self_signed_cert(&secret_key).unwrap();
+        assert_eq!(cert_node_id(&cert_der), Some(node_id_for(&secret_key)));
+    }
+
+    #[test]
+    fn cert_node_id_cannot_be_spoofed_by_a_different_key() {
+        // An attacker holding a different keypair cannot make their own
+        // cert extract to a victim's node id just by wanting it to — the
+        // id is a one-way function of the real SPKI. This is exactly the
+        // attack the old `ember-{hex}` SAN-string check was vulnerable
+        // to: `generate_self_signed_cert` used to accept the label as a
+        // free-standing parameter completely independent of which key it
+        // signed with.
+        let attacker_key = random_secret_key();
+        let victim_key = random_secret_key();
+        let (attacker_cert, _) = generate_self_signed_cert(&attacker_key).unwrap();
+        assert_ne!(cert_node_id(&attacker_cert), Some(node_id_for(&victim_key)));
+    }
+
     #[tokio::test]
     async fn connect_pinned_matches_and_rejects_node_id() {
-        let server_id = [0x11; 16];
-        let client_id = [0x22; 16];
-        let (s_cert, s_key) = generate_self_signed_cert(&server_id).unwrap();
-        let (c_cert, c_key) = generate_self_signed_cert(&client_id).unwrap();
+        let server_key = random_secret_key();
+        let client_key = random_secret_key();
+        let server_node_id = node_id_for(&server_key);
+        let (s_cert, s_key) = generate_self_signed_cert(&server_key).unwrap();
+        let (c_cert, c_key) = generate_self_signed_cert(&client_key).unwrap();
 
         let server = build_server_client_endpoint(&s_cert, &s_key, 0).unwrap();
         let client = build_server_client_endpoint(&c_cert, &c_key, 0).unwrap();
@@ -483,13 +595,13 @@ mod tests {
             }
         });
 
-        // Correct pin → the verifier accepts the server cert (its `ember-{hex}`
-        // SAN matches `server_id`) and the round-trip succeeds.
+        // Correct pin → the verifier accepts the server cert (its real
+        // SPKI hashes to `server_node_id`) and the round-trip succeeds.
         let conn = connect_pinned(
             &client,
             server_addr,
             "ember",
-            Some((&c_cert, &c_key, server_id)),
+            Some((&c_cert, &c_key, server_node_id)),
         )
         .await
         .expect("pinned connect with correct node id should succeed");

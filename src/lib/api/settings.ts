@@ -6,7 +6,12 @@ export async function getSettings(): Promise<AppSettings> {
 }
 
 export async function updateSettings(settings: AppSettings): Promise<string> {
-  return invoke('update_settings', { settings });
+  const result = await invoke<string>('update_settings', { settings });
+  // The backend accepts this exact revision and commits revision + 1.
+  // Keep the caller's snapshot current so a subsequent save from the same
+  // screen/wizard is not incorrectly rejected as stale.
+  settings.settings_revision += 1;
+  return result;
 }
 
 export async function downloadNodesDat(): Promise<string> {

@@ -1345,6 +1345,13 @@
   let someActiveDlChecked = $derived(
     filteredActiveDownloads.some((t) => selectedDlIdSet.has(t.id))
   );
+  let selectAllDownloadsCheckbox: HTMLInputElement | undefined = $state(undefined);
+  $effect(() => {
+    if (selectAllDownloadsCheckbox) {
+      selectAllDownloadsCheckbox.indeterminate =
+        someActiveDlChecked && !allActiveDlChecked;
+    }
+  });
 
   function toggleDlCheckAll() {
     if (allActiveDlChecked) {
@@ -2636,8 +2643,8 @@
             <th class="col-dl-check">
               <input
                 type="checkbox"
+                bind:this={selectAllDownloadsCheckbox}
                 checked={allActiveDlChecked}
-                indeterminate={someActiveDlChecked && !allActiveDlChecked}
                 onchange={toggleDlCheckAll}
                 aria-label={m.transfers_select_all_aria()}
                 title={m.transfers_select_all_aria()}

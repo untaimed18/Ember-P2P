@@ -7,7 +7,6 @@ use crate::network::{
     EmberDhtContactInfo, EmberMaintenanceResult, EmberPublishResult, NetworkCommand,
     PeerReputationInfo, ReputationStatsInfo,
 };
-use crate::storage::identity::NodeIdentity;
 use crate::types::EmberDiagnostics;
 use crate::types::*;
 
@@ -185,14 +184,7 @@ pub async fn add_friend(
         ));
     }
 
-    let our_ember_hash = {
-        let data_dir = crate::storage::paths::resolve_data_dir();
-        let id = tokio::task::spawn_blocking(move || NodeIdentity::load_or_create(&data_dir))
-            .await
-            .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
-            .map_err(|e| coded_ctx("peers_identity_load_failed", "Failed to load identity", e))?;
-        hex::encode(id.ember_hash)
-    };
+    let our_ember_hash = hex::encode(state.identity.ember_hash);
     if canonical == our_ember_hash {
         return Err(coded(
             "peers_cannot_add_self",
@@ -361,13 +353,8 @@ pub async fn get_friends(state: tauri::State<'_, AppState>) -> Result<Vec<Friend
 }
 
 #[tauri::command]
-pub async fn get_my_ember_hash(_app: tauri::AppHandle) -> Result<String, String> {
-    let data_dir = crate::storage::paths::resolve_data_dir();
-    let identity = tokio::task::spawn_blocking(move || NodeIdentity::load_or_create(&data_dir))
-        .await
-        .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
-        .map_err(|e| coded_ctx("peers_failed_load_identity", "Failed to load identity", e))?;
-    Ok(hex::encode(identity.ember_hash))
+pub async fn get_my_ember_hash(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    Ok(hex::encode(state.identity.ember_hash))
 }
 
 #[derive(serde::Serialize)]
@@ -526,14 +513,7 @@ pub async fn accept_friend_request(
     let canonical = sender_hash.to_lowercase();
     let hash = parse_user_hash(&canonical)?;
 
-    let our_ember_hash = {
-        let data_dir = crate::storage::paths::resolve_data_dir();
-        let id = tokio::task::spawn_blocking(move || NodeIdentity::load_or_create(&data_dir))
-            .await
-            .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
-            .map_err(|e| coded_ctx("peers_identity_load_failed", "Failed to load identity", e))?;
-        hex::encode(id.ember_hash)
-    };
+    let our_ember_hash = hex::encode(state.identity.ember_hash);
     if canonical == our_ember_hash {
         return Err(coded(
             "peers_cannot_add_self",

@@ -151,8 +151,11 @@ impl RelaySession {
     }
 
     pub fn is_expired(&self) -> bool {
-        self.last_activity.elapsed() > RELAY_IDLE_TIMEOUT
-            || self.created.elapsed() > RELAY_MAX_DURATION
+        if self.created.elapsed() > RELAY_MAX_DURATION {
+            return true;
+        }
+        self.state == RelaySessionState::WaitingForTarget
+            && self.last_activity.elapsed() > RELAY_IDLE_TIMEOUT
     }
 
     pub fn mark_active(&mut self) {
@@ -201,7 +204,11 @@ impl RelayManager {
     }
 
     pub fn set_current_attestation_hash(&mut self, hash: [u8; 32], expires_at_unix: u64) {
-        self.attestation_hashes.clear();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.attestation_hashes.retain(|_, exp| *exp > now);
         self.attestation_hashes.insert(hash, expires_at_unix);
     }
 
@@ -510,9 +517,9 @@ pub async fn connect_to_peer_relay(
         .await
         .map_err(|e| format!("relay QUIC handshake failed: {e}"))?;
 
-    let (mut send, mut recv) = conn
-        .open_bi()
+    let (mut send, mut recv) = tokio::time::timeout(RELAY_CONTROL_TIMEOUT, conn.open_bi())
         .await
+        .map_err(|_| "relay open_bi timed out".to_string())?
         .map_err(|e| format!("relay open_bi failed: {e}"))?;
 
     let session_id = rand::random::<u32>();
@@ -524,8 +531,9 @@ pub async fn connect_to_peer_relay(
         attestation_hash,
     );
 
-    send.write_all(&request)
+    tokio::time::timeout(RELAY_CONTROL_TIMEOUT, send.write_all(&request))
         .await
+        .map_err(|_| "relay write request timed out".to_string())?
         .map_err(|e| format!("relay write request: {e}"))?;
 
     // Read header first (always 7 bytes: msg_type | session_id | payload_len),
@@ -535,9 +543,7 @@ pub async fn connect_to_peer_relay(
     // to avoid reading an attacker-chosen huge `payload_len` into
     // memory.
     let mut resp_header = [0u8; 7];
-    recv.read_exact(&mut resp_header)
-        .await
-        .map_err(|e| format!("relay read response: {e}"))?;
+    read_relay_control(&mut recv, &mut resp_header, "relay read response").await?;
     let payload_len = u16::from_le_bytes([resp_header[5], resp_header[6]]) as usize;
     if payload_len > 64 * 1024 {
         return Err(format!(
@@ -546,9 +552,7 @@ pub async fn connect_to_peer_relay(
     }
     let mut payload_buf = vec![0u8; payload_len];
     if payload_len > 0 {
-        recv.read_exact(&mut payload_buf)
-            .await
-            .map_err(|e| format!("relay read response payload: {e}"))?;
+        read_relay_control(&mut recv, &mut payload_buf, "relay read response payload").await?;
     }
     let mut full = Vec::with_capacity(7 + payload_len);
     full.extend_from_slice(&resp_header);
@@ -739,6 +743,20 @@ impl AsyncWrite for WsStream {
 
 /// Timeout for the relay node to connect to the target peer.
 const RELAY_TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Bound every control-plane stream open/read/write after the QUIC handshake.
+/// Data-plane relay copies remain governed by `RELAY_MAX_DURATION`.
+const RELAY_CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
+
+async fn read_relay_control(
+    recv: &mut quinn::RecvStream,
+    buffer: &mut [u8],
+    context: &str,
+) -> Result<(), String> {
+    tokio::time::timeout(RELAY_CONTROL_TIMEOUT, recv.read_exact(buffer))
+        .await
+        .map_err(|_| format!("{context}: timed out"))?
+        .map_err(|e| format!("{context}: {e}"))
+}
 
 /// A relay target must be a globally-routable IPv4 unicast address.
 ///
@@ -841,19 +859,26 @@ pub async fn run_quic_accept_loop(
             let remote = conn.remote_address();
             debug!("Relay accept: new QUIC connection from {remote}");
 
-            let (mut init_send, mut init_recv) = match conn.accept_bi().await {
-                Ok(s) => s,
-                Err(e) => {
-                    debug!("Relay accept: accept_bi failed from {remote}: {e}");
-                    return;
-                }
-            };
+            let (mut init_send, mut init_recv) =
+                match tokio::time::timeout(RELAY_CONTROL_TIMEOUT, conn.accept_bi()).await {
+                    Ok(Ok(streams)) => streams,
+                    Ok(Err(e)) => {
+                        debug!("Relay accept: accept_bi failed from {remote}: {e}");
+                        return;
+                    }
+                    Err(_) => {
+                        debug!("Relay accept: timed out waiting for a stream from {remote}");
+                        return;
+                    }
+                };
 
             // Read the first 7 bytes to determine connection type.
             // Relay framing: [msg_type(1) | session_id(4 LE) | payload_len(2 LE)]
             // eMule protocol: first byte >= 0xC5 (0xE3=ED2K, 0xC5=eMule, 0xD4=packed)
             let mut header = [0u8; 7];
-            if let Err(e) = init_recv.read_exact(&mut header).await {
+            if let Err(e) =
+                read_relay_control(&mut init_recv, &mut header, "read initial header").await
+            {
                 debug!("QUIC accept: failed to read header from {remote}: {e}");
                 return;
             }
@@ -882,7 +907,13 @@ pub async fn run_quic_accept_loop(
                 }
 
                 let mut payload_buf = vec![0u8; payload_len as usize];
-                if let Err(e) = init_recv.read_exact(&mut payload_buf).await {
+                if let Err(e) = read_relay_control(
+                    &mut init_recv,
+                    &mut payload_buf,
+                    "read relay request payload",
+                )
+                .await
+                {
                     debug!("QUIC accept: failed to read request payload from {remote}: {e}");
                     return;
                 }
@@ -1069,7 +1100,9 @@ pub async fn run_quic_accept_loop(
                     return;
                 }
                 let mut file_hash = [0u8; 16];
-                if let Err(e) = init_recv.read_exact(&mut file_hash).await {
+                if let Err(e) =
+                    read_relay_control(&mut init_recv, &mut file_hash, "read relay file hash").await
+                {
                     debug!(
                         "QUIC accept: failed to read RELAY_CONNECT file hash from {remote}: {e}"
                     );
@@ -1289,18 +1322,42 @@ mod tests {
     }
 
     #[test]
-    fn relay_manager_accepts_only_current_attestation_hash() {
+    fn relay_manager_retains_unexpired_attestation_hashes() {
         let mut mgr = RelayManager::new();
         let current = [1u8; 32];
-        let other = [2u8; 32];
+        let previous = [2u8; 32];
+        let unknown = [3u8; 32];
         let expires = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs()
             + 60;
+        mgr.set_current_attestation_hash(previous, expires);
         mgr.set_current_attestation_hash(current, expires);
         assert!(mgr.accepts_attestation_hash(&current));
-        assert!(!mgr.accepts_attestation_hash(&other));
+        assert!(mgr.accepts_attestation_hash(&previous));
+        assert!(!mgr.accepts_attestation_hash(&unknown));
+    }
+
+    #[test]
+    fn active_relay_ignores_waiting_session_idle_timeout() {
+        let mut session = RelaySession::new(
+            1,
+            Ipv4Addr::new(1, 2, 3, 4),
+            4662,
+            Ipv4Addr::new(5, 6, 7, 8),
+            4663,
+            [1u8; 16],
+        );
+        session.last_activity = Instant::now() - RELAY_IDLE_TIMEOUT - Duration::from_secs(1);
+        assert!(session.is_expired());
+
+        session.mark_active();
+        session.last_activity = Instant::now() - RELAY_IDLE_TIMEOUT - Duration::from_secs(1);
+        assert!(
+            !session.is_expired(),
+            "active bridges remain tracked until the hard duration cap"
+        );
     }
 
     #[test]

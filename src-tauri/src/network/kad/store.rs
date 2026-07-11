@@ -7,6 +7,11 @@ use super::types::*;
 
 const MAX_ENTRIES_PER_KEY: usize = 1000;
 const MAX_TOTAL_ENTRIES: usize = 50_000;
+// eMule caps one keyword-publish batch at 150 files. Mirroring that as the
+// maximum contribution from one verified KAD identity prevents one publisher
+// monopolising an entire 1000-entry keyword bucket while accepting a complete
+// standards-sized publish from an ordinary peer.
+const MAX_KEYWORD_ENTRIES_PER_SENDER: usize = 150;
 /// How long a keyword entry we're storing *for another node* survives
 /// before we evict it. `publish::keyword_republish_interval` assumes
 /// every other KAD node enforces this same TTL against entries *we*
@@ -74,6 +79,10 @@ impl DhtStore {
         let len_before = bucket.len();
         bucket.retain(|e| !e.is_expired(now));
         self.total_count = self.total_count.saturating_sub(len_before - bucket.len());
+        let mut sender_entry_count = bucket
+            .iter()
+            .filter(|entry| entry.source_id == *sender_id)
+            .count();
 
         for entry in entries {
             if let Some(pos) = bucket
@@ -89,6 +98,9 @@ impl DhtStore {
                 // refresh `stored_at`, otherwise an active republish that
                 // happens to include one over-cap new entry would let its other
                 // (already-stored) entries expire.
+                if sender_entry_count >= MAX_KEYWORD_ENTRIES_PER_SENDER {
+                    continue;
+                }
                 if self.total_count >= MAX_TOTAL_ENTRIES {
                     continue;
                 }
@@ -103,6 +115,7 @@ impl DhtStore {
                     source_id: *sender_id,
                 });
                 self.total_count += 1;
+                sender_entry_count += 1;
             }
         }
 
@@ -366,6 +379,46 @@ impl DhtStore {
     fn compute_load(&self) -> u8 {
         let ratio = self.total_count as f64 / MAX_TOTAL_ENTRIES as f64;
         (ratio * 100.0).min(100.0) as u8
+    }
+}
+
+#[cfg(test)]
+mod keyword_store_tests {
+    use super::*;
+
+    fn entry(index: u16) -> PublishEntry {
+        let mut id = [0u8; 16];
+        id[..2].copy_from_slice(&index.to_le_bytes());
+        PublishEntry {
+            id: KadId(id),
+            tags: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn one_sender_cannot_monopolize_a_keyword_bucket() {
+        let mut store = DhtStore::new();
+        let target = KadId([0x11; 16]);
+        let first_sender = KadId([0x22; 16]);
+        let second_sender = KadId([0x33; 16]);
+
+        let oversized_batch = (0..(MAX_KEYWORD_ENTRIES_PER_SENDER as u16 + 25))
+            .map(entry)
+            .collect();
+        store.store_keyword_entries(&target, oversized_batch, &first_sender);
+        store.store_keyword_entries(&target, vec![entry(500)], &second_sender);
+
+        let bucket = store.keyword_entries.get(&target).unwrap();
+        assert_eq!(
+            bucket
+                .iter()
+                .filter(|stored| stored.source_id == first_sender)
+                .count(),
+            MAX_KEYWORD_ENTRIES_PER_SENDER
+        );
+        assert!(bucket
+            .iter()
+            .any(|stored| stored.source_id == second_sender));
     }
 }
 

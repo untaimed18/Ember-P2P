@@ -70,6 +70,39 @@ pub const NONCE_LEN: usize = 32;
 /// Length of an `OP_EMBER_AUTH_RESPONSE` payload (`pubkey || signature`).
 pub const RESPONSE_LEN: usize = 32 + 64;
 
+/// Domain separation for Ember's custom Ed25519 proof-of-possession.
+/// The wire payload remains the same nonce/signature pair; only the signed
+/// message is contextualized so an attacker cannot reuse this endpoint as a
+/// generic signer for another Ember protocol.
+pub const AUTH_SIGNATURE_DOMAIN: &[u8] = b"ember-ed2k-auth-v1\0";
+
+fn auth_signature_message(nonce: &[u8]) -> Vec<u8> {
+    let mut message = Vec::with_capacity(AUTH_SIGNATURE_DOMAIN.len() + nonce.len());
+    message.extend_from_slice(AUTH_SIGNATURE_DOMAIN);
+    message.extend_from_slice(nonce);
+    message
+}
+
+pub(crate) fn sign_auth_nonce(signing_key: &SigningKey, nonce: &[u8]) -> Signature {
+    signing_key.sign(&auth_signature_message(nonce))
+}
+
+pub(crate) fn verify_auth_nonce_compat(
+    verifying_key: &VerifyingKey,
+    nonce: &[u8],
+    signature: &Signature,
+) -> bool {
+    if verifying_key
+        .verify_strict(&auth_signature_message(nonce), signature)
+        .is_ok()
+    {
+        return true;
+    }
+    // Receive-only transition compatibility for older Ember releases.
+    // Upgraded clients never emit a bare-nonce signature.
+    verifying_key.verify_strict(nonce, signature).is_ok()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EmberAuthState {
     /// No CHALLENGE seen yet on this session. May transition to
@@ -101,7 +134,6 @@ impl EmberAuthState {
     pub fn is_verified(&self) -> bool {
         matches!(self, EmberAuthState::Verified)
     }
-
 }
 
 /// Outbound packets the dispatcher should write back to the peer in
@@ -189,7 +221,7 @@ pub fn handle_challenge(
     OsRng.fill_bytes(&mut our_nonce);
 
     let signing_key = SigningKey::from_bytes(our_secret_key);
-    let signature = signing_key.sign(&their_nonce);
+    let signature = sign_auth_nonce(&signing_key, &their_nonce);
 
     let mut response = [0u8; RESPONSE_LEN];
     response[..32].copy_from_slice(our_pubkey);
@@ -263,7 +295,7 @@ pub fn handle_response(
     let peer_sig = Signature::from_bytes(&sig_bytes);
     // verify_strict rejects non-canonical / small-order signatures (Ed25519
     // malleability), matching `crypto::verify` used elsewhere in the codebase.
-    if peer_vk.verify_strict(&our_nonce, &peer_sig).is_err() {
+    if !verify_auth_nonce_compat(&peer_vk, &our_nonce, &peer_sig) {
         *state = EmberAuthState::Failed;
         return Err(AuthError::BadSignature);
     }
@@ -311,7 +343,7 @@ mod tests {
         // Initiator-side: receives responder's CHALLENGE, signs it,
         // builds RESPONSE.
         let init_signing = SigningKey::from_bytes(&init_sk);
-        let init_sig = init_signing.sign(&resp_nonce);
+        let init_sig = sign_auth_nonce(&init_signing, &resp_nonce);
         let mut init_response = [0u8; RESPONSE_LEN];
         init_response[..32].copy_from_slice(&init_pk);
         init_response[32..].copy_from_slice(&init_sig.to_bytes());
@@ -321,9 +353,17 @@ mod tests {
         let resp_response_sig_bytes: [u8; 64] = resp_response[32..].try_into().unwrap();
         let resp_response_sig = Signature::from_bytes(&resp_response_sig_bytes);
         let resp_vk = VerifyingKey::from_bytes(&resp_response_pk).unwrap();
-        assert!(resp_vk
-            .verify_strict(&init_nonce, &resp_response_sig)
-            .is_ok());
+        assert!(verify_auth_nonce_compat(
+            &resp_vk,
+            &init_nonce,
+            &resp_response_sig
+        ));
+        assert!(
+            resp_vk
+                .verify_strict(&init_nonce, &resp_response_sig)
+                .is_err(),
+            "new responses must never emit a reusable bare-nonce signature"
+        );
         assert!(crate::network::ember::crypto::verify_ember_hash_binding(
             &resp_response_pk,
             &resp_hash

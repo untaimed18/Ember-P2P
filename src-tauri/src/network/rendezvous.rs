@@ -1,6 +1,6 @@
 use std::net::Ipv4Addr;
 
-use ed25519_dalek::{Signature, SigningKey};
+use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
@@ -46,14 +46,18 @@ fn signing_key_from_secret(secret: &[u8; 32]) -> SigningKey {
     SigningKey::from_bytes(secret)
 }
 
-fn sign_register(
-    secret: &[u8; 32],
-    pubkey: &[u8; 32],
+/// Builds the exact byte sequence a registrant signs (and that the
+/// server / lookup callers re-verify against). Factored out of
+/// `sign_register` so `lookup`'s response-verification path can
+/// reconstruct the identical message without re-deriving a signature.
+/// Mirrors `rendezvous-server/src/main.rs::build_register_msg`.
+fn build_register_msg(
     id_raw: &[u8; 32],
     port: u16,
     ip4: [u8; 4],
+    pubkey: &[u8; 32],
     ts: i64,
-) -> Signature {
+) -> Vec<u8> {
     let mut m = Vec::with_capacity(RDV_DOMAIN.len() + 1 + 32 + 2 + 4 + 32 + 8);
     m.extend_from_slice(RDV_DOMAIN);
     m.push(OP_REGISTER);
@@ -62,8 +66,48 @@ fn sign_register(
     m.extend_from_slice(&ip4);
     m.extend_from_slice(pubkey);
     m.extend_from_slice(&ts.to_le_bytes());
+    m
+}
+
+fn sign_register(
+    secret: &[u8; 32],
+    pubkey: &[u8; 32],
+    id_raw: &[u8; 32],
+    port: u16,
+    ip4: [u8; 4],
+    ts: i64,
+) -> Signature {
+    let m = build_register_msg(id_raw, port, ip4, pubkey, ts);
     use ed25519_dalek::Signer;
     signing_key_from_secret(secret).sign(&m)
+}
+
+/// Re-derives the rendezvous id from a pubkey and checks it matches
+/// the id we looked up. Mirrors the server-side derivation chain
+/// `pubkey -> ember_hash (BLAKE3 truncated) -> id (SHA256)` — see
+/// `rendezvous-server/src/main.rs::pubkey_matches_id`. This is what
+/// lets `lookup` trust a pubkey it has never seen before: the id
+/// itself is a one-way function of the pubkey, so a pubkey that
+/// hashes to the id we asked for could only have been chosen by
+/// whoever controls the corresponding private key (or by brute-force
+/// preimage search, which SHA256/BLAKE3 make infeasible).
+fn pubkey_matches_id(pubkey: &[u8; 32], claimed_id: &str) -> bool {
+    let pk_blake = blake3::hash(pubkey);
+    let ember_hash = &pk_blake.as_bytes()[..16];
+    let mut sha = Sha256::new();
+    sha.update(ember_hash);
+    let derived = hex::encode(sha.finalize());
+    derived.eq_ignore_ascii_case(claimed_id)
+}
+
+/// Strict Ed25519 verification (rejects malleable signatures /
+/// small-subgroup attacks), matching the server's verifier.
+fn ed25519_verify_lookup(pubkey: &[u8; 32], message: &[u8], sig: &[u8; 64]) -> bool {
+    let Ok(vk) = VerifyingKey::from_bytes(pubkey) else {
+        return false;
+    };
+    let signature = Signature::from_bytes(sig);
+    vk.verify_strict(message, &signature).is_ok()
 }
 
 fn sign_unregister(secret: &[u8; 32], id_raw: &[u8; 32], ts: i64) -> Signature {
@@ -81,8 +125,9 @@ fn current_timestamp() -> i64 {
 }
 
 /// Hard byte cap on rendezvous responses. Every payload this client
-/// consumes is a small JSON blob (lookup result is < 200 bytes; relay
-/// invite list is bounded server-side). 8 KiB leaves ~40x headroom
+/// consumes is a small JSON blob (a signed lookup result — ip, port,
+/// pubkey, ts, sig — is well under 512 bytes; relay invite list is
+/// bounded server-side). 8 KiB leaves >15x headroom
 /// over the largest realistic response while making us decisively
 /// hostile to a malicious or misbehaving rendezvous that tries to
 /// stream megabytes at us. The previous 64 KiB cap was chosen for
@@ -233,22 +278,46 @@ pub async fn register(
 /// Look up a friend on the rendezvous server.
 /// Returns `Some((ip, port))` if the friend is currently registered, `None` if not found.
 ///
-/// Defense-in-depth: even though `require_https` + `https_only(true)` means
-/// the response is authentic w.r.t. the configured rendezvous host, the
-/// rendezvous operator could be compromised or misconfigured. We refuse
-/// to hand back addresses that would make the caller connect to
-/// loopback / link-local / private / unspecified / reserved IPs — those
-/// could steer a friend-connect session into the local host, the LAN,
-/// or an attacker-chosen network. The rendezvous server is expected to
-/// filter these at registration time (see `rendezvous-server/src/main.rs::register`),
-/// but mirroring the check on the client side closes the gap if a
-/// future server change regresses it.
+/// The response is cryptographically authenticated, not just
+/// transport-secured: the server has no signing key of its own, so it
+/// can only ever return an (ip, port, pubkey, ts) tuple accompanied by
+/// the registrant's own Ed25519 signature over that exact tuple
+/// (produced once, at `/register` time, and replayed verbatim by the
+/// server on every `/lookup`). We verify the pubkey derives to the id
+/// we asked for AND that the signature checks out under that pubkey
+/// before trusting the ip/port at all. That closes the hole where a
+/// compromised, malicious, or MITM'd rendezvous server could steer a
+/// friend-connect session at an arbitrary attacker-controlled host —
+/// `require_https` + `https_only(true)` alone only guarantee the
+/// response came from the configured host, not that the host told the
+/// truth.
+///
+/// On top of that, and independent of the above: we refuse to hand
+/// back addresses that would make the caller connect to loopback /
+/// link-local / private / unspecified / reserved IPs — those could
+/// steer a friend-connect session into the local host, the LAN, or an
+/// attacker-chosen internal network. The rendezvous server is expected
+/// to filter these at registration time (see
+/// `rendezvous-server/src/main.rs::register`), but mirroring the check
+/// on the client side closes the gap if a future server change
+/// regresses it.
+/// Upper bound on how old a lookup response's signed `ts` may be.
+/// Defense-in-depth against a compromised/misbehaving rendezvous
+/// server replaying a stale-but-still-validly-signed registration
+/// after the real peer has moved or gone offline: the server is
+/// already supposed to expire presence entries after `ENTRY_TTL`
+/// (300s, see `rendezvous-server/src/main.rs`), so this just mirrors
+/// that with headroom for clock skew and in-flight latency rather
+/// than trusting the server to enforce it correctly forever.
+const MAX_LOOKUP_SIG_AGE_SECS: i64 = 600;
+
 pub async fn lookup(
     base_url: &str,
     friend_hash: &[u8; 16],
 ) -> Result<Option<(Ipv4Addr, u16)>, String> {
     require_https(base_url)?;
     let id = hashed_id(friend_hash);
+    let id_raw = sha256_id_raw(friend_hash);
     let url = format!("{}/lookup/{}", base_url.trim_end_matches('/'), id);
     let resp = client()?
         .get(&url)
@@ -276,7 +345,67 @@ pub async fn lookup(
         return Ok(None);
     }
     let port = raw_port as u16;
+
+    // Authenticate the response before trusting anything in it. The
+    // rendezvous server itself holds no long-term signing key we can
+    // pin — instead, the response must carry the registrant's OWN
+    // Ed25519 signature (produced at `/register` time and replayed
+    // verbatim by the server) over exactly this (id, port, ip,
+    // pubkey, ts) tuple. Two checks, both required:
+    //   1. `pubkey` must derive to the `id` we asked for (one-way
+    //      hash chain — see `pubkey_matches_id`), so a malicious or
+    //      compromised server can't substitute a different keypair
+    //      it controls.
+    //   2. The signature over the reconstructed message must verify
+    //      under that pubkey, so the server can't substitute a
+    //      different ip/port/ts for the real registrant's pubkey
+    //      without the registrant's private key.
+    // Without this, a compromised/malicious rendezvous operator (or
+    // a MITM that somehow defeats `https_only`) could steer a friend
+    // connection at an arbitrary attacker-controlled host — the
+    // routability filter below only blocks *local-network* targets,
+    // not arbitrary internet hosts.
+    let pubkey_hex = body["pubkey"].as_str().unwrap_or_default();
+    let sig_hex = body["sig"].as_str().unwrap_or_default();
+    let ts = body["ts"].as_i64().unwrap_or_default();
+
+    let mut pubkey = [0u8; 32];
+    let mut sig = [0u8; 64];
+    let pubkey_ok = hex::decode_to_slice(pubkey_hex, &mut pubkey).is_ok();
+    let sig_ok = hex::decode_to_slice(sig_hex, &mut sig).is_ok();
+    if !pubkey_ok || !sig_ok {
+        warn!(
+            "Rendezvous: lookup for {}… missing/malformed auth fields; refusing to connect",
+            &id[..8]
+        );
+        return Ok(None);
+    }
+    if !pubkey_matches_id(&pubkey, &id) {
+        warn!(
+            "Rendezvous: lookup for {}… pubkey does not derive to requested id; refusing to connect (server may be compromised)",
+            &id[..8]
+        );
+        return Ok(None);
+    }
+    let now = current_timestamp();
+    if (now - ts).abs() > MAX_LOOKUP_SIG_AGE_SECS {
+        warn!(
+            "Rendezvous: lookup for {}… returned a stale signed registration (ts={}); refusing to connect",
+            &id[..8],
+            ts
+        );
+        return Ok(None);
+    }
+
     if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+        let msg = build_register_msg(&id_raw, port, ip.octets(), &pubkey, ts);
+        if !ed25519_verify_lookup(&pubkey, &msg, &sig) {
+            warn!(
+                "Rendezvous: lookup for {}… signature verification failed; refusing to connect (server may be compromised)",
+                &id[..8]
+            );
+            return Ok(None);
+        }
         if port > 0 && is_routable_public_v4(ip) {
             // Friend IP/port is effectively PII — keep it at debug rather than
             // info so it doesn't land in user-shared log bundles by default.

@@ -19,4 +19,13 @@ hex = "0.4"
 strip = true
 lto = true
 codegen-units = 1
-panic = "abort"
+# Deliberately NOT panic = "abort". Axum/tokio isolate a panicking
+# request handler to its own task (the runtime catches the unwind at
+# the task boundary and fails just that task's JoinHandle) — that's
+# what stops one malformed request from taking down every other
+# in-flight connection and the sweep task. `panic = "abort"` disables
+# unwinding process-wide, so any single panicking handler (e.g. an
+# unexpected slice-index/arithmetic panic on attacker-controlled
+# input) would kill the entire server process instead of just that
+# request. The binary-size/perf win from `abort` isn't worth trading
+# away per-request fault isolation on an internet-facing service.

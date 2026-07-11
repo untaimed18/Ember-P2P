@@ -1,6 +1,6 @@
 use parking_lot::Mutex;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 use tracing::info;
 
 use crate::storage::paths;
@@ -13,14 +13,50 @@ pub struct Database {
     conn: Mutex<Connection>,
 }
 
+#[derive(Debug)]
+struct CorruptDatabase(String);
+
+impl std::fmt::Display for CorruptDatabase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "database integrity check failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for CorruptDatabase {}
+
 impl Database {
     pub fn new(app_handle: &tauri::AppHandle) -> anyhow::Result<Self> {
         let app_dir = paths::ensure_data_dir_with_app(app_handle)
             .map_err(|e| anyhow::anyhow!("Failed to prepare data dir: {e}"))?;
 
         let db_path = app_dir.join("ember.db");
+        match Self::open_at(&db_path) {
+            Ok(db) => Ok(db),
+            Err(e) if db_path.exists() && Self::is_corruption_error(&e) => {
+                let backup = Self::backup_corrupt_database(&db_path)?;
+                tracing::warn!(
+                    "ember.db was corrupt and has been preserved at {}; creating a fresh database",
+                    backup.display()
+                );
+                Self::open_at(&db_path).map_err(|retry| {
+                    anyhow::anyhow!(
+                        "Failed to initialize a fresh database after preserving the corrupt one at {}: {retry}",
+                        backup.display()
+                    )
+                })
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn open_at(db_path: &std::path::Path) -> anyhow::Result<Self> {
         let conn = Connection::open(&db_path)?;
         crate::security::restrict_file_permissions(&db_path);
+
+        let quick_check: String = conn.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
+        if !quick_check.eq_ignore_ascii_case("ok") {
+            return Err(CorruptDatabase(quick_check).into());
+        }
 
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;\
@@ -38,6 +74,77 @@ impl Database {
 
         info!("Database initialized");
         Ok(db)
+    }
+
+    fn is_corruption_error(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| {
+            if cause.downcast_ref::<CorruptDatabase>().is_some() {
+                return true;
+            }
+            matches!(
+                cause.downcast_ref::<rusqlite::Error>(),
+                Some(rusqlite::Error::SqliteFailure(sqlite, _))
+                    if matches!(
+                        sqlite.code,
+                        ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase
+                    )
+            )
+        })
+    }
+
+    fn backup_corrupt_database(db_path: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+        let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
+        let mut backup = db_path.with_extension(format!("db.{timestamp}.corrupt"));
+        let mut suffix = 1u32;
+        while backup.exists() && suffix < 1000 {
+            backup = db_path.with_extension(format!("db.{timestamp}.{suffix}.corrupt"));
+            suffix += 1;
+        }
+
+        Self::move_database_file(db_path, &backup)?;
+        crate::security::restrict_file_permissions(&backup);
+
+        // Preserve WAL sidecars under matching backup names. Leaving a stale
+        // sidecar beside the new database could make SQLite associate old
+        // pages with the replacement file.
+        for sidecar in ["-wal", "-shm"] {
+            let mut source_name = db_path.as_os_str().to_os_string();
+            source_name.push(sidecar);
+            let source = std::path::PathBuf::from(source_name);
+            if !source.exists() {
+                continue;
+            }
+            let mut destination_name = backup.as_os_str().to_os_string();
+            destination_name.push(sidecar);
+            let destination = std::path::PathBuf::from(destination_name);
+            Self::move_database_file(&source, &destination)?;
+            crate::security::restrict_file_permissions(&destination);
+        }
+
+        Ok(backup)
+    }
+
+    fn move_database_file(
+        source: &std::path::Path,
+        destination: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        if std::fs::rename(source, destination).is_ok() {
+            return Ok(());
+        }
+        std::fs::copy(source, destination).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to preserve corrupt database file {} at {}: {e}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+        std::fs::remove_file(source).map_err(|e| {
+            anyhow::anyhow!(
+                "Copied corrupt database file {} to {}, but could not remove the original: {e}",
+                source.display(),
+                destination.display()
+            )
+        })
     }
 
     fn run_migrations(&self) -> anyhow::Result<()> {
