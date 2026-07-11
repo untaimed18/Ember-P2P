@@ -735,6 +735,22 @@ pub struct AppSettings {
     /// under a folder adopt its priority unless individually overridden.
     #[serde(default)]
     pub folder_priorities: std::collections::HashMap<String, String>,
+    /// Automatically check for Ember updates in the background shortly
+    /// after launch (subject to `update_check_frequency`). This only gates
+    /// the *silent* startup check — the "Check for Updates" button in
+    /// Settings → About always works regardless of this setting. Defaults
+    /// to `true` to preserve Ember's original always-check-on-launch
+    /// behavior for existing users upgrading into this setting.
+    #[serde(default = "default_true")]
+    pub auto_check_updates: bool,
+    /// How often the automatic background check gated by `auto_check_updates`
+    /// may run: `"daily"`, `"weekly"`, or `"monthly"`. This is only the
+    /// user's preference — the actual "was it long enough ago?" bookkeeping
+    /// (last-checked timestamp) is tracked on the frontend
+    /// (`src/lib/stores/updater.ts`), since the whole update-check flow
+    /// already lives there with no backend involvement.
+    #[serde(default = "default_update_check_frequency")]
+    pub update_check_frequency: String,
 }
 
 /// Sanitized ed2k download limits derived from [`AppSettings`] (clamped for safety).
@@ -966,6 +982,10 @@ fn default_close_to_tray_behavior() -> String {
     "ask".to_string()
 }
 
+fn default_update_check_frequency() -> String {
+    "daily".to_string()
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         let download_dir = directories::UserDirs::new()
@@ -1046,6 +1066,8 @@ impl Default for AppSettings {
             ember_native_enabled: false,
             close_to_tray_behavior: default_close_to_tray_behavior(),
             launch_maximized: false,
+            auto_check_updates: true,
+            update_check_frequency: default_update_check_frequency(),
         }
     }
 }

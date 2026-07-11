@@ -19,7 +19,7 @@
   import { applyDocumentLang, translateError } from '$lib/i18n';
   import * as m from '$lib/paraglide/messages';
   import { getSettings, hideToTray, quitApp, setCloseBehavior } from '$lib/api/settings';
-  import { checkForUpdates } from '$lib/stores/updater';
+  import { checkForUpdates, isUpdateCheckDue } from '$lib/stores/updater';
   import { clearAllToasts, toastWarning } from '$lib/stores/toast';
   import type { AppSettings } from '$lib/types';
   import { onMount } from 'svelte';
@@ -216,10 +216,17 @@
           // Silent background update check, deferred so it never competes
           // with first paint or store init. Production only: in a dev build
           // the running version is the dev version and the GitHub manifest
-          // would spuriously report an "update". Any failure (offline,
-          // unreachable manifest) is swallowed by the store's silent mode,
-          // and a result surfaces non-blockingly via <UpdateNotice />.
-          if (!import.meta.env.DEV) {
+          // would spuriously report an "update". Gated on the user's
+          // auto-update preference and on `isUpdateCheckDue` so the chosen
+          // daily/weekly/monthly cadence is honored across launches, not
+          // just "once per app start" (falls back to the pre-setting
+          // always-on/daily behavior if settings failed to load). Any
+          // failure (offline, unreachable manifest) is swallowed by the
+          // store's silent mode, and a result surfaces non-blockingly via
+          // <UpdateNotice />.
+          const autoCheckEnabled = settings?.auto_check_updates ?? true;
+          const checkFrequency = settings?.update_check_frequency ?? 'daily';
+          if (!import.meta.env.DEV && autoCheckEnabled && isUpdateCheckDue(checkFrequency)) {
             updateCheckTimer = window.setTimeout(() => {
               if (mounted) void checkForUpdates({ silent: true });
             }, 4000);

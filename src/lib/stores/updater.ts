@@ -48,6 +48,56 @@ const INITIAL: UpdaterState = {
 
 export const updater = writable<UpdaterState>({ ...INITIAL });
 
+export type UpdateCheckFrequency = 'daily' | 'weekly' | 'monthly';
+
+const FREQUENCY_MS: Record<UpdateCheckFrequency, number> = {
+  daily: 24 * 60 * 60 * 1000,
+  weekly: 7 * 24 * 60 * 60 * 1000,
+  monthly: 30 * 24 * 60 * 60 * 1000,
+};
+
+// When the automatic startup check last ran, kept in the webview's
+// localStorage rather than in `AppSettings`/config.json: it's a bookkeeping
+// cache ("did we already check recently?"), not a user preference, and the
+// entire update-check flow already lives on the frontend with no backend
+// awareness of checks at all (see the module doc above). A manual check
+// from Settings → About also updates it, since that makes an automatic
+// check redundant until the configured interval elapses again.
+const LAST_CHECK_STORAGE_KEY = 'ember.updater.lastCheckedAt';
+
+function readLastCheckedAt(): number {
+  try {
+    const raw = localStorage.getItem(LAST_CHECK_STORAGE_KEY);
+    const parsed = raw === null ? NaN : Number(raw);
+    return Number.isFinite(parsed) ? parsed : 0;
+  } catch {
+    // Storage unavailable (private mode / disabled) — treat as "never
+    // checked" so callers fall back to a safe (if more frequent) default.
+    return 0;
+  }
+}
+
+function recordCheckedNow(): void {
+  try {
+    localStorage.setItem(LAST_CHECK_STORAGE_KEY, String(Date.now()));
+  } catch {
+    // Quota or storage failure — worst case we check more often than the
+    // configured frequency on this device; not worth surfacing to the user.
+  }
+}
+
+/**
+ * True when no check has ever been recorded, or enough time has passed
+ * since the last one (manual or silent) for the given `frequency`. The
+ * startup flow in `+layout.svelte` uses this to decide whether the silent
+ * background check should run at all this launch.
+ */
+export function isUpdateCheckDue(frequency: UpdateCheckFrequency): boolean {
+  const last = readLastCheckedAt();
+  if (last <= 0) return true;
+  return Date.now() - last >= FREQUENCY_MS[frequency];
+}
+
 // Module-private handle to the pending update. Kept out of the store because
 // it's a non-serializable Tauri `Resource` (and we only ever need the latest).
 let pending: Update | null = null;
@@ -82,6 +132,12 @@ function toMessage(e: unknown): string {
  * missing network / unreachable manifest never surfaces UI noise. A manual
  * check leaves the error in the store for the Settings card to display.
  *
+ * Every call (silent or manual) records "checked now" for
+ * {@link isUpdateCheckDue}, regardless of outcome — an attempt counts even
+ * if it fails, matching how "check weekly" is normally understood (retry
+ * roughly on that cadence, not on every launch just because the last
+ * attempt happened to fail).
+ *
  * Returns true when an update is available.
  */
 export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<boolean> {
@@ -90,6 +146,7 @@ export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<
   // mid-way through streaming, aborting it. A check during install is a no-op.
   if (installInFlight) return false;
   await disposePending();
+  recordCheckedNow();
   updater.update((s) => ({ ...s, phase: 'checking', error: null }));
   try {
     const found = await check();

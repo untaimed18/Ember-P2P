@@ -1602,6 +1602,29 @@
 
           <div class="divider"></div>
 
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">{m.settings_auto_check_updates_label()}</span>
+              <span class="hint">{m.settings_auto_check_updates_hint()}</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.auto_check_updates} ariaLabel={m.settings_auto_check_updates_label()} />
+          </div>
+          <div class="field">
+            <label for="update-check-frequency">{m.settings_update_check_frequency_label()}</label>
+            <span class="hint">{m.settings_update_check_frequency_hint()}</span>
+            <select
+              id="update-check-frequency"
+              bind:value={settings.update_check_frequency}
+              disabled={!settings.auto_check_updates}
+            >
+              <option value="daily">{m.settings_update_frequency_daily()}</option>
+              <option value="weekly">{m.settings_update_frequency_weekly()}</option>
+              <option value="monthly">{m.settings_update_frequency_monthly()}</option>
+            </select>
+          </div>
+
+          <div class="divider"></div>
+
           <div class="field nested">
             <div class="action-row">
               <button

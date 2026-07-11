@@ -408,4 +408,11 @@ export interface AppSettings {
    *  window is created at its configured size), so a change only affects
    *  the next launch. Off by default. */
   launch_maximized: boolean;
+  /** Automatically check for updates shortly after launch, subject to
+   *  `update_check_frequency`. The "Check for updates" button in Settings →
+   *  About always works manually regardless of this setting. Defaults to
+   *  true (Ember's original always-check-on-launch behavior). */
+  auto_check_updates: boolean;
+  /** How often the automatic background update check may run. */
+  update_check_frequency: 'daily' | 'weekly' | 'monthly';
 }
