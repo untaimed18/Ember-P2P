@@ -267,10 +267,6 @@ pub fn verify_relay_attestation(attestation: &RelayAttestation, now_unix: u64) -
     let Some(vk) = crypto::verifying_key_from_bytes(&attestation.ed25519_pubkey) else {
         return false;
     };
-    let ember_hash = crypto::node_id_from_public_key(&vk);
-    if !crypto::verify_ember_hash_binding(&attestation.ed25519_pubkey, &ember_hash) {
-        return false;
-    }
     let payload = build_relay_attestation_payload(
         &attestation.ed25519_pubkey,
         attestation.relay_ip,

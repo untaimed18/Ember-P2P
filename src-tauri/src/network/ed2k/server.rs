@@ -1081,10 +1081,56 @@ fn parse_server_ident_name(payload: &[u8]) -> Option<String> {
                 }
                 offset += slen;
             }
-            0x03 => offset += 4,
-            0x08 => offset += 2,
-            0x09 => offset += 1,
+            0x01 => offset = offset.saturating_add(16), // HASH
+            0x03 | 0x04 => offset = offset.saturating_add(4), // UINT32/FLOAT32
+            0x05 | 0x09 => offset = offset.saturating_add(1), // BOOL/UINT8
+            0x06 => {
+                if offset + 2 > payload.len() {
+                    break;
+                }
+                let bits = u16::from_le_bytes([payload[offset], payload[offset + 1]]) as usize;
+                offset = offset.saturating_add(2 + bits.div_ceil(8));
+            }
+            0x07 => {
+                if offset + 4 > payload.len() {
+                    break;
+                }
+                let len = u32::from_le_bytes([
+                    payload[offset],
+                    payload[offset + 1],
+                    payload[offset + 2],
+                    payload[offset + 3],
+                ]) as usize;
+                offset = offset.saturating_add(4 + len);
+            }
+            0x08 => offset = offset.saturating_add(2), // UINT16
+            0x0A => {
+                if offset >= payload.len() {
+                    break;
+                }
+                let len = payload[offset] as usize;
+                offset = offset.saturating_add(1 + len);
+            }
+            0x0B => offset = offset.saturating_add(8), // UINT64
+            0x11..=0x20 => {
+                let len = (tag_type - 0x10) as usize;
+                if offset + len > payload.len() {
+                    break;
+                }
+                if name_id == Some(0x01) {
+                    if let Ok(s) = std::str::from_utf8(&payload[offset..offset + len]) {
+                        let trimmed = s.trim();
+                        if !trimmed.is_empty() {
+                            return Some(trimmed.to_string());
+                        }
+                    }
+                }
+                offset += len;
+            }
             _ => break,
+        }
+        if offset > payload.len() {
+            break;
         }
     }
     None
@@ -1096,6 +1142,27 @@ mod tests {
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
+
+    #[test]
+    fn server_ident_skips_standard_unknown_tag_before_name() {
+        let mut payload = vec![0u8; 26];
+        payload[22..26].copy_from_slice(&2u32.to_le_bytes());
+        payload.push(0x07); // TAGTYPE_BLOB
+        payload.extend_from_slice(&1u16.to_le_bytes());
+        payload.push(0x99);
+        payload.extend_from_slice(&3u32.to_le_bytes());
+        payload.extend_from_slice(&[1, 2, 3]);
+        payload.push(0x02); // TAGTYPE_STRING
+        payload.extend_from_slice(&1u16.to_le_bytes());
+        payload.push(0x01); // server-name tag id
+        payload.extend_from_slice(&8u16.to_le_bytes());
+        payload.extend_from_slice(b"MyServer");
+
+        assert_eq!(
+            parse_server_ident_name(&payload).as_deref(),
+            Some("MyServer")
+        );
+    }
 
     #[test]
     fn classify_packet_read_timeout_as_disconnect() {

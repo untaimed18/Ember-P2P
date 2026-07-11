@@ -39,6 +39,7 @@
 
   import { listen } from '@tauri-apps/api/event';
   import LibraryVirtualTable from '$lib/components/LibraryVirtualTable.svelte';
+  import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import IconX from '$lib/components/IconX.svelte';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
@@ -52,6 +53,27 @@
   // the banner on the next successful load without clobbering an unrelated
   // error set by a user-initiated action.
   let lastLoadError: string | null = null;
+  let confirmOpen = $state(false);
+  let confirmTitle = $state('');
+  let confirmMessage = $state('');
+  let confirmResolver: ((confirmed: boolean) => void) | null = null;
+
+  function askConfirm(message: string, title: string): Promise<boolean> {
+    confirmResolver?.(false);
+    confirmMessage = message;
+    confirmTitle = title;
+    confirmOpen = true;
+    return new Promise<boolean>((resolve) => {
+      confirmResolver = resolve;
+    });
+  }
+
+  function settleConfirm(confirmed: boolean) {
+    const resolve = confirmResolver;
+    confirmResolver = null;
+    confirmOpen = false;
+    resolve?.(confirmed);
+  }
   let selectedPath: string | null = $state(null);
   // Bound to the virtualized file table; used by arrow-key navigation
   // to scroll the new selection into view (the row may not exist in
@@ -324,10 +346,9 @@
   async function handleRemoveMissing() {
     if (missingPathSet.size === 0) return;
     try {
-      const { confirm } = await import('@tauri-apps/plugin-dialog');
-      const confirmed = await confirm(
+      const confirmed = await askConfirm(
         missingPathSet.size === 1 ? m.library_confirm_remove_missing_one() : m.library_confirm_remove_missing_other({ count: missingPathSet.size }),
-        { title: m.library_remove_missing_title(), kind: 'warning' }
+        m.library_remove_missing_title(),
       );
       if (!confirmed) return;
       const removed = await removeMissingFiles([...missingPathSet]);
@@ -562,14 +583,13 @@
   async function handleRemoveFolder(path: string) {
     const stats = folderStats.counts.get(path) ?? 0;
     try {
-      const { confirm } = await import('@tauri-apps/plugin-dialog');
       const displayName = path.split(/[\\/]/).filter(Boolean).pop() || path;
       const body = stats > 0
         ? (stats === 1
             ? m.library_confirm_remove_folder_one({ name: displayName })
             : m.library_confirm_remove_folder_other({ name: displayName, count: stats.toLocaleString() }))
         : m.library_confirm_remove_folder_empty({ name: displayName });
-      const confirmed = await confirm(body, { title: m.library_remove_folder_title(), kind: 'warning' });
+      const confirmed = await askConfirm(body, m.library_remove_folder_title());
       if (!confirmed || !mounted) return;
       error = null;
       await removeSharedFolder(path);
@@ -823,12 +843,11 @@
     const totalBytes = targets.reduce((sum, f) => sum + f.size, 0);
     bulkBusy = true;
     try {
-      const { confirm } = await import('@tauri-apps/plugin-dialog');
-      const confirmed = await confirm(
+      const confirmed = await askConfirm(
         targets.length === 1
           ? m.library_confirm_delete_one({ size: formatSize(totalBytes) })
           : m.library_confirm_delete_other({ count: targets.length.toLocaleString(), size: formatSize(totalBytes) }),
-        { title: m.library_delete_files_title(), kind: 'warning' }
+        m.library_delete_files_title(),
       );
       if (!confirmed) return;
       let deleted = 0;
@@ -1259,10 +1278,9 @@
     const f = selectedFile;
     if (!f) return;
     try {
-      const { confirm } = await import('@tauri-apps/plugin-dialog');
-      const confirmed = await confirm(
+      const confirmed = await askConfirm(
         m.library_confirm_delete_single({ name: f.name }),
-        { title: m.library_delete_file_title(), kind: 'warning' }
+        m.library_delete_file_title(),
       );
       if (!confirmed) return;
       await deleteSharedFile(f.path, f.hash || undefined);
@@ -1438,10 +1456,9 @@
         case 'open_file': await openSharedFile(f.path); break;
         case 'open_folder': await openSharedFolder(f.path); break;
         case 'delete': {
-          const { confirm } = await import('@tauri-apps/plugin-dialog');
-          const confirmed = await confirm(
+          const confirmed = await askConfirm(
             m.library_confirm_delete_single({ name: f.name }),
-            { title: m.library_delete_file_title(), kind: 'warning' }
+            m.library_delete_file_title(),
           );
           if (!confirmed) break;
           await deleteSharedFile(f.path, f.hash || undefined);
@@ -1490,18 +1507,17 @@
 
   async function handleUnshareFolder(path: string) {
     try {
-      const { confirm } = await import('@tauri-apps/plugin-dialog');
       const displayName = path.split(/[\\/]/).filter(Boolean).pop() || path;
       const sharedCount = files.filter((f) => f.shared && isPathInFolder(f.path, path)).length;
       if (sharedCount === 0) {
         toastWarning(m.library_no_shared_files_in({ name: displayName }));
         return;
       }
-      const confirmed = await confirm(
+      const confirmed = await askConfirm(
         sharedCount === 1
           ? m.library_confirm_unshare_folder_one({ name: displayName })
           : m.library_confirm_unshare_folder_other({ count: sharedCount.toLocaleString(), name: displayName }),
-        { title: m.library_unshare_folder_title(), kind: 'warning' }
+        m.library_unshare_folder_title(),
       );
       if (!confirmed) return;
       await unshareFolder(path);
@@ -1628,6 +1644,7 @@
       // quota) can't strand the drag handlers and leave the page stuck.
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
+      window.removeEventListener('blur', onUp);
       dragCleanup = null;
       try {
         localStorage.setItem('library-sidebar-w', String(sidebarWidth));
@@ -1637,9 +1654,11 @@
     };
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
+    window.addEventListener('blur', onUp);
     dragCleanup = () => {
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
+      window.removeEventListener('blur', onUp);
     };
   }
 
@@ -1842,6 +1861,15 @@
 </script>
 
 <svelte:document onclick={onDocClick} onkeydown={onPageKeyDown} />
+
+<ConfirmDialog
+  bind:open={confirmOpen}
+  title={confirmTitle}
+  message={confirmMessage}
+  danger={true}
+  onconfirm={() => settleConfirm(true)}
+  oncancel={() => settleConfirm(false)}
+/>
 
 <div class="page-header">
   <h2>{m.library_title()}</h2>

@@ -1,3 +1,5 @@
+import { getLocale } from '$lib/i18n';
+
 /**
  * Format a byte count as a human-readable string (e.g. "1.5 MB").
  * Uses iterative division to avoid floating-point edge cases.
@@ -43,22 +45,22 @@ export function formatEta(totalSize: number, transferred: number, speed: number)
  * to `toLocaleDateString(undefined, options)` allocates a fresh formatter
  * internally, which shows up in the flame graph for tables rendering
  * hundreds of rows (transfers, library, known clients). Module-scope these
- * once; the intl cache respects the user's current system locale at first
- * use and that's what we want anyway (the app doesn't switch locales at
- * runtime).
+ * once per page load. Locale changes reload the webview, so construction with
+ * Paraglide's active locale keeps these aligned with the in-app language.
  */
-const SHORT_DT_FORMATTER = new Intl.DateTimeFormat(undefined, {
+const APP_LOCALE = getLocale();
+const SHORT_DT_FORMATTER = new Intl.DateTimeFormat(APP_LOCALE, {
   month: 'short',
   day: 'numeric',
   hour: '2-digit',
   minute: '2-digit',
 });
-const LEDGER_DATE_FORMATTER = new Intl.DateTimeFormat(undefined, {
+const LEDGER_DATE_FORMATTER = new Intl.DateTimeFormat(APP_LOCALE, {
   year: 'numeric',
   month: 'short',
   day: 'numeric',
 });
-const RELATIVE_TIME_FORMATTER = new Intl.RelativeTimeFormat(undefined, {
+const RELATIVE_TIME_FORMATTER = new Intl.RelativeTimeFormat(APP_LOCALE, {
   numeric: 'auto',
   style: 'short',
 });

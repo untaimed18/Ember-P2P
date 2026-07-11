@@ -209,11 +209,14 @@ export async function closeSearchTab(tabId: string): Promise<void> {
       /* best effort */
     }
   }
-  searchTabs.update((currentTabs) => currentTabs.filter((t) => t.id !== tabId));
+  const currentTabs = get(searchTabs);
+  const currentIdx = currentTabs.findIndex((t) => t.id === tabId);
+  if (currentIdx === -1) return;
+  const remaining = currentTabs.filter((t) => t.id !== tabId);
+  searchTabs.set(remaining);
   const active = get(activeSearchTabId);
   if (active === tabId) {
-    const remaining = get(searchTabs);
-    const newIdx = Math.max(0, idx - 1);
+    const newIdx = Math.max(0, currentIdx - 1);
     activeSearchTabId.set(remaining[newIdx]?.id ?? remaining[0]?.id ?? null);
   }
 }

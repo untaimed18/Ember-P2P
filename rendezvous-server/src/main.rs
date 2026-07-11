@@ -11,7 +11,7 @@ use std::{
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        ConnectInfo, Path, State,
+        ConnectInfo, DefaultBodyLimit, Path, State,
     },
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
@@ -1517,21 +1517,29 @@ async fn cleanup_relay(state: &AppState, session_id: &str, client_ip: IpAddr) {
     }
 }
 
-async fn stats_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+async fn stats_handler(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let client_ip = extract_client_ip(&headers, addr);
+    if !check_rate_limit(&state, client_ip).await {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
     let relay_count = state.relay_sessions.read().await.len();
     let punch_count = state.punch_requests.read().await.len();
     let relay_ip_count = state.relay_ip_counts.read().await.len();
     let presence_count = state.store.read().await.len();
     let uptime_secs = state.started_at.elapsed().as_secs();
 
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "active_relay_sessions": relay_count,
         "active_punch_requests": punch_count,
         "relay_ip_count": relay_ip_count,
         "registered_peers": presence_count,
         "uptime_seconds": uptime_secs,
         "max_global_relays": MAX_GLOBAL_RELAY_SESSIONS,
-    }))
+    })))
 }
 
 async fn health() -> &'static str {
@@ -1727,6 +1735,7 @@ async fn main() {
         .route("/bootstrap", get(bootstrap))
         .route("/health", get(health))
         .route("/stats", get(stats_handler))
+        .layer(DefaultBodyLimit::max(64 * 1024))
         .with_state(state);
 
     let port: u16 = std::env::var("PORT")

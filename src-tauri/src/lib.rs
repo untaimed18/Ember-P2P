@@ -465,7 +465,7 @@ pub fn run() {
             let net_tx = startup_network_tx;
             let startup_cancel_flags = hash_cancel_flags.clone();
             let startup_fresh_part_hashes = fresh_part_hashes.clone();
-            tauri::async_runtime::spawn(async move {
+            let startup_scan_handle = tauri::async_runtime::handle().inner().spawn(async move {
                 if shared_folders.is_empty() {
                     info!("Indexed 0 files from 0 shared folders");
                     return;
@@ -772,6 +772,11 @@ pub fn run() {
                     hashed,
                 );
             });
+            {
+                let state = app_handle.state::<AppState>();
+                tauri::async_runtime::handle()
+                    .block_on(state.register_background_scan(startup_scan_handle));
+            }
 
             let net_handle = app_handle.clone();
             let net_index = local_index.clone();

@@ -15,10 +15,13 @@ import type { AppSettings } from '$lib/types';
  * so a toggle flipped at runtime takes effect immediately, not just next launch.
  */
 export const appSettings = writable<AppSettings | null>(null);
+let settingsEpoch = 0;
 
 export async function loadAppSettings(): Promise<void> {
+  const epoch = settingsEpoch;
   try {
-    appSettings.set(await getSettings());
+    const settings = await getSettings();
+    if (epoch === settingsEpoch) appSettings.set(settings);
   } catch {
     // Backend not ready yet — consumers fall back to defaults until a later
     // load (or a Settings save) populates the cache.
@@ -32,5 +35,6 @@ export function setAppSettings(settings: AppSettings): void {
 }
 
 export function clearAppSettings(): void {
+  settingsEpoch++;
   appSettings.set(null);
 }

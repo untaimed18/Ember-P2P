@@ -280,6 +280,18 @@ pub async fn add_shared_folder(
         {
             None
         } else {
+            if let Some(existing) = config.settings.shared_folders.iter().find(|existing| {
+                crate::commands::settings::shared_paths_overlap(
+                    std::path::Path::new(existing),
+                    &canonical,
+                )
+            }) {
+                return Err(coded_ctx(
+                    "sharing_folder_overlap",
+                    "Shared folders must not overlap",
+                    format!("{existing} and {canonical_str}"),
+                ));
+            }
             let mut new_settings = config.settings.clone();
             new_settings.shared_folders.push(canonical_str.clone());
             new_settings.settings_revision = config.settings.settings_revision.saturating_add(1);

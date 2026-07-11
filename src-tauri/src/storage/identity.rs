@@ -19,9 +19,9 @@ use crate::network::kad::types::KadId;
 ///   `security::atomic_write` with `restrict=true`, which applies mode 0o600 on
 ///   Unix and a Windows ACL limiting access to the current user (see
 ///   `restrict_file_permissions`).
-/// - TODO (release hardening): encrypt at rest using a per-user OS keyring.
-///   On Windows: DPAPI (`CryptProtectData` / `CryptUnprotectData`) scoped to the
-///   current user. On macOS: Keychain. On Linux: Secret Service / libsecret.
+/// - Windows releases wrap the serialized identity with current-user DPAPI
+///   (`CryptProtectData` / `CryptUnprotectData`) via `secret_store`. Non-Windows
+///   developer/CI builds retain the restricted-file-permission fallback.
 ///   The identity is not a cryptographic secret that rotates, but leaking
 ///   `user_hash` / `ember_hash` deanonymizes the node across sessions.
 #[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
@@ -56,6 +56,10 @@ impl std::fmt::Debug for NodeIdentity {
             .field("user_hash", &"[redacted]")
             .field("udp_key_seed", &"[redacted]")
             .field("ember_hash", &"[redacted]")
+            .field("ed25519_secret_key", &"[redacted]")
+            .field("ed25519_public_key", &"[redacted]")
+            .field("noise_private_key", &"[redacted]")
+            .field("noise_public_key", &"[redacted]")
             .finish()
     }
 }

@@ -63,6 +63,7 @@
     for (const hash of onlineFriends) failedSearchToastsShown.delete(hash);
   });
   let searchingFriends: Set<string> = $derived($searchingFriendsStore);
+  let reconnectingFriends = $state(new Set<string>());
   let isFirewalled = $state(false);
   let recheckingFirewall = $state(false);
   let recheckError: string | null = $state(null);
@@ -190,11 +191,16 @@
     // emits `ember:friend-searching` (which drives the row's "Searching…"
     // state) and then a terminal online/failed event, so no extra local
     // spinner state is needed here.
-    if (searchingFriends.has(f.user_hash)) return;
+    if (searchingFriends.has(f.user_hash) || reconnectingFriends.has(f.user_hash)) return;
+    reconnectingFriends = new Set(reconnectingFriends).add(f.user_hash);
     try {
       await retryFriendSearch(f.user_hash);
     } catch (e: unknown) {
       error = toErr(e);
+    } finally {
+      const next = new Set(reconnectingFriends);
+      next.delete(f.user_hash);
+      reconnectingFriends = next;
     }
   }
 
@@ -860,14 +866,14 @@
             <button
               class="action-btn reconnect-action"
               onclick={() => handleRetrySearch(f)}
-              disabled={searchingFriends.has(f.user_hash)}
+              disabled={searchingFriends.has(f.user_hash) || reconnectingFriends.has(f.user_hash)}
               title={m.friends_action_reconnect_title()}
             >
               <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9"/>
                 <polyline points="13.5 2 13.5 5 10.5 5"/>
               </svg>
-              {searchingFriends.has(f.user_hash) ? m.friends_status_searching() : m.friends_action_reconnect()}
+              {searchingFriends.has(f.user_hash) || reconnectingFriends.has(f.user_hash) ? m.friends_status_searching() : m.friends_action_reconnect()}
             </button>
           {/if}
         </div>
