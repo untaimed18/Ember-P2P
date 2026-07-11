@@ -49,6 +49,15 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
             "Close behavior must be 'ask', 'tray', or 'exit'",
         ));
     }
+    if settings.update_check_frequency != "daily"
+        && settings.update_check_frequency != "weekly"
+        && settings.update_check_frequency != "monthly"
+    {
+        return Err(coded(
+            "settings_update_check_frequency_invalid",
+            "Update check frequency must be 'daily', 'weekly', or 'monthly'",
+        ));
+    }
     if settings.download_folder.len() > MAX_PATH_LEN {
         return Err(coded_ctx(
             "settings_download_folder_too_long",
@@ -394,6 +403,7 @@ pub async fn update_settings(
     let mut settings = settings;
     settings.spam_filter_profile = settings.spam_filter_profile.trim().to_ascii_lowercase();
     settings.close_to_tray_behavior = settings.close_to_tray_behavior.trim().to_ascii_lowercase();
+    settings.update_check_frequency = settings.update_check_frequency.trim().to_ascii_lowercase();
     // L20: strip bidi/zero-width/control formatters from the
     // local user's own nickname before it's stored or sent on the
     // wire (Hello/EmuleInfo/HelloAnswer all carry it). Without
