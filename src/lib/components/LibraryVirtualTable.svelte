@@ -431,6 +431,13 @@
 
   function closeMenu() { colMenu = null; }
 
+  function onDocumentKeydown(event: KeyboardEvent) {
+    if (event.key === 'Escape' && colMenu) {
+      event.preventDefault();
+      closeMenu();
+    }
+  }
+
   function toggleVisibility(key: string) {
     if (key === FIXED_KEY) return;
     colHidden[key] = !colHidden[key];
@@ -473,7 +480,7 @@
   });
 </script>
 
-<svelte:document onclick={() => closeMenu()} />
+<svelte:document onclick={() => closeMenu()} onkeydown={onDocumentKeydown} />
 
 <div class="library-virtual-table-root">
 <div class="vtable-header" bind:this={headerWrap} style="padding-right:{scrollbarWidth}px;">

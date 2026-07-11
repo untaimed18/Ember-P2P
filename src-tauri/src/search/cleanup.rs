@@ -38,6 +38,14 @@ fn remove_all_case_insensitive(chars: &[char], pat_lower: &str) -> Vec<char> {
     if pat_char_len == 0 {
         return chars.to_vec();
     }
+    // Some Unicode lowercase mappings expand one source character into
+    // several characters. In that case a fixed source-character window
+    // cannot be mapped safely back for truncation; leave the display text
+    // unchanged rather than remove the wrong neighbouring characters.
+    let lowered_char_len: usize = chars.iter().map(|c| c.to_lowercase().count()).sum();
+    if lowered_char_len != chars.len() {
+        return chars.to_vec();
+    }
     let mut stack: Vec<char> = Vec::with_capacity(chars.len());
     for &c in chars {
         stack.push(c);

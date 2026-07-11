@@ -19,6 +19,7 @@
   import { onMount, untrack } from 'svelte';
   import * as m from '$lib/paraglide/messages';
   import { translateError, degradedReasonText, firewallStatusText } from '$lib/i18n';
+  import { inertBackground } from '$lib/a11y';
 
   let contacts: KadContact[] = $state([]);
   let searches: KadSearchEntry[] = $state([]);
@@ -69,6 +70,11 @@
   let bootstrapIpPort = $state('4672');
   let bootstrapUrl = $state('');
   let bootstrapPending = $state(false);
+  let bootstrapOverlay: HTMLDivElement | undefined = $state(undefined);
+  $effect(() => {
+    if (!bootstrapOpen || !bootstrapOverlay) return;
+    return inertBackground(bootstrapOverlay);
+  });
 
   // K25: debounce Connect/Disconnect so a user who double-clicks the
   // button doesn't queue two conflicting commands.
@@ -845,6 +851,7 @@
     -->
     <div
       class="modal-overlay"
+      bind:this={bootstrapOverlay}
       role="dialog"
       aria-modal="true"
       aria-labelledby="kad-bootstrap-title"

@@ -23,6 +23,7 @@ const OP_EMULEINFOANSWER: u8 = 0x02;
 
 const BUDDY_EVENT_CHANNEL_SIZE: usize = 32;
 const REASK_CALLBACK_BUDGET_PER_SESSION: u32 = 16;
+const MAX_PENDING_BUDDY_HASHES: usize = 512;
 /// Max time to wait for the *next* packet on a buddy TCP connection before
 /// treating it as dead. Both directions send an `OP_BUDDYPING` roughly every
 /// 60s (see `mod.rs`'s `buddy_timer`), so 3x that interval tolerates a
@@ -455,6 +456,15 @@ impl BuddyManager {
         let now = chrono::Utc::now().timestamp();
         let mut map = self.pending_buddy_hashes.lock().await;
         map.retain(|_, (_, ts)| now - *ts < 120);
+        if !map.contains_key(&user_hash) && map.len() >= MAX_PENDING_BUDDY_HASHES {
+            if let Some(oldest) = map
+                .iter()
+                .min_by_key(|(_, (_, timestamp))| *timestamp)
+                .map(|(hash, _)| *hash)
+            {
+                map.remove(&oldest);
+            }
+        }
         map.insert(user_hash, (callback_check, now));
     }
 
@@ -766,16 +776,15 @@ async fn run_buddy_reader(
     let mut callback_budget: u32 = 64;
     let mut reask_callback_budget: u32 = REASK_CALLBACK_BUDGET_PER_SESSION;
     loop {
-        let read_result = match tokio::time::timeout(idle_timeout, read_ed2k_packet(&mut reader))
-            .await
-        {
-            Ok(result) => result,
-            Err(_) => {
-                debug!("Buddy reader idle for {idle_timeout:?} with no traffic, disconnecting");
-                let _ = event_tx.send(BuddyEvent::Disconnected).await;
-                break;
-            }
-        };
+        let read_result =
+            match tokio::time::timeout(idle_timeout, read_ed2k_packet(&mut reader)).await {
+                Ok(result) => result,
+                Err(_) => {
+                    debug!("Buddy reader idle for {idle_timeout:?} with no traffic, disconnecting");
+                    let _ = event_tx.send(BuddyEvent::Disconnected).await;
+                    break;
+                }
+            };
         match read_result {
             Ok((proto, opcode, payload)) => {
                 let event = match (proto, opcode) {
@@ -1027,6 +1036,27 @@ mod tests {
         // A search is already in flight; don't start another even though both
         // ports are firewalled.
         assert!(!mgr.should_find_buddy(FirewallStatus::Firewalled, FirewallStatus::Firewalled));
+    }
+
+    #[tokio::test]
+    async fn pending_buddy_hashes_are_capacity_bounded() {
+        let manager = test_manager();
+        let now = chrono::Utc::now().timestamp();
+        {
+            let mut pending = manager.pending_buddy_hashes.lock().await;
+            for index in 0..MAX_PENDING_BUDDY_HASHES {
+                let mut hash = [0u8; 16];
+                hash[..8].copy_from_slice(&(index as u64).to_le_bytes());
+                pending.insert(hash, (KadId(hash), now));
+            }
+        }
+        let newest = [0xFFu8; 16];
+        manager
+            .register_pending_buddy(newest, KadId([0xEE; 16]))
+            .await;
+        let pending = manager.pending_buddy_hashes.lock().await;
+        assert_eq!(pending.len(), MAX_PENDING_BUDDY_HASHES);
+        assert!(pending.contains_key(&newest));
     }
 
     /// Regression guard for the "dead firewalled client occupies the single

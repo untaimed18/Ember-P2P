@@ -1806,6 +1806,7 @@
       // quota) can't strand the drag handlers.
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
+      window.removeEventListener('blur', onUp);
       dragCleanup = null;
       try {
         localStorage.setItem('transfers-split', String(splitPercent));
@@ -1815,9 +1816,11 @@
     };
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
+    window.addEventListener('blur', onUp);
     dragCleanup = () => {
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
+      window.removeEventListener('blur', onUp);
     };
   }
 

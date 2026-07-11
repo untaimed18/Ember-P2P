@@ -31,6 +31,7 @@ export interface ChatTab {
 }
 
 const STORAGE_KEY = 'ember.chatTabs.v1';
+const MAX_CHAT_TABS = 50;
 
 interface PersistedState {
   tabs: ChatTab[];
@@ -57,7 +58,8 @@ function loadPersisted(): PersistedState {
           typeof (t as ChatTab).hash === 'string' &&
           typeof (t as ChatTab).name === 'string',
       )
-      .map((t) => ({ hash: t.hash, name: t.name }));
+      .map((t) => ({ hash: t.hash, name: t.name }))
+      .slice(-MAX_CHAT_TABS);
     const activeRaw = typeof obj.activeHash === 'string' ? obj.activeHash : null;
     const activeHash =
       activeRaw && tabs.some((t) => t.hash === activeRaw)
@@ -154,7 +156,13 @@ export function clearDraft(hash: string) {
 export function openChat(hash: string, name: string) {
   chatTabs.update((tabs) => {
     const idx = tabs.findIndex((t) => t.hash === hash);
-    if (idx === -1) return [...tabs, { hash, name }];
+    if (idx === -1) {
+      const next = [...tabs, { hash, name }];
+      if (next.length <= MAX_CHAT_TABS) return next;
+      const evicted = next.shift();
+      if (evicted) chatDrafts.delete(evicted.hash);
+      return next;
+    }
     if (tabs[idx].name !== name) {
       const next = tabs.slice();
       next[idx] = { hash, name };

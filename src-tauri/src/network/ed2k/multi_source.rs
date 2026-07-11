@@ -1758,7 +1758,10 @@ impl MultiSourceDownload {
             let mut injection_deadline: Option<tokio::time::Instant> = None;
             let mut injection_channel_open = true;
             loop {
-                check_control(&self.control).await?;
+                if let Err(e) = check_control(&self.control).await {
+                    while pending_futs.next().await.is_some() {}
+                    return Err(e);
+                }
                 let all_done = {
                     let t = tracker.read().await;
                     t.all_complete()
@@ -1832,12 +1835,7 @@ impl MultiSourceDownload {
                         }
                     }
                     _ = self.control.wait_cancelled() => {
-                        for ah in &abort_handles {
-                            ah.abort();
-                        }
-                        for ah in &injected_abort_handles {
-                            ah.abort();
-                        }
+                        while pending_futs.next().await.is_some() {}
                         anyhow::bail!("cancelled by user");
                     }
                     // Accept new source from the injection channel
@@ -2446,7 +2444,14 @@ impl MultiSourceDownload {
         };
 
         while retry_round < max_retry_rounds {
-            check_control(&self.control).await?;
+            if let Err(e) = check_control(&self.control).await {
+                for handle in adopted_handles.drain(..) {
+                    let _ = handle.await;
+                }
+                drop(adopt_progress_tx);
+                let _ = adopt_agg.await;
+                return Err(e);
+            }
 
             let incomplete: Vec<usize> = {
                 let t = tracker.read().await;
@@ -2476,6 +2481,11 @@ impl MultiSourceDownload {
                     tokio::select! {
                         _ = tokio::time::sleep(wait) => {}
                         _ = self.control.wait_cancelled() => {
+                            for handle in adopted_handles.drain(..) {
+                                let _ = handle.await;
+                            }
+                            drop(adopt_progress_tx);
+                            let _ = adopt_agg.await;
                             anyhow::bail!("cancelled by user");
                         }
                     }
@@ -2906,6 +2916,11 @@ impl MultiSourceDownload {
                         tokio::select! {
                             biased;
                             _ = self.control.wait_cancelled() => {
+                                for handle in adopted_handles.drain(..) {
+                                    let _ = handle.await;
+                                }
+                                drop(adopt_progress_tx);
+                                let _ = adopt_agg.await;
                                 anyhow::bail!("cancelled by user");
                             }
                             _ = tokio::time::sleep(slice) => {}

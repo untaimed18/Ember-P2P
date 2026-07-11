@@ -216,9 +216,11 @@ fn recover_zip(
                 continue;
             }
 
-            // Validate CRC32 if stored (not when using data descriptor)
-            let crc_valid = if crc32 != 0 && compressed_size > 0 && (flags & 0x08) == 0 {
-                validate_zip_crc(input, data_offset, compressed_size, crc32)?
+            // A CRC value of zero is valid (rare, but possible). Skip local
+            // header validation only when bit 3 says the authoritative CRC is
+            // carried in a following data descriptor.
+            let crc_valid = if (flags & 0x08) == 0 {
+                validate_zip_crc(input, data_offset, compressed_size, method, crc32)?
             } else {
                 true
             };
@@ -487,22 +489,32 @@ fn validate_zip_crc(
     input: &mut std::fs::File,
     offset: u64,
     size: u32,
+    method: u16,
     expected_crc: u32,
 ) -> anyhow::Result<bool> {
     input.seek(SeekFrom::Start(offset))?;
+    let limited = input.take(size as u64);
+    let actual_crc = match method {
+        0 => crc32_reader(limited)?,
+        8 => crc32_reader(flate2::read::DeflateDecoder::new(limited))?,
+        // Recovery preserves unsupported methods verbatim, but cannot verify
+        // their uncompressed CRC without a decoder.
+        _ => return Ok(true),
+    };
+    Ok(actual_crc == expected_crc)
+}
+
+fn crc32_reader(mut reader: impl Read) -> anyhow::Result<u32> {
     let mut hasher = crc32fast::Hasher::new();
-    let mut remaining = size as u64;
     let mut buf = [0u8; 64 * 1024];
-    while remaining > 0 {
-        let to_read = (remaining as usize).min(buf.len());
-        let n = input.read(&mut buf[..to_read])?;
+    loop {
+        let n = reader.read(&mut buf)?;
         if n == 0 {
             break;
         }
         hasher.update(&buf[..n]);
-        remaining -= n as u64;
     }
-    Ok(hasher.finalize() == expected_crc)
+    Ok(hasher.finalize())
 }
 
 // ==========================================================================
@@ -786,8 +798,17 @@ fn recover_ace(
                 header_body[6],
             ]) as u64;
 
-            let data_start = pos + 4 + head_size;
-            let data_end = data_start + pack_size;
+            let Some(data_start) = pos
+                .checked_add(4)
+                .and_then(|value| value.checked_add(head_size))
+            else {
+                pos += 1;
+                continue;
+            };
+            let Some(data_end) = data_start.checked_add(pack_size) else {
+                pos += 1;
+                continue;
+            };
 
             if data_end > file_size {
                 pos += 1;

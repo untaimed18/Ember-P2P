@@ -11,6 +11,60 @@ use crate::types::AppSettings;
 const NODES_DAT_URL: &str = "https://upd.emule-security.org/nodes.dat";
 const IPFILTER_URL: &str = "https://upd.emule-security.org/ipfilter.dat";
 
+fn normalized_path_components(path: &std::path::Path) -> Vec<String> {
+    path.components()
+        .map(|component| {
+            let value = component.as_os_str().to_string_lossy().into_owned();
+            if cfg!(target_os = "windows") {
+                value.to_ascii_lowercase()
+            } else {
+                value
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn shared_paths_overlap(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let a = normalized_path_components(a);
+    let b = normalized_path_components(b);
+    a == b || (a.len() < b.len() && b.starts_with(&a)) || (b.len() < a.len() && a.starts_with(&b))
+}
+
+fn normalize_shared_folders(folders: Vec<String>) -> Result<Vec<String>, String> {
+    let mut normalized: Vec<std::path::PathBuf> = Vec::with_capacity(folders.len());
+    for folder in folders {
+        let canonical = std::path::Path::new(&folder).canonicalize().map_err(|e| {
+            coded_ctx(
+                "settings_shared_folder_invalid",
+                format!("Shared folder cannot be resolved: {folder}"),
+                e,
+            )
+        })?;
+        let canonical_components = normalized_path_components(&canonical);
+        if normalized
+            .iter()
+            .any(|existing| normalized_path_components(existing) == canonical_components)
+        {
+            continue;
+        }
+        if let Some(existing) = normalized
+            .iter()
+            .find(|existing| shared_paths_overlap(existing, &canonical))
+        {
+            return Err(coded_ctx(
+                "settings_shared_folder_overlap",
+                "Shared folders must not overlap",
+                format!("{} and {}", existing.display(), canonical.display()),
+            ));
+        }
+        normalized.push(canonical);
+    }
+    Ok(normalized
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect())
+}
+
 #[tauri::command]
 pub async fn get_settings(state: tauri::State<'_, AppState>) -> Result<AppSettings, String> {
     let config = state.config.read().await;
@@ -424,6 +478,11 @@ pub async fn update_settings(
         .collect::<String>()
         .trim()
         .to_string();
+    let shared_folders = std::mem::take(&mut settings.shared_folders);
+    settings.shared_folders =
+        tokio::task::spawn_blocking(move || normalize_shared_folders(shared_folders))
+            .await
+            .map_err(|e| coded_ctx("settings_validation_task_failed", "Validation failed", e))??;
     {
         let settings_for_validation = settings.clone();
         tokio::task::spawn_blocking(move || validate_settings(&settings_for_validation))
@@ -889,5 +948,17 @@ mod tests {
         if let Err(e) = validate_settings(&AppSettings::default()) {
             panic!("AppSettings::default() must satisfy validate_settings, got: {e}");
         }
+    }
+
+    #[test]
+    fn shared_folder_overlap_uses_component_boundaries() {
+        assert!(shared_paths_overlap(
+            std::path::Path::new("root/media"),
+            std::path::Path::new("root/media/movies"),
+        ));
+        assert!(!shared_paths_overlap(
+            std::path::Path::new("root/media"),
+            std::path::Path::new("root/media-old"),
+        ));
     }
 }

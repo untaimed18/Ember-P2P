@@ -576,8 +576,16 @@ pub fn atomic_write(final_path: &Path, data: &[u8], restrict: bool) -> std::io::
             .truncate(true)
             .mode(mode)
             .open(&tmp)?;
-        f.write_all(data)?;
-        f.sync_all()?;
+        if let Err(e) = f.write_all(data) {
+            drop(f);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        if let Err(e) = f.sync_all() {
+            drop(f);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
         drop(f);
     }
     #[cfg(not(unix))]
@@ -839,13 +847,18 @@ pub fn is_invisible_or_bidi_control_pub(c: char) -> bool {
 
 fn is_invisible_or_bidi_control(c: char) -> bool {
     matches!(c,
+        // Arabic letter mark (bidi control).
+        '\u{061C}'
         // Mongolian vowel separator: invisible, used in some
         // historical spoofing payloads.
-        '\u{180E}'
+        | '\u{180E}'
         // Zero-width spaces, joiners, LTR/RTL marks.
         | '\u{200B}'..='\u{200F}'
         // LTR/RTL embedding, pop, override.
         | '\u{202A}'..='\u{202E}'
+        // Unicode line/paragraph separators can visually split a one-line
+        // filename or display name without being caught by `is_control`.
+        | '\u{2028}' | '\u{2029}'
         // Word joiner, function application, invisible separator
         // / times / plus.
         | '\u{2060}'..='\u{2064}'
@@ -946,6 +959,9 @@ mod tests {
         assert_eq!(sanitize_display_name("Carol\u{2066}\u{2069}"), "Carol");
         assert_eq!(sanitize_display_name("Dave\u{FEFF}"), "Dave");
         assert_eq!(sanitize_display_name("E\u{202A}v\u{202C}e"), "Eve");
+        assert_eq!(sanitize_display_name("A\u{061C}rabic"), "Arabic");
+        assert_eq!(sanitize_display_name("Line\u{2028}Break"), "LineBreak");
+        assert_eq!(sanitize_display_name("Para\u{2029}Break"), "ParaBreak");
         // Variation selectors are also dropped.
         assert_eq!(sanitize_display_name("Frank\u{FE0F}"), "Frank");
         // A nickname that's purely invisible chars falls back like

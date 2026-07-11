@@ -426,6 +426,7 @@ impl SpamFilter {
                                     .collect();
                                 for k in to_drop {
                                     db.udp_server_spam_ratios.remove(&k);
+                                    db.spam_server_ips.remove(&k);
                                 }
                             }
                             info!(
@@ -874,6 +875,7 @@ impl SpamFilter {
                     .map(|(k, _)| k.clone())
                 {
                     self.db.udp_server_spam_ratios.remove(&lowest_key);
+                    self.db.spam_server_ips.remove(&lowest_key);
                 }
             }
         }
