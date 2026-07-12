@@ -584,6 +584,15 @@ impl Database {
             tx.commit()?;
         }
 
+        if version < 20 {
+            // Link eD2K SecIdent credit rows to Ember node ids so the Known
+            // Clients tab can mark friends (friends are keyed by ember hash).
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(&tx, "credits", "ember_hash", "BLOB")?;
+            set_version(&tx, 20)?;
+            tx.commit()?;
+        }
+
         Ok(())
     }
 
@@ -1045,9 +1054,13 @@ impl Database {
         Ok(())
     }
 
-    pub fn load_credits(&self) -> anyhow::Result<Vec<([u8; 16], u64, u64, i64, Vec<u8>, u32, u8)>> {
+    pub fn load_credits(
+        &self,
+    ) -> anyhow::Result<Vec<([u8; 16], u64, u64, i64, Vec<u8>, u32, u8, Option<[u8; 16]>)>> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare("SELECT user_hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state FROM credits")?;
+        let mut stmt = conn.prepare(
+            "SELECT user_hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state, ember_hash FROM credits",
+        )?;
         let records = stmt
             .query_map([], |row| {
                 let hash_blob: Vec<u8> = row.get(0)?;
@@ -1060,6 +1073,16 @@ impl Database {
                 }
                 let mut hash = [0u8; 16];
                 hash.copy_from_slice(&hash_blob[..16]);
+                let ember_blob: Option<Vec<u8>> = row.get(7)?;
+                let ember_hash = ember_blob.and_then(|b| {
+                    if b.len() == 16 {
+                        let mut eh = [0u8; 16];
+                        eh.copy_from_slice(&b);
+                        Some(eh)
+                    } else {
+                        None
+                    }
+                });
                 Ok((
                     hash,
                     row.get::<_, i64>(1)?.max(0) as u64,
@@ -1070,6 +1093,7 @@ impl Database {
                     // u32 range defensively in case of a malformed row.
                     row.get::<_, i64>(5)?.clamp(0, u32::MAX as i64) as u32,
                     row.get::<_, i64>(6)?.clamp(0, u8::MAX as i64) as u8,
+                    ember_hash,
                 ))
             })?
             .filter_map(|r| match r {
@@ -1254,16 +1278,16 @@ impl Database {
     #[allow(dead_code)]
     pub fn save_all_credits(
         &self,
-        credits: &[(&[u8; 16], u64, u64, i64, &[u8], u32, u8)],
+        credits: &[(&[u8; 16], u64, u64, i64, &[u8], u32, u8, Option<&[u8; 16]>)],
     ) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
         tx.execute("DELETE FROM credits", [])?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO credits (user_hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+                "INSERT INTO credits (user_hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state, ember_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
             )?;
-            for (hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state) in
+            for (hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state, ember_hash) in
                 credits
             {
                 stmt.execute(params![
@@ -1273,7 +1297,8 @@ impl Database {
                     *last_seen,
                     *public_key,
                     i64::from(*ident_ip),
-                    i64::from(*ident_state)
+                    i64::from(*ident_state),
+                    ember_hash.map(|eh| eh.as_slice()),
                 ])?;
             }
         }
@@ -1356,7 +1381,7 @@ impl Database {
     #[allow(clippy::type_complexity)]
     pub fn save_all_credits_with_ember(
         &self,
-        credits: &[(&[u8; 16], u64, u64, i64, &[u8], u32, u8)],
+        credits: &[(&[u8; 16], u64, u64, i64, &[u8], u32, u8, Option<&[u8; 16]>)],
         ember_credits: &[(&[u8; 32], u64, u64, i64, i64, u32, u32, u64, i64, bool)],
     ) -> anyhow::Result<()> {
         let conn = self.conn.lock();
@@ -1364,9 +1389,9 @@ impl Database {
         tx.execute("DELETE FROM credits", [])?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO credits (user_hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+                "INSERT INTO credits (user_hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state, ember_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
             )?;
-            for (hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state) in
+            for (hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state, ember_hash) in
                 credits
             {
                 stmt.execute(params![
@@ -1376,7 +1401,8 @@ impl Database {
                     *last_seen,
                     *public_key,
                     i64::from(*ident_ip),
-                    i64::from(*ident_state)
+                    i64::from(*ident_state),
+                    ember_hash.map(|eh| eh.as_slice()),
                 ])?;
             }
         }
@@ -2050,7 +2076,8 @@ mod tests {
                 last_seen INTEGER NOT NULL DEFAULT 0,
                 public_key BLOB NOT NULL DEFAULT x'',
                 ident_ip INTEGER NOT NULL DEFAULT 0,
-                ident_state INTEGER NOT NULL DEFAULT 0
+                ident_state INTEGER NOT NULL DEFAULT 0,
+                ember_hash BLOB
             );",
         )
         .expect("create schema");
@@ -2077,9 +2104,9 @@ mod tests {
 
         // Seed three records.
         db.save_all_credits(&[
-            (&h1, 100, 200, 1_700_000_000, pk, 0, 0),
-            (&h2, 300, 400, 1_700_000_001, pk, 0x0102_0304, 1),
-            (&h3, 500, 600, 1_700_000_002, pk, 0, 0),
+            (&h1, 100, 200, 1_700_000_000, pk, 0, 0, None),
+            (&h2, 300, 400, 1_700_000_001, pk, 0x0102_0304, 1, None),
+            (&h3, 500, 600, 1_700_000_002, pk, 0, 0, None),
         ])
         .expect("seed");
         let loaded = db.load_credits().expect("reload after seed");
@@ -2088,7 +2115,7 @@ mod tests {
         // Re-save with only one of the three. The other two represent
         // stale records the in-memory pruner has just dropped — they
         // must NOT survive in the database.
-        db.save_all_credits(&[(&h2, 999, 888, 1_700_000_999, pk, 0x0102_0304, 1)])
+        db.save_all_credits(&[(&h2, 999, 888, 1_700_000_999, pk, 0x0102_0304, 1, None)])
             .expect("replace");
         let after = db.load_credits().expect("reload after replace");
         assert_eq!(after.len(), 1, "stale records must not persist");
@@ -2111,7 +2138,7 @@ mod tests {
     fn save_all_credits_with_empty_input_clears_table() {
         let db = credits_only_db();
         let h1 = [0x01u8; 16];
-        db.save_all_credits(&[(&h1, 1, 1, 0, &[], 0, 0)])
+        db.save_all_credits(&[(&h1, 1, 1, 0, &[], 0, 0, None)])
             .expect("seed");
         assert_eq!(db.load_credits().expect("reload").len(), 1);
 

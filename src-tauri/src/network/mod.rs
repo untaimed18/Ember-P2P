@@ -3307,6 +3307,9 @@ struct NetworkState {
     /// until the first send this session, so the first `SharedFilesChanged`
     /// after connecting always sends unconditionally.
     last_offer_files_signature: Option<(usize, u64)>,
+    /// Hashes successfully included in an `OP_OFFERFILES` this server session.
+    /// Drives the Library eD2K "published" badge (connection alone is not enough).
+    offered_ed2k_hashes: HashSet<[u8; 16]>,
     /// Round-robin cursor for TCP OP_GETSOURCES batching across downloads.
     server_tcp_getsources_cursor: usize,
     /// Unix-seconds timestamp of the most recent successful server login.
@@ -3645,6 +3648,48 @@ fn offer_files_signature(files: &[ed2k::server::OfferFile]) -> (usize, u64) {
         fold ^= h.finish();
     }
     (files.len(), fold)
+}
+
+fn parse_ed2k_hash16(hash_hex: &str) -> Option<[u8; 16]> {
+    let bytes = hex::decode(hash_hex).ok()?;
+    if bytes.len() < 16 {
+        return None;
+    }
+    let mut h = [0u8; 16];
+    h.copy_from_slice(&bytes[..16]);
+    Some(h)
+}
+
+/// Set Library KAD / eD2K badges from real publish/offer state, not mere connectivity.
+fn apply_publish_badges(
+    files: &mut [FileInfo],
+    kad_connected: bool,
+    server_connected: bool,
+    kad_published: &HashSet<[u8; 16]>,
+    ed2k_offered: &HashSet<[u8; 16]>,
+) {
+    for f in files {
+        let hash = parse_ed2k_hash16(&f.hash);
+        f.shared_kad = f.shared
+            && kad_connected
+            && hash
+                .map(|h| kad_published.contains(&h))
+                .unwrap_or(false);
+        f.shared_ed2k = f.shared
+            && server_connected
+            && hash.map(|h| ed2k_offered.contains(&h)).unwrap_or(false);
+    }
+}
+
+fn record_offered_ed2k_hashes(state: &mut NetworkState, files: &[ed2k::server::OfferFile]) {
+    for f in files {
+        state.offered_ed2k_hashes.insert(f.hash);
+    }
+}
+
+fn replace_offered_ed2k_hashes(state: &mut NetworkState, files: &[ed2k::server::OfferFile]) {
+    state.offered_ed2k_hashes.clear();
+    record_offered_ed2k_hashes(state, files);
 }
 
 /// Filter search results by file type, matching eMule's AddToList behavior:
@@ -4029,6 +4074,7 @@ async fn handle_server_disconnect(
     // or the first offer after reconnecting could be wrongly skipped as
     // "unchanged" when the new server session has never seen it.
     state.last_offer_files_signature = None;
+    state.offered_ed2k_hashes.clear();
     *shared_server_addr.write().await = None;
     if let Some(mut pending) = state.pending_server_search.take() {
         let request_id = pending.request_id;
@@ -4096,6 +4142,7 @@ async fn initiate_server_connect(
         // See `handle_server_disconnect`: the next connection is a
         // fresh session that hasn't seen any offer we sent before.
         state.last_offer_files_signature = None;
+        state.offered_ed2k_hashes.clear();
         let _ = app_handle.emit(
             "server-status-changed",
             serde_json::json!({ "status": "disconnected" }),
@@ -4209,7 +4256,7 @@ async fn flush_credit_state(
     let (serialized_bytes, owned, ember_owned) = {
         let cm = credit_manager.read().await;
         let bytes = cm.serialize();
-        let records: Vec<([u8; 16], u64, u64, i64, Vec<u8>, u32, u8)> = cm
+        let records: Vec<([u8; 16], u64, u64, i64, Vec<u8>, u32, u8, Option<[u8; 16]>)> = cm
             .all_records()
             .iter()
             .map(|r| {
@@ -4221,6 +4268,7 @@ async fn flush_credit_state(
                     r.public_key.clone(),
                     r.ident_ip,
                     r.ident_state.to_u8(),
+                    r.ember_hash,
                 )
             })
             .collect();
@@ -4256,9 +4304,9 @@ async fn flush_credit_state(
     let data_dir = data_dir.to_path_buf();
     let save_result = tokio::task::spawn_blocking(move || {
         let _ownership = ownership;
-        let refs: Vec<(&[u8; 16], u64, u64, i64, &[u8], u32, u8)> = owned
+        let refs: Vec<(&[u8; 16], u64, u64, i64, &[u8], u32, u8, Option<&[u8; 16]>)> = owned
             .iter()
-            .map(|(h, u, d, l, p, ip, st)| (h, *u, *d, *l, p.as_slice(), *ip, *st))
+            .map(|(h, u, d, l, p, ip, st, eh)| (h, *u, *d, *l, p.as_slice(), *ip, *st, eh.as_ref()))
             .collect();
         // Persist both credit tables in ONE SQLite transaction so they can
         // never diverge across a crash or partial failure.
@@ -4956,12 +5004,36 @@ async fn upload_queue_snapshot(
 /// tab. Reads every persisted SecIdent credit record (eMule's
 /// clients.met) so this tab is the lifetime view of every peer we've
 /// ever traded credit with — independent of which peers happen to be
-/// connected right now.
+/// connected right now. Friend markers use the Ember node id bound to
+/// each credit row (not the eD2K user hash).
 async fn known_clients_snapshot(
     credit_manager: &Arc<RwLock<ed2k::credits::CreditManager>>,
+    friend_hashes: &crate::app_state::SharedFriendHashes,
+    upload_queue: &ed2k::upload::UploadQueueRef,
     geoip: &crate::geoip::GeoIpReader,
 ) -> Vec<crate::types::KnownClient> {
+    // Live queue bindings fill gaps for peers we verified this session
+    // before the credit flush lands (and for older DB rows that predate
+    // the ember_hash column).
+    let mut live_ember: std::collections::HashMap<[u8; 16], [u8; 16]> =
+        std::collections::HashMap::new();
+    {
+        let q = upload_queue.lock().await;
+        for entry in q.iter() {
+            if entry.user_hash == [0u8; 16] || !entry.ember_verified {
+                continue;
+            }
+            if let Some(pk) = entry.ember_pubkey {
+                let hash = blake3::hash(&pk);
+                let mut ember_id = [0u8; 16];
+                ember_id.copy_from_slice(&hash.as_bytes()[..16]);
+                live_ember.insert(entry.user_hash, ember_id);
+            }
+        }
+    }
+
     let cm = credit_manager.read().await;
+    let friends = friend_hashes.read().await;
     let mut out: Vec<crate::types::KnownClient> = cm
         .all_records()
         .iter()
@@ -4983,6 +5055,12 @@ async fn known_clients_snapshot(
             } else {
                 None
             };
+            let ember = record
+                .ember_hash
+                .or_else(|| live_ember.get(&record.user_hash).copied());
+            let is_friend = ember
+                .map(|eh| friends.contains(&eh))
+                .unwrap_or(false);
             crate::types::KnownClient {
                 user_hash: hex::encode(record.user_hash),
                 downloaded: record.downloaded,
@@ -4993,6 +5071,8 @@ async fn known_clients_snapshot(
                 last_known_ip,
                 country_code,
                 has_public_key: !record.public_key.is_empty(),
+                ember_hash: ember.map(hex::encode),
+                is_friend,
             }
         })
         .collect();
@@ -5673,6 +5753,7 @@ pub async fn start_network(
         server_udp_source_reask_at: HashMap::new(),
         pending_udp_reasks: HashMap::new(),
         last_offer_files_signature: None,
+        offered_ed2k_hashes: HashSet::new(),
         server_tcp_getsources_cursor: 0,
         server_connected_at: 0,
         starved_server_reask_at: std::collections::HashMap::new(),
@@ -6018,7 +6099,7 @@ pub async fn start_network(
         let mut cm = CreditManager::new();
         cm.load_or_create_keypair(&data_dir);
         if let Ok(records) = db.load_credits() {
-            for (hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state) in
+            for (hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state, ember_hash) in
                 records
             {
                 // `get_or_create` bumps `last_seen` to "now" — the right
@@ -6039,6 +6120,7 @@ pub async fn start_network(
                 // reconnects.
                 record.ident_ip = ident_ip;
                 record.ident_state = ed2k::credits::IdentState::from_u8(ident_state);
+                record.ember_hash = ember_hash;
             }
             info!(
                 "Loaded {} credit records from database",
@@ -7080,17 +7162,26 @@ pub async fn start_network(
                     info!("Part file ready for {} ({}) — offering to server and publishing to KAD",
                         transfer_id, hex::encode(file_hash));
                     if state.server_connected {
-                        if let Some(conn) = state.server_connection.as_mut() {
-                            let offer = vec![ed2k::server::OfferFile {
-                                hash: *file_hash,
-                                name: file_name.clone(),
-                                size: file_size,
-                                is_complete: false,
-                                file_type: String::new(),
-                            }];
-                            if let Err(e) = conn.offer_files(&offer, settings.tcp_port).await {
-                                debug!("Failed to offer new partial to server: {e}");
+                        let offer = vec![ed2k::server::OfferFile {
+                            hash: *file_hash,
+                            name: file_name.clone(),
+                            size: file_size,
+                            is_complete: false,
+                            file_type: String::new(),
+                        }];
+                        let offered_ok = if let Some(conn) = state.server_connection.as_mut() {
+                            match conn.offer_files(&offer, settings.tcp_port).await {
+                                Ok(()) => true,
+                                Err(e) => {
+                                    debug!("Failed to offer new partial to server: {e}");
+                                    false
+                                }
                             }
+                        } else {
+                            false
+                        };
+                        if offered_ok {
+                            record_offered_ed2k_hashes(&mut state, &offer);
                         }
                     }
                     let kad_hash = md4_bytes_to_kad_id(file_hash);
@@ -7378,13 +7469,15 @@ pub async fn start_network(
                                     let mut snap = local_index.read().await.all_files().to_vec();
                                     let kad_connected =
                                         state.stats.status == NetworkStatus::Connected;
-                                    for file in &mut snap {
-                                        file.shared_kad =
-                                            file.shared && kad_connected && !file.hash.is_empty();
-                                        file.shared_ed2k = file.shared
-                                            && state.server_connected
-                                            && !file.hash.is_empty();
-                                    }
+                                    let kad_published =
+                                        state.publish_manager.source_published_md4_hashes();
+                                    apply_publish_badges(
+                                        &mut snap,
+                                        kad_connected,
+                                        state.server_connected,
+                                        &kad_published,
+                                        &state.offered_ed2k_hashes,
+                                    );
                                     *shared_files.write().await = snap;
                                 }
 
@@ -7409,17 +7502,28 @@ pub async fn start_network(
 
                                     // Offer to eD2K server
                                     if state.server_connected {
-                                        if let Some(conn) = state.server_connection.as_mut() {
-                                            let offer = vec![ed2k::server::OfferFile {
-                                                hash: fh,
-                                                name: shared_file.name.clone(),
-                                                size: shared_file.size,
-                                                is_complete: true,
-                                                file_type: String::new(),
-                                            }];
-                                            if let Err(e) = conn.offer_files(&offer, state.tcp_port).await {
-                                                debug!("Failed to offer completed download to server: {e}");
-                                            }
+                                        let offer = vec![ed2k::server::OfferFile {
+                                            hash: fh,
+                                            name: shared_file.name.clone(),
+                                            size: shared_file.size,
+                                            is_complete: true,
+                                            file_type: String::new(),
+                                        }];
+                                        let offered_ok =
+                                            if let Some(conn) = state.server_connection.as_mut() {
+                                                match conn.offer_files(&offer, state.tcp_port).await
+                                                {
+                                                    Ok(()) => true,
+                                                    Err(e) => {
+                                                        debug!("Failed to offer completed download to server: {e}");
+                                                        false
+                                                    }
+                                                }
+                                            } else {
+                                                false
+                                            };
+                                        if offered_ok {
+                                            record_offered_ed2k_hashes(&mut state, &offer);
                                         }
                                     }
                                 }
@@ -17024,6 +17128,10 @@ pub async fn start_network(
                                 info!("Offering {} files to server ({} complete, {} partial)", offer_files.len(), complete_count, partial_count);
                                 if let Err(e) = conn.offer_files(&offer_files, settings.tcp_port).await {
                                     debug!("Failed to send OP_OFFERFILES: {e}");
+                                } else {
+                                    replace_offered_ed2k_hashes(&mut state, &offer_files);
+                                    state.last_offer_files_signature =
+                                        Some(offer_files_signature(&offer_files));
                                 }
                             } else {
                                 warn!("No files to offer to server after login — check shared folders");
@@ -18164,6 +18272,14 @@ pub async fn start_network(
                 // source-asking and reads zero on KAD/Ember-only runs.
                 stats_manager.drain_sx_counters();
                 stats_manager.record_rate(chrono::Utc::now().timestamp());
+                // Keep the Statistics IPC cache in lock-step with the 1s rate
+                // tick. The heavy 5s cache refresh can skip while a prior write
+                // is still running; without this, the page lagged several
+                // seconds behind StatsManager under load.
+                {
+                    let snap = stats_manager.get_stats();
+                    *shared_transfer_stats.write().await = snap;
+                }
                 state.ip_filter.collect_shared_hits(&shared_ip_filter);
                 for (transfer_id, injected, remaining) in drain_active_source_overflow(&mut state) {
                     debug!(
@@ -18833,14 +18949,19 @@ pub async fn start_network(
                     let s_files = shared_files.clone();
                     let kad_connected = state.stats.status == NetworkStatus::Connected;
                     let srv_connected = state.server_connected;
+                    let kad_published = state.publish_manager.source_published_md4_hashes();
+                    let ed2k_offered = state.offered_ed2k_hashes.clone();
                     tokio::spawn(async move {
                         let file_snap = {
                             let index = li_ref.read().await;
                             let mut snap = index.all_files().to_vec();
-                            for f in &mut snap {
-                                f.shared_kad = f.shared && kad_connected && !f.hash.is_empty();
-                                f.shared_ed2k = f.shared && srv_connected && !f.hash.is_empty();
-                            }
+                            apply_publish_badges(
+                                &mut snap,
+                                kad_connected,
+                                srv_connected,
+                                &kad_published,
+                                &ed2k_offered,
+                            );
                             snap
                         };
                         *s_files.write().await = file_snap;
@@ -19330,6 +19451,8 @@ pub async fn start_network(
                 let li_ref = local_index.clone();
                 let kad_connected = state.stats.status == NetworkStatus::Connected;
                 let srv_connected = state.server_connected;
+                let kad_published = state.publish_manager.source_published_md4_hashes();
+                let ed2k_offered = state.offered_ed2k_hashes.clone();
                 last_cache_refresh_started_at = chrono::Utc::now().timestamp();
                 cache_write_handle = Some(tokio::spawn(async move {
                     // Merge all-time stats from known.met into local_index, then
@@ -19343,10 +19466,13 @@ pub async fn start_network(
                             index.update_alltime_stats(&hash_hex, *reqs, *accepted, *transferred);
                         }
                         let mut snap = index.all_files().to_vec();
-                        for f in &mut snap {
-                            f.shared_kad = f.shared && kad_connected && !f.hash.is_empty();
-                            f.shared_ed2k = f.shared && srv_connected && !f.hash.is_empty();
-                        }
+                        apply_publish_badges(
+                            &mut snap,
+                            kad_connected,
+                            srv_connected,
+                            &kad_published,
+                            &ed2k_offered,
+                        );
                         snap
                     };
                     // Do the expensive hex/distance conversions here, off the event loop
@@ -24542,6 +24668,10 @@ async fn handle_command_inner(
                 if let Ok(mut set) = shared_banned_hashes.write() {
                     set.insert(kad_id.0);
                 }
+                // Keep ReputationManager in sync so Trust badges and
+                // reputation-gated connect paths see the manual ban
+                // immediately (UnbanPeer already cleared this side).
+                state.reputation.apply_manual_ban(&kad_id.0);
             }
         }
 
@@ -24806,7 +24936,8 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::GetKnownClientsSnapshot { tx } => {
-            let snap = known_clients_snapshot(credit_manager, geoip).await;
+            let snap =
+                known_clients_snapshot(credit_manager, friend_hashes, upload_queue, geoip).await;
             let _ = tx.send(snap);
         }
 
@@ -26230,77 +26361,89 @@ async fn handle_command_inner(
 
             // eMule: re-send OP_OFFERFILES to the server when shared files change
             if state.server_connected {
-                if let Some(conn) = state.server_connection.as_mut() {
-                    let mut seen_offer_hashes = std::collections::HashSet::new();
-                    let mut offer_files: Vec<ed2k::server::OfferFile> = all_index_files
-                        .iter()
-                        .filter(|f| f.shared)
-                        .filter_map(|f| {
-                            if f.hash.is_empty() || !seen_offer_hashes.insert(f.hash.clone()) {
-                                return None;
-                            }
-                            let hash_bytes = hex::decode(&f.hash).ok()?;
-                            if hash_bytes.len() < 16 {
-                                return None;
-                            }
-                            let mut h = [0u8; 16];
-                            h.copy_from_slice(&hash_bytes[..16]);
-                            Some(ed2k::server::OfferFile {
-                                hash: h,
-                                name: f.name.clone(),
-                                size: f.size,
-                                is_complete: true,
-                                file_type: String::new(),
-                            })
-                        })
-                        .collect();
-                    let temp_dir = PathBuf::from(&settings.download_folder).join("Temp");
-                    {
-                        let mgr = transfer_manager.read().await;
-                        for transfer in mgr.active.values().chain(mgr.queue.iter()) {
-                            if transfer.direction != TransferDirection::Download {
-                                continue;
-                            }
-                            if matches!(
-                                transfer.status,
-                                TransferStatus::Completed | TransferStatus::Failed
-                            ) {
-                                continue;
-                            }
-                            if transfer.file_hash.is_empty()
-                                || !seen_offer_hashes.insert(transfer.file_hash.clone())
-                            {
-                                continue;
-                            }
-                            let hash_bytes = match hex::decode(&transfer.file_hash) {
-                                Ok(bytes) if bytes.len() >= 16 => bytes,
-                                _ => continue,
-                            };
-                            let part_path = temp_dir.join(format!("{}.part", transfer.id));
-                            if !part_path.exists() {
-                                continue;
-                            }
-                            let mut h = [0u8; 16];
-                            h.copy_from_slice(&hash_bytes[..16]);
-                            offer_files.push(ed2k::server::OfferFile {
-                                hash: h,
-                                name: transfer.file_name.clone(),
-                                size: transfer.total_size,
-                                is_complete: false,
-                                file_type: String::new(),
-                            });
+                let mut seen_offer_hashes = std::collections::HashSet::new();
+                let mut offer_files: Vec<ed2k::server::OfferFile> = all_index_files
+                    .iter()
+                    .filter(|f| f.shared)
+                    .filter_map(|f| {
+                        if f.hash.is_empty() || !seen_offer_hashes.insert(f.hash.clone()) {
+                            return None;
                         }
+                        let hash_bytes = hex::decode(&f.hash).ok()?;
+                        if hash_bytes.len() < 16 {
+                            return None;
+                        }
+                        let mut h = [0u8; 16];
+                        h.copy_from_slice(&hash_bytes[..16]);
+                        Some(ed2k::server::OfferFile {
+                            hash: h,
+                            name: f.name.clone(),
+                            size: f.size,
+                            is_complete: true,
+                            file_type: String::new(),
+                        })
+                    })
+                    .collect();
+                let temp_dir = PathBuf::from(&settings.download_folder).join("Temp");
+                {
+                    let mgr = transfer_manager.read().await;
+                    for transfer in mgr.active.values().chain(mgr.queue.iter()) {
+                        if transfer.direction != TransferDirection::Download {
+                            continue;
+                        }
+                        if matches!(
+                            transfer.status,
+                            TransferStatus::Completed | TransferStatus::Failed
+                        ) {
+                            continue;
+                        }
+                        if transfer.file_hash.is_empty()
+                            || !seen_offer_hashes.insert(transfer.file_hash.clone())
+                        {
+                            continue;
+                        }
+                        let hash_bytes = match hex::decode(&transfer.file_hash) {
+                            Ok(bytes) if bytes.len() >= 16 => bytes,
+                            _ => continue,
+                        };
+                        let part_path = temp_dir.join(format!("{}.part", transfer.id));
+                        if !part_path.exists() {
+                            continue;
+                        }
+                        let mut h = [0u8; 16];
+                        h.copy_from_slice(&hash_bytes[..16]);
+                        offer_files.push(ed2k::server::OfferFile {
+                            hash: h,
+                            name: transfer.file_name.clone(),
+                            size: transfer.total_size,
+                            is_complete: false,
+                            file_type: String::new(),
+                        });
                     }
-                    let signature = offer_files_signature(&offer_files);
-                    if state.last_offer_files_signature == Some(signature) {
-                        debug!(
-                            "Skipping OP_OFFERFILES resend: offer set unchanged ({} files)",
-                            offer_files.len()
-                        );
-                    } else if let Err(e) = conn.offer_files(&offer_files, settings.tcp_port).await {
-                        debug!("Failed to re-send OP_OFFERFILES: {e}");
-                    } else {
+                }
+                let signature = offer_files_signature(&offer_files);
+                if state.last_offer_files_signature == Some(signature) {
+                    debug!(
+                        "Skipping OP_OFFERFILES resend: offer set unchanged ({} files)",
+                        offer_files.len()
+                    );
+                    // Still refresh the badge set — e.g. after reconnect bookkeeping
+                    // or a process where the signature survived but the set was cleared.
+                    replace_offered_ed2k_hashes(state, &offer_files);
+                } else {
+                    let send_ok = match state.server_connection.as_mut() {
+                        Some(conn) => match conn.offer_files(&offer_files, settings.tcp_port).await {
+                            Ok(()) => true,
+                            Err(e) => {
+                                debug!("Failed to re-send OP_OFFERFILES: {e}");
+                                false
+                            }
+                        },
+                        None => false,
+                    };
+                    if send_ok {
                         state.last_offer_files_signature = Some(signature);
+                        replace_offered_ed2k_hashes(state, &offer_files);
                     }
                 }
             }
@@ -27145,20 +27288,35 @@ async fn handle_command_inner(
             // shows the same score the tracker would act on, not a stale
             // pre-decay value.
             state.reputation.maybe_decay();
-            let info = state.reputation.get_peer(&user_hash).map(|p| {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                PeerReputationInfo {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let manual_banned = shared_banned_hashes
+                .read()
+                .map(|s| s.contains(&user_hash))
+                .unwrap_or(false);
+            let info = match state.reputation.get_peer(&user_hash) {
+                Some(p) => Some(PeerReputationInfo {
                     score: p.score,
                     successful_transfers: p.successful_transfers,
                     failed_transfers: p.failed_transfers,
-                    is_banned: p.is_banned(now),
+                    is_banned: p.is_banned(now) || manual_banned,
                     first_seen: p.first_seen,
                     last_interaction: p.last_interaction,
-                }
-            });
+                }),
+                // Manual ban with no tracker history still needs a row so
+                // the Known Clients Trust column shows "banned".
+                None if manual_banned => Some(PeerReputationInfo {
+                    score: 0,
+                    successful_transfers: 0,
+                    failed_transfers: 0,
+                    is_banned: true,
+                    first_seen: now,
+                    last_interaction: now,
+                }),
+                None => None,
+            };
             let _ = tx.send(info);
         }
 
@@ -27533,7 +27691,6 @@ async fn handle_download_event(
             final_path,
             ..
         } => {
-            stats_manager.record_completed_download();
             // A download reaches Completed only after every part is present
             // and hash-verified, so the terminal row represents the whole
             // file. Persist 100% / full bytes (not the last in-memory progress
@@ -27545,7 +27702,7 @@ async fn handle_download_event(
                 mgr.get_transfer(&transfer_id).map(|t| t.total_size)
             };
             db_progress_last_persist.remove(&transfer_id);
-            if let Some(promoted) = {
+            let completed_ok = if let Some(promoted) = {
                 let mut mgr = transfer_manager.write().await;
                 // Record the real on-disk path (possibly deduplicated by
                 // `move_part_to_final`) BEFORE `complete()` moves the row out
@@ -27556,6 +27713,10 @@ async fn handle_download_event(
                 }
                 mgr.complete(&transfer_id)
             } {
+                // Mirror the upload path: only count after `complete()`
+                // confirms the transfer existed. Counting beforehand
+                // over-reported on duplicate/stale Completed events.
+                stats_manager.record_completed_download();
                 for t in &promoted {
                     info!(
                         "Promoted queued transfer {} ({}) to active",
@@ -27563,8 +27724,17 @@ async fn handle_download_event(
                     );
                 }
                 promoted_out.extend(promoted);
+                true
             } else {
                 warn!("Completed event for transfer {transfer_id} not found in active set");
+                false
+            };
+
+            // Skip history/DB completion work when the transfer was already
+            // gone — those paths would otherwise write a second "completed"
+            // history row for a phantom event.
+            if !completed_ok {
+                return;
             }
 
             let history_row = {

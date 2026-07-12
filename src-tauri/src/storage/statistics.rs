@@ -19,6 +19,10 @@ pub struct TransferStats {
     pub session_completed_down: u32,
     pub session_completed_up: u32,
     pub session_start_time: i64,
+    /// Monotonic seconds since process start for this stats session.
+    /// Prefer this over `now - session_start_time` so display matches the
+    /// Instant-based `cum_conn_time` accounting (immune to NTP/sleep jumps).
+    pub session_elapsed_secs: u64,
 
     pub cum_downloaded: u64,
     pub cum_uploaded: u64,
@@ -78,10 +82,10 @@ pub struct StatsManager {
     pub session_up_counter: Arc<AtomicU64>,
     pub sx_counters: SharedSxOverheadCounters,
     /// Monotonic session-start marker for connection-time accounting.
-    /// `session_start_time` is a wall-clock timestamp (used for display);
-    /// deriving elapsed connection time from it lets a forward clock jump
-    /// (NTP correction, suspend/resume) spike `cum_conn_time`. `Instant` is
-    /// immune to wall-clock changes, so we measure session duration with it.
+    /// `session_start_time` is a wall-clock timestamp kept for "session
+    /// started at" display; elapsed connection time must use this Instant
+    /// (via `session_elapsed_secs` / save path) so NTP or sleep/resume
+    /// cannot spike `cum_conn_time`.
     session_start_instant: std::time::Instant,
 }
 
@@ -314,7 +318,9 @@ impl StatsManager {
     }
 
     pub fn get_stats(&self) -> TransferStats {
-        self.stats.clone()
+        let mut stats = self.stats.clone();
+        stats.session_elapsed_secs = self.session_start_instant.elapsed().as_secs();
+        stats
     }
 }
 
@@ -387,5 +393,18 @@ mod tests {
             "expected 2048 B/s steady-state upload, got {}",
             mgr.stats.session_up_rate
         );
+    }
+
+    #[test]
+    fn get_stats_fills_monotonic_session_elapsed() {
+        let mgr = StatsManager::new();
+        let snap = mgr.get_stats();
+        assert_eq!(
+            snap.session_elapsed_secs,
+            mgr.session_start_instant.elapsed().as_secs()
+        );
+        // Stored stats keep session_elapsed_secs at default; only get_stats
+        // materialises the Instant-based value for IPC/UI.
+        assert_eq!(mgr.stats.session_elapsed_secs, 0);
     }
 }

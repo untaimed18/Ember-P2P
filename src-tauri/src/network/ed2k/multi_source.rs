@@ -4690,6 +4690,11 @@ async fn download_parts_from_source(
                             ) {
                                 ember_hash_binding_verified = true;
                                 info!("Ember binding: source {} at {} pubkey BLAKE3-binds to advertised hash", _src_idx, addr);
+                                if peer_user_hash != [0u8; 16] {
+                                    if let Some(cm) = &credit_mgr {
+                                        cm.write().await.set_ember_hash(peer_user_hash, *peer_eh);
+                                    }
+                                }
                             } else {
                                 tracing::warn!(
                                     "Ember binding: source {} at {} advertised pubkey does not BLAKE3-bind to ember_hash={} (possible spoof)",
@@ -5326,6 +5331,11 @@ async fn download_parts_from_source(
                         ) {
                             ember_hash_binding_verified = true;
                             info!("Ember binding: source {} at {} pubkey BLAKE3-binds (file-status-wait)", _src_idx, addr);
+                            if peer_user_hash != [0u8; 16] {
+                                if let Some(cm) = &credit_mgr {
+                                    cm.write().await.set_ember_hash(peer_user_hash, *peer_eh);
+                                }
+                            }
                         } else {
                             tracing::warn!(
                                 "Ember binding: source {} at {} advertised pubkey does not BLAKE3-bind to ember_hash={} (file-status-wait, possible spoof)",

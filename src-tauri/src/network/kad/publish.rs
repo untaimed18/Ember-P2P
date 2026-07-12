@@ -430,6 +430,17 @@ impl PublishManager {
         }
     }
 
+    /// MD4 file hashes that have completed at least one KAD source publish
+    /// (this session or restored from known.met `last_publish_src`). Used by
+    /// the Library KAD badge so it means "published", not merely "connected".
+    pub fn source_published_md4_hashes(&self) -> std::collections::HashSet<[u8; 16]> {
+        self.records
+            .iter()
+            .filter(|(_, record)| record.last_source_publish > 0)
+            .map(|(id, _)| kad_id_to_md4_bytes(id))
+            .collect()
+    }
+
     /// K15: record the load value returned by the peer that accepted
     /// our keyword publish. Load >= 90 means the peer's keyword bucket
     /// is effectively full — don't hammer it. Load < 50 means we have

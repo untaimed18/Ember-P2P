@@ -892,6 +892,11 @@ pub struct KnownClient {
     /// Verified state — useful for diagnosing why a record is stuck at
     /// Unknown after several connections).
     pub has_public_key: bool,
+    /// Ember node id hex when known (from a verified hello binding).
+    /// Friends are keyed by this hash, not `user_hash`.
+    pub ember_hash: Option<String>,
+    /// True when `ember_hash` is present in the local friends set.
+    pub is_friend: bool,
 }
 
 fn default_max_uploads() -> u32 {

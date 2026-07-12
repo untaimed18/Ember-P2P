@@ -300,6 +300,22 @@ impl ReputationManager {
         }
     }
 
+    /// Apply a manual UI ban so reputation-gated paths and the Trust
+    /// badge agree with the persistent ban list. Creates a tracker
+    /// entry if needed. Duration matches automatic score bans.
+    pub fn apply_manual_ban(&mut self, node_id: &[u8; 16]) {
+        let now = now_secs();
+        let peer = self
+            .peers
+            .entry(*node_id)
+            .or_insert_with(|| PeerReputation::new(*node_id, now));
+        peer.banned_until = Some(now + BAN_DURATION.as_secs());
+        peer.last_interaction = now;
+        if peer.score > BAN_THRESHOLD {
+            peer.score = BAN_THRESHOLD;
+        }
+    }
+
     /// Lift bans that have expired.
     pub fn lift_expired_bans(&mut self) {
         let now = now_secs();

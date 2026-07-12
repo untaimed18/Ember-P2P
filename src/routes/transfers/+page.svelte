@@ -763,14 +763,12 @@
       knownClients = data;
       knownClientsLoaded = true;
       knownClientsFailCount = 0;
-      // Kick off reputation refresh for the just-loaded roster. Runs
-      // off-cycle because `get_peer_reputation` may return `null` for
-      // peers the tracker hasn't seen yet, which is common for known
-      // clients that only exist as SecIdent credit records. Null
-      // entries are now eligible for re-fetch on subsequent polls
-      // (see `refreshReputations`) so a peer the tracker only later
-      // observes will eventually pick up a real badge.
-      void refreshReputations(knownClients.map((k) => k.user_hash));
+      // Force-refresh Trust badges each poll so manual bans / score
+      // changes appear without leaving the tab.
+      void refreshReputations(
+        knownClients.map((k) => k.user_hash),
+        true,
+      );
     } catch (e) {
       console.warn('Failed to refresh known clients:', e);
       if (!mounted || gen !== knownClientsGen) return;
@@ -796,12 +794,13 @@
   let reputationMap = $state<Record<string, PeerReputationInfo | null>>({});
   let reputationInFlight = new Set<string>();
 
-  async function refreshReputations(hashes: string[]) {
-    // Skip hashes already resolved to a non-null record or currently
-    // in flight. `null` entries are eligible for re-fetch — the
-    // tracker may only have started recording them between polls.
+  async function refreshReputations(hashes: string[], force = false) {
+    // Skip hashes currently in flight. Non-null cache entries are
+    // re-fetched when `force` is set (Known Clients poll) so score /
+    // ban changes surface without a full page reload; otherwise only
+    // missing/`null` entries are eligible (first paint).
     const targets = hashes.filter(
-      (h) => reputationMap[h] == null && !reputationInFlight.has(h),
+      (h) => (force || reputationMap[h] == null) && !reputationInFlight.has(h),
     );
     if (targets.length === 0) return;
     for (const h of targets) reputationInFlight.add(h);
@@ -814,11 +813,13 @@
         }
       }),
     );
+    // Always clear in-flight markers — an early unmount return used to
+    // leak hashes permanently blocked from future fetches.
+    for (const [h] of results) reputationInFlight.delete(h);
     if (!mounted) return;
     const next = { ...reputationMap };
     for (const [h, rep] of results) {
       next[h] = rep;
-      reputationInFlight.delete(h);
     }
     reputationMap = next;
   }
@@ -879,9 +880,11 @@
     return sortedKnownClients.filter((kc) => {
       const hash = kc.user_hash.toLowerCase();
       if (hash.includes(q)) return true;
+      const ember = kc.ember_hash?.toLowerCase();
+      if (ember && ember.includes(q)) return true;
       if (kc.last_known_ip && kc.last_known_ip.toLowerCase().includes(q)) return true;
       if (kc.country_code && kc.country_code.toLowerCase().includes(q)) return true;
-      const nick = friendNickById[hash];
+      const nick = ember ? friendNickById[ember] : undefined;
       if (nick && nick.toLowerCase().includes(q)) return true;
       return false;
     });
@@ -892,7 +895,8 @@
 
   // Top-line stats for the Known Clients sub-toolbar. Computed off the
   // unfiltered list so the totals reflect the full ledger regardless of
-  // the current search.
+  // the current search. Friend count uses backend is_friend (ember hash)
+  // with a live friendHashSet fallback after add/remove.
   let knownStats = $derived.by(() => {
     let totalUp = 0;
     let totalDown = 0;
@@ -900,7 +904,8 @@
     for (const kc of knownClients) {
       totalUp += kc.uploaded;
       totalDown += kc.downloaded;
-      if (friendHashSet.has(kc.user_hash.toLowerCase())) friendCount++;
+      const ember = kc.ember_hash?.toLowerCase();
+      if (kc.is_friend || (ember != null && friendHashSet.has(ember))) friendCount++;
     }
     return {
       total: knownClients.length,
@@ -933,16 +938,17 @@
 
   $effect(() => {
     // Same pattern as the queue poll; longer interval because credit
-    // records change far less often than queue rank. Friend hashes
-    // are pulled at the same time so the friend marker / nickname
-    // search work without the user having to load the Friends page
-    // first; the friend list rarely changes so we don't poll it on
-    // the same interval.
+    // records change far less often than queue rank. Friend hashes are
+    // refreshed on the same cadence so add/remove from the Friends page
+    // updates markers while this tab stays open.
     if (bottomView === 'known_clients') {
       refreshKnownClients();
       void refreshFriendHashes();
       if (knownPollHandle === null) {
-        knownPollHandle = setInterval(refreshKnownClients, KNOWN_POLL_INTERVAL_MS);
+        knownPollHandle = setInterval(() => {
+          refreshKnownClients();
+          void refreshFriendHashes();
+        }, KNOWN_POLL_INTERVAL_MS);
       }
     } else if (knownPollHandle !== null) {
       clearInterval(knownPollHandle);
@@ -1573,6 +1579,7 @@
 
   // --- Context menu ---
   let ctxMenu: { x: number; y: number; transfer: Transfer; section: 'active' | 'completed' | 'upload' } | null = $state(null);
+  let knownCtxMenu: { x: number; y: number; client: KnownClient } | null = $state(null);
   let ctxTransfer = $derived.by(() => {
     const menu = ctxMenu;
     if (!menu) return null;
@@ -1585,6 +1592,7 @@
   function onCtx(e: MouseEvent, t: Transfer, section: 'active' | 'completed' | 'upload') {
     e.preventDefault();
     closeColumnMenu();
+    closeKnownCtx();
     ctxPrioritySub = false;
     ctxCategorySub = false;
     const margin = 8;
@@ -1592,14 +1600,68 @@
     const y = Math.max(margin, Math.min(e.clientY, window.innerHeight - 300 - margin));
     ctxMenu = { x, y, transfer: t, section };
   }
+  function onKnownCtx(e: MouseEvent, client: KnownClient) {
+    e.preventDefault();
+    closeCtx();
+    closeColumnMenu();
+    const margin = 8;
+    const x = Math.max(margin, Math.min(e.clientX, window.innerWidth - 220 - margin));
+    const y = Math.max(margin, Math.min(e.clientY, window.innerHeight - 180 - margin));
+    knownCtxMenu = { x, y, client };
+  }
   function closeCtx() { ctxMenu = null; ctxPrioritySub = false; ctxCategorySub = false; }
+  function closeKnownCtx() { knownCtxMenu = null; }
   function closeColumnMenu() { columnMenu = null; }
 
   function onDocClick() {
     closeCtx();
+    closeKnownCtx();
     closeColumnMenu();
   }
 
+  async function knownCtxAction(action: string) {
+    if (!knownCtxMenu) return;
+    const kc = knownCtxMenu.client;
+    closeKnownCtx();
+    try {
+      switch (action) {
+        case 'copy_user_hash':
+          await copyKnownHash(kc.user_hash);
+          break;
+        case 'copy_ember_hash':
+          if (!kc.ember_hash) {
+            transferError = m.transfers_no_ember_hash();
+            break;
+          }
+          await copyKnownHash(kc.ember_hash);
+          break;
+        case 'add_friend': {
+          if (!kc.ember_hash) {
+            transferError = m.transfers_no_ember_hash();
+            break;
+          }
+          const nick = friendNickById[kc.ember_hash.toLowerCase()];
+          await addFriend(kc.ember_hash, nick);
+          await refreshFriendHashes();
+          showInfo(m.transfers_added_friend({
+            name: nick || kc.ember_hash.slice(0, 8) + '\u2026',
+          }));
+          break;
+        }
+        case 'ban_user': {
+          confirmBan = {
+            open: true,
+            userHash: kc.user_hash,
+            name: (kc.ember_hash && friendNickById[kc.ember_hash.toLowerCase()])
+              || kc.user_hash.slice(0, 8) + '\u2026',
+          };
+          return;
+        }
+      }
+    } catch (e: unknown) {
+      transferError = toErrorMsg(e);
+    }
+  }
   async function ctxAction(action: string, extra?: string) {
     if (!ctxMenu) return;
     const t = ctxMenu.transfer;
@@ -2547,6 +2609,7 @@
 <svelte:document onclick={onDocClick} onkeydown={(e) => {
   if (e.key === 'Escape') {
     if (ctxMenu) { closeCtx(); e.preventDefault(); }
+    if (knownCtxMenu) { closeKnownCtx(); e.preventDefault(); }
     else if (columnMenu) { closeColumnMenu(); e.preventDefault(); }
     return;
   }
@@ -2555,7 +2618,7 @@
   // filter box or confirm dialogs.
   const target = e.target as HTMLElement | null;
   const inEditable = target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
-  if (inEditable || ctxMenu || confirmCancel.open || confirmBan.open || confirmClearCompleted || confirmBatchCancel.open || confirmRecover.open) return;
+  if (inEditable || ctxMenu || knownCtxMenu || confirmCancel.open || confirmBan.open || confirmClearCompleted || confirmBatchCancel.open || confirmRecover.open) return;
   if (filteredActiveDownloads.length === 0) return;
   const currentId = selectedDownloadIds[selectedDownloadIds.length - 1];
   const idx = currentId ? filteredActiveDownloads.findIndex((t) => t.id === currentId) : -1;
@@ -3457,9 +3520,14 @@
           </thead>
           <tbody>
             {#each displayedKnownClients as kc (kc.user_hash)}
-              {@const isFriend = friendHashSet.has(kc.user_hash.toLowerCase())}
-              {@const friendNick = isFriend ? friendNickById[kc.user_hash.toLowerCase()] : undefined}
-              <tr class="client-row" class:client-row-friend={isFriend}>
+              {@const emberKey = kc.ember_hash?.toLowerCase()}
+              {@const isFriend = kc.is_friend || (!!emberKey && friendHashSet.has(emberKey))}
+              {@const friendNick = emberKey ? friendNickById[emberKey] : undefined}
+              <tr
+                class="client-row"
+                class:client-row-friend={isFriend}
+                oncontextmenu={(e) => onKnownCtx(e, kc)}
+              >
                 {#each visibleKnownColumns as column (column.key)}
                   {#if column.key === 'country'}
                     <td class="flag-cell" title={kc.country_code ?? ''}>{#if countryFlagSrc(kc.country_code ?? undefined)}<img src={countryFlagSrc(kc.country_code ?? undefined)} alt={kc.country_code ?? ''} class="flag-img" />{/if}</td>
@@ -3807,6 +3875,33 @@
   </div>
 {/if}
 
+{#if knownCtxMenu}
+  <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+  <div
+    class="context-menu"
+    style="left: {knownCtxMenu.x}px; top: {knownCtxMenu.y}px;"
+    onclick={(e) => e.stopPropagation()}
+  >
+    <button class="ctx-item" onclick={() => knownCtxAction('copy_user_hash')}>
+      {m.transfers_ctx_copy_user_hash()}
+    </button>
+    {#if knownCtxMenu.client.ember_hash}
+      <button class="ctx-item" onclick={() => knownCtxAction('copy_ember_hash')}>
+        {m.transfers_ctx_copy_ember_hash()}
+      </button>
+      {#if !friendHashSet.has(knownCtxMenu.client.ember_hash.toLowerCase())}
+        <button class="ctx-item" onclick={() => knownCtxAction('add_friend')}>
+          {m.transfers_ctx_add_friend()}
+        </button>
+      {/if}
+    {/if}
+    <div class="ctx-sep"></div>
+    <button class="ctx-item danger" onclick={() => knownCtxAction('ban_user')}>
+      {m.transfers_ctx_ban_user()}
+    </button>
+  </div>
+{/if}
+
 <ConfirmDialog
   bind:open={confirmCancel.open}
   title={m.transfers_confirm_cancel_title()}
@@ -3824,6 +3919,12 @@
   onconfirm={async () => {
     try {
       await banPeer(confirmBan.userHash);
+      // Invalidate cached Trust badge so the next poll (or immediate
+      // re-fetch) shows banned instead of a stale trusted/neutral label.
+      const next = { ...reputationMap };
+      delete next[confirmBan.userHash];
+      reputationMap = next;
+      void refreshReputations([confirmBan.userHash], true);
       showInfo(m.transfers_banned_user({ name: confirmBan.name }));
     } catch (e: unknown) {
       transferError = toErrorMsg(e);

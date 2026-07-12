@@ -41,6 +41,10 @@ pub struct AppState {
     /// Single-flight guard shared by startup, per-folder, and watcher reload
     /// scans. Index mutations from different scan generations must not overlap.
     pub scan_coordination: Arc<tokio::sync::Mutex<()>>,
+    /// Set when the user explicitly stops hashing. While true, the FS watcher
+    /// must not call `reload_shared_files` (that would resume hashing behind
+    /// the user's back). Cleared by resume, manual reload, and add-folder.
+    pub hashing_paused: Arc<AtomicBool>,
     /// Per-folder cancellation flags for background hashing tasks.
     /// Key = folder path (or "__reload__" / "__startup__" for special tasks).
     pub hash_cancel_flags: Arc<RwLock<HashMap<String, Arc<AtomicBool>>>>,

@@ -306,6 +306,9 @@ export interface KnownClient {
   last_known_ip: string | null;
   country_code: string | null;
   has_public_key: boolean;
+  /** Ember node id hex when known; friends are keyed by this, not user_hash. */
+  ember_hash: string | null;
+  is_friend: boolean;
 }
 
 /** Snapshot of the anti-leech client filter — the eMule-style
