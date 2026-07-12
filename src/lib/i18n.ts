@@ -119,6 +119,8 @@ export function languageLabel(locale: Locale): string {
       return m.language_name_fr({}, { locale });
     case 'pt-BR':
       return m.language_name_pt_BR({}, { locale });
+    case 'de':
+      return m.language_name_de({}, { locale });
     default:
       return locale;
   }
