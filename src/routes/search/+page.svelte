@@ -1360,10 +1360,10 @@
       return;
     }
 
-    if (networkAddresses.length === 0) {
-      addToast('error', m.search_no_sources());
-      return;
-    }
+    // Empty `source_addresses` is fine when we have a hash: KAD/server
+    // results often report availability without embedding peer IPs. The
+    // backend starts with `{ ip: '', port: 0 }` and runs full source
+    // discovery. Only local-only hits (handled above) should short-circuit.
 
     downloadPending[key] = true;
     try {
@@ -1631,11 +1631,8 @@
           skippedLocal++;
           continue;
         }
-        if (networkAddrs.length === 0) {
-          failed++;
-          failures.push(m.search_bulk_no_sources({ name: result.file.name }));
-          continue;
-        }
+        // Same as single-row download: a hash without embedded addresses
+        // still queues; the backend discovers sources.
         try {
           const { ip: peerIp, port: peerPort } = pickInitialSource(networkAddrs);
           // Same bulk-seed treatment as the single-row download path

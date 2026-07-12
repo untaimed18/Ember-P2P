@@ -243,6 +243,8 @@
   "layout_init_failed": "No se pudo iniciar. Reinicia la aplicación.",
   "layout_config_corrupt": "Tu archivo de configuración estaba dañado y se ha restablecido a los valores predeterminados.",
   "layout_config_corrupt_backup": "Tu archivo de configuración estaba dañado y se ha restablecido a los valores predeterminados. Se guardó una copia de seguridad del original en {path}.",
+  "layout_db_corrupt": "Tu base de datos local estaba dañada y se ha recreado. El historial de transferencias y los peers guardados pueden necesitar reconstruirse.",
+  "layout_db_corrupt_backup": "Tu base de datos local estaba dañada y se ha recreado. Se guardó una copia de seguridad del original en {path}.",
 
   "speed_input_unlimited": "Sin límite",
   "speed_input_unlimited_aria": "Sin límite — activa para fijar uno",

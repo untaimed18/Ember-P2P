@@ -235,6 +235,7 @@ pub fn run() {
             // If config.json was corrupt and reset to defaults, surface it to the
             // user once the webview has mounted (the file is preserved as a .bak).
             let corrupt_backup = config.corrupt_backup.clone();
+            let db_corrupt_backup = db.corrupt_backup.clone();
 
             // Honour the "launch maximized" preference. The window is
             // created at its configured size (per `tauri.conf.json`); we
@@ -380,6 +381,16 @@ pub fn run() {
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                     let _ = emit_handle.emit(
                         "config-corrupt-recovered",
+                        serde_json::json!({ "backup_path": bak.to_string_lossy().to_string() }),
+                    );
+                });
+            }
+            if let Some(bak) = db_corrupt_backup {
+                let emit_handle = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    let _ = emit_handle.emit(
+                        "db-corrupt-recovered",
                         serde_json::json!({ "backup_path": bak.to_string_lossy().to_string() }),
                     );
                 });

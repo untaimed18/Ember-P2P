@@ -243,6 +243,8 @@
   "layout_init_failed": "Failed to initialize. Please restart the app.",
   "layout_config_corrupt": "Your settings file was corrupt and has been reset to defaults.",
   "layout_config_corrupt_backup": "Your settings file was corrupt and has been reset to defaults. A backup of the original was saved to {path}.",
+  "layout_db_corrupt": "Your local database was corrupt and has been recreated. Transfer history and saved peers may need to be rebuilt.",
+  "layout_db_corrupt_backup": "Your local database was corrupt and has been recreated. A backup of the original was saved to {path}.",
 
   "speed_input_unlimited": "Unlimited",
   "speed_input_unlimited_aria": "Unlimited — activate to set a limit",

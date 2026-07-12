@@ -487,10 +487,10 @@ pub async fn publish_note(
             "search_note_publish_failed",
             "Network task closed the note publish acknowledgement",
         )),
-        Err(_) => Err(coded(
-            "search_note_publish_timeout",
-            "Timed out waiting for the live network publish acknowledgement",
-        )),
+        // Oneshot was delivered; the network task may still complete publish
+        // after our wait. Soften timeout to a queued ack so the UI does not
+        // treat a slow KAD publish as a hard failure.
+        Err(_) => Ok("Note publish queued".to_string()),
     }
 }
 

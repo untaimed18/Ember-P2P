@@ -1,5 +1,5 @@
 use tauri::Manager;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::app_state::AppState;
 use crate::commands::errors::{coded, coded_ctx};
@@ -30,16 +30,62 @@ pub(crate) fn shared_paths_overlap(a: &std::path::Path, b: &std::path::Path) -> 
     a == b || (a.len() < b.len() && b.starts_with(&a)) || (b.len() < a.len() && a.starts_with(&b))
 }
 
+/// Drop exact duplicates and nested children, preferring the shorter (parent)
+/// path. Used on config load so an older build that allowed overlapping
+/// `shared_folders` does not wipe the whole config on upgrade validation.
+///
+/// Returns `(deduped, changed)` where `changed` is true when any entry was
+/// removed or replaced relative to the input order/contents.
+pub(crate) fn dedupe_overlapping_shared_folders(folders: Vec<String>) -> (Vec<String>, bool) {
+    let original = folders.clone();
+    let mut kept: Vec<String> = Vec::with_capacity(folders.len());
+    for folder in folders {
+        let path = std::path::Path::new(&folder);
+        let comps = normalized_path_components(path);
+        let mut skip = false;
+        kept.retain(|existing| {
+            let existing_path = std::path::Path::new(existing);
+            if !shared_paths_overlap(existing_path, path) {
+                return true;
+            }
+            let existing_comps = normalized_path_components(existing_path);
+            if existing_comps == comps {
+                // Exact duplicate: keep the earlier entry.
+                skip = true;
+                true
+            } else if existing_comps.len() < comps.len() {
+                // Existing is a parent of the new path: drop the child.
+                skip = true;
+                true
+            } else {
+                // New path is a parent of an existing child: prefer the parent.
+                false
+            }
+        });
+        if !skip {
+            kept.push(folder);
+        }
+    }
+    let changed = kept != original;
+    (kept, changed)
+}
+
 fn normalize_shared_folders(folders: Vec<String>) -> Result<Vec<String>, String> {
     let mut normalized: Vec<std::path::PathBuf> = Vec::with_capacity(folders.len());
     for folder in folders {
-        let canonical = std::path::Path::new(&folder).canonicalize().map_err(|e| {
-            coded_ctx(
-                "settings_shared_folder_invalid",
-                format!("Shared folder cannot be resolved: {folder}"),
-                e,
-            )
-        })?;
+        let configured = std::path::PathBuf::from(&folder);
+        // A temporarily offline USB/network path must not fail the entire
+        // settings save. Keep the configured string and still run overlap /
+        // duplicate checks via path components.
+        let canonical = match configured.canonicalize() {
+            Ok(path) => path,
+            Err(e) => {
+                warn!(
+                    "Shared folder cannot be resolved (keeping configured path): {folder} ({e})"
+                );
+                configured
+            }
+        };
         let canonical_components = normalized_path_components(&canonical);
         if normalized
             .iter()
@@ -971,5 +1017,26 @@ mod tests {
             std::path::Path::new("root/media"),
             std::path::Path::new("root/media-old"),
         ));
+    }
+
+    #[test]
+    fn dedupe_overlapping_shared_folders_prefers_parents() {
+        let (deduped, changed) = dedupe_overlapping_shared_folders(vec![
+            "root/media/movies".into(),
+            "root/media".into(),
+            "root/media".into(),
+            "root/other".into(),
+            "root/media/tv".into(),
+        ]);
+        assert!(changed);
+        assert_eq!(
+            deduped,
+            vec!["root/media".to_string(), "root/other".to_string()]
+        );
+
+        let (same, unchanged) =
+            dedupe_overlapping_shared_folders(vec!["a/b".into(), "c/d".into()]);
+        assert!(!unchanged);
+        assert_eq!(same, vec!["a/b".to_string(), "c/d".to_string()]);
     }
 }
