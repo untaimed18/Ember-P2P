@@ -738,6 +738,10 @@ impl SearchState {
             if current_offset / FETCH_PAGE_SIZE as u16 + 1 < MAX_PAGES_PER_PEER {
                 self.fetch_page_offset.insert(*from, next_offset);
                 self.fetched.remove(from);
+                // JumpStart `next_store_queries` gates on `!store_sent`. Without
+                // clearing it, page-2+ SearchKey/Source requests never fire
+                // during Lookup and popular keywords stop at one full page.
+                self.store_sent.remove(from);
             }
         }
 
@@ -787,6 +791,13 @@ impl SearchState {
         for id in &store_timed_out {
             self.store_pending.remove(id);
             self.store_pending_times.remove(id);
+            // Unlike routing timeouts (`handle_timeout`), a StorePacket /
+            // Search*Req timeout must not permanently consume the contact.
+            // Leaving `store_sent`/`fetched` set blocked `next_store_queries`
+            // and made Fetch treat the peer as done, so slow nodes never got
+            // another keyword/source/notes page.
+            self.store_sent.remove(id);
+            self.fetched.remove(id);
             self.check_completion();
         }
         timed_out
@@ -854,6 +865,24 @@ impl SearchState {
         true
     }
 
+    /// Undo [`reserve_find_buddy_request`] when the FindBuddyReq never left
+    /// the UDP socket (encode/send failure). Keeps the buddy request budget
+    /// and `find_buddy_sent` aligned with packets that were actually tracked.
+    pub fn release_find_buddy_request(&mut self, contact_id: KadId) {
+        self.find_buddy_sent.remove(&contact_id);
+    }
+
+    /// Mark in-flight routing queries as queried and drop their pending
+    /// reservations. Used when leaving Lookup for Fetch so we neither re-send
+    /// KadReq to the same contacts nor leave them as eternally pending.
+    fn settle_in_flight_routing_queries(&mut self) {
+        for id in self.pending.iter().copied().collect::<Vec<_>>() {
+            self.queried.insert(id);
+        }
+        self.pending.clear();
+        self.pending_times.clear();
+    }
+
     fn check_phase_transition(&mut self) {
         if self.phase != SearchPhase::Lookup {
             return;
@@ -917,8 +946,7 @@ impl SearchState {
                 self.store_pending.len(),
                 if is_store { "holding open to publish" } else { "switching to fetch" },
             );
-            self.pending.clear();
-            self.pending_times.clear();
+            self.settle_in_flight_routing_queries();
             if is_store {
                 // eMule's StoreFile/StoreKeyword/StoreNotes searches have no
                 // real "fetch" step — publishing IS the lookup's side effect
@@ -1341,8 +1369,7 @@ impl SearchManager {
                     sid.0, elapsed, state.queried.len(), state.responded_during_lookup.len()
                 );
                 state.phase = SearchPhase::Fetch;
-                state.pending.clear();
-                state.pending_times.clear();
+                state.settle_in_flight_routing_queries();
                 state.fetch_started_at = Some(chrono::Utc::now().timestamp());
             }
 
@@ -1568,6 +1595,40 @@ mod tests {
         assert_eq!(timed_out, vec![old]);
         assert!(!state.pending.contains(&old));
         assert!(state.pending.contains(&fresh));
+    }
+
+    #[test]
+    fn expire_store_pending_clears_store_sent_and_fetched_for_retry() {
+        let mut state = SearchState::new(SearchId(1), kad_id(1), SearchType::FindKeyword);
+        let peer = kad_id(2);
+        let now = chrono::Utc::now().timestamp();
+        state.store_pending.insert(peer);
+        state
+            .store_pending_times
+            .insert(peer, now - PENDING_TIMEOUT_SECS);
+        state.store_sent.insert(peer);
+        state.fetched.insert(peer);
+
+        let timed_out = state.expire_pending();
+
+        assert!(timed_out.is_empty(), "routing pending should be untouched");
+        assert!(!state.store_pending.contains(&peer));
+        assert!(!state.store_sent.contains(&peer));
+        assert!(!state.fetched.contains(&peer));
+    }
+
+    #[test]
+    fn release_find_buddy_request_frees_budget_after_failed_send() {
+        let mut state = SearchState::new(SearchId(1), kad_id(1), SearchType::FindBuddy);
+        let peer = kad_id(42);
+        assert!(state.reserve_find_buddy_request(peer));
+        assert_eq!(state.find_buddy_requests_sent(), 1);
+        state.release_find_buddy_request(peer);
+        assert_eq!(state.find_buddy_requests_sent(), 0);
+        assert!(
+            state.reserve_find_buddy_request(peer),
+            "same contact must be reservable again after release"
+        );
     }
 
     #[test]

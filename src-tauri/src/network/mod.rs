@@ -2490,7 +2490,7 @@ pub enum NetworkCommand {
         file_hash: KadId,
         file_size: u64,
         request_id: u64,
-        tx: oneshot::Sender<Vec<(String, u16)>>,
+        tx: oneshot::Sender<Result<Vec<(String, u16)>, String>>,
     },
     BanPeer {
         peer_id_hex: String,
@@ -3121,7 +3121,7 @@ struct NetworkState {
     /// `request_id` (caller-generated) lets `NetworkCommand::CancelSearch`
     /// cancel a `find_sources` call on IPC timeout, same as it already does
     /// for `search_files`'s keyword searches.
-    pending_source_searches: HashMap<SearchId, PendingHelperSearchTx<Vec<(String, u16)>>>,
+    pending_source_searches: HashMap<SearchId, PendingHelperSearchTx<Result<Vec<(String, u16)>, String>>>,
     /// Source searches tied to pending downloads (search_id -> (transfer_id, file_hash_md4)).
     /// File hash is carried alongside so the search-completion handler can build
     /// CallbackReqs / inject sources without re-reading `pending_downloads`, which
@@ -3888,7 +3888,7 @@ fn finalize_removed_searches(
             maybe_finish_active_search(state, app_handle, request_id);
         }
         if let Some((_, tx)) = state.pending_source_searches.remove(sid) {
-            let _ = tx.send(Vec::new());
+            let _ = tx.send(Ok(Vec::new()));
         }
         if let Some((_, tx)) = state.pending_notes_searches.remove(sid) {
             let _ = tx.send(Vec::new());
@@ -3951,7 +3951,7 @@ fn cancel_search_request(state: &mut NetworkState, app_handle: &tauri::AppHandle
         // `finalize_removed_searches`; idempotent (each lookup is a no-op when
         // absent).
         if let Some((_, tx)) = state.pending_source_searches.remove(sid) {
-            let _ = tx.send(Vec::new());
+            let _ = tx.send(Ok(Vec::new()));
         }
         if let Some((_, tx)) = state.pending_notes_searches.remove(sid) {
             let _ = tx.send(Vec::new());
@@ -4407,9 +4407,19 @@ async fn try_start_pending_download_from_known_sources(
             arr
         }
         _ => {
-            state
-                .pending_downloads
-                .insert(transfer_id.to_string(), pending);
+            // Do not re-queue a permanently invalid hash — it would sit in
+            // Searching forever. Fail the transfer so the UI can clear it.
+            warn!(
+                "Pending download {transfer_id} has invalid file hash {:?}; failing transfer",
+                pending.file_hash
+            );
+            let _ = dl_event_tx
+                .send(DownloadEvent::Failed {
+                    transfer_id: pending.transfer_id,
+                    error: "Invalid file hash in pending download".to_string(),
+                    failure_kind: SourceFailureKind::Permanent,
+                })
+                .await;
             return false;
         }
     };
@@ -4551,6 +4561,7 @@ async fn try_start_pending_download_from_known_sources(
         banned_ips: Some(shared_banned_ips.clone()),
         external_ip: state.external_ip,
         aich_pending: Some(state.aich_recovery_pending.clone()),
+        trusted_aich_master: state.aich_root_map.get(&hash_bytes).copied(),
         geoip: geoip.clone(),
         tracker_registry: Some(state.tracker_registry.clone()),
         sx_overhead: sx_overhead.clone(),
@@ -7884,6 +7895,7 @@ pub async fn start_network(
                                     }
                                 }
                                 "no_needed_parts" => pfs.set_none_needed_parts(v4, port, None),
+                                "duplicate" => pfs.clear_duplicate_route(v4, port, None),
                                 "wait_callback" => pfs.set_wait_callback(v4, port, None),
                                 "wait_callback_kad" => pfs.set_wait_callback_kad(v4, port, None),
                                 "too_many_conns" => pfs.set_too_many_conns(v4, port, None),
@@ -9599,7 +9611,7 @@ pub async fn start_network(
                             Vec::new()
                         };
                         info!("Source search {} completed: {} sources found", sid.0, sources.len());
-                        let _ = tx.send(sources.clone());
+                        let _ = tx.send(Ok(sources.clone()));
 
                         // Connect found sources to any pending download with a
                         // matching file hash so "Find More Sources" actually
@@ -9953,29 +9965,34 @@ pub async fn start_network(
                                 } else {
                                     None
                                 };
-                                match &obf_pkt {
-                                    Some(enc) => {
-                                        let _ = udp_socket.send_to(enc, addr).await;
-                                    }
-                                    None => {
-                                        let _ = udp_socket.send_to(&pkt, addr).await;
-                                    }
-                                }
-                                info!(
-                                    "Sent OP_DIRECTCALLBACKREQ to type-6 source {}:{} (tcp_port={}, obfuscated={})",
-                                    ds.ip,
-                                    ds.udp_port,
-                                    ds.tcp_port,
-                                    obf_pkt.is_some(),
-                                );
-                                if let Some(fh) = resolved_file_hash {
-                                    register_or_refresh_pending_kad_callback(
-                                        &pending_kad_callbacks,
+                                let send_ok = match &obf_pkt {
+                                    Some(enc) => udp_socket.send_to(enc, addr).await.is_ok(),
+                                    None => udp_socket.send_to(&pkt, addr).await.is_ok(),
+                                };
+                                if send_ok {
+                                    info!(
+                                        "Sent OP_DIRECTCALLBACKREQ to type-6 source {}:{} (tcp_port={}, obfuscated={})",
                                         ds.ip,
+                                        ds.udp_port,
                                         ds.tcp_port,
-                                        fh,
-                                        ds.source_user_hash,
-                                    ).await;
+                                        obf_pkt.is_some(),
+                                    );
+                                    // Register only after a successful send — same
+                                    // track-after-send rule as buddy CallbackReq.
+                                    if let Some(fh) = resolved_file_hash {
+                                        register_or_refresh_pending_kad_callback(
+                                            &pending_kad_callbacks,
+                                            ds.ip,
+                                            ds.tcp_port,
+                                            fh,
+                                            ds.source_user_hash,
+                                        ).await;
+                                    }
+                                } else {
+                                    warn!(
+                                        "Failed to send OP_DIRECTCALLBACKREQ to type-6 source {}:{}",
+                                        ds.ip, ds.udp_port
+                                    );
                                 }
                             }
                         }
@@ -10527,6 +10544,7 @@ pub async fn start_network(
                                         banned_ips: Some(shared_banned_ips.clone()),
                                         external_ip: state.external_ip,
                                         aich_pending: Some(state.aich_recovery_pending.clone()),
+                                        trusted_aich_master: state.aich_root_map.get(&hash_bytes).copied(),
                                         geoip: geoip.clone(),
                                         tracker_registry: Some(state.tracker_registry.clone()),
                                         sx_overhead: stats_manager.sx_counters.clone(),
@@ -11028,10 +11046,30 @@ pub async fn start_network(
                                     user_id,
                                     tcp_port: local_tcp,
                                 };
-                                if let Ok(packet) = messages::encode_packet(&msg) {
-                                    state.flood_protection.track_request(addr, 0x51);
-                                    let _ = send_kad_packet(&udp_socket, &packet, addr, &state, &contact.id).await;
-                                    sent += 1;
+                                match messages::encode_packet(&msg) {
+                                    Ok(packet) => {
+                                        if send_kad_packet(
+                                            &udp_socket, &packet, addr, &state, &contact.id,
+                                        )
+                                        .await
+                                        .is_ok()
+                                        {
+                                            // Track only after a successful send —
+                                            // mirrors poll_queries and avoids
+                                            // phantom FindBuddyRes ack slots.
+                                            state.flood_protection.track_request(addr, 0x51);
+                                            sent += 1;
+                                        } else if let Some(search) =
+                                            state.search_manager.get_mut(&sid)
+                                        {
+                                            search.release_find_buddy_request(contact.id);
+                                        }
+                                    }
+                                    Err(_) => {
+                                        if let Some(search) = state.search_manager.get_mut(&sid) {
+                                            search.release_find_buddy_request(contact.id);
+                                        }
+                                    }
                                 }
                             }
                             info!(
@@ -11441,13 +11479,13 @@ pub async fn start_network(
                 // is connected (separate from the status transition above because
                 // the KAD response handler may set Connected before this timer fires).
                 if count > 0 && !state.kad_initial_source_burst_done && !state.pending_downloads.is_empty() {
-                    state.kad_initial_source_burst_done = true;
                     {
                         let pending_count = state.pending_downloads.len();
                         info!("KAD connected: triggering source search for {pending_count} pending downloads");
                         let now = chrono::Utc::now().timestamp();
                         let mut tids: Vec<String> = state.pending_downloads.keys().cloned().collect();
                         let mut kad_started = 0usize;
+                        let mut kad_capacity_blocked = false;
                         const MAX_INITIAL_KAD: usize = 20;
                         if tids.len() > MAX_INITIAL_KAD {
                             let rotate_by = state.kad_source_search_cursor % tids.len();
@@ -11482,6 +11520,15 @@ pub async fn start_network(
                                         state.download_source_searches.insert(sid, (tid.clone(), file_hash_arr));
                                         kad_started += 1;
                                         did_search = true;
+                                    } else {
+                                        // Search manager at capacity — defer the rest of
+                                        // the burst so we retry when a slot frees instead
+                                        // of treating this as a completed empty search.
+                                        kad_capacity_blocked = true;
+                                        warn!(
+                                            "FindSource for pending download {} deferred: active search cap reached",
+                                            tid
+                                        );
                                     }
                                 }
                             }
@@ -11512,6 +11559,12 @@ pub async fn start_network(
                                     pd.last_search_at = now;
                                 }
                             }
+                        }
+                        // Only mark the burst done when every attempted KAD start
+                        // either succeeded or had an empty closest set. Capacity
+                        // rejects leave the flag clear so the next tick retries.
+                        if !kad_capacity_blocked {
+                            state.kad_initial_source_burst_done = true;
                         }
                         if pending_count > MAX_INITIAL_KAD {
                             info!("Started {kad_started} KAD searches initially; remaining {} will search on next retry cycle", pending_count - kad_started);
@@ -13494,6 +13547,14 @@ pub async fn start_network(
                             SearchType::FindBuddy,
                             closest,
                         );
+                        if sid == SearchId(0) {
+                            // Search manager at capacity — do not sit in
+                            // FindingBuddy with zero requests until timeout.
+                            state.buddy_manager.find_failed();
+                            warn!(
+                                "FindBuddy search rejected: active search cap reached"
+                            );
+                        } else {
 
                         // Send FindBuddyReq to a broad sample of verified contacts.
                         // Any non-firewalled node can be buddy, so sample from across
@@ -13521,31 +13582,59 @@ pub async fn start_network(
                                 user_id: user_id_for_buddy,
                                 tcp_port: local_tcp,
                             };
-                            if let Ok(packet) = messages::encode_packet(&msg) {
-                                if !logged_wire {
-                                    let preview: Vec<u8> = packet.iter().take(10).copied().collect();
-                                    info!(
-                                        "FindBuddyReq wire: {:02X?} (len={}, buddy_target={}, user_id={}, tcp={})",
-                                        preview, packet.len(), target, user_id_for_buddy, local_tcp
-                                    );
-                                    logged_wire = true;
+                            match messages::encode_packet(&msg) {
+                                Ok(packet) => {
+                                    if !logged_wire {
+                                        let preview: Vec<u8> =
+                                            packet.iter().take(10).copied().collect();
+                                        info!(
+                                            "FindBuddyReq wire: {:02X?} (len={}, buddy_target={}, user_id={}, tcp={})",
+                                            preview, packet.len(), target, user_id_for_buddy, local_tcp
+                                        );
+                                        logged_wire = true;
+                                    }
+                                    let c_obf = state.obfuscation_enabled
+                                        && state
+                                            .routing_table
+                                            .get_contact(&contact.id)
+                                            .map_or(false, |c| c.supports_obfuscation());
+                                    if c_obf {
+                                        obf_count += 1;
+                                    } else {
+                                        plain_count += 1;
+                                    }
+                                    if send_kad_packet(
+                                        &udp_socket,
+                                        &packet,
+                                        addr,
+                                        &state,
+                                        &contact.id,
+                                    )
+                                    .await
+                                    .is_ok()
+                                    {
+                                        state.flood_protection.track_request(addr, 0x51);
+                                        sent_addrs.insert(addr);
+                                        initial_sent += 1;
+                                    } else if let Some(search) =
+                                        state.search_manager.get_mut(&sid)
+                                    {
+                                        search.release_find_buddy_request(contact.id);
+                                    }
                                 }
-                                let c_obf = state.obfuscation_enabled
-                                    && state.routing_table.get_contact(&contact.id)
-                                        .map_or(false, |c| c.supports_obfuscation());
-                                if c_obf { obf_count += 1; } else { plain_count += 1; }
-                                state.flood_protection.track_request(addr, 0x51);
-                                let _ = send_kad_packet(
-                                    &udp_socket, &packet, addr, &state, &contact.id,
-                                ).await;
-                                sent_addrs.insert(addr);
-                                initial_sent += 1;
+                                Err(_) => {
+                                    if let Some(search) = state.search_manager.get_mut(&sid) {
+                                        search.release_find_buddy_request(contact.id);
+                                    }
+                                }
                             }
                         }
 
                         // 2) Up to 20 random verified contacts from across the
                         //    routing table (different part of keyspace).
-                        let all_contacts: Vec<_> = state.routing_table.all_contacts()
+                        let all_contacts: Vec<_> = state
+                            .routing_table
+                            .all_contacts()
                             .filter(|c| c.verified && !c.is_dead() && !c.is_udp_firewalled())
                             .collect();
                         let random_contacts: Vec<KadContact> = {
@@ -13553,11 +13642,18 @@ pub async fn start_network(
                             let mut rng = rand::thread_rng();
                             let mut shuffled: Vec<_> = all_contacts.iter().collect();
                             shuffled.shuffle(&mut rng);
-                            shuffled.into_iter().take(20).cloned().cloned().collect()
+                            shuffled
+                                .into_iter()
+                                .take(20)
+                                .cloned()
+                                .cloned()
+                                .collect()
                         };
                         for contact in &random_contacts {
                             let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
-                            if sent_addrs.contains(&addr) { continue; }
+                            if sent_addrs.contains(&addr) {
+                                continue;
+                            }
                             if !state
                                 .search_manager
                                 .get_mut(&sid)
@@ -13571,17 +13667,42 @@ pub async fn start_network(
                                 user_id: user_id_for_buddy,
                                 tcp_port: local_tcp,
                             };
-                            if let Ok(packet) = messages::encode_packet(&msg) {
-                                let c_obf = state.obfuscation_enabled
-                                    && state.routing_table.get_contact(&contact.id)
-                                        .map_or(false, |c| c.supports_obfuscation());
-                                if c_obf { obf_count += 1; } else { plain_count += 1; }
-                                state.flood_protection.track_request(addr, 0x51);
-                                let _ = send_kad_packet(
-                                    &udp_socket, &packet, addr, &state, &contact.id,
-                                ).await;
-                                sent_addrs.insert(addr);
-                                initial_sent += 1;
+                            match messages::encode_packet(&msg) {
+                                Ok(packet) => {
+                                    let c_obf = state.obfuscation_enabled
+                                        && state
+                                            .routing_table
+                                            .get_contact(&contact.id)
+                                            .map_or(false, |c| c.supports_obfuscation());
+                                    if c_obf {
+                                        obf_count += 1;
+                                    } else {
+                                        plain_count += 1;
+                                    }
+                                    if send_kad_packet(
+                                        &udp_socket,
+                                        &packet,
+                                        addr,
+                                        &state,
+                                        &contact.id,
+                                    )
+                                    .await
+                                    .is_ok()
+                                    {
+                                        state.flood_protection.track_request(addr, 0x51);
+                                        sent_addrs.insert(addr);
+                                        initial_sent += 1;
+                                    } else if let Some(search) =
+                                        state.search_manager.get_mut(&sid)
+                                    {
+                                        search.release_find_buddy_request(contact.id);
+                                    }
+                                }
+                                Err(_) => {
+                                    if let Some(search) = state.search_manager.get_mut(&sid) {
+                                        search.release_find_buddy_request(contact.id);
+                                    }
+                                }
                             }
                         }
 
@@ -13589,6 +13710,7 @@ pub async fn start_network(
                             info!("Sent initial FindBuddyReq to {} contacts ({} target-close + random from {} verified, {} obfuscated/{} plaintext)",
                                 initial_sent, target_contacts.len(), all_contacts.len(), obf_count, plain_count);
                         }
+                        } // sid != SearchId(0)
                     }
                 }
 
@@ -14232,6 +14354,7 @@ pub async fn start_network(
                             banned_ips: Some(shared_banned_ips.clone()),
                             external_ip: state.external_ip,
                             aich_pending: Some(state.aich_recovery_pending.clone()),
+                            trusted_aich_master: state.aich_root_map.get(&hash_bytes).copied(),
                             geoip: geoip.clone(),
                             tracker_registry: Some(state.tracker_registry.clone()),
                             sx_overhead: stats_manager.sx_counters.clone(),
@@ -14410,6 +14533,7 @@ pub async fn start_network(
                             banned_ips: Some(shared_banned_ips.clone()),
                             external_ip: state.external_ip,
                             aich_pending: Some(state.aich_recovery_pending.clone()),
+                            trusted_aich_master: state.aich_root_map.get(&hash_bytes).copied(),
                             geoip: geoip.clone(),
                             tracker_registry: Some(state.tracker_registry.clone()),
                             sx_overhead: stats_manager.sx_counters.clone(),
@@ -14745,6 +14869,11 @@ pub async fn start_network(
                                 state.download_source_searches.insert(sid, (tid.clone(), fh));
                                 kad_searches_started += 1;
                                 did_search = true;
+                            } else {
+                                warn!(
+                                    "FindSource retry for {} deferred: active search cap reached",
+                                    tid
+                                );
                             }
                         } else {
                             debug!("Routing table empty for retry of {tid}, continuing with server-only source refresh");
@@ -14890,6 +15019,11 @@ pub async fn start_network(
                                 entry.0 = now;
                                 entry.1 += 1;
                                 debug!("Started KAD source search for active download {} (attempt {})", tid, entry.1);
+                            } else {
+                                warn!(
+                                    "Active FindSource for {} deferred: active search cap reached",
+                                    tid
+                                );
                             }
                         }
                     }
@@ -17148,6 +17282,7 @@ pub async fn start_network(
                                     banned_ips: Some(shared_banned_ips.clone()),
                                     external_ip: state.external_ip,
                                     aich_pending: Some(state.aich_recovery_pending.clone()),
+                                    trusted_aich_master: state.aich_root_map.get(&file_hash).copied(),
                                     geoip: geoip.clone(),
                                     tracker_registry: Some(state.tracker_registry.clone()),
                                     sx_overhead: stats_manager.sx_counters.clone(),
@@ -17419,6 +17554,7 @@ pub async fn start_network(
                                 banned_ips: Some(shared_banned_ips.clone()),
                                 external_ip: state.external_ip,
                                 aich_pending: Some(state.aich_recovery_pending.clone()),
+                                trusted_aich_master: state.aich_root_map.get(&parts.file_hash).copied(),
                                 geoip: geoip.clone(),
                                 sx_overhead: stats_manager.sx_counters.clone(),
                             };
@@ -17440,8 +17576,12 @@ pub async fn start_network(
                             }
                             let handle = tokio::spawn(async move {
                                 if let Err(e) = download.run_from_callback(
-                                    parts.reader, parts.writer, parts.peer_user_hash,
-                                    parts.emule_info_done, tx,
+                                    parts.reader,
+                                    parts.writer,
+                                    parts.peer_user_hash,
+                                    parts.peer_caps,
+                                    parts.emule_info_done,
+                                    tx,
                                 ).await {
                                     warn!("Callback download failed: {e}");
                                     let kind = classify_error(&e.to_string());
@@ -21683,6 +21823,8 @@ async fn handle_udp_packet_inner(
                 // needs a whole-`state` immutable borrow that can't coexist with
                 // the &mut search-manager borrow.
                 let mut reactive_queries: Vec<(KadContact, KadMessage)> = Vec::new();
+                // Deferred FindBuddyReq send — same borrow pattern as reactive_queries.
+                let mut pending_find_buddy: Option<(Vec<u8>, KadId)> = None;
                 if let (Some(search), Some(sender_id)) =
                     (state.search_manager.get_mut(&sid), sender_id)
                 {
@@ -21762,7 +21904,8 @@ async fn handle_udp_packet_inner(
 
                     // eMule behavior: for FindBuddy searches, send FindBuddyReq
                     // to EVERY node that responds during the lookup, not just the
-                    // final closest at convergence.
+                    // final closest at convergence. Reserve here; send after the
+                    // search borrow ends (and only then track flood ack).
                     if matches!(search.search_type, SearchType::FindBuddy)
                         && search.phase == SearchPhase::Lookup
                         && state.buddy_manager.state() == BuddyState::FindingBuddy
@@ -21776,9 +21919,13 @@ async fn handle_udp_packet_inner(
                             user_id,
                             tcp_port: local_tcp,
                         };
-                        if let Ok(packet) = messages::encode_packet(&msg) {
-                            state.flood_protection.track_request(from, 0x51);
-                            let _ = send_kad_packet(socket, &packet, from, state, &sender_id).await;
+                        match messages::encode_packet(&msg) {
+                            Ok(packet) => {
+                                pending_find_buddy = Some((packet, sender_id));
+                            }
+                            Err(_) => {
+                                search.release_find_buddy_request(sender_id);
+                            }
                         }
                     }
 
@@ -21817,6 +21964,17 @@ async fn handle_udp_packet_inner(
                         for c in &safe_contacts {
                             state.routing_table.insert(c.clone());
                         }
+                    }
+                }
+
+                if let Some((packet, sender_id)) = pending_find_buddy {
+                    if send_kad_packet(socket, &packet, from, state, &sender_id)
+                        .await
+                        .is_ok()
+                    {
+                        state.flood_protection.track_request(from, 0x51);
+                    } else if let Some(search) = state.search_manager.get_mut(&sid) {
+                        search.release_find_buddy_request(sender_id);
                     }
                 }
 
@@ -23810,6 +23968,7 @@ async fn handle_command_inner(
                     banned_ips: Some(shared_banned_ips.clone()),
                     external_ip: state.external_ip,
                     aich_pending: Some(state.aich_recovery_pending.clone()),
+                    trusted_aich_master: state.aich_root_map.get(&hash_bytes).copied(),
                     geoip: geoip.clone(),
                     tracker_registry: Some(state.tracker_registry.clone()),
                     sx_overhead: stats_manager.sx_counters.clone(),
@@ -24744,7 +24903,7 @@ async fn handle_command_inner(
                 .find_closest_prefer_verified(&file_hash, SEARCH_INITIAL_CONTACTS);
 
             if closest.is_empty() {
-                let _ = tx.send(Vec::new());
+                let _ = tx.send(Ok(Vec::new()));
                 return;
             }
 
@@ -24755,7 +24914,10 @@ async fn handle_command_inner(
             );
 
             if sid == SearchId(0) {
-                let _ = tx.send(Vec::new());
+                warn!("FindSources rejected: active search cap reached");
+                let _ = tx.send(Err(
+                    "Source search busy: too many active KAD searches".to_string(),
+                ));
                 return;
             }
             state.pending_source_searches.insert(sid, (request_id, tx));
@@ -25128,7 +25290,7 @@ async fn handle_command_inner(
                 let _ = tx.send(local_results);
             }
             for (_, (_, tx)) in state.pending_source_searches.drain() {
-                let _ = tx.send(Vec::new());
+                let _ = tx.send(Ok(Vec::new()));
             }
             for (_, (_, tx)) in state.pending_notes_searches.drain() {
                 let _ = tx.send(Vec::new());

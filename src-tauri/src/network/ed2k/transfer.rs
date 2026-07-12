@@ -130,6 +130,9 @@ pub struct Ed2kDownload {
     pub external_ip: Option<std::net::Ipv4Addr>,
     /// Shared pending AICH recovery retries (read to gate OP_AICHREQUEST)
     pub aich_pending: Option<SharedAichPending>,
+    /// Trusted AICH master from EPX / `aich_cache` when known before any
+    /// peer HashSet2 arrives. Seeded so recovery does not wait on the wire.
+    pub trusted_aich_master: Option<[u8; 20]>,
     /// GeoIP reader for country code lookups
     pub geoip: crate::geoip::GeoIpReader,
     /// Lock-free counter that the per-source loop bumps on every
@@ -749,6 +752,7 @@ impl Ed2kDownload {
         reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
         writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
         peer_user_hash: [u8; 16],
+        peer_caps: PeerCapabilities,
         emule_info_done: bool,
         event_tx: mpsc::Sender<DownloadEvent>,
     ) -> anyhow::Result<()> {
@@ -756,6 +760,7 @@ impl Ed2kDownload {
             reader,
             writer,
             peer_user_hash,
+            peer_caps,
             emule_info_done,
             event_tx,
         ))
@@ -779,6 +784,7 @@ impl Ed2kDownload {
         mut reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
         mut writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
         peer_user_hash: [u8; 16],
+        peer_caps: PeerCapabilities,
         emule_info_done: bool,
         event_tx: mpsc::Sender<DownloadEvent>,
     ) -> anyhow::Result<()> {
@@ -816,7 +822,10 @@ impl Ed2kDownload {
                 &mut *reader,
                 &mut *writer,
                 peer_user_hash,
-                PeerCapabilities::default(),
+                // Same as multi-source EstablishedStream: format file requests
+                // from the peer's Hello caps, not PeerCapabilities::default()
+                // (ext_ver=0), or modern peers short-read and FIN.
+                peer_caps,
                 &event_tx,
                 emule_info_done,
                 &mut completed_path_out,
@@ -837,16 +846,10 @@ impl Ed2kDownload {
                 Ok(())
             }
             Err(e) => {
-                let msg = e.to_string();
-                let kind = classify_error(&msg);
-                let _ = event_tx
-                    .send(DownloadEvent::Failed {
-                        transfer_id: self.transfer_id.clone(),
-                        error: msg,
-                        failure_kind: kind,
-                    })
-                    .await;
-                Ok(())
+                // Propagate Err so the spawn site emits Failed once. Emitting
+                // here and returning Ok made Result look successful while the
+                // transfer had already failed on the event channel.
+                Err(e)
             }
         }
     }
@@ -2174,7 +2177,13 @@ impl Ed2kDownload {
         }
 
         let mut part_hashes: Vec<[u8; 16]> = Vec::new();
-        let mut aich_master_hash: Option<[u8; 20]> = None;
+        let mut aich_master_hash: Option<[u8; 20]> = self.trusted_aich_master;
+        if aich_master_hash.is_some() {
+            debug!(
+                "Seeded trusted AICH master for callback download {}",
+                self.transfer_id
+            );
+        }
         // Try to read hashset answer. The peer may send other packets
         // (SecIdent, EmuleInfo) before the hashset, so read up to 5 packets.
         for _hs_attempt in 0..5u32 {
@@ -2210,26 +2219,40 @@ impl Ed2kDownload {
                                 if !local_ident.compare_relaxed(&resp.identifier) {
                                     anyhow::bail!("hashsetanswer2 file identifier mismatch");
                                 }
-                                if let (Some(root), Some(part_hashes)) =
-                                    (resp.aich_master_hash, resp.aich_part_hashes.as_ref())
-                                {
-                                    aich_master_hash = Some(root);
-                                    debug!(
-                                        "Got HashSet2 AICH data: master={}, parts={}",
-                                        hex::encode(root),
-                                        part_hashes.len()
-                                    );
-                                }
-                                if let Some(hashes) = resp.md4_hashes {
-                                    if verify_hashset(&self.file_hash, &hashes, self.file_size) {
+                                // Match multi_source: pin AICH only after the
+                                // accompanying MD4 hashset verifies against the
+                                // file's ed2k hash. Otherwise a callback peer can
+                                // first-win a bogus master and poison recovery.
+                                let md4_ok = resp
+                                    .md4_hashes
+                                    .as_ref()
+                                    .map(|h| verify_hashset(&self.file_hash, h, self.file_size))
+                                    .unwrap_or(false);
+                                if md4_ok {
+                                    if let Some(hashes) = resp.md4_hashes {
                                         debug!(
                                             "Got verified hashset2 with {} part hashes",
                                             hashes.len()
                                         );
                                         part_hashes = hashes;
-                                    } else {
-                                        warn!("Hashset2 verification failed - combined hash doesn't match file hash");
                                     }
+                                    if aich_master_hash.is_none() {
+                                        if let Some(root) = resp.aich_master_hash {
+                                            aich_master_hash = Some(root);
+                                            debug!(
+                                                "Got HashSet2 AICH data: master={}, parts={}",
+                                                hex::encode(root),
+                                                resp.aich_part_hashes
+                                                    .as_ref()
+                                                    .map(|p| p.len())
+                                                    .unwrap_or(0)
+                                            );
+                                        }
+                                    }
+                                } else if resp.aich_master_hash.is_some() {
+                                    warn!(
+                                        "HashSet2 had an AICH master but the MD4 hashset failed or was absent — deferring AICH pin"
+                                    );
                                 }
                             }
                             Err(e) => debug!("Failed to parse hashset answer2: {e}"),
@@ -3156,9 +3179,10 @@ impl Ed2kDownload {
                                 pending_credit_bytes.saturating_add(newly_written);
 
                             if last_progress_emit.elapsed() >= PROGRESS_EMIT_INTERVAL {
+                                let progress = tracker.progress_bytes().min(self.file_size);
                                 let _ = event_tx.try_send(DownloadEvent::Progress {
                                     transfer_id: self.transfer_id.clone(),
-                                    downloaded: downloaded.min(self.file_size),
+                                    downloaded: progress,
                                     total: self.file_size,
                                 });
                                 last_progress_emit = std::time::Instant::now();
@@ -3284,9 +3308,10 @@ impl Ed2kDownload {
                                 pending_credit_bytes.saturating_add(newly_written);
 
                             if last_progress_emit.elapsed() >= PROGRESS_EMIT_INTERVAL {
+                                let progress = tracker.progress_bytes().min(self.file_size);
                                 let _ = event_tx.try_send(DownloadEvent::Progress {
                                     transfer_id: self.transfer_id.clone(),
-                                    downloaded: downloaded.min(self.file_size),
+                                    downloaded: progress,
                                     total: self.file_size,
                                 });
                                 last_progress_emit = std::time::Instant::now();
@@ -3831,9 +3856,10 @@ impl Ed2kDownload {
                                         )
                                         .await;
                                         downloaded = downloaded.saturating_sub(invalidated);
+                                        let progress = tracker.progress_bytes().min(self.file_size);
                                         let _ = event_tx.try_send(DownloadEvent::Progress {
                                             transfer_id: self.transfer_id.clone(),
-                                            downloaded: downloaded.min(self.file_size),
+                                            downloaded: progress,
                                             total: self.file_size,
                                         });
                                         info!(
@@ -3944,9 +3970,10 @@ impl Ed2kDownload {
                 }
                 // Force one Progress emit at part boundary so the UI sees
                 // verified-part jumps even if the throttle just fired.
+                let progress = tracker.progress_bytes().min(self.file_size);
                 let _ = event_tx.try_send(DownloadEvent::Progress {
                     transfer_id: self.transfer_id.clone(),
-                    downloaded: downloaded.min(self.file_size),
+                    downloaded: progress,
                     total: self.file_size,
                 });
                 last_progress_emit = std::time::Instant::now();
