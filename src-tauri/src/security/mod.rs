@@ -388,6 +388,12 @@ pub fn build_pinned_client(
     addrs: &[std::net::SocketAddr],
 ) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder()
+        // Keep these guarantees on the client itself, not just in
+        // `validate_fetch_url`: callers can reuse this client for more than
+        // the originally validated request, and reqwest otherwise accepts
+        // plaintext URLs and environment/system proxy configuration.
+        .https_only(true)
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         // Hard per-request ceiling. Bootstrap downloads should be small
         // and fast; anything over a minute is already failing.

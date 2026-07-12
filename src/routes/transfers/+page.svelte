@@ -534,7 +534,7 @@
       case 'transferring': return m.transfers_src_transferring();
       case 'completed': return m.transfers_src_done();
       case 'failed': return m.transfers_src_status_failed();
-      default: return s.status;
+      default: return m.common_unknown();
     }
   }
 
@@ -1448,7 +1448,7 @@
       case 'hashing': return m.transfer_status_hashing();
       case 'insufficient': return m.transfers_dl_status_insufficient_disk();
       case 'noneneeded': return m.transfers_dl_status_no_needed_parts();
-      default: return t.status;
+      default: return m.common_unknown();
     }
   }
 
@@ -1541,7 +1541,7 @@
         if (reason.includes('hash') && reason.includes('mismatch')) return m.transfers_ul_failure_bad_data();
         return m.transfers_failure_generic();
       }
-      default: return t.status;
+      default: return m.common_unknown();
     }
   }
 
@@ -1721,6 +1721,14 @@
       if (action === 'stop' && canStop(selectedTransfer)) await stopTransfer(selectedTransfer.id);
       if (action === 'sources') await findSources(selectedTransfer.file_hash, selectedTransfer.total_size);
       if (action === 'preview') await previewFile(selectedTransfer.id);
+    } catch (e: unknown) {
+      transferError = toErrorMsg(e);
+    }
+  }
+
+  async function findSourcesInline(t: Transfer) {
+    try {
+      await findSources(t.file_hash, t.total_size);
     } catch (e: unknown) {
       transferError = toErrorMsg(e);
     }
@@ -2360,7 +2368,7 @@
       case 'hashing': return m.transfers_dl_tooltip_hashing();
       case 'insufficient': return m.transfers_dl_tooltip_insufficient();
       case 'noneneeded': return m.transfers_dl_tooltip_noneneeded();
-      default: return t.status;
+      default: return m.common_unknown();
     }
   }
 
@@ -2379,7 +2387,7 @@
           ? m.transfers_ul_tooltip_failed_reason({ reason })
           : m.transfers_ul_tooltip_failed();
       }
-      default: return t.status;
+      default: return m.common_unknown();
     }
   }
 
@@ -2588,7 +2596,7 @@
 </div>
 
 {#if transferError}
-  <div class="error-banner">
+  <div class="error-banner" role="alert">
     <span>{transferError}</span>
     <button class="ghost" onclick={() => transferError = null}>{m.common_dismiss()}</button>
   </div>
@@ -2796,7 +2804,7 @@
                           ? m.transfers_connecting_sources_one()
                           : m.transfers_connecting_sources_other({ count: t.sources }))
                         : m.transfers_no_source_details()}
-                      <button class="source-inline-btn" onclick={() => findSources(t.file_hash, t.total_size).catch(() => {})}>{m.transfers_find_sources()}</button>
+                      <button class="source-inline-btn" onclick={() => findSourcesInline(t)}>{m.transfers_find_sources()}</button>
                     </span>
                   </td>
                 </tr>
@@ -2825,7 +2833,7 @@
                   <tr class="source-child-row src-{src.status}" in:fade={{ duration: 150 }}>
                     <td class="source-child-cell" colspan={dlColCount}>
                       <span class="source-fields">
-                        <span class="source-status-dot src-dot-{src.status}" title={src.status}></span>
+                        <span class="source-status-dot src-dot-{src.status}" title={sourceStatusLabel(src)}></span>
                         <span class="source-flag" title={src.country_code ?? ''}>{#if countryFlagSrc(src.country_code)}<img src={countryFlagSrc(src.country_code)} alt={src.country_code ?? ''} class="flag-img" />{/if}</span>
                         <span class="source-client" title={src.peer_name || src.client_software || m.transfers_unknown_client()}><bdi>{src.peer_name || src.client_software || m.transfers_unknown_client()}</bdi></span>
                         <span class="source-sep"></span>

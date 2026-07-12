@@ -120,6 +120,14 @@ fn migrate_legacy_app_data(legacy: &Path, canonical: &Path) -> std::io::Result<(
     if paths_equivalent(legacy, canonical) || !legacy.exists() {
         return Ok(());
     }
+    let legacy_meta = std::fs::symlink_metadata(legacy)?;
+    if metadata_is_link_or_reparse(&legacy_meta) {
+        tracing::warn!(
+            "Skipping legacy data migration from symlink/reparse-point root {}",
+            legacy.display()
+        );
+        return Ok(());
+    }
     copy_missing_entries(legacy, canonical)
 }
 
@@ -129,20 +137,36 @@ fn copy_missing_entries(src_dir: &Path, dst_dir: &Path) -> std::io::Result<()> {
         let entry = entry?;
         let src = entry.path();
         let dst = dst_dir.join(entry.file_name());
-        let meta = entry.metadata()?;
+        // Do not let a symlink/junction inside the legacy tree escape that
+        // tree during recursive migration. `DirEntry::metadata()` follows
+        // links; `symlink_metadata()` plus the Windows reparse bit does not.
+        let meta = std::fs::symlink_metadata(&src)?;
+        if metadata_is_link_or_reparse(&meta) {
+            tracing::warn!(
+                "Skipping symlink/reparse point during legacy migration: {}",
+                src.display()
+            );
+            continue;
+        }
         if dst.exists() {
-            if meta.is_dir() && dst.is_dir() {
+            let dst_meta = std::fs::symlink_metadata(&dst)?;
+            if metadata_is_link_or_reparse(&dst_meta) {
+                tracing::warn!(
+                    "Skipping legacy migration destination symlink/reparse point: {}",
+                    dst.display()
+                );
+            } else if meta.is_dir() && dst_meta.is_dir() {
                 copy_missing_entries(&src, &dst)?;
-            } else if meta.is_file() && dst.is_file() {
-                let dst_meta = std::fs::metadata(&dst)?;
+            } else if meta.is_file() && dst_meta.is_file() {
                 let source_is_newer = meta
                     .modified()
                     .ok()
                     .zip(dst_meta.modified().ok())
                     .is_some_and(|(source, target)| source > target);
-                if meta.len() > 0
-                    && (dst_meta.len() == 0 || (source_is_newer && meta.len() > dst_meta.len()))
-                {
+                // Freshness, not size, decides which nonempty copy wins. A
+                // newer compacted DB/config is legitimately smaller than its
+                // stale canonical predecessor and must still migrate.
+                if meta.len() > 0 && (dst_meta.len() == 0 || source_is_newer) {
                     replace_stale_migration_file(&src, &dst, meta.len())?;
                 }
             }
@@ -160,14 +184,20 @@ fn copy_missing_entries(src_dir: &Path, dst_dir: &Path) -> std::io::Result<()> {
 
 fn replace_stale_migration_file(src: &Path, dst: &Path, expected_len: u64) -> std::io::Result<()> {
     let seq = MIGRATION_COPY_SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
     let file_name = dst
         .file_name()
         .map(|name| name.to_string_lossy())
         .unwrap_or_else(|| "file".into());
-    let backup = dst
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(format!(".{file_name}.{seq}.pre-migration.bak"));
+    let parent = dst.parent().unwrap_or_else(|| Path::new("."));
+    let mut backup = parent.join(format!(".{file_name}.{pid}.{seq}.pre-migration.bak"));
+    let mut collision = 0u32;
+    while backup.exists() {
+        collision = collision.saturating_add(1);
+        backup = parent.join(format!(
+            ".{file_name}.{pid}.{seq}.{collision}.pre-migration.bak"
+        ));
+    }
     std::fs::rename(dst, &backup)?;
     match copy_file_atomically(src, dst, expected_len) {
         Ok(()) => {
@@ -178,10 +208,16 @@ fn replace_stale_migration_file(src: &Path, dst: &Path, expected_len: u64) -> st
             );
             Ok(())
         }
-        Err(error) => {
-            let _ = std::fs::rename(&backup, dst);
-            Err(error)
-        }
+        Err(error) => match std::fs::rename(&backup, dst) {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "{error}; rollback failed ({rollback_error}); canonical backup remains at {}",
+                    backup.display()
+                ),
+            )),
+        },
     }
 }
 
@@ -240,11 +276,35 @@ fn copy_file_atomically(src: &Path, dst: &Path, expected_len: u64) -> std::io::R
 fn paths_equivalent(a: &Path, b: &Path) -> bool {
     match (a.canonicalize(), b.canonicalize()) {
         (Ok(a), Ok(b)) => a == b,
-        _ if cfg!(target_os = "windows") => a
-            .to_string_lossy()
-            .eq_ignore_ascii_case(&b.to_string_lossy()),
+        _ if cfg!(target_os = "windows") => {
+            normalize_windows_path_alias(a) == normalize_windows_path_alias(b)
+        }
         _ => a == b,
     }
+}
+
+fn normalize_windows_path_alias(path: &Path) -> String {
+    let normalized = path.to_string_lossy().replace('/', "\\");
+    let normalized = normalized
+        .strip_prefix(r"\\?\UNC\")
+        .map(|rest| format!(r"\\{rest}"))
+        .or_else(|| normalized.strip_prefix(r"\\?\").map(str::to_string))
+        .unwrap_or(normalized);
+    normalized.trim_end_matches('\\').to_ascii_lowercase()
+}
+
+fn metadata_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(target_os = "windows"))]
+    false
 }
 
 #[cfg(test)]

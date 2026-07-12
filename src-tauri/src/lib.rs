@@ -29,6 +29,23 @@ use sharing::manager::TransferManager;
 use storage::config::AppConfig;
 use storage::database::Database;
 
+async fn reconcile_shared_files(network_tx: &mpsc::Sender<network::NetworkCommand>) -> bool {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        network_tx.send(network::NetworkCommand::SharedFilesChangedAck { tx }),
+    )
+    .await
+    .is_err()
+    {
+        return false;
+    }
+    matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(15), rx).await,
+        Ok(Ok(Ok(())))
+    )
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Give async tasks a larger worker-thread stack than tokio's 2 MiB default.
@@ -336,7 +353,6 @@ pub fn run() {
                 bw_shutdown: bw_shutdown.clone(),
                 scanning_count: scanning_count.clone(),
                 scan_coordination: scan_coordination.clone(),
-                cached_contacts,
                 cached_transfer_stats,
                 cached_shared_files: cached_shared_files.clone(),
                 hash_cancel_flags: hash_cancel_flags.clone(),
@@ -700,10 +716,10 @@ pub fn run() {
                                     || last_known_met_persist.elapsed()
                                         >= std::time::Duration::from_secs(30)
                                 {
-                                    let _ = net_tx
-                                        .try_send(network::NetworkCommand::SharedFilesChanged);
-                                    last_known_met_persist = std::time::Instant::now();
-                                    hashed_since_persist = 0;
+                                    if reconcile_shared_files(&net_tx).await {
+                                        last_known_met_persist = std::time::Instant::now();
+                                        hashed_since_persist = 0;
+                                    }
                                 }
                             }
                         }
@@ -756,7 +772,9 @@ pub fn run() {
 
                 drop(_scan_guard);
                 startup_cancel_flags.write().await.remove("__startup__");
-                let _ = net_tx.try_send(network::NetworkCommand::SharedFilesChanged);
+                if !reconcile_shared_files(&net_tx).await {
+                    tracing::warn!("Startup shared-file reconciliation failed");
+                }
                 let _ = startup_app.emit("file-hash-progress", serde_json::json!({
                     "current": total_to_hash,
                     "total": total_to_hash,

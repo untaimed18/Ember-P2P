@@ -13,7 +13,7 @@ use crate::storage::config::AppConfig;
 use crate::storage::database::Database;
 use crate::storage::identity::NodeIdentity;
 use crate::storage::statistics::TransferStats;
-use crate::types::{FileInfo, KadContactInfo};
+use crate::types::FileInfo;
 
 /// Live shared-folder list visible to the upload server's security check.
 pub type SharedFolderList = Arc<RwLock<Vec<String>>>;
@@ -58,8 +58,6 @@ pub struct AppState {
     /// they're consumed, so this stays small/transient rather than growing
     /// unbounded.
     pub fresh_part_hashes: Arc<RwLock<HashMap<[u8; 16], Vec<[u8; 16]>>>>,
-    /// Cached KAD contacts updated by the network loop — avoids blocking the event loop.
-    pub cached_contacts: Arc<RwLock<Vec<KadContactInfo>>>,
     /// Cached transfer statistics — updated by the network loop.
     pub cached_transfer_stats: Arc<RwLock<TransferStats>>,
     /// Cached shared files list — updated by sharing commands and the network

@@ -4119,7 +4119,10 @@ impl UploadHandler {
             std::time::Instant,
         )> = None;
         let mut cached_is_video_ext: Option<(PathBuf, bool)> = None;
-        const PART_TRACKER_REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
+        // Keep the disk-backed cache short-lived so a just-verified part can
+        // be seeded promptly. The unchanged is_range_safe_to_serve gate below
+        // still requires both completeness and MD4 verification.
+        const PART_TRACKER_REFRESH: std::time::Duration = std::time::Duration::from_millis(500);
         // One-shot INFO log per session the first time we serve verified bytes
         // out of a `.part` file (eMule-style partial-file sharing). Makes it
         // observable that we're seeding a file we're still downloading, without

@@ -40,6 +40,11 @@ const FT_EMBER_SOURCES: u8 = 0xE1;
 const TAG_STRING: u8 = 0x02;
 const TAG_UINT32: u8 = 0x03;
 const AICH_BASE32_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+// Settings accepts up to 512 shared folders and discovery accepts up to
+// 100,000 files per folder. Keep the companion path-index ceiling aligned
+// with that supported scale instead of silently retaining only the first
+// folder's worth of mappings.
+const MAX_KNOWN_PATH_MAPPINGS: usize = 512 * 100_000;
 
 #[derive(Debug, Clone)]
 pub struct KnownFileRecord {
@@ -91,9 +96,8 @@ impl KnownFileList {
             return list;
         }
         // known.met is app-managed, but a corrupt or maliciously-swapped file
-        // shouldn't be slurped wholesale. 50k records (the parse cap) is only
-        // a few MB, so this ceiling is very generous while still bounding the
-        // worst-case allocation.
+        // shouldn't be slurped wholesale. This ceiling bounds the worst-case
+        // allocation while allowing millions of ordinary records.
         const MAX_KNOWN_MET_BYTES: u64 = 256 * 1024 * 1024;
         if let Ok(meta) = std::fs::metadata(path) {
             if meta.len() > MAX_KNOWN_MET_BYTES {
@@ -140,37 +144,49 @@ impl KnownFileList {
         }
         let count = cursor.read_u32::<LittleEndian>()? as usize;
 
+        // Every record has at least mtime + hash + part-count + tag-count.
+        // Reject an impossible declared count up front so a truncated file (or
+        // corrupt count) reaches `load()`'s quarantine/reset path rather than
+        // becoming a valid-looking, permanently shrunken catalog on next save.
+        const MIN_RECORD_BYTES: usize = 4 + 16 + 2 + 4;
+        let remaining = data.len().saturating_sub(cursor.position() as usize);
+        if count > remaining / MIN_RECORD_BYTES {
+            anyhow::bail!(
+                "known.met declares {count} records but at most {} minimum-size records fit",
+                remaining / MIN_RECORD_BYTES
+            );
+        }
+
         // No artificial record cap here: `save()` writes the full `files.len()`
-        // header, so a hard 50k parse cap silently dropped every file past the
-        // 50,000th on restart for large libraries. Memory is already bounded
-        // before we get here — the caller refuses files over MAX_KNOWN_MET_BYTES
-        // (256 MiB), each record's part/tag counts are clamped, and the
-        // consecutive-failure guard below stops a truncated/garbage tail (e.g. a
-        // bogus huge `count`) after 3 failed reads.
-        let mut consecutive_failures = 0u32;
-        for _ in 0..count {
-            match Self::read_record(&mut cursor, version) {
-                Ok(record) => {
-                    consecutive_failures = 0;
-                    let hash = record.file_hash;
-                    let path = record.file_path.clone();
-                    self.files.insert(hash, record);
-                    if !path.is_empty() {
-                        // Normalize the key so Windows path-casing differences
-                        // between sessions still hit on lookup (the record keeps
-                        // the original-case `file_path`).
-                        self.path_index.insert(normalize_path_key(&path), hash);
-                    }
-                }
-                Err(e) => {
-                    consecutive_failures += 1;
-                    warn!("Skipping corrupt record in known.met: {e}");
-                    if consecutive_failures >= 3 {
-                        warn!("Too many consecutive failures, stopping known.met parse");
-                        break;
-                    }
-                }
+        // header, so a hard parse cap would silently drop the tail on restart.
+        // A malformed record is not safely skippable because its failed parse
+        // may stop mid-record; there is no framing marker from which to find the
+        // next record. Propagate the first failure and quarantine the whole
+        // sequence instead of accepting a partial prefix.
+        for record_index in 0..count {
+            let record = Self::read_record(&mut cursor, version).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to parse known.met record {} of {count}: {e}",
+                    record_index + 1
+                )
+            })?;
+            let hash = record.file_hash;
+            let path = record.file_path.clone();
+            self.files.insert(hash, record);
+            if !path.is_empty() {
+                // Normalize the key so Windows path-casing differences
+                // between sessions still hit on lookup (the record keeps
+                // the original-case `file_path`).
+                self.path_index.insert(normalize_path_key(&path), hash);
             }
+        }
+
+        let consumed = cursor.position() as usize;
+        if consumed != data.len() {
+            anyhow::bail!(
+                "known.met has {} trailing bytes after its declared {count} records",
+                data.len() - consumed
+            );
         }
 
         info!("Loaded {} known files from known.met", self.files.len());
@@ -751,25 +767,86 @@ impl KnownFileList {
             Ok(c) => c as usize,
             Err(_) => return,
         };
-        let mut loaded = 0usize;
-        for _ in 0..count.min(100_000) {
+        if count > MAX_KNOWN_PATH_MAPPINGS {
+            warn!(
+                "known_paths.dat declares {count} mappings (max supported {MAX_KNOWN_PATH_MAPPINGS}); discarding path index"
+            );
+            return;
+        }
+        // A mapping always needs at least a u16 length plus a 16-byte hash.
+        // This also rejects a corrupt huge count without iterating it.
+        let remaining = data.len().saturating_sub(cur.position() as usize);
+        if count > remaining / 18 {
+            warn!(
+                "known_paths.dat is truncated: declares {count} mappings but at most {} fit",
+                remaining / 18
+            );
+            return;
+        }
+
+        // Parse into a temporary collection first. A truncated/corrupt tail
+        // must discard this rebuildable cache wholesale, not leave a silently
+        // shortened path index that looks successfully loaded.
+        let mut mappings = Vec::with_capacity(count.min(self.files.len()));
+        for mapping_index in 0..count {
             let path_len = match cur.read_u16::<LittleEndian>() {
                 Ok(l) => l as usize,
-                Err(_) => break,
+                Err(e) => {
+                    warn!(
+                        "known_paths.dat mapping {} of {count} has no path length: {e}; discarding path index",
+                        mapping_index + 1
+                    );
+                    return;
+                }
             };
             if path_len > 32768 {
-                break;
+                warn!(
+                    "known_paths.dat mapping {} of {count} has implausible path length {path_len}; discarding path index",
+                    mapping_index + 1
+                );
+                return;
             }
             let mut pbuf = vec![0u8; path_len];
-            if cur.read_exact(&mut pbuf).is_err() {
-                break;
+            if let Err(e) = cur.read_exact(&mut pbuf) {
+                warn!(
+                    "known_paths.dat mapping {} of {count} has a truncated path: {e}; discarding path index",
+                    mapping_index + 1
+                );
+                return;
             }
             let mut hash = [0u8; 16];
-            if cur.read_exact(&mut hash).is_err() {
-                break;
+            if let Err(e) = cur.read_exact(&mut hash) {
+                warn!(
+                    "known_paths.dat mapping {} of {count} has a truncated hash: {e}; discarding path index",
+                    mapping_index + 1
+                );
+                return;
             }
+            let fp = match String::from_utf8(pbuf) {
+                Ok(path) => path,
+                Err(e) => {
+                    warn!(
+                        "known_paths.dat mapping {} of {count} is not UTF-8: {e}; discarding path index",
+                        mapping_index + 1
+                    );
+                    return;
+                }
+            };
+            if !fp.is_empty() && self.files.contains_key(&hash) {
+                mappings.push((fp, hash));
+            }
+        }
+        if cur.position() as usize != data.len() {
+            warn!(
+                "known_paths.dat has {} trailing bytes after its declared {count} mappings; discarding path index",
+                data.len() - cur.position() as usize
+            );
+            return;
+        }
+
+        let mut loaded = 0usize;
+        for (fp, hash) in mappings {
             if let Some(record) = self.files.get_mut(&hash) {
-                let fp = String::from_utf8_lossy(&pbuf).to_string();
                 if record.file_path.is_empty() {
                     record.file_path = fp.clone();
                 }

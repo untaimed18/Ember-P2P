@@ -460,14 +460,8 @@ pub async fn publish_note(
             "Add a rating or a comment before publishing",
         ));
     }
-    if state.cached_contacts.read().await.is_empty() {
-        return Err(coded(
-            "search_no_kad_contacts",
-            "No Kad contacts available to publish note",
-        ));
-    }
-
     let kad_hash = md4_bytes_to_kad_id(&parse_exact_file_hash(&file_hash)?);
+    let (tx, rx) = oneshot::channel();
 
     state
         .network_tx
@@ -477,6 +471,7 @@ pub async fn publish_note(
             file_size,
             rating,
             comment,
+            tx,
         })
         .map_err(|_| {
             coded(
@@ -485,7 +480,18 @@ pub async fn publish_note(
             )
         })?;
 
-    Ok("Note publish queued".to_string())
+    match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+        Ok(Ok(Ok(()))) => Ok("Note publish started".to_string()),
+        Ok(Ok(Err(message))) => Err(coded("search_note_publish_unavailable", message)),
+        Ok(Err(_)) => Err(coded(
+            "search_note_publish_failed",
+            "Network task closed the note publish acknowledgement",
+        )),
+        Err(_) => Err(coded(
+            "search_note_publish_timeout",
+            "Timed out waiting for the live network publish acknowledgement",
+        )),
+    }
 }
 
 #[tauri::command]

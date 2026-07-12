@@ -279,7 +279,7 @@
           <div class="browse-status">{m.browse_no_files()}</div>
         {:else}
           {#if downloadError}
-            <div class="browse-error" style="margin-bottom: 8px">{downloadError}</div>
+            <div class="browse-error" style="margin-bottom: 8px" role="alert">{downloadError}</div>
           {/if}
           <div class="browse-count">
             {files.length === 1 ? m.browse_count_one() : m.browse_count_other({ count: files.length })}

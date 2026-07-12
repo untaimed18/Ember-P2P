@@ -918,6 +918,22 @@ pub async fn run_quic_accept_loop(
                     let _ = init_send.write_all(&reject).await;
                     return;
                 };
+                // The v1 Ember relay request carries only the hash of the
+                // relay's public EPX attestation. That proves the caller saw a
+                // current advertisement, but it is not proof of possession:
+                // the hash is necessarily public and is therefore a bearer
+                // value. Do not pretend that consuming it once or binding it
+                // to the source IP fixes that — one-shot use breaks legitimate
+                // parallel transfers, while an IP binding breaks NAT/mobile
+                // peers and still does not authenticate the requester.
+                //
+                // A compatible fix needs a versioned Ember-native request
+                // carrying the requester's identity plus a signature over the
+                // relay identity, target, file hash, session id, and a fresh
+                // nonce. Until both ends support that wire shape, retain the
+                // current expiry/capacity/target controls and the downstream
+                // authenticated Ember/eMule handshake rather than weakening
+                // interoperability or treating this hash as a secret.
                 {
                     let mut mgr_lock = mgr.lock().await;
                     if !mgr_lock.accepts_attestation_hash(&attestation_hash) {
@@ -1144,56 +1160,95 @@ async fn connect_relay_target(
     Ok((send, recv))
 }
 
+fn validate_server_relay_session_id(session_id: &str) -> Result<(), String> {
+    if !session_id.is_empty()
+        && session_id.len() <= 128
+        && session_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        Ok(())
+    } else {
+        Err("invalid server-relay session id".to_string())
+    }
+}
+
 /// Connect to the rendezvous server's WebSocket relay endpoint.
 /// Returns a WsStream that implements AsyncRead + AsyncWrite.
 pub async fn connect_server_relay(
     rendezvous_url: &str,
     session_id: &str,
 ) -> Result<WsStream, String> {
-    // L11: refuse to downgrade ws upgrades to plaintext. The
-    // previous implementation rewrote `https://`→`wss://` and also
-    // `http://`→`ws://`, which would cheerfully open a plain
-    // websocket if the rendezvous URL was misconfigured to use
-    // `http://` (e.g. a stale env var). The rest of the system
-    // requires HTTPS for the rendezvous control plane, so we should
-    // refuse to ride the relay over plaintext too — a
-    // network-position attacker can otherwise observe and inject
-    // relayed bytes verbatim. If the URL doesn't already use
-    // `https://`, return a hard error rather than silently downgrading.
-    let trimmed = rendezvous_url.trim();
-    if !trimmed.starts_with("https://") {
-        return Err(format!(
-            "rendezvous URL must use https:// for relay connections, got {trimmed}"
-        ));
-    }
-    let ws_url = format!(
-        "{}/relay/{}",
-        trimmed.replacen("https://", "wss://", 1),
-        session_id
-    );
+    validate_server_relay_session_id(session_id)?;
 
-    info!("Relay: connecting to server relay at {ws_url}");
-
-    let (ws_stream, _response) = tokio_tungstenite::connect_async(&ws_url)
+    // Validate HTTPS and resolve exactly once through the shared SSRF guard.
+    // `connect_async` would resolve the hostname again after this check,
+    // reopening a DNS-rebinding window. Instead, connect the TCP socket to one
+    // of these validated addresses and hand that socket to the TLS upgrader.
+    let (validated_url, host, addrs) = crate::security::validate_fetch_url(rendezvous_url)
         .await
-        .map_err(|e| {
-            // tokio-tungstenite surfaces an HTTP 404 from the upgrade
-            // handshake as `Http(Response { status: 404, ... })`. The
-            // raw `Display` is noisy but does contain "404", so we
-            // pattern-match on the rendered string. Same intent as the
-            // explicit branch in `register_punch`: make a missing
-            // route on the deployed rendezvous obvious.
-            let rendered = format!("{e}");
-            if rendered.contains("404") {
-                format!(
-                    "WS relay connect failed: 404 Not Found ({ws_url} — deployed rendezvous is missing the /relay route; redeploy the server)"
-                )
-            } else {
-                format!("WS relay connect failed: {rendered}")
-            }
-        })?;
+        .map_err(|e| format!("rendezvous URL rejected: {e}"))?;
+    let mut ws_url = reqwest::Url::parse(&validated_url)
+        .map_err(|e| format!("invalid validated rendezvous URL: {e}"))?;
+    ws_url
+        .set_scheme("wss")
+        .map_err(|_| "failed to construct secure relay WebSocket URL".to_string())?;
+    let relay_path = format!("{}/relay/{session_id}", ws_url.path().trim_end_matches('/'));
+    ws_url.set_path(&relay_path);
+    ws_url.set_query(None);
+    ws_url.set_fragment(None);
 
-    info!("Relay: server relay connected for session {session_id}");
+    info!("Relay: connecting to pinned server relay host {host}");
+
+    // Bound all address attempts together so a long DNS answer cannot multiply
+    // the connect timeout. No hostname is passed to TcpStream, so this performs
+    // no second DNS lookup.
+    let tcp_stream = tokio::time::timeout(RELAY_CONTROL_TIMEOUT, async {
+        let mut last_error = None;
+        for addr in &addrs {
+            match tokio::net::TcpStream::connect(addr).await {
+                Ok(stream) => return Ok(stream),
+                Err(e) => last_error = Some(e),
+            }
+        }
+        Err(last_error
+            .map(|e| format!("all validated rendezvous addresses failed: {e}"))
+            .unwrap_or_else(|| "rendezvous hostname resolved to no addresses".to_string()))
+    })
+    .await
+    .map_err(|_| "server relay TCP connection timed out".to_string())??;
+    tcp_stream
+        .set_nodelay(true)
+        .map_err(|e| format!("failed to configure server relay TCP socket: {e}"))?;
+
+    // `client_async_tls_with_config` derives both TLS SNI and the HTTP Host
+    // header from `ws_url`, while using the already-connected pinned socket.
+    // This preserves normal certificate verification without another lookup.
+    let (ws_stream, _response) = tokio::time::timeout(
+        RELAY_CONTROL_TIMEOUT,
+        tokio_tungstenite::client_async_tls_with_config(
+            ws_url.as_str(),
+            tcp_stream,
+            None,
+            None,
+        ),
+    )
+    .await
+    .map_err(|_| "server relay TLS/WebSocket handshake timed out".to_string())?
+    .map_err(|e| {
+        // Do not include `ws_url`: the path contains the relay room's bearer
+        // session id. The protocol currently has no separate join credential,
+        // so keeping that value out of this helper's logs/errors is the
+        // compatible mitigation available without a wire-format migration.
+        let rendered = format!("{e}");
+        if rendered.contains("404") {
+            "WS relay connect failed: 404 Not Found (deployed rendezvous is missing the /relay route; redeploy the server)".to_string()
+        } else {
+            format!("WS relay connect failed: {rendered}")
+        }
+    })?;
+
+    info!("Relay: server relay connected");
     Ok(WsStream::new(ws_stream))
 }
 

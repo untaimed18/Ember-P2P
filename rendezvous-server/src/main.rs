@@ -3,7 +3,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     time::{Duration, Instant},
 };
@@ -23,7 +23,7 @@ use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
 // Authentication: every endpoint that mutates per-id state, or dequeues
@@ -442,14 +442,119 @@ struct UnregisterRequest {
     sig: String,
 }
 
-fn extract_client_ip(headers: &HeaderMap, addr: SocketAddr) -> IpAddr {
-    // Only trust proxy headers when running behind a reverse proxy (e.g. Fly.io).
-    // Set TRUST_PROXY=false to disable when running without a proxy.
-    let trust_proxy = std::env::var("TRUST_PROXY")
-        .map(|v| v != "false" && v != "0")
-        .unwrap_or(false);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProxyMode {
+    Disabled,
+    Fly,
+}
 
-    if trust_proxy {
+#[derive(Clone, Copy, Debug)]
+struct TrustedProxyNet {
+    network: IpAddr,
+    prefix_len: u8,
+}
+
+impl TrustedProxyNet {
+    fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        let (ip, prefix_len) = match value.split_once('/') {
+            Some((ip, prefix)) => {
+                let ip = ip.parse::<IpAddr>().ok()?;
+                let prefix_len = prefix.parse::<u8>().ok()?;
+                (ip, prefix_len)
+            }
+            None => {
+                let ip = value.parse::<IpAddr>().ok()?;
+                let prefix_len = if ip.is_ipv4() { 32 } else { 128 };
+                (ip, prefix_len)
+            }
+        };
+        if (ip.is_ipv4() && prefix_len > 32) || (ip.is_ipv6() && prefix_len > 128) {
+            return None;
+        }
+        Some(Self {
+            network: ip,
+            prefix_len,
+        })
+    }
+
+    fn contains(&self, ip: IpAddr) -> bool {
+        match (self.network, ip) {
+            (IpAddr::V4(network), IpAddr::V4(candidate)) => {
+                let mask = if self.prefix_len == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - self.prefix_len)
+                };
+                u32::from(network) & mask == u32::from(candidate) & mask
+            }
+            (IpAddr::V6(network), IpAddr::V6(candidate)) => {
+                let mask = if self.prefix_len == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - self.prefix_len)
+                };
+                u128::from(network) & mask == u128::from(candidate) & mask
+            }
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ProxyConfig {
+    mode: ProxyMode,
+    trusted_hops: Vec<TrustedProxyNet>,
+}
+
+impl ProxyConfig {
+    fn from_env() -> Self {
+        // Deliberately require a named mode. Historically any TRUST_PROXY
+        // value other than "false"/"0" trusted Fly-Client-IP from every
+        // directly connected client, so typos such as "flase" silently
+        // enabled spoofing. Only the exact, documented Fly mode enables the
+        // Fly-specific header.
+        let mode = match std::env::var("TRUST_PROXY") {
+            Ok(value) if value.trim().eq_ignore_ascii_case("fly") => ProxyMode::Fly,
+            _ => ProxyMode::Disabled,
+        };
+        let trusted_hops = std::env::var("TRUSTED_PROXY_HOPS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|value| {
+                let value = value.trim();
+                if value.is_empty() {
+                    return None;
+                }
+                match TrustedProxyNet::parse(value) {
+                    Some(network) => Some(network),
+                    None => {
+                        warn!("ignoring invalid TRUSTED_PROXY_HOPS entry");
+                        None
+                    }
+                }
+            })
+            .collect();
+        Self { mode, trusted_hops }
+    }
+
+    fn trusts_hop(&self, ip: IpAddr) -> bool {
+        self.trusted_hops.iter().any(|network| network.contains(ip))
+    }
+}
+
+fn proxy_config() -> &'static ProxyConfig {
+    static CONFIG: OnceLock<ProxyConfig> = OnceLock::new();
+    CONFIG.get_or_init(ProxyConfig::from_env)
+}
+
+fn extract_client_ip(headers: &HeaderMap, addr: SocketAddr) -> IpAddr {
+    let config = proxy_config();
+    // A forwarded address has authority only when both controls agree:
+    // deployment explicitly selected Fly mode, and the immediate TCP peer is
+    // in the operator-configured proxy allowlist. This prevents a public
+    // client from supplying Fly-Client-IP directly to evade rate/session caps.
+    if config.mode == ProxyMode::Fly && config.trusts_hop(addr.ip()) {
         if let Some(val) = headers.get("fly-client-ip") {
             if let Ok(s) = val.to_str() {
                 if let Ok(ip) = s.trim().parse::<IpAddr>() {
@@ -1239,6 +1344,14 @@ async fn relay_ws(
     if !validate_relay_session_id(&session_id) {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    // The Ember-native v1 server-relay protocol uses this high-entropy room id
+    // as its join capability; it has no separate identity proof or role-bound
+    // token. Requiring a new bearer/header here would strand existing peers,
+    // while IP-binding either half would break same-NAT peers and roaming
+    // clients. A real fix therefore requires a versioned client/server
+    // protocol that authenticates both joins and binds their roles to the
+    // invite. Until that migration exists, avoid logging the full id and leave
+    // downstream Ember/eMule authentication intact.
     let client_ip = extract_client_ip(&headers, addr);
     if !check_rate_limit(&state, client_ip).await {
         return StatusCode::TOO_MANY_REQUESTS.into_response();
