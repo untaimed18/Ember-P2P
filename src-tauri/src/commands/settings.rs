@@ -993,6 +993,24 @@ pub async fn set_close_behavior(
     Ok(())
 }
 
+/// Official Ember project website (GitHub Pages).
+const EMBER_WEBSITE_URL: &str = "https://untaimed18.github.io/Ember-P2P/";
+
+/// Open the Ember website in the user's default browser.
+///
+/// The URL is hardcoded so the frontend cannot redirect this command at an
+/// arbitrary destination.
+#[tauri::command]
+pub async fn open_ember_website() -> Result<(), String> {
+    opener::open(EMBER_WEBSITE_URL).map_err(|e| {
+        coded_ctx(
+            "settings_open_website_failed",
+            "Failed to open the Ember website",
+            e,
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -43,3 +43,8 @@ export async function quitApp(): Promise<void> {
 export async function setCloseBehavior(behavior: 'ask' | 'tray' | 'exit'): Promise<void> {
   return invoke('set_close_behavior', { behavior });
 }
+
+/** Open the official Ember website in the default browser. */
+export async function openEmberWebsite(): Promise<void> {
+  return invoke('open_ember_website');
+}
