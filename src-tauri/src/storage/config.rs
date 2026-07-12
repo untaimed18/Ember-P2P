@@ -117,17 +117,32 @@ impl AppConfig {
                 // `tcp_port: 0`) from reaching bind/connection logic. App-written
                 // configs always pass, so this only trips on foreign input —
                 // which we treat like corruption: preserve and reset.
-                Some(Ok(s)) => match crate::commands::settings::validate_settings(&s) {
-                    Ok(()) => s,
-                    Err(e) => {
-                        corrupt_backup = Some(backup_corrupt_config(
-                            &config_path,
-                            &format!("has invalid settings ({e})"),
-                        )?);
+                // Overlapping shared folders from older builds are soft-fixed
+                // first so upgrade does not wipe the whole settings file.
+                Some(Ok(mut s)) => {
+                    let (deduped, deduped_changed) =
+                        crate::commands::settings::dedupe_overlapping_shared_folders(
+                            std::mem::take(&mut s.shared_folders),
+                        );
+                    s.shared_folders = deduped;
+                    if deduped_changed {
+                        tracing::warn!(
+                            "Removed overlapping/duplicate shared folders from config on load"
+                        );
                         config_changed = true;
-                        AppSettings::default()
                     }
-                },
+                    match crate::commands::settings::validate_settings(&s) {
+                        Ok(()) => s,
+                        Err(e) => {
+                            corrupt_backup = Some(backup_corrupt_config(
+                                &config_path,
+                                &format!("has invalid settings ({e})"),
+                            )?);
+                            config_changed = true;
+                            AppSettings::default()
+                        }
+                    }
+                }
                 Some(Err(e)) => {
                     corrupt_backup = Some(backup_corrupt_config(
                         &config_path,

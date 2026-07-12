@@ -77,7 +77,12 @@ pub fn coded_ctx(
 /// reply yet short enough that the user gets a clear error instead of a
 /// permanent spinner.
 pub const CMD_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-pub const CMD_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Bound how long an IPC command waits to *enqueue* work on the network
+/// task. Matched to [`CMD_REPLY_TIMEOUT`] (10s): a full send queue under
+/// load should still clear within a healthy reply window, while a hung
+/// network task surfaces a coded timeout instead of blocking forever.
+pub const CMD_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub async fn bounded_send<T: Send>(
     sender: &tokio::sync::mpsc::Sender<T>,

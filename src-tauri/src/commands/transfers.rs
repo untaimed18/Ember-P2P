@@ -751,15 +751,12 @@ pub async fn cancel_transfers_batch(
     }
     let promoted: Vec<Transfer> = promoted_by_id.into_values().collect();
     start_promoted_downloads(&state, &promoted).await;
-    if teardown_failures == 0 {
-        Ok(())
-    } else {
-        Err(coded_ctx(
-            "transfers_batch_cleanup_incomplete",
-            "Some transfers were cancelled but their partial files were retained because teardown was not acknowledged",
-            teardown_failures,
-        ))
+    if teardown_failures > 0 {
+        tracing::warn!(
+            "cancel_transfers_batch: {teardown_failures} teardown ack failure(s); partials retained where cleanup was not acknowledged"
+        );
     }
+    Ok(())
 }
 
 #[tauri::command]

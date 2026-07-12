@@ -11,6 +11,9 @@ const MAX_DOWNLOAD_HISTORY_ROWS: i64 = 5_000;
 
 pub struct Database {
     conn: Mutex<Connection>,
+    /// Set when `ember.db` was corrupt at open time and replaced after backup.
+    /// Startup surfaces a non-silent notice (same pattern as config recovery).
+    pub corrupt_backup: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug)]
@@ -38,12 +41,14 @@ impl Database {
                     "ember.db was corrupt and has been preserved at {}; creating a fresh database",
                     backup.display()
                 );
-                Self::open_at(&db_path).map_err(|retry| {
+                let mut db = Self::open_at(&db_path).map_err(|retry| {
                     anyhow::anyhow!(
                         "Failed to initialize a fresh database after preserving the corrupt one at {}: {retry}",
                         backup.display()
                     )
-                })
+                })?;
+                db.corrupt_backup = Some(backup);
+                Ok(db)
             }
             Err(e) => Err(e),
         }
@@ -69,6 +74,7 @@ impl Database {
 
         let db = Self {
             conn: Mutex::new(conn),
+            corrupt_backup: None,
         };
         db.run_migrations()?;
 
@@ -2102,6 +2108,7 @@ mod tests {
         .expect("create schema");
         Database {
             conn: Mutex::new(conn),
+            corrupt_backup: None,
         }
     }
 
@@ -2179,6 +2186,7 @@ mod tests {
         .expect("create schema");
         Database {
             conn: Mutex::new(conn),
+            corrupt_backup: None,
         }
     }
 

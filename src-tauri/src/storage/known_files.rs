@@ -159,17 +159,22 @@ impl KnownFileList {
 
         // No artificial record cap here: `save()` writes the full `files.len()`
         // header, so a hard parse cap would silently drop the tail on restart.
-        // A malformed record is not safely skippable because its failed parse
-        // may stop mid-record; there is no framing marker from which to find the
-        // next record. Propagate the first failure and quarantine the whole
-        // sequence instead of accepting a partial prefix.
+        // A mid-record parse failure has no framing marker to resync from, so we
+        // stop without inventing further records — but we keep every complete
+        // record already inserted. That preserves a large library prefix instead
+        // of failing the whole parse and wiping known.met on the next save.
         for record_index in 0..count {
-            let record = Self::read_record(&mut cursor, version).map_err(|e| {
-                anyhow::anyhow!(
-                    "failed to parse known.met record {} of {count}: {e}",
-                    record_index + 1
-                )
-            })?;
+            let record = match Self::read_record(&mut cursor, version) {
+                Ok(record) => record,
+                Err(e) => {
+                    warn!(
+                        "failed to parse known.met record {} of {count}: {e}; keeping {} previously loaded records",
+                        record_index + 1,
+                        self.files.len()
+                    );
+                    return Ok(());
+                }
+            };
             let hash = record.file_hash;
             let path = record.file_path.clone();
             self.files.insert(hash, record);
@@ -181,6 +186,8 @@ impl KnownFileList {
             }
         }
 
+        // Only after successfully reading all declared records: trailing bytes
+        // mean the file is malformed beyond a clean prefix truncate.
         let consumed = cursor.position() as usize;
         if consumed != data.len() {
             anyhow::bail!(

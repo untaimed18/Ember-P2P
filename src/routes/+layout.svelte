@@ -102,10 +102,11 @@
     ]);
   }
 
-  // The `close-requested` and `config-corrupt-recovered` listeners are
-  // registered inside onMount (below) so they're torn down AND re-registered
-  // across remounts. onMount runs before the splash floor (~400ms) lifts and
-  // before the backend's (delayed) corrupt-config emit, so the
+  // The `close-requested`, `config-corrupt-recovered`, and
+  // `db-corrupt-recovered` listeners are registered inside onMount
+  // (below) so they're torn down AND re-registered across remounts.
+  // onMount runs before the splash floor (~400ms) lifts and before the
+  // backend's (delayed) corrupt-config/db emit, so the
   // "active before the user can act" intent is preserved.
   onMount(() => {
     initTheme();
@@ -125,6 +126,7 @@
     let updateCheckTimer: number | undefined;
     let unlistenClose: UnlistenFn | null = null;
     let unlistenConfigCorrupt: UnlistenFn | null = null;
+    let unlistenDbCorrupt: UnlistenFn | null = null;
 
     // Surface the native close confirmation. The splash masks the first frames
     // so the window can't be closed before this lands.
@@ -143,6 +145,13 @@
     })
       .then((fn) => { if (mounted) unlistenConfigCorrupt = fn; else fn(); })
       .catch((e) => console.error('Failed to register config-corrupt listener:', e));
+
+    listen<{ backup_path: string }>('db-corrupt-recovered', (event) => {
+      const path = event.payload?.backup_path ?? '';
+      toastWarning(path ? m.layout_db_corrupt_backup({ path }) : m.layout_db_corrupt());
+    })
+      .then((fn) => { if (mounted) unlistenDbCorrupt = fn; else fn(); })
+      .catch((e) => console.error('Failed to register db-corrupt listener:', e));
 
     const revealApp = () => {
       if (!mounted || !splashVisible) return;
@@ -272,6 +281,7 @@
       clearAppSettings();
       if (unlistenClose) unlistenClose();
       if (unlistenConfigCorrupt) unlistenConfigCorrupt();
+      if (unlistenDbCorrupt) unlistenDbCorrupt();
     };
   });
 </script>

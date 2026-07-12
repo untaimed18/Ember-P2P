@@ -83,8 +83,14 @@ fn auth_signature_message(nonce: &[u8]) -> Vec<u8> {
     message
 }
 
+/// Sign an auth nonce for wire RESPONSE payloads.
+///
+/// **Transitional emit (this release):** signs the raw nonce so v1.1 can
+/// authenticate with v1.0.14 peers that only verify bare nonces. The next
+/// release can switch emit back to domain-separated `auth_signature_message`.
+/// Verification stays dual via [`verify_auth_nonce_compat`].
 pub(crate) fn sign_auth_nonce(signing_key: &SigningKey, nonce: &[u8]) -> Signature {
-    signing_key.sign(&auth_signature_message(nonce))
+    signing_key.sign(nonce)
 }
 
 pub(crate) fn verify_auth_nonce_compat(
@@ -98,8 +104,9 @@ pub(crate) fn verify_auth_nonce_compat(
     {
         return true;
     }
-    // Receive-only transition compatibility for older Ember releases.
-    // Upgraded clients never emit a bare-nonce signature.
+    // Dual verify during mixed-version rollout: accept domain-separated
+    // signatures from peers that still emit them, and bare-nonce signatures
+    // from this transitional emit / older releases.
     verifying_key.verify_strict(nonce, signature).is_ok()
 }
 
@@ -361,8 +368,8 @@ mod tests {
         assert!(
             resp_vk
                 .verify_strict(&init_nonce, &resp_response_sig)
-                .is_err(),
-            "new responses must never emit a reusable bare-nonce signature"
+                .is_ok(),
+            "transitional emit signs the bare nonce for v1.0.14 interop"
         );
         assert!(crate::network::ember::crypto::verify_ember_hash_binding(
             &resp_response_pk,
@@ -373,6 +380,19 @@ mod tests {
         let result = handle_response(&mut resp_state, &init_response, &init_pk, &init_hash);
         assert_eq!(result, Ok(()));
         assert_eq!(resp_state, EmberAuthState::Verified);
+    }
+
+    #[test]
+    fn verify_compat_accepts_domain_separated_signatures() {
+        // Peers that still emit domain-separated signatures (e.g. interim
+        // v1.1.1 builds) must continue to verify via the dual path.
+        let sk = SigningKey::generate(&mut OsRng);
+        let vk = sk.verifying_key();
+        let mut nonce = [0u8; NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce);
+        let domain_sig = sk.sign(&auth_signature_message(&nonce));
+        assert!(verify_auth_nonce_compat(&vk, &nonce, &domain_sig));
+        assert!(vk.verify_strict(&nonce, &domain_sig).is_err());
     }
 
     #[test]

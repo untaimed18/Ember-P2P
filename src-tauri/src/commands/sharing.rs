@@ -65,6 +65,14 @@ async fn reconcile_shared_files(
     .await?
 }
 
+async fn reconcile_shared_files_best_effort(
+    network_tx: &tokio::sync::mpsc::Sender<NetworkCommand>,
+) {
+    if let Err(e) = reconcile_shared_files(network_tx).await {
+        warn!("Failed to reconcile shared files (best-effort): {e}");
+    }
+}
+
 async fn persist_shared_states(
     network_tx: &tokio::sync::mpsc::Sender<NetworkCommand>,
     hashes: &[String],
@@ -87,6 +95,16 @@ async fn persist_shared_states(
     )
     .await??;
     Ok(())
+}
+
+async fn persist_shared_states_best_effort(
+    network_tx: &tokio::sync::mpsc::Sender<NetworkCommand>,
+    hashes: &[String],
+    shared: bool,
+) {
+    if let Err(e) = persist_shared_states(network_tx, hashes, shared).await {
+        warn!("Failed to persist file sharing state (best-effort): {e}");
+    }
 }
 
 fn paths_equal_ignore_case(a: &str, b: &str) -> bool {
@@ -654,9 +672,7 @@ pub async fn add_shared_folder(
             }
         }
 
-        if let Err(e) = reconcile_shared_files(&network_tx).await {
-            warn!("Failed to reconcile shared files: {e}");
-        }
+        reconcile_shared_files_best_effort(&network_tx).await;
         remove_cancel_flag_if_current(&cancel_flags, &cancel_key, &cancel_flag).await;
 
         let from_known = total_files.saturating_sub(total_to_hash);
@@ -801,9 +817,7 @@ pub async fn remove_shared_folder(
         watcher.sync_paths(&folders);
     }
 
-    if let Err(e) = reconcile_shared_files(&state.network_tx).await {
-        warn!("Failed to reconcile shared files after folder removal: {e}");
-    }
+    reconcile_shared_files_best_effort(&state.network_tx).await;
     let _ = app.emit(
         "shared-files-changed",
         serde_json::json!({ "folder": path, "removed": true }),
@@ -1033,14 +1047,17 @@ pub async fn set_folder_priority(
             .map(|(_, hash)| hash.clone())
             .filter(|hash| !hash.is_empty())
             .collect();
-        bounded_send(
+        if let Err(e) = bounded_send(
             &state.network_tx,
             NetworkCommand::SetUploadPriorities {
                 file_hashes: hashes,
                 priority: priority_str_to_u8(&priority),
             },
         )
-        .await?;
+        .await
+        {
+            warn!("Failed to push upload priorities to network task: {e}");
+        }
     }
     info!(
         "Set folder priority {priority} for {folder_path} ({} files)",
@@ -1072,14 +1089,17 @@ pub async fn set_file_priority(
     };
     refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
     if let Some(hash) = file_hash.filter(|h| !h.is_empty()) {
-        bounded_send(
+        if let Err(e) = bounded_send(
             &state.network_tx,
             NetworkCommand::SetUploadPriorities {
                 file_hashes: vec![hash],
                 priority: priority_str_to_u8(&priority),
             },
         )
-        .await?;
+        .await
+        {
+            warn!("Failed to push upload priorities to network task: {e}");
+        }
     }
     info!("Set priority for {} to {}", file_path, priority);
     Ok(())
@@ -1128,14 +1148,17 @@ pub async fn batch_set_priority(
     };
     if count > 0 {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        bounded_send(
+        if let Err(e) = bounded_send(
             &state.network_tx,
             NetworkCommand::SetUploadPriorities {
                 file_hashes: hashes,
                 priority: priority_str_to_u8(&priority),
             },
         )
-        .await?;
+        .await
+        {
+            warn!("Failed to push upload priorities to network task: {e}");
+        }
         info!(
             "Batch set priority to {priority} for {count}/{} files",
             file_paths.len()
@@ -1167,8 +1190,8 @@ pub async fn batch_share(
     let count = changed_hashes.len() as u32;
     if count > 0 {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        reconcile_shared_files(&state.network_tx).await?;
-        persist_shared_states(&state.network_tx, &changed_hashes, true).await?;
+        reconcile_shared_files_best_effort(&state.network_tx).await;
+        persist_shared_states_best_effort(&state.network_tx, &changed_hashes, true).await;
         let _ = app.emit(
             "shared-files-changed",
             serde_json::json!({ "shared": count }),
@@ -1200,8 +1223,8 @@ pub async fn batch_unshare(
     let count = changed_hashes.len() as u32;
     if count > 0 {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        reconcile_shared_files(&state.network_tx).await?;
-        persist_shared_states(&state.network_tx, &changed_hashes, false).await?;
+        reconcile_shared_files_best_effort(&state.network_tx).await;
+        persist_shared_states_best_effort(&state.network_tx, &changed_hashes, false).await;
         let _ = app.emit(
             "shared-files-changed",
             serde_json::json!({ "unshared": count }),
@@ -1479,9 +1502,7 @@ pub async fn reload_shared_files(
             }
         }
 
-        if let Err(e) = reconcile_shared_files(&network_tx).await {
-            warn!("Failed to reconcile shared files on reload: {e}");
-        }
+        reconcile_shared_files_best_effort(&network_tx).await;
         remove_cancel_flag_if_current(&cancel_flags, &reload_key, &cancel_flag).await;
 
         let from_known = total_files.saturating_sub(total_to_hash);
@@ -1586,8 +1607,9 @@ pub async fn unshare_file(
     };
     if let Some(f) = &file {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        reconcile_shared_files(&state.network_tx).await?;
-        persist_shared_states(&state.network_tx, std::slice::from_ref(&f.hash), false).await?;
+        reconcile_shared_files_best_effort(&state.network_tx).await;
+        persist_shared_states_best_effort(&state.network_tx, std::slice::from_ref(&f.hash), false)
+            .await;
         let _ = app.emit("shared-files-changed", serde_json::json!({ "unshared": 1 }));
         info!(
             "Unshared file {}{}",
@@ -1622,8 +1644,9 @@ pub async fn share_file(
     };
     if let Some(f) = &file {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        reconcile_shared_files(&state.network_tx).await?;
-        persist_shared_states(&state.network_tx, std::slice::from_ref(&f.hash), true).await?;
+        reconcile_shared_files_best_effort(&state.network_tx).await;
+        persist_shared_states_best_effort(&state.network_tx, std::slice::from_ref(&f.hash), true)
+            .await;
         let _ = app.emit("shared-files-changed", serde_json::json!({ "shared": 1 }));
         info!("Shared file {}", file_path);
     }
@@ -1642,8 +1665,8 @@ pub async fn unshare_folder(
     };
     if !affected_hashes.is_empty() {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        reconcile_shared_files(&state.network_tx).await?;
-        persist_shared_states(&state.network_tx, &affected_hashes, false).await?;
+        reconcile_shared_files_best_effort(&state.network_tx).await;
+        persist_shared_states_best_effort(&state.network_tx, &affected_hashes, false).await;
         let _ = app.emit(
             "shared-files-changed",
             serde_json::json!({ "folder": path, "unshared": true }),
@@ -1707,7 +1730,7 @@ pub async fn delete_shared_file(
     };
     refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
 
-    reconcile_shared_files(&state.network_tx).await?;
+    reconcile_shared_files_best_effort(&state.network_tx).await;
     let _ = app.emit(
         "shared-files-changed",
         serde_json::json!({ "file_deleted": true }),
@@ -1806,7 +1829,7 @@ pub async fn remove_missing_files(
     }
     if removed > 0 {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        reconcile_shared_files(&state.network_tx).await?;
+        reconcile_shared_files_best_effort(&state.network_tx).await;
         let _ = app.emit(
             "shared-files-changed",
             serde_json::json!({ "missing_removed": removed }),
