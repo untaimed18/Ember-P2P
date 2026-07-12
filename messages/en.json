@@ -1133,7 +1133,6 @@
   "search_detail_artist": "Artist:",
   "search_detail_album": "Album:",
   "search_detail_title": "Title:",
-  "search_bitrate_value": "{kbps} kbps",
   "search_detail_spam_score": "Spam score:",
   "search_evaluating": "Evaluating...",
   "search_spam_flagged": "Flagged ({profile})",
