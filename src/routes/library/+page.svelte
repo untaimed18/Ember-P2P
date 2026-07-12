@@ -328,6 +328,8 @@
   let showDuplicatesOnly = $state(false);
   let showMissingOnly = $state(false);
   let missingPathSet: Set<string> = $state(new Set());
+  let missingScanTruncated = $state(false);
+  let missingTotalCount = $state(0);
   let missingScanInFlight = false;
   // `scanMissingFiles` stats every shared file on disk, so it must not run on
   // every data refresh — and `refresh()` itself fires every 3s while hashing.
@@ -347,9 +349,11 @@
     missingScanInFlight = true;
     lastMissingScanAt = Date.now();
     try {
-      const list = await scanMissingFiles();
+      const result = await scanMissingFiles();
       if (!mounted) return;
-      missingPathSet = new Set(list);
+      missingPathSet = new Set(result.paths);
+      missingScanTruncated = result.truncated;
+      missingTotalCount = result.totalMissing;
       // Apply a deferred persisted "missing only" filter now that we know
       // whether any files are actually missing — only enable it if so.
       if (pendingRestoreMissingOnly) {
@@ -377,6 +381,8 @@
       const removed = await removeMissingFiles([...missingPathSet]);
       toastSuccess(removed === 1 ? m.library_removed_missing_one() : m.library_removed_missing_other({ count: removed }));
       missingPathSet = new Set();
+      missingScanTruncated = false;
+      missingTotalCount = 0;
       showMissingOnly = false;
       await refresh();
     } catch (e: unknown) {
@@ -403,8 +409,16 @@
     return n;
   });
 
+  // Match backend `security::normalize_match_path` / `normalize_path_key`:
+  // Windows filesystems are case-insensitive, so folder filters must be too.
+  const IS_WINDOWS =
+    typeof navigator !== 'undefined' &&
+    (/Win/i.test(navigator.platform) || /Windows/i.test(navigator.userAgent));
+
   function normalizePathForMatch(path: string): string {
-    return path.replace(/\\/g, '/').replace(/\/+$/, '');
+    let normalized = path.replace(/\\/g, '/').replace(/\/+$/, '');
+    if (IS_WINDOWS) normalized = normalized.toLowerCase();
+    return normalized;
   }
 
   function isPathInFolder(filePath: string, folderPath: string): boolean {
@@ -412,6 +426,10 @@
     const normalizedFolderPath = normalizePathForMatch(folderPath);
     return normalizedFilePath === normalizedFolderPath
       || normalizedFilePath.startsWith(`${normalizedFolderPath}/`);
+  }
+
+  function pathsEqualForFolder(a: string, b: string): boolean {
+    return normalizePathForMatch(a) === normalizePathForMatch(b);
   }
 
   function folderDisplayName(path: string | null): string {
@@ -617,7 +635,7 @@
       error = null;
       await removeSharedFolder(path);
       if (!mounted) return;
-      if (filterFolder === path) filterFolder = null;
+      if (filterFolder !== null && pathsEqualForFolder(filterFolder, path)) filterFolder = null;
       await refresh();
     } catch (e: unknown) {
       if (mounted) error = toErr(e);
@@ -1655,7 +1673,7 @@
   // If the persisted folder no longer exists after folders load, clear it silently.
   $effect(() => {
     if (!filtersRestored) return;
-    if (filterFolder && folders.length > 0 && !folders.includes(filterFolder)) {
+    if (filterFolder && folders.length > 0 && !folders.some((f) => pathsEqualForFolder(f, filterFolder!))) {
       filterFolder = null;
     }
   });
@@ -1966,11 +1984,21 @@
     <button
       class="dupes-toggle missing-toggle"
       class:active={showMissingOnly}
-      disabled={missingPathSet.size === 0}
+      disabled={missingPathSet.size === 0 && missingTotalCount === 0}
       onclick={() => (showMissingOnly = !showMissingOnly)}
-      title={missingPathSet.size === 0 ? m.library_no_missing() : m.library_missing_tooltip({ count: missingPathSet.size })}
+      title={
+        missingTotalCount === 0
+          ? m.library_no_missing()
+          : missingScanTruncated
+            ? m.library_missing_truncated({
+                shown: missingPathSet.size,
+                total: missingTotalCount,
+                limit: 10_000,
+              })
+            : m.library_missing_tooltip({ count: missingTotalCount })
+      }
     >
-      {m.library_missing()}{missingPathSet.size > 0 ? ` (${missingPathSet.size})` : ''}
+      {m.library_missing()}{missingTotalCount > 0 ? ` (${missingTotalCount})` : ''}
     </button>
     {#if showMissingOnly && missingPathSet.size > 0}
       <button
@@ -2232,7 +2260,7 @@
       {#each folders as folder (folder)}
         <div
           class="tree-item"
-          class:active={filterFolder === folder}
+          class:active={filterFolder !== null && pathsEqualForFolder(filterFolder, folder)}
           onclick={() => filterFolder = folder}
           role="button"
           tabindex="0"

@@ -1442,6 +1442,11 @@ impl Ed2kDownload {
                                         "Ember binding: peer {} pubkey BLAKE3-binds to advertised hash",
                                         self.source_addr
                                     );
+                                    if peer_user_hash != [0u8; 16] {
+                                        if let Some(cm) = &self.credit_manager {
+                                            cm.write().await.set_ember_hash(peer_user_hash, *eh);
+                                        }
+                                    }
                                 } else {
                                     tracing::warn!(
                                         "Ember binding: peer {} advertised pubkey does not BLAKE3-bind to ember_hash={} (possible spoof)",
@@ -2063,6 +2068,11 @@ impl Ed2kDownload {
                                         "Ember binding: peer {} pubkey BLAKE3-binds (file-status-wait)",
                                         self.source_addr
                                     );
+                                    if peer_user_hash != [0u8; 16] {
+                                        if let Some(cm) = &self.credit_manager {
+                                            cm.write().await.set_ember_hash(peer_user_hash, *eh);
+                                        }
+                                    }
                                 } else {
                                     tracing::warn!(
                                         "Ember binding: peer {} advertised pubkey does not BLAKE3-bind to ember_hash={} (file-status-wait, possible spoof)",
@@ -3626,6 +3636,13 @@ impl Ed2kDownload {
                                                 "Ember binding: peer {} pubkey BLAKE3-binds (data loop)",
                                                 self.source_addr
                                             );
+                                            if peer_user_hash != [0u8; 16] {
+                                                if let Some(cm) = &self.credit_manager {
+                                                    cm.write()
+                                                        .await
+                                                        .set_ember_hash(peer_user_hash, *eh);
+                                                }
+                                            }
                                         } else {
                                             tracing::warn!(
                                                 "Ember binding: peer {} advertised pubkey does not BLAKE3-bind (data loop, possible spoof)",

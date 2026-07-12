@@ -10,6 +10,8 @@ export interface TransferStats {
   session_completed_down: number;
   session_completed_up: number;
   session_start_time: number;
+  /** Monotonic seconds since session start (prefer over wall-clock math). */
+  session_elapsed_secs: number;
   cum_downloaded: number;
   cum_uploaded: number;
   cum_down_overhead: number;

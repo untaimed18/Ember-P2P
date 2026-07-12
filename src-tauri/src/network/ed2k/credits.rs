@@ -127,6 +127,11 @@ pub struct CreditRecord {
     pub public_key: Vec<u8>,
     pub ident_state: IdentState,
     pub ident_ip: u32,
+    /// Ember node id (`BLAKE3(ed25519_pubkey)[0..16]`) learned when an
+    /// Ember hello binding check succeeds for this eD2K user hash.
+    /// Distinct from SecIdent RSA `public_key` — used by Known Clients
+    /// to mark friends (friends are keyed by ember hash, not user hash).
+    pub ember_hash: Option<[u8; 16]>,
 }
 
 /// Enhanced credit record for verified Ember peers.
@@ -251,6 +256,7 @@ impl CreditRecord {
             public_key: Vec::new(),
             ident_state: IdentState::Unknown,
             ident_ip: 0,
+            ember_hash: None,
         }
     }
 }
@@ -757,6 +763,18 @@ impl CreditManager {
         record.public_key = key;
     }
 
+    /// Remember the Ember identity bound to an eD2K `user_hash` after a
+    /// successful offline binding check (`verify_ember_hash_binding`).
+    /// No-op for the all-zero sentinel hashes. Overwrites a previous
+    /// binding so a peer that rotated keys still links correctly.
+    pub fn set_ember_hash(&mut self, user_hash: [u8; 16], ember_hash: [u8; 16]) {
+        if user_hash == [0u8; 16] || ember_hash == [0u8; 16] {
+            return;
+        }
+        let record = self.get_or_create(user_hash);
+        record.ember_hash = Some(ember_hash);
+    }
+
     pub fn set_ident_state(&mut self, user_hash: [u8; 16], state: IdentState) {
         let record = self.get_or_create(user_hash);
         // eMule Verified(): on first-time crypto verification, reset pre-existing
@@ -1111,6 +1129,7 @@ impl CreditManager {
                 public_key,
                 ident_state,
                 ident_ip,
+                ember_hash: None,
             };
             self.credits.insert(user_hash, record);
             loaded += 1;

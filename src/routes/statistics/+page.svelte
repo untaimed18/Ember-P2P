@@ -13,6 +13,11 @@
   let refreshBusy = false;
   let tickCounter = $state(0);
   let unmounted = false;
+  // Monotonic session elapsed from the backend at last successful poll,
+  // plus the local tick counter at that moment — interpolate between polls
+  // without falling back to wall-clock math (H1).
+  let elapsedAtFetch = 0;
+  let tickAtFetch = 0;
 
   // Reputation-tracker snapshot. Loaded alongside stats on the same
   // 2-second cadence. `null` before the first successful fetch so the
@@ -63,6 +68,8 @@
       if (repResult.status === 'fulfilled') repStats = repResult.value;
       if (statsResult.status === 'fulfilled') {
         stats = statsResult.value;
+        elapsedAtFetch = statsResult.value.session_elapsed_secs ?? 0;
+        tickAtFetch = tickCounter;
         error = null;
       } else if (!stats) {
         // Only surface a blocking error screen on the very first load.
@@ -98,8 +105,8 @@
 
   let sessionTime = $derived.by(() => {
     void tickCounter;
-    if (!stats || !stats.session_start_time) return 0;
-    return Math.floor(Date.now() / 1000 - stats.session_start_time);
+    if (!stats) return 0;
+    return elapsedAtFetch + Math.max(0, tickCounter - tickAtFetch);
   });
 
   let cumConnTime = $derived(
@@ -110,17 +117,27 @@
   let totalDown = $derived(stats ? stats.cum_downloaded + stats.session_downloaded : 0);
   let totalUp = $derived(stats ? stats.cum_uploaded + stats.session_uploaded : 0);
 
-  let ratio = $derived.by(() => {
+  // Hero ratio is session-scoped (matches neighbouring session rate/time cards).
+  // All-time ratio lives in the cumulative section below.
+  let sessionRatio = $derived.by(() => {
+    if (!stats || !stats.session_downloaded) return null;
+    return stats.session_uploaded / stats.session_downloaded;
+  });
+
+  let allTimeRatio = $derived.by(() => {
     if (!totalDown) return null;
     return totalUp / totalDown;
   });
 
-  let ratioLabel = $derived.by(() => {
+  function formatRatio(ratio: number | null): string {
     if (ratio === null) return '\u2014';
     if (ratio >= 100) return ratio.toFixed(0);
     if (ratio >= 10) return ratio.toFixed(1);
     return ratio.toFixed(2);
-  });
+  }
+
+  let sessionRatioLabel = $derived(formatRatio(sessionRatio));
+  let allTimeRatioLabel = $derived(formatRatio(allTimeRatio));
 
   let totalOverhead = $derived(
     stats
@@ -243,8 +260,8 @@
           </svg>
         </div>
         <div class="hero-body">
-          <span class="hero-value" class:ratio-good={ratio !== null && ratio >= 1} class:ratio-low={ratio !== null && ratio < 1}>{ratioLabel}</span>
-          <span class="hero-label">{m.stats_upload_ratio()}</span>
+          <span class="hero-value" class:ratio-good={sessionRatio !== null && sessionRatio >= 1} class:ratio-low={sessionRatio !== null && sessionRatio < 1}>{sessionRatioLabel}</span>
+          <span class="hero-label">{m.stats_session_upload_ratio()}</span>
         </div>
       </div>
     </div>
@@ -338,7 +355,7 @@
         </div>
         <div class="cum-item">
           <span class="cum-label">{m.stats_upload_download_ratio()}</span>
-          <span class="cum-value" class:ratio-good={ratio !== null && ratio >= 1} class:ratio-low={ratio !== null && ratio < 1}>{ratioLabel}</span>
+          <span class="cum-value" class:ratio-good={allTimeRatio !== null && allTimeRatio >= 1} class:ratio-low={allTimeRatio !== null && allTimeRatio < 1}>{allTimeRatioLabel}</span>
         </div>
       </div>
     </section>
@@ -352,7 +369,7 @@
           </svg>
         </span>
         <h3>{m.stats_protocol_overhead()}</h3>
-        <span class="head-aside">{m.stats_overhead_total({ bytes: formatBytes(totalOverhead) })}</span>
+        <span class="head-aside">{m.stats_overhead_session_aside()} · {m.stats_overhead_total({ bytes: formatBytes(totalOverhead) })}</span>
       </div>
 
       <div class="overhead-bars">

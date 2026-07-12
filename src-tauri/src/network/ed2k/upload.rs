@@ -7298,6 +7298,10 @@ impl UploadHandler {
                                 if crate::network::ember::crypto::verify_ember_hash_binding(peer_pk, peer_eh) {
                                     ember_hash_binding_verified = true;
                                     info!("Ember binding: peer {peer_addr} pubkey matches advertised hash");
+                                    if peer_user_hash != [0u8; 16] {
+                                        let mut cm = self.credit_manager.write().await;
+                                        cm.set_ember_hash(peer_user_hash, *peer_eh);
+                                    }
                                 } else {
                                     tracing::warn!(
                                         "Ember binding: peer {peer_addr} advertised pubkey does not BLAKE3-bind to ember_hash={} (possible spoof)",

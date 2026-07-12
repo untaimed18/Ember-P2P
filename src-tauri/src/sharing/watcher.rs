@@ -81,13 +81,27 @@ impl SharedFoldersWatcher {
                     }
                 }
 
+                let state_ref = app_for_handler.state::<AppState>();
+                // Honour an explicit Stop: reloading here would cancel the
+                // pause latch and start hashing again without user consent.
+                if state_ref
+                    .hashing_paused
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    info!("FS watcher: hashing paused; deferring rescan until resume");
+                    let _ = app_for_handler.emit(
+                        "shared-files-changed",
+                        serde_json::json!({ "phase": "fs-changed-deferred" }),
+                    );
+                    continue;
+                }
+
                 info!("FS watcher: triggering shared-folder rescan");
                 let _ = app_for_handler.emit(
                     "shared-files-changed",
                     serde_json::json!({ "phase": "fs-changed" }),
                 );
 
-                let state_ref = app_for_handler.state::<AppState>();
                 if let Err(e) = crate::commands::sharing::reload_shared_files(
                     app_for_handler.clone(),
                     state_ref,

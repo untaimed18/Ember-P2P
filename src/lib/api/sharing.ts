@@ -104,7 +104,11 @@ export async function republishFile(fileHash: string): Promise<void> {
   return invoke('republish_file', { fileHash });
 }
 
-export async function scanMissingFiles(): Promise<string[]> {
+export async function scanMissingFiles(): Promise<{
+  paths: string[];
+  truncated: boolean;
+  totalMissing: number;
+}> {
   return invoke('scan_missing_files');
 }
 

@@ -20,6 +20,17 @@ const MAX_SCAN_MISSING_RESULTS: usize = 10_000;
 /// compromised-webview payload (and the per-call stat loop / index lock hold).
 const MAX_REMOVE_MISSING_PATHS: usize = 200_000;
 
+/// Result of a missing-file filesystem probe. `paths` is capped; when
+/// `truncated` is true, `total_missing` is still the full count so the UI can
+/// warn instead of silently under-reporting.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissingScanResult {
+    pub paths: Vec<String>,
+    pub truncated: bool,
+    pub total_missing: u32,
+}
+
 struct ScanGuard(Arc<AtomicUsize>);
 impl Drop for ScanGuard {
     fn drop(&mut self) {
@@ -417,6 +428,10 @@ pub async fn add_shared_folder(
             live.push(canonical_str.clone());
         }
     }
+
+    // Adding a folder is an explicit user action that should resume hashing
+    // even if a previous Stop left the pause latch set.
+    state.hashing_paused.store(false, Ordering::Relaxed);
 
     // Start watching the new folder (and anything else currently shared).
     if let Some(watcher) = state.shared_folder_watcher.as_ref() {
@@ -1239,6 +1254,10 @@ pub async fn reload_shared_files(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    // Manual reload / resume always clear the pause latch. The FS watcher
+    // never reaches this path while paused (it checks hashing_paused first).
+    state.hashing_paused.store(false, Ordering::Relaxed);
+
     let folders = {
         let config = state.config.read().await;
         config.settings.shared_folders.clone()
@@ -1537,6 +1556,10 @@ pub async fn get_scan_status(state: tauri::State<'_, AppState>) -> Result<bool, 
 
 #[tauri::command]
 pub async fn stop_hashing(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+    // Latch pause before signalling cancel so a concurrent FS-watcher tick
+    // cannot start a new reload that races past the cancel flags.
+    state.hashing_paused.store(true, Ordering::Relaxed);
+
     let (shared_folders, index_snap) = tokio::join!(
         async {
             let config = state.config.read().await;
@@ -1757,27 +1780,38 @@ pub async fn delete_shared_file(
 /// file); typical libraries finish in well under a second even with tens of
 /// thousands of files. Callers can then display the count and offer a bulk
 /// "remove missing" action via `remove_missing_files`.
+///
+/// `paths` is capped at [`MAX_SCAN_MISSING_RESULTS`]; when the cap is hit,
+/// `truncated` is true and `total_missing` still reflects the full count so
+/// the UI can warn instead of silently under-counting.
 #[tauri::command]
-pub async fn scan_missing_files(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+pub async fn scan_missing_files(
+    state: tauri::State<'_, AppState>,
+) -> Result<MissingScanResult, String> {
     let paths: Vec<String> = {
         let index = state.local_index.read().await;
         index.all_files().iter().map(|f| f.path.clone()).collect()
     };
-    let missing = tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         let mut missing = Vec::new();
+        let mut total_missing: u32 = 0;
         for p in paths {
             if !std::path::Path::new(&p).exists() {
-                missing.push(p);
-                if missing.len() >= MAX_SCAN_MISSING_RESULTS {
-                    break;
+                total_missing = total_missing.saturating_add(1);
+                if missing.len() < MAX_SCAN_MISSING_RESULTS {
+                    missing.push(p);
                 }
             }
         }
-        missing
+        MissingScanResult {
+            truncated: (total_missing as usize) > missing.len(),
+            total_missing,
+            paths: missing,
+        }
     })
     .await
     .map_err(|e| coded_ctx("sharing_scan_task_failed", "Scan task failed", e))?;
-    Ok(missing)
+    Ok(result)
 }
 
 /// Remove the given paths from the shared-file index if — and only if —

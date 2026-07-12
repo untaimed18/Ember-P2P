@@ -107,11 +107,10 @@
 
   <div class="status-right" aria-label={m.statusbar_speeds_aria()}>
     <!--
-      D7: status bar rate is the total network rate (file payload + protocol
-      overhead: server, KAD, source exchange, reasks). The Transfers page
-      "DL" / "UL" chips show only the active transfer-payload rate. The
-      numbers legitimately differ, so label the status bar "Network" in the
-      tooltip to flag the distinction.
+      Status bar rates/totals are file-transfer payload only (BandwidthLimiter).
+      Protocol overhead (server, KAD, source exchange, reasks) is tracked on
+      the Statistics page — these numbers intentionally differ from a full
+      "network bytes" view.
     -->
     <span class="status-item upload" title={m.statusbar_upload_title()}>
       <span aria-hidden="true">↑</span>
@@ -123,7 +122,7 @@
       <span class="sr-only">{m.statusbar_download_sr()}</span>
       {formatSpeed($networkStats.download_speed)}
     </span>
-    <span class="status-item muted" aria-label={m.statusbar_total_transferred({ up: formatBytes($networkStats.total_uploaded), down: formatBytes($networkStats.total_downloaded) })}>
+    <span class="status-item muted" title={m.statusbar_total_transferred({ up: formatBytes($networkStats.total_uploaded), down: formatBytes($networkStats.total_downloaded) })} aria-label={m.statusbar_total_transferred({ up: formatBytes($networkStats.total_uploaded), down: formatBytes($networkStats.total_downloaded) })}>
       <span aria-hidden="true">↑</span> {formatBytes($networkStats.total_uploaded)} / <span aria-hidden="true">↓</span> {formatBytes($networkStats.total_downloaded)}
     </span>
   </div>
