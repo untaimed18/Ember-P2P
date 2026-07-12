@@ -260,11 +260,12 @@
       const d = event.payload;
       if (d.transfer_id !== expandedTransferId) return;
       const idx = expandedSources.findIndex((s) => s.ip === d.ip && s.port === d.port);
-      const status = d.status as SourceInfo['status'];
       // D28: if the backend now reports a terminal status for this source,
       // drop it from the visible list rather than accumulating dead rows
       // that stay until the user collapses and re-opens the drawer.
-      const isDead = status === 'failed' || status === 'duplicate';
+      // `duplicate` is a transient wire status not modeled on SourceInfo.
+      const isDead = d.status === 'failed' || d.status === 'duplicate';
+      const status = d.status as SourceInfo['status'];
       if (idx >= 0) {
         if (isDead) {
           expandedSources = expandedSources.filter((_, i) => i !== idx);

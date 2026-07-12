@@ -1208,7 +1208,8 @@ impl Database {
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, Option<String>>(4)?,
-                    row.get::<_, Option<u64>>(5)?,
+                    row.get::<_, Option<i64>>(5)?
+                        .map(|v| v.max(0) as u64),
                 ))
             })?
             .filter_map(|r| match r {
@@ -1253,7 +1254,7 @@ impl Database {
                 comment,
                 last_publish,
                 file_name,
-                file_size
+                file_size.map(|v| v.min(i64::MAX as u64) as i64)
             ],
         )?;
         Ok(())

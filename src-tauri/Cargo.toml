@@ -6,10 +6,9 @@ authors = ["you"]
 license = "GPL-3.0-only"
 edition = "2021"
 # `str::floor_char_boundary` (used in the ed2k collection parser and the
-# comment store) was stabilized in Rust 1.91. Older toolchains fail to
-# build with a non-obvious error; declaring MSRV here makes `cargo`
-# surface a clean "package requires rustc 1.91" message instead.
-rust-version = "1.91"
+# comment store) was stabilized in Rust 1.91. `rusqlite` 0.40's bundled
+# `libsqlite3-sys` additionally needs `cfg_select` (stable in 1.94+).
+rust-version = "1.94"
 
 [lib]
 name = "ember_lib"
@@ -36,11 +35,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "fs"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 blake3 = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-directories = "5"
+directories = "6"
 futures = "0.3"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -54,12 +53,12 @@ byteorder = "1"
 rand = "0.8"
 flate2 = "1"
 hex = "0.4"
-reqwest = { version = "0.12", features = ["rustls-tls", "stream", "json"], default-features = false }
+reqwest = { version = "0.13", features = ["rustls", "stream", "json"], default-features = false }
 sha2 = "0.10"
-igd-next = { version = "0.15", features = ["aio_tokio"] }
-socket2 = "0.5"
-tracing-appender = "0.2.4"
-tauri-plugin-single-instance = "2.4.0"
+igd-next = { version = "0.17", features = ["aio_tokio"] }
+socket2 = "0.6"
+tracing-appender = "0.2"
+tauri-plugin-single-instance = "2"
 # Registers the `ed2k://` URI scheme with the OS so browser/forum links
 # launch (or focus) Ember. Combined with single-instance, a link clicked
 # while Ember is already running is delivered to the existing instance as
@@ -74,15 +73,15 @@ tauri-plugin-updater = "2"
 rsa = "0.9"
 signature = "2"
 num-bigint-dig = "0.8"
-opener = "0.8.4"
-crc32fast = "1.5.0"
+opener = "0.8"
+crc32fast = "1"
 zeroize = { version = "1", features = ["derive"] }
 ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
 snow = "0.9"
 chacha20poly1305 = "0.10"
-lz4_flex = "0.11"
+lz4_flex = "0.13"
 quinn = "0.11"
-rcgen = "0.13"
+rcgen = "0.14"
 rustls = { version = "0.23", features = ["ring"] }
 # Used to robustly parse a peer's QUIC/TLS certificate and extract its
 # real SubjectPublicKeyInfo (see `network::ember::quic`'s
@@ -93,10 +92,10 @@ rustls = { version = "0.23", features = ["ring"] }
 # be fooled that way.
 x509-cert = { version = "0.2", default-features = false }
 strsim = "0.11"
-zip = "2"
+zip = "8"
 fs2 = "0.4"
 maxminddb = "0.29"
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 parking_lot = "0.12"
 notify-debouncer-mini = { version = "0.7", default-features = false }
 # Used by the AntiLeech filter to compile the user-editable pattern list
@@ -104,7 +103,7 @@ notify-debouncer-mini = { version = "0.7", default-features = false }
 # Unicode tables we don't need (we match ASCII-only client-software
 # strings) — saves ~250 KiB binary and ~50 ms startup compile time.
 regex = { version = "1", default-features = false, features = ["std", "perf"] }
-lofty = "0.22.2"
+lofty = "0.24"
 
 [profile.release]
 strip = true
