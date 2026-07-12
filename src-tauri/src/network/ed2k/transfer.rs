@@ -3094,20 +3094,27 @@ impl Ed2kDownload {
                                     // even if that coupling is ever loosened.
                                     let off = gs.saturating_sub(start) as usize;
                                     let len = ge.saturating_sub(gs) as usize;
-                                    output
-                                        .write(gs, data[off..off + len].to_vec())
-                                        .await
-                                        .map_err(|e| anyhow::anyhow!("part write at {gs}: {e}"))?;
+                                    if let Err(e) =
+                                        output.write(gs, data[off..off + len].to_vec()).await
+                                    {
+                                        // Earlier subranges have already reached
+                                        // disk and the tracker. Persist that state
+                                        // before this single-source task unwinds.
+                                        if newly_written > 0 {
+                                            super::part_tracker::save_snapshot_async(
+                                                tracker.snapshot_for_save(),
+                                            )
+                                            .await;
+                                        }
+                                        return Err(anyhow::anyhow!("part write at {gs}: {e}"));
+                                    }
+                                    // Commit immediately after each successful
+                                    // write. Deferring all fill_range calls until
+                                    // the loop ends loses earlier writes if a
+                                    // later subrange fails.
+                                    newly_written =
+                                        newly_written.saturating_add(tracker.fill_range(gs, ge));
                                 }
-
-                                // Derive accounting from the tracker's atomic
-                                // state transition, not from the pre-write
-                                // snapshot. This remains correct if this path
-                                // is later shared by multiple source workers.
-                                newly_written = fill_subranges
-                                    .iter()
-                                    .map(|&(gs, ge)| tracker.fill_range(gs, ge))
-                                    .sum();
 
                                 if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
                                     let _ = event_tx
@@ -3228,15 +3235,21 @@ impl Ed2kDownload {
                                 for &(gs, ge) in &fill_subranges {
                                     let off = (gs - start) as usize;
                                     let len = (ge - gs) as usize;
-                                    output
+                                    if let Err(e) = output
                                         .write(gs, decompressed[off..off + len].to_vec())
                                         .await
-                                        .map_err(|e| anyhow::anyhow!("part write at {gs}: {e}"))?;
+                                    {
+                                        if newly_written > 0 {
+                                            super::part_tracker::save_snapshot_async(
+                                                tracker.snapshot_for_save(),
+                                            )
+                                            .await;
+                                        }
+                                        return Err(anyhow::anyhow!("part write at {gs}: {e}"));
+                                    }
+                                    newly_written =
+                                        newly_written.saturating_add(tracker.fill_range(gs, ge));
                                 }
-                                newly_written = fill_subranges
-                                    .iter()
-                                    .map(|&(gs, ge)| tracker.fill_range(gs, ge))
-                                    .sum();
 
                                 if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
                                     let _ = event_tx
@@ -3847,6 +3860,13 @@ impl Ed2kDownload {
                             }
 
                             if narrowed {
+                                // This bucket includes the invalidated AICH
+                                // blocks. Clear it so a later successful repair
+                                // cannot award credit for bytes proven corrupt.
+                                #[allow(unused_assignments)]
+                                {
+                                    pending_credit_bytes = 0;
+                                }
                                 continue;
                             }
                         }

@@ -17,11 +17,19 @@ import type { AppSettings } from '$lib/types';
 export const appSettings = writable<AppSettings | null>(null);
 let settingsEpoch = 0;
 
+function keepNewestSettings(current: AppSettings | null, incoming: AppSettings): AppSettings {
+  return current && incoming.settings_revision < current.settings_revision
+    ? current
+    : incoming;
+}
+
 export async function loadAppSettings(): Promise<void> {
   const epoch = settingsEpoch;
   try {
     const settings = await getSettings();
-    if (epoch === settingsEpoch) appSettings.set(settings);
+    if (epoch === settingsEpoch) {
+      appSettings.update((current) => keepNewestSettings(current, settings));
+    }
   } catch {
     // Backend not ready yet — consumers fall back to defaults until a later
     // load (or a Settings save) populates the cache.
@@ -31,7 +39,12 @@ export async function loadAppSettings(): Promise<void> {
 /** Mirror a just-persisted settings object into the cache. Call after a
  *  successful `updateSettings` so the cache never lags the on-disk value. */
 export function setAppSettings(settings: AppSettings): void {
-  appSettings.set(settings);
+  // Any explicit write is newer than a load that started before it, even when
+  // the load's IPC response arrives afterward.
+  settingsEpoch++;
+  // Settings revisions are monotonic. A delayed getSettings() or an older
+  // caller snapshot must never roll runtime consumers back to stale values.
+  appSettings.update((current) => keepNewestSettings(current, settings));
 }
 
 export function clearAppSettings(): void {

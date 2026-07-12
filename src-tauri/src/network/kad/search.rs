@@ -396,7 +396,6 @@ impl SearchState {
         for c in &batch {
             self.pending.insert(c.id);
             self.pending_times.insert(c.id, now);
-            self.tried.insert((c.ip, c.udp_port), c.id);
             if self.phase == SearchPhase::Fetch {
                 self.fetched.insert(c.id);
             }
@@ -410,8 +409,9 @@ impl SearchState {
     /// *synchronously in the packet handler* rather than waiting for the next
     /// one-second `JumpStart`. `handle_response` fills `priority_queries` with
     /// exactly those contacts; this drains them and applies the identical
-    /// `pending`/`pending_times`/`tried` marking that `next_to_query` uses, so
-    /// the caller can encode and send the queries right away. Regular
+    /// `pending`/`pending_times` reservation that `next_to_query` uses, so the
+    /// caller can encode and send the queries right away. Endpoint `tried`
+    /// tracking is committed separately after the UDP send succeeds. Regular
     /// (non-best) contacts still flow through the periodic `poll_queries` tick,
     /// matching eMule where only `m_mapBest` additions are queried immediately
     /// and the remaining `m_mapPossible` pool is drained by `JumpStart`.
@@ -437,11 +437,56 @@ impl SearchState {
             }
             self.pending.insert(c.id);
             self.pending_times.insert(c.id, now);
-            self.tried.insert((c.ip, c.udp_port), c.id);
             let msg = self.build_query_message(&c);
             out.push((c, msg));
         }
         out
+    }
+
+    /// Roll back the reservation made by `next_to_query`,
+    /// `next_store_queries`, or `take_priority_queries` when the caller could
+    /// not put the packet on the UDP socket. Reservations are deliberately
+    /// made before returning a query so a second poll cannot select the same
+    /// contact concurrently; they must not become permanent merely because
+    /// the outgoing rate gate fired or `send_to` failed.
+    pub fn rollback_unsent_query(&mut self, contact_id: KadId, message: &KadMessage) {
+        self.pending.remove(&contact_id);
+        self.pending_times.remove(&contact_id);
+
+        match message {
+            KadMessage::SearchKeyReq { .. }
+            | KadMessage::SearchSourceReq { .. }
+            | KadMessage::SearchNotesReq { .. } => {
+                self.fetched.remove(&contact_id);
+                self.store_sent.remove(&contact_id);
+                self.store_pending.remove(&contact_id);
+                self.store_pending_times.remove(&contact_id);
+            }
+            KadMessage::KadReq { .. } => {
+                // `take_priority_queries` removes the contact from the eager
+                // queue. Reinsert every unsent lookup request at the front;
+                // regular `next_to_query` contacts are safe here too, and this
+                // preserves the intended immediate priority on the retry.
+                if !self.queried.contains(&contact_id)
+                    && !self.priority_queries.iter().any(|c| c.id == contact_id)
+                {
+                    if let Some(contact) = self.closest.iter().find(|c| c.id == contact_id).cloned()
+                    {
+                        self.priority_queries.insert(0, contact);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Commit endpoint tracking only after the caller confirms `send_to`
+    /// succeeded. This keeps anti-poisoning's `tried` map from accepting a
+    /// response for a packet that was merely reserved but never transmitted.
+    pub fn commit_query_sent(&mut self, contact_id: KadId, addr: SocketAddr) {
+        if let std::net::IpAddr::V4(ip) = addr.ip() {
+            self.tried.insert((ip, addr.port()), contact_id);
+        }
     }
 
     /// eMule StorePacket equivalent: during Lookup phase, generate keyword/source
@@ -480,7 +525,6 @@ impl SearchState {
             self.fetched.insert(c.id);
             self.store_pending.insert(c.id);
             self.store_pending_times.insert(c.id, now);
-            self.tried.insert((c.ip, c.udp_port), c.id);
             let msg = self.build_fetch_message_for(&c);
             result.push((c, msg));
         }

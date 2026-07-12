@@ -44,7 +44,7 @@ async fn remove_cancel_flag_if_current(
 }
 
 use crate::app_state::AppState;
-use crate::commands::errors::{bounded_send, coded, coded_ctx};
+use crate::commands::errors::{await_reply, bounded_send, coded, coded_ctx};
 use crate::network::NetworkCommand;
 use crate::search::index::LocalIndex;
 use crate::sharing::indexer::FileIndexer;
@@ -52,12 +52,68 @@ use crate::storage::known_files::{priority_str_to_u8, priority_u8_to_str, KnownF
 use crate::types::*;
 use tracing::{debug, info, warn};
 
-fn paths_equal_ignore_case(a: &str, b: &str) -> bool {
-    if cfg!(target_os = "windows") {
-        a.eq_ignore_ascii_case(b)
-    } else {
-        a == b
+async fn reconcile_shared_files(
+    network_tx: &tokio::sync::mpsc::Sender<NetworkCommand>,
+) -> Result<(), String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    bounded_send(network_tx, NetworkCommand::SharedFilesChangedAck { tx }).await?;
+    await_reply(
+        rx,
+        "sharing_reconcile_failed",
+        "Failed to reconcile shared files",
+    )
+    .await?
+}
+
+async fn persist_shared_states(
+    network_tx: &tokio::sync::mpsc::Sender<NetworkCommand>,
+    hashes: &[String],
+    shared: bool,
+) -> Result<(), String> {
+    if hashes.is_empty() {
+        return Ok(());
     }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let updates = hashes
+        .iter()
+        .filter(|hash| !hash.is_empty())
+        .map(|hash| (hash.clone(), shared))
+        .collect();
+    bounded_send(network_tx, NetworkCommand::SetFilesShared { updates, tx }).await?;
+    await_reply(
+        rx,
+        "sharing_persist_state_failed",
+        "Failed to persist file sharing state",
+    )
+    .await??;
+    Ok(())
+}
+
+fn paths_equal_ignore_case(a: &str, b: &str) -> bool {
+    let normalize = |path: &str| {
+        crate::search::index::normalize_path_key(path)
+            .trim_end_matches(|c| c == '/' || c == '\\')
+            .to_string()
+    };
+    normalize(a) == normalize(b)
+}
+
+/// Whether a registered scan generation can add files at or below
+/// `removed_folder`.
+///
+/// Per-folder scan keys are their canonical roots. Startup/reload generations
+/// are deliberately not cancelled here: their snapshots may predate a newly
+/// added folder and therefore be unrelated. The shared scan-coordination guard
+/// below either lets an already-running broad scan finish before removal, or
+/// makes a queued broad scan start afterward; startup/reload both re-filter
+/// against current config before writes, so neither ordering can resurrect the
+/// removed folder.
+fn scan_can_write_under(scan_key: &str, removed_folder: &str) -> bool {
+    if scan_key.starts_with("__") {
+        return false;
+    }
+    crate::security::path_matches_dir(scan_key, removed_folder)
+        || crate::security::path_matches_dir(removed_folder, scan_key)
 }
 
 pub(crate) async fn refresh_file_cache(
@@ -598,8 +654,8 @@ pub async fn add_shared_folder(
             }
         }
 
-        if let Err(e) = network_tx.try_send(NetworkCommand::SharedFilesChanged) {
-            warn!("Failed to queue SharedFilesChanged: {e}");
+        if let Err(e) = reconcile_shared_files(&network_tx).await {
+            warn!("Failed to reconcile shared files: {e}");
         }
         remove_cancel_flag_if_current(&cancel_flags, &cancel_key, &cancel_flag).await;
 
@@ -680,13 +736,17 @@ pub async fn remove_shared_folder(
     // Use `canonical_path` for every comparison.
     {
         let flags = state.hash_cancel_flags.read().await;
-        // Scans are single-flight. Cancel whichever generation currently owns
-        // the scan guard (startup/reload/per-folder), then wait for it below
-        // before removing index entries. Path-only cancellation missed the
-        // synthetic `__startup__`/`__reload_*` keys and allowed a late scan
-        // write to resurrect this folder.
-        for flag in flags.values() {
-            flag.store(true, Ordering::Relaxed);
+        // Cancel only generations whose scan roots can write under the folder
+        // being removed. Broad startup/reload generations are safely ordered by
+        // `scan_coordination` and may not contain a recently added folder, so
+        // leave them (and unrelated per-folder scans) running. Do not remove
+        // entries here: each generation owns its flag and generation-aware
+        // cleanup removes it only when the Arc still matches the map's current
+        // value.
+        for (scan_key, flag) in flags.iter() {
+            if scan_can_write_under(scan_key, &canonical_path) {
+                flag.store(true, Ordering::Relaxed);
+            }
         }
     }
     let scan_coordination_guard = state.scan_coordination.lock().await;
@@ -741,11 +801,8 @@ pub async fn remove_shared_folder(
         watcher.sync_paths(&folders);
     }
 
-    if let Err(e) = state
-        .network_tx
-        .try_send(NetworkCommand::SharedFilesChanged)
-    {
-        warn!("Failed to queue SharedFilesChanged after folder removal: {e}");
+    if let Err(e) = reconcile_shared_files(&state.network_tx).await {
+        warn!("Failed to reconcile shared files after folder removal: {e}");
     }
     let _ = app.emit(
         "shared-files-changed",
@@ -971,23 +1028,19 @@ pub async fn set_folder_priority(
     };
     if !changed.is_empty() {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        let prio_u8 = priority_str_to_u8(&priority);
-        for (_, hash) in &changed {
-            if hash.is_empty() {
-                continue;
-            }
-            if state
-                .network_tx
-                .try_send(NetworkCommand::SetUploadPriority {
-                    file_hash_hex: hash.clone(),
-                    priority: prio_u8,
-                })
-                .is_err()
-            {
-                warn!("Network channel full during folder priority push");
-                break;
-            }
-        }
+        let hashes = changed
+            .iter()
+            .map(|(_, hash)| hash.clone())
+            .filter(|hash| !hash.is_empty())
+            .collect();
+        bounded_send(
+            &state.network_tx,
+            NetworkCommand::SetUploadPriorities {
+                file_hashes: hashes,
+                priority: priority_str_to_u8(&priority),
+            },
+        )
+        .await?;
     }
     info!(
         "Set folder priority {priority} for {folder_path} ({} files)",
@@ -1018,22 +1071,15 @@ pub async fn set_file_priority(
         index.get_by_path(&file_path).map(|f| f.hash.clone())
     };
     refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-    // Push the new priority into `known.met` via the network task so
-    // the value persists across restarts. `try_send` is fine here —
-    // if the channel is briefly full the value still survives in the
-    // search index (saved separately) and a future SharedFilesChanged
-    // will reconcile it.
     if let Some(hash) = file_hash.filter(|h| !h.is_empty()) {
-        if state
-            .network_tx
-            .try_send(NetworkCommand::SetUploadPriority {
-                file_hash_hex: hash,
+        bounded_send(
+            &state.network_tx,
+            NetworkCommand::SetUploadPriorities {
+                file_hashes: vec![hash],
                 priority: priority_str_to_u8(&priority),
-            })
-            .is_err()
-        {
-            warn!("Network channel full; upload_priority change not yet flushed to known.met");
-        }
+            },
+        )
+        .await?;
     }
     info!("Set priority for {} to {}", file_path, priority);
     Ok(())
@@ -1121,25 +1167,8 @@ pub async fn batch_share(
     let count = changed_hashes.len() as u32;
     if count > 0 {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        if let Err(e) = state
-            .network_tx
-            .try_send(NetworkCommand::SharedFilesChanged)
-        {
-            warn!("Failed to queue SharedFilesChanged after batch share: {e}");
-        }
-        for hash in &changed_hashes {
-            if state
-                .network_tx
-                .try_send(NetworkCommand::SetFileShared {
-                    file_hash_hex: hash.clone(),
-                    shared: true,
-                })
-                .is_err()
-            {
-                warn!("Network channel full during batch share persistence push");
-                break;
-            }
-        }
+        reconcile_shared_files(&state.network_tx).await?;
+        persist_shared_states(&state.network_tx, &changed_hashes, true).await?;
         let _ = app.emit(
             "shared-files-changed",
             serde_json::json!({ "shared": count }),
@@ -1171,25 +1200,8 @@ pub async fn batch_unshare(
     let count = changed_hashes.len() as u32;
     if count > 0 {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        if let Err(e) = state
-            .network_tx
-            .try_send(NetworkCommand::SharedFilesChanged)
-        {
-            warn!("Failed to queue SharedFilesChanged after batch unshare: {e}");
-        }
-        for hash in &changed_hashes {
-            if state
-                .network_tx
-                .try_send(NetworkCommand::SetFileShared {
-                    file_hash_hex: hash.clone(),
-                    shared: false,
-                })
-                .is_err()
-            {
-                warn!("Network channel full during batch unshare persistence push");
-                break;
-            }
-        }
+        reconcile_shared_files(&state.network_tx).await?;
+        persist_shared_states(&state.network_tx, &changed_hashes, false).await?;
         let _ = app.emit(
             "shared-files-changed",
             serde_json::json!({ "unshared": count }),
@@ -1467,8 +1479,8 @@ pub async fn reload_shared_files(
             }
         }
 
-        if let Err(e) = network_tx.try_send(NetworkCommand::SharedFilesChanged) {
-            warn!("Failed to queue SharedFilesChanged on reload: {e}");
+        if let Err(e) = reconcile_shared_files(&network_tx).await {
+            warn!("Failed to reconcile shared files on reload: {e}");
         }
         remove_cancel_flag_if_current(&cancel_flags, &reload_key, &cancel_flag).await;
 
@@ -1574,27 +1586,8 @@ pub async fn unshare_file(
     };
     if let Some(f) = &file {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        if let Err(e) = state
-            .network_tx
-            .try_send(NetworkCommand::SharedFilesChanged)
-        {
-            warn!("Failed to queue SharedFilesChanged after unshare: {e}");
-        }
-        // Persist the unshare into known.met so it survives a restart — see
-        // `NetworkCommand::SetFileShared`. Best-effort like the priority
-        // equivalent: a dropped send just delays persistence until the next
-        // successful toggle or SharedFilesChanged reconciliation.
-        if !f.hash.is_empty()
-            && state
-                .network_tx
-                .try_send(NetworkCommand::SetFileShared {
-                    file_hash_hex: f.hash.clone(),
-                    shared: false,
-                })
-                .is_err()
-        {
-            warn!("Network channel full; unshare not yet flushed to known.met");
-        }
+        reconcile_shared_files(&state.network_tx).await?;
+        persist_shared_states(&state.network_tx, std::slice::from_ref(&f.hash), false).await?;
         let _ = app.emit("shared-files-changed", serde_json::json!({ "unshared": 1 }));
         info!(
             "Unshared file {}{}",
@@ -1629,23 +1622,8 @@ pub async fn share_file(
     };
     if let Some(f) = &file {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        if let Err(e) = state
-            .network_tx
-            .try_send(NetworkCommand::SharedFilesChanged)
-        {
-            warn!("Failed to queue SharedFilesChanged after share: {e}");
-        }
-        if !f.hash.is_empty()
-            && state
-                .network_tx
-                .try_send(NetworkCommand::SetFileShared {
-                    file_hash_hex: f.hash.clone(),
-                    shared: true,
-                })
-                .is_err()
-        {
-            warn!("Network channel full; share not yet flushed to known.met");
-        }
+        reconcile_shared_files(&state.network_tx).await?;
+        persist_shared_states(&state.network_tx, std::slice::from_ref(&f.hash), true).await?;
         let _ = app.emit("shared-files-changed", serde_json::json!({ "shared": 1 }));
         info!("Shared file {}", file_path);
     }
@@ -1664,25 +1642,8 @@ pub async fn unshare_folder(
     };
     if !affected_hashes.is_empty() {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        if let Err(e) = state
-            .network_tx
-            .try_send(NetworkCommand::SharedFilesChanged)
-        {
-            warn!("Failed to queue SharedFilesChanged after unshare_folder: {e}");
-        }
-        for hash in &affected_hashes {
-            if state
-                .network_tx
-                .try_send(NetworkCommand::SetFileShared {
-                    file_hash_hex: hash.clone(),
-                    shared: false,
-                })
-                .is_err()
-            {
-                warn!("Network channel full during folder unshare persistence push");
-                break;
-            }
-        }
+        reconcile_shared_files(&state.network_tx).await?;
+        persist_shared_states(&state.network_tx, &affected_hashes, false).await?;
         let _ = app.emit(
             "shared-files-changed",
             serde_json::json!({ "folder": path, "unshared": true }),
@@ -1746,12 +1707,7 @@ pub async fn delete_shared_file(
     };
     refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
 
-    if let Err(e) = state
-        .network_tx
-        .try_send(NetworkCommand::SharedFilesChanged)
-    {
-        warn!("Failed to queue SharedFilesChanged after file deletion: {e}");
-    }
+    reconcile_shared_files(&state.network_tx).await?;
     let _ = app.emit(
         "shared-files-changed",
         serde_json::json!({ "file_deleted": true }),
@@ -1850,12 +1806,7 @@ pub async fn remove_missing_files(
     }
     if removed > 0 {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        if let Err(e) = state
-            .network_tx
-            .try_send(NetworkCommand::SharedFilesChanged)
-        {
-            warn!("Failed to queue SharedFilesChanged after remove_missing_files: {e}");
-        }
+        reconcile_shared_files(&state.network_tx).await?;
         let _ = app.emit(
             "shared-files-changed",
             serde_json::json!({ "missing_removed": removed }),

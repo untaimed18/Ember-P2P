@@ -339,27 +339,81 @@
     return { error: null, adjusted };
   }
 
+  function sameSettingValue(a: unknown, b: unknown): boolean {
+    return JSON.stringify(a) === JSON.stringify(b);
+  }
+
+  /**
+   * Apply only fields changed in this page's draft over the latest persisted
+   * snapshot. This keeps unrelated out-of-band changes while preserving every
+   * unsaved field the user has edited here.
+   */
+  function mergeDraftOntoLatest(draft: AppSettings, latest: AppSettings): AppSettings {
+    let baseline: AppSettings | null = null;
+    try {
+      baseline = originalSettings ? JSON.parse(originalSettings) as AppSettings : null;
+    } catch {
+      // With no trustworthy baseline we cannot distinguish changed fields, so
+      // preserve the full visible draft and refresh only its concurrency token.
+    }
+
+    if (!baseline) {
+      return { ...draft, settings_revision: latest.settings_revision };
+    }
+
+    const merged = JSON.parse(JSON.stringify(latest)) as AppSettings;
+    const draftFields = draft as unknown as Record<string, unknown>;
+    const baselineFields = baseline as unknown as Record<string, unknown>;
+    const mergedFields = merged as unknown as Record<string, unknown>;
+    for (const key of Object.keys(draftFields)) {
+      if (key === 'settings_revision') continue;
+      if (!sameSettingValue(draftFields[key], baselineFields[key])) {
+        mergedFields[key] = draftFields[key];
+      }
+    }
+    merged.settings_revision = latest.settings_revision;
+    return merged;
+  }
+
+  function isSettingsRevisionConflict(error: unknown): boolean {
+    const raw = error instanceof Error
+      ? error.message
+      : typeof error === 'string'
+        ? error
+        : '';
+    if (!raw || raw[0] !== '{') return false;
+    try {
+      const parsed = JSON.parse(raw) as { __coded?: unknown; code?: unknown };
+      return parsed.__coded === true && parsed.code === 'settings_stale_revision';
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Fold the persisted snapshot back into untouched form fields after save.
+   * Fields edited again while IPC was in flight remain as unsaved changes.
+   */
+  function reconcileSavedSettings(draft: AppSettings, saved: AppSettings): void {
+    if (!settings) return;
+    const currentFields = settings as unknown as Record<string, unknown>;
+    const draftFields = draft as unknown as Record<string, unknown>;
+    const savedFields = saved as unknown as Record<string, unknown>;
+    for (const key of Object.keys(savedFields)) {
+      if (key === 'settings_revision') continue;
+      if (sameSettingValue(currentFields[key], draftFields[key])) {
+        currentFields[key] = savedFields[key];
+      }
+    }
+    settings.settings_revision = saved.settings_revision;
+  }
+
   async function handleSave() {
     if (!settings || saving) return;
     const validation = validateSettings(settings);
     if (validation.error) {
       showSaveMsg(validation.error, true, 5000);
       return;
-    }
-    // Snapshot the previous port values BEFORE we overwrite
-    // `originalSettings` below — that's the only post-save signal we have
-    // for whether the user actually changed a port (vs. just touched the
-    // input and reverted, or saved unrelated fields).
-    let previousTcpPort: number | undefined;
-    let previousUdpPort: number | undefined;
-    try {
-      const prev = JSON.parse(originalSettings) as AppSettings;
-      previousTcpPort = prev.tcp_port;
-      previousUdpPort = prev.udp_port;
-    } catch {
-      // originalSettings was empty/corrupt — treat as "no previous value
-      // to compare", which means we won't prompt for restart on the very
-      // first save after load.
     }
     saving = true;
     saveMessage = null;
@@ -371,15 +425,49 @@
     // comparison below) reflecting whatever `settings` drifted to by the time
     // the await resolves, not what this save actually persisted.
     const snapshot = JSON.stringify(settings);
-    const toSave = JSON.parse(snapshot) as AppSettings;
+    const draft = JSON.parse(snapshot) as AppSettings;
     try {
-      const result = await updateSettings(toSave);
+      let result = '';
+      let saved: AppSettings | null = null;
+      let latestBeforeSave: AppSettings | null = null;
+
+      // Refresh immediately before each write. Another command may have saved
+      // settings while this page was open, and the backend correctly rejects
+      // an old revision. Retry one genuine revision race with a fresh merge.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const latest = await getSettings();
+        latestBeforeSave = latest;
+        setAppSettings(latest);
+        if (settings) settings.settings_revision = latest.settings_revision;
+        const candidate = mergeDraftOntoLatest(draft, latest);
+        try {
+          result = await updateSettings(candidate);
+          saved = candidate;
+          break;
+        } catch (e) {
+          if (attempt === 0 && isSettingsRevisionConflict(e)) continue;
+          if (isSettingsRevisionConflict(e)) {
+            // Keep the page's token current even when sustained concurrent
+            // writers win both attempts; never replace the user's draft.
+            try {
+              const refreshed = await getSettings();
+              setAppSettings(refreshed);
+              if (settings) settings.settings_revision = refreshed.settings_revision;
+            } catch {
+              // Preserve the original conflict as the actionable error.
+            }
+          }
+          throw e;
+        }
+      }
+      if (!saved || !latestBeforeSave) return;
+
       // Keep the process-wide settings cache in step with the just-saved
       // values so runtime consumers (friend online-notification toast, chat
       // "disabled" state) react immediately instead of next launch.
-      setAppSettings(toSave);
-      settings.settings_revision = toSave.settings_revision;
-      originalSettings = JSON.stringify(toSave);
+      setAppSettings(saved);
+      reconcileSavedSettings(draft, saved);
+      originalSettings = JSON.stringify(saved);
       // `validation.adjusted` means at least one numeric field was outside
       // its valid range and got silently clamped by `validateSettings`
       // above — surface that alongside the normal save result instead of
@@ -390,32 +478,33 @@
       const isWarn = result.toLowerCase().includes('restart') || validation.adjusted;
       showSaveMsg(message, isWarn, isWarn ? 8000 : 3000);
 
-      // Compare the snapshot we took above against the saved settings.
+      // Compare against the authoritative pre-save snapshot, so an unrelated
+      // out-of-band port change does not look like a change made by this save.
       // The TCP/UDP ports drive `start_upload_server` (TCP listen socket)
       // and the KAD/server UDP socket; both are bound exactly once during
       // app startup, so a hot save here updates the persisted value but
       // not the running listener. Prompt the user to restart.
-      const tcpChanged =
-        previousTcpPort !== undefined && previousTcpPort !== toSave.tcp_port;
-      const udpChanged =
-        previousUdpPort !== undefined && previousUdpPort !== toSave.udp_port;
+      const previousTcpPort = latestBeforeSave.tcp_port;
+      const previousUdpPort = latestBeforeSave.udp_port;
+      const tcpChanged = previousTcpPort !== saved.tcp_port;
+      const udpChanged = previousUdpPort !== saved.udp_port;
       if (tcpChanged || udpChanged) {
         if (tcpChanged && udpChanged) {
           pendingRestartReason = m.settings_restart_reason_both({
             tcp_from: String(previousTcpPort),
-            tcp_to: String(toSave.tcp_port),
+            tcp_to: String(saved.tcp_port),
             udp_from: String(previousUdpPort),
-            udp_to: String(toSave.udp_port),
+            udp_to: String(saved.udp_port),
           });
         } else if (tcpChanged) {
           pendingRestartReason = m.settings_restart_reason_tcp_only({
             from: String(previousTcpPort),
-            to: String(toSave.tcp_port),
+            to: String(saved.tcp_port),
           });
         } else {
           pendingRestartReason = m.settings_restart_reason_udp_only({
             from: String(previousUdpPort),
-            to: String(toSave.udp_port),
+            to: String(saved.udp_port),
           });
         }
         showRestartPrompt = true;

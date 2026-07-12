@@ -10,7 +10,10 @@ primary_region = 'iad'
 
 [env]
   RUST_LOG = 'ember_rendezvous=info'
-  TRUST_PROXY = 'true'
+  # Trust Fly-Client-IP only in the explicit Fly mode and only when the
+  # immediate connection is from Fly's private/local proxy network.
+  TRUST_PROXY = 'fly'
+  TRUSTED_PROXY_HOPS = '10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8,fc00::/7,::1/128'
 
 [http_service]
   internal_port = 8080

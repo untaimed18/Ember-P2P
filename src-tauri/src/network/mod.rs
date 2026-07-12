@@ -97,11 +97,13 @@ struct UpnpMaintainResult {
 }
 
 struct RendezvousRegisterResult {
+    generation: u64,
     initial: bool,
     result: Result<(), String>,
 }
 
 struct NatProbeResult {
+    generation: u64,
     reason: &'static str,
     info: ember::nat::NatInfo,
 }
@@ -113,12 +115,17 @@ const NAT_PROBE_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(2
 fn spawn_nat_probe(
     udp_socket: Arc<UdpSocket>,
     result_tx: mpsc::UnboundedSender<NatProbeResult>,
+    generation: u64,
     reason: &'static str,
 ) -> mpsc::Sender<(Vec<u8>, SocketAddr)> {
     let (packet_tx, packet_rx) = mpsc::channel(32);
     tokio::spawn(async move {
         let info = ember::nat::probe_nat_with_replies(udp_socket, packet_rx).await;
-        let _ = result_tx.send(NatProbeResult { reason, info });
+        let _ = result_tx.send(NatProbeResult {
+            generation,
+            reason,
+            info,
+        });
     });
     packet_tx
 }
@@ -2503,6 +2510,7 @@ pub enum NetworkCommand {
         file_size: Option<u64>,
         rating: u8,
         comment: String,
+        tx: oneshot::Sender<Result<(), String>>,
     },
     CancelSearch {
         request_id: u64,
@@ -2614,16 +2622,9 @@ pub enum NetworkCommand {
     GetKadSearchesSnapshot {
         tx: oneshot::Sender<Vec<KadSearchInfo>>,
     },
-    SharedFilesChanged,
-    /// UI changed a file's upload priority. Pushes the new value into
-    /// the in-memory `KnownFileList` so the upload server's per-request
-    /// priority lookup sees it without waiting for a reload. Without
-    /// this, priority changes only took effect after the next restart
-    /// because `set_file_priority` only updated the live index, not the
-    /// on-disk known-file record the upload handler reads.
-    SetUploadPriority {
-        file_hash_hex: String,
-        priority: u8,
+    /// Reconcile the live index into known.met and acknowledge completion.
+    SharedFilesChangedAck {
+        tx: oneshot::Sender<Result<(), String>>,
     },
     SetUploadPriorities {
         file_hashes: Vec<String>,
@@ -2659,14 +2660,11 @@ pub enum NetworkCommand {
         rating: u8,
         comment: String,
     },
-    /// Persist a per-file share/unshare toggle into `known.met` so it
-    /// survives a restart. Mirrors `SetUploadPriority`: the UI-facing
-    /// `unshare_file`/`share_file`/`unshare_folder`/`batch_share`/
-    /// `batch_unshare` commands flip the live `LocalIndex` flag immediately
-    /// and fire this as a best-effort follow-up to make it durable.
-    SetFileShared {
-        file_hash_hex: String,
-        shared: bool,
+    /// Atomically validates and applies a batch of share-state changes to the
+    /// in-memory known.met catalog, then acknowledges central processing.
+    SetFilesShared {
+        updates: Vec<(String, bool)>,
+        tx: oneshot::Sender<Result<usize, String>>,
     },
     GetFileComments {
         file_hash: String,
@@ -3027,6 +3025,68 @@ struct PublishedNote {
     last_publish: i64,
 }
 
+#[derive(Clone, Debug)]
+struct PendingNotePublish {
+    file_hash: KadId,
+    rating: u8,
+    comment: String,
+    file_name: Option<String>,
+    file_size: Option<u64>,
+    message: KadMessage,
+}
+
+fn build_publish_notes_message(
+    local_id: KadId,
+    file_hash: KadId,
+    local_file: Option<FileInfo>,
+    file_name: Option<&str>,
+    file_size: Option<u64>,
+    rating: u8,
+    comment: &str,
+) -> KadMessage {
+    let mut tags = Vec::new();
+    if let Some(file) = local_file {
+        tags.push(KadTag {
+            name: TagName::Id(TAG_FILENAME),
+            value: TagValue::String(file.name),
+        });
+        tags.push(KadTag {
+            name: TagName::Id(TAG_FILESIZE),
+            value: TagValue::Uint64(file.size),
+        });
+    } else {
+        if let Some(name) = file_name.filter(|name| !name.is_empty()) {
+            tags.push(KadTag {
+                name: TagName::Id(TAG_FILENAME),
+                value: TagValue::String(name.to_string()),
+            });
+        }
+        if let Some(size) = file_size.filter(|size| *size > 0) {
+            tags.push(KadTag {
+                name: TagName::Id(TAG_FILESIZE),
+                value: TagValue::Uint64(size),
+            });
+        }
+    }
+    if !comment.is_empty() {
+        tags.push(KadTag {
+            name: TagName::Id(TAG_DESCRIPTION),
+            value: TagValue::String(comment.to_string()),
+        });
+    }
+    if rating > 0 {
+        tags.push(KadTag {
+            name: TagName::Id(TAG_FILERATING),
+            value: TagValue::Uint8(rating),
+        });
+    }
+    KadMessage::PublishNotesReq {
+        target: file_hash,
+        sender_id: local_id,
+        tags,
+    }
+}
+
 /// Pending `find_sources`/`find_notes` IPC response channel, paired with the
 /// caller-generated `request_id` so `NetworkCommand::CancelSearch` can find
 /// and tear down the underlying KAD search if the IPC caller times out.
@@ -3081,6 +3141,11 @@ struct NetworkState {
     /// Downloads waiting for sources (transfer_id -> PendingDownload)
     pending_downloads: HashMap<String, PendingDownload>,
     data_dir: PathBuf,
+    /// Serializes every known.met writer, including shutdown, so a timed-out
+    /// periodic snapshot cannot rename over a newer authoritative save.
+    known_met_save_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Same ownership rule for periodic/disconnect/shutdown nodes.dat writes.
+    nodes_save_lock: Arc<tokio::sync::Mutex<()>>,
     external_ip: Option<Ipv4Addr>,
     external_udp_port: Option<u16>,
     firewalled: bool,
@@ -3141,8 +3206,9 @@ struct NetworkState {
     /// Pending notes searches: search_id -> (request_id, response sender).
     /// See `pending_source_searches` for why `request_id` is carried here.
     pending_notes_searches: HashMap<SearchId, PendingHelperSearchTx<Vec<SearchResult>>>,
-    /// Pending note publishes: search_id -> (file_hash, rating, comment)
-    pending_note_publishes: HashMap<SearchId, (KadId, u8, String, Option<String>, Option<u64>)>,
+    /// Pending note publishes, including the exact StorePacket payload used by
+    /// both eager lookup sends and completion mop-up.
+    pending_note_publishes: HashMap<SearchId, PendingNotePublish>,
     /// Notes we have published to the KAD DHT, keyed by the file's KadId.
     /// Re-published periodically so our comments/ratings don't expire from
     /// the network after ~24h; loaded from the `published_notes` table at
@@ -3461,6 +3527,8 @@ struct NetworkState {
     upload_disconnected: Arc<std::sync::atomic::AtomicBool>,
     /// Whether we have successfully registered with the rendezvous server
     rendezvous_registered: bool,
+    /// Invalidates late initial/heartbeat results after timeout/disconnect.
+    rendezvous_register_generation: u64,
     /// Last time we registered with the rendezvous server (for heartbeat)
     rendezvous_last_register: Option<std::time::Instant>,
     /// Tracks active outbound friend session tasks to prevent duplicates.
@@ -3478,6 +3546,9 @@ struct NetworkState {
     tracker_registry: SharedTrackerRegistry,
     /// Cached NAT type info for LowID-to-LowID hole-punch decisions
     nat_info: ember::nat::NatInfo,
+    /// Invalidates NAT probe results that arrive after a watchdog/disconnect
+    /// has superseded the task.
+    nat_probe_generation: u64,
     /// Live-updated mirror of `nat_info` (plus the QUIC endpoint once
     /// available) shared with spawned friend-dial tasks via
     /// `connect_friend_with_fallback`, so a fresh read right before the
@@ -4124,7 +4195,12 @@ async fn flush_credit_state(
     db: &Arc<Database>,
     data_dir: &std::path::Path,
     cleanup_stale: bool,
+    save_ownership: &Arc<tokio::sync::Mutex<()>>,
 ) {
+    // Serialize snapshot creation as well as persistence. If two callers
+    // captured snapshots first and only serialized the writes, an older
+    // snapshot could acquire the slot second and overwrite the newer flush.
+    let ownership = save_ownership.clone().lock_owned().await;
     if cleanup_stale {
         let mut cm_w = credit_manager.write().await;
         cm_w.cleanup_stale(90);
@@ -4172,14 +4248,14 @@ async fn flush_credit_state(
             .collect();
         (bytes, records, ember_records)
     };
-    // Ordering note: persist credits to the SQLite database *first* (the
-    // authoritative source on load — see `CreditManager` loader, which
-    // only falls back to `clients.met` when the DB has no rows) and only
-    // afterwards write the `clients.met` cache copy. If a crash happens
-    // between the two writes, the next launch still sees the latest credits
-    // via the DB; the on-disk cache may lag but does not clobber fresh data.
+    // Own the save slot through the blocking DB/cache write itself. If the
+    // async parent is aborted while spawn_blocking is running, this owned
+    // guard remains inside the blocking closure, so shutdown cannot race a
+    // newer snapshot against the still-running periodic write.
     let db_ref = db.clone();
-    let db_save = tokio::task::spawn_blocking(move || {
+    let data_dir = data_dir.to_path_buf();
+    let save_result = tokio::task::spawn_blocking(move || {
+        let _ownership = ownership;
         let refs: Vec<(&[u8; 16], u64, u64, i64, &[u8], u32, u8)> = owned
             .iter()
             .map(|(h, u, d, l, p, ip, st)| (h, *u, *d, *l, p.as_slice(), *ip, *st))
@@ -4193,34 +4269,31 @@ async fn flush_credit_state(
                     (pk, *u, *d, *lu, *ld, *c, *t, *s, *ls, *v)
                 })
                 .collect();
+        // Persist SQLite first: it is authoritative on load. Only refresh the
+        // clients.met cache after that transaction succeeds.
         let result = db_ref.save_all_credits_with_ember(&refs, &ember_refs);
         db_ref.incremental_vacuum();
+        if result.is_ok() {
+            let clients_met = data_dir.join("clients.met");
+            let clients_bak = data_dir.join("clients.met.bak");
+            if clients_met.exists() {
+                if let Err(e) = std::fs::copy(&clients_met, &clients_bak) {
+                    debug!("Failed to create clients.met backup: {e}");
+                }
+            }
+            if let Err(e) = crate::security::atomic_write(&clients_met, &serialized_bytes, false) {
+                debug!("Failed to finalize clients.met: {e}");
+            }
+        }
         result
     })
     .await;
-    let db_ok = matches!(db_save, Ok(Ok(())));
-    match &db_save {
+    match &save_result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => error!("Failed to save credits: {e}"),
         Err(e) => error!("Credit save task failed: {e}"),
     }
-
-    // Only refresh the clients.met cache when the authoritative DB write
-    // succeeded. The DB wins on load, so writing a newer cache while the DB
-    // still holds the old rows would just be confusing on recovery; skip it
-    // and keep the previous cache intact.
-    if db_ok {
-        let clients_met = data_dir.join("clients.met");
-        let clients_bak = data_dir.join("clients.met.bak");
-        if clients_met.exists() {
-            if let Err(e) = std::fs::copy(&clients_met, &clients_bak) {
-                debug!("Failed to create clients.met backup: {e}");
-            }
-        }
-        if let Err(e) = crate::security::atomic_write(&clients_met, &serialized_bytes, false) {
-            debug!("Failed to finalize clients.met: {e}");
-        }
-    } else {
+    if !matches!(save_result, Ok(Ok(()))) {
         debug!("Skipping clients.met cache write because the DB credit flush failed");
     }
 }
@@ -4230,24 +4303,18 @@ fn spawn_credit_flush(
     db: Arc<Database>,
     data_dir: std::path::PathBuf,
     cleanup_stale: bool,
-    in_flight: Arc<std::sync::atomic::AtomicBool>,
-) {
-    if in_flight
-        .compare_exchange(
-            false,
-            true,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-        )
-        .is_err()
-    {
-        debug!("Skipping credit flush: previous flush is still in flight");
-        return;
-    }
+    save_ownership: Arc<tokio::sync::Mutex<()>>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        flush_credit_state(&credit_manager, &db, &data_dir, cleanup_stale).await;
-        in_flight.store(false, std::sync::atomic::Ordering::Release);
-    });
+        flush_credit_state(
+            &credit_manager,
+            &db,
+            &data_dir,
+            cleanup_stale,
+            &save_ownership,
+        )
+        .await;
+    })
 }
 
 fn server_entry_to_info(server: &ServerEntry) -> ServerInfo {
@@ -5543,6 +5610,8 @@ pub async fn start_network(
         source_search_stream_cursor: HashMap::new(),
         pending_downloads: HashMap::new(),
         data_dir: data_dir.clone(),
+        known_met_save_lock: Arc::new(tokio::sync::Mutex::new(())),
+        nodes_save_lock: Arc::new(tokio::sync::Mutex::new(())),
         external_ip: None,
         external_udp_port: None,
         firewalled: !upnp_success,
@@ -5674,6 +5743,7 @@ pub async fn start_network(
             !settings.auto_connect_kad,
         )),
         rendezvous_registered: false,
+        rendezvous_register_generation: 0,
         rendezvous_last_register: None,
         outbound_session_tasks: HashMap::new(),
         friend_search_initial_done: false,
@@ -5681,6 +5751,7 @@ pub async fn start_network(
         friend_reconnect_last: HashMap::new(),
         tracker_registry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         nat_info: ember::nat::NatInfo::unknown(),
+        nat_probe_generation: 0,
         friend_nat_context: ember::nat::new_shared_friend_nat_context(),
         connection_broker: None,
         broker_event_rx: None,
@@ -5929,6 +6000,8 @@ pub async fn start_network(
         Arc::new(RwLock::new(sm))
     };
 
+    let credit_save_ownership = Arc::new(tokio::sync::Mutex::new(()));
+
     // Load credits from DB (primary) and clients.met (fallback), persist RSA keypair
     let credit_manager: Arc<RwLock<CreditManager>> = {
         let mut cm = CreditManager::new();
@@ -6030,7 +6103,7 @@ pub async fn start_network(
         // already-transactional (DELETE + INSERT inside a single
         // SQLite tx in `save_all_credits`).
         if any_pruned {
-            flush_credit_state(&arc, &db, &data_dir, false).await;
+            flush_credit_state(&arc, &db, &data_dir, false, &credit_save_ownership).await;
         }
         arc
     };
@@ -6419,7 +6492,7 @@ pub async fn start_network(
     let mut nat_probe_in_flight = false;
     let mut nat_probe_started_at: Option<tokio::time::Instant> = None;
     let mut nat_probe_backoff_until: Option<tokio::time::Instant> = None;
-    let credit_flush_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut credit_flush_handle: Option<tokio::task::JoinHandle<()>> = None;
     let mut last_server_activity_at = chrono::Utc::now().timestamp();
     let mut last_kad_activity_at = chrono::Utc::now().timestamp();
     let mut last_cache_refresh_started_at = 0i64;
@@ -6774,6 +6847,14 @@ pub async fn start_network(
             break;
         }
 
+        if state.stats.status == NetworkStatus::Disconnected {
+            nat_probe_in_flight = false;
+            nat_probe_started_at = None;
+            nat_probe_packet_tx = None;
+            rendezvous_register_in_flight = false;
+            rendezvous_register_started_at = None;
+        }
+
         if state.external_ip.is_some()
             && state.nat_info.nat_type == ember::nat::NatType::Unknown
             && !nat_probe_in_flight
@@ -6783,9 +6864,11 @@ pub async fn start_network(
         {
             nat_probe_in_flight = true;
             nat_probe_started_at = Some(tokio::time::Instant::now());
+            state.nat_probe_generation = state.nat_probe_generation.saturating_add(1);
             nat_probe_packet_tx = Some(spawn_nat_probe(
                 udp_socket.clone(),
                 nat_probe_result_tx.clone(),
+                state.nat_probe_generation,
                 "external IP available",
             ));
         }
@@ -7017,7 +7100,12 @@ pub async fn start_network(
                             .unwrap_or(0),
                     });
                 }
-                if let DownloadEvent::Completed { ref transfer_id, part_hashes: ref event_part_hashes, .. } = event {
+                if let DownloadEvent::Completed {
+                    ref transfer_id,
+                    ref final_path,
+                    part_hashes: ref event_part_hashes,
+                } = event
+                {
                     {
                         let mgr_snap = transfer_manager.read().await;
                         if let Some(t) = mgr_snap.get_transfer(transfer_id) {
@@ -7095,61 +7183,99 @@ pub async fn start_network(
                                 }
                             }
                         }
-                        let safe_name = crate::security::sanitize_filename(&file_name);
-                        let completed_path = PathBuf::from(&settings.download_folder)
+                        let sanitized_name = crate::security::sanitize_filename(&file_name);
+                        let default_completed_path = PathBuf::from(&settings.download_folder)
                             .join("Downloads")
-                            .join(&safe_name);
+                            .join(&sanitized_name);
+                        // The transfer owns final-name claiming and may choose a
+                        // deduplicated path. Using a reconstructed default path
+                        // here creates a second transient LocalIndex row when the
+                        // file watcher observes the actual path.
+                        let completed_path = final_path
+                            .as_deref()
+                            .filter(|path| !path.is_empty())
+                            .map(PathBuf::from)
+                            .unwrap_or_else(|| default_completed_path.clone());
+                        let completed_name = completed_path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .filter(|name| !name.is_empty())
+                            .unwrap_or(sanitized_name);
                         let now = chrono::Utc::now().timestamp();
 
                         if let Ok(hash_bytes) = hex::decode(&file_hash) {
                             if hash_bytes.len() == 16 {
                                 let mut fh = [0u8; 16];
                                 fh.copy_from_slice(&hash_bytes);
-                                if known_files.find_by_hash(&fh).is_none() {
-                                    use crate::storage::known_files::KnownFileRecord;
-                                    // Prefer the hashset already verified during
-                                    // the transfer (see `DownloadEvent::Completed`)
-                                    // over re-reading this whole file from disk a
-                                    // second time — same fix as the
-                                    // `SharedFilesChanged` handler, applied here
-                                    // for the download-completion path.
-                                    let part_hashes = if !event_part_hashes.is_empty() {
-                                        event_part_hashes.clone()
-                                    } else {
-                                        // Fallback for completion paths that don't
-                                        // track a verified hashset (zero-byte
-                                        // files, single-source callback downloads,
-                                        // restart re-verification). A freshly
-                                        // completed large file taking this branch
-                                        // would otherwise block the network select
-                                        // loop for the full part-hash read.
-                                        let hash_path = completed_path.clone();
-                                        tokio::task::spawn_blocking(move || {
-                                            ed2k::hash::ed2k_part_hashes_file(&hash_path)
-                                                .unwrap_or_default()
-                                        })
-                                        .await
+                                use crate::storage::known_files::KnownFileRecord;
+                                let existing = known_files.find_by_hash(&fh).cloned();
+                                // Prefer the hashset already verified during
+                                // the transfer, then a valid cached set, before
+                                // re-reading the completed file.
+                                let part_hashes = if !event_part_hashes.is_empty() {
+                                    event_part_hashes.clone()
+                                } else if existing.as_ref().is_some_and(|record| {
+                                    record.part_hashes.len()
+                                        == ed2k::hash::ed2k_known_met_part_hash_count(file_size)
+                                }) {
+                                    existing
+                                        .as_ref()
+                                        .map(|record| record.part_hashes.clone())
                                         .unwrap_or_default()
-                                    };
-                                    let record = KnownFileRecord {
-                                        file_hash: fh,
-                                        part_hashes,
-                                        file_name: file_name.clone(),
-                                        file_size,
-                                        file_path: completed_path.to_string_lossy().to_string(),
-                                        aich_hash: String::new(),
-                                        modified_at: now,
-                                        all_time_transferred: transferred,
-                                        all_time_requested: 0,
-                                        all_time_accepted: 0,
-                                        upload_priority: 0,
-                                        last_publish_src: 0,
-                                        last_shared: 0,
-                                        is_shared: true,
-                                        complete_sources: 0,
-                                    };
-                                    known_files.add_or_update(record);
-                                }
+                                } else {
+                                    let hash_path = completed_path.clone();
+                                    tokio::task::spawn_blocking(move || {
+                                        ed2k::hash::ed2k_part_hashes_file(&hash_path)
+                                            .unwrap_or_default()
+                                    })
+                                    .await
+                                    .unwrap_or_default()
+                                };
+                                let record = KnownFileRecord {
+                                    file_hash: fh,
+                                    part_hashes,
+                                    file_name: completed_name.clone(),
+                                    file_size,
+                                    file_path: completed_path.to_string_lossy().to_string(),
+                                    aich_hash: existing
+                                        .as_ref()
+                                        .map(|record| record.aich_hash.clone())
+                                        .unwrap_or_default(),
+                                    modified_at: now,
+                                    all_time_transferred: existing
+                                        .as_ref()
+                                        .map(|record| record.all_time_transferred.max(transferred))
+                                        .unwrap_or(transferred),
+                                    all_time_requested: existing
+                                        .as_ref()
+                                        .map(|record| record.all_time_requested)
+                                        .unwrap_or(0),
+                                    all_time_accepted: existing
+                                        .as_ref()
+                                        .map(|record| record.all_time_accepted)
+                                        .unwrap_or(0),
+                                    upload_priority: existing
+                                        .as_ref()
+                                        .map(|record| record.upload_priority)
+                                        .unwrap_or(0),
+                                    last_publish_src: existing
+                                        .as_ref()
+                                        .map(|record| record.last_publish_src)
+                                        .unwrap_or(0),
+                                    last_shared: existing
+                                        .as_ref()
+                                        .map(|record| record.last_shared)
+                                        .unwrap_or(0),
+                                    is_shared: existing
+                                        .as_ref()
+                                        .map(|record| record.is_shared)
+                                        .unwrap_or(true),
+                                    complete_sources: existing
+                                        .as_ref()
+                                        .map(|record| record.complete_sources)
+                                        .unwrap_or(0),
+                                };
+                                known_files.add_or_update(record);
 
                                 // Auto-share completed download (eMule: CPartFile::PerformFileCompleteEnd)
                                 let ext = completed_path.extension()
@@ -7160,67 +7286,129 @@ pub async fn start_network(
                                     .unwrap_or_default();
                                 let shared_file = FileInfo {
                                     id: file_hash.clone(),
-                                    name: safe_name,
+                                    name: completed_name,
                                     path: completed_path.to_string_lossy().to_string(),
                                     size: file_size,
                                     hash: file_hash,
-                                    aich_hash: String::new(),
+                                    aich_hash: existing
+                                        .as_ref()
+                                        .map(|record| record.aich_hash.clone())
+                                        .unwrap_or_default(),
                                     extension: ext,
                                     modified_at: now,
-                                    priority: "normal".to_string(),
+                                    priority: existing
+                                        .as_ref()
+                                        .map(|record| {
+                                            crate::storage::known_files::priority_u8_to_str(
+                                                record.upload_priority,
+                                            )
+                                            .to_string()
+                                        })
+                                        .unwrap_or_else(|| "normal".to_string()),
                                     requests: 0,
                                     accepted: 0,
                                     bytes_transferred: 0,
-                                    alltime_requests: 0,
-                                    alltime_accepted: 0,
-                                    alltime_transferred: 0,
-                                    complete_sources: 0,
+                                    alltime_requests: existing
+                                        .as_ref()
+                                        .map(|record| record.all_time_requested)
+                                        .unwrap_or(0),
+                                    alltime_accepted: existing
+                                        .as_ref()
+                                        .map(|record| record.all_time_accepted)
+                                        .unwrap_or(0),
+                                    alltime_transferred: existing
+                                        .as_ref()
+                                        .map(|record| record.all_time_transferred)
+                                        .unwrap_or(0),
+                                    complete_sources: existing
+                                        .as_ref()
+                                        .map(|record| record.complete_sources)
+                                        .unwrap_or(0),
                                     folder,
-                                    shared: true,
+                                    shared: existing
+                                        .as_ref()
+                                        .map(|record| record.is_shared)
+                                        .unwrap_or(true),
                                     shared_kad: false,
                                     shared_ed2k: false,
                                 };
-                                {
+                                let shared_file = {
                                     let mut index = local_index.write().await;
-                                    if index.get_by_path(&shared_file.path).is_none() {
-                                        index.add_file(shared_file.clone());
+                                    // Clean up the old reconstructed-default row
+                                    // only when it is an on-disk orphan carrying
+                                    // this exact completed hash/size. A pending
+                                    // or merely same-named row is not proof that
+                                    // it represents this physical completion.
+                                    if default_completed_path != completed_path
+                                        && !default_completed_path.exists()
+                                    {
+                                        let default_path =
+                                            default_completed_path.to_string_lossy().to_string();
+                                        let is_proven_orphan = index
+                                            .get_by_path(&default_path)
+                                            .is_some_and(|file| {
+                                                file.hash.eq_ignore_ascii_case(&shared_file.hash)
+                                                    && file.size == shared_file.size
+                                            });
+                                        if is_proven_orphan {
+                                            index.remove_file_by_path(&default_path);
+                                        }
                                     }
-                                }
+                                    // Always upsert. LocalIndex preserves
+                                    // runtime/shared flags from an existing
+                                    // same-path (including pending) row.
+                                    index.add_file(shared_file.clone());
+                                    index
+                                        .get_by_path(&shared_file.path)
+                                        .cloned()
+                                        .unwrap_or(shared_file)
+                                };
                                 {
-                                    let snap = local_index.read().await.all_files().to_vec();
+                                    let mut snap = local_index.read().await.all_files().to_vec();
+                                    let kad_connected =
+                                        state.stats.status == NetworkStatus::Connected;
+                                    for file in &mut snap {
+                                        file.shared_kad =
+                                            file.shared && kad_connected && !file.hash.is_empty();
+                                        file.shared_ed2k = file.shared
+                                            && state.server_connected
+                                            && !file.hash.is_empty();
+                                    }
                                     *shared_files.write().await = snap;
                                 }
 
-                                // Publish to KAD
-                                state.publish_manager.add_file(PublishableFile {
-                                    file_hash: md4_bytes_to_kad_id(&hash_bytes[..16]),
-                                    file_name: shared_file.name.clone(),
-                                    file_size: shared_file.size,
-                                    file_type: crate::search::index::infer_file_type(&shared_file.extension),
-                                    complete_sources: 0,
-                                    keyword_publishable: true,
-                                    last_source_publish: {
-                                        let mut raw = [0u8; 16];
-                                        raw.copy_from_slice(&hash_bytes[..16]);
-                                        known_files
-                                            .find_by_hash(&raw)
-                                            .map(|r| r.last_publish_src as i64)
-                                            .unwrap_or(0)
-                                    },
-                                });
+                                if shared_file.shared {
+                                    // Publish to KAD
+                                    state.publish_manager.add_file(PublishableFile {
+                                        file_hash: md4_bytes_to_kad_id(&hash_bytes[..16]),
+                                        file_name: shared_file.name.clone(),
+                                        file_size: shared_file.size,
+                                        file_type: crate::search::index::infer_file_type(&shared_file.extension),
+                                        complete_sources: shared_file.complete_sources,
+                                        keyword_publishable: true,
+                                        last_source_publish: {
+                                            let mut raw = [0u8; 16];
+                                            raw.copy_from_slice(&hash_bytes[..16]);
+                                            known_files
+                                                .find_by_hash(&raw)
+                                                .map(|r| r.last_publish_src as i64)
+                                                .unwrap_or(0)
+                                        },
+                                    });
 
-                                // Offer to eD2K server
-                                if state.server_connected {
-                                    if let Some(conn) = state.server_connection.as_mut() {
-                                        let offer = vec![ed2k::server::OfferFile {
-                                            hash: fh,
-                                            name: shared_file.name.clone(),
-                                            size: shared_file.size,
-                                            is_complete: true,
-                                            file_type: String::new(),
-                                        }];
-                                        if let Err(e) = conn.offer_files(&offer, state.tcp_port).await {
-                                            debug!("Failed to offer completed download to server: {e}");
+                                    // Offer to eD2K server
+                                    if state.server_connected {
+                                        if let Some(conn) = state.server_connection.as_mut() {
+                                            let offer = vec![ed2k::server::OfferFile {
+                                                hash: fh,
+                                                name: shared_file.name.clone(),
+                                                size: shared_file.size,
+                                                is_complete: true,
+                                                file_type: String::new(),
+                                            }];
+                                            if let Err(e) = conn.offer_files(&offer, state.tcp_port).await {
+                                                debug!("Failed to offer completed download to server: {e}");
+                                            }
                                         }
                                     }
                                 }
@@ -7229,7 +7417,10 @@ pub async fn start_network(
                                     "phase": "download-complete",
                                     "count": 1,
                                 }));
-                                info!("Auto-shared completed download: {}", file_name);
+                                info!(
+                                    "Indexed completed download: {} (shared={})",
+                                    file_name, shared_file.shared
+                                );
 
                                 // Build full AICH hash set for the completed file
                                 // (enables AICH-based verification when serving to other peers)
@@ -8753,24 +8944,35 @@ pub async fn start_network(
                     state.routing_table.release_contacts_in_use(&to_release);
                 }
                 let queries = state.search_manager.poll_queries();
-                for (sid, addr, msg, contact_id) in &queries {
+                for (sid, addr, msg, contact_id) in queries {
                     if state.flood_protection.check_outgoing_rate(addr.ip()) {
                         debug!("Throttling outgoing search {} packet to {addr}", sid.0);
+                        if let Some(search) = state.search_manager.get_mut(&sid) {
+                            search.rollback_unsent_query(contact_id, &msg);
+                        }
                         continue;
                     }
-                    if let Ok(packet) = messages::encode_packet(msg) {
+                    if let Ok(packet) = messages::encode_packet(&msg) {
                         let opcode = packet.get(1).copied().unwrap_or(0);
-                        state.flood_protection.track_request(*addr, opcode);
-                        let _ = send_kad_packet(
-                            &udp_socket, &packet, *addr, &state, contact_id,
-                        ).await;
+                        if send_kad_packet(
+                            &udp_socket, &packet, addr, &state, &contact_id,
+                        ).await.is_err() {
+                            if let Some(search) = state.search_manager.get_mut(&sid) {
+                                search.rollback_unsent_query(contact_id, &msg);
+                            }
+                            continue;
+                        }
+                        if let Some(search) = state.search_manager.get_mut(&sid) {
+                            search.commit_query_sent(contact_id, addr);
+                        }
+                        state.flood_protection.track_request(addr, opcode);
                         // Track publish requests for ack matching. poll_queries
                         // can return KadReq (routing lookup) or Publish* (store
                         // phase); only the latter expect a PublishRes so only
                         // those need an entry. Insert at send-time (not at
                         // search completion) — peers ack within milliseconds
                         // and we used to miss every single lookup-phase ack.
-                        let (publish_target, is_source) = match msg {
+                        let (publish_target, is_source) = match &msg {
                             KadMessage::PublishSourceReq { target, .. } => (Some(*target), true),
                             KadMessage::PublishKeyReq { target, .. } => (Some(*target), false),
                             KadMessage::PublishNotesReq { target, .. } => (Some(*target), false),
@@ -8779,19 +8981,21 @@ pub async fn start_network(
                         if let Some(target) = publish_target {
                             let file_hash = state
                                 .store_source_searches
-                                .get(sid)
+                                .get(&sid)
                                 .map(|(fh, _)| *fh)
                                 .unwrap_or(target);
                             let now_ts = chrono::Utc::now().timestamp();
                             let pending = state
                                 .publish_pending
-                                .entry((target, *addr))
+                                .entry((target, addr))
                                 .or_insert((file_hash, now_ts, is_source, 0));
                             pending.0 = file_hash;
                             pending.1 = now_ts;
                             pending.2 = is_source;
                             pending.3 = pending.3.saturating_add(1);
                         }
+                    } else if let Some(search) = state.search_manager.get_mut(&sid) {
+                        search.rollback_unsent_query(contact_id, &msg);
                     }
                 }
 
@@ -8817,8 +9021,11 @@ pub async fn start_network(
                                     };
                                     for contact in &candidates {
                                         let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+                                        if state.flood_protection.check_outgoing_rate(addr.ip()) {
+                                            debug!("Throttling eager source publish to {addr}");
+                                            continue;
+                                        }
                                         if let Ok(packet) = messages::encode_packet(&msg) {
-                                            state.flood_protection.track_request(addr, opcode);
                                             if send_kad_packet(
                                                 &udp_socket,
                                                 &packet,
@@ -8829,22 +9036,23 @@ pub async fn start_network(
                                             .await
                                             .is_ok()
                                             {
+                                                state.flood_protection.track_request(addr, opcode);
                                                 if let Some(sent_search) =
                                                     state.search_manager.get_mut(&sid)
                                                 {
                                                     sent_search.mark_publish_sent(contact);
                                                 }
-                                            if let Some(target) = publish_target {
-                                                let now_ts = chrono::Utc::now().timestamp();
-                                                let pending = state
-                                                    .publish_pending
-                                                    .entry((target, addr))
-                                                    .or_insert((file_hash, now_ts, true, 0));
-                                                pending.0 = file_hash;
-                                                pending.1 = now_ts;
-                                                pending.2 = true;
-                                                pending.3 = pending.3.saturating_add(1);
-                                            }
+                                                if let Some(target) = publish_target {
+                                                    let now_ts = chrono::Utc::now().timestamp();
+                                                    let pending = state
+                                                        .publish_pending
+                                                        .entry((target, addr))
+                                                        .or_insert((file_hash, now_ts, true, 0));
+                                                    pending.0 = file_hash;
+                                                    pending.1 = now_ts;
+                                                    pending.2 = true;
+                                                    pending.3 = pending.3.saturating_add(1);
+                                                }
                                             }
                                         }
                                     }
@@ -8869,12 +9077,15 @@ pub async fn start_network(
                             let candidates = search.next_publish_candidates();
                             if !candidates.is_empty() {
                                 if let Some(batch) = state.store_keyword_searches.get(&sid).cloned() {
-                                    for msg in &batch.messages {
-                                        let opcode = kad_request_opcode(msg).unwrap_or(0);
-                                        for contact in &candidates {
-                                            let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+                                    for contact in &candidates {
+                                        let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+                                        if state.flood_protection.check_outgoing_rate(addr.ip()) {
+                                            debug!("Throttling eager keyword publish to {addr}");
+                                            continue;
+                                        }
+                                        let mut successful_packets = 0usize;
+                                        for msg in &batch.messages {
                                             if let Ok(packet) = messages::encode_packet(msg) {
-                                                state.flood_protection.track_request(addr, opcode);
                                                 if send_kad_packet(
                                                     &udp_socket,
                                                     &packet,
@@ -8887,11 +9098,9 @@ pub async fn start_network(
                                                 {
                                                     continue;
                                                 }
-                                                if let Some(sent_search) =
-                                                    state.search_manager.get_mut(&sid)
-                                                {
-                                                    sent_search.mark_publish_sent(contact);
-                                                }
+                                                let opcode = kad_request_opcode(msg).unwrap_or(0);
+                                                state.flood_protection.track_request(addr, opcode);
+                                                successful_packets += 1;
                                                 let now_ts = chrono::Utc::now().timestamp();
                                                 let pending = state
                                                     .publish_pending
@@ -8903,9 +9112,80 @@ pub async fn start_network(
                                                 pending.3 = pending.3.saturating_add(1);
                                             }
                                         }
+                                        // A keyword peer is complete only after
+                                        // every split packet reached the socket.
+                                        // Partial success remains retryable on
+                                        // the next StorePacket tick.
+                                        if successful_packets == batch.messages.len()
+                                            && successful_packets > 0
+                                        {
+                                            if let Some(sent_search) =
+                                                state.search_manager.get_mut(&sid)
+                                            {
+                                                sent_search.mark_publish_sent(contact);
+                                            }
+                                        }
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+
+                // StoreNotes follows the same eager StorePacket behavior as
+                // source/keyword publishing. The exact payload is captured
+                // when the publish search starts so lookup and completion use
+                // identical tags.
+                {
+                    let store_sids: Vec<SearchId> =
+                        state.pending_note_publishes.keys().copied().collect();
+                    for sid in store_sids {
+                        let candidates = state
+                            .search_manager
+                            .get_mut(&sid)
+                            .map(|search| search.next_publish_candidates())
+                            .unwrap_or_default();
+                        if candidates.is_empty() {
+                            continue;
+                        }
+                        let Some(note) = state.pending_note_publishes.get(&sid).cloned() else {
+                            continue;
+                        };
+                        let opcode = kad_request_opcode(&note.message).unwrap_or(0);
+                        for contact in &candidates {
+                            let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+                            if state.flood_protection.check_outgoing_rate(addr.ip()) {
+                                debug!("Throttling eager note publish to {addr}");
+                                continue;
+                            }
+                            let Ok(packet) = messages::encode_packet(&note.message) else {
+                                continue;
+                            };
+                            if send_kad_packet(
+                                &udp_socket,
+                                &packet,
+                                addr,
+                                &state,
+                                &contact.id,
+                            )
+                            .await
+                            .is_err()
+                            {
+                                continue;
+                            }
+                            state.flood_protection.track_request(addr, opcode);
+                            if let Some(search) = state.search_manager.get_mut(&sid) {
+                                search.mark_publish_sent(contact);
+                            }
+                            let now_ts = chrono::Utc::now().timestamp();
+                            let pending = state
+                                .publish_pending
+                                .entry((note.file_hash, addr))
+                                .or_insert((note.file_hash, now_ts, false, 0));
+                            pending.0 = note.file_hash;
+                            pending.1 = now_ts;
+                            pending.2 = false;
+                            pending.3 = pending.3.saturating_add(1);
                         }
                     }
                 }
@@ -10471,12 +10751,33 @@ pub async fn start_network(
                                 })
                                 .take(remaining)
                                 .collect();
-                            for msg in &batch.messages {
-                                for contact in &candidates {
-                                    let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+                            let mut successful_packets = 0usize;
+                            let mut successful_peers = 0usize;
+                            for contact in &candidates {
+                                let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+                                if state.flood_protection.check_outgoing_rate(addr.ip()) {
+                                    debug!("Throttling completion keyword publish to {addr}");
+                                    continue;
+                                }
+                                let mut peer_packets = 0usize;
+                                for msg in &batch.messages {
                                     if let Ok(packet) = messages::encode_packet(msg) {
-                                        state.flood_protection.track_request(addr, kad_request_opcode(msg).unwrap_or(0));
-                                        let _ = send_kad_packet(&udp_socket, &packet, addr, &state, &contact.id).await;
+                                        if send_kad_packet(
+                                            &udp_socket,
+                                            &packet,
+                                            addr,
+                                            &state,
+                                            &contact.id,
+                                        )
+                                        .await
+                                        .is_err()
+                                        {
+                                            continue;
+                                        }
+                                        state.flood_protection.track_request(
+                                            addr,
+                                            kad_request_opcode(msg).unwrap_or(0),
+                                        );
                                         // Per-peer pending entry so every ack counts.
                                         let pending = state
                                             .publish_pending
@@ -10486,21 +10787,26 @@ pub async fn start_network(
                                         pending.1 = now;
                                         pending.2 = false;
                                         pending.3 = pending.3.saturating_add(1);
+                                        peer_packets += 1;
+                                        successful_packets += 1;
                                     }
                                 }
+                                if peer_packets == batch.messages.len() && peer_packets > 0 {
+                                    successful_peers += 1;
+                                }
                             }
-                            let total_published = already_published.len() + candidates.len();
+                            let total_published = already_published.len() + successful_peers;
                             if total_published > 0 {
                                 state.publish_manager.mark_keyword_published(&batch.keyword_hash);
                                 info!(
-                                    "StoreKeyword search {} completed: published keyword '{}' ({} file entries, {} packet(s)) to {} closest nodes ({} during lookup, {} at completion)",
+                                    "StoreKeyword search {} completed: published keyword '{}' ({} file entries, {} packet send(s)) to {} fully-reached nodes ({} during lookup, {} at completion)",
                                     sid.0,
                                     batch.keyword,
                                     batch.file_hashes.len(),
-                                    batch.messages.len(),
+                                    successful_packets,
                                     total_published,
                                     already_published.len(),
-                                    candidates.len(),
+                                    successful_peers,
                                 );
                             }
                         }
@@ -10509,7 +10815,7 @@ pub async fn start_network(
                         // within-tolerance responded contacts not already published during Lookup.
                         if let Some(search) = state.search_manager.get(&sid) {
                             let now = chrono::Utc::now().timestamp();
-                            let mut sent = 0;
+                            let mut successful_peers = 0usize;
                             let already_published = &search.store_sent;
                             let responded = &search.responded_during_lookup;
                             let remaining = STORE_PUBLISH_TARGET_TOTAL.saturating_sub(already_published.len());
@@ -10524,9 +10830,27 @@ pub async fn start_network(
                                 .collect();
                             for contact in candidates {
                                 let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+                                if state.flood_protection.check_outgoing_rate(addr.ip()) {
+                                    debug!("Throttling completion source publish to {addr}");
+                                    continue;
+                                }
                                 if let Ok(packet) = messages::encode_packet(&msg) {
-                                    state.flood_protection.track_request(addr, kad_request_opcode(&msg).unwrap_or(0));
-                                    let _ = send_kad_packet(&udp_socket, &packet, addr, &state, &contact.id).await;
+                                    if send_kad_packet(
+                                        &udp_socket,
+                                        &packet,
+                                        addr,
+                                        &state,
+                                        &contact.id,
+                                    )
+                                    .await
+                                    .is_err()
+                                    {
+                                        continue;
+                                    }
+                                    state.flood_protection.track_request(
+                                        addr,
+                                        kad_request_opcode(&msg).unwrap_or(0),
+                                    );
                                     // Per-peer pending entry — we track the
                                     // store's target rather than `file_hash` so
                                     // remove-on-ack matches the target echoed
@@ -10541,10 +10865,10 @@ pub async fn start_network(
                                     pending.1 = now;
                                     pending.2 = true;
                                     pending.3 = pending.3.saturating_add(1);
-                                    sent += 1;
+                                    successful_peers += 1;
                                 }
                             }
-                            let total_published = already_published.len() + sent;
+                            let total_published = already_published.len() + successful_peers;
                             if total_published > 0 {
                                 let now_ts = chrono::Utc::now().timestamp();
                                 state.publish_manager.mark_source_published(&file_hash);
@@ -10554,73 +10878,50 @@ pub async fn start_network(
                                     known_files.mark_dirty();
                                 }
                                 info!("StoreSource search {} completed: published to {} nodes ({} during lookup, {} at completion)",
-                                    sid.0, total_published, already_published.len(), sent);
+                                    sid.0, total_published, already_published.len(), successful_peers);
                             }
                         }
-                    } else if let Some((file_hash, rating, comment, file_name, file_size)) = state.pending_note_publishes.remove(&sid) {
+                    } else if let Some(note) = state.pending_note_publishes.remove(&sid) {
                         // StoreNotes search completed - send PublishNotesReq to closest nodes
                         if let Some(search) = state.search_manager.get(&sid) {
-                            let local_note_file = {
-                                let index = local_index.read().await;
-                                index.get_by_hash(&file_hash.to_hex()).cloned()
-                            };
-                            let mut note_tags = Vec::new();
-                            if let Some(file) = local_note_file {
-                                note_tags.push(KadTag {
-                                    name: TagName::Id(TAG_FILENAME),
-                                    value: TagValue::String(file.name),
-                                });
-                                note_tags.push(KadTag {
-                                    name: TagName::Id(TAG_FILESIZE),
-                                    value: TagValue::Uint64(file.size),
-                                });
-                            } else {
-                                if let Some(name) = file_name.clone().filter(|name| !name.is_empty()) {
-                                    note_tags.push(KadTag {
-                                        name: TagName::Id(TAG_FILENAME),
-                                        value: TagValue::String(name),
-                                    });
-                                }
-                                if let Some(size) = file_size.filter(|size| *size > 0) {
-                                    note_tags.push(KadTag {
-                                        name: TagName::Id(TAG_FILESIZE),
-                                        value: TagValue::Uint64(size),
-                                    });
-                                }
-                            }
-                            if !comment.is_empty() {
-                                note_tags.push(KadTag {
-                                    name: TagName::Id(TAG_DESCRIPTION),
-                                    value: TagValue::String(comment.clone()),
-                                });
-                            }
-                            if rating > 0 {
-                                note_tags.push(KadTag {
-                                    name: TagName::Id(TAG_FILERATING),
-                                    value: TagValue::Uint8(rating),
-                                });
-                            }
-                            let msg = KadMessage::PublishNotesReq {
-                                target: file_hash,
-                                sender_id: state.local_id,
-                                tags: note_tags,
-                            };
                             let now = chrono::Utc::now().timestamp();
-                            let mut sent = 0;
+                            let already_published = &search.store_sent;
+                            let remaining =
+                                STORE_PUBLISH_TARGET_TOTAL.saturating_sub(already_published.len());
+                            let mut successful_peers = 0usize;
                             // Same targeting as StoreSource/StoreKeyword: publish only
                             // to nodes that answered during the lookup and lie within
                             // the search tolerance of the target, skipping overloaded
                             // nodes. Publishing to never-queried / far nodes is rejected
                             // remotely and weakens note availability.
                             for contact in search.closest.iter()
-                                .filter(|c| !state.overloaded_nodes.contains_key(&c.ip)
+                                .filter(|c| !already_published.contains(&c.id)
+                                    && !state.overloaded_nodes.contains_key(&c.ip)
                                     && search.responded_during_lookup.contains(&c.id)
                                     && kad::search::within_search_tolerance_pub(&search.target, &c.id))
-                                .take(STORE_PUBLISH_TARGET_TOTAL) {
+                                .take(remaining) {
                                 let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
-                                if let Ok(packet) = messages::encode_packet(&msg) {
-                                    state.flood_protection.track_request(addr, kad_request_opcode(&msg).unwrap_or(0));
-                                    let _ = send_kad_packet(&udp_socket, &packet, addr, &state, &contact.id).await;
+                                if state.flood_protection.check_outgoing_rate(addr.ip()) {
+                                    debug!("Throttling completion note publish to {addr}");
+                                    continue;
+                                }
+                                if let Ok(packet) = messages::encode_packet(&note.message) {
+                                    if send_kad_packet(
+                                        &udp_socket,
+                                        &packet,
+                                        addr,
+                                        &state,
+                                        &contact.id,
+                                    )
+                                    .await
+                                    .is_err()
+                                    {
+                                        continue;
+                                    }
+                                    state.flood_protection.track_request(
+                                        addr,
+                                        kad_request_opcode(&note.message).unwrap_or(0),
+                                    );
                                     // Track per-peer pending entry so the
                                     // PublishRes handler can match and bump
                                     // `publish_confirmed`. The Source and
@@ -10631,16 +10932,18 @@ pub async fn start_network(
                                     // even when the publish succeeded.
                                     let pending = state
                                         .publish_pending
-                                        .entry((file_hash, addr))
-                                        .or_insert((file_hash, now, false, 0));
-                                    pending.0 = file_hash;
+                                        .entry((note.file_hash, addr))
+                                        .or_insert((note.file_hash, now, false, 0));
+                                    pending.0 = note.file_hash;
                                     pending.1 = now;
                                     pending.2 = false;
                                     pending.3 = pending.3.saturating_add(1);
-                                    sent += 1;
+                                    successful_peers += 1;
                                 }
                             }
-                            if sent > 0 {
+                            let total_published =
+                                already_published.len().saturating_add(successful_peers);
+                            if total_published > 0 {
                                 // Only now — after PublishNotesReq packets were
                                 // actually transmitted — do we record/refresh
                                 // the note's `last_publish` and reset its 24h
@@ -10654,31 +10957,35 @@ pub async fn start_network(
                                 // reset the timer (or, for first publish,
                                 // record a "published" entry) despite nothing
                                 // actually being sent.
-                                if rating > 0 || !comment.trim().is_empty() {
+                                if note.rating > 0 || !note.comment.trim().is_empty() {
                                     state.published_notes.insert(
-                                        file_hash,
+                                        note.file_hash,
                                         PublishedNote {
-                                            rating,
-                                            comment: comment.clone(),
-                                            file_name: file_name.clone(),
-                                            file_size,
+                                            rating: note.rating,
+                                            comment: note.comment.clone(),
+                                            file_name: note.file_name.clone(),
+                                            file_size: note.file_size,
                                             last_publish: now,
                                         },
                                     );
                                     if let Err(e) = db.save_published_note(
-                                        &file_hash.to_hex(),
-                                        rating,
-                                        &comment,
+                                        &note.file_hash.to_hex(),
+                                        note.rating,
+                                        &note.comment,
                                         now,
-                                        file_name.as_deref(),
-                                        file_size,
+                                        note.file_name.as_deref(),
+                                        note.file_size,
                                     ) {
                                         warn!("Failed to persist note republish timestamp: {e}");
                                     }
                                 }
                                 info!(
-                                    "StoreNotes search {} completed: published note (rating={}) to {} closest nodes",
-                                    sid.0, rating, sent
+                                    "StoreNotes search {} completed: published note (rating={}) to {} nodes ({} during lookup, {} at completion)",
+                                    sid.0,
+                                    note.rating,
+                                    total_published,
+                                    already_published.len(),
+                                    successful_peers,
                                 );
                             }
                         }
@@ -10994,9 +11301,12 @@ pub async fn start_network(
                             info!("External IP discovered via firewall check — scheduling initial NAT probe");
                             nat_probe_in_flight = true;
                             nat_probe_started_at = Some(tokio::time::Instant::now());
+                            state.nat_probe_generation =
+                                state.nat_probe_generation.saturating_add(1);
                             nat_probe_packet_tx = Some(spawn_nat_probe(
                                 udp_socket.clone(),
                                 nat_probe_result_tx.clone(),
+                                state.nat_probe_generation,
                                 "firewall check",
                             ));
                         }
@@ -11357,11 +11667,15 @@ pub async fn start_network(
                         let tx = rendezvous_register_result_tx.clone();
                         rendezvous_register_in_flight = true;
                         rendezvous_register_started_at = Some(tokio::time::Instant::now());
+                        state.rendezvous_register_generation =
+                            state.rendezvous_register_generation.saturating_add(1);
+                        let generation = state.rendezvous_register_generation;
                         tokio::spawn(async move {
                             let result =
                                 rendezvous::register(&rv_url, &rv_hash, rv_port, rv_ip, &rv_pubkey, &rv_secret)
                                     .await;
                             let _ = tx.send(RendezvousRegisterResult {
+                                generation,
                                 initial: true,
                                 result,
                             });
@@ -11455,6 +11769,8 @@ pub async fn start_network(
                         .is_some_and(|started| started.elapsed() > std::time::Duration::from_secs(60))
                 {
                     warn!("Rendezvous registration exceeded watchdog timeout; allowing retry");
+                    state.rendezvous_register_generation =
+                        state.rendezvous_register_generation.saturating_add(1);
                     rendezvous_register_in_flight = false;
                     rendezvous_register_started_at = None;
                 }
@@ -11477,11 +11793,15 @@ pub async fn start_network(
                             let tx = rendezvous_register_result_tx.clone();
                             rendezvous_register_in_flight = true;
                             rendezvous_register_started_at = Some(tokio::time::Instant::now());
+                            state.rendezvous_register_generation =
+                                state.rendezvous_register_generation.saturating_add(1);
+                            let generation = state.rendezvous_register_generation;
                             tokio::spawn(async move {
                                 let result =
                                     rendezvous::register(&rv_url, &rv_hash, rv_port, rv_ip, &rv_pubkey, &rv_secret)
                                         .await;
                                 let _ = tx.send(RendezvousRegisterResult {
+                                    generation,
                                     initial: false,
                                     result,
                                 });
@@ -11846,7 +12166,7 @@ pub async fn start_network(
                     let in_flight: HashSet<KadId> = state
                         .pending_note_publishes
                         .values()
-                        .map(|(h, _, _, _, _)| *h)
+                        .map(|pending| pending.file_hash)
                         .collect();
                     let due_note = round_robin_next(&state.published_notes, &mut state.notes_publish_cursor)
                         .filter(|hash| !in_flight.contains(hash))
@@ -11873,9 +12193,30 @@ pub async fn start_network(
                                 closest,
                             );
                             if sid != SearchId(0) {
-                                state
-                                    .pending_note_publishes
-                                    .insert(sid, (file_hash, rating, comment.clone(), file_name.clone(), file_size));
+                                let local_note_file = {
+                                    let index = local_index.read().await;
+                                    index.get_by_hash(&file_hash.to_hex()).cloned()
+                                };
+                                let message = build_publish_notes_message(
+                                    state.local_id,
+                                    file_hash,
+                                    local_note_file,
+                                    file_name.as_deref(),
+                                    file_size,
+                                    rating,
+                                    &comment,
+                                );
+                                state.pending_note_publishes.insert(
+                                    sid,
+                                    PendingNotePublish {
+                                        file_hash,
+                                        rating,
+                                        comment: comment.clone(),
+                                        file_name: file_name.clone(),
+                                        file_size,
+                                        message,
+                                    },
+                                );
                                 // `last_publish`/the DB row are updated once the
                                 // search actually completes and PublishNotesReq
                                 // packets go out (see the `sent > 0` branch in
@@ -12175,9 +12516,12 @@ pub async fn start_network(
                     if !nat_probe_in_flight {
                         nat_probe_in_flight = true;
                         nat_probe_started_at = Some(tokio::time::Instant::now());
+                        state.nat_probe_generation =
+                            state.nat_probe_generation.saturating_add(1);
                         nat_probe_packet_tx = Some(spawn_nat_probe(
                             udp_socket.clone(),
                             nat_probe_result_tx.clone(),
+                            state.nat_probe_generation,
                             "periodic reprobe",
                         ));
                     }
@@ -12230,9 +12574,8 @@ pub async fn start_network(
                     sm.cleanup_expired();
                 }
 
-                // Prune stale credit records (older than 90 days)
-                // and immediately flush the result to disk in the same
-                // critical section. L6: previously this only mutated
+                // Request a stale-credit prune/flush (older than 90 days).
+                // L6: previously this only mutated
                 // the in-memory map; the next `credit_save_timer` tick
                 // (up to 60 s away) was the only thing that wrote the
                 // pruned snapshot back. A crash inside that window
@@ -12240,9 +12583,26 @@ pub async fn start_network(
                 // rows, which got reloaded into memory on next start),
                 // and any operator who'd correlated metrics off the
                 // pruned in-memory count would see them re-appear. The
-                // periodic flush still runs; this just guarantees the
-                // disk catches up at the moment we mutated memory.
-                flush_credit_state(&credit_manager, &db, &state.data_dir, true).await;
+                // periodic flush still runs; serialized ownership prevents
+                // this request from overlapping an existing writer.
+                if credit_flush_handle.as_ref().is_some_and(|handle| handle.is_finished()) {
+                    if let Some(handle) = credit_flush_handle.take() {
+                        if let Err(e) = handle.await {
+                            warn!("Credit cleanup flush task failed: {e}");
+                        }
+                    }
+                }
+                if credit_flush_handle.is_none() {
+                    credit_flush_handle = Some(spawn_credit_flush(
+                        credit_manager.clone(),
+                        db.clone(),
+                        state.data_dir.clone(),
+                        true,
+                        credit_save_ownership.clone(),
+                    ));
+                } else {
+                    debug!("Deferring credit cleanup flush: a save is already in flight");
+                }
 
                 // Remove contacts not seen in 2 hours
                 let stale_removed = state.routing_table.remove_stale(7200);
@@ -14659,13 +15019,24 @@ pub async fn start_network(
             // Periodic credit save to database (with stale record cleanup)
             _ = credit_save_timer.tick() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
-                spawn_credit_flush(
-                    credit_manager.clone(),
-                    db.clone(),
-                    state.data_dir.clone(),
-                    true,
-                    credit_flush_in_flight.clone(),
-                );
+                if credit_flush_handle.as_ref().is_some_and(|handle| handle.is_finished()) {
+                    if let Some(handle) = credit_flush_handle.take() {
+                        if let Err(e) = handle.await {
+                            warn!("Periodic credit flush task failed: {e}");
+                        }
+                    }
+                }
+                if credit_flush_handle.is_none() {
+                    credit_flush_handle = Some(spawn_credit_flush(
+                        credit_manager.clone(),
+                        db.clone(),
+                        state.data_dir.clone(),
+                        true,
+                        credit_save_ownership.clone(),
+                    ));
+                } else {
+                    debug!("Skipping credit flush: previous flush is still in flight");
+                }
                 }).catch_unwind().await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'credit_save_timer' panicked: {}", describe_panic(&*__p));
@@ -16379,9 +16750,12 @@ pub async fn start_network(
                                         info!("External IP discovered via server HighID — scheduling initial NAT probe");
                                         nat_probe_in_flight = true;
                                         nat_probe_started_at = Some(tokio::time::Instant::now());
+                                        state.nat_probe_generation =
+                                            state.nat_probe_generation.saturating_add(1);
                                         nat_probe_packet_tx = Some(spawn_nat_probe(
                                             udp_socket.clone(),
                                             nat_probe_result_tx.clone(),
+                                            state.nat_probe_generation,
                                             "server HighID",
                                         ));
                                     }
@@ -17445,6 +17819,7 @@ pub async fn start_network(
             _ = nodes_save_timer.tick() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
                 if !nodes_save_in_flight {
+                    let ownership = state.nodes_save_lock.clone().lock_owned().await;
                     let contacts = state.routing_table.export_bootstrap_contacts(200);
                     let nodes_path = state.data_dir.join("nodes.dat");
                     let tx = periodic_save_result_tx.clone();
@@ -17452,6 +17827,7 @@ pub async fn start_network(
                     nodes_save_started_at = Some(tokio::time::Instant::now());
                     tokio::spawn(async move {
                         let result = tokio::task::spawn_blocking(move || {
+                            let _ownership = ownership;
                             bootstrap::save_nodes_dat(&nodes_path, &contacts)
                                 .map_err(|e| e.to_string())
                         })
@@ -17547,6 +17923,13 @@ pub async fn start_network(
 
             Some(result) = nat_probe_result_rx.recv() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
+                if result.generation != state.nat_probe_generation {
+                    debug!(
+                        "Ignoring stale NAT probe result generation {} (current {})",
+                        result.generation, state.nat_probe_generation
+                    );
+                    return;
+                }
                 nat_probe_in_flight = false;
                 nat_probe_started_at = None;
                 nat_probe_packet_tx = None;
@@ -17584,6 +17967,13 @@ pub async fn start_network(
 
             Some(result) = rendezvous_register_result_rx.recv() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
+                if result.generation != state.rendezvous_register_generation {
+                    debug!(
+                        "Ignoring stale rendezvous result generation {} (current {})",
+                        result.generation, state.rendezvous_register_generation
+                    );
+                    return;
+                }
                 rendezvous_register_in_flight = false;
                 rendezvous_register_started_at = None;
                 match result.result {
@@ -17847,11 +18237,16 @@ pub async fn start_network(
                     && known_met_save_started_at
                         .is_some_and(|started| started.elapsed() > std::time::Duration::from_secs(300))
                 {
-                    warn!("known.met save exceeded watchdog timeout; allowing next periodic retry");
-                    known_met_save_in_flight = false;
-                    known_met_save_started_at = None;
+                    warn!(
+                        "known.met save exceeded watchdog timeout; retaining serialized ownership and suppressing overlapping retries"
+                    );
                 }
                 if known_files.is_dirty() && !known_met_save_in_flight {
+                    let ownership = state
+                        .known_met_save_lock
+                        .clone()
+                        .lock_owned()
+                        .await;
                     let known_path = state.data_dir.join("known.met");
                     let generation = known_files.dirty_generation();
                     let mut snapshot = known_files.clone();
@@ -17860,6 +18255,7 @@ pub async fn start_network(
                     known_met_save_started_at = Some(tokio::time::Instant::now());
                     tokio::spawn(async move {
                         let result = tokio::task::spawn_blocking(move || {
+                            let _ownership = ownership;
                             snapshot.save(&known_path).map(|_| !snapshot.is_dirty())
                         })
                         .await
@@ -18337,21 +18733,19 @@ pub async fn start_network(
                     && now.saturating_sub(last_cache_refresh_started_at) > 20
                 {
                     warn!(
-                        "Watchdog: aborting stale cache refresh after {}s",
+                        "Watchdog: cache refresh still running after {}s; leaving it owned so the cache bundle cannot be partially applied by abort",
                         now.saturating_sub(last_cache_refresh_started_at)
                     );
-                    if let Some(handle) = cache_write_handle.take() {
-                        handle.abort();
-                    }
+                    last_cache_refresh_started_at = 0;
                 }
 
                 let timed_out = |started: Option<tokio::time::Instant>, limit: std::time::Duration| {
                     started.is_some_and(|started| started.elapsed() > limit)
                 };
                 if nodes_save_in_flight && timed_out(nodes_save_started_at, SHORT_IO_WATCHDOG) {
-                    warn!("Watchdog: nodes.dat save exceeded timeout; allowing next retry");
-                    nodes_save_in_flight = false;
-                    nodes_save_started_at = None;
+                    warn!(
+                        "Watchdog: nodes.dat save exceeded timeout; suppressing overlapping retry until serialized writer finishes"
+                    );
                 }
                 if spam_save_in_flight && timed_out(spam_save_started_at, SHORT_IO_WATCHDOG) {
                     warn!("Watchdog: spam-filter save exceeded timeout; allowing next retry");
@@ -18384,6 +18778,8 @@ pub async fn start_network(
                 }
                 if nat_probe_in_flight && timed_out(nat_probe_started_at, NAT_PROBE_WATCHDOG) {
                     warn!("Watchdog: NAT probe exceeded timeout; allowing next retry");
+                    state.nat_probe_generation =
+                        state.nat_probe_generation.saturating_add(1);
                     nat_probe_in_flight = false;
                     nat_probe_started_at = None;
                     nat_probe_packet_tx = None;
@@ -18813,7 +19209,6 @@ pub async fn start_network(
                         }
                         snap
                     };
-                    *s_files.write().await = file_snap;
                     // Do the expensive hex/distance conversions here, off the event loop
                     let mut peers: Vec<PeerInfo> = Vec::new();
                     let mut cached_c: Vec<KadContactInfo> = Vec::new();
@@ -18865,6 +19260,11 @@ pub async fn start_network(
                     *s_srv.write().await = cached_srv;
                     *s_conn.write().await = cached_conn_srv;
                     *s_tstats.write().await = cached_tstats;
+                    // Apply the file snapshot last, after every expensive/fallible
+                    // preparation step. The watchdog never aborts this task, so
+                    // a refresh cannot leave only the leading subset of this
+                    // cache bundle updated.
+                    *s_files.write().await = file_snap;
                 }));
                 }).catch_unwind().await;
                 if let Err(__p) = __panic_result {
@@ -19011,8 +19411,20 @@ pub async fn start_network(
     }
     let contacts = state.routing_table.export_bootstrap_contacts(200);
     let nodes_path = state.data_dir.join("nodes.dat");
-    if let Err(e) = bootstrap::save_nodes_dat(&nodes_path, &contacts) {
-        error!("Failed to save nodes.dat: {e}");
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        state.nodes_save_lock.lock(),
+    )
+    .await
+    {
+        Ok(_ownership) => {
+            if let Err(e) = bootstrap::save_nodes_dat(&nodes_path, &contacts) {
+                error!("Failed to save nodes.dat: {e}");
+            }
+        }
+        Err(_) => {
+            warn!("Final nodes.dat save skipped: serialized periodic writer still owns the file")
+        }
     }
 
     stats_manager.save_cumulative(&db);
@@ -19086,8 +19498,20 @@ pub async fn start_network(
     }
 
     let known_path = state.data_dir.join("known.met");
-    if let Err(e) = known_files.save(&known_path) {
-        error!("Failed to save known.met on shutdown: {e}");
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        state.known_met_save_lock.lock(),
+    )
+    .await
+    {
+        Ok(_ownership) => {
+            if let Err(e) = known_files.save(&known_path) {
+                error!("Failed to save known.met on shutdown: {e}");
+            }
+        }
+        Err(_) => warn!(
+            "Final known.met save skipped: serialized periodic writer still owns the file; refusing a racing overwrite"
+        ),
     }
     // Drain remaining AICH sets, but honour the same cap as the
     // periodic timer — we don't want shutdown to be the one place
@@ -19118,26 +19542,34 @@ pub async fn start_network(
             );
         }
     }
-    let wait_for_credit_flush = async {
-        while credit_flush_in_flight.load(std::sync::atomic::Ordering::Acquire) {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    };
-    if tokio::time::timeout(std::time::Duration::from_secs(5), wait_for_credit_flush)
-        .await
-        .is_err()
-    {
-        warn!("Timed out waiting for the periodic credit flush during shutdown");
-    } else {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(8),
-            flush_credit_state(&credit_manager, &db, &state.data_dir, true),
-        )
-        .await
+    if let Some(mut handle) = credit_flush_handle.take() {
+        if tokio::time::timeout(std::time::Duration::from_secs(5), &mut handle)
+            .await
+            .is_err()
         {
-            Ok(()) => info!("Credit state saved on shutdown"),
-            Err(_) => warn!("Credit state save timed out during shutdown"),
+            warn!(
+                "Periodic credit flush still running at shutdown; aborting its async owner and retrying the final flush through serialized save ownership"
+            );
+            handle.abort();
+            let _ = handle.await;
         }
+    }
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        flush_credit_state(
+            &credit_manager,
+            &db,
+            &state.data_dir,
+            true,
+            &credit_save_ownership,
+        ),
+    )
+    .await
+    {
+        Ok(()) => info!("Credit state saved on shutdown"),
+        Err(_) => warn!(
+            "Final credit flush could not acquire/finish serialized save ownership within shutdown timeout"
+        ),
     }
 
     let rep_path = state.data_dir.join("reputation.json");
@@ -19928,6 +20360,12 @@ async fn handle_ember_native_udp_inner(
             }
         }
         Some(EmberControlMessage::ExchangeData { payload }) => {
+            if !state.ember_transport.peer_is_ik_authenticated(&from) {
+                debug!(
+                    "ember-udp: refusing EPX ExchangeData from unauthenticated XX session {from}"
+                );
+                return;
+            }
             state.ember_diagnostics.ember_exchange_received = state
                 .ember_diagnostics
                 .ember_exchange_received
@@ -21393,12 +21831,26 @@ async fn handle_udp_packet_inner(
                     let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                     if state.flood_protection.check_outgoing_rate(addr.ip()) {
                         debug!("Throttling reactive search packet to {addr}");
+                        if let Some(search) = state.search_manager.get_mut(&sid) {
+                            search.rollback_unsent_query(contact.id, &msg);
+                        }
                         continue;
                     }
                     if let Ok(packet) = messages::encode_packet(&msg) {
                         let opcode = packet.get(1).copied().unwrap_or(0);
-                        state.flood_protection.track_request(addr, opcode);
-                        let _ = send_kad_packet(socket, &packet, addr, state, &contact.id).await;
+                        if send_kad_packet(socket, &packet, addr, state, &contact.id)
+                            .await
+                            .is_ok()
+                        {
+                            if let Some(search) = state.search_manager.get_mut(&sid) {
+                                search.commit_query_sent(contact.id, addr);
+                            }
+                            state.flood_protection.track_request(addr, opcode);
+                        } else if let Some(search) = state.search_manager.get_mut(&sid) {
+                            search.rollback_unsent_query(contact.id, &msg);
+                        }
+                    } else if let Some(search) = state.search_manager.get_mut(&sid) {
+                        search.rollback_unsent_query(contact.id, &msg);
                     }
                 }
             }
@@ -21630,7 +22082,7 @@ async fn handle_udp_packet_inner(
                             state
                                 .pending_note_publishes
                                 .iter()
-                                .find(|(_, (file_hash, ..))| *file_hash == publish_file_hash)
+                                .find(|(_, pending)| pending.file_hash == publish_file_hash)
                                 .map(|(sid, _)| *sid)
                         })
                 };
@@ -23778,13 +24230,21 @@ async fn handle_command_inner(
             file_size,
             rating,
             comment,
+            tx,
         } => {
+            if state.stats.status == NetworkStatus::Disconnected {
+                let _ = tx.send(Err("KAD is disconnected".to_string()));
+                return;
+            }
             let closest = state
                 .routing_table
                 .find_closest_prefer_verified(&file_hash, SEARCH_INITIAL_CONTACTS);
 
             if closest.is_empty() {
                 debug!("No contacts to publish note to");
+                let _ = tx.send(Err(
+                    "No live KAD contacts available to publish note".to_string()
+                ));
                 return;
             }
 
@@ -23793,16 +24253,33 @@ async fn handle_command_inner(
                 .start_search(file_hash, SearchType::StoreNotes, closest);
             if sid == SearchId(0) {
                 debug!("Failed to start StoreNotes search: too many active searches");
+                let _ = tx.send(Err(
+                    "KAD publish capacity is busy; retry shortly".to_string()
+                ));
             } else {
+                let local_note_file = {
+                    let index = local_index.read().await;
+                    index.get_by_hash(&file_hash.to_hex()).cloned()
+                };
+                let message = build_publish_notes_message(
+                    state.local_id,
+                    file_hash,
+                    local_note_file,
+                    file_name.as_deref(),
+                    file_size,
+                    rating,
+                    &comment,
+                );
                 state.pending_note_publishes.insert(
                     sid,
-                    (
+                    PendingNotePublish {
                         file_hash,
                         rating,
-                        comment.clone(),
-                        file_name.clone(),
+                        comment: comment.clone(),
+                        file_name: file_name.clone(),
                         file_size,
-                    ),
+                        message,
+                    },
                 );
                 info!(
                     "Started StoreNotes search {} for file {} (rating={}, comment_len={})",
@@ -23844,6 +24321,7 @@ async fn handle_command_inner(
                         warn!("Failed to persist published note for republish: {e}");
                     }
                 }
+                let _ = tx.send(Ok(()));
             }
         }
 
@@ -24617,13 +25095,25 @@ async fn handle_command_inner(
             // Save routing table before clearing (eMule saves on Stop)
             let contacts = state.routing_table.export_bootstrap_contacts(200);
             let nodes_path = state.data_dir.join("nodes.dat");
-            if let Err(e) = bootstrap::save_nodes_dat(&nodes_path, &contacts) {
-                error!("Failed to save nodes.dat on disconnect: {e}");
-            } else {
-                info!(
-                    "Saved {} contacts to nodes.dat on disconnect",
-                    contacts.len()
-                );
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                state.nodes_save_lock.lock(),
+            )
+            .await
+            {
+                Ok(_ownership) => {
+                    if let Err(e) = bootstrap::save_nodes_dat(&nodes_path, &contacts) {
+                        error!("Failed to save nodes.dat on disconnect: {e}");
+                    } else {
+                        info!(
+                            "Saved {} contacts to nodes.dat on disconnect",
+                            contacts.len()
+                        );
+                    }
+                }
+                Err(_) => warn!(
+                    "Skipped disconnect nodes.dat checkpoint because the serialized periodic writer did not finish"
+                ),
             }
 
             // Stop all searches and cancel pending oneshot channels
@@ -24680,6 +25170,9 @@ async fn handle_command_inner(
             state.friend_presence_initial_done = false;
             state.friend_search_initial_done = false;
             state.friend_search_started_at = None;
+            state.rendezvous_register_generation =
+                state.rendezvous_register_generation.saturating_add(1);
+            state.nat_probe_generation = state.nat_probe_generation.saturating_add(1);
             state.rendezvous_registered = false;
             state.rendezvous_last_register = None;
             if rendezvous_was_registered {
@@ -25263,49 +25756,6 @@ async fn handle_command_inner(
             let _ = tx.send(connected_server_info(state));
         }
 
-        NetworkCommand::SetUploadPriority {
-            file_hash_hex,
-            priority,
-        } => {
-            // Push a priority change from the UI directly into the
-            // in-memory `KnownFileList` so the upload server's
-            // per-request priority lookup sees it without waiting for
-            // a reload. Without this hook the new priority sat in the
-            // search index but the upload handler — which reads
-            // `KnownFileRecord::upload_priority` — kept using the
-            // stale value until the next process restart.
-            match hex::decode(&file_hash_hex) {
-                Ok(hash_bytes) if hash_bytes.len() == 16 => {
-                    let mut fh = [0u8; 16];
-                    fh.copy_from_slice(&hash_bytes);
-                    if let Some(record) = known_files.find_by_hash_mut(&fh) {
-                        record.upload_priority = priority;
-                        known_files.mark_dirty();
-                        debug!(
-                            "Updated upload_priority={priority} for {file_hash_hex} in known.met"
-                        );
-                    } else {
-                        // `SetUploadPriority` is a fire-and-forget `try_send`
-                        // from the UI with no ack, so this is the only
-                        // signal that a priority change silently didn't
-                        // take effect (e.g. a race with the file not yet
-                        // being registered in `known_files`).
-                        warn!(
-                            "SetUploadPriority: no known_files record for hash {file_hash_hex}; priority={priority} not applied"
-                        );
-                    }
-                }
-                Ok(hash_bytes) => {
-                    warn!(
-                        "SetUploadPriority: hash {file_hash_hex} has {} bytes, expected 16; ignoring",
-                        hash_bytes.len()
-                    );
-                }
-                Err(e) => {
-                    warn!("SetUploadPriority: invalid hex hash {file_hash_hex}: {e}");
-                }
-            }
-        }
         NetworkCommand::SetUploadPriorities {
             file_hashes,
             priority,
@@ -25329,47 +25779,50 @@ async fn handle_command_inner(
             }
         }
 
-        NetworkCommand::SetFileShared {
-            file_hash_hex,
-            shared,
-        } => {
-            // Same rationale as `SetUploadPriority` above: push the toggle
-            // straight into `known.met` so the file's shared state survives
-            // a restart instead of silently reverting to shared=true the
-            // next time this path is rediscovered.
-            match hex::decode(&file_hash_hex) {
-                Ok(hash_bytes) if hash_bytes.len() == 16 => {
-                    let mut fh = [0u8; 16];
-                    fh.copy_from_slice(&hash_bytes);
-                    if let Some(record) = known_files.find_by_hash_mut(&fh) {
-                        record.is_shared = shared;
-                        known_files.mark_dirty();
-                        debug!("Updated is_shared={shared} for {file_hash_hex} in known.met");
-                    } else {
-                        // Fire-and-forget `try_send` with no ack, same as
-                        // `SetUploadPriority` — this is the only signal that
-                        // the toggle didn't take effect (e.g. a race with the
-                        // file not yet registered in `known_files`). The next
-                        // `SharedFilesChanged` will create the record from the
-                        // live `LocalIndex` flag, so it isn't lost, just delayed.
-                        warn!(
-                            "SetFileShared: no known_files record for hash {file_hash_hex}; shared={shared} not yet persisted"
-                        );
+        NetworkCommand::SetFilesShared { updates, tx } => {
+            let mut parsed = Vec::with_capacity(updates.len());
+            let mut error = None;
+            for (file_hash_hex, shared) in updates {
+                match hex::decode(&file_hash_hex) {
+                    Ok(bytes) if bytes.len() == 16 => {
+                        let mut hash = [0u8; 16];
+                        hash.copy_from_slice(&bytes);
+                        if known_files.find_by_hash(&hash).is_none() {
+                            error =
+                                Some(format!("No known.met record for file hash {file_hash_hex}"));
+                            break;
+                        }
+                        parsed.push((hash, shared));
+                    }
+                    Ok(bytes) => {
+                        error = Some(format!(
+                            "File hash {file_hash_hex} has {} bytes, expected 16",
+                            bytes.len()
+                        ));
+                        break;
+                    }
+                    Err(e) => {
+                        error = Some(format!("Invalid file hash {file_hash_hex}: {e}"));
+                        break;
                     }
                 }
-                Ok(hash_bytes) => {
-                    warn!(
-                        "SetFileShared: hash {file_hash_hex} has {} bytes, expected 16; ignoring",
-                        hash_bytes.len()
-                    );
-                }
-                Err(e) => {
-                    warn!("SetFileShared: invalid hex hash {file_hash_hex}: {e}");
+            }
+            if let Some(error) = error {
+                let _ = tx.send(Err(error));
+                return;
+            }
+            for (hash, shared) in &parsed {
+                if let Some(record) = known_files.find_by_hash_mut(hash) {
+                    record.is_shared = *shared;
                 }
             }
+            if !parsed.is_empty() {
+                known_files.mark_dirty();
+            }
+            let _ = tx.send(Ok(parsed.len()));
         }
 
-        NetworkCommand::SharedFilesChanged => {
+        NetworkCommand::SharedFilesChangedAck { tx: reconcile_ack } => {
             let all_index_files = {
                 let index = local_index.read().await;
                 index.all_files().to_vec()
@@ -25689,6 +26142,7 @@ async fn handle_command_inner(
                     }
                 }
             }
+            let _ = reconcile_ack.send(Ok(()));
         }
 
         NetworkCommand::SetFileComment {

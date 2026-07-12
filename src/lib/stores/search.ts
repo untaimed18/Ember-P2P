@@ -89,8 +89,11 @@ function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResu
     source_addresses: mergedAddresses,
     rating: incoming.rating ?? existing.rating,
     comment: incoming.comment ?? existing.comment,
-    spam_rating: incoming.spam_rating ?? existing.spam_rating,
-    is_spam: incoming.is_spam,
+    // Search channels can disagree or report partial spam evaluation. Treat a
+    // positive classification and the highest observed score conservatively;
+    // a later unflagged hit must not erase an earlier warning for the same file.
+    spam_rating: Math.max(existing.spam_rating ?? 0, incoming.spam_rating ?? 0),
+    is_spam: existing.is_spam || incoming.is_spam,
     clean_name: incoming.clean_name || existing.clean_name,
     result_origin: combineOrigin(existing.result_origin || '', incoming.result_origin || ''),
   };

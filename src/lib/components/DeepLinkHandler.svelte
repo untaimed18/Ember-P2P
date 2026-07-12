@@ -33,7 +33,7 @@
   function isAllowedServerListUrl(value: string): boolean {
     try {
       const url = new URL(value);
-      return url.protocol === 'https:' || url.protocol === 'http:';
+      return url.protocol === 'https:';
     } catch {
       return false;
     }
@@ -75,7 +75,9 @@
         const segs = ed2kSegments(payload); // ['serverlist', url]
         const url = segs[1] ?? '';
         if (!isAllowedServerListUrl(url)) {
-          toastError(translateError(undefined));
+          // Match the backend's pinned-fetch policy: never silently turn an
+          // OS-delivered deep link into an insecure HTTP server-list request.
+          toastError(m.security_url_must_be_https());
           return;
         }
         const msg = await downloadServerMet(url);

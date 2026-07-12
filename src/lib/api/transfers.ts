@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import * as m from '$lib/paraglide/messages';
 import type {
   Transfer,
   SourceInfo,
@@ -24,6 +25,11 @@ export async function startDownload(
    */
   extraSources?: string[]
 ): Promise<StartDownloadResponse> {
+  // A source address identifies a peer, not the file. Never let a source-bearing
+  // result bypass the mandatory content hash used to identify and verify it.
+  if (!fileHash?.trim()) {
+    throw new Error(m.error_transfers_invalid_file_hash());
+  }
   return invoke('start_download', {
     fileHash,
     fileName,

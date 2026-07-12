@@ -739,7 +739,7 @@
       case 'hashing': return m.transfer_status_hashing();
       case 'insufficient': return m.transfer_status_insufficient();
       case 'noneneeded': return m.transfer_status_noneneeded();
-      default: return t.status;
+      default: return m.common_unknown();
     }
   }
 
@@ -1350,12 +1350,17 @@
       (a) => a && a !== 'local'
     );
 
+    if (!result.file.hash?.trim()) {
+      addToast('error', m.error_transfers_invalid_file_hash());
+      return;
+    }
+
     if (networkAddresses.length === 0 && result.result_origin?.includes('Local')) {
       addToast('info', m.search_already_in_library());
       return;
     }
 
-    if (networkAddresses.length === 0 && !result.file.hash) {
+    if (networkAddresses.length === 0) {
       addToast('error', m.search_no_sources());
       return;
     }
@@ -1617,11 +1622,16 @@
         if (idx >= toDownload.length) return;
         const result = toDownload[idx];
         const networkAddrs = (result.source_addresses ?? []).filter((a) => a && a !== 'local');
+        if (!result.file.hash?.trim()) {
+          failed++;
+          failures.push(`${result.file.name}: ${m.error_transfers_invalid_file_hash()}`);
+          continue;
+        }
         if (networkAddrs.length === 0 && result.result_origin?.includes('Local')) {
           skippedLocal++;
           continue;
         }
-        if (networkAddrs.length === 0 && !result.file.hash) {
+        if (networkAddrs.length === 0) {
           failed++;
           failures.push(m.search_bulk_no_sources({ name: result.file.name }));
           continue;
@@ -2200,7 +2210,7 @@
               <div class="name-cell-wrap">
                 <button class="ghost link-btn" onclick={() => showFileDetails(result)}>{result.clean_name || result.file.name}</button>
                 {#if dlTransfer}
-                  <span class="dl-status-badge {dlBadgeClass(dlTransfer)}" title="{dlTransfer.status}: {dlTransfer.file_name}">
+                  <span class="dl-status-badge {dlBadgeClass(dlTransfer)}" title="{dlBadgeLabel(dlTransfer)}: {dlTransfer.file_name}">
                     {dlBadgeLabel(dlTransfer)}
                   </span>
                 {/if}

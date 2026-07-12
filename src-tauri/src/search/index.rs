@@ -19,7 +19,13 @@ pub struct LocalIndex {
 #[inline]
 pub(crate) fn normalize_path_key(path: &str) -> String {
     if cfg!(windows) {
-        path.to_lowercase()
+        let normalized = path.replace('/', "\\");
+        let normalized = normalized
+            .strip_prefix(r"\\?\UNC\")
+            .map(|rest| format!(r"\\{rest}"))
+            .or_else(|| normalized.strip_prefix(r"\\?\").map(str::to_string))
+            .unwrap_or(normalized);
+        normalized.to_lowercase()
     } else {
         path.to_string()
     }
@@ -631,5 +637,26 @@ pub fn infer_file_type(extension: &str) -> String {
         "emulecollection" => "EmuleCollection".into(),
 
         _ => String::new(),
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::normalize_path_key;
+
+    #[test]
+    fn windows_path_keys_collapse_separator_and_case_aliases() {
+        assert_eq!(
+            normalize_path_key(r"C:\Downloads\Video.mkv"),
+            normalize_path_key("c:/downloads/video.mkv"),
+        );
+    }
+
+    #[test]
+    fn windows_path_keys_collapse_extended_path_prefix() {
+        assert_eq!(
+            normalize_path_key(r"\\?\C:\Downloads\Video.mkv"),
+            normalize_path_key(r"C:\Downloads\Video.mkv"),
+        );
     }
 }

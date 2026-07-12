@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use tauri::Emitter;
@@ -546,7 +546,7 @@ pub async fn cancel_transfers_batch(
     check_batch_size(&transfer_ids)?;
     let mut promoted_by_id: HashMap<String, Transfer> = HashMap::new();
     let mut pending_acks = Vec::with_capacity(transfer_ids.len());
-    let mut cleanup_ids = Vec::with_capacity(transfer_ids.len());
+    let mut teardown_failures = 0usize;
     for transfer_id in transfer_ids {
         let (promoted, cancelled_info) = {
             let mut manager = state.transfer_manager.write().await;
@@ -574,39 +574,46 @@ pub async fn cancel_transfers_batch(
             transfer_id: transfer_id.clone(),
             cleanup_ack: Some(ack_tx),
         }) {
-            // Network task is gone: nothing will release the download's file
-            // handle. We still clean up so the partial doesn't leak, but log it
-            // — silently dropping this hid that the delete below runs without a
-            // teardown handshake.
             tracing::warn!(
-                "cancel_transfers_batch: network task unavailable for {transfer_id}; deleting partial without teardown ack ({e})"
+                "cancel_transfers_batch: network task unavailable for {transfer_id}; retaining partial and DB row without teardown ack ({e})"
             );
+            teardown_failures += 1;
         } else {
             pending_acks.push((transfer_id.clone(), ack_rx));
         }
-        cleanup_ids.push(transfer_id);
     }
 
-    // Wait for every teardown concurrently under one global deadline. The old
-    // per-item timeout made a 500-row batch wait up to ~83 minutes.
-    let waits = futures::future::join_all(
-        pending_acks
-            .into_iter()
-            .map(|(transfer_id, ack_rx)| async move { (transfer_id, ack_rx.await) }),
-    );
-    match tokio::time::timeout(CMD_REPLY_TIMEOUT, waits).await {
-        Ok(results) => {
-            for (transfer_id, result) in results {
-                if result.is_err() {
-                    tracing::warn!(
-                        "cancel_transfers_batch: cleanup ack channel closed for {transfer_id}"
-                    );
-                }
+    // Every timeout starts concurrently, preserving one global wall-clock
+    // deadline while still retaining the identities of acks that arrived
+    // before other items timed out.
+    let results = futures::future::join_all(pending_acks.into_iter().map(
+        |(transfer_id, ack_rx)| async move {
+            (
+                transfer_id,
+                tokio::time::timeout(CMD_REPLY_TIMEOUT, ack_rx).await,
+            )
+        },
+    ))
+    .await;
+    let mut cleanup_ids = HashSet::new();
+    for (transfer_id, result) in results {
+        match result {
+            Ok(Ok(())) => {
+                cleanup_ids.insert(transfer_id);
+            }
+            Ok(Err(_)) => {
+                teardown_failures += 1;
+                tracing::warn!(
+                    "cancel_transfers_batch: cleanup ack channel closed for {transfer_id}; retaining partial and DB row"
+                );
+            }
+            Err(_) => {
+                teardown_failures += 1;
+                tracing::warn!(
+                    "cancel_transfers_batch: cleanup ack timed out for {transfer_id}; retaining partial and DB row"
+                );
             }
         }
-        Err(_) => tracing::warn!(
-            "cancel_transfers_batch: one or more cleanup acks timed out; partial deletion may race a slow teardown"
-        ),
     }
 
     for transfer_id in cleanup_ids {
@@ -626,7 +633,15 @@ pub async fn cancel_transfers_batch(
     }
     let promoted: Vec<Transfer> = promoted_by_id.into_values().collect();
     start_promoted_downloads(&state, &promoted).await;
-    Ok(())
+    if teardown_failures == 0 {
+        Ok(())
+    } else {
+        Err(coded_ctx(
+            "transfers_batch_cleanup_incomplete",
+            "Some transfers were cancelled but their partial files were retained because teardown was not acknowledged",
+            teardown_failures,
+        ))
+    }
 }
 
 #[tauri::command]
