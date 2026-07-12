@@ -21,6 +21,7 @@
     getLocale,
     setLocale,
     languageLabel,
+    localeFlagSrc,
     hasExplicitLocale,
     useSystemLocale,
     systemLocale,
@@ -1133,6 +1134,14 @@
                     (value) => value === 'system' ? pickSystemLocale() : pickLocale(value as Locale),
                   )}
               >
+                <span class="behavior-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="12" cy="12" r="9" />
+                    <path d="M3 12h18" />
+                    <path d="M12 3a14 14 0 0 1 0 18" />
+                    <path d="M12 3a14 14 0 0 0 0 18" />
+                  </svg>
+                </span>
                 <span class="behavior-title">{m.settings_language_system()}</span>
                 <span class="behavior-desc">{languageLabel(systemPreviewLocale)}</span>
                 {#if followingSystem}<span class="behavior-check" aria-hidden="true">&#10003;</span>{/if}
@@ -1155,6 +1164,11 @@
                       (value) => value === 'system' ? pickSystemLocale() : pickLocale(value as Locale),
                     )}
                 >
+                  {#if localeFlagSrc(loc)}
+                    <span class="behavior-icon lang-flag-icon" aria-hidden="true">
+                      <img class="lang-flag" src={localeFlagSrc(loc)} alt="" />
+                    </span>
+                  {/if}
                   <span class="behavior-title">{languageLabel(loc)}</span>
                   <span class="behavior-desc">{loc.toUpperCase()}</span>
                   {#if !followingSystem && currentLocale === loc}<span class="behavior-check" aria-hidden="true">&#10003;</span>{/if}
@@ -2677,6 +2691,26 @@
   .behavior-card.selected .behavior-icon {
     background: var(--accent);
     color: var(--on-accent);
+  }
+
+  /* Language picker: keep the circle plate, but let the flag fill it
+     without the selected-state color wash tinting the SVG. */
+  .lang-flag-icon {
+    padding: 0;
+    overflow: hidden;
+    background: transparent;
+  }
+
+  .behavior-card.selected .lang-flag-icon {
+    background: transparent;
+  }
+
+  .lang-flag {
+    width: 100%;
+    height: 100%;
+    display: block;
+    object-fit: cover;
+    border-radius: inherit;
   }
 
   .behavior-title {

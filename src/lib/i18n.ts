@@ -127,6 +127,32 @@ export function languageLabel(locale: Locale): string {
 }
 
 /**
+ * Representative country flag for a UI locale, using the same
+ * `/flags/*.svg` circle-flags assets as Transfers. Languages aren't
+ * countries — this is a recognition aid for the Settings picker only.
+ * Returns null when no sensible mapping exists.
+ */
+export function localeFlagSrc(locale: Locale): string | null {
+  const code = (() => {
+    switch (locale) {
+      case 'en':
+        return 'us';
+      case 'es':
+        return 'es';
+      case 'fr':
+        return 'fr';
+      case 'pt-BR':
+        return 'br';
+      case 'de':
+        return 'de';
+      default:
+        return null;
+    }
+  })();
+  return code ? `/flags/${code}.svg` : null;
+}
+
+/**
  * Coded-error envelope emitted by the Rust command layer
  * (`src-tauri/src/commands/errors.rs`). The `__coded` sentinel
  * disambiguates our envelopes from arbitrary error strings that
