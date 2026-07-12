@@ -982,6 +982,7 @@ pub fn run() {
             commands::settings::show_main_window,
             commands::settings::quit_app,
             commands::settings::set_close_behavior,
+            commands::settings::open_ember_website,
             commands::security::get_ip_filter_stats,
             commands::security::add_ip_filter_range,
             commands::security::remove_ip_filter_range,

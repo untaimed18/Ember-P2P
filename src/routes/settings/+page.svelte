@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { getSettings, updateSettings, downloadNodesDat, downloadIpfilter } from '$lib/api/settings';
+  import { getSettings, updateSettings, downloadNodesDat, downloadIpfilter, openEmberWebsite } from '$lib/api/settings';
   import { setAppSettings } from '$lib/stores/settings';
   import { getSpamStats, resetSpamFilter, clearDownloadHistory, getDownloadHistoryStats } from '$lib/api/search';
   import {
@@ -40,6 +40,16 @@
       ? Math.min(100, Math.round(($updater.downloaded / $updater.total) * 100))
       : null,
   );
+  let websiteOpenError = $state('');
+
+  async function openWebsite() {
+    websiteOpenError = '';
+    try {
+      await openEmberWebsite();
+    } catch (e) {
+      websiteOpenError = translateError(e);
+    }
+  }
 
   // Active locale, kept in component state so the radio group has
   // a reactive `selected` source. Updating this state goes through
@@ -1864,6 +1874,19 @@
           <div class="field">
             <span class="field-label">{m.settings_about_version_label()}</span>
             <p class="about-value">Ember {appVersion}</p>
+          </div>
+
+          <div class="field">
+            <span class="field-label">{m.settings_about_website_label()}</span>
+            <span class="hint">{m.settings_about_website_hint()}</span>
+            <div class="action-row">
+              <button class="action-btn" onclick={() => void openWebsite()}>
+                {m.settings_about_website_btn()}
+              </button>
+            </div>
+            {#if websiteOpenError}
+              <span class="feedback error">{websiteOpenError}</span>
+            {/if}
           </div>
 
           <div class="divider"></div>

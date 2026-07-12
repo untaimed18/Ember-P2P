@@ -1,5 +1,7 @@
 <script lang="ts">
   import * as m from '$lib/paraglide/messages';
+  import { openEmberWebsite } from '$lib/api/settings';
+  import { translateError } from '$lib/i18n';
   const appVersion = import.meta.env.VITE_APP_VERSION;
   const license = import.meta.env.VITE_APP_LICENSE;
   // Description used to come from the package.json `description`
@@ -20,9 +22,20 @@
   // Element focused before the dialog opened, restored on close.
   let returnFocusEl: HTMLElement | null = null;
   const instanceId = Math.random().toString(36).slice(2, 10);
+  let websiteError = $state('');
 
   function close() {
     open = false;
+    websiteError = '';
+  }
+
+  async function openWebsite() {
+    websiteError = '';
+    try {
+      await openEmberWebsite();
+    } catch (e) {
+      websiteError = translateError(e);
+    }
   }
 
   function handleKeydown(e: KeyboardEvent) {
@@ -53,7 +66,8 @@
       const active = typeof document !== 'undefined' ? document.activeElement : null;
       if (active instanceof HTMLElement && active !== document.body) returnFocusEl = active;
       requestAnimationFrame(() => {
-        panelEl?.querySelector<HTMLButtonElement>('button')?.focus();
+        const closeBtn = panelEl?.querySelector<HTMLButtonElement>('button.about-close');
+        (closeBtn ?? panelEl?.querySelector<HTMLButtonElement>('button'))?.focus();
       });
     }
     return () => {
@@ -106,8 +120,14 @@
       <p id="about-desc-{instanceId}" class="about-version">{m.about_dialog_version({ version: appVersion })}</p>
       <p class="about-description">{m.about_dialog_description()}</p>
       <p class="about-license">{m.about_dialog_license({ license })}</p>
+      {#if websiteError}
+        <p class="about-website-error" role="alert">{websiteError}</p>
+      {/if}
 
       <div class="about-actions">
+        <button type="button" class="about-website" onclick={() => void openWebsite()}>
+          {m.about_dialog_website()}
+        </button>
         <button type="button" class="about-close" onclick={close}>{m.common_close()}</button>
       </div>
     </div>
@@ -196,9 +216,39 @@
     margin: 0 0 18px;
   }
 
+  .about-website-error {
+    color: var(--danger);
+    font-size: 12px;
+    margin: -10px 0 14px;
+  }
+
   .about-actions {
     display: flex;
-    justify-content: flex-end;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .about-website {
+    padding: 8px 4px;
+    font-size: 13px;
+    font-weight: 600;
+    border: none;
+    background: transparent;
+    color: var(--accent);
+    cursor: pointer;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+
+  .about-website:hover {
+    filter: brightness(1.08);
+  }
+
+  .about-website:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
   }
 
   .about-close {
