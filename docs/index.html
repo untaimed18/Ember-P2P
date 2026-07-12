@@ -547,6 +547,102 @@
     .site-footer a:hover { color: var(--text-primary); }
     .footer-links { display: flex; gap: 20px; }
 
+    /* ---- RELEASE HISTORY (GitHub-style notes) ---- */
+    .release {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 22px 24px 18px;
+      margin: 20px 0 28px;
+      box-shadow: var(--shadow-sm);
+    }
+    .release-header {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 8px 16px;
+      margin-bottom: 4px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    .release h3 {
+      margin: 0;
+      font-size: 20px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .release h3 a {
+      color: var(--text-primary);
+    }
+    .release h3 a:hover {
+      color: var(--accent);
+    }
+    .release-badge {
+      display: inline-block;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.6px;
+      text-transform: uppercase;
+      color: var(--accent);
+      background: var(--accent-dim);
+      padding: 3px 8px;
+      border-radius: 999px;
+    }
+    .release-badge.upcoming {
+      color: var(--warning);
+      background: rgba(234, 134, 0, 0.12);
+    }
+    .release-date {
+      font-size: 13px;
+      color: var(--text-muted);
+      font-weight: 500;
+    }
+    .release-tag {
+      font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+      font-size: 12.5px;
+      color: var(--text-muted);
+      margin: 10px 0 16px;
+    }
+    .release-tag a {
+      color: var(--text-secondary);
+    }
+    .release-notes h4 {
+      margin: 20px 0 8px;
+      font-size: 16px;
+      font-weight: 700;
+      color: var(--text-primary);
+      border: none;
+      padding: 0;
+    }
+    .release-notes h5 {
+      margin: 14px 0 6px;
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+    .release-notes ul {
+      margin: 0 0 8px 22px;
+    }
+    .release-notes li {
+      margin-bottom: 4px;
+      color: var(--text-secondary);
+      font-size: 14px;
+    }
+    .release-notes .full-changelog {
+      margin: 18px 0 4px;
+      padding-top: 14px;
+      border-top: 1px solid var(--border);
+      font-size: 13.5px;
+    }
+    .release-notes .full-changelog strong {
+      display: block;
+      margin-bottom: 4px;
+      color: var(--text-primary);
+    }
+
     /* ---- RESPONSIVE ---- */
     @media (max-width: 960px) {
       .sidebar {
@@ -604,6 +700,7 @@
     <nav class="header-nav">
       <a href="#highlights">Features</a>
       <a href="#download">Download</a>
+      <a href="#releases">Releases</a>
       <a href="#epx">EPX</a>
       <a href="#faq">FAQ</a>
       <a href="https://github.com/untaimed18/Ember-P2P" target="_blank" rel="noopener" class="gh-link">
@@ -660,6 +757,7 @@
   <div class="toc-section">
     <span class="toc-heading">Support</span>
     <a href="#faq" class="toc-link">FAQ</a>
+    <a href="#releases" class="toc-link">Release History</a>
     <a href="#support" class="toc-link">Report an Issue</a>
   </div>
 
@@ -1199,6 +1297,178 @@ npm run tauri build</code></pre>
 
   <hr>
 
+  <!-- Release History -->
+  <section id="releases">
+    <h2>Release History</h2>
+    <p>Official Ember releases for Windows. Notes mirror the <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">GitHub Releases</a> changelog style. Ember can also update itself in-app when a signed release is published.</p>
+
+    <article class="release" id="release-1-1-3">
+      <div class="release-header">
+        <h3>Ember v1.1.3 <span class="release-badge upcoming">Upcoming</span></h3>
+        <span class="release-date">Not released yet</span>
+      </div>
+      <p class="release-tag"><code>v1.1.3</code> &middot; draft notes from <code>main</code> since v1.1.2</p>
+      <div class="release-notes">
+        <h4>What's Fixed</h4>
+
+        <h5>KAD &amp; ED2K</h5>
+        <ul>
+          <li>Clear store / FindBuddy / routing failure modes that could stall discovery and publish</li>
+          <li>Restore callback peer caps and source-search capacity handling</li>
+        </ul>
+
+        <h5>GeoIP</h5>
+        <ul>
+          <li>Refresh the bundled DB-IP country lite database (July 2026)</li>
+          <li>Update the MaxMind reader dependency</li>
+        </ul>
+
+        <h5>Known Clients</h5>
+        <ul>
+          <li>Friend markers match on Ember hash (not only eD2K user hash)</li>
+          <li>Trust badge reflects manual bans</li>
+          <li>Reputation refreshes on each poll; friend list keeps the same cadence</li>
+          <li>Row context menu for copy hash / add friend / ban</li>
+        </ul>
+
+        <h5>Library</h5>
+        <ul>
+          <li>Stop hashing stays stopped against FS-watcher rescans</li>
+          <li>Windows folder filters are case-insensitive</li>
+          <li>KAD / eD2K badges mean published, not merely connected</li>
+          <li>Missing-file scan reports when results are truncated</li>
+        </ul>
+
+        <h5>Statistics</h5>
+        <ul>
+          <li>Session and connection time use monotonic elapsed time (immune to clock jumps)</li>
+          <li>Download completions counted only after the transfer is confirmed complete</li>
+          <li>Status bar and protocol-overhead labels match real scopes (payload / session)</li>
+          <li>Transfer-stats cache refreshes every second; session vs all-time upload ratio clarified</li>
+        </ul>
+
+        <h5>Repository</h5>
+        <ul>
+          <li>Expanded <code>.gitignore</code> for runtime data, installer copies, and tooling artifacts</li>
+        </ul>
+
+        <p class="full-changelog">
+          <strong>Full Changelog</strong>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.1.2...main" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.1.2...main</a>
+        </p>
+      </div>
+    </article>
+
+    <article class="release" id="release-1-1-2">
+      <div class="release-header">
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.1.2" target="_blank" rel="noopener">Ember v1.1.2</a></h3>
+        <time class="release-date" datetime="2026-07-12">July 12, 2026</time>
+      </div>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.1.2" target="_blank" rel="noopener"><code>v1.1.2</code></a></p>
+      <div class="release-notes">
+        <h4>What's Fixed</h4>
+
+        <h5>Search &amp; downloads</h5>
+        <ul>
+          <li>Search results with a file hash but no embedded peer IPs can be downloaded again (backend discovers sources)</li>
+          <li>Batch cancel no longer fails the UI after transfers are already cancelled; incomplete teardown only retains partials and logs a warning</li>
+        </ul>
+
+        <h5>Sharing &amp; settings</h5>
+        <ul>
+          <li>Overlapping shared folders from older configs are soft-deduped on upgrade instead of resetting all settings</li>
+          <li>Temporarily unavailable shared folders no longer block saving unrelated settings</li>
+          <li>Share/unshare and priority updates succeed even if network persistence is briefly busy (best-effort reconcile)</li>
+        </ul>
+
+        <h5>Reliability &amp; compatibility</h5>
+        <ul>
+          <li>Corrupt <code>known.met</code> keeps previously parsed records instead of wiping the whole catalog</li>
+          <li>Corrupt <code>ember.db</code> still recreates safely, and now shows a recovery toast with the backup path</li>
+          <li>Ember auth works across mixed versions (transitional bare-nonce emit; dual verify retained)</li>
+          <li>Network command send timeout increased to reduce false failures under load</li>
+          <li>Note publish softens a slow KAD ack into &ldquo;queued&rdquo; instead of a hard error</li>
+        </ul>
+
+        <p class="full-changelog">
+          <strong>Full Changelog</strong>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.1.1...v1.1.2" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.1.1...v1.1.2</a>
+        </p>
+      </div>
+    </article>
+
+    <article class="release" id="release-1-1-1">
+      <div class="release-header">
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.1.1" target="_blank" rel="noopener">Ember v1.1.1</a></h3>
+        <time class="release-date" datetime="2026-07-11">July 11, 2026</time>
+      </div>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.1.1" target="_blank" rel="noopener"><code>v1.1.1</code></a></p>
+      <div class="release-notes">
+        <h4>What's Fixed</h4>
+
+        <h5>Persistence &amp; transfers</h5>
+        <ul>
+          <li>Prevent stale persistence from writing outdated transfer and settings state</li>
+          <li>Fix divergence between on-disk progress and the in-app transfer tracker</li>
+        </ul>
+
+        <h5>KAD &amp; networking</h5>
+        <ul>
+          <li>Stop dropped KAD work from silently stalling discovery and publish paths</li>
+          <li>Harden relay networking while preserving eMule-compatible behavior</li>
+        </ul>
+
+        <h5>Frontend</h5>
+        <ul>
+          <li>Close state races that could leave the UI out of sync with the backend</li>
+        </ul>
+
+        <p class="full-changelog">
+          <strong>Full Changelog</strong>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.1.0...v1.1.1" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.1.0...v1.1.1</a>
+        </p>
+      </div>
+    </article>
+
+    <article class="release" id="release-1-1-0">
+      <div class="release-header">
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.1.0" target="_blank" rel="noopener">Ember v1.1.0</a> <span class="release-badge">Initial Release</span></h3>
+        <time class="release-date" datetime="2026-07-11">July 11, 2026</time>
+      </div>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.1.0" target="_blank" rel="noopener"><code>v1.1.0</code></a></p>
+      <div class="release-notes">
+        <h4>What's New</h4>
+
+        <h5>Networking</h5>
+        <ul>
+          <li>Full eMule KAD v8/v9 participation with automatic Security-server ED2K peer exchange</li>
+          <li>Credits, SecIdent, protocol obfuscation, and AICH</li>
+          <li>EPX (Ember Peer Exchange) for faster source discovery between Ember clients</li>
+        </ul>
+
+        <h5>Transfers &amp; library</h5>
+        <ul>
+          <li>Multi-source downloads with queue management, health monitoring, and real-time progress</li>
+          <li>Multi-tab search with filters and spam detection</li>
+          <li>Virtual-scrolling library with priorities, comments, and collections</li>
+        </ul>
+
+        <h5>Friends &amp; security</h5>
+        <ul>
+          <li>Ember-exclusive Friend IDs with rendezvous discovery, mutual requests, chat, remote browsing, and priority upload slots</li>
+          <li>IP filtering, private-IP blocking, path traversal protection, and a strict webview CSP</li>
+        </ul>
+
+        <h5>Desktop app</h5>
+        <ul>
+          <li>Windows 10/11 installer, first-run setup wizard, statistics, GeoIP peer countries, and signed in-app updates</li>
+        </ul>
+      </div>
+    </article>
+  </section>
+
+  <hr>
+
   <!-- Support -->
   <section id="support">
     <h2>Support</h2>
@@ -1227,7 +1497,8 @@ npm run tauri build</code></pre>
   <div>&copy; 2025&ndash;2026 Ember. Released under the GPLv3 License.</div>
   <div class="footer-links">
     <a href="https://github.com/untaimed18/Ember-P2P" target="_blank" rel="noopener">GitHub</a>
-    <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">Releases</a>
+    <a href="#releases">Release History</a>
+    <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">All Releases</a>
     <a href="https://github.com/untaimed18/Ember-P2P/issues" target="_blank" rel="noopener">Issues</a>
   </div>
 </footer>
