@@ -870,6 +870,102 @@ enum AddResult {
     Failed,
 }
 
+/// In-place update for a contact already present in `bin`.
+/// Returns `Some((old_ip, new_ip))` when the IP changed so the caller can
+/// adjust global IP accounting via `track_ip_*`.
+fn apply_existing_contact_update(
+    bin: &mut RoutingBin,
+    contact: KadContact,
+    // Host-order external IP (`RoutingTable::external_ip`).
+    external_ip: Option<u32>,
+    global_ip_count: &HashMap<Ipv4Addr, u32>,
+    global_subnet_count: &HashMap<u32, u32>,
+) -> Option<(Ipv4Addr, Ipv4Addr)> {
+    let Some(existing) = bin.get_contact_mut(&contact.id) else {
+        return None;
+    };
+    // eMule UDPKey sender verification: if the existing contact has a
+    // valid UDP key for our IP, the incoming contact must present the
+    // same key. Prevents contact hijacking.
+    if let Some(our_ip) = external_ip {
+        let existing_key_val = existing
+            .udp_key
+            .map(|k| k.get_key_value(our_ip))
+            .unwrap_or(0);
+        if existing_key_val != 0 {
+            let incoming_key_val = contact
+                .udp_key
+                .map(|k| k.get_key_value(our_ip))
+                .unwrap_or(0);
+            if existing_key_val != incoming_key_val {
+                tracing::debug!(
+                    "RT reject update for {}: UDPKey mismatch (sender key empty: {})",
+                    existing.id,
+                    incoming_key_val == 0,
+                );
+                return None;
+            }
+        }
+    }
+
+    // eMule legacy Kad2 restriction: contacts with version >= 0.46c and
+    // < 0.49a-beta that have already received a HELLO packet are limited
+    // to timer-refresh-only updates (prevents value hijacking of legacy nodes).
+    let is_legacy_kad2 = existing.version >= KADEMLIA_VERSION1_46C
+        && existing.version < KADEMLIA_VERSION6_49ABETA;
+    if is_legacy_kad2 && existing.received_hello {
+        let same_values = existing.ip == contact.ip
+            && existing.tcp_port == contact.tcp_port
+            && existing.version == contact.version
+            && existing.udp_port == contact.udp_port;
+        if same_values {
+            existing.update_type();
+            let id = existing.id;
+            bin.push_to_bottom(&id);
+        }
+        return None;
+    }
+
+    let old_ip = existing.ip;
+    if old_ip != contact.ip
+        && !bin.change_contact_ip(
+            &contact.id,
+            contact.ip,
+            global_ip_count,
+            global_subnet_count,
+        )
+    {
+        return None;
+    }
+    let Some(existing) = bin.get_contact_mut(&contact.id) else {
+        return None;
+    };
+    existing.udp_port = contact.udp_port;
+    existing.tcp_port = contact.tcp_port;
+    if contact.version >= existing.version {
+        existing.version = contact.version;
+    }
+    if contact.verified && !existing.verified {
+        existing.verified = true;
+    }
+    if contact.udp_key.is_some() {
+        existing.udp_key = contact.udp_key.clone();
+    }
+    existing.kad_options = contact.kad_options;
+    if contact.received_hello {
+        existing.received_hello = true;
+    }
+    existing.update_type();
+    let new_ip = existing.ip;
+    let id = existing.id;
+    bin.push_to_bottom(&id);
+    if old_ip != new_ip {
+        Some((old_ip, new_ip))
+    } else {
+        None
+    }
+}
+
 fn check_global_limits(
     ip: Ipv4Addr,
     global_ip_count: &HashMap<Ipv4Addr, u32>,
@@ -1047,94 +1143,65 @@ impl RoutingTable {
 
         let distance = self.local_id.xor_distance(&contact.id);
 
-        // Check if contact already exists -- handle update path
+        // Check if contact already exists — handle update path.
+        // K12: after a RoutingZone split the contact may live in a leaf that
+        // no longer matches the XOR-distance fast path. `remove`/`get_contact`
+        // already scan all leaves; insert must do the same or it falls through
+        // to `root.add` and duplicates the KadId in another bin.
+        let mut contact = Some(contact);
         {
-            let Some(bin) = self.root.find_bin_mut(&distance) else {
-                return false;
-            };
-            if let Some(existing) = bin.get_contact_mut(&contact.id) {
-                // eMule UDPKey sender verification: if the existing contact has a
-                // valid UDP key for our IP, the incoming contact must present the
-                // same key. Prevents contact hijacking.
-                if let Some(our_ip) = self.external_ip {
-                    let existing_key_val = existing
-                        .udp_key
-                        .map(|k| k.get_key_value(our_ip))
-                        .unwrap_or(0);
-                    if existing_key_val != 0 {
-                        let incoming_key_val = contact
-                            .udp_key
-                            .map(|k| k.get_key_value(our_ip))
-                            .unwrap_or(0);
-                        if existing_key_val != incoming_key_val {
-                            tracing::debug!(
-                                "RT reject update for {}: UDPKey mismatch (sender key empty: {})",
-                                existing.id,
-                                incoming_key_val == 0,
-                            );
-                            return false;
-                        }
-                    }
-                }
-
-                // eMule legacy Kad2 restriction: contacts with version >= 0.46c and
-                // < 0.49a-beta that have already received a HELLO packet are limited
-                // to timer-refresh-only updates (prevents value hijacking of legacy nodes).
-                let is_legacy_kad2 = existing.version >= KADEMLIA_VERSION1_46C
-                    && existing.version < KADEMLIA_VERSION6_49ABETA;
-                if is_legacy_kad2 && existing.received_hello {
-                    let same_values = existing.ip == contact.ip
-                        && existing.tcp_port == contact.tcp_port
-                        && existing.version == contact.version
-                        && existing.udp_port == contact.udp_port;
-                    if same_values {
-                        existing.update_type();
-                        let id = existing.id;
-                        bin.push_to_bottom(&id);
-                    }
-                    return false;
-                }
-
-                let old_ip = existing.ip;
-                if old_ip != contact.ip {
-                    let ok = bin.change_contact_ip(
-                        &contact.id,
-                        contact.ip,
+            let contact_id = contact.as_ref().expect("contact present before update").id;
+            let in_xor_bin = self
+                .root
+                .find_bin(&distance)
+                .is_some_and(|bin| bin.get_contact(&contact_id).is_some());
+            if in_xor_bin {
+                if let Some(bin) = self.root.find_bin_mut(&distance) {
+                    let ip_change = apply_existing_contact_update(
+                        bin,
+                        contact.take().expect("contact present for xor update"),
+                        self.external_ip,
                         &self.global_ip_count,
                         &self.global_subnet_count,
                     );
-                    if !ok {
-                        return false;
-                    }
-                }
-                if let Some(existing) = bin.get_contact_mut(&contact.id) {
-                    existing.udp_port = contact.udp_port;
-                    existing.tcp_port = contact.tcp_port;
-                    if contact.version >= existing.version {
-                        existing.version = contact.version;
-                    }
-                    if contact.verified && !existing.verified {
-                        existing.verified = true;
-                    }
-                    if contact.udp_key.is_some() {
-                        existing.udp_key = contact.udp_key.clone();
-                    }
-                    existing.kad_options = contact.kad_options;
-                    if contact.received_hello {
-                        existing.received_hello = true;
-                    }
-                    existing.update_type();
-                    let new_ip = existing.ip;
-                    let id = existing.id;
-                    bin.push_to_bottom(&id);
-                    if old_ip != new_ip {
+                    if let Some((old_ip, new_ip)) = ip_change {
                         self.track_ip_remove(old_ip);
                         self.track_ip_add(new_ip);
                     }
+                    return false;
+                }
+                return false;
+            }
+            // K12 leaf scan: take contact only when a matching leaf is found.
+            let leaf_match = {
+                let mut leaves: Vec<&mut RoutingZone> = Vec::new();
+                collect_leaves_mut(&mut self.root, &mut leaves);
+                let mut matched = None;
+                for zone in leaves {
+                    if let Some(bin) = zone.bin.as_mut() {
+                        if bin.get_contact(&contact_id).is_some() {
+                            matched = Some(apply_existing_contact_update(
+                                bin,
+                                contact.take().expect("contact present for leaf update"),
+                                self.external_ip,
+                                &self.global_ip_count,
+                                &self.global_subnet_count,
+                            ));
+                            break;
+                        }
+                    }
+                }
+                matched
+            };
+            if let Some(ip_change) = leaf_match {
+                if let Some((old_ip, new_ip)) = ip_change {
+                    self.track_ip_remove(old_ip);
+                    self.track_ip_add(new_ip);
                 }
                 return false;
             }
         }
+        let mut contact = contact.expect("contact retained when not already present");
 
         let now = chrono::Utc::now().timestamp();
         if contact.created_at == 0 {

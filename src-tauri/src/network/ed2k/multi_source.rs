@@ -807,6 +807,10 @@ pub struct MultiSourceDownload {
     pub external_ip: Option<std::net::Ipv4Addr>,
     /// Shared pending AICH recovery retries
     pub aich_pending: Option<super::transfer::SharedAichPending>,
+    /// Trusted AICH master from EPX / `aich_cache` when known before any
+    /// peer HashSet2 arrives. Seeded into recovery so we do not wait for
+    /// a first wire pin when a verified root is already available.
+    pub trusted_aich_master: Option<[u8; 20]>,
     /// GeoIP reader for country code lookups
     pub geoip: crate::geoip::GeoIpReader,
     /// Shared registry so the shutdown path can save our tracker
@@ -1366,8 +1370,16 @@ impl MultiSourceDownload {
         // refresh this later, but resume must not wait for another hashset.
         let resumed_part_hashes = tracker.read().await.part_hashes().to_vec();
         let part_hashes: Arc<RwLock<Vec<[u8; 16]>>> = Arc::new(RwLock::new(resumed_part_hashes));
-        // Trusted AICH master from HashSet2 (first peer to provide it wins).
-        let shared_aich_master: Arc<RwLock<Option<[u8; 20]>>> = Arc::new(RwLock::new(None));
+        // Seed from EPX/cache when available; otherwise first verified
+        // HashSet2 peer to provide a master wins (see HashSet2 handler).
+        let shared_aich_master: Arc<RwLock<Option<[u8; 20]>>> =
+            Arc::new(RwLock::new(self.trusted_aich_master));
+        if self.trusted_aich_master.is_some() {
+            debug!(
+                "Seeded trusted AICH master for multi-source download {}",
+                self.transfer_id
+            );
+        }
 
         // Source status counters (shared by all per-source tasks)
         let total_sources = Arc::new(AtomicU32::new(self.sources.len() as u32));
@@ -1446,7 +1458,7 @@ impl MultiSourceDownload {
                                 agg_control.set_preview_ready(
                                     t.is_preview_ready(&agg_file_name, file_size),
                                 );
-                                t.completed_bytes().min(file_size)
+                                t.progress_bytes().min(file_size)
                             };
                             // Skip the Progress emit when nothing actually
                             // changed (e.g. only `pending_progress` from a
@@ -1487,7 +1499,7 @@ impl MultiSourceDownload {
             let capped = {
                 let t = agg_tracker.read().await;
                 agg_control.set_preview_ready(t.is_preview_ready(&agg_file_name, file_size));
-                t.completed_bytes().min(file_size)
+                t.progress_bytes().min(file_size)
             };
             if capped != last_emitted_bytes {
                 let _ = event_tx_clone
@@ -2481,7 +2493,7 @@ impl MultiSourceDownload {
                 while adopt_progress_rx.recv().await.is_some() {
                     let capped = {
                         let t = adopt_tracker.read().await;
-                        t.completed_bytes().min(adopt_fs)
+                        t.progress_bytes().min(adopt_fs)
                     };
                     let _ = adopt_etx
                         .send(DownloadEvent::Progress {
@@ -3070,7 +3082,7 @@ impl MultiSourceDownload {
                 while let Some((_source_idx, _bytes)) = retry_rx.recv().await {
                     let capped = {
                         let t = retry_agg_tracker.read().await;
-                        t.completed_bytes().min(fs)
+                        t.progress_bytes().min(fs)
                     };
                     let _ = etx
                         .send(DownloadEvent::Progress {
@@ -3306,10 +3318,11 @@ impl MultiSourceDownload {
             // it now — before we verify and rename — so an OS/power crash
             // between the rename and that drop can't leave a "Completed" file
             // with unflushed tail blocks. Mirrors the single-source fsync in
-            // transfer.rs; best-effort so a sync error doesn't strand the file.
-            if let Err(e) = shared_part_file.sync_data().await {
-                warn!("Pre-finalize fsync failed for {}: {e}", self.file_name);
-            }
+            // transfer.rs.
+            shared_part_file
+                .sync_data()
+                .await
+                .context("pre-finalize fsync failed")?;
 
             // Always re-read the `.part` file before finalizing. eMule's
             // completion path trusts verified parts, but our process can be
@@ -3723,7 +3736,9 @@ async fn download_parts_from_source(
         };
     }
 
-    emit_source!("connecting", None, 0u64);
+    // Defer the "connecting" SourceDetail until we actually commit to this
+    // route. Predial skip (peer already live via callback) must not leave a
+    // Connecting row until the 120s watchdog.
     check_control(&control).await?;
 
     type DynRead = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
@@ -3761,6 +3776,7 @@ async fn download_parts_from_source(
     let mut _global_conn_permit: Option<GlobalConnPermit> = None;
 
     if let Some(es) = pre_established {
+        emit_source!("connecting", None, 0u64);
         // Pre-established (KAD/server callback) path: the upload-side
         // listener already did TCP + (maybe obfuscation) + Hello +
         // (maybe EmuleInfo) for this peer, so we adopt the supplied
@@ -3836,8 +3852,10 @@ async fn download_parts_from_source(
                 "Source {} ({}) skip dial: already connected to this peer via another route",
                 _src_idx, addr,
             );
+            // Never emitted "connecting" for this route — nothing to clear.
             return Ok(());
         }
+        emit_source!("connecting", None, 0u64);
         // Global connection cap + dial pacing apply to outbound dials only.
         // Reserve the machine-wide slot first (waits here if we're already at
         // eMule's `maxconnections`), then pace the actual TCP connect so a
@@ -4235,6 +4253,9 @@ async fn download_parts_from_source(
             "Source {} ({}) dropping duplicate connection: peer already live via another source",
             _src_idx, addr,
         );
+        // Clear the Connecting SourceDetail without a fail_count penalty —
+        // another live route owns this peer.
+        emit_source!("duplicate", None, 0u64);
         return Ok(());
     }
     let _live_guard = LivePeerGuard {
@@ -5809,24 +5830,37 @@ async fn download_parts_from_source(
         true
     };
     if sx_allowed {
-        if peer_supports_source_ex2 {
+        let sx_write_ok = if peer_supports_source_ex2 {
             let mut sx2_req = Vec::with_capacity(19);
             sx2_req.push(SOURCEEXCHANGE2_VERSION);
             sx2_req.extend_from_slice(&0u16.to_le_bytes());
             sx2_req.extend_from_slice(file_hash);
-            let _ = write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_REQUESTSOURCES2, &sx2_req)
-                .await;
-            sx_overhead.record_upload((6 + sx2_req.len()) as u64);
+            let ok = write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_REQUESTSOURCES2, &sx2_req)
+                .await
+                .is_ok();
+            if ok {
+                sx_overhead.record_upload((6 + sx2_req.len()) as u64);
+            }
+            ok
         } else {
             let sx_req = build_file_request(file_hash);
-            let _ =
-                write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_REQUESTSOURCES, &sx_req).await;
-            sx_overhead.record_upload((6 + sx_req.len()) as u64);
-        }
-        if let Some(sm) = &source_mgr {
-            let mut sm = sm.write().await;
-            if let Ok(v4) = source.peer_ip.parse::<Ipv4Addr>() {
-                sm.mark_sx_sent(file_hash, v4, source.peer_port);
+            let ok =
+                write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_REQUESTSOURCES, &sx_req)
+                    .await
+                    .is_ok();
+            if ok {
+                sx_overhead.record_upload((6 + sx_req.len()) as u64);
+            }
+            ok
+        };
+        // Only start the 40-minute SOURCECLIENTREASKS cooldown when the
+        // packet actually left the socket (mirrors transfer.rs).
+        if sx_write_ok {
+            if let Some(sm) = &source_mgr {
+                let mut sm = sm.write().await;
+                if let Ok(v4) = source.peer_ip.parse::<Ipv4Addr>() {
+                    sm.mark_sx_sent(file_hash, v4, source.peer_port);
+                }
             }
         }
     }

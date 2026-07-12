@@ -406,6 +406,37 @@ impl PartTracker {
         self.file_size.saturating_sub(gap_bytes)
     }
 
+    /// Bytes belonging to MD4-verified parts only.
+    pub fn verified_bytes(&self) -> u64 {
+        (0..self.part_count)
+            .filter(|&i| self.is_part_verified(i))
+            .map(|i| {
+                let (ps, pe) = self.part_range(i);
+                pe.saturating_sub(ps)
+            })
+            .sum()
+    }
+
+    /// Progress figure for UI / Progress events.
+    ///
+    /// Gap-fill alone can reach `file_size` before any part MD4 runs (no
+    /// hashset yet). Cap just below 100% in that case so the bar does not
+    /// claim completion until parts verify or the final whole-file hash runs.
+    pub fn progress_bytes(&self) -> u64 {
+        let filled = self.completed_bytes();
+        if self.file_size == 0 {
+            return 0;
+        }
+        if self.gaps.is_empty() && !self.part_verified.iter().all(|&v| v) {
+            let verified = self.verified_bytes();
+            if verified > 0 {
+                return verified.min(self.file_size.saturating_sub(1));
+            }
+            return self.file_size.saturating_sub(1);
+        }
+        filled.min(self.file_size)
+    }
+
     /// Return a boolean bitmap of completed parts (for OP_FILESTATUS compatibility).
     pub fn completed_parts(&self) -> Vec<bool> {
         (0..self.part_count)
@@ -1334,6 +1365,25 @@ mod tests {
             }
         }
 
+        let _ = std::fs::remove_file(part_path.with_extension("part.met"));
+    }
+
+    #[test]
+    fn progress_bytes_caps_below_100_when_gaps_empty_but_unverified() {
+        let part_path = temp_part_path("progress_cap");
+        let file_size = PARTSIZE * 2;
+        let mut tracker = PartTracker::new(file_size, &part_path);
+        tracker.fill_range(0, file_size);
+        assert!(tracker.all_complete());
+        assert_eq!(tracker.completed_bytes(), file_size);
+        assert_eq!(
+            tracker.progress_bytes(),
+            file_size.saturating_sub(1),
+            "UI must not show 100% before any part MD4"
+        );
+        tracker.set_part_verified(0);
+        tracker.set_part_verified(1);
+        assert_eq!(tracker.progress_bytes(), file_size);
         let _ = std::fs::remove_file(part_path.with_extension("part.met"));
     }
 }

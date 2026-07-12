@@ -95,7 +95,7 @@ x509-cert = { version = "0.2", default-features = false }
 strsim = "0.11"
 zip = "2"
 fs2 = "0.4"
-maxminddb = "0.28"
+maxminddb = "0.29"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 parking_lot = "0.12"
 notify-debouncer-mini = { version = "0.7", default-features = false }

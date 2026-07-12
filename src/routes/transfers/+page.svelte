@@ -264,7 +264,7 @@
       // D28: if the backend now reports a terminal status for this source,
       // drop it from the visible list rather than accumulating dead rows
       // that stay until the user collapses and re-opens the drawer.
-      const isDead = status === 'failed';
+      const isDead = status === 'failed' || status === 'duplicate';
       if (idx >= 0) {
         if (isDead) {
           expandedSources = expandedSources.filter((_, i) => i !== idx);

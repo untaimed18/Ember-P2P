@@ -376,6 +376,25 @@ impl PerFileSourceList {
         }
     }
 
+    /// Clear Connecting/Downloading after a duplicate-route skip without
+    /// bumping `fail_count` (another live source task owns this peer).
+    pub fn clear_duplicate_route(
+        &mut self,
+        ip: Ipv4Addr,
+        port: u16,
+        user_hash: Option<[u8; 16]>,
+    ) {
+        if let Some(s) = self.find_mut(ip, port, user_hash) {
+            if matches!(
+                s.state,
+                DownloadSourceState::Connecting | DownloadSourceState::Downloading
+            ) {
+                s.state = DownloadSourceState::Failed;
+                s.state_changed = Instant::now();
+            }
+        }
+    }
+
     /// Mark a source as having no needed parts.
     pub fn set_none_needed_parts(&mut self, ip: Ipv4Addr, port: u16, user_hash: Option<[u8; 16]>) {
         if let Some(s) = self.find_mut(ip, port, user_hash) {

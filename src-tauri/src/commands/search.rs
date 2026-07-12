@@ -408,7 +408,12 @@ pub async fn find_sources(
             .clamp(SEARCH_TIMEOUT_MIN, SEARCH_TIMEOUT_MAX)
     };
     match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
-        Ok(Ok(results)) => Ok(results),
+        Ok(Ok(Ok(results))) => Ok(results),
+        Ok(Ok(Err(msg))) => Err(coded_ctx(
+            "search_source_search_busy",
+            msg,
+            "kad search capacity",
+        )),
         Ok(Err(e)) => Err(coded_ctx(
             "search_source_search_failed",
             "Source search failed",
