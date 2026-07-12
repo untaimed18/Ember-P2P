@@ -6,9 +6,14 @@ build/
 dist/
 .svelte-kit/
 out/
+coverage/
+*.tsbuildinfo
 
 # Generated flag SVGs (copied from circle-flags via postinstall)
 static/flags/
+
+# Paraglide compiled i18n output (also self-ignored via src/lib/paraglide/.gitignore)
+src/lib/paraglide/
 
 # Rust build
 src-tauri/target/
@@ -18,7 +23,9 @@ rendezvous-server/target/
 .harness/
 
 # Tauri generated files
-src-tauri/gen/schemas
+src-tauri/gen/
+# WiX toolset downloaded by the Windows MSI bundler
+src-tauri/WixTools/
 
 # Never commit a literal "~" folder (mistaken path for ~/.tauri signing keys)
 /~/
@@ -26,6 +33,8 @@ src-tauri/gen/schemas
 # Tauri updater signing keys — the PRIVATE key must NEVER be committed.
 # It signs release artifacts (provided to CI via the TAURI_SIGNING_PRIVATE_KEY
 # secret); losing it means you can never update already-installed apps.
+# The matching public key is embedded in tauri.conf.json, so the .pub file
+# on disk is also ignored to avoid accidental dual sources of truth.
 *.key
 *.key.pub
 
@@ -40,8 +49,17 @@ src-tauri/gen/schemas
 # Tauri keys if ever generated into a project-local dir (default is ~/.tauri).
 .tauri/
 
-# Lockfiles (keep package-lock.json, ignore Cargo.lock for apps is optional)
-# Cargo.lock is typically committed for applications, so it stays
+# Accidental installer / release copies dropped in the repo root.
+# Canonical builds live under src-tauri/target/ (already ignored).
+/*.msi
+/*.exe
+/*.nsis.zip
+/*.AppImage
+/*.deb
+/*.dmg
+/latest.json
+
+# Lockfiles (keep package-lock.json; Cargo.lock is committed for applications)
 
 # IDE
 .vscode/
@@ -66,33 +84,48 @@ emulesource/
 .cursor/
 .cursorignore
 .cursorindexingignore
+# Agent canvas artifacts (must not be committed)
+*.canvas.tsx
 
-# P2P runtime data files
+# P2P runtime data files (written under the app data dir; also ignored if
+# someone points EMBER_DATA_DIR / runs with cwd inside the working tree)
 clients.met
 cryptkey.dat
 identity.json
 ipfilter.dat
 known.met
+known2_64.met
+server.met
+sources.met
+nodes.dat
+aich_cache.dat
+reputation.json
+search_spam.json
 *.sqlite
 *.sqlite3
 *.db
+*.bak
+
+# App config if ever written into the working-tree root
+/config.json
+/config.json.bak
 
 # Environment
 .env
 .env.*
 !.env.example
 
-# Logs
+# Logs / crash dumps
 *.log
+*.dmp
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
-# P2P app data (nodes.dat, downloaded .part files, etc.)
+# P2P transfer temp files
 *.part
 *.part.met
-nodes.dat
 
 # Rust / Cargo extras
 **/*.rs.bk
