@@ -4530,12 +4530,11 @@ async fn download_parts_from_source(
                 early_upload_accept = true;
                 debug!("Received early AcceptUploadReq from source {}", _src_idx);
             }
-            // EPX is Ember-only; gate reception on `hello_caps.is_ember` as
-            // the upload side and the documented intent require (see the
-            // OP_EMBER_HELLO arm comment below). Otherwise a non-Ember peer
-            // we're downloading from could inject crafted source/peer hints.
+            // EPX is Ember-only; gate on `hello_caps.is_ember` AND Ed25519
+            // PoP for this TCP session (`ember_auth_verified`).
             (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE)
                 if hello_caps.is_ember
+                    && ember_auth_verified
                     && epx_packets_received
                         < crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION =>
             {
@@ -4820,30 +4819,26 @@ async fn download_parts_from_source(
         }
     }
 
-    // Ember Peer Exchange: if peer is a Ember client, send our source list.
+    // Ember Peer Exchange: only share sources after Ed25519 PoP.
     // Snapshot the generation we sent so the periodic-resend loop below
-    // (line ~3192) can correctly detect rebuilds that happen during the
-    // file-status-wait / queue-wait window. Capturing the generation at
-    // data-loop start instead — which the original code did — silently
-    // lost every EPX update produced while we were queued (often the
-    // most useful ones, since other sources arrived and shifted the
-    // shareable set).
+    // can correctly detect rebuilds during file-status-wait / queue-wait.
     info!(
-        "Source {}: is_ember={}, mod_version='{}', ember_hash={}",
+        "Source {}: is_ember={}, mod_version='{}', ember_hash={}, pop={}",
         _src_idx,
         hello_caps.is_ember,
         hello_caps.mod_version,
         peer_ember_hash
             .map(|h| hex::encode(h))
-            .unwrap_or_else(|| "none".to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        ember_auth_verified
     );
     let mut initial_epx_sent_generation: Option<u64> = None;
-    if hello_caps.is_ember {
+    if hello_caps.is_ember && ember_auth_verified {
         let sent_gen = ember_payload_generation.load(std::sync::atomic::Ordering::Relaxed);
         let epx_data = ember_payload.read().await.clone();
         if !epx_data.is_empty() {
             info!(
-                "Sending EPX to Ember source {} ({} bytes, gen {})",
+                "Sending EPX to verified Ember source {} ({} bytes, gen {})",
                 _src_idx,
                 epx_data.len(),
                 sent_gen
@@ -4863,6 +4858,8 @@ async fn download_parts_from_source(
                 _src_idx
             );
         }
+    }
+    if hello_caps.is_ember {
         if let std::net::IpAddr::V4(v4) = addr.ip() {
             let peer_tcp = addr.port();
             if peer_tcp > 0 && !crate::security::is_special_use_v4(v4) {
@@ -5197,10 +5194,11 @@ async fn download_parts_from_source(
             }
             continue;
         }
-        // Ember-only; gated on `hello_caps.is_ember` (see upload.rs).
+        // Ember-only; gated on `hello_caps.is_ember` + PoP (see upload.rs).
         if proto == OP_EMULEPROT
             && opcode == OP_EMBER_SOURCEEXCHANGE
             && hello_caps.is_ember
+            && ember_auth_verified
             && epx_packets_received < crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION
         {
             sx_overhead.record_download((6 + _payload.len()) as u64);
@@ -5366,6 +5364,34 @@ async fn download_parts_from_source(
                                     "Ember auth: source {} at {} verified via PoP during file-status-wait ({} deferred packet(s) queued for replay)",
                                     _src_idx, addr, auth_deferred.len()
                                 );
+                                if initial_epx_sent_generation.is_none() {
+                                    let sent_gen = ember_payload_generation
+                                        .load(std::sync::atomic::Ordering::Relaxed);
+                                    let epx_data = ember_payload.read().await.clone();
+                                    if !epx_data.is_empty() {
+                                        info!(
+                                            "Sending EPX to newly verified Ember source {} ({} bytes, gen {})",
+                                            _src_idx,
+                                            epx_data.len(),
+                                            sent_gen
+                                        );
+                                        if write_packet_async_ms(
+                                            &mut *writer,
+                                            OP_EMULEPROT,
+                                            OP_EMBER_SOURCEEXCHANGE,
+                                            &*epx_data,
+                                        )
+                                        .await
+                                        .is_ok()
+                                        {
+                                            sx_overhead
+                                                .record_upload((6 + epx_data.len()) as u64);
+                                            initial_epx_sent_generation = Some(sent_gen);
+                                        }
+                                    } else {
+                                        initial_epx_sent_generation = Some(sent_gen);
+                                    }
+                                }
                                 if !friend_seen_emitted {
                                     if let (true, Some(eh)) =
                                         (peer_is_friend, hello_caps.ember_hash)
@@ -6481,7 +6507,10 @@ async fn download_parts_from_source(
                 }
 
                 // Periodic EPX re-send: if payload has been rebuilt and 5min elapsed
-                if hello_caps.is_ember && last_epx_resend.elapsed() >= EPX_RESEND_INTERVAL {
+                if hello_caps.is_ember
+                    && ember_auth_verified
+                    && last_epx_resend.elapsed() >= EPX_RESEND_INTERVAL
+                {
                     let current_gen =
                         ember_payload_generation.load(std::sync::atomic::Ordering::Relaxed);
                     if current_gen != last_epx_generation {
@@ -7369,8 +7398,10 @@ async fn download_parts_from_source(
                             ),
                         }
                     }
-                    // Ember-only; gated on `hello_caps.is_ember` (see upload.rs).
-                    (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE) if hello_caps.is_ember => {
+                    // Ember-only; gated on `hello_caps.is_ember` + PoP (see upload.rs).
+                    (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE)
+                        if hello_caps.is_ember && ember_auth_verified =>
+                    {
                         sx_overhead.record_download((6 + payload.len()) as u64);
                         if epx_packets_received
                             >= crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION

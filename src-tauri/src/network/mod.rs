@@ -312,28 +312,49 @@ fn prune_stale_ember_peers_at(
 
 /// Insert or refresh an Ember Noise pubkey for `(ip, port)`. Mirrors
 /// `record_known_ember_peer`'s LRU-by-timestamp eviction policy at the
-/// `MAX_KNOWN_EMBER_NOISE_KEYS` cap. A re-publish overwrites the
-/// stored key (last-write-wins) so a peer that rotates its Noise
-/// identity is reachable on the next dial. Returns the *previous*
-/// pubkey when the entry already existed and the value changed; this
-/// is used by callers that want to log key rotation events.
+/// `MAX_KNOWN_EMBER_NOISE_KEYS` cap.
+///
+/// KAD `"ember_npub"` tags are unauthenticated, so a poisoner could
+/// otherwise last-write-wins overwrite a legitimate peer's key and
+/// redirect Noise_IK dials. We **pin on first sight**: a different key
+/// for the same `(ip, port)` is ignored while the existing entry is
+/// still within `KNOWN_EMBER_PEER_TTL`. Same-key re-publishes refresh
+/// the timestamp. After TTL expiry the entry is pruned and a new key
+/// (including a legitimate rotation) can be learned again.
+///
+/// Returns the *previous* pubkey only when a conflicting advertise was
+/// rejected (caller may log a poison/rotation attempt). Returns `None`
+/// on first insert or same-key refresh.
 fn record_ember_noise_key(
     map: &mut HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)>,
     ip: Ipv4Addr,
     port: u16,
     noise_pub: [u8; 32],
 ) -> Option<[u8; 32]> {
-    let now = std::time::Instant::now();
+    record_ember_noise_key_at(map, ip, port, noise_pub, std::time::Instant::now())
+}
+
+/// `record_ember_noise_key` with an explicit comparison clock — same
+/// testability rationale as `prune_stale_ember_peers_at`.
+fn record_ember_noise_key_at(
+    map: &mut HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)>,
+    ip: Ipv4Addr,
+    port: u16,
+    noise_pub: [u8; 32],
+    now: std::time::Instant,
+) -> Option<[u8; 32]> {
     let key = (ip, port);
     if let Some((existing, ts)) = map.get_mut(&key) {
-        let prev = if *existing != noise_pub {
-            Some(*existing)
+        if now.duration_since(*ts) >= KNOWN_EMBER_PEER_TTL {
+            // Stale pin — treat as a fresh insert below.
+            map.remove(&key);
+        } else if *existing == noise_pub {
+            *ts = now;
+            return None;
         } else {
-            None
-        };
-        *existing = noise_pub;
-        *ts = now;
-        return prev;
+            // Conflicting key while pin is live: keep the first-seen key.
+            return Some(*existing);
+        }
     }
     if map.len() >= MAX_KNOWN_EMBER_NOISE_KEYS {
         if let Some(oldest_key) = map.iter().min_by_key(|(_, (_, ts))| *ts).map(|(k, _)| *k) {
@@ -453,8 +474,11 @@ async fn handle_epx_sources(
                 break;
             }
             if flags & ember::SOURCE_FLAG_RELAY_CAPABLE != 0 {
+                // Flag alone never admits a relay candidate — ERAT trailer
+                // verification above is the only broker path. The peer is
+                // still eligible for normal source injection below.
                 debug!(
-                    "Ignoring EPX relay-capable source hint from {ip}:{port}; relay candidates require a verified attestation trailer"
+                    "EPX source {ip}:{port} advertised relay-capable; not treating flag as relay admission (attestation trailer required)"
                 );
             }
             if flags & ember::SOURCE_FLAG_FIREWALLED != 0 && (state.firewalled || state.low_id) {
@@ -472,17 +496,17 @@ async fn handle_epx_sources(
             if state.banned_ips.contains(&ip) {
                 continue;
             }
+            // Only reuse connect_options / user_hash already known from
+            // SourceManager. Never invent obfuscation (`0x02`) from the
+            // unauthenticated EPX `SOURCE_FLAG_OBFUSCATION` bit alone —
+            // that would steer dials toward crypt against peers that
+            // never advertised it on the wire.
             let (peer_user_hash, peer_connect_options) = {
                 let sm = source_manager.read().await;
-                let uh = sm.get_user_hash(file_hash, ip, port);
-                let co = sm.get_connect_options(file_hash, ip, port);
-                if uh.is_some() || co.is_some() {
-                    (uh, co)
-                } else if flags & ember::SOURCE_FLAG_OBFUSCATION != 0 {
-                    (None, Some(0x02))
-                } else {
-                    (None, None)
-                }
+                (
+                    sm.get_user_hash(file_hash, ip, port),
+                    sm.get_connect_options(file_hash, ip, port),
+                )
             };
             let ds = ed2k::multi_source::DownloadSource {
                 peer_ip: ip.to_string(),
@@ -1999,7 +2023,7 @@ mod tests {
     }
 
     #[test]
-    fn record_ember_noise_key_overwrites_on_rotation() {
+    fn record_ember_noise_key_pins_first_seen_against_poison() {
         let mut map = HashMap::new();
         let ip = Ipv4Addr::new(1, 2, 3, 4);
         let port = 4662u16;
@@ -2011,12 +2035,36 @@ mod tests {
         assert_eq!(record_ember_noise_key(&mut map, ip, port, key1), None);
         assert_eq!(map[&(ip, port)].0, key1);
 
-        // Same key → no rotation reported.
+        // Same key → refresh only, no conflict reported.
         assert_eq!(record_ember_noise_key(&mut map, ip, port, key1), None);
+        assert_eq!(map[&(ip, port)].0, key1);
 
-        // Different key → caller learns the previous value so it can
-        // log a rotation event if it wants to.
+        // Different key while pin is live → reject poison / premature
+        // rotation; keep first-seen key and report the pinned value.
         assert_eq!(record_ember_noise_key(&mut map, ip, port, key2), Some(key1));
+        assert_eq!(map[&(ip, port)].0, key1);
+    }
+
+    #[test]
+    fn record_ember_noise_key_accepts_new_key_after_ttl() {
+        let mut map = HashMap::new();
+        let ip = Ipv4Addr::new(1, 2, 3, 4);
+        let port = 4662u16;
+        let key1 = [0xAAu8; 32];
+        let key2 = [0xBBu8; 32];
+
+        // Anchor both "then" and "now" to a synthetic timeline so we never
+        // depend on Instant::checked_sub against wall-clock boot age.
+        let then = std::time::Instant::now();
+        let now = then + KNOWN_EMBER_PEER_TTL + std::time::Duration::from_secs(1);
+        assert_eq!(
+            record_ember_noise_key_at(&mut map, ip, port, key1, then),
+            None
+        );
+        assert_eq!(
+            record_ember_noise_key_at(&mut map, ip, port, key2, now),
+            None
+        );
         assert_eq!(map[&(ip, port)].0, key2);
     }
 
@@ -9459,12 +9507,17 @@ pub async fn start_network(
                                     state.ember_capable_peers.insert((s.ip, s.tcp_port));
                                 }
                                 if let Some(npub) = s.ember_noise_pub {
-                                    record_ember_noise_key(
+                                    if let Some(_pinned) = record_ember_noise_key(
                                         &mut state.ember_noise_keys,
                                         s.ip,
                                         s.tcp_port,
                                         npub,
-                                    );
+                                    ) {
+                                        debug!(
+                                            "Ignoring conflicting KAD ember_npub for {}:{} (first-seen key pinned until TTL)",
+                                            s.ip, s.tcp_port
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -9692,12 +9745,17 @@ pub async fn start_network(
                                         state.ember_capable_peers.insert((s.ip, s.tcp_port));
                                     }
                                     if let Some(npub) = s.ember_noise_pub {
-                                        record_ember_noise_key(
+                                        if let Some(_pinned) = record_ember_noise_key(
                                             &mut state.ember_noise_keys,
                                             s.ip,
                                             s.tcp_port,
                                             npub,
-                                        );
+                                        ) {
+                                            debug!(
+                                                "Ignoring conflicting KAD ember_npub for {}:{} (first-seen key pinned until TTL)",
+                                                s.ip, s.tcp_port
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -9777,12 +9835,17 @@ pub async fn start_network(
                                         state.ember_capable_peers.insert((s.ip, s.tcp_port));
                                     }
                                     if let Some(npub) = s.ember_noise_pub {
-                                        record_ember_noise_key(
+                                        if let Some(_pinned) = record_ember_noise_key(
                                             &mut state.ember_noise_keys,
                                             s.ip,
                                             s.tcp_port,
                                             npub,
-                                        );
+                                        ) {
+                                            debug!(
+                                                "Ignoring conflicting KAD ember_npub for {}:{} (first-seen key pinned until TTL)",
+                                                s.ip, s.tcp_port
+                                            );
+                                        }
                                     }
                                 }
                             }

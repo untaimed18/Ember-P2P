@@ -976,12 +976,12 @@
     <p>When two Ember clients connect (during a download or upload), they exchange compact lists of the files they are currently downloading along with the sources they know about for each file. If the receiving peer is downloading one of those files, it immediately gains new sources it may not have found through KAD or ED2K peer exchange alone.</p>
 
     <div class="callout-info callout">
-      <p><strong>Key point:</strong> EPX only activates between confirmed Ember peers. Detection uses the <code>ET_MOD_VERSION</code> tag (must start with "Ember") and the Ember capability bit in <code>CT_EMULE_MISCOPTIONS2</code>.</p>
+      <p><strong>Key point:</strong> EPX only activates between confirmed Ember peers. Detection uses the private <code>OP_EMBER_HELLO</code> / <code>OP_EMBER_HELLOANSWER</code> handshake. TCP EPX also requires Ed25519 proof-of-possession on the session; UDP EPX requires an authenticated Noise_IK session. Legacy <code>ET_MOD_VERSION</code> / <code>CT_EMULE_MISCOPTIONS2</code> Ember bits are not used.</p>
     </div>
 
     <h3 id="epx-wire">Wire Protocol</h3>
-    <p>EPX uses opcode <code>0xF0</code> on the eMule extended protocol (<code>OP_EMULEPROT</code>). The current version is <strong>v3</strong>. The payload format:</p>
-    <pre><code>version       (1 byte, currently 0x03)
+    <p>EPX uses opcode <code>0xF0</code> on the eMule extended protocol (<code>OP_EMULEPROT</code>). The current version is <strong>v4</strong>. The payload format:</p>
+    <pre><code>version       (1 byte, currently 0x04)
 file_count    (u16 LE)
   for each file:
     ed2k_hash   (16 bytes)
@@ -993,12 +993,16 @@ file_count    (u16 LE)
         ipv4      (4 bytes, network order)
         tcp_port  (u16 LE)
         udp_port  (u16 LE)
-        flags     (u8, bit 0 = firewalled, bit 1 = obfuscation)
+        flags     (u8, bit 0 = firewalled, bit 1 = obfuscation, bit 2 = relay-capable)
 peer_count    (u16 LE)
   for each peer:
     ipv4      (4 bytes, network order)
-    tcp_port  (u16 LE)</code></pre>
-    <p>v3 additions over v2: per-file AICH root hashes for corruption recovery, UDP port and capability flags per source, and a peer discovery section for Ember mesh building. v2 payloads are still accepted.</p>
+    tcp_port  (u16 LE)
+[optional ERAT trailer]</code></pre>
+    <p>v4 is layout-identical to v3 for the main body and adds the relay-capable flag bit plus an optional <code>ERAT</code> relay-attestation trailer. v3 parsers ignore unknown flag bits. v3 additions over v2: per-file AICH root hashes for corruption recovery, UDP port and capability flags per source, and a peer discovery section for Ember mesh building. v2 and v3 payloads are still accepted.</p>
+
+    <h3 id="epx-erat">ERAT relay attestations</h3>
+    <p>After the peer list, a v4 packet may append a trailer beginning with magic <code>ERAT</code>: version byte, attestation count (max 16), then fixed-size Ed25519-signed entries binding a relay IP/port to an expiry and capability bits. Only cryptographically valid, non-expired attestations (max TTL 30 minutes) become connection-broker relay candidates. The per-source <code>relay-capable</code> flag alone never admits a relay.</p>
 
     <h3 id="epx-limits">Safety Limits</h3>
     <p>These caps prevent abuse from poisoned or malicious payloads. Private/reserved IPs and zero-port entries are silently dropped.</p>

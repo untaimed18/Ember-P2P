@@ -61,12 +61,36 @@ for Ember mesh building. v2 and v3 payloads are still accepted.
 | Max payload size | 64 KB |
 | Max packets per TCP connection | 3 |
 | Max total sources per event | 2,000 |
+| Max relay attestations (ERAT trailer) | 16 |
+| Relay attestation max TTL | 30 minutes |
 
 Private/reserved IPs and zero-port entries are silently dropped. These caps prevent abuse from poisoned or malicious payloads.
 
+TCP EPX ingest and send require Ed25519 proof-of-possession on the session (same bar as Ember chat/browse). UDP EPX (`ExchangeData`) requires an authenticated Noise_IK session. The per-source `relay-capable` flag is advisory only — relay candidates are admitted solely from verified ERAT trailers.
+
+### ERAT — relay attestation trailer (v4)
+
+After the peer list, a v4 payload may append an optional trailer:
+
+```
+"ERAT"            (4 bytes magic)
+version           (1 byte, currently 0x01)
+count             (u16 LE, max 16)
+  for each attestation:
+    ed25519_pubkey  (32 bytes)
+    relay_ipv4      (4 bytes, network order)
+    relay_port      (u16 LE)
+    expires_at      (u64 LE, unix seconds)
+    capability_bits (u32 LE; bit 0 = relay v1)
+    reserved        (u16 LE)
+    signature       (64 bytes Ed25519 over a domain-separated payload)
+```
+
+Attestations are verified before the connection broker records a relay candidate. Invalid, expired, over-TTL, or special-use-IP attestations are dropped.
+
 ### Backward compatibility
 
-Non-Ember eMule clients silently ignore the `0xF0` opcode — it causes no errors, disconnects, or side effects. Ember detects peer support via the `ET_MOD_VERSION` tag (must start with `"Ember"`) and the Ember capability bit in `CT_EMULE_MISCOPTIONS2`. EPX is only sent to confirmed Ember peers.
+Non-Ember eMule clients silently ignore the `0xF0` opcode — it causes no errors, disconnects, or side effects. Ember detects peer support via the private `OP_EMBER_HELLO` / `OP_EMBER_HELLOANSWER` handshake (not `ET_MOD_VERSION` or `CT_EMULE_MISCOPTIONS2`). EPX is only exchanged with peers that complete Ember Hello and Ed25519 PoP on that TCP session.
 
 ## Friends — Ember-Exclusive Social Features
 

@@ -40,7 +40,10 @@ pub const SOURCE_FLAG_OBFUSCATION: u8 = 0x02;
 pub const SOURCE_FLAG_RELAY_CAPABLE: u8 = 0x04;
 
 pub const RELAY_ATTESTATION_CAP_RELAY_V1: u32 = 0x01;
-pub const RELAY_ATTESTATION_MAX_TTL_SECS: u64 = 60 * 60;
+/// Max attestation lifetime. Kept aligned with the connection broker's
+/// relay-candidate prune window (`broker.rs` tick) so a cryptographically
+/// valid ERAT cannot outlive the broker's retained candidates.
+pub const RELAY_ATTESTATION_MAX_TTL_SECS: u64 = 30 * 60;
 pub const MAX_RELAY_ATTESTATIONS: usize = 16;
 const RELAY_ATTESTATION_MAGIC: &[u8; 4] = b"ERAT";
 const RELAY_ATTESTATION_TRAILER_VERSION: u8 = 1;

@@ -3880,25 +3880,13 @@ impl UploadHandler {
             .ember_payload_generation
             .load(std::sync::atomic::Ordering::Relaxed);
         let mut last_epx_resend = std::time::Instant::now();
+        // EPX send is deferred until Ed25519 PoP succeeds on this TCP
+        // session (`ember_auth_state.is_verified()`). Sending on bare
+        // `is_ember` from OP_EMBER_HELLO would let an unauthenticated
+        // peer harvest our source/mesh hints, and peers that PoP-gate
+        // ingest would drop the packet anyway.
+        let mut epx_sent_after_pop = false;
         if hello_caps.is_ember {
-            let epx_data = self.ember_payload.read().await.clone();
-            if !epx_data.is_empty() {
-                info!(
-                    "Sending EPX to Ember peer {peer_addr} ({} bytes, gen {})",
-                    epx_data.len(),
-                    last_epx_generation
-                );
-                let _ = write_packet_async(
-                    &mut writer,
-                    OP_EMULEPROT,
-                    OP_EMBER_SOURCEEXCHANGE,
-                    &*epx_data,
-                )
-                .await;
-                self.sx_overhead.record_upload((6 + epx_data.len()) as u64);
-            } else {
-                info!("EPX payload empty, skipping EPX send to {peer_addr}");
-            }
             if let std::net::IpAddr::V4(v4) = peer_addr.ip() {
                 if hello_caps.tcp_port > 0 && !crate::security::is_special_use_v4(v4) {
                     let _ = self
@@ -4314,12 +4302,12 @@ impl UploadHandler {
             }
 
             // Re-share EPX with Ember peers when our shared payload has
-            // been rebuilt since we last sent. The check is two atomic
-            // loads + a compare; cheap enough to do every loop iteration
-            // (worst case: a 1s queued tick). We deliberately gate on
-            // `is_ember` so non-Ember peers never see the OP_EMBER_*
-            // opcode.
-            if hello_caps.is_ember && last_epx_resend.elapsed() >= EPX_RESEND_INTERVAL {
+            // been rebuilt since we last sent. Gated on PoP so we never
+            // push source/mesh hints to an unverified Ember claim.
+            if hello_caps.is_ember
+                && ember_auth_state.is_verified()
+                && last_epx_resend.elapsed() >= EPX_RESEND_INTERVAL
+            {
                 let current_gen = self
                     .ember_payload_generation
                     .load(std::sync::atomic::Ordering::Relaxed);
@@ -7371,15 +7359,14 @@ impl UploadHandler {
                     }
                 }
 
-                // Gated on `hello_caps.is_ember`. EPX is an
-                // Ember-only extension; vanilla eMule peers should
-                // never send `OP_EMBER_SOURCEEXCHANGE`. Without this
-                // guard a non-Ember (or attacker) peer could ship
-                // crafted EPX that gets parsed and ends up steering
-                // `known_ember_peers` and broker relay candidates,
-                // polluting our peer-mesh hints. Symmetric with the
-                // pubkey/binding/PoP gating on the other Ember opcodes.
-                (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE) if hello_caps.is_ember => {
+                // Gated on `hello_caps.is_ember` AND Ed25519 PoP for this
+                // TCP session. EPX injects sources into active downloads
+                // and feeds mesh/broker caches; friend/chat already require
+                // `ember_auth_state.is_verified()`, and TCP must not be
+                // weaker than the Noise_IK UDP ExchangeData path.
+                (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE)
+                    if hello_caps.is_ember && ember_auth_state.is_verified() =>
+                {
                     self.sx_overhead.record_download((6 + payload.len()) as u64);
                     if epx_packets_received >= crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION {
                         debug!("Ignoring excess EPX packet from uploading peer {peer_addr}");
@@ -7517,6 +7504,39 @@ impl UploadHandler {
                     match outcome {
                         Ok(()) => {
                             info!("Ember auth (responder): peer {peer_addr} verified (proof of possession)");
+                            // First EPX push after PoP — mirrors download
+                            // paths that only share sources once the peer
+                            // has proven possession of its Ember identity.
+                            if hello_caps.is_ember && !epx_sent_after_pop {
+                                let epx_data = self.ember_payload.read().await.clone();
+                                if !epx_data.is_empty() {
+                                    let gen = self
+                                        .ember_payload_generation
+                                        .load(std::sync::atomic::Ordering::Relaxed);
+                                    info!(
+                                        "Sending EPX to verified Ember peer {peer_addr} ({} bytes, gen {gen})",
+                                        epx_data.len()
+                                    );
+                                    if write_packet_async(
+                                        &mut writer,
+                                        OP_EMULEPROT,
+                                        OP_EMBER_SOURCEEXCHANGE,
+                                        &*epx_data,
+                                    )
+                                    .await
+                                    .is_ok()
+                                    {
+                                        last_epx_generation = gen;
+                                        last_epx_resend = std::time::Instant::now();
+                                        epx_sent_after_pop = true;
+                                        self.sx_overhead
+                                            .record_upload((6 + epx_data.len()) as u64);
+                                    }
+                                } else {
+                                    epx_sent_after_pop = true;
+                                    info!("EPX payload empty, skipping EPX send to {peer_addr}");
+                                }
+                            }
                             // PoP succeeded — claim the inbound friend
                             // session slot now. We deliberately defer
                             // this until verification completes so that
