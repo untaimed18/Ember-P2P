@@ -1286,13 +1286,13 @@ impl Ed2kDownload {
                     debug!("Received early AcceptUploadReq before file status");
                 }
                 // EPX is an Ember-only extension; gate reception on
-                // `peer_is_ember` exactly as the upload side does
-                // (`upload.rs` OP_EMBER_SOURCEEXCHANGE arm). Without this a
-                // non-Ember (or hostile) peer we're downloading from could
-                // inject crafted source/peer hints into our mesh
-                // (`known_ember_peers`, broker relay candidates).
+                // `peer_is_ember` AND Ed25519 PoP for this TCP session
+                // (`ember_auth_verified`). Without PoP, a peer that only
+                // sent a parseable OP_EMBER_HELLO could inject crafted
+                // source/peer hints into active downloads and the mesh.
                 (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE)
                     if peer_is_ember
+                        && ember_auth_verified
                         && epx_packets_received
                             < crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION =>
                 {
@@ -1569,19 +1569,19 @@ impl Ed2kDownload {
             }
         }
 
-        // Ember Peer Exchange: if peer is a Ember client, send our source list.
-        // Snapshot the generation we sent so the periodic-resend loop below
-        // can detect rebuilds that happen during file-status / queue wait.
-        // (See `multi_source.rs` for the symmetric fix.)
+        // Ember Peer Exchange: only share sources after Ed25519 PoP on
+        // this session. Snapshot the generation we sent so the periodic
+        // resend loop below can detect rebuilds during file-status /
+        // queue wait. (See `multi_source.rs` for the symmetric fix.)
         let mut initial_epx_sent_generation: Option<u64> = None;
-        if peer_is_ember {
+        if peer_is_ember && ember_auth_verified {
             let sent_gen = self
                 .ember_payload_generation
                 .load(std::sync::atomic::Ordering::Relaxed);
             let epx_data = self.ember_payload.read().await.clone();
             if !epx_data.is_empty() {
                 debug!(
-                    "Sending Ember Peer Exchange to {} ({} bytes, gen {})",
+                    "Sending Ember Peer Exchange to verified peer {} ({} bytes, gen {})",
                     self.source_addr,
                     epx_data.len(),
                     sent_gen
@@ -1596,6 +1596,8 @@ impl Ed2kDownload {
                 self.sx_overhead.record_upload((6 + epx_data.len()) as u64);
                 initial_epx_sent_generation = Some(sent_gen);
             }
+        }
+        if peer_is_ember {
             if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
                 let peer_tcp = self.source_addr.port();
                 if peer_tcp > 0 && !crate::security::is_special_use_v4(v4) {
@@ -1936,8 +1938,10 @@ impl Ed2kDownload {
                         }
                     }
                 }
-                // Ember-only; gated on `peer_is_ember` (see upload.rs).
-                (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE) if peer_is_ember => {
+                // Ember-only; gated on `peer_is_ember` + PoP (see upload.rs).
+                (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE)
+                    if peer_is_ember && ember_auth_verified =>
+                {
                     self.sx_overhead.record_download((6 + payload.len()) as u64);
                     if epx_packets_received >= crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION
                     {
@@ -2111,6 +2115,35 @@ impl Ed2kDownload {
                                             self.source_addr,
                                             auth_deferred.len()
                                         );
+                                        if initial_epx_sent_generation.is_none() {
+                                            let sent_gen = self
+                                                .ember_payload_generation
+                                                .load(std::sync::atomic::Ordering::Relaxed);
+                                            let epx_data = self.ember_payload.read().await.clone();
+                                            if !epx_data.is_empty() {
+                                                debug!(
+                                                    "Sending Ember Peer Exchange to newly verified peer {} ({} bytes, gen {})",
+                                                    self.source_addr,
+                                                    epx_data.len(),
+                                                    sent_gen
+                                                );
+                                                if write_packet_async(
+                                                    &mut writer,
+                                                    OP_EMULEPROT,
+                                                    OP_EMBER_SOURCEEXCHANGE,
+                                                    &*epx_data,
+                                                )
+                                                .await
+                                                .is_ok()
+                                                {
+                                                    self.sx_overhead
+                                                        .record_upload((6 + epx_data.len()) as u64);
+                                                    initial_epx_sent_generation = Some(sent_gen);
+                                                }
+                                            } else {
+                                                initial_epx_sent_generation = Some(sent_gen);
+                                            }
+                                        }
                                         if !friend_seen_emitted {
                                             if let (true, Some(eh)) =
                                                 (peer_is_friend, peer_ember_hash)
@@ -2946,7 +2979,10 @@ impl Ed2kDownload {
                     self.check_control().await?;
 
                     // Periodic EPX re-send: if payload has been rebuilt and 5min elapsed
-                    if peer_is_ember && last_epx_resend.elapsed() >= EPX_RESEND_INTERVAL {
+                    if peer_is_ember
+                        && ember_auth_verified
+                        && last_epx_resend.elapsed() >= EPX_RESEND_INTERVAL
+                    {
                         let current_gen = self
                             .ember_payload_generation
                             .load(std::sync::atomic::Ordering::Relaxed);
@@ -3512,8 +3548,10 @@ impl Ed2kDownload {
                                 }
                             }
                         }
-                        // Ember-only; gated on `peer_is_ember` (see upload.rs).
-                        (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE) if peer_is_ember => {
+                        // Ember-only; gated on `peer_is_ember` + PoP (see upload.rs).
+                        (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE)
+                            if peer_is_ember && ember_auth_verified =>
+                        {
                             self.sx_overhead.record_download((6 + payload.len()) as u64);
                             if epx_packets_received
                                 >= crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION

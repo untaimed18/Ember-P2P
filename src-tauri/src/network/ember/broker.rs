@@ -35,6 +35,13 @@ const RELAY_TIMEOUT: Duration = Duration::from_secs(30);
 const ATTEMPT_COOLDOWN: Duration = Duration::from_secs(120);
 const ATTEMPT_RESET: Duration = Duration::from_secs(600);
 const MAX_ATTEMPTS_PER_SOURCE: u32 = 3;
+/// Prefer fresh candidates when picking a relay; older-but-still-retained
+/// entries remain until `RELAY_CANDIDATE_PRUNE_MAX_AGE`.
+const RELAY_CANDIDATE_PICK_MAX_AGE: Duration = Duration::from_secs(600);
+/// Must match `super::RELAY_ATTESTATION_MAX_TTL_SECS` so broker retention
+/// cannot outlive (or trail) cryptographically accepted ERAT lifetimes.
+const RELAY_CANDIDATE_PRUNE_MAX_AGE: Duration =
+    Duration::from_secs(super::RELAY_ATTESTATION_MAX_TTL_SECS);
 
 /// Outcome of a successful broker connection attempt.
 pub struct BrokerConnection {
@@ -467,10 +474,9 @@ impl ConnectionBroker {
 
     /// Pick the best available relay candidate (fewest sessions, most recent).
     fn pick_relay_candidate(&self) -> Option<&RelayCandidate> {
-        let stale_threshold = Duration::from_secs(600);
         self.relay_candidates
             .iter()
-            .filter(|c| c.last_seen.elapsed() < stale_threshold)
+            .filter(|c| c.last_seen.elapsed() < RELAY_CANDIDATE_PICK_MAX_AGE)
             .min_by_key(|c| (c.relay_sessions, c.last_seen.elapsed().as_secs()))
     }
 
@@ -501,10 +507,9 @@ impl ConnectionBroker {
             }
         }
 
-        // Prune stale relay candidates
-        let stale = Duration::from_secs(1800);
+        // Prune stale relay candidates (aligned with ERAT max TTL).
         self.relay_candidates
-            .retain(|c| c.last_seen.elapsed() < stale);
+            .retain(|c| c.last_seen.elapsed() < RELAY_CANDIDATE_PRUNE_MAX_AGE);
 
         // Prune old cooldowns
         self.cooldowns

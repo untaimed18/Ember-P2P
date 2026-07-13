@@ -363,10 +363,9 @@ pub struct PeerCapabilities {
     pub version_update: u8,
     pub mod_version: String,
     pub peer_name: String,
-    /// Ember Peer Exchange support (MISCOPTIONS2 bit 20)
+    /// Ember peer — set only from `OP_EMBER_HELLO` / `OP_EMBER_HELLOANSWER`
+    /// (never from MISCOPTIONS2; that legacy in-band signal was removed).
     pub is_ember: bool,
-    /// EPX protocol version (MISCOPTIONS2 bits 21-23, 0-7)
-    pub epx_version: u8,
     /// Ember-specific identity hash for the friend system (from EmuleInfo tag 0x56)
     pub ember_hash: Option<[u8; 16]>,
     /// Ed25519 public key for Ember auth (from EmuleInfo tag 0x57)
@@ -1060,15 +1059,13 @@ pub fn parse_hello_answer(payload: &[u8]) -> io::Result<([u8; 16], PeerCapabilit
                 caps.supports_preview = (int_val & 0x01) != 0;
             }
             0xFE => {
-                // `is_ember` and `epx_version` used to be harvested from
-                // bits 20 and 21-23 of MISCOPTIONS2 — a legacy in-band
-                // signal. We removed both: vanilla eMule never sets these
-                // bits and our `build_misc_options2` doesn't either,
-                // so the only peers that would set them are old Ember
-                // builds. Modern Ember peer detection uses
+                // `is_ember` (and the old unused `epx_version` field) used
+                // to be harvested from bits 20 and 21-23 of MISCOPTIONS2 —
+                // a legacy in-band signal. We removed both: vanilla eMule
+                // never sets these bits and our `build_misc_options2`
+                // doesn't either. Modern Ember peer detection uses
                 // `OP_EMBER_HELLO` (see `parse_ember_hello`) which gives
-                // us not just is_ember but also nickname, mod_version,
-                // and pubkey in one round-trip.
+                // us is_ember plus nickname, mod_version, and pubkey.
                 caps.supports_file_ident = ((int_val >> 13) & 0x01) != 0;
                 caps.supports_direct_udp_callback = ((int_val >> 12) & 0x01) != 0;
                 caps.supports_captcha = ((int_val >> 11) & 0x01) != 0;
@@ -1586,7 +1583,6 @@ pub fn merge_caps(base: &mut PeerCapabilities, update: PeerCapabilities) {
         base.peer_name = update.peer_name;
     }
     base.is_ember |= update.is_ember;
-    base.epx_version = base.epx_version.max(update.epx_version);
     if update.ember_hash.is_some() {
         base.ember_hash = update.ember_hash;
     }
