@@ -341,6 +341,9 @@ pub fn run() {
                 storage::known_files::migrate_aich_v2(&data_dir);
             }
 
+            // Allow WebView media playback for files under shared/download dirs.
+            commands::sharing::sync_asset_protocol_scope(&app_handle, &config);
+
             app.manage(AppState {
                 network_tx,
                 db: db.clone(),
@@ -923,6 +926,7 @@ pub fn run() {
             commands::sharing::stop_hashing,
             commands::sharing::resume_hashing,
             commands::sharing::open_shared_file,
+            commands::sharing::resolve_media_asset_path,
             commands::sharing::open_shared_folder,
             commands::sharing::delete_shared_file,
             commands::sharing::republish_file,

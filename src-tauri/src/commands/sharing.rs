@@ -178,7 +178,7 @@ fn load_known_files() -> KnownFileList {
     KnownFileList::load(&data_dir.join("known.met"))
 }
 
-fn shared_access_dirs(config: &crate::storage::config::AppConfig) -> Vec<String> {
+pub(crate) fn shared_access_dirs(config: &crate::storage::config::AppConfig) -> Vec<String> {
     let mut allowed_dirs = config.settings.shared_folders.clone();
     let download_dir = std::path::PathBuf::from(&config.settings.download_folder)
         .join("Downloads")
@@ -187,6 +187,51 @@ fn shared_access_dirs(config: &crate::storage::config::AppConfig) -> Vec<String>
     allowed_dirs.push(download_dir);
     allowed_dirs.push(config.settings.download_folder.clone());
     allowed_dirs
+}
+
+/// Previously applied asset-protocol directory roots (for logging / future
+/// reconciliation). Removals intentionally do **not** call `forbid_directory`:
+/// forbid permanently wins over allow in Tauri's scope, so removing then
+/// re-adding a shared folder would leave in-app playback broken until restart.
+/// Access is still gated per request by `resolve_media_asset_path`.
+static ASSET_SCOPE_DIRS: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
+
+/// Keep the WebView asset protocol aligned with folders the UI may open for
+/// in-app playback (shared folders + download tree). Called on startup and
+/// whenever those paths change.
+pub(crate) fn sync_asset_protocol_scope(
+    app: &tauri::AppHandle,
+    config: &crate::storage::config::AppConfig,
+) {
+    use tauri::Manager;
+
+    let new_dirs: Vec<String> = shared_access_dirs(config)
+        .into_iter()
+        .filter(|d| !d.trim().is_empty())
+        .collect();
+    let scope = app.asset_protocol_scope();
+    let mut prev = ASSET_SCOPE_DIRS.lock();
+
+    for dir in &new_dirs {
+        if let Err(e) = scope.allow_directory(dir, true) {
+            warn!("Failed to allow asset protocol scope for {dir}: {e}");
+        }
+    }
+
+    *prev = new_dirs;
+}
+
+/// Strip Windows verbatim (`\\?\`) prefixes so `convertFileSrc` / WebView2 get
+/// a user-namespace path (matches explorer open helpers elsewhere).
+fn path_for_asset_url(canonical: &std::path::Path) -> String {
+    let raw = canonical.to_string_lossy();
+    if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        raw.into_owned()
+    }
 }
 
 pub(crate) fn file_in_shared_folders(file_path: &str, shared_folders: &[String]) -> bool {
@@ -437,6 +482,10 @@ pub async fn add_shared_folder(
     if let Some(watcher) = state.shared_folder_watcher.as_ref() {
         let folders = state.config.read().await.settings.shared_folders.clone();
         watcher.sync_paths(&folders);
+    }
+    {
+        let config = state.config.read().await;
+        sync_asset_protocol_scope(&app, &config);
     }
 
     let local_index = state.local_index.clone();
@@ -830,6 +879,10 @@ pub async fn remove_shared_folder(
     if let Some(watcher) = state.shared_folder_watcher.as_ref() {
         let folders = state.config.read().await.settings.shared_folders.clone();
         watcher.sync_paths(&folders);
+    }
+    {
+        let config = state.config.read().await;
+        sync_asset_protocol_scope(&app, &config);
     }
 
     reconcile_shared_files_best_effort(&state.network_tx).await;
@@ -1947,6 +2000,54 @@ pub async fn open_shared_file(
         opener::open(&canonical)
             .map_err(|e| coded_ctx("sharing_open_file_failed", "Failed to open file", e))?;
         Ok(())
+    })
+    .await
+    .map_err(|e| coded_ctx("sharing_task_failed", "Task failed", e))?
+}
+
+/// Validate that `file_path` is a real file inside a shared/download folder and
+/// return its canonical path for `convertFileSrc` / in-app media playback.
+#[tauri::command]
+pub async fn resolve_media_asset_path(
+    state: tauri::State<'_, AppState>,
+    file_path: String,
+) -> Result<String, String> {
+    if file_path.len() > MAX_PATH_LEN {
+        return Err(coded_ctx(
+            "sharing_file_path_too_long",
+            format!("File path exceeds {MAX_PATH_LEN} bytes"),
+            MAX_PATH_LEN,
+        ));
+    }
+    let allowed_dirs = {
+        let config = state.config.read().await;
+        shared_access_dirs(&config)
+    };
+
+    tokio::task::spawn_blocking(move || {
+        let path = std::path::Path::new(&file_path);
+        if !path.exists() {
+            return Err(coded("sharing_file_not_exist", "File does not exist"));
+        }
+        if !path.is_file() {
+            return Err(coded("sharing_not_a_file", "Path is not a file"));
+        }
+        let canonical = path
+            .canonicalize()
+            .map_err(|e| coded_ctx("sharing_invalid_path", "Invalid path", e))?;
+        if !crate::security::is_path_within_dirs(&canonical, &allowed_dirs) {
+            return Err(coded(
+                "sharing_file_not_in_shared",
+                "File is not within a shared or download folder",
+            ));
+        }
+        if crate::security::is_dangerous_extension(&canonical.to_string_lossy()) {
+            return Err(coded(
+                "sharing_dangerous_file",
+                "Cannot open potentially dangerous file types",
+            ));
+        }
+        Ok(path_for_asset_url(&canonical))
     })
     .await
     .map_err(|e| coded_ctx("sharing_task_failed", "Task failed", e))?

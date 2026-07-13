@@ -508,6 +508,7 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn update_settings(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     settings: AppSettings,
 ) -> Result<String, String> {
@@ -623,6 +624,10 @@ pub async fn update_settings(
     // added folders, and needlessly watching removed ones).
     if let Some(watcher) = state.shared_folder_watcher.as_ref() {
         watcher.sync_paths(&settings.shared_folders);
+    }
+    {
+        let config = state.config.read().await;
+        crate::commands::sharing::sync_asset_protocol_scope(&app, &config);
     }
 
     // Settings are already persisted to disk above; if the runtime update
