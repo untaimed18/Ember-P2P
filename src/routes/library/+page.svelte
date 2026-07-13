@@ -39,6 +39,7 @@
 
   import { listen } from '@tauri-apps/api/event';
   import LibraryVirtualTable from '$lib/components/LibraryVirtualTable.svelte';
+  import LibraryMediaPlayer from '$lib/components/LibraryMediaPlayer.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import IconX from '$lib/components/IconX.svelte';
   import * as m from '$lib/paraglide/messages';
@@ -91,6 +92,11 @@
   let selectedFile = $derived(selectedPath ? (fileByPath.get(selectedPath) ?? null) : null);
   let selectedHash = $derived.by(() => selectedFile?.hash || null);
   let selectedMedia: MediaMetadata | null = $state(null);
+  /** In-app play requests: bump `mediaPlayId` with the target path. */
+  let mediaPlayId = $state(0);
+  let mediaPlayPath: string | null = $state(null);
+  /** Bumped to pause the in-app player (e.g. before Open Externally). */
+  let playerStopToken = $state(0);
 
   let hashedLibraryFiles = $derived.by(() => files.filter((f) => !!f.hash));
 
@@ -554,6 +560,27 @@
   }
 
   async function openSharedFile(path: string) {
+    const file = fileByPath.get(path);
+    const ext = file?.extension || extensionFromPath(path);
+    if (playableKind(ext)) {
+      if (selectedPath !== path) {
+        selectedPath = path;
+      }
+      mediaPlayPath = path;
+      mediaPlayId += 1;
+      return;
+    }
+    try {
+      await openSharedFileCommand(path);
+    } catch (e: unknown) {
+      error = toErr(e);
+      toastError(error);
+    }
+  }
+
+  async function openSharedFileExternally(path: string) {
+    // Stop in-app playback before handing the file to the OS player.
+    playerStopToken += 1;
     try {
       await openSharedFileCommand(path);
     } catch (e: unknown) {
@@ -1079,6 +1106,9 @@
     'rmm','rmvb','rv','smil','smk','swf','tp','ts','vid','video','vob',
     'vp6','webm','wm','wmv','xvid',
   ]);
+  /** Formats WebView2 / Media Foundation commonly decode without extra codecs. */
+  const playableAudioExts = new Set(['aac', 'flac', 'm4a', 'mp3', 'ogg', 'opus', 'wav']);
+  const playableVideoExts = new Set(['m4v', 'mov', 'mp4', 'webm']);
   const imageExts = new Set([
     'bmp','emf','gif','ico','jfif','jpe','jpeg','jpg','pct','pcx','pic',
     'pict','png','psd','psp','svg','tga','tif','tiff','webp','wmf','wmp','xif',
@@ -1097,6 +1127,21 @@
     'bin','bwa','bwi','bws','bwt','ccd','cue','dmg','img','iso',
     'mdf','mds','nrg','sub','toast',
   ]);
+  function playableKind(ext: string): 'audio' | 'video' | null {
+    const lower = ext.toLowerCase();
+    if (playableAudioExts.has(lower)) return 'audio';
+    if (playableVideoExts.has(lower)) return 'video';
+    return null;
+  }
+  function extensionFromPath(path: string): string {
+    const base = path.replace(/^.*[/\\]/, '');
+    const dot = base.lastIndexOf('.');
+    if (dot <= 0 || dot === base.length - 1) return '';
+    return base.slice(dot + 1);
+  }
+  let selectedPlayableKind = $derived(
+    selectedFile ? playableKind(selectedFile.extension || extensionFromPath(selectedFile.path)) : null,
+  );
   function fileType(ext: string): string {
     const lower = ext.toLowerCase();
     if (audioExts.has(lower)) return m.library_type_audio();
@@ -2646,15 +2691,38 @@
           </div>
         {/if}
 
+        {#if selectedPlayableKind && selectedPath}
+          {#key selectedPath}
+            <LibraryMediaPlayer
+              path={selectedPath}
+              kind={selectedPlayableKind}
+              playId={mediaPlayId}
+              playPath={mediaPlayPath}
+              stopToken={playerStopToken}
+            />
+          {/key}
+        {/if}
+
         <div class="drawer-actions">
-          <button class="drawer-action-btn" onclick={() => openSharedFile(selectedFile.path)} title={m.library_open_file_title()}>
-            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
-              <path d="M2 2.5h4.5l1.5 2H14v9H2z"/>
-              <path d="M6 8.5l2 2 2-2"/>
-              <line x1="8" y1="5" x2="8" y2="10.5"/>
-            </svg>
-            {m.library_open_file()}
-          </button>
+          {#if selectedPlayableKind}
+            <button class="drawer-action-btn" onclick={() => openSharedFileExternally(selectedFile.path)} title={m.library_open_externally_title()}>
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
+                <path d="M9 3h4v4"/>
+                <path d="M13 3L7 9"/>
+                <path d="M7 3H3.5A1.5 1.5 0 0 0 2 4.5v7A1.5 1.5 0 0 0 3.5 13h7A1.5 1.5 0 0 0 12 11.5V8"/>
+              </svg>
+              {m.library_open_externally()}
+            </button>
+          {:else}
+            <button class="drawer-action-btn" onclick={() => openSharedFile(selectedFile.path)} title={m.library_open_file_title()}>
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
+                <path d="M2 2.5h4.5l1.5 2H14v9H2z"/>
+                <path d="M6 8.5l2 2 2-2"/>
+                <line x1="8" y1="5" x2="8" y2="10.5"/>
+              </svg>
+              {m.library_open_file()}
+            </button>
+          {/if}
           <button class="drawer-action-btn" onclick={() => openSharedFolder(selectedFile.path)} title={m.library_open_folder_title()}>
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
               <path d="M2 2.5h4.5l1.5 2H14v9H2z"/>

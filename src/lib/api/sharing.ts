@@ -96,6 +96,11 @@ export async function openSharedFolder(filePath: string): Promise<void> {
   return invoke('open_shared_folder', { filePath });
 }
 
+/** Canonical path safe for convertFileSrc / in-app media playback. */
+export async function resolveMediaAssetPath(filePath: string): Promise<string> {
+  return invoke('resolve_media_asset_path', { filePath });
+}
+
 export async function deleteSharedFile(filePath: string, fileHash?: string): Promise<void> {
   return invoke('delete_shared_file', { filePath, fileHash });
 }
