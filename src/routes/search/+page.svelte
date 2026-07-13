@@ -1758,7 +1758,12 @@
     <!-- Also show Stop while a server retry is in flight (isSearching is
          false then, but retryRequestId is set) so the user can cancel it;
          stopSearch already cancels the retry leg. -->
-    <button class="stop-btn" onclick={() => stopSearch()}>{m.common_stop()}</button>
+    <button class="stop-btn" type="button" onclick={() => stopSearch()}>
+      <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true">
+        <rect x="3.5" y="3.5" width="9" height="9" rx="2"/>
+      </svg>
+      {m.common_stop()}
+    </button>
   {:else}
     <button onclick={() => handleSearch(barQuery)}>{m.search_title()}</button>
   {/if}
@@ -1795,34 +1800,35 @@
             <span class="search-tab-spinner" aria-hidden="true"></span>
           {/if}
         </button>
-        {#if tab.isSearching || tab.retryRequestId != null}
-          <!-- Lets a search running in a background tab be stopped without
-               switching to it first — the toolbar Stop button only ever
-               acts on `activeTab`. -->
+        <div class="search-tab-actions">
+          {#if tab.isSearching || tab.retryRequestId != null}
+            <!-- Lets a search running in a background tab be stopped without
+                 switching to it first — the toolbar Stop button only ever
+                 acts on `activeTab`. -->
+            <button
+              type="button"
+              class="search-tab-action search-tab-stop"
+              onclick={() => stopSearch(tab.id)}
+              title={m.search_stop_tab()}
+              aria-label={m.search_stop_tab_aria()}
+            >
+              <svg viewBox="0 0 16 16" width="11" height="11" fill="currentColor" aria-hidden="true">
+                <rect x="4" y="4" width="8" height="8" rx="1.75"/>
+              </svg>
+            </button>
+          {/if}
           <button
             type="button"
-            class="search-tab-stop"
-            onclick={() => stopSearch(tab.id)}
-            title={m.search_stop_tab()}
-            aria-label={m.search_stop_tab_aria()}
+            class="search-tab-action search-tab-close"
+            onclick={() => requestCloseSearchTab(tab)}
+            title={m.search_close_tab()}
+            aria-label={m.search_close_tab_aria()}
           >
-            <svg viewBox="0 0 14 14" width="10" height="10" fill="currentColor" aria-hidden="true">
-              <rect x="2" y="2" width="10" height="10" rx="1.5"/>
+            <svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+              <path d="M4.25 4.25l7.5 7.5M11.75 4.25l-7.5 7.5"/>
             </svg>
           </button>
-        {/if}
-        <button
-          type="button"
-          class="search-tab-close"
-          onclick={() => requestCloseSearchTab(tab)}
-          title={m.search_close_tab()}
-          aria-label={m.search_close_tab_aria()}
-        >
-          <svg viewBox="0 0 14 14" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
-            <line x1="3.5" y1="3.5" x2="10.5" y2="10.5"/>
-            <line x1="10.5" y1="3.5" x2="3.5" y2="10.5"/>
-          </svg>
-        </button>
+        </div>
       </div>
     {/each}
   </div>
@@ -2665,63 +2671,65 @@
     }
   }
 
-  .search-tab-stop {
-    width: 26px;
+  .search-tab-actions {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    padding: 4px 5px 4px 4px;
+    border-left: 1px solid var(--border);
+    flex-shrink: 0;
+    background: color-mix(in srgb, var(--bg-tertiary) 35%, transparent);
+  }
+
+  .search-tab.active .search-tab-actions {
+    background: color-mix(in srgb, var(--accent-dim) 28%, transparent);
+  }
+
+  .search-tab-action {
+    width: 24px;
+    height: 24px;
     padding: 0;
     border: none;
-    border-left: 1px solid var(--border);
+    border-radius: var(--radius-sm);
     background: transparent;
     color: var(--text-muted);
-    display: flex;
+    display: inline-flex;
     align-items: center;
     justify-content: center;
     cursor: pointer;
-    transition: color 0.15s ease, background-color 0.15s ease, opacity 0.12s ease;
-    opacity: 0.55;
+    flex-shrink: 0;
+    transition:
+      color 0.14s ease,
+      background-color 0.14s ease,
+      transform 0.1s ease;
   }
 
-  .search-tab:hover .search-tab-stop,
-  .search-tab.active .search-tab-stop {
-    opacity: 1;
-  }
-
-  .search-tab-stop:focus-visible {
+  .search-tab-action:focus-visible {
     outline: 2px solid var(--accent);
-    outline-offset: -2px;
+    outline-offset: 1px;
   }
 
-  .search-tab-stop:hover {
-    color: var(--accent);
-    background: var(--bg-hover);
+  .search-tab-action:active {
+    transform: scale(0.94);
   }
 
-  .search-tab-close {
-    width: 30px;
-    padding: 0;
-    border: none;
-    border-left: 1px solid var(--border);
-    background: transparent;
-    color: var(--text-muted);
-    font-size: 17px;
-    line-height: 1;
-    cursor: pointer;
-    transition: color 0.15s ease, background-color 0.15s ease, opacity 0.12s ease;
-    opacity: 0.55;
-  }
-
-  .search-tab:hover .search-tab-close,
-  .search-tab.active .search-tab-close {
-    opacity: 1;
-  }
-
-  .search-tab-close:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: -2px;
-  }
-
-  .search-tab-close:hover {
+  .search-tab-stop {
     color: var(--danger);
-    background: var(--bg-hover);
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
+  }
+
+  .search-tab-stop:hover,
+  .search-tab-stop:focus-visible {
+    color: var(--on-danger);
+    background: var(--danger);
+    outline-color: var(--danger);
+  }
+
+  .search-tab-close:hover,
+  .search-tab-close:focus-visible {
+    color: var(--danger);
+    background: color-mix(in srgb, var(--danger) 14%, transparent);
+    outline-color: var(--danger);
   }
 
   @media (max-width: 760px) {
@@ -3265,18 +3273,33 @@
   }
 
   .stop-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
     background: var(--danger);
     color: var(--on-danger);
     border: none;
     border-radius: var(--radius-md);
-    padding: 8px 18px;
+    padding: 8px 16px 8px 14px;
     font-weight: 600;
     cursor: pointer;
     flex-shrink: 0;
+    box-shadow: 0 1px 0 color-mix(in srgb, #000 12%, transparent);
+    transition: background-color 0.15s ease, transform 0.1s ease, box-shadow 0.15s ease;
   }
 
   .stop-btn:hover {
-    opacity: 0.85;
+    background: var(--danger-hover);
+  }
+
+  .stop-btn:active {
+    transform: translateY(1px);
+    box-shadow: none;
+  }
+
+  .stop-btn:focus-visible {
+    outline: 2px solid var(--danger);
+    outline-offset: 2px;
   }
 
   .searching-indicator {

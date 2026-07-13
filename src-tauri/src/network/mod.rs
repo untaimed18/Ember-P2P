@@ -42,7 +42,8 @@ use self::kad::bootstrap;
 use self::kad::buddy::{BuddyEvent, BuddyManager, BuddyState, BuddyWriteStream, PendingBuddySet};
 use self::kad::firewall::FirewallChecker;
 use self::kad::ip_filter::{IpFilter, IpFilterStats};
-use self::kad::messages::{self, KadMessage, KADEMLIA_FIND_NODE};
+use self::kad::legacy_challenge::LegacyChallengeTracker;
+use self::kad::messages::{self, KadMessage};
 use self::kad::obfuscation;
 use self::kad::protection::FloodProtection;
 use self::kad::publish::{
@@ -3221,6 +3222,8 @@ struct NetworkState {
     /// Nodes that reported load=100 -- avoid publishing to them for a while
     overloaded_nodes: HashMap<Ipv4Addr, i64>,
     flood_protection: FloodProtection,
+    /// Pending Kad <7 (and crypt-off) Hello verification challenges.
+    legacy_challenges: LegacyChallengeTracker,
     buddy_manager: BuddyManager,
     /// Our UDP verification key seed (random, stable for session)
     udp_key_seed: u32,
@@ -5725,6 +5728,7 @@ pub async fn start_network(
         notes_publish_cursor: None,
         overloaded_nodes: HashMap::new(),
         flood_protection: FloodProtection::new(),
+        legacy_challenges: LegacyChallengeTracker::new(),
         buddy_manager,
         udp_key_seed,
         tcp_port,
@@ -19933,25 +19937,22 @@ async fn send_kad_packet(
     result
 }
 
-/// Resolve the KAD id to trust for a store-side operation. We prefer the
-/// KAD id already in our routing table for the source IP:port, because that
-/// entry was either added after a successful Hello (verified path) or from
-/// nodes.dat (booted from disk). We only fall back to the wire `claimed`
-/// value when we have no contact at that address, which is the common case
-/// for unsolicited publish requests. This stops a single IP from writing
-/// per-sender entries under arbitrary KAD IDs to poison the store.
-/// Identity we use for DHT store accounting when a publish arrives from a
-/// peer whose `claimed` `KadId` we can't cross-check against the routing
-/// table. K6: the previous behaviour was to trust the wire value, which
-/// let one IP rotate claimed IDs on every publish to occupy many logical
-/// publisher slots. We now derive a deterministic-but-unspoofable ID by
-/// hashing `(ip, port)` into the 128-bit KadId space so the same peer
-/// always resolves to the same synthetic identity regardless of what
-/// they claim on the wire.
-fn resolve_verified_sender_id(state: &NetworkState, from: SocketAddr, claimed: &KadId) -> KadId {
+fn from_ip_v4(from: SocketAddr) -> Option<Ipv4Addr> {
+    match from.ip() {
+        std::net::IpAddr::V4(v4) => Some(v4),
+        _ => None,
+    }
+}
+
+/// Resolve the publisher identity for keyword-index accounting when the
+/// publish packet has no wire client hash (PublishKeyReq). Derive a stable
+/// ID from `(ip, port)` so one address cannot rotate claimed IDs to occupy
+/// many logical publisher slots. Source/Notes publishes use the wire
+/// `sender_id` directly (eMule `m_uSourceID.SetValue(uTarget)`).
+fn resolve_keyword_publisher_id(state: &NetworkState, from: SocketAddr) -> KadId {
     let v4 = match from.ip() {
         std::net::IpAddr::V4(v4) => v4,
-        _ => return *claimed,
+        _ => return KadId::zero(),
     };
     if let Some(c) = state
         .routing_table
@@ -19960,10 +19961,6 @@ fn resolve_verified_sender_id(state: &NetworkState, from: SocketAddr, claimed: &
     {
         return c.id;
     }
-    // Unknown sender — synthesize a stable ID from the socket pair.
-    // MD5 is enough here: we're hashing into an opaque 16-byte identity
-    // namespace, not making a cryptographic claim. Prefix distinguishes
-    // these synthetic IDs in logs / debug tools.
     use digest::Digest;
     let mut h = md5::Md5::new();
     h.update(b"ember-kad-unknown-sender-v1");
@@ -19973,6 +19970,64 @@ fn resolve_verified_sender_id(state: &NetworkState, from: SocketAddr, claimed: &
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest);
     KadId(bytes)
+}
+
+/// eMule Hello challenge when a contact lacks a valid receiver UDP key:
+/// - Kad < 7: `KADEMLIA2_REQ` with a random target (legacy challenge)
+/// - Kad == 7: Ping challenge
+/// - Kad ≥ 8 with obfuscation disabled: Req challenge (plaintext verify path;
+///   HelloResAck cannot prove identity without crypt)
+async fn maybe_send_hello_challenge(
+    socket: &UdpSocket,
+    from: SocketAddr,
+    ip: Ipv4Addr,
+    contact_id: KadId,
+    version: u8,
+    state: &mut NetworkState,
+    peer_udp_key: Option<KadUDPKey>,
+) {
+    if state.legacy_challenges.has_active(ip) {
+        return;
+    }
+
+    if version < KADEMLIA_VERSION7_49A
+        || (version >= KADEMLIA_VERSION8_49B && !state.obfuscation_enabled)
+    {
+        let mut challenge = KadId::random();
+        if challenge == KadId::zero() {
+            challenge = KadId::from_u32(1);
+        }
+        let req = KadMessage::KadReq {
+            search_type: messages::KADEMLIA_FIND_VALUE,
+            target: challenge,
+            receiver: contact_id,
+        };
+        if let Ok(packet) = messages::encode_packet(&req) {
+            state
+                .legacy_challenges
+                .add(contact_id, challenge, ip, LegacyChallengeTracker::OPCODE_REQ);
+            state
+                .flood_protection
+                .track_request(from, messages::KADEMLIA2_REQ);
+            let _ = send_kad_response(socket, &packet, from, state, Some(&contact_id), peer_udp_key)
+                .await;
+            debug!("Sent legacy KadReq challenge to {from} (version={version})");
+        }
+    } else if version == KADEMLIA_VERSION7_49A {
+        let ping = KadMessage::Ping;
+        if let Ok(packet) = messages::encode_packet(&ping) {
+            state.legacy_challenges.add(
+                contact_id,
+                KadId::zero(),
+                ip,
+                LegacyChallengeTracker::OPCODE_PING,
+            );
+            state.flood_protection.track_request(from, 0x60);
+            let _ = send_kad_response(socket, &packet, from, state, Some(&contact_id), peer_udp_key)
+                .await;
+            debug!("Sent legacy Ping challenge to {from}");
+        }
+    }
 }
 
 async fn send_kad_response(
@@ -21393,23 +21448,21 @@ async fn handle_udp_packet_inner(
             // contact as `verified` when the local routing table was
             // empty. That let a single malicious bootstrap peer poison
             // the routing table end-to-end at first launch. Now we insert
-            // them unverified and let the normal handshake / UDP-key
-            // exchange flow promote them. Up to the first 8 contacts get
-            // an immediate Hello via `contact_addrs` below to bootstrap
-            // liveness; the rest wait to be verified lazily as they're
-            // touched.
-            let mut contact_addrs = Vec::new();
-            for c in contacts {
+            // them unverified and Hello the first 8 so the normal
+            // handshake / UDP-key (or legacy challenge) path can promote
+            // them. Remaining contacts wait to be verified lazily.
+            let mut hello_addrs: Vec<(SocketAddr, KadId, u8)> = Vec::new();
+            for (i, c) in contacts.into_iter().enumerate() {
                 let addr = SocketAddr::new(c.ip.into(), c.udp_port);
-                contact_addrs.push(addr);
+                let id = c.id;
+                let ver = c.version;
+                if i < 8 {
+                    hello_addrs.push((addr, id, ver));
+                }
                 state.routing_table.insert(c);
             }
 
-            // eMule Process_KADEMLIA2_BOOTSTRAP_RES: only adds contacts to routing
-            // zone. Does NOT chain-bootstrap or send HelloReq to returned contacts.
-            // The periodic bootstrap timer and self-lookup handle further discovery.
-
-            // Send HelloReq only to the bootstrap node itself (not all returned contacts)
+            // Hello the bootstrap node itself, then the first returned contacts.
             let hello = KadMessage::HelloReq {
                 sender_id: state.local_id,
                 tcp_port: state.tcp_port,
@@ -21457,6 +21510,13 @@ async fn handle_udp_packet_inner(
                 )
                 .await;
                 debug!("Sent HelloReq to bootstrap node {from}");
+            }
+
+            if let Ok(packet) = messages::encode_packet(&hello) {
+                for (addr, id, _ver) in hello_addrs {
+                    state.flood_protection.track_request(addr, 0x11);
+                    let _ = send_kad_packet(socket, &packet, addr, state, &id).await;
+                }
             }
 
             let table_size = state.routing_table.len();
@@ -21571,10 +21631,12 @@ async fn handle_udp_packet_inner(
                 state.routing_table.mark_verified(&sender_id);
             }
 
-            // Build our firewall options + UDP verify key for the peer
-            // Bit 0: UDP firewalled, bit 1: TCP firewalled, bit 2: request ACK
-            // eMule: only request ACK if the contact was added and not yet verified
-            let needs_ack = !valid_receiver_key && version >= KADEMLIA_VERSION8_49B;
+            // eMule: only request ACK when crypt is on and the peer is Kad ≥8.
+            // When obfuscation is disabled, HelloResAck cannot carry a valid
+            // receiver key, so we fall through to a plaintext legacy challenge.
+            let needs_ack = !valid_receiver_key
+                && version >= KADEMLIA_VERSION8_49B
+                && state.obfuscation_enabled;
             let mut res_tags = Vec::new();
             if state.external_udp_port.unwrap_or(state.udp_port) == state.udp_port {
                 res_tags.push(KadTag {
@@ -21620,20 +21682,22 @@ async fn handle_udp_packet_inner(
                 .await;
             }
 
-            if !valid_receiver_key && version <= KADEMLIA_VERSION7_49A {
-                let ping = KadMessage::Ping;
-                if let Ok(packet) = messages::encode_packet(&ping) {
-                    state.flood_protection.track_request(from, 0x60);
-                    let _ = send_kad_response(
-                        socket,
-                        &packet,
-                        from,
-                        state,
-                        Some(&sender_id),
-                        packet_sender_udp_key,
-                    )
-                    .await;
-                }
+            // eMule Process_KADEMLIA2_HELLO_REQ challenge paths when the peer
+            // was added/updated without a valid receiver key:
+            //   <7  → SendLegacyChallenge (KADEMLIA2_REQ with random target)
+            //   ==7 → Ping challenge
+            //   ≥8 + crypt off → same Req challenge (plaintext verify path)
+            if !peer_udp_firewalled && !valid_receiver_key {
+                maybe_send_hello_challenge(
+                    socket,
+                    from,
+                    ip,
+                    sender_id,
+                    version,
+                    state,
+                    packet_sender_udp_key,
+                )
+                .await;
             }
         }
 
@@ -21737,6 +21801,19 @@ async fn handle_udp_packet_inner(
                         .await;
                     }
                 }
+            } else if !peer_udp_firewalled && !valid_receiver_key {
+                // eMule Process_KADEMLIA2_HELLO_RES: old peers (and crypt-off
+                // modern peers) get a legacy challenge instead of ACK.
+                maybe_send_hello_challenge(
+                    socket,
+                    from,
+                    ip,
+                    sender_id,
+                    version,
+                    state,
+                    packet_sender_udp_key,
+                )
+                .await;
             }
 
             // Persist peer to database. This runs in the per-packet hot path
@@ -21835,29 +21912,67 @@ async fn handle_udp_packet_inner(
                 contacts.len()
             );
 
+            // eMule Process_KADEMLIA2_RES: first check legacy Hello challenge.
+            if let std::net::IpAddr::V4(v4) = from.ip() {
+                if let Some(contact_id) = state.legacy_challenges.take_match(
+                    &target,
+                    v4,
+                    LegacyChallengeTracker::OPCODE_REQ,
+                ) {
+                    if state.routing_table.get_contact(&contact_id).map(|c| c.ip == v4)
+                        == Some(true)
+                    {
+                        state.routing_table.mark_verified(&contact_id);
+                        debug!(
+                            "Verified contact {contact_id} via legacy KadReq challenge from {from}"
+                        );
+                    } else {
+                        debug!(
+                            "Legacy KadReq challenge matched from {from} but contact {contact_id} missing/mismatched"
+                        );
+                    }
+                    return;
+                }
+            }
+
             // eMule Process_KADEMLIA2_RES: verify we have an active search for this target.
             let expected = state.search_manager.get_expected_response_count(&target);
             if expected == 0 {
                 debug!("  No active search for target {target}, ignoring response");
                 return;
             }
-            // eMule accepts up to KADEMLIA_FIND_NODE (11) contacts in any response.
-            // GetRequestContactCount controls what we *ask for*, not what we accept.
-            // Peers commonly return more contacts than requested (e.g. 4 for a
-            // FIND_VALUE request asking for 2).
-            let contacts = if contacts.len() > KADEMLIA_FIND_NODE as usize {
-                debug!(
-                    "KadRes from {from}: contact count {} exceeds max {}, truncating",
-                    contacts.len(),
-                    KADEMLIA_FIND_NODE
-                );
-                contacts
-                    .into_iter()
-                    .take(KADEMLIA_FIND_NODE as usize)
-                    .collect()
-            } else {
-                contacts
+
+            // Resolve responder id (for FIND_VALUE_MORE allowance) from tried set.
+            let responder_id = match from.ip() {
+                std::net::IpAddr::V4(v4) => state
+                    .search_manager
+                    .active
+                    .values()
+                    .find(|s| {
+                        s.target == target
+                            && !s.completed
+                            && s.tried.contains_key(&(v4, from.port()))
+                    })
+                    .and_then(|s| s.tried.get(&(v4, from.port())).copied()),
+                _ => None,
             };
+
+            // eMule drops the entire response when contact count exceeds what
+            // we requested (ProcessResponse / GetRequestContactCount), except
+            // FIND_VALUE_MORE from the re-ask contact (≤ KADEMLIA_FIND_NODE).
+            // Never truncate-and-use — that lets a malicious peer inject up to
+            // 11 contacts after a FIND_VALUE(2) / STORE(4) query.
+            let max_accepted = state
+                .search_manager
+                .max_accepted_response_count(&target, responder_id.as_ref());
+            if contacts.len() > max_accepted as usize {
+                debug!(
+                    "KadRes from {from}: contact count {} exceeds max {}, dropping response",
+                    contacts.len(),
+                    max_accepted
+                );
+                return;
+            }
 
             // Route the response to EVERY active same-target search that
             // actually queried this sender. eMule keeps at most one search per
@@ -22446,13 +22561,28 @@ async fn handle_udp_packet_inner(
                     dispatch_udp_firewall_probe_requests(state, settings);
                 }
             }
-            // K22: only promote a contact to verified when the Pong
-            // carried our correct per-receiver UDP key (proves the sender
-            // could decrypt/compose against our current key seed, not
-            // just that their source address is reachable). This matches
-            // eMule's own check before accepting an identity claim.
-            if packet_valid_receiver_key {
-                if let std::net::IpAddr::V4(v4) = from.ip() {
+            // eMule Process_KADEMLIA2_PONG: legacy Ping challenge verifies
+            // without requiring a valid receiver key.
+            if let std::net::IpAddr::V4(v4) = from.ip() {
+                if let Some(contact_id) = state.legacy_challenges.take_match(
+                    &KadId::zero(),
+                    v4,
+                    LegacyChallengeTracker::OPCODE_PING,
+                ) {
+                    if state.routing_table.get_contact(&contact_id).map(|c| c.ip == v4)
+                        == Some(true)
+                    {
+                        state.routing_table.mark_verified(&contact_id);
+                        debug!(
+                            "Verified contact {contact_id} via legacy Ping challenge from {from}"
+                        );
+                    }
+                } else if packet_valid_receiver_key {
+                    // K22: only promote a contact to verified when the Pong
+                    // carried our correct per-receiver UDP key (proves the sender
+                    // could decrypt/compose against our current key seed, not
+                    // just that their source address is reachable). This matches
+                    // eMule's own check before accepting an identity claim.
                     let contact_id = state
                         .routing_table
                         .all_contacts()
@@ -22498,65 +22628,10 @@ async fn handle_udp_packet_inner(
                 results.retain(|entry| matches_search_expr_for_entry(expr, entry));
             }
 
-            // Answer from the already-indexed `publish_manager` (the same
-            // set of files we'd publish to the DHT under this keyword)
-            // instead of re-tokenizing every locally shared file's name on
-            // every incoming request. `files_for_keyword` is an O(1)
-            // average-case index lookup, not a full-library scan — see
-            // its doc comment for why the previous linear scan was a
-            // remotely-triggerable CPU-amplification vector (a flood of
-            // tiny `SearchKeyReq` packets, one per rotated source address
-            // to dodge the per-IP opcode rate limit, could each force an
-            // O(shared library size) scan regardless of packet size).
-            if results.len() < 200 {
-                for file in state.publish_manager.files_for_keyword(&target) {
-                    if results.len() >= 200 {
-                        break;
-                    }
-                    if let Some(expr) = &search_expr {
-                        if !matches_search_expr_for_local_file(
-                            expr,
-                            &file.file_name,
-                            file.file_size,
-                        ) {
-                            continue;
-                        }
-                    }
-                    results.push(kad::messages::SearchResultEntry {
-                        id: file.file_hash,
-                        tags: vec![
-                            KadTag {
-                                name: TagName::Id(TAG_FILENAME),
-                                value: TagValue::String(file.file_name.clone()),
-                            },
-                            KadTag {
-                                name: TagName::Id(TAG_FILESIZE),
-                                value: TagValue::Uint64(file.file_size),
-                            },
-                            KadTag {
-                                name: TagName::Id(TAG_FILETYPE),
-                                value: TagValue::String(file.file_type.clone()),
-                            },
-                            KadTag {
-                                name: TagName::Id(TAG_SOURCES),
-                                // Match `build_keyword_entry`'s publish-side
-                                // value (see publish.rs) instead of a
-                                // hardcoded 1 — we don't separately track a
-                                // "total sources" count distinct from
-                                // "complete sources" for our own shared
-                                // files, and the `max(1)` floor accounts for
-                                // the fact that we ourselves are always a
-                                // complete source for anything we publish.
-                                value: TagValue::Uint32(file.complete_sources.max(1)),
-                            },
-                            KadTag {
-                                name: TagName::Id(TAG_COMPLETE_SOURCES),
-                                value: TagValue::Uint32(file.complete_sources.max(1)),
-                            },
-                        ],
-                    });
-                }
-            }
+            // eMule answers keyword search from the indexed store only.
+            // Mixing in local share answers inflated reflection volume vs
+            // stock peers; publish_manager indexing already feeds the DHT
+            // via PublishKeyReq when we are a responsible node.
             let start = (start_position & 0x7FFF) as usize;
             let end = results.len().min(start + 200);
             let page = if start < results.len() {
@@ -22637,7 +22712,10 @@ async fn handle_udp_packet_inner(
                 }
                 return;
             }
-            if !state.dht_store.is_within_tolerance(&target) {
+            if !state
+                .dht_store
+                .is_within_tolerance_for(&target, from_ip_v4(from))
+            {
                 debug!("PublishKeyReq for {target} rejected - outside tolerance zone");
                 let res = KadMessage::PublishRes {
                     target,
@@ -22656,20 +22734,9 @@ async fn handle_udp_packet_inner(
                     .await;
                 }
             } else {
-                // Bind the publishing identity the same way PublishSourceReq
-                // and PublishNotesReq do: routing-table id when known,
-                // otherwise a deterministic MD5-derived id over the full
-                // (ip, port) pair. This handler used to roll its own
-                // fallback — first 4 octets of the IP, zero-padded, port
-                // dropped entirely — which let every sender behind the same
-                // public IP (e.g. two NATed peers) collide onto one
-                // trivially-guessable identity. Since `store_keyword_entries`
-                // dedups/updates by `(entry.id, source_id)`, that weak,
-                // predictable identity meant one publisher's keyword entries
-                // could be silently overwritten by anyone able to guess or
-                // reuse the same 4-byte id — a DHT poisoning surface unique
-                // to this handler.
-                let sender_kad_id = resolve_verified_sender_id(state, from, &KadId::zero());
+                // Keyword publishes have no wire client hash; account by a
+                // stable (ip,port)-derived publisher id for per-sender caps.
+                let sender_kad_id = resolve_keyword_publisher_id(state, from);
                 let load = state
                     .dht_store
                     .store_keyword_entries(&target, entries, &sender_kad_id);
@@ -22718,13 +22785,12 @@ async fn handle_udp_packet_inner(
                 }
                 return;
             }
-            // Bind the publishing identity to the UDP-authenticated contact
-            // (IP:port). Trusting the wire sender_id lets an attacker poison
-            // the storage index with arbitrary per-publisher keys; the routing
-            // table match is only honoured when sender_id also matches the
-            // entry we have for that address.
-            let verified_sender_id = resolve_verified_sender_id(state, from, &sender_id);
-            if !state.dht_store.is_within_tolerance(&target) {
+            // eMule stores the wire client hash as m_uSourceID. Keep IP
+            // overwrite / per-IP caps in store_source_entry for anti-Sybil.
+            if !state
+                .dht_store
+                .is_within_tolerance_for(&target, from_ip_v4(from))
+            {
                 debug!("PublishSourceReq for {target} rejected - outside tolerance zone");
                 let res = KadMessage::PublishRes {
                     target,
@@ -22737,7 +22803,7 @@ async fn handle_udp_packet_inner(
                         &packet,
                         from,
                         state,
-                        Some(&verified_sender_id),
+                        Some(&sender_id),
                         packet_sender_udp_key,
                     )
                     .await;
@@ -22749,7 +22815,7 @@ async fn handle_udp_packet_inner(
                 };
                 let load = state.dht_store.store_source_entry(
                     &target,
-                    verified_sender_id,
+                    sender_id,
                     tags,
                     sender_ip,
                     from.port(),
@@ -22765,7 +22831,7 @@ async fn handle_udp_packet_inner(
                         &packet,
                         from,
                         state,
-                        Some(&verified_sender_id),
+                        Some(&sender_id),
                         packet_sender_udp_key,
                     )
                     .await;
@@ -22798,12 +22864,15 @@ async fn handle_udp_packet_inner(
                 }
                 return;
             }
-            let verified_sender_id = resolve_verified_sender_id(state, from, &sender_id);
+            // eMule: wire source id + SEARCHTOLERANCE or LAN.
             // Tolerance check FIRST: if we're not responsible for this hash we
             // must not absorb the comment into our local view either. Letting
             // peers dump arbitrary per-hash comments into our UI without the
             // tolerance gate makes us a spam/comment-poisoning amplifier.
-            if !state.dht_store.is_within_tolerance(&target) {
+            if !state
+                .dht_store
+                .is_within_tolerance_for(&target, from_ip_v4(from))
+            {
                 let res = KadMessage::PublishRes {
                     target,
                     load: 100,
@@ -22815,7 +22884,7 @@ async fn handle_udp_packet_inner(
                         &packet,
                         from,
                         state,
-                        Some(&verified_sender_id),
+                        Some(&sender_id),
                         packet_sender_udp_key,
                     )
                     .await;
@@ -22841,7 +22910,7 @@ async fn handle_udp_packet_inner(
             }
             if note_rating > 0 || !note_comment.is_empty() {
                 let hash_hex = target.to_hex();
-                let peer_name = verified_sender_id.to_hex()[..8].to_string();
+                let peer_name = sender_id.to_hex()[..8].to_string();
                 use ed2k::comments::rating_name;
                 debug!(
                     "Received peer note for {}: rating={} ({})",
@@ -22860,7 +22929,7 @@ async fn handle_udp_packet_inner(
             let tags_owned = tags.clone();
             let load = state
                 .dht_store
-                .store_notes_entry(&target, verified_sender_id, tags_owned);
+                .store_notes_entry(&target, sender_id, tags_owned);
             let res = KadMessage::PublishRes {
                 target,
                 load,
@@ -22872,7 +22941,7 @@ async fn handle_udp_packet_inner(
                     &packet,
                     from,
                     state,
-                    Some(&verified_sender_id),
+                    Some(&sender_id),
                     packet_sender_udp_key,
                 )
                 .await;
@@ -29236,24 +29305,6 @@ fn read_kad_search_tag_ref(cursor: &mut Cursor<&[u8]>) -> std::io::Result<Search
             String::from_utf8_lossy(bytes).to_string().to_lowercase(),
         ))
     }
-}
-
-fn matches_search_expr_for_local_file(
-    expr: &KadSearchExpr,
-    file_name: &str,
-    file_size: u64,
-) -> bool {
-    let lower_name = file_name.to_lowercase();
-    let extension = file_name
-        .rsplit_once('.')
-        .map(|(_, ext)| ext.to_string())
-        .unwrap_or_default();
-    let file_type = crate::search::index::infer_file_type(&extension);
-    let tags = vec![KadTag {
-        name: TagName::Id(TAG_FILETYPE),
-        value: TagValue::String(file_type),
-    }];
-    matches_search_expr_impl(expr, &lower_name, file_size, Some(&tags))
 }
 
 fn matches_search_expr_for_entry(

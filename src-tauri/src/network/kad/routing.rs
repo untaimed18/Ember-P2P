@@ -513,16 +513,28 @@ impl RoutingZone {
         // The bin is full and this zone cannot split, so eMule would drop
         // `contact` here. If `contact` is verified, first try to upgrade the
         // bin's quality by evicting an unverified squatter instead (see
-        // `RoutingBin::replace_unverified`). The evicted IP is funnelled
+        // `RoutingBin::replace_unverified`). Intentional divergence from
+        // eMule 0.50a (which drops the newcomer). The evicted IP is funnelled
         // through `split_dropped_ips` so `RoutingTable::insert` removes it
         // from the global IP/subnet accounting, exactly as it does for IPs
-        // dropped during a split.
-        if contact.verified && check_global_limits(contact.ip, global_ip_count, global_subnet_count)
-        {
+        // dropped during a split. Global limits are evaluated as if the
+        // victim is already gone so a same-IP / same-/24 replacement is not
+        // spuriously rejected.
+        if contact.verified {
             if let Some(bin) = self.bin.as_mut() {
-                if let Some(evicted_ip) = bin.replace_unverified(contact) {
-                    split_dropped_ips.push(evicted_ip);
-                    return AddResult::Added;
+                let victim_ip = bin.contacts.iter().find(|c| !c.verified).map(|c| c.ip);
+                if let Some(victim_ip) = victim_ip {
+                    if check_global_limits_replacing(
+                        contact.ip,
+                        Some(victim_ip),
+                        global_ip_count,
+                        global_subnet_count,
+                    ) {
+                        if let Some(evicted_ip) = bin.replace_unverified(contact) {
+                            split_dropped_ips.push(evicted_ip);
+                            return AddResult::Added;
+                        }
+                    }
                 }
             }
         }
@@ -971,14 +983,35 @@ fn check_global_limits(
     global_ip_count: &HashMap<Ipv4Addr, u32>,
     global_subnet_count: &HashMap<u32, u32>,
 ) -> bool {
-    let ip_count = global_ip_count.get(&ip).copied().unwrap_or(0);
+    check_global_limits_replacing(ip, None, global_ip_count, global_subnet_count)
+}
+
+/// Like [`check_global_limits`], but accounts for an IP that is about to leave
+/// the table (e.g. `replace_unverified` victim). Without this, a verified
+/// newcomer that shares the victim's IP (MAX_CONTACTS_IP = 1) or frees a
+/// saturated /24 slot is rejected before the eviction can make room.
+fn check_global_limits_replacing(
+    ip: Ipv4Addr,
+    victim_ip: Option<Ipv4Addr>,
+    global_ip_count: &HashMap<Ipv4Addr, u32>,
+    global_subnet_count: &HashMap<u32, u32>,
+) -> bool {
+    let mut ip_count = global_ip_count.get(&ip).copied().unwrap_or(0);
+    if victim_ip == Some(ip) {
+        ip_count = ip_count.saturating_sub(1);
+    }
     if ip_count >= MAX_CONTACTS_IP {
         return false;
     }
     let snet = subnet_key(ip);
     let is_lan = ip_filter::is_lan_ip(ip);
     if !is_lan {
-        let snet_count = global_subnet_count.get(&snet).copied().unwrap_or(0);
+        let mut snet_count = global_subnet_count.get(&snet).copied().unwrap_or(0);
+        if let Some(victim) = victim_ip {
+            if !ip_filter::is_lan_ip(victim) && subnet_key(victim) == snet {
+                snet_count = snet_count.saturating_sub(1);
+            }
+        }
         if snet_count >= MAX_CONTACTS_SUBNET {
             return false;
         }
@@ -1318,16 +1351,24 @@ impl RoutingTable {
             return verified;
         }
 
-        // The verified pool didn't reach `count`; fall back to still-live
-        // unverified contacts to fill up the search-seed slot. Explicitly
-        // filter out `is_dead()` rows: `get_contacts_to_probe` and
-        // `remove_dead_contacts` prune dead+expired contacts, but there's
-        // a window between a contact's final `checking_type` failure
-        // (type=DEAD, expires_at set ~2 min out) and the next cleanup
-        // pass where a dead-but-not-yet-expired row still sits in the
-        // bin. Without this filter, a nearly-empty verified pool would
-        // seed a fresh search with contacts that are known to be
-        // unresponsive, guaranteeing one wasted round of probes.
+        // eMule GetClosestTo always requires IsIpVerified(). After cold start
+        // (any verified contact exists), do not seed lookups with unverified
+        // contacts — that lets BootstrapRes / KadRes poison become query
+        // targets without Hello/UDP-key proof. Only while verified_len == 0
+        // may we fall back to still-live unverified contacts.
+        if self.verified_len() > 0 {
+            return verified;
+        }
+
+        // Cold start: the verified pool didn't reach `count`; fill from
+        // still-live unverified contacts. Explicitly filter out `is_dead()`
+        // rows: `get_contacts_to_probe` and `remove_dead_contacts` prune
+        // dead+expired contacts, but there's a window between a contact's
+        // final `checking_type` failure (type=DEAD, expires_at set ~2 min
+        // out) and the next cleanup pass where a dead-but-not-yet-expired
+        // row still sits in the bin. Without this filter, a nearly-empty
+        // verified pool would seed a fresh search with contacts that are
+        // known to be unresponsive, guaranteeing one wasted round of probes.
         let remaining = count - verified.len();
         let verified_ids: HashSet<KadId> = verified.iter().map(|c| c.id).collect();
         let unverified_candidates = self.find_closest_any(target, count);
@@ -1359,21 +1400,30 @@ impl RoutingTable {
         result.into_values().collect()
     }
 
-    /// Closest contacts to `target` by XOR distance, regardless of verified
-    /// status (unlike `find_closest_verified*`). Used to seed fresh
-    /// FindNode/self-lookup searches and bootstrap sampling, where we want
-    /// every lead we have — not just Kad2-handshake-verified ones.
+    /// Closest contacts to `target` by XOR distance.
+    ///
+    /// After cold start (`verified_len() > 0`), matches eMule `GetClosestTo`
+    /// and returns verified contacts only. While the table has no verified
+    /// contacts yet, falls back to any still-live contact so bootstrap can
+    /// progress.
     ///
     /// Still excludes `is_dead()` contacts: without this, a search or
     /// bootstrap round gets seeded with contacts we already *know* are
     /// unresponsive (a prior `checking_type` probe failed), guaranteeing at
     /// least one wasted round-trip per dead contact and degrading lookup
-    /// quality under churn. Matches the same dead-contact exclusion
-    /// `find_closest_prefer_verified`'s unverified fallback already
-    /// applies, just without that function's verified-first / prefer-
-    /// non-firewalled reordering, which callers here don't want.
+    /// quality under churn.
     pub fn find_closest(&self, target: &KadId, count: usize) -> Vec<KadContact> {
-        self.find_closest_any(target, count)
+        if self.verified_len() > 0 {
+            self.find_closest_verified(target, count)
+                .into_iter()
+                .filter(|c| !c.is_dead())
+                .collect()
+        } else {
+            self.find_closest_any(target, count)
+                .into_iter()
+                .filter(|c| !c.is_dead())
+                .collect()
+        }
     }
 
     pub fn touch_contact_by_addr(&mut self, ip: Ipv4Addr, udp_port: u16) -> bool {
@@ -1667,6 +1717,49 @@ mod find_closest_tests {
         assert!(
             !closest.iter().any(|c| c.id == dead.id),
             "a known-dead contact must never be returned by find_closest"
+        );
+    }
+
+    /// Regression: after any verified contact exists, `find_closest` must not
+    /// seed lookups with unverified contacts (eMule GetClosestTo / IsIpVerified).
+    #[test]
+    fn find_closest_verified_only_after_cold_start() {
+        let mut rt = RoutingTable::new(KadId([0xFF; 16]), false);
+
+        let mut verified = contact(0x01, 1);
+        verified.verified = true;
+        assert!(rt.insert(verified.clone()));
+
+        let mut unverified = contact(0x02, 2);
+        unverified.verified = false;
+        assert!(rt.insert(unverified.clone()));
+
+        let target = KadId([0x00; 16]);
+        let closest = rt.find_closest(&target, 10);
+        assert!(
+            closest.iter().any(|c| c.id == verified.id),
+            "verified contact must be returned"
+        );
+        assert!(
+            !closest.iter().any(|c| c.id == unverified.id),
+            "unverified contact must not seed lookups once verified_len > 0"
+        );
+    }
+
+    #[test]
+    fn find_closest_allows_unverified_during_cold_start() {
+        let mut rt = RoutingTable::new(KadId([0xFF; 16]), false);
+
+        let mut unverified = contact(0x02, 2);
+        unverified.verified = false;
+        assert!(rt.insert(unverified.clone()));
+        assert_eq!(rt.verified_len(), 0);
+
+        let target = KadId([0x00; 16]);
+        let closest = rt.find_closest(&target, 10);
+        assert!(
+            closest.iter().any(|c| c.id == unverified.id),
+            "cold start may seed from unverified contacts"
         );
     }
 }

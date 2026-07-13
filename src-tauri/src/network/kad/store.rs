@@ -62,9 +62,21 @@ impl DhtStore {
     }
 
     /// Check if the target is within our tolerance zone for accepting publishes.
-    pub fn is_within_tolerance(&self, target: &KadId) -> bool {
+    ///
+    /// Matches eMule `Process_KADEMLIA2_PUBLISH_*`: accept when
+    /// `distance.chunk(0) <= SEARCHTOLERANCE` **or** the publisher is on a LAN
+    /// IP (`IsLANIP`). The LAN bypass is required for local/test topologies
+    /// where peers sit outside the XOR zone but are trusted by address class.
+    pub fn is_within_tolerance_for(
+        &self,
+        target: &KadId,
+        publisher_ip: Option<std::net::Ipv4Addr>,
+    ) -> bool {
         let distance = self.local_id.xor_distance(target);
-        distance.chunk(0) <= SEARCH_TOLERANCE
+        if distance.chunk(0) <= SEARCH_TOLERANCE {
+            return true;
+        }
+        publisher_ip.is_some_and(super::ip_filter::is_lan_ip)
     }
 
     pub fn store_keyword_entries(
@@ -419,6 +431,32 @@ mod keyword_store_tests {
         assert!(bucket
             .iter()
             .any(|stored| stored.source_id == second_sender));
+    }
+}
+
+#[cfg(test)]
+mod tolerance_tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn within_tolerance_accepts_lan_publisher_outside_xor_zone() {
+        let mut store = DhtStore::new();
+        // Local id far from target so chunk(0) exceeds SEARCH_TOLERANCE.
+        store.set_local_id(KadId([0xFF; 16]));
+        let target = KadId([0x00; 16]);
+        assert!(
+            !store.is_within_tolerance_for(&target, None),
+            "target must be outside XOR tolerance for this setup"
+        );
+        assert!(
+            store.is_within_tolerance_for(&target, Some(Ipv4Addr::new(192, 168, 1, 10))),
+            "LAN publisher must bypass tolerance like eMule IsLANIP"
+        );
+        assert!(
+            !store.is_within_tolerance_for(&target, Some(Ipv4Addr::new(8, 8, 8, 8))),
+            "public IP outside zone must still be rejected"
+        );
     }
 }
 
