@@ -503,7 +503,8 @@ impl PublishManager {
                 }
                 tags.push(KadTag {
                     name: TagName::Id(TAG_BUDDYHASH),
-                    value: TagValue::String(hex::encode(buddy_hash_id)),
+                    // eMule `md4str` emits uppercase hex; keep wire parity.
+                    value: TagValue::String(hex::encode_upper(buddy_hash_id)),
                 });
             } else {
                 return None;
@@ -660,17 +661,9 @@ impl PublishManager {
 
     /// Files backing `keyword_hash` right now — an O(1) average-case
     /// lookup via [`Self::keyword_index`] followed by O(matches) record
-    /// fetches, in place of the naive approach of extracting keywords
-    /// from every shared file on every call.
-    ///
-    /// This backs the inbound `SearchKeyReq` handler: before this
-    /// existed, answering a keyword search from a remote peer meant
-    /// tokenizing every locally shared file's name on every single
-    /// incoming request — a remotely-triggerable CPU-amplification
-    /// vector, since a flood of tiny `SearchKeyReq` packets (one per
-    /// spoofed/rotated source address, to dodge the per-IP opcode rate
-    /// limit in `protection.rs`) could each force an O(shared library
-    /// size) scan on the receiving node regardless of packet size.
+    /// fetches. Kept for unit tests of the keyword index; inbound
+    /// `SearchKeyReq` answers from the DHT store only (eMule parity).
+    #[cfg(test)]
     pub fn files_for_keyword(&self, keyword_hash: &KadId) -> Vec<&PublishableFile> {
         match self.keyword_index.get(keyword_hash) {
             Some(hashes) => hashes
@@ -935,6 +928,38 @@ mod tests {
             "firewalled publish must still advertise ember capability — \
              the broker uses this to decide whether to attempt LowID-to-LowID",
         );
+    }
+
+    #[test]
+    fn buddyhash_tag_uses_uppercase_hex_like_emule_md4str() {
+        let mut publisher = make_publisher(false);
+        publisher.firewalled = true;
+        publisher.direct_udp_callback = false;
+        publisher.buddy_id = Some(KadId([0x11; 16]));
+        publisher.buddy_ip = u32::from_be_bytes([10, 0, 0, 1]);
+        publisher.buddy_port = 4662;
+
+        let tags = match publisher.build_source_publish(&sample_file()).unwrap() {
+            KadMessage::PublishSourceReq { tags, .. } => tags,
+            _ => panic!("unexpected message"),
+        };
+        let buddyhash = tags
+            .iter()
+            .find(|t| matches!(&t.name, TagName::Id(TAG_BUDDYHASH)))
+            .and_then(|t| match &t.value {
+                TagValue::String(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .expect("TAG_BUDDYHASH required for buddy publish");
+        assert!(
+            buddyhash.chars().all(|c| !c.is_ascii_lowercase()),
+            "buddy hash must be uppercase hex like eMule md4str, got {buddyhash}"
+        );
+        let mut expected = publisher.local_id.0;
+        for b in &mut expected {
+            *b ^= 0xFF;
+        }
+        assert_eq!(buddyhash, hex::encode_upper(expected));
     }
 
     /// eMule `StorePacket`'s STOREFILE guard only refuses a file that has

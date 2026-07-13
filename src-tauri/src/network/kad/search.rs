@@ -1055,27 +1055,13 @@ impl SearchState {
     }
 
     fn is_fetch_candidate(&self, contact: &KadContact) -> bool {
+        // eMule StorePacket / fetch gate: SEARCHTOLERANCE or LAN only — never
+        // widen to out-of-zone lookup responders when the tolerance set is empty.
         if is_lan_ip(contact.ip) {
-            return true;
-        }
-        if within_search_tolerance(&self.target, &contact.id) {
             return self.responded_during_lookup.contains(&contact.id);
         }
-        // Fallback: if no contacts are within strict tolerance, allow the
-        // closest contacts that responded during lookup. This handles the
-        // common case where the routing table is small and the iterative
-        // lookup couldn't walk close enough to the target.
-        if !self.has_any_tolerance_candidates() {
-            return self.responded_during_lookup.contains(&contact.id);
-        }
-        false
-    }
-
-    fn has_any_tolerance_candidates(&self) -> bool {
-        self.closest.iter().any(|c| {
-            self.responded_during_lookup.contains(&c.id)
-                && within_search_tolerance(&self.target, &c.id)
-        })
+        within_search_tolerance(&self.target, &contact.id)
+            && self.responded_during_lookup.contains(&contact.id)
     }
 
     /// Returns the expected number of contacts in a response.
@@ -1325,6 +1311,30 @@ impl SearchManager {
             .map(|s| s.get_expected_response_count())
             .max()
             .unwrap_or(0)
+    }
+
+    /// Maximum contacts accepted in a KadRes for `target` from `from_id`.
+    ///
+    /// Matches eMule `ProcessResponse`: normally `GetRequestContactCount()`,
+    /// but when this responder is the FIND_VALUE_MORE re-ask target, allow up
+    /// to `KADEMLIA_FIND_NODE` (11). Oversized responses must be dropped, not
+    /// truncated.
+    pub fn max_accepted_response_count(&self, target: &KadId, from_id: Option<&KadId>) -> u8 {
+        let expected = self.get_expected_response_count(target);
+        if expected == 0 {
+            return 0;
+        }
+        if let Some(from_id) = from_id {
+            let is_reask = self.active.values().any(|s| {
+                s.target == *target
+                    && !s.completed
+                    && s.lookup_reask_more_target == Some(*from_id)
+            });
+            if is_reask {
+                return KADEMLIA_FIND_NODE;
+            }
+        }
+        expected
     }
 
     pub fn active_count(&self) -> usize {
@@ -1889,6 +1899,35 @@ mod tests {
         assert!(
             expected > 0,
             "keyword search must have nonzero expected response count"
+        );
+        assert_eq!(
+            manager.max_accepted_response_count(&target, None),
+            expected,
+            "default max accepted must equal GetRequestContactCount"
+        );
+    }
+
+    #[test]
+    fn max_accepted_allows_find_node_for_reask_more_target() {
+        let target = kad_id(9);
+        let mut manager = SearchManager::new();
+        let responder = contact(near_kad_id(1), 1);
+        let sid = manager.start_search(target, SearchType::FindKeyword, vec![responder.clone()]);
+        assert_ne!(sid, SearchId(0));
+
+        let search = manager.get_mut(&sid).unwrap();
+        search.lookup_reask_more_target = Some(responder.id);
+        search.responded_during_lookup.insert(responder.id);
+
+        assert_eq!(
+            manager.max_accepted_response_count(&target, Some(&responder.id)),
+            KADEMLIA_FIND_NODE,
+            "FIND_VALUE_MORE re-ask responder may return up to FIND_NODE contacts"
+        );
+        assert_eq!(
+            manager.max_accepted_response_count(&target, Some(&kad_id(99))),
+            KADEMLIA_FIND_VALUE,
+            "other responders stay at FIND_VALUE"
         );
     }
 
