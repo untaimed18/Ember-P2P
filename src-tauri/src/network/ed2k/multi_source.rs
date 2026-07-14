@@ -174,11 +174,30 @@ const MAX_BLOCKS_PER_REQUEST: usize = 3;
 /// `RwLock` guard before invoking this — the previous design held
 /// `tracker.read().await` across `atomic_write`, which serialized all
 /// concurrent writers behind the fsync.
+///
+/// Coalesces overlapping periodic saves: if a prior snapshot is still
+/// writing, the newer call is dropped (verified-part saves still use
+/// `save_snapshot_now` and always await).
+static PART_MET_SAVE_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn spawn_save_snapshot(snap: super::part_tracker::SaveSnapshot) {
+    if PART_MET_SAVE_IN_FLIGHT
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        return;
+    }
     tokio::task::spawn_blocking(move || {
         if let Err(e) = snap.write_to_disk() {
             tracing::warn!("part.met save failed: {e}");
         }
+        PART_MET_SAVE_IN_FLIGHT.store(false, std::sync::atomic::Ordering::Release);
     });
 }
 
@@ -3855,6 +3874,32 @@ async fn download_parts_from_source(
             // Never emitted "connecting" for this route — nothing to clear.
             return Ok(());
         }
+        // Same admissibility gate as SX registration / network inject:
+        // never dial a filtered, banned, or self address that slipped into
+        // the source list before filters were applied (or via an older
+        // seed path).
+        if let std::net::IpAddr::V4(v4) = addr.ip() {
+            if is_sx_rejected(&v4, addr.port()) {
+                debug!(
+                    "Source {} ({}) skip dial: filtered, banned, or self",
+                    _src_idx, addr,
+                );
+                return Ok(());
+            }
+        } else {
+            debug!(
+                "Source {} ({}) skip dial: non-IPv4 address",
+                _src_idx, addr,
+            );
+            return Ok(());
+        }
+        if addr.port() == 0 {
+            debug!(
+                "Source {} ({}) skip dial: port 0",
+                _src_idx, addr,
+            );
+            return Ok(());
+        }
         emit_source!("connecting", None, 0u64);
         // Global connection cap + dial pacing apply to outbound dials only.
         // Reserve the machine-wide slot first (waits here if we're already at
@@ -6913,6 +6958,13 @@ async fn download_parts_from_source(
                                         tracing::warn!(
                                             "source {_src_idx}: disk write failed at start={gs} ({len} bytes): {e}"
                                         );
+                                        if e.kind() == std::io::ErrorKind::StorageFull
+                                            || super::transfer::is_disk_full_error(&e.to_string())
+                                        {
+                                            anyhow::bail!(
+                                                "stage:insufficient_disk disk write failed: {e}"
+                                            );
+                                        }
                                         write_ok = false;
                                         break;
                                     }
@@ -7067,6 +7119,13 @@ async fn download_parts_from_source(
                                         tracing::warn!(
                                             "source {_src_idx}: compressed disk write failed at start={gs} ({len} bytes): {e}"
                                         );
+                                        if e.kind() == std::io::ErrorKind::StorageFull
+                                            || super::transfer::is_disk_full_error(&e.to_string())
+                                        {
+                                            anyhow::bail!(
+                                                "stage:insufficient_disk compressed disk write failed: {e}"
+                                            );
+                                        }
                                         write_ok = false;
                                         break;
                                     }

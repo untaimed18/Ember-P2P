@@ -20,8 +20,10 @@
     isDiscoverable as isDiscoverableStore,
     clearUnread,
   } from '$lib/stores/friends';
+  import { appSettings } from '$lib/stores/settings';
 
   let friends: FriendInfo[] = $state([]);
+  let browseDisabled = $derived($appSettings?.friend_browse_disabled === true);
   let loading = $state(true);
   let error: string | null = $state(null);
   let successMsg: string | null = $state(null);
@@ -126,6 +128,7 @@
   }
 
   function openBrowse(f: FriendInfo) {
+    if (browseDisabled) return;
     browseFriendHash = f.user_hash;
     browseFriendName = f.nickname || f.user_hash.slice(0, 8) + '\u2026';
     browseFriendIp = f.last_ip || '';
@@ -850,8 +853,10 @@
           <button
             class="action-btn browse-action"
             onclick={() => openBrowse(f)}
-            disabled={!f.mutual || !isOnline}
-            title={!f.mutual
+            disabled={!f.mutual || !isOnline || browseDisabled}
+            title={browseDisabled
+              ? m.settings_friend_browse_disabled()
+              : !f.mutual
               ? m.friends_action_waiting_accept()
               : isOnline
                 ? m.friends_action_browse_files()

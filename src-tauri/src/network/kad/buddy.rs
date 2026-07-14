@@ -443,7 +443,7 @@ impl BuddyManager {
 
         self.serving_buddy_for = Some(requester_id);
         self.serving_callback_check = Some(callback_check);
-        self.serving_callback_budget = 64;
+        self.serving_callback_budget = 32;
         self.serving_writer = Some(Box::new(writer));
         self.serving_reader_handle = Some(handle);
         info!("Now serving as buddy for {}", requester_id);

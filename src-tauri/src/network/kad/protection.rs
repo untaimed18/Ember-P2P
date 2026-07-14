@@ -41,9 +41,10 @@ fn opcode_limit(opcode: u8) -> u32 {
         // default anyway, but named explicitly so this stays a
         // deliberate choice (buddy discovery can retry a few
         // times per search) rather than an accidental gap.
-        0x52 => 5, // CallbackReq — same rationale as FindBuddyReq: a
-        // firewalled source may need several callback attempts
-        // in one serving session.
+        0x52 => 3, // CallbackReq — keep below the per-session relay budget
+        // so a single UDP source cannot burn the full buddy relay
+        // allowance in one flood window. eMule still allows a few
+        // retries per firewalled source.
         0x53 => 3, // Firewalled2Req
         0x60 => 3, // Ping
         _ => DEFAULT_OPCODE_LIMIT,

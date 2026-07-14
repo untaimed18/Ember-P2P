@@ -388,7 +388,7 @@ impl TransferManager {
         transfer.speed = 0;
         if matches!(
             transfer.status,
-            TransferStatus::Paused | TransferStatus::Stopped
+            TransferStatus::Paused | TransferStatus::Stopped | TransferStatus::Insufficient
         ) {
             return;
         }
@@ -416,6 +416,13 @@ impl TransferManager {
         if transfer.direction == TransferDirection::Upload {
             self.active.insert(id, transfer);
             return true;
+        }
+        // Keep Insufficient in `active` (eMule ResumeFileInsufficient) so
+        // Resume finds the row, the orphan `.part` sweep knows the UUID,
+        // and we never rewrite the status to Searching/Queued.
+        if transfer.status == TransferStatus::Insufficient {
+            self.active.insert(id, transfer);
+            return false;
         }
         if Self::can_auto_run(&transfer)
             && self.active_download_count() < self.max_concurrent as usize

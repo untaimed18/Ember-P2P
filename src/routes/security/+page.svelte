@@ -16,6 +16,8 @@
   import { onMount, untrack } from 'svelte';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
+  import { getSettings } from '$lib/api/settings';
+  import { setAppSettings } from '$lib/stores/settings';
 
   let stats: IpFilterStats | null = $state(null);
   let loading = $state(true);
@@ -208,6 +210,18 @@
     flashTimer = setTimeout(() => (successMsg = null), 4000);
   }
 
+  async function syncIpFilterSettingsCache(patch: {
+    ip_filter_enabled?: boolean;
+    block_private_ips?: boolean;
+  }) {
+    try {
+      const current = await getSettings();
+      setAppSettings({ ...current, ...patch });
+    } catch {
+      // Settings page will reload from disk on next visit.
+    }
+  }
+
   async function handleToggleEnabled() {
     if (!stats) return;
     const prev = stats.enabled;
@@ -215,6 +229,7 @@
     togglesInFlight++;
     try {
       await setIpFilterEnabled(stats.enabled);
+      await syncIpFilterSettingsCache({ ip_filter_enabled: stats.enabled });
     } catch (e: unknown) {
       stats.enabled = prev;
       error = toErrorMsg(e);
@@ -230,6 +245,7 @@
     togglesInFlight++;
     try {
       await setBlockPrivateIps(stats.block_private);
+      await syncIpFilterSettingsCache({ block_private_ips: stats.block_private });
     } catch (e: unknown) {
       stats.block_private = prev;
       error = toErrorMsg(e);

@@ -10,7 +10,7 @@ use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use super::ember_auth::{sign_auth_nonce, verify_auth_nonce_compat};
+use super::ember_auth::{sign_auth_nonce, verify_auth_nonce};
 use super::messages::*;
 use super::upload::{EmberSessionHandle, EmberSessionMap, UploadEvent, UploadEventKind};
 use crate::network::ember::crypto;
@@ -1591,7 +1591,7 @@ where
         .map_err(|e| anyhow::anyhow!("invalid peer Ed25519 pubkey: {e}"))?;
     let sig_bytes: [u8; 64] = peer_response[32..96].try_into().unwrap();
     let peer_sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-    if !verify_auth_nonce_compat(&peer_vk, &our_nonce, &peer_sig) {
+    if !verify_auth_nonce(&peer_vk, &our_nonce, &peer_sig) {
         anyhow::bail!("Ember auth: signature verification failed for {addr}");
     }
 

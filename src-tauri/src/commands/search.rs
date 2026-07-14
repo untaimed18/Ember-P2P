@@ -1,4 +1,5 @@
 use tokio::sync::oneshot;
+use tauri::Emitter;
 
 use crate::app_state::AppState;
 use crate::commands::errors::{coded, coded_ctx};
@@ -940,10 +941,12 @@ pub async fn get_download_history_stats(
 /// Clear download history entries by status ("completed", "cancelled", or "all").
 #[tauri::command]
 pub async fn clear_download_history(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     status: String,
 ) -> Result<(), String> {
     let db = state.db.clone();
+    let cleared_status = status.clone();
     tokio::task::spawn_blocking(move || {
         match status.as_str() {
             "all" => {
@@ -963,7 +966,13 @@ pub async fn clear_download_history(
     })
     .await
     .map_err(|e| coded_ctx("search_task_failed", "Task failed", e))?
-    .map_err(|e| coded_ctx("search_history_clear_failed", "Failed to clear history", e))
+    .map_err(|e| coded_ctx("search_history_clear_failed", "Failed to clear history", e))?;
+    // Notify Search badges / history map that the DB was wiped.
+    let _ = app.emit(
+        "download-history-cleared",
+        serde_json::json!({ "status": cleared_status }),
+    );
+    Ok(())
 }
 
 /// Remove a single download-history row by file hash.

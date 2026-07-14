@@ -829,6 +829,14 @@ impl PartTracker {
         // can only be "verified" if it's also fully present. This prevents a
         // stale bitmap (e.g. .part hand-edited, .part.met survived a partial
         // rewrite) from letting us serve unverified bytes to uploads.
+        //
+        // We intentionally trust the verified bit for complete parts without
+        // an immediate MD4 re-hash on load (same as eMule's part.met resume):
+        // re-hashing every complete part at startup would stall large
+        // resumes. Corruption is still caught when the download worker next
+        // verifies a part, and `set_part_verified` only flips after a live
+        // MD4 match. Upload serving further requires `is_part_complete` via
+        // `is_range_safe_to_serve`.
         if let Some(bytes) = verified_bitmap_bytes {
             self.part_verified = vec![false; self.part_count];
             for i in 0..self.part_count {

@@ -1126,59 +1126,27 @@ fn inject_source_into_active_transfers(
     };
     let parsed_ip = source.peer_ip.parse::<Ipv4Addr>().ok();
 
-    // Source-level filtering. The Ember EPX path applies the same
-    // checks before calling its own injection helper; doing them here
-    // too means the UDP server (`OP_GLOBFOUNDSOURCES`) and KAD source
-    // paths inherit them automatically without each site having to
-    // duplicate the gate. Order: cheap rejections first.
-    //
-    // 1. IP filter (`IpFilter::is_blocked`): always rejects bogus /
-    //    unroutable space; rejects RFC1918/CGNAT when
-    //    `block_private_ips` is on; rejects `ipfilter.dat` ranges when
-    //    the filter is enabled. Do not add a separate
-    //    `is_special_use_v4` gate here — that would permanently deny
-    //    LAN peers even when the user turned private blocking off.
-    // 2. Banned IPs (live runtime banlist).
-    // 3. Reputation-banned user hashes (existing check).
-    // 4. Self-source: our own external IP+port, or our own user hash.
-    // 5. Undialable TCP port 0.
+    // Source-level filtering via the shared admissibility gate so UDP
+    // server (`OP_GLOBFOUNDSOURCES`), KAD, StartDownload, and live-source
+    // paths all refuse the same peers. Do not add a separate
+    // `is_special_use_v4` gate here — that would permanently deny LAN
+    // peers even when the user turned private blocking off.
     if let Some(v4) = parsed_ip {
-        if state.ip_filter.is_blocked(v4) {
+        if !is_source_admissible(
+            state,
+            v4,
+            source.peer_port,
+            source.peer_user_hash.as_ref(),
+        ) {
             stats.dropped_full += transfer_ids.len();
             return stats;
         }
-        if state.banned_ips.contains(&v4) {
-            stats.dropped_full += transfer_ids.len();
-            return stats;
-        }
-        // 5. Never inject ourselves. KAD (`is_self_source`) and source-exchange
-        //    workers already drop self up-front, but the server source paths
-        //    (`OP_FOUNDSOURCES` / `OP_GLOBFOUNDSOURCES`) funnel straight through
-        //    this shared gate — without this, a server echoing our own published
-        //    HighID source would make us dial ourselves and burn a slot. eMule
-        //    filters self-sources too.
-        if let Some(ext) = state.external_ip {
-            if v4 == ext && source.peer_port == state.tcp_port {
-                stats.dropped_full += transfer_ids.len();
-                return stats;
-            }
-        }
-        // 6. A TCP port of 0 is not dialable (some server lists carry it); drop
-        //    it before it reaches the per-file source list or a worker.
-        if source.peer_port == 0 {
-            stats.dropped_full += transfer_ids.len();
-            return stats;
-        }
-    }
-    if let Some(ref uh) = source.peer_user_hash {
-        if state.reputation.is_banned(uh) {
-            stats.dropped_full += transfer_ids.len();
-            return stats;
-        }
-        // Self by identity: a source list can carry our own user hash on a
-        // different (e.g. NATed) address than `external_ip`, so the address
-        // check above wouldn't catch it.
-        if *uh != [0u8; 16] && *uh == state.user_hash {
+    } else if source.peer_port == 0 {
+        stats.dropped_full += transfer_ids.len();
+        return stats;
+    } else if let Some(ref uh) = source.peer_user_hash {
+        // Non-IPv4 address: still honor reputation / self-hash bans.
+        if state.reputation.is_banned(uh) || (*uh != [0u8; 16] && *uh == state.user_hash) {
             stats.dropped_full += transfer_ids.len();
             return stats;
         }
@@ -1350,10 +1318,10 @@ async fn try_connect_server(
 ///     / EPX traffic queues ahead of its CHALLENGE response.
 ///   - friend-connect / upload sessions: full Ed25519 PoP over a fresh nonce.
 ///
-/// It only drives the DB row + UI verification badge. We never auto-promote to
-/// "mutual" based on it: an already-mutual sender is ignored, an already-added
-/// (non-mutual) friend is auto-confirmed only when the user disabled approval,
-/// and a stranger always routes through the approval queue.
+/// It only drives the DB row + UI verification badge for queued strangers.
+/// Auto-promotion of an already-added (non-mutual) friend when the user
+/// disabled approval still requires `verified` (Ed25519 PoP / binding) so
+/// a hash-spoofing peer cannot force mutual status.
 async fn process_inbound_friend_request(
     db: &Arc<Database>,
     app_handle: &tauri::AppHandle,
@@ -1394,7 +1362,10 @@ async fn process_inbound_friend_request(
             .unwrap_or((false, false));
         if already_mutual {
             FriendRequestDbOutcome::AlreadyMutual
-        } else if is_friend && !require_approval {
+        } else if is_friend && !require_approval && verified {
+            // Auto-confirm only after Ed25519 PoP (or equivalent verified
+            // binding). An unverified reciprocal request still queues so a
+            // spoofed hash cannot promote a listed friend to mutual.
             match db_q.set_friend_mutual(&h_q, &ip_q, peer_port) {
                 Ok(n) if n > 0 => FriendRequestDbOutcome::Promoted,
                 Ok(_) => FriendRequestDbOutcome::PromotionSkipped,
@@ -2942,6 +2913,11 @@ async fn mark_download_insufficient(
 ) {
     {
         let mut mgr = transfer_manager.write().await;
+        // Stop any still-running workers so they do not keep retrying
+        // writes against a full volume.
+        if let Some(control) = mgr.get_control(transfer_id) {
+            control.cancel();
+        }
         mgr.update_status(transfer_id, TransferStatus::Insufficient);
         mgr.set_failure_context(
             transfer_id,
@@ -3815,25 +3791,48 @@ fn emit_search_results(
     );
 }
 
-/// Return true if `ip` is safe to surface as a candidate download source
-/// in a streamed search result. Mirrors the gate used at
-/// `inject_source_into_active_transfers` so the search UI never lists IPs
-/// that we'd refuse to dial: the user's IP filter (bogus always; private
-/// when `block_private_ips` is on; `ipfilter.dat` ranges when enabled)
-/// and the live runtime banlist.
+/// Shared source-admissibility gate used by injection, StartDownload,
+/// live-source collection, and the search UI. Order matches
+/// `inject_source_into_active_transfers`: IP filter → banlist → self
+/// address → port 0 → reputation / self user-hash.
 ///
-/// Uses the readonly form of `IpFilter::is_blocked` because we only have
-/// `&NetworkState` at the call sites; the per-IP cache miss cost is
-/// negligible compared to the per-result string formatting we're already
-/// doing on the same path.
-fn is_search_source_safe(state: &NetworkState, ip: Ipv4Addr) -> bool {
+/// Always uses `IpFilter::is_blocked_readonly` so call sites that only
+/// hold `&NetworkState` (search enrichment, live-source filters) work;
+/// the cache-miss cost is negligible next to dial / inject work.
+fn is_source_admissible(
+    state: &NetworkState,
+    ip: Ipv4Addr,
+    port: u16,
+    user_hash: Option<&[u8; 16]>,
+) -> bool {
+    if port == 0 {
+        return false;
+    }
     if state.ip_filter.is_blocked_readonly(ip) {
         return false;
     }
     if state.banned_ips.contains(&ip) {
         return false;
     }
+    if let Some(ext) = state.external_ip {
+        if ip == ext && port == state.tcp_port {
+            return false;
+        }
+    }
+    if let Some(uh) = user_hash {
+        if state.reputation.is_banned(uh) {
+            return false;
+        }
+        if *uh != [0u8; 16] && *uh == state.user_hash {
+            return false;
+        }
+    }
     true
+}
+
+/// Search-result IP gate: filter + banlist only (no port / hash yet).
+fn is_search_source_safe(state: &NetworkState, ip: Ipv4Addr) -> bool {
+    is_source_admissible(state, ip, 1, None)
 }
 
 /// Apply spam scoring + filename cleanup + comment URL stripping to a
@@ -4533,6 +4532,7 @@ async fn try_start_pending_download_from_known_sources(
             !state
                 .dead_sources
                 .is_dead_source_for_file(&hash_bytes, u32::from(*ip), *port)
+                && is_source_admissible(&state, *ip, *port, None)
         })
         .map(|(ip, port)| (ip.to_string(), port))
         .collect();
@@ -6313,6 +6313,11 @@ pub async fn start_network(
     let (connect_serve_tx, connect_serve_rx) =
         mpsc::channel::<upload_server::ConnectServeRequest>(64);
 
+    // Shared so Settings nickname changes hot-reload into Hello / EmuleInfo
+    // without restarting the upload listener.
+    let shared_nickname: Arc<tokio::sync::RwLock<String>> =
+        Arc::new(tokio::sync::RwLock::new(settings.nickname.clone()));
+
     // Start the peer-to-peer upload listener (accepts incoming file requests from other KAD peers)
     {
         let ul_tx = ul_event_tx.clone();
@@ -6320,7 +6325,7 @@ pub async fn start_network(
         let ul_transfers = transfer_manager.clone();
         let ul_bw = bandwidth_limiter.clone();
         let ul_folders = upload_shared_folders.clone();
-        let ul_nickname = settings.nickname.clone();
+        let ul_nickname = shared_nickname.clone();
         let ul_app = app_handle.clone();
         let ul_max = state.upload_max_slots.clone();
         let ul_sm = source_manager.clone();
@@ -6848,12 +6853,16 @@ pub async fn start_network(
                 // Register in pending_downloads regardless of whether active
                 // or queued. Queued downloads still need source discovery
                 // (KAD searches, server queries, retry timer) so they have
-                // sources ready when promoted.
-                if active_now
+                // sources ready when promoted. Insufficient stays out of
+                // pending until Resume (eMule ResumeFileInsufficient) —
+                // but the transfer remains in the manager so Temp orphan
+                // sweep will not delete its `.part`.
+                if (active_now
                     || matches!(
                         transfer.status,
                         TransferStatus::Searching | TransferStatus::Queued
-                    )
+                    ))
+                    && transfer.status != TransferStatus::Insufficient
                 {
                     state.pending_downloads.insert(
                         transfer.id.clone(),
@@ -6954,7 +6963,26 @@ pub async fn start_network(
                     break;
                 }
                 NetworkCommand::UpdateSettings { settings: new_settings } => {
+                    let prev_filter_servers = settings.filter_servers_by_ip;
                     apply_network_settings(&mut state, &mut settings, new_settings);
+                    {
+                        let mut nick = shared_nickname.write().await;
+                        *nick = settings.nickname.clone();
+                    }
+                    source_manager
+                        .write()
+                        .await
+                        .set_max_per_file(settings.max_sources_per_file);
+                    if settings.filter_servers_by_ip && !prev_filter_servers {
+                        let removed = state.server_list.remove_filtered(&mut state.ip_filter);
+                        if removed > 0 {
+                            let met_path = state.data_dir.join("server.met");
+                            let _ = state.server_list.save_server_met(&met_path);
+                            info!(
+                                "Removed {removed} servers blocked by IP filter (toggle enabled)"
+                            );
+                        }
+                    }
                 }
                 cmd => {
                     handle_command(
@@ -7178,7 +7206,26 @@ pub async fn start_network(
                     // (obfuscation toggle, USS toggle, max-uploads slider all
                     // had no effect until the next message woke the loop).
                     Some(NetworkCommand::UpdateSettings { settings: new_settings }) => {
+                        let prev_filter_servers = settings.filter_servers_by_ip;
                         apply_network_settings(&mut state, &mut settings, new_settings);
+                        {
+                            let mut nick = shared_nickname.write().await;
+                            *nick = settings.nickname.clone();
+                        }
+                        source_manager
+                            .write()
+                            .await
+                            .set_max_per_file(settings.max_sources_per_file);
+                        if settings.filter_servers_by_ip && !prev_filter_servers {
+                            let removed = state.server_list.remove_filtered(&mut state.ip_filter);
+                            if removed > 0 {
+                                let met_path = state.data_dir.join("server.met");
+                                let _ = state.server_list.save_server_met(&met_path);
+                                info!(
+                                    "Removed {removed} servers blocked by IP filter (toggle enabled)"
+                                );
+                            }
+                        }
                     }
                     Some(cmd) => {
                         handle_command(
@@ -7705,11 +7752,31 @@ pub async fn start_network(
                     }
 
                     // eMule-style: downloads never auto-fail. Re-queue for source
-                    // retry unless the user explicitly cancelled.
+                    // retry unless the user explicitly cancelled — or the local
+                    // disk is full (Insufficient), which is transfer-level.
                     let is_user_cancel = error.to_lowercase().contains("cancelled") || {
                         let mgr = transfer_manager.read().await;
                         mgr.is_control_cancelled(transfer_id)
                     };
+                    let is_disk_full = *failure_kind == SourceFailureKind::InsufficientDisk
+                        || ed2k::transfer::is_disk_full_error(error);
+                    if is_disk_full && !is_user_cancel {
+                        let file_name = {
+                            let mgr = transfer_manager.read().await;
+                            mgr.get_transfer(transfer_id)
+                                .map(|t| t.file_name.clone())
+                                .unwrap_or_default()
+                        };
+                        state.pending_downloads.remove(transfer_id);
+                        mark_download_insufficient(
+                            &transfer_manager,
+                            &db,
+                            &app_handle,
+                            transfer_id,
+                            &file_name,
+                        )
+                        .await;
+                    } else {
                     let is_terminal_final_hash_failure = *failure_kind == SourceFailureKind::Permanent
                         && error.to_lowercase().contains("final hash verification failed");
                     if !is_user_cancel && !is_terminal_final_hash_failure {
@@ -7812,6 +7879,7 @@ pub async fn start_network(
                             continue;
                         }
                     }
+                    } // end else (!is_disk_full)
                 }
                 // Inject source-exchange-discovered sources into the active download
                 if let DownloadEvent::SourceExchange { ref transfer_id, ref file_hash, ref sources } = event {
@@ -8056,6 +8124,9 @@ pub async fn start_network(
                                             Some(SourceFailureKind::Transient) => 1,
                                             Some(SourceFailureKind::DownloadTimeout) => 2,
                                             Some(SourceFailureKind::Permanent) => 4,
+                                            // Disk-full is transfer-level, not a peer fault —
+                                            // don't punish the source.
+                                            Some(SourceFailureKind::InsufficientDisk) => 0,
                                             None => 1,
                                         };
                                         pfs.set_failed_with_penalty(v4, port, penalty, None);
@@ -8119,6 +8190,7 @@ pub async fn start_network(
                         let failure_kind_name = match failure_kind {
                             Some(SourceFailureKind::Permanent) => "permanent",
                             Some(SourceFailureKind::DownloadTimeout) => "timeout",
+                            Some(SourceFailureKind::InsufficientDisk) => "insufficient_disk",
                             Some(SourceFailureKind::Transient) | None => "transient",
                         };
                         let _ = app_handle.emit("transfer:source-failed", serde_json::json!({
@@ -10620,8 +10692,9 @@ pub async fn start_network(
                                         .filter(|(ip, port)| {
                                             if let Ok(v4) = ip.parse::<Ipv4Addr>() {
                                                 !state.dead_sources.is_dead_source_for_file(&hash_bytes, u32::from(v4), *port)
+                                                    && is_source_admissible(&state, v4, *port, None)
                                             } else {
-                                                true
+                                                false
                                             }
                                         })
                                         .collect();
@@ -14578,7 +14651,10 @@ pub async fn start_network(
                             sm.get_sources(&hash_bytes)
                         };
                         let live_sources: Vec<(String, u16)> = sm_sources.into_iter()
-                            .filter(|(ip, port)| !state.dead_sources.is_dead_source_for_file(&hash_bytes, u32::from(*ip), *port))
+                            .filter(|(ip, port)| {
+                                !state.dead_sources.is_dead_source_for_file(&hash_bytes, u32::from(*ip), *port)
+                                    && is_source_admissible(&state, *ip, *port, None)
+                            })
                             .map(|(ip, port)| (ip.to_string(), port))
                             .collect();
                         if live_sources.is_empty() {
@@ -17703,7 +17779,19 @@ pub async fn start_network(
                             .find(|(_, pd)| pd.file_hash == hash_hex)
                             .map(|(tid, _)| tid.clone())
                         {
-                            if let Some(pd) = state.pending_downloads.remove(&tid) {
+                            // Respect pause/cancel the same way
+                            // `try_start_pending_download_from_known_sources`
+                            // does — a paused download stays in
+                            // pending_downloads and must not be started
+                            // by a KAD/buddy callback connect-back.
+                            let blocked = state
+                                .pending_downloads
+                                .get(&tid)
+                                .map(|pd| pd.control.is_paused() || pd.control.is_cancelled())
+                                .unwrap_or(true);
+                            if blocked {
+                                None
+                            } else if let Some(pd) = state.pending_downloads.remove(&tid) {
                             let source_addr = SocketAddr::new(parts.peer_ip.into(), parts.peer_port);
                             info!("Starting callback download {tid} from {source_addr}");
                             let download = Ed2kDownload {
@@ -24100,17 +24188,32 @@ async fn handle_command_inner(
                     }
                 };
 
-                // Validate every extra source up-front so we don't
-                // hand the multi-source manager addresses we know are
-                // unsafe (special-use IPv4, IP-filtered, banned, or
-                // duplicates of the primary). The cap mirrors
-                // `MAX_SOURCE_ADDRS` from the search merge path so a
-                // bug in the frontend can't push an unbounded list.
+                // Validate primary + extras with the shared admissibility
+                // gate so we don't hand the multi-source manager addresses
+                // we refuse to dial (IP filter, banlist, self, port 0).
+                // The cap mirrors `MAX_SOURCE_ADDRS` from the search merge
+                // path so a bug in the frontend can't push an unbounded list.
                 const MAX_SEED_EXTRA_SOURCES: usize = 49;
                 let mut seen_addrs: std::collections::HashSet<(Ipv4Addr, u16)> =
                     std::collections::HashSet::new();
-                if let std::net::IpAddr::V4(primary_v4) = source_addr.ip() {
-                    seen_addrs.insert((primary_v4, source_addr.port()));
+                let primary_ok = match source_addr.ip() {
+                    std::net::IpAddr::V4(primary_v4) => {
+                        seen_addrs.insert((primary_v4, source_addr.port()));
+                        is_source_admissible(
+                            &state,
+                            primary_v4,
+                            source_addr.port(),
+                            None,
+                        )
+                    }
+                    _ => false,
+                };
+                if !primary_ok {
+                    warn!(
+                        "StartDownload rejecting primary source {peer_ip}:{peer_port} (filtered/banned/self/undialable)"
+                    );
+                    // Fall through without registering the primary; extras
+                    // may still seed the download if any are admissible.
                 }
                 let mut validated_extras: Vec<(Ipv4Addr, u16, String)> =
                     Vec::with_capacity(extra_sources.len().min(MAX_SEED_EXTRA_SOURCES));
@@ -24123,7 +24226,7 @@ async fn handle_command_inner(
                         Ok(ip) => ip,
                         Err(_) => continue,
                     };
-                    if !is_search_source_safe(&state, parsed_ip) {
+                    if !is_source_admissible(&state, parsed_ip, *extra_port, None) {
                         continue;
                     }
                     if !seen_addrs.insert((parsed_ip, *extra_port)) {
@@ -24134,8 +24237,10 @@ async fn handle_command_inner(
 
                 {
                     let mut sm = source_manager.write().await;
-                    if let std::net::IpAddr::V4(v4) = source_addr.ip() {
-                        sm.register_source(hash_bytes, v4, source_addr.port());
+                    if primary_ok {
+                        if let std::net::IpAddr::V4(v4) = source_addr.ip() {
+                            sm.register_source(hash_bytes, v4, source_addr.port());
+                        }
                     }
                     for (parsed_ip, extra_port, _) in &validated_extras {
                         sm.register_source(hash_bytes, *parsed_ip, *extra_port);
@@ -24143,24 +24248,28 @@ async fn handle_command_inner(
                 }
                 let download_sources = {
                     let sm = source_manager.read().await;
-                    let uh = if let std::net::IpAddr::V4(v4) = source_addr.ip() {
-                        sm.get_user_hash(&hash_bytes, v4, source_addr.port())
-                    } else {
-                        None
-                    };
-                    let co = if let std::net::IpAddr::V4(v4) = source_addr.ip() {
-                        sm.get_connect_options(&hash_bytes, v4, source_addr.port())
-                    } else {
-                        None
-                    };
-                    let mut sources = Vec::with_capacity(1 + validated_extras.len());
-                    sources.push(DownloadSource {
-                        peer_ip: peer_ip.clone(),
-                        peer_port,
-                        available_parts: Vec::new(),
-                        peer_user_hash: uh,
-                        peer_connect_options: co,
-                    });
+                    let mut sources = Vec::with_capacity(
+                        usize::from(primary_ok) + validated_extras.len(),
+                    );
+                    if primary_ok {
+                        let uh = if let std::net::IpAddr::V4(v4) = source_addr.ip() {
+                            sm.get_user_hash(&hash_bytes, v4, source_addr.port())
+                        } else {
+                            None
+                        };
+                        let co = if let std::net::IpAddr::V4(v4) = source_addr.ip() {
+                            sm.get_connect_options(&hash_bytes, v4, source_addr.port())
+                        } else {
+                            None
+                        };
+                        sources.push(DownloadSource {
+                            peer_ip: peer_ip.clone(),
+                            peer_port,
+                            available_parts: Vec::new(),
+                            peer_user_hash: uh,
+                            peer_connect_options: co,
+                        });
+                    }
                     for (parsed_ip, extra_port, extra_ip_str) in &validated_extras {
                         // Look up cached identity for the extra in the
                         // same way as the primary, so a peer the source
@@ -24180,6 +24289,15 @@ async fn handle_command_inner(
                     }
                     sources
                 };
+                if download_sources.is_empty() {
+                    warn!(
+                        "StartDownload {transfer_id}: no admissible sources after filter/ban checks"
+                    );
+                    // Keep going through the no-source / searching path
+                    // below by treating this as has_source=false would —
+                    // fall through is awkward inside this branch, so
+                    // queue as pending discovery instead.
+                }
                 if !validated_extras.is_empty() {
                     info!(
                         "Seeded multi-source download {} with primary {}:{} + {} extra source(s)",
@@ -26745,6 +26863,8 @@ async fn handle_command_inner(
         } => {
             if settings.friend_chat_disabled {
                 let _ = tx.send(Err("Chat is disabled in Friends settings".into()));
+            } else if !friend_hashes.read().await.contains(&friend_eh) {
+                let _ = tx.send(Err("Can only chat with friends".into()));
             } else {
                 let sessions = state.ember_sessions.read().await;
                 // Only reuse the session if it's actually fresh (see

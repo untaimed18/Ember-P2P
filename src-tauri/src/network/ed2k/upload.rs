@@ -954,7 +954,9 @@ struct UploadHandler {
     shared_folders: Arc<RwLock<Vec<String>>>,
     download_folder: PathBuf,
     user_hash: [u8; 16],
-    nickname: String,
+    /// Live nickname — Settings can change it without restarting the
+    /// upload listener. Read on every Hello / EmuleInfo build.
+    nickname: Arc<tokio::sync::RwLock<String>>,
     /// Live-toggleable obfuscation preference. The Settings page can
     /// flip this at runtime; we read it on every Hello / EmuleInfo
     /// build so inbound and outbound advertise the same value as the
@@ -1620,7 +1622,7 @@ pub(crate) async fn udp_queue_rank_for_peer(
 pub async fn start_upload_server(
     tcp_port: u16,
     user_hash: [u8; 16],
-    nickname: String,
+    nickname: Arc<tokio::sync::RwLock<String>>,
     udp_port: u16,
     shared_folders: Arc<RwLock<Vec<String>>>,
     download_folder: PathBuf,
@@ -2121,13 +2123,11 @@ pub async fn start_upload_server(
             }
             // Punch/relay-adopted streams: the network task already completed
             // a QUIC hole-punch or relay-invite websocket connect on our
-            // behalf. Same admission checks (global/per-IP caps) as a plain
-            // inbound accept; no IP-filter/ban check here because these
-            // streams didn't come through the plain TCP listener (the peer's
-            // IP was already vetted at rendezvous-registration time and, for
-            // hole-punches, `peer_addr` may be a placeholder unspecified
-            // address for relay sessions where the true peer IP is hidden
-            // behind the relay).
+            // behalf. Same admission checks as a plain inbound accept —
+            // including IP filter / ban when `peer_addr` is a real IPv4
+            // (not an unspecified relay placeholder). Bogus addresses are
+            // always rejected; `ipfilter.dat` / private blocks honor the
+            // live `filter_incoming_connections` toggle like TCP accept.
             maybe_stream = inbound_stream_rx.recv(), if !inbound_stream_closed => {
                 let req = match maybe_stream {
                     Some(r) => r,
@@ -2138,6 +2138,63 @@ pub async fn start_upload_server(
                 };
                 let peer_addr = req.peer_addr;
                 let peer_ip = peer_addr.ip();
+
+                if let std::net::IpAddr::V4(peer_ipv4) = peer_ip {
+                    // Unspecified (0.0.0.0) is the relay-placeholder case —
+                    // skip filter/ban because the true peer IP is hidden.
+                    if !peer_ipv4.is_unspecified() {
+                        if crate::security::is_bogus_v4(peer_ipv4) {
+                            debug!(
+                                "Rejecting punch/relay-adopted stream from bogus IP {peer_addr}"
+                            );
+                            continue;
+                        }
+                        if server
+                            .filter_incoming_connections
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            let blocked = match server.shared_ip_filter.read() {
+                                Ok(snap) => snap.is_blocked(peer_ipv4),
+                                Err(_poisoned) => {
+                                    tracing::warn!(
+                                        "IP filter lock poisoned while checking punch/relay {peer_addr}; rejecting"
+                                    );
+                                    true
+                                }
+                            };
+                            if blocked {
+                                info!(
+                                    "IP filter blocked punch/relay-adopted stream from {peer_addr}"
+                                );
+                                continue;
+                            }
+                        }
+                        let banned_check = match server.banned_ips.read() {
+                            Ok(banned) => banned.contains(&peer_ipv4),
+                            Err(_poisoned) => {
+                                tracing::warn!(
+                                    "Banned-IP lock poisoned while checking punch/relay {peer_addr}; rejecting"
+                                );
+                                true
+                            }
+                        };
+                        if banned_check {
+                            debug!(
+                                "Rejecting punch/relay-adopted stream from banned IP {peer_addr}"
+                            );
+                            continue;
+                        }
+                        {
+                            let tracker = server.abuse_tracker.lock().await;
+                            if tracker.is_banned(&peer_ip) {
+                                debug!(
+                                    "Rejecting punch/relay-adopted stream from auto-banned IP {peer_addr}"
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                }
 
                 let reserved = {
                     let mut cur = server
@@ -2218,6 +2275,20 @@ pub async fn start_upload_server(
 }
 
 impl UploadHandler {
+    async fn nickname_snapshot(&self) -> String {
+        self.nickname.read().await.clone()
+    }
+
+    /// Keep the waiting-list entry's file hash in sync when a peer mid-slot
+    /// switches files (`OP_SETREQFILEID` / `OP_REQUESTPARTS` / MultiPacket).
+    /// Queue scoring and file-priority bonuses key off `QueueEntry::file_hash`.
+    async fn sync_queue_file_hash(&self, identity: &QueueIdentity, file_hash: [u8; 16]) {
+        let mut queue = self.upload_queue.lock().await;
+        if let Some(entry) = queue.iter_mut().find(|e| e.identity == *identity) {
+            entry.file_hash = file_hash;
+        }
+    }
+
     async fn resolve_upload_file(&self, file_hash: &[u8; 16]) -> Option<ResolvedUploadFile> {
         let hash_hex = hex::encode(file_hash);
         if let Some(file) = {
@@ -2765,11 +2836,12 @@ impl UploadHandler {
                 .load(std::sync::atomic::Ordering::Relaxed);
             let buddy = self.shared_buddy_info.read().await.clone();
             let hello_options = self.hello_options().await;
+            let nickname = self.nickname_snapshot().await;
             let hello_payload = build_hello_with_buddy_opts(
                 &self.user_hash,
                 our_client_id,
                 self.tcp_port,
-                &self.nickname,
+                &nickname,
                 buddy,
                 &hello_options,
             );
@@ -2967,11 +3039,12 @@ impl UploadHandler {
                 let our_client_id = self
                     .external_ip_shared
                     .load(std::sync::atomic::Ordering::Relaxed);
+                let nickname = self.nickname_snapshot().await;
                 let hello_payload = build_hello_answer_with_buddy_opts(
                     &self.user_hash,
                     our_client_id,
                     self.tcp_port,
-                    &self.nickname,
+                    &nickname,
                     buddy,
                     &hello_options,
                 );
@@ -3080,11 +3153,12 @@ impl UploadHandler {
                                 let our_client_id = self
                                     .external_ip_shared
                                     .load(std::sync::atomic::Ordering::Relaxed);
+                                let nickname = self.nickname_snapshot().await;
                                 let hello_payload = build_hello_answer_with_buddy_opts(
                                     &self.user_hash,
                                     our_client_id,
                                     self.tcp_port,
-                                    &self.nickname,
+                                    &nickname,
                                     buddy,
                                     &hello_options,
                                 );
@@ -3249,11 +3323,12 @@ impl UploadHandler {
                         let our_client_id = self
                             .external_ip_shared
                             .load(std::sync::atomic::Ordering::Relaxed);
+                        let nickname = self.nickname_snapshot().await;
                         let hello_payload = build_hello_answer_with_buddy_opts(
                             &self.user_hash,
                             our_client_id,
                             self.tcp_port,
-                            &self.nickname,
+                            &nickname,
                             buddy,
                             &hello_options,
                         );
@@ -3796,9 +3871,10 @@ impl UploadHandler {
             // has a verifier to challenge us with. Previously this
             // site passed `None`, which silently disabled Ember
             // identity verification on every upload session.
+            let nickname = self.nickname_snapshot().await;
             let payload = build_ember_hello(
                 &self.ember_hash,
-                &self.nickname,
+                &nickname,
                 Some(&self.ed25519_public_key),
             );
             if write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_HELLO, &payload)
@@ -3968,7 +4044,8 @@ impl UploadHandler {
         let mut friend_request_sent = false;
         if is_friend && hello_caps.is_ember {
             info!("Sending friend request to Ember peer {peer_addr}");
-            let nick_bytes = self.nickname.as_bytes();
+            let nickname = self.nickname_snapshot().await;
+            let nick_bytes = nickname.as_bytes();
             if write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_FRIEND_REQ, nick_bytes)
                 .await
                 .is_ok()
@@ -4809,6 +4886,7 @@ impl UploadHandler {
                             }
                         }
                         current_file_hash = Some(hash);
+                        self.sync_queue_file_hash(&queue_identity, hash).await;
 
                         if let Some(file) = self.resolve_upload_file(&hash).await {
                             self.record_share_request_once(&hash, &mut recorded_share_request)
@@ -5478,6 +5556,7 @@ impl UploadHandler {
                             // Force the size backstop below to re-resolve for the
                             // newly-targeted file.
                             total_size = 0;
+                            self.sync_queue_file_hash(&queue_identity, requested).await;
                         }
                     }
                     let hash = if let Some(h) = current_file_hash {
@@ -6901,6 +6980,7 @@ impl UploadHandler {
                             }
                             current_file_hash = Some(mpreq.file_hash);
                             total_size = file.size;
+                            self.sync_queue_file_hash(&queue_identity, mpreq.file_hash).await;
 
                                 // eMule ProcessExtendedInfo over MultiPacket: the
                                 // OP_REQUESTFILENAME sub-block carries the peer's
@@ -7277,7 +7357,8 @@ impl UploadHandler {
                         );
                         if opcode == OP_EMBER_HELLO && !ul_sent_ember_hello {
                             // See above for why we advertise our pubkey here.
-                            let payload = build_ember_hello(&self.ember_hash, &self.nickname, Some(&self.ed25519_public_key));
+                            let nickname = self.nickname_snapshot().await;
+                            let payload = build_ember_hello(&self.ember_hash, &nickname, Some(&self.ed25519_public_key));
                             let _ = write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_HELLOANSWER, &payload).await;
                             ul_sent_ember_hello = true;
                         }
@@ -7356,7 +7437,8 @@ impl UploadHandler {
                             info!(
                                 "Sending deferred friend request to Ember peer {peer_addr} after OP_EMBER_HELLO",
                             );
-                            let nick_bytes = self.nickname.as_bytes();
+                            let nickname = self.nickname_snapshot().await;
+                            let nick_bytes = nickname.as_bytes();
                             if write_packet_async(
                                 &mut writer,
                                 OP_EMULEPROT,
