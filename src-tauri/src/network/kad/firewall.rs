@@ -245,6 +245,13 @@ impl FirewallChecker {
         );
     }
 
+    /// Record that an ed2k server assigned us LowID — inbound TCP to our
+    /// advertised port failed from the server's perspective.
+    pub fn note_tcp_firewalled(&mut self) {
+        self.tcp_status = FirewallStatus::Firewalled;
+        debug!("TCP firewall check: firewalled (server LowID)");
+    }
+
     /// Handle KADEMLIA2_PONG: peer reports what UDP port it sees us on.
     /// `reporter` is the responding contact's source IP; votes are weighted by
     /// distinct /24 (K7) so a single-subnet cluster can't bias the result.

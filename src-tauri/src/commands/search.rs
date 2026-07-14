@@ -706,15 +706,10 @@ pub async fn mark_spam(
         spam.mark_spam(&result, &search_keywords, server_ip.as_deref());
         spam.take_save_data()
     };
-    if let Some((data, path, gen)) = save_data {
-        tokio::task::spawn_blocking(move || {
-            crate::security::atomic_write(&path, data.as_bytes(), false)
-        })
-        .await
-        .map_err(|e| coded_ctx("spam_filter_save_task_failed", "Spam filter save failed", e))?
-        .map_err(|e| coded_ctx("spam_filter_save_failed", "Spam filter save failed", e))?;
-        state.spam_filter.write().await.mark_saved(gen);
-    }
+    // Persist off the IPC path so the UI isn't parked on disk I/O. In-memory
+    // state is already updated; a crash before the write lands is recovered by
+    // the next mark or the periodic spam flush in the network loop.
+    spawn_spam_filter_save(state.spam_filter.clone(), save_data);
     Ok(())
 }
 
@@ -731,23 +726,55 @@ pub async fn mark_not_spam(
         spam.mark_not_spam(&file_hash);
         spam.take_save_data()
     };
-    if let Some((data, path, gen)) = save_data {
-        let ok = tokio::task::spawn_blocking(move || {
-            match crate::security::atomic_write(&path, data.as_bytes(), false) {
-                Ok(()) => true,
-                Err(e) => {
+    spawn_spam_filter_save(state.spam_filter.clone(), save_data);
+    Ok(())
+}
+
+/// Serialize happened under the lock; write + `mark_saved` run in the background.
+/// Saves are gated so concurrent mark_spam / mark_not_spam calls cannot write
+/// out of order and leave a stale snapshot on disk with `dirty == false`.
+fn spam_save_gate() -> &'static tokio::sync::Mutex<()> {
+    static GATE: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+fn spawn_spam_filter_save(
+    spam_filter: std::sync::Arc<tokio::sync::RwLock<SpamFilter>>,
+    save_data: Option<(String, std::path::PathBuf, u64)>,
+) {
+    if save_data.is_none() {
+        return;
+    }
+    tokio::spawn(async move {
+        let _guard = spam_save_gate().lock().await;
+        // Drain under the gate: re-snapshot each iteration so concurrent marks
+        // collapse into the latest on-disk state instead of racing.
+        loop {
+            let Some((data, path, gen)) = ({
+                let mut spam = spam_filter.write().await;
+                spam.take_save_data()
+            }) else {
+                break;
+            };
+            let write_result = tokio::task::spawn_blocking(move || {
+                crate::security::atomic_write(&path, data.as_bytes(), false)
+            })
+            .await;
+            match write_result {
+                Ok(Ok(())) => {
+                    spam_filter.write().await.mark_saved(gen);
+                }
+                Ok(Err(e)) => {
                     tracing::warn!("Failed to save spam filter: {e}");
-                    false
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!("Spam filter save task failed: {e}");
+                    break;
                 }
             }
-        })
-        .await
-        .unwrap_or(false);
-        if ok {
-            state.spam_filter.write().await.mark_saved(gen);
         }
-    }
-    Ok(())
+    });
 }
 
 #[tauri::command]

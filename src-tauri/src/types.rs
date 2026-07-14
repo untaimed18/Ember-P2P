@@ -603,10 +603,8 @@ pub struct AppSettings {
     #[serde(default)]
     pub auto_connect_kad: bool,
     /// Automatically connect to an ed2k server on startup (eMule: "Autoconnect" for server),
-    /// independent of `auto_connect_kad`. Defaults to `false`: unlike the KAD
-    /// Connect button, which always brings up a default server alongside it
-    /// by design (see `NetworkCommand::KadConnect`), a server should not be
-    /// contacted before the user has taken *some* connecting action.
+    /// independent of `auto_connect_kad`. Defaults to `false`. KAD Connect never
+    /// starts an eD2K session — use the Servers page or enable this setting.
     #[serde(default)]
     pub auto_connect_server: bool,
     /// Maximum sources tracked per file (eMule: maxsourceperfile, default 400)

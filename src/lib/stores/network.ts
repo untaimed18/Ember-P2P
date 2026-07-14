@@ -127,6 +127,18 @@ function syncServerStatus(stats: NetworkStats) {
 }
 let lastNetworkUpdate = 0;
 
+/** Prefer a known TCP/UDP result over a stale Unknown from poll/events. */
+function preferFirewallStatus(incoming: string | undefined, current: string | undefined): string {
+  const next = incoming || current || 'Unknown';
+  if (
+    (current === 'Open' || current === 'Firewalled') &&
+    (!incoming || incoming === 'Unknown')
+  ) {
+    return current;
+  }
+  return next;
+}
+
 function withDerivedNetworkState(stats: NetworkStats, now = Date.now()): NetworkStats {
   const newestUpdate = Math.max(lastEventUpdate, lastPollOkAt, lastNetworkUpdate);
   const stale = newestUpdate > 0 && now - newestUpdate > STALE_NETWORK_MS;
@@ -195,8 +207,8 @@ export async function initNetworkStore() {
           ...s,
           firewalled: p.firewalled,
           external_ip: p.external_ip,
-          tcp_status: p.tcp_status ?? s.tcp_status,
-          udp_status: p.udp_status ?? s.udp_status,
+          tcp_status: preferFirewallStatus(p.tcp_status, s.tcp_status),
+          udp_status: preferFirewallStatus(p.udp_status, s.udp_status),
         }),
       }));
     }));
@@ -334,12 +346,8 @@ export async function initNetworkStore() {
       if (!merged.external_ip && current.external_ip) {
         merged.external_ip = current.external_ip;
       }
-      if (!merged.tcp_status && current.tcp_status) {
-        merged.tcp_status = current.tcp_status;
-      }
-      if (!merged.udp_status && current.udp_status) {
-        merged.udp_status = current.udp_status;
-      }
+      merged.tcp_status = preferFirewallStatus(merged.tcp_status, current.tcp_status);
+      merged.udp_status = preferFirewallStatus(merged.udp_status, current.udp_status);
       return withDerivedNetworkState(merged);
     });
   } catch {
@@ -461,12 +469,8 @@ export function startStatsPoll() {
         if (current.firewalled && !merged.firewalled && merged.external_ip === '') {
           merged.firewalled = current.firewalled;
         }
-        if (!merged.tcp_status && current.tcp_status) {
-          merged.tcp_status = current.tcp_status;
-        }
-        if (!merged.udp_status && current.udp_status) {
-          merged.udp_status = current.udp_status;
-        }
+        merged.tcp_status = preferFirewallStatus(merged.tcp_status, current.tcp_status);
+        merged.udp_status = preferFirewallStatus(merged.udp_status, current.udp_status);
         return withDerivedNetworkState(merged);
       });
     } catch {

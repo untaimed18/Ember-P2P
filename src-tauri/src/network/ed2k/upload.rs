@@ -1016,6 +1016,9 @@ struct UploadHandler {
     firewall_probe_ips: FirewallProbeSet,
     /// Shared atomic: set to false when TCP is proven open
     firewalled_shared: Arc<std::sync::atomic::AtomicBool>,
+    /// Set true on a KAD firewall-probe connect-back so the network loop can
+    /// promote `tcp_status` without treating UPnP clears as proof.
+    tcp_connect_back_shared: Arc<std::sync::atomic::AtomicBool>,
     /// Our current external IPv4 as a HighID-format little-endian u32, or
     /// `0` when we don't yet have a trusted public IP. Read on every
     /// incoming Hello so the `OP_HELLOANSWER` we send advertises our real
@@ -1651,6 +1654,8 @@ pub async fn start_upload_server(
     share_browsing_enabled: Arc<std::sync::atomic::AtomicBool>,
     firewall_probe_ips: FirewallProbeSet,
     firewalled_shared: Arc<std::sync::atomic::AtomicBool>,
+    // Set true when a firewall-probe IP connects back; network loop consumes it.
+    tcp_connect_back_shared: Arc<std::sync::atomic::AtomicBool>,
     // Our current external IPv4 in ed2k HighID encoding (little-endian u32
     // of the four IP octets), or 0 when we don't yet have a trusted public
     // IP to advertise. Kept in sync with `NetworkState::external_ip` by
@@ -1746,6 +1751,7 @@ pub async fn start_upload_server(
         share_browsing_enabled,
         firewall_probe_ips,
         firewalled_shared,
+        tcp_connect_back_shared,
         external_ip_shared,
         pending_kad_callbacks,
         kad_callback_tx,
@@ -1881,6 +1887,7 @@ pub async fn start_upload_server(
                             };
                             if is_probe {
                                 info!("TCP connect-back from {peer_addr} confirms port is open (firewall check passed)");
+                                server.tcp_connect_back_shared.store(true, std::sync::atomic::Ordering::Relaxed);
                                 server.firewalled_shared.store(false, std::sync::atomic::Ordering::Relaxed);
                                 drop(stream);
                                 continue;

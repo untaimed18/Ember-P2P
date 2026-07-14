@@ -57,7 +57,11 @@
         const ip = segs[1] ?? '';
         const port = parseInt(segs[2] ?? '', 10);
         if (!ip || !Number.isFinite(port) || port <= 0 || port > 65535) {
-          toastError(translateError(undefined));
+          toastError(
+            !ip
+              ? m.servers_validation_ip_invalid()
+              : m.servers_validation_port_range(),
+          );
           return;
         }
         // Add to the list, but don't let a duplicate-add error block the

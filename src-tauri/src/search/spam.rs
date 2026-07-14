@@ -517,10 +517,14 @@ impl SpamFilter {
     /// Clear the dirty flag, but only if no mutation occurred since the
     /// snapshot identified by `gen` was taken. If the database changed while
     /// the corresponding write was in flight, the flag stays set so the newer
-    /// state is persisted on the next save.
+    /// state is persisted on the next save. If an *older* write completes
+    /// after a newer generation, re-dirty so a stale on-disk snapshot is
+    /// rewritten.
     pub fn mark_saved(&mut self, gen: u64) {
         if self.gen == gen {
             self.dirty = false;
+        } else if gen < self.gen {
+            self.dirty = true;
         }
     }
 

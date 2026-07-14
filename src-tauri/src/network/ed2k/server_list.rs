@@ -252,8 +252,12 @@ impl ServerList {
     }
 
     fn connect_cooldown_secs(entry: &ServerEntry) -> i64 {
+        // High priority (e.g. eMule Security) still gets first pick when
+        // healthy, but after a failed login we want a long enough window
+        // for auto-reconnect to try Normal servers (Sunrise, etc.) instead
+        // of hammering the same dead High entry. First failure → 2 minutes.
         let base: i64 = match entry.priority {
-            ServerPriority::High => 20,
+            ServerPriority::High => 60,
             ServerPriority::Normal => 30,
             ServerPriority::Low => 45,
         };
@@ -448,6 +452,15 @@ impl ServerList {
             return Some(entry);
         }
         None
+    }
+
+    /// Clear per-server connect cooldowns so an explicit user Connect can
+    /// retry servers that recently failed. Fail counts are kept for sort
+    /// preference (prefer less-failed servers) but do not block the attempt.
+    pub fn clear_connect_cooldowns(&mut self) {
+        for entry in &mut self.servers {
+            entry.last_failed_at = 0;
+        }
     }
 
     /// eMule MAX_SERVERFAILCOUNT = 10
@@ -1303,4 +1316,60 @@ fn write_met_uint16_tag(buf: &mut Vec<u8>, tag_id: u8, value: u16) {
     buf.extend_from_slice(&1u16.to_le_bytes()); // name length = 1
     buf.push(tag_id);
     buf.extend_from_slice(&value.to_le_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_next_server_skips_failed_high_for_healthy_normal() {
+        let mut list = ServerList::hardcoded();
+        let security = list
+            .get_next_server()
+            .expect("hardcoded list has servers");
+        assert_eq!(security.name, "eMule Security");
+        let sec_ip = security.ip.clone();
+        let sec_port = security.port;
+
+        list.record_failure(&sec_ip, sec_port);
+
+        let next = list
+            .get_next_server()
+            .expect("another server should be eligible");
+        assert_ne!(
+            (next.ip.as_str(), next.port),
+            (sec_ip.as_str(), sec_port),
+            "failed High-priority server must be on cooldown so Normal servers can be tried"
+        );
+    }
+
+    #[test]
+    fn clear_connect_cooldowns_allows_retrying_high_again() {
+        let mut list = ServerList::hardcoded();
+        let security = list.get_next_server().unwrap();
+        let sec_ip = security.ip.clone();
+        let sec_port = security.port;
+        list.record_failure(&sec_ip, sec_port);
+
+        // While cooling down, Security must not be returned.
+        let during = list.get_next_server().unwrap();
+        assert_ne!((during.ip.as_str(), during.port), (sec_ip.as_str(), sec_port));
+
+        list.clear_connect_cooldowns();
+        // After an explicit Connect clears cooldowns, High is eligible again
+        // (may not be the immediate next round-robin slot — scan one full pass).
+        let mut found = false;
+        for _ in 0..list.servers().len() {
+            let s = list.get_next_server().unwrap();
+            if s.ip == sec_ip && s.port == sec_port {
+                found = true;
+                break;
+            }
+        }
+        assert!(
+            found,
+            "cleared cooldowns should make the failed High server eligible again"
+        );
+    }
 }
