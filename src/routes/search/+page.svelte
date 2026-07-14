@@ -1759,7 +1759,9 @@
     (filterMaxSize !== '' ? 1 : 0) +
     (filterExtension !== '' ? 1 : 0) +
     (filterMinSources !== '' ? 1 : 0) +
-    (filterMinComplete !== '' ? 1 : 0)
+    (filterMinComplete !== '' ? 1 : 0) +
+    // Default is hide-spam on; count only when the user opted out.
+    (hideSpam === false ? 1 : 0)
   );
 
 </script>
@@ -1906,46 +1908,6 @@
       </select>
     </div>
 
-    <div class="filter-toggles" role="group" aria-label={m.search_visibility_filters_aria()}>
-      <label class="filter-toggle">
-        <input type="checkbox" bind:checked={hideSpam} />
-        <span>{m.search_hide_spam()}</span>
-        {#if spamHiddenCount > 0}
-          <span class="filter-count">({spamHiddenCount})</span>
-        {/if}
-        <span class="filter-help-wrap">
-          <button
-            type="button"
-            class="filter-help-icon"
-            aria-label={m.search_explain_spam_hiding()}
-            onmouseenter={() => (showSpamHelp = true)}
-            onmouseleave={() => (showSpamHelp = false)}
-            onfocus={() => (showSpamHelp = true)}
-            onblur={() => (showSpamHelp = false)}
-            onclick={() => (showSpamHelp = !showSpamHelp)}
-          >
-            <svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <circle cx="8" cy="8" r="6.25"/>
-              <path d="M6.25 6.25c0-1 .75-1.75 1.75-1.75s1.75.75 1.75 1.75c0 1-1.75 1.25-1.75 2.75"/>
-              <circle cx="8" cy="11.5" r="0.55" fill="currentColor" stroke="none"/>
-            </svg>
-          </button>
-          {#if showSpamHelp}
-            <div class="filter-help-popover" role="tooltip">
-              {#if spamHiddenCount > 0}
-                {m.search_spam_hidden_count({ count: spamHiddenCount })}
-              {:else}
-                {m.search_spam_hidden_none()}
-              {/if}
-              <br />
-              {m.search_spam_help_prefix()}
-              <strong>{spamThreshold}</strong> {m.search_spam_help_in()} <strong>{spamProfile}</strong> {m.search_spam_help_suffix()}
-            </div>
-          {/if}
-        </span>
-      </label>
-    </div>
-
     <button class="ghost advanced-toggle" onclick={() => (showAdvancedFilters = !showAdvancedFilters)}>
       {showAdvancedFilters ? m.search_hide_advanced() : (advancedFilterCount > 0 ? m.search_advanced_filters_count({ count: advancedFilterCount }) : m.search_advanced_filters())}
     </button>
@@ -1957,6 +1919,46 @@
 
   {#if showAdvancedFilters}
     <div class="filter-advanced-row">
+      <div class="filter-toggles" role="group" aria-label={m.search_visibility_filters_aria()}>
+        <label class="filter-toggle">
+          <input type="checkbox" bind:checked={hideSpam} />
+          <span>{m.search_hide_spam()}</span>
+          {#if spamHiddenCount > 0}
+            <span class="filter-count">({spamHiddenCount})</span>
+          {/if}
+          <span class="filter-help-wrap">
+            <button
+              type="button"
+              class="filter-help-icon"
+              aria-label={m.search_explain_spam_hiding()}
+              onmouseenter={() => (showSpamHelp = true)}
+              onmouseleave={() => (showSpamHelp = false)}
+              onfocus={() => (showSpamHelp = true)}
+              onblur={() => (showSpamHelp = false)}
+              onclick={() => (showSpamHelp = !showSpamHelp)}
+            >
+              <svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="8" cy="8" r="6.25"/>
+                <path d="M6.25 6.25c0-1 .75-1.75 1.75-1.75s1.75.75 1.75 1.75c0 1-1.75 1.25-1.75 2.75"/>
+                <circle cx="8" cy="11.5" r="0.55" fill="currentColor" stroke="none"/>
+              </svg>
+            </button>
+            {#if showSpamHelp}
+              <div class="filter-help-popover" role="tooltip">
+                {#if spamHiddenCount > 0}
+                  {m.search_spam_hidden_count({ count: spamHiddenCount })}
+                {:else}
+                  {m.search_spam_hidden_none()}
+                {/if}
+                <br />
+                {m.search_spam_help_prefix()}
+                <strong>{spamThreshold}</strong> {m.search_spam_help_in()} <strong>{spamProfile}</strong> {m.search_spam_help_suffix()}
+              </div>
+            {/if}
+          </span>
+        </label>
+      </div>
+
       <div class="filter-group">
         <label for="filter-column">{m.search_filter_column()}</label>
         <select id="filter-column" bind:value={filterColumn} class="column-select" aria-label={m.search_filter_column()}>
@@ -2088,6 +2090,7 @@
     </div>
   {:else if (activeTab?.isSearching || activeTab?.retryRequestId != null) && searchResultsList.length === 0}
     <div class="empty-state">
+      <div class="spinner lg"></div>
       <p>{m.search_searching_network()}</p>
       {#if activeTab.progress}
         <p class="search-detail">

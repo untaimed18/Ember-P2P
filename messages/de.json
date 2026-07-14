@@ -2006,5 +2006,9 @@
   "updater_error_title": "Update fehlgeschlagen",
   "updater_error_body": "Update konnte nicht abgeschlossen werden: {detail}",
   "updater_retry": "Erneut versuchen",
-  "updater_dismiss_aria": "Update-Benachrichtigung schließen"
+  "updater_dismiss_aria": "Update-Benachrichtigung schließen",
+  "statusbar_epx_status_active": "Aktiv",
+  "statusbar_epx_status_idle": "Wartend",
+  "statusbar_epx_status_inactive": "Offline",
+  "servers_connect_select_hint": "Wählen Sie einen Server in der Liste zum Verbinden"
 }

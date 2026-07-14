@@ -219,6 +219,7 @@
 
   let flashTimer: ReturnType<typeof setTimeout> | undefined;
   function flash(msg: string) {
+    error = null;
     successMsg = msg;
     clearTimeout(flashTimer);
     flashTimer = setTimeout(() => { if (mounted) successMsg = null; }, 4000);
@@ -654,20 +655,21 @@
     {:else if selectedServer}
       <button onclick={() => handleConnect()}>{m.servers_connect()}</button>
     {:else}
-      <button disabled>{m.servers_connect()}</button>
+      <span title={m.servers_connect_select_hint()}>
+        <button disabled>{m.servers_connect()}</button>
+      </span>
     {/if}
   </div>
 </div>
 
 <div class="page-content servers-page">
   {#if error}
-    <div class="banner error-banner">
+    <div class="banner error-banner" role="alert">
       <span>{error}</span>
       <button class="ghost" onclick={() => (error = null)}>{m.common_dismiss()}</button>
     </div>
-  {/if}
-  {#if successMsg}
-    <div class="banner success-banner">
+  {:else if successMsg}
+    <div class="banner success-banner" role="status">
       <span>{successMsg}</span>
     </div>
   {/if}

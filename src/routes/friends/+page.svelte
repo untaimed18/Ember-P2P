@@ -320,6 +320,7 @@
   }
 
   function flash(msg: string) {
+    error = null;
     clearTimeout(flashTimer);
     successMsg = msg;
     flashTimer = setTimeout(() => (successMsg = null), 4000);
@@ -509,17 +510,57 @@
 </div>
 
 <div class="page-content friends-content">
-  {#if error}
-    <div class="banner error-banner">
-      <span>{error}</span>
-      <button class="ghost" onclick={() => (error = null)}>{m.common_dismiss()}</button>
-    </div>
-  {/if}
-  {#if successMsg}
-    <div class="banner success-banner">
-      <span>{successMsg}</span>
-    </div>
-  {/if}
+  <div class="alerts-stack">
+    {#if error}
+      <div class="banner error-banner" role="alert">
+        <span>{error}</span>
+        <button class="ghost" onclick={() => (error = null)}>{m.common_dismiss()}</button>
+      </div>
+    {:else if successMsg}
+      <div class="banner success-banner" role="status">
+        <span>{successMsg}</span>
+      </div>
+    {/if}
+
+    {#if isFirewalled}
+      <div class="banner firewall-banner" role="status">
+        <div class="firewall-banner-content">
+          <svg class="firewall-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M10 1l7 3v5c0 4.5-3 8.5-7 10-4-1.5-7-5.5-7-10V4z"/>
+            <line x1="10" y1="7" x2="10" y2="11"/>
+            <circle cx="10" cy="14" r="0.5" fill="currentColor" stroke="none"/>
+          </svg>
+          <div class="firewall-text">
+            <strong>{m.friends_firewall_title()}</strong>
+            {m.friends_firewall_body()}
+          </div>
+        </div>
+        <button class="firewall-recheck" onclick={handleRecheckFirewall} disabled={recheckingFirewall}>
+          {recheckingFirewall ? m.friends_firewall_checking() : m.friends_firewall_recheck()}
+        </button>
+        {#if recheckError}
+          <span class="firewall-recheck-error" role="status">{m.friends_firewall_recheck_failed({ error: recheckError })}</span>
+        {/if}
+      </div>
+    {:else if isDiscoverable}
+      <div class="banner discoverable-banner" role="status">
+        <div class="discoverable-content">
+          <svg class="discoverable-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="10" cy="10" r="3"/>
+            <path d="M5.64 5.64a7 7 0 000 8.72"/>
+            <path d="M14.36 5.64a7 7 0 010 8.72"/>
+            <path d="M3.05 3.05a11 11 0 000 13.9"/>
+            <path d="M16.95 3.05a11 11 0 010 13.9"/>
+          </svg>
+          <span>
+            {m.friends_discoverable_prefix()}
+            <strong>{m.friends_discoverable_emphasis()}</strong>
+            {m.friends_discoverable_suffix()}
+          </span>
+        </div>
+      </div>
+    {/if}
+  </div>
 
   <!-- Your Friend ID -->
   {#if myHash}
@@ -551,49 +592,6 @@
           {m.common_copy()}
         {/if}
       </button>
-    </div>
-  {/if}
-
-  <!-- Discoverable status -->
-  {#if isDiscoverable && !isFirewalled}
-    <div class="banner discoverable-banner">
-      <div class="discoverable-content">
-        <svg class="discoverable-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="10" cy="10" r="3"/>
-          <path d="M5.64 5.64a7 7 0 000 8.72"/>
-          <path d="M14.36 5.64a7 7 0 010 8.72"/>
-          <path d="M3.05 3.05a11 11 0 000 13.9"/>
-          <path d="M16.95 3.05a11 11 0 010 13.9"/>
-        </svg>
-        <span>
-          {m.friends_discoverable_prefix()}
-          <strong>{m.friends_discoverable_emphasis()}</strong>
-          {m.friends_discoverable_suffix()}
-        </span>
-      </div>
-    </div>
-  {/if}
-
-  <!-- Firewall warning -->
-  {#if isFirewalled}
-    <div class="banner firewall-banner">
-      <div class="firewall-banner-content">
-        <svg class="firewall-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M10 1l7 3v5c0 4.5-3 8.5-7 10-4-1.5-7-5.5-7-10V4z"/>
-          <line x1="10" y1="7" x2="10" y2="11"/>
-          <circle cx="10" cy="14" r="0.5" fill="currentColor" stroke="none"/>
-        </svg>
-        <div class="firewall-text">
-          <strong>{m.friends_firewall_title()}</strong>
-          {m.friends_firewall_body()}
-        </div>
-      </div>
-      <button class="firewall-recheck" onclick={handleRecheckFirewall} disabled={recheckingFirewall}>
-        {recheckingFirewall ? m.friends_firewall_checking() : m.friends_firewall_recheck()}
-      </button>
-      {#if recheckError}
-        <span class="firewall-recheck-error" role="status">{m.friends_firewall_recheck_failed({ error: recheckError })}</span>
-      {/if}
     </div>
   {/if}
 
@@ -729,6 +727,7 @@
 
   {#if loading && friends.length === 0}
     <div class="empty-state">
+      <div class="spinner lg"></div>
       <p>{m.friends_loading()}</p>
     </div>
   {:else if friends.length === 0}
@@ -917,13 +916,24 @@
   }
 
   /* --- Banners --- */
+  .alerts-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+
+  .alerts-stack:empty {
+    display: none;
+  }
+
   .banner {
     display: flex;
     align-items: center;
     justify-content: space-between;
     padding: 8px 16px;
     border-radius: var(--radius-md);
-    margin-bottom: 12px;
+    margin-bottom: 0;
     font-size: 12px;
   }
 
