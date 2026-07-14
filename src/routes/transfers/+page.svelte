@@ -2612,6 +2612,13 @@
     if (ctxMenu) { closeCtx(); e.preventDefault(); }
     if (knownCtxMenu) { closeKnownCtx(); e.preventDefault(); }
     else if (columnMenu) { closeColumnMenu(); e.preventDefault(); }
+    else {
+      const openMore = document.querySelector('.toolbar-more[open]') as HTMLDetailsElement | null;
+      if (openMore) {
+        openMore.open = false;
+        e.preventDefault();
+      }
+    }
     return;
   }
   // D33: keyboard nav for download rows. Only hijack when focus is not
@@ -2702,11 +2709,16 @@
           {showAdvancedDlCols ? m.transfers_toggle_compact() : m.transfers_toggle_full()}
         </button>
         <span class="toolbar-sep"></span>
-        <button class="tb-btn" onclick={handlePauseAll} title={m.transfers_pause_all()}>{m.transfers_pause_all()}</button>
-        <button class="tb-btn" onclick={handleResumeAll} title={m.transfers_resume_all()}>{m.transfers_resume_all()}</button>
-        {#if hasCompletedDl}
-          <button class="tb-btn" onclick={() => confirmClearCompleted = true} title={m.transfers_clear_completed()}>{m.transfers_clear_completed()}</button>
-        {/if}
+        <details class="toolbar-more">
+          <summary class="tb-btn" title={m.common_more()} aria-haspopup="menu">{m.common_more()}</summary>
+          <div class="toolbar-more-menu" role="menu">
+            <button type="button" role="menuitem" onclick={(e) => { handlePauseAll(); (e.currentTarget.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open'); }}>{m.transfers_pause_all()}</button>
+            <button type="button" role="menuitem" onclick={(e) => { handleResumeAll(); (e.currentTarget.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open'); }}>{m.transfers_resume_all()}</button>
+            {#if hasCompletedDl}
+              <button type="button" role="menuitem" onclick={(e) => { confirmClearCompleted = true; (e.currentTarget.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open'); }}>{m.transfers_clear_completed()}</button>
+            {/if}
+          </div>
+        </details>
       </div>
     </div>
     <div class="pane-content scroll-shadows">
@@ -4105,6 +4117,43 @@
   }
   .tb-btn.danger-outline:hover {
     background: color-mix(in srgb, var(--danger) 12%, var(--bg-primary));
+  }
+  .toolbar-more {
+    position: relative;
+  }
+  .toolbar-more > summary {
+    list-style: none;
+  }
+  .toolbar-more > summary::-webkit-details-marker {
+    display: none;
+  }
+  .toolbar-more-menu {
+    position: absolute;
+    right: 0;
+    top: calc(100% + 4px);
+    z-index: 20;
+    min-width: 160px;
+    padding: 4px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    box-shadow: var(--shadow-md, 0 4px 12px rgba(0, 0, 0, 0.15));
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .toolbar-more-menu button {
+    text-align: left;
+    font-size: 12px;
+    padding: 6px 10px;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-primary);
+    cursor: pointer;
+  }
+  .toolbar-more-menu button:hover {
+    background: var(--bg-hover);
   }
   .pane-content {
     flex: 1;

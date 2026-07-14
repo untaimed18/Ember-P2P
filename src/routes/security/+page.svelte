@@ -12,6 +12,7 @@
     type IpFilterEntry,
   } from '$lib/api/security';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
+  import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
   import { passiveScroll } from '$lib/actions/passiveScroll';
   import { onMount, untrack } from 'svelte';
   import * as m from '$lib/paraglide/messages';
@@ -205,6 +206,7 @@
 
   let flashTimer: ReturnType<typeof setTimeout> | undefined;
   function flash(msg: string) {
+    error = null;
     clearTimeout(flashTimer);
     successMsg = msg;
     flashTimer = setTimeout(() => (successMsg = null), 4000);
@@ -222,14 +224,13 @@
     }
   }
 
-  async function handleToggleEnabled() {
+  async function persistIpFilterEnabled(next: boolean) {
     if (!stats) return;
-    const prev = stats.enabled;
-    stats.enabled = !prev;
+    const prev = !next;
     togglesInFlight++;
     try {
-      await setIpFilterEnabled(stats.enabled);
-      await syncIpFilterSettingsCache({ ip_filter_enabled: stats.enabled });
+      await setIpFilterEnabled(next);
+      await syncIpFilterSettingsCache({ ip_filter_enabled: next });
     } catch (e: unknown) {
       stats.enabled = prev;
       error = toErrorMsg(e);
@@ -238,14 +239,13 @@
     }
   }
 
-  async function handleTogglePrivate() {
+  async function persistBlockPrivate(next: boolean) {
     if (!stats) return;
-    const prev = stats.block_private;
-    stats.block_private = !prev;
+    const prev = !next;
     togglesInFlight++;
     try {
-      await setBlockPrivateIps(stats.block_private);
-      await syncIpFilterSettingsCache({ block_private_ips: stats.block_private });
+      await setBlockPrivateIps(next);
+      await syncIpFilterSettingsCache({ block_private_ips: next });
     } catch (e: unknown) {
       stats.block_private = prev;
       error = toErrorMsg(e);
@@ -454,33 +454,35 @@
 
 <div class="security-content">
   {#if error}
-    <div class="banner error-banner">
+    <div class="banner error-banner" role="alert">
       <span>{error}</span>
       <button class="ghost" onclick={() => (error = null)}>{m.common_dismiss()}</button>
     </div>
-  {/if}
-  {#if successMsg}
-    <div class="banner success-banner">
+  {:else if successMsg}
+    <div class="banner success-banner" role="status">
       <span>{successMsg}</span>
     </div>
   {/if}
 
   {#if loading && !stats}
-    <div class="empty-state"><p>{m.security_loading()}</p></div>
+    <div class="empty-state">
+      <div class="spinner lg"></div>
+      <p>{m.security_loading()}</p>
+    </div>
   {:else if stats}
     <!-- Controls bar: toggles + stats inline -->
     <div class="controls-bar">
       <div class="controls-left">
-        <label class="toggle-switch" title={m.security_toggle_enabled_title()}>
-          <input type="checkbox" checked={stats.enabled} onchange={handleToggleEnabled} />
-          <span class="switch-track"></span>
-          <span class="switch-label">{m.security_ipfilter_label()}</span>
-        </label>
-        <label class="toggle-switch" title={m.security_toggle_private_title()}>
-          <input type="checkbox" checked={stats.block_private} onchange={handleTogglePrivate} />
-          <span class="switch-track"></span>
-          <span class="switch-label">{m.security_block_private_label()}</span>
-        </label>
+        <ToggleSwitch
+          bind:checked={stats.enabled}
+          label={m.security_ipfilter_label()}
+          onchange={(v) => { void persistIpFilterEnabled(v); }}
+        />
+        <ToggleSwitch
+          bind:checked={stats.block_private}
+          label={m.security_block_private_label()}
+          onchange={(v) => { void persistBlockPrivate(v); }}
+        />
         <button class="ghost add-range-btn" onclick={() => (showAddForm = !showAddForm)}>
           {showAddForm ? m.common_cancel() : m.security_add_range()}
         </button>
@@ -753,59 +755,6 @@
   .inline-stat { font-variant-numeric: tabular-nums; }
   .inline-sep { opacity: 0.45; }
   .hits-stat { color: var(--danger); font-weight: 600; }
-
-  /* --- Toggle switch --- */
-  .toggle-switch {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    cursor: pointer;
-    user-select: none;
-    font-size: 12px;
-  }
-  .toggle-switch input {
-    position: absolute;
-    opacity: 0;
-    width: 0;
-    height: 0;
-    pointer-events: none;
-  }
-  .switch-track {
-    position: relative;
-    width: 32px;
-    height: 18px;
-    border-radius: 9px;
-    background: var(--bg-surface);
-    border: 1px solid var(--border);
-    transition: background 0.2s, border-color 0.2s;
-    flex-shrink: 0;
-  }
-  .switch-track::after {
-    content: '';
-    position: absolute;
-    top: 2px;
-    left: 2px;
-    width: 12px;
-    height: 12px;
-    border-radius: 50%;
-    background: var(--text-muted);
-    transition: transform 0.2s, background 0.2s;
-  }
-  .toggle-switch input:checked + .switch-track {
-    background: var(--accent);
-    border-color: var(--accent);
-  }
-  .toggle-switch input:checked + .switch-track::after {
-    transform: translateX(14px);
-    background: var(--bg-secondary);
-  }
-  .toggle-switch:hover .switch-track {
-    border-color: var(--accent);
-  }
-  .switch-label {
-    color: var(--text-primary);
-    font-weight: 500;
-  }
 
   .add-range-btn {
     font-size: 12px;

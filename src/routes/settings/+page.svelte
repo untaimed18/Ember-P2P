@@ -992,7 +992,7 @@
   <h2>{m.settings_title()}</h2>
   <div class="header-actions">
     {#if saveMessage}
-      <span class="toast" class:warning={saveIsWarning}>{saveMessage}</span>
+      <span class="save-status" class:warning={saveIsWarning} role="status">{saveMessage}</span>
     {/if}
     {#if hasUnsavedChanges}
       <span class="unsaved-indicator">{m.settings_unsaved_changes()}</span>
@@ -2112,7 +2112,7 @@
     to { transform: rotate(360deg); }
   }
 
-  .toast {
+  .save-status {
     font-size: 13px;
     font-weight: 600;
     color: var(--success);
@@ -2121,7 +2121,7 @@
     background: color-mix(in srgb, var(--success) 12%, transparent);
   }
 
-  .toast.warning {
+  .save-status.warning {
     color: var(--warning);
     background: color-mix(in srgb, var(--warning) 12%, transparent);
   }

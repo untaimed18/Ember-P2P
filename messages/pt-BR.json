@@ -2006,5 +2006,9 @@
   "updater_error_title": "Falha na atualização",
   "updater_error_body": "Não foi possível concluir a atualização: {detail}",
   "updater_retry": "Tentar novamente",
-  "updater_dismiss_aria": "Dispensar notificação de atualização"
+  "updater_dismiss_aria": "Dispensar notificação de atualização",
+  "statusbar_epx_status_active": "Ativo",
+  "statusbar_epx_status_idle": "Ocioso",
+  "statusbar_epx_status_inactive": "Offline",
+  "servers_connect_select_hint": "Selecione um servidor na lista para conectar"
 }

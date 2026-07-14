@@ -1,6 +1,5 @@
 {
   "$schema": "https://inlang.com/schema/inlang-message-format",
-
   "common_cancel": "Cancel",
   "common_save": "Save",
   "common_close": "Close",
@@ -44,10 +43,8 @@
   "common_second_short": "s",
   "common_hour_short": "h",
   "common_create": "Create",
-
   "app_tagline": "P2P File Sharing",
   "app_name": "Ember",
-
   "nav_home": "Home",
   "nav_kad_network": "KAD Network",
   "nav_ed2k_servers": "ED2K Servers",
@@ -118,12 +115,10 @@
   "sidebar_active_uploads_other": "{count} active uploads",
   "sidebar_nav_with_shortcut_title": "{label} (Alt+{n})",
   "sidebar_dev_link_title": "Ember-native transport diagnostics (developer)",
-
   "network_status_connected": "Connected",
   "network_status_connecting": "Connecting",
   "network_status_disconnected": "Disconnected",
   "network_status_unknown": "Unknown",
-
   "chat_dock_aria_label": "Chats",
   "chat_dock_tablist_aria": "Open chats",
   "chat_dock_no_open": "No open chats",
@@ -137,7 +132,6 @@
   "chat_dock_empty_title": "No conversation selected",
   "chat_dock_empty_hint": "Start a chat from the Friends page, then it'll show up here as a tab.",
   "chat_dock_empty_cta": "Go to Friends",
-
   "chat_input_placeholder": "Type a message... (Enter to send, Shift+Enter for newline)",
   "chat_send": "Send",
   "chat_sending": "Sending...",
@@ -164,10 +158,9 @@
   "chat_disabled_notice": "Chat is turned off in Settings → Friends. Turn it back on to send and receive messages.",
   "chat_send_title_short": "Send (Enter)",
   "chat_send_aria": "Send message",
-  "chat_loading_short": "Loading\u2026",
+  "chat_loading_short": "Loading…",
   "chat_load_error": "Couldn't load messages — {error}",
   "chat_say_hello": "No messages yet. Say hello!",
-
   "statusbar_aria_label": "Application status",
   "statusbar_kad_label": "KAD",
   "statusbar_kad_title": "KAD Network: {status}",
@@ -192,29 +185,24 @@
   "statusbar_peers_count_one": "1 peer",
   "statusbar_peers_count_other": "{count} peers",
   "statusbar_active_transfers": "{count} active",
-
   "toast_default_title": "Notification",
   "toast_close_aria": "Close notification",
   "toast_network_stopped": "Network stopped: {message}",
-
   "confirm_default_title": "Confirm",
   "confirm_default_message": "Are you sure?",
   "confirm_default_button": "Confirm",
   "confirm_yes": "Yes",
   "confirm_no": "No",
-
   "splash_title": "Ember",
   "splash_aria_starting": "Ember is starting",
   "splash_subtitle": "eMule KAD Network",
   "splash_status_init": "Initializing network services...",
-
   "about_dialog_title": "About Ember",
   "about_dialog_version": "Version {version}",
   "about_dialog_description": "Decentralized P2P file sharing application",
   "about_dialog_license": "Licensed under {license}",
   "about_dialog_website": "Website",
   "about_dialog_close": "Close",
-
   "shortcuts_dialog_title": "Keyboard Shortcuts",
   "shortcuts_dialog_close": "Close",
   "shortcuts_dialog_hint_press": "Press",
@@ -252,25 +240,21 @@
   "shortcuts_library_navigate": "Move the row selection up or down",
   "shortcuts_library_jump_ends": "Jump to the first or last file",
   "shortcuts_library_page": "Move the selection by 10 rows",
-
   "close_dialog_title": "Close Ember",
   "close_dialog_message": "What would you like Ember to do? Minimizing keeps your downloads, uploads, and friend connections active in the background.",
   "close_dialog_remember": "Remember my choice (you can change this in Settings → General)",
   "close_dialog_minimize": "Minimize to Tray",
   "close_dialog_exit": "Exit Ember",
-
   "settings_title": "Settings",
   "settings_language_label": "Language",
   "settings_language_description": "Pick the language used throughout the app. Changing language reloads the window.",
   "settings_language_system": "System",
   "settings_language_system_with_locale": "System ({system})",
-
   "language_name_en": "English",
   "language_name_es": "Spanish",
   "language_name_fr": "French",
   "language_name_pt_BR": "Portuguese (Brazil)",
   "language_name_de": "German",
-
   "layout_skip_to_content": "Skip to content",
   "layout_starting": "Starting Ember...",
   "layout_retry": "Retry",
@@ -281,13 +265,11 @@
   "layout_config_corrupt_backup": "Your settings file was corrupt and has been reset to defaults. A backup of the original was saved to {path}.",
   "layout_db_corrupt": "Your local database was corrupt and has been recreated. Transfer history and saved peers may need to be rebuilt.",
   "layout_db_corrupt_backup": "Your local database was corrupt and has been recreated. A backup of the original was saved to {path}.",
-
   "speed_input_unlimited": "Unlimited",
   "speed_input_unlimited_aria": "Unlimited — activate to set a limit",
   "speed_input_click_to_set_limit": "Click to set a limit",
   "speed_input_set_unlimited": "Set unlimited",
   "speed_input_unit_label": "Unit",
-
   "browse_title_prefix": "Browsing",
   "browse_requesting": "Requesting file list...",
   "browse_no_files": "No shared files found.",
@@ -303,7 +285,6 @@
   "browse_request_timed_out": "Browse request timed out. The friend may be offline.",
   "browse_failed_to_browse": "Failed to browse",
   "browse_download_failed": "Download failed",
-
   "wizard_aria": "Setup Wizard",
   "wizard_restarting_aria": "Restarting",
   "wizard_restarting_title": "Restarting Ember",
@@ -383,7 +364,6 @@
   "wizard_saving": "Saving...",
   "wizard_downloading": "Downloading...",
   "wizard_launch": "Launch Ember",
-
   "stats_title": "Statistics",
   "stats_loading": "Loading statistics...",
   "stats_download_rate": "Download Rate",
@@ -420,7 +400,6 @@
   "stats_banned_peers": "Banned peers",
   "stats_banned_ips": "Banned IPs",
   "stats_banned_ips_hint": "IP addresses currently blocked, including manual bans and automatic bans for request flooding or sending corrupt data.",
-
   "security_title": "Security",
   "security_loading": "Loading IP filter data…",
   "security_download_ipfilter": "Download IP Filter",
@@ -468,7 +447,6 @@
   "security_invalid_ip_format": "Invalid IP address format. Use dotted decimal (e.g. 192.168.1.0)",
   "security_added_range": "Added range {start} — {end}",
   "security_removed_range": "Removed range {start} — {end}",
-
   "friends_your_id_label": "Your Friend ID",
   "friends_discoverable_prefix": "Your Friend ID is",
   "friends_discoverable_emphasis": "discoverable",
@@ -543,7 +521,6 @@
   "friends_search_timeout": "{name} appears to be offline or unreachable.",
   "friends_search_refused": "{name} went offline.",
   "friends_search_generic": "Could not reach {name}.",
-
   "servers_refresh_failed": "Failed to refresh server state",
   "servers_already_connected": "Already connected to {name}:{port}",
   "servers_log_switching": "Switching from {from_ip}:{from_port} to {to_ip}:{to_port}...",
@@ -618,7 +595,6 @@
   "servers_confirm_remove_all_message": "Remove all {count} servers from the list? This cannot be undone.",
   "servers_confirm_remove_title": "Remove Server",
   "servers_confirm_remove_message": "Remove {count} selected server(s) from the list?",
-
   "kad_connection_failed": "Connection failed",
   "kad_firewall_recheck_initiated": "Firewall recheck initiated",
   "kad_firewall_recheck_failed": "Firewall recheck failed",
@@ -743,14 +719,12 @@
   "kad_search_status_stopping": "Stopping",
   "kad_search_cancel_title": "Cancel this search",
   "kad_search_cancel_aria": "Cancel search {id}",
-
   "search_bar_placeholder": "Search...",
   "search_bar_aria": "Search files",
   "search_bar_clear": "Clear search",
   "search_bar_recent_searches": "Recent searches",
   "search_bar_clear_all": "Clear all",
   "search_bar_remove_recent": "Remove {query} from recent",
-
   "library_col_filename": "Filename",
   "library_col_size": "Size",
   "library_col_type": "Type",
@@ -1017,7 +991,6 @@
   "library_added_folder_one": "Added 1 folder",
   "library_added_folder_other": "Added {count} folders",
   "library_added_with_skipped": "{base} ({skipped} skipped)",
-
   "search_title": "Search",
   "search_query_placeholder": "Search files across the network...",
   "search_method_title": "Search method",
@@ -1224,7 +1197,6 @@
   "search_confirm_close_tab_btn": "Close Tab",
   "search_confirm_clear_btn": "Clear",
   "search_confirm_keep": "Keep",
-
   "transfer_status_queued": "Queued",
   "transfer_status_paused": "Paused",
   "transfer_status_stopped": "Stopped",
@@ -1234,12 +1206,10 @@
   "transfer_status_hashing": "Hashing",
   "transfer_status_insufficient": "Insufficient",
   "transfer_status_noneneeded": "Not needed",
-
   "transfers_title": "Transfers",
   "transfers_paste_link_title": "Read an ed2k:// link from the clipboard and start downloading",
   "transfers_paste_link": "Paste eD2K Link",
   "transfers_pasting": "Pasting…",
-
   "transfers_col_file_name": "File Name",
   "transfers_col_size": "Size",
   "transfers_col_transferred": "Transferred",
@@ -1274,7 +1244,6 @@
   "transfers_col_download_speed": "Download Speed",
   "transfers_col_downloaded": "Downloaded",
   "transfers_col_parts": "Parts",
-
   "transfers_src_server_query": "Querying server for sources",
   "transfers_src_server_found_one": "Server returned 1 source",
   "transfers_src_server_found_other": "Server returned {count} sources",
@@ -1303,7 +1272,6 @@
   "transfers_src_done": "Done",
   "transfers_src_status_failed": "Failed",
   "transfers_operation_failed": "Operation failed",
-
   "transfers_dl_status_stalled": "Stalled",
   "transfers_dl_status_downloading_idle": "Downloading (Idle)",
   "transfers_dl_status_downloading": "Downloading",
@@ -1315,26 +1283,22 @@
   "transfers_dl_status_complete": "Complete",
   "transfers_dl_status_insufficient_disk": "Insufficient Disk",
   "transfers_dl_status_no_needed_parts": "No Needed Parts",
-
   "transfers_failure_timeout": "Timeout",
   "transfers_failure_permanent_error": "Permanent Error",
   "transfers_failure_queue_wait": "Queue Wait",
   "transfers_failure_connect_error": "Connect Error",
   "transfers_failure_generic": "Error",
-
   "transfers_ul_status_transferring": "Transferring",
   "transfers_ul_failure_refused": "Refused",
   "transfers_ul_failure_disconnected": "Disconnected",
   "transfers_ul_failure_cancelled": "Cancelled",
   "transfers_ul_failure_bad_data": "Bad data",
-
   "transfers_priority_tooltip_high": "High: downloaded before normal and low priority files",
   "transfers_priority_tooltip_normal": "Normal: default download priority",
   "transfers_priority_tooltip_low": "Low: downloaded after high and normal priority files",
   "transfers_priority_tooltip_verylow": "Very Low: downloaded only when no higher priority files are waiting",
   "transfers_priority_tooltip_auto": "Auto: priority adjusted automatically based on file size and availability",
   "transfers_priority_tooltip_release": "Release: highest priority, downloaded before all other files",
-
   "transfers_dl_tooltip_stalled_base": "Stalled — no data received recently",
   "transfers_dl_tooltip_stalled_reason": "Stalled — no data received recently. {reason}",
   "transfers_dl_tooltip_degraded_base": "Downloading slowly or idle",
@@ -1357,12 +1321,10 @@
   "transfers_dl_tooltip_hashing": "Computing file hash for verification",
   "transfers_dl_tooltip_insufficient": "Insufficient disk space to continue download",
   "transfers_dl_tooltip_noneneeded": "No sources have parts needed to complete the file",
-
   "transfers_ul_tooltip_completed": "Upload to this client completed",
   "transfers_ul_tooltip_active": "Actively uploading data to this client",
   "transfers_ul_tooltip_failed": "Upload to this client failed",
   "transfers_ul_tooltip_failed_reason": "Upload failed: {reason}",
-
   "transfers_sources_tooltip_none": "No sources found",
   "transfers_sources_tooltip_active": "{count} active",
   "transfers_sources_tooltip_queued": "{count} queued",
@@ -1371,14 +1333,12 @@
   "transfers_sources_tooltip_a4af": "{count} A4AF (asked for another file)",
   "transfers_sources_tooltip_max": "max {count}",
   "transfers_sources_tooltip_full": "Sources: {parts}. Format: active/total+a4af [max]",
-
   "transfers_column_menu_downloads": "Download Columns",
   "transfers_column_menu_uploads": "Upload Columns",
   "transfers_column_menu_queue": "Queued Columns",
   "transfers_column_menu_known": "Known Clients Columns",
   "transfers_column_menu_clients": "Client Columns",
   "transfers_reset_columns": "Reset Columns",
-
   "transfers_batch_done_one": "{label} 1 transfer",
   "transfers_batch_done_other": "{label} {count} transfers",
   "transfers_batch_failed": "{label} {success} of {total} transfers — failed: {name}{rest}: {error}",
@@ -1386,7 +1346,6 @@
   "transfers_batch_label_paused": "Paused",
   "transfers_batch_label_resumed": "Resumed",
   "transfers_batch_label_stopped": "Stopped",
-
   "transfers_clipboard_too_long": "Clipboard text is too long ({length} chars, max {max}) — eD2K links are typically under 1 KiB",
   "transfers_clipboard_not_ed2k": "Clipboard does not contain an ed2k:// link",
   "transfers_already_in_list": "Already in download list: {name}",
@@ -1395,7 +1354,6 @@
   "transfers_added_friend": "Added {name} as friend",
   "transfers_banned_user": "Banned {name}",
   "transfers_archive_recovered": "Archive recovered: {path}",
-
   "transfers_overview_dl_title": "Active download payload rate (status bar shows total network rate)",
   "transfers_overview_ul_title": "Active upload payload rate (status bar shows total network rate)",
   "transfers_overview_label_dl": "DL",
@@ -1406,18 +1364,15 @@
   "transfers_filter_label": "Filter",
   "transfers_filter_placeholder": "name, hash, category, peer...",
   "transfers_downloading_count": "{shown}/{total} downloading",
-
   "transfers_toggle_cols_title": "Toggle between full and compact columns",
   "transfers_toggle_compact": "Compact",
   "transfers_toggle_full": "Full",
   "transfers_pause_all": "Pause All",
   "transfers_resume_all": "Resume All",
   "transfers_clear_completed": "Clear Completed",
-
   "transfers_select_all_aria": "Select all downloads",
   "transfers_resize_column": "Resize {name} column",
   "transfers_select_row": "Select {name}",
-
   "transfers_loading_sources": "Loading sources...",
   "transfers_connecting_sources_one": "Connecting to 1 source...",
   "transfers_connecting_sources_other": "Connecting to {count} sources...",
@@ -1438,14 +1393,11 @@
   "transfers_parts_title": "Parts available from this source",
   "transfers_failed_sources_hidden_one": "1 failed source hidden",
   "transfers_failed_sources_hidden_other": "{count} failed sources hidden",
-
   "transfers_completed_failed_section": "COMPLETED / FAILED ({count})",
-
   "transfers_empty_no_downloads": "No downloads yet",
   "transfers_empty_start_search_prefix": "Start a search",
   "transfers_empty_start_search_suffix": " to find files on the network.",
   "transfers_empty_no_matches": "No transfers match this filter",
-
   "transfers_selected_count": "{count} downloads selected",
   "transfers_batch_pause_title": "Pause all selected downloads",
   "transfers_batch_resume_title": "Resume all selected downloads",
@@ -1458,9 +1410,7 @@
   "transfers_preview_not_ready": "Preview available once the first part is downloaded and verified (media files only).",
   "transfers_selection_hint": "Click to select · Shift+click for range · Ctrl/Cmd+click to toggle · Double-click for sources",
   "transfers_status_label_aria": "Status: {label}. {tooltip}",
-
   "transfers_resize_panes_aria": "Resize transfer panes",
-
   "transfers_bottom_pane_aria": "Bottom pane view",
   "transfers_tab_uploading": "Uploading ({count})",
   "transfers_tab_uploading_label": "Uploading",
@@ -1471,21 +1421,17 @@
   "transfers_tab_known_count": "Known Clients ({count})",
   "transfers_tab_known_title": "Every peer with a SecIdent credit record (lifetime)",
   "transfers_tab_download_clients": "Download Clients",
-
   "transfers_empty_no_uploads": "No active uploads",
   "transfers_empty_no_uploads_sub": "Shared files will appear here when peers request them.",
   "transfers_empty_no_upload_matches": "No uploads match this filter",
-
   "transfers_upload_partial_seed_badge": "Seeding",
   "transfers_upload_partial_seed_title": "Sharing the finished, verified parts of \"{name}\" while you keep downloading the rest (partial-file sharing).",
-
   "transfers_queue_disconnected_title": "Disconnected — waiting for callback",
   "transfers_queue_credit_title": "Credit ratio (1.0 = no history, 10.0 = max)",
   "transfers_queue_transfer_history_title": "We've uploaded {up} to and downloaded {down} from this peer",
   "transfers_empty_no_queue": "No peers waiting",
   "transfers_empty_no_queue_sub": "The upload queue is empty.",
   "transfers_loading_short": "Loading…",
-
   "transfers_known_filter_aria": "Known Clients filters",
   "transfers_known_filter_placeholder": "Filter by hash, IP, country, or friend nickname",
   "transfers_known_input_aria": "Filter known clients",
@@ -1498,7 +1444,6 @@
   "transfers_known_total_up_title": "Lifetime bytes uploaded to all known peers (drives our credit on their side)",
   "transfers_known_total_down_title": "Lifetime bytes downloaded from all known peers",
   "transfers_known_showing_label": "showing",
-
   "transfers_known_copied_title": "Copied!",
   "transfers_known_friend_copy_title": "{nick} — click to copy {hash}",
   "transfers_known_copy_title": "Click to copy {hash}",
@@ -1517,12 +1462,10 @@
   "transfers_known_no_pubkey": "No public key cached",
   "transfers_known_ident_title": "eD2K identification state: {state}",
   "transfers_known_never_seen": "Never seen",
-
   "transfers_empty_no_credit": "No credit records yet",
   "transfers_empty_no_credit_sub": "Records appear after peers verify their identity with us.",
   "transfers_known_no_matches": "No matches",
   "transfers_known_no_matches_sub": "Nothing in this ledger matches \"{query}\".",
-
   "transfers_empty_all_sources_failed": "All sources failed",
   "transfers_empty_all_sources_failed_sub": "Sources will reappear once the download contacts a peer.",
   "transfers_loading_sources_dots": "Loading sources…",
@@ -1532,7 +1475,6 @@
   "transfers_empty_no_active_dl_sub": "Source clients will appear here once a download is running.",
   "transfers_empty_select_dl": "Select a download",
   "transfers_empty_select_dl_sub": "Click a download above to see its source clients.",
-
   "transfers_ctx_preview_priority": "Preview Priority",
   "transfers_ctx_recovering": "Recovering…",
   "transfers_ctx_recover_archive": "Recover Archive",
@@ -1550,7 +1492,6 @@
   "transfers_no_ember_hash": "No Ember identity known for this peer yet",
   "transfers_confirm_ban_title": "Ban User",
   "transfers_confirm_ban_message": "Ban {name}? This blocks future connections from this identity.",
-
   "transfers_cat_none": "None",
   "transfers_cat_audio": "Audio",
   "transfers_cat_video": "Video",
@@ -1558,7 +1499,6 @@
   "transfers_cat_archive": "Archive",
   "transfers_cat_document": "Document",
   "transfers_cat_program": "Program",
-
   "transfers_confirm_cancel_title": "Cancel Download",
   "transfers_confirm_cancel_message": "Cancel download of \"{name}\"? The partial file will be deleted.",
   "transfers_confirm_cancel_label": "Cancel Download",
@@ -1570,7 +1510,6 @@
   "transfers_confirm_batch_cancel_one": "Cancel 1 download and delete partial data?",
   "transfers_confirm_batch_cancel_other": "Cancel {count} downloads and delete partial data?",
   "transfers_confirm_batch_cancel_label": "Cancel Downloads",
-
   "settings_unsaved_changes": "Unsaved changes",
   "settings_discard": "Discard",
   "settings_saving": "Saving...",
@@ -1584,7 +1523,6 @@
   "settings_section_security": "Security",
   "settings_section_friends": "Friends",
   "settings_section_search": "Search",
-
   "settings_general_desc": "Theme and identity",
   "settings_theme_label": "Theme",
   "settings_theme_light_aria": "Light theme",
@@ -1603,11 +1541,10 @@
   "settings_close_behavior_tray_desc": "Keep running in the background",
   "settings_close_behavior_exit": "Exit Ember",
   "settings_close_behavior_exit_desc": "Quit the app fully each time",
-
   "settings_downloads_desc": "Storage and concurrency",
   "settings_download_folder_label": "Download Folder",
   "settings_browse": "Browse",
-  "settings_folder_layout_hint": "Completed files: {folder}/Downloads \u00a0\u2022\u00a0 Part files: {folder}/Temp",
+  "settings_folder_layout_hint": "Completed files: {folder}/Downloads  •  Part files: {folder}/Temp",
   "settings_max_downloads": "Max Downloads",
   "settings_max_uploads": "Max Uploads",
   "settings_max_file_size_label": "Max File Size (GiB)",
@@ -1644,7 +1581,6 @@
   "settings_history_cleared_completed": "Completed history cleared.",
   "settings_history_cleared_cancelled": "Cancelled history cleared.",
   "settings_history_clear_failed": "Failed: {error}",
-
   "settings_search_desc": "Search filters and cleanup",
   "settings_spam_filter": "Search Spam Filter",
   "settings_spam_filter_hint": "Score search results against known spam patterns (eMule-compatible).",
@@ -1664,14 +1600,13 @@
   "settings_resetting": "Resetting...",
   "settings_reset_spam_data": "Reset learned spam data",
   "settings_search_timeout_label": "Search timeout (seconds)",
-  "settings_search_timeout_hint": "How long to wait for global search, source lookup, and file notes (30\u2013600).",
+  "settings_search_timeout_hint": "How long to wait for global search, source lookup, and file notes (30–600).",
   "settings_save_search_history": "Save search history",
   "settings_save_search_history_hint": "Remember recent search queries and suggest them when you start a new search. Turning this off clears your existing history and stops saving new searches.",
   "settings_filename_cleanups_label": "Filename Cleanup Strings",
   "settings_filename_cleanups_hint_prefix": "Pipe-separated substrings stripped from filenames in search and library views (e.g.",
   "settings_filename_cleanups_hint_suffix": "). Leave empty to disable cleanup.",
   "settings_filename_cleanups_placeholder": "http|www.|.com|.de|.org|.net",
-
   "settings_bandwidth_desc": "Upload and download speed limits",
   "settings_max_upload_speed": "Max Upload Speed",
   "settings_max_download_speed": "Max Download Speed",
@@ -1686,7 +1621,6 @@
   "settings_speed_recommended_upload": "Recommended upload limit:",
   "settings_apply_recommended": "Apply Recommended",
   "settings_speed_test_failed": "Speed test failed",
-
   "settings_network_desc": "Ports, UPnP, and connection startup",
   "settings_tcp_port": "TCP Port",
   "settings_restart_badge": "Restart",
@@ -1715,7 +1649,6 @@
   "settings_update_servers_clients_hint": "Accept new servers advertised by other eD2K clients during peer connections. Off if you prefer a curated list.",
   "settings_filter_servers_label": "Filter servers by IP",
   "settings_filter_servers_hint": "Apply your IP filter to newly discovered servers as well as peers.",
-
   "settings_security_desc": "Obfuscation and IP filtering",
   "settings_obfuscation_label": "Protocol Obfuscation",
   "settings_obfuscation_hint": "Encrypt KAD UDP traffic with RC4. Compatible with eMule.",
@@ -1741,17 +1674,16 @@
   "settings_antileech_load_failed": "Failed to load anti-leech filter: {error}",
   "settings_antileech_saved_one": "Saved 1 pattern.",
   "settings_antileech_saved_other": "Saved {count} patterns.",
-  "settings_antileech_saved_rejected_one": "Saved 1 pattern; {rejected} rejected \u2014 see below.",
-  "settings_antileech_saved_rejected_other": "Saved {count} patterns; {rejected} rejected \u2014 see below.",
+  "settings_antileech_saved_rejected_one": "Saved 1 pattern; {rejected} rejected — see below.",
+  "settings_antileech_saved_rejected_other": "Saved {count} patterns; {rejected} rejected — see below.",
   "settings_antileech_save_failed": "Save failed: {error}",
   "settings_antileech_toggle_failed": "Toggle failed: {error}",
   "settings_antileech_restored_one": "Restored 1 default pattern.",
   "settings_antileech_restored_other": "Restored {count} default patterns.",
   "settings_antileech_reset_failed": "Reset failed: {error}",
-
   "settings_friends_desc": "Privacy and friend feature controls",
   "settings_friend_require_approval": "Require Approval for Friend Requests",
-  "settings_friend_require_approval_hint": "Always show incoming friend requests on the Friends page for explicit accept. When off, requests from peers you already added as a friend auto-confirm. Requests carry a Verified badge when the peer's Ember identity is cryptographically consistent \u2014 proof-of-possession on friend-connect dial-back sessions, identity-binding check on regular file-transfer sessions. Even with a Verified badge, only accept requests from people you recognise.",
+  "settings_friend_require_approval_hint": "Always show incoming friend requests on the Friends page for explicit accept. When off, requests from peers you already added as a friend auto-confirm. Requests carry a Verified badge when the peer's Ember identity is cryptographically consistent — proof-of-possession on friend-connect dial-back sessions, identity-binding check on regular file-transfer sessions. Even with a Verified badge, only accept requests from people you recognise.",
   "settings_friend_online_notif": "Online Notifications",
   "settings_friend_online_notif_hint": "Show a toast when a friend comes online.",
   "settings_friend_chat_disabled": "Disable Friend Chat",
@@ -1761,25 +1693,23 @@
   "settings_friend_session_encryption": "Encrypt Friend Sessions",
   "settings_friend_session_encryption_hint": "Wrap friend connections with RC4 obfuscation to prevent casual packet inspection.",
   "settings_max_friends_label": "Maximum Friends",
-  "settings_max_friends_hint": "Limit the total number of friends you can add (1\u2013500, default 200).",
+  "settings_max_friends_hint": "Limit the total number of friends you can add (1–500, default 200).",
   "settings_rendezvous_url_label": "Rendezvous Server URL",
   "settings_rendezvous_url_hint": "HTTPS endpoint used for Ember friend discovery and NAT coordination.",
   "settings_rendezvous_url_placeholder": "https://rendezvous.example.com",
-
   "settings_restart_dialog_title": "Restart Ember to apply port change?",
   "settings_restart_dialog_message": "You changed your {reason}. Ember binds the listening sockets when the app starts, so the new port(s) won't take effect until the app is restarted. Restart now?",
   "settings_restart_now": "Restart now",
   "settings_restart_later": "Later",
-  "settings_restart_reason_tcp_only": "TCP port ({from} \u2192 {to})",
-  "settings_restart_reason_udp_only": "UDP port ({from} \u2192 {to})",
-  "settings_restart_reason_both": "TCP port ({tcp_from} \u2192 {tcp_to}) and UDP port ({udp_from} \u2192 {udp_to})",
+  "settings_restart_reason_tcp_only": "TCP port ({from} → {to})",
+  "settings_restart_reason_udp_only": "UDP port ({from} → {to})",
+  "settings_restart_reason_both": "TCP port ({tcp_from} → {tcp_to}) and UDP port ({udp_from} → {udp_to})",
   "settings_spam_reset_dialog_title": "Reset learned spam data?",
-  "settings_spam_reset_dialog_message": "Clear all learned spam filter data \u2014 hashes, filenames, and source IPs. The filter will start from scratch and re-learn from your actions. This cannot be undone.",
+  "settings_spam_reset_dialog_message": "Clear all learned spam filter data — hashes, filenames, and source IPs. The filter will start from scratch and re-learn from your actions. This cannot be undone.",
   "settings_spam_reset_confirm": "Reset",
   "settings_restarting_aria": "Restarting Ember",
   "settings_restarting_title": "Restarting Ember",
-  "settings_restarting_sub": "Applying your new port settings\u2026",
-
+  "settings_restarting_sub": "Applying your new port settings…",
   "settings_validation_nickname_empty": "Nickname cannot be empty.",
   "settings_validation_folder_empty": "Download folder cannot be empty.",
   "settings_values_adjusted": "One or more values were outside their valid range and have been adjusted.",
@@ -1796,7 +1726,6 @@
   "settings_folder_picker_failed": "Folder picker: {error}",
   "settings_folder_picker_generic_error": "Failed to open folder picker",
   "settings_download_failed": "Download failed",
-
   "error_friend_not_found": "Friend not found",
   "error_friend_offline": "Friend is offline",
   "error_invalid_hash": "Invalid hash",
@@ -1806,7 +1735,6 @@
   "error_self_add": "You can't add yourself as a friend",
   "error_operation_failed": "Operation failed",
   "error_unknown": "Unknown error",
-
   "error_collections_cannot_resolve_path": "Cannot resolve path: {detail}",
   "error_collections_canonicalize_task_failed": "Canonicalize task failed: {detail}",
   "error_collections_file_not_found": "File does not exist",
@@ -2086,7 +2014,6 @@
   "error_transfers_start_download_failed": "Failed to start download: {detail}",
   "error_transfers_transfer_not_found": "Transfer not found",
   "error_transfers_upload_queue_failed": "Failed to get upload queue",
-
   "settings_section_about": "About",
   "settings_about_desc": "Version and updates",
   "settings_about_version_label": "Version",
@@ -2102,7 +2029,6 @@
   "settings_update_frequency_monthly": "Monthly",
   "settings_about_check_btn": "Check for updates",
   "settings_about_check_hint": "You can check for updates manually here at any time.",
-
   "updater_available_title": "Update available",
   "updater_available_body": "Ember {version} is available to install.",
   "updater_available_status": "Ember {version} is available.",
@@ -2120,5 +2046,9 @@
   "updater_error_title": "Update failed",
   "updater_error_body": "Couldn't complete the update: {detail}",
   "updater_retry": "Retry",
-  "updater_dismiss_aria": "Dismiss update notification"
+  "updater_dismiss_aria": "Dismiss update notification",
+  "statusbar_epx_status_active": "Active",
+  "statusbar_epx_status_idle": "Idle",
+  "statusbar_epx_status_inactive": "Offline",
+  "servers_connect_select_hint": "Select a server in the list to connect"
 }

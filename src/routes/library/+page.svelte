@@ -2098,7 +2098,7 @@
       {/if}
     </button>
     <button class="ghost" onclick={() => openCreateDialog()}>{m.library_create_collection()}</button>
-    <button onclick={handleReload}>{m.library_reload()}</button>
+    <button class="ghost" onclick={handleReload}>{m.library_reload()}</button>
     <button onclick={handleAddFolder}>{m.library_add_folder()}</button>
   </div>
 </div>

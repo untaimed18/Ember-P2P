@@ -58,6 +58,14 @@
     return stats.ember_peers > 0 ? 'active' : 'idle';
   }
 
+  function epxStatusLabel(status: 'active' | 'idle' | 'inactive'): string {
+    switch (status) {
+      case 'active': return m.statusbar_epx_status_active();
+      case 'idle': return m.statusbar_epx_status_idle();
+      case 'inactive': return m.statusbar_epx_status_inactive();
+    }
+  }
+
   // Localized status string for the tri-state network/server dots.
   // Keep the mapping co-located with the status-bar specifically
   // (instead of pulling from `network_status_*`) because the
@@ -105,7 +113,7 @@
     </span>
     <span class="status-label" title={epxTitle($networkStats)}>
       {m.statusbar_epx_label()}
-      <span class="dot {epxStatus($networkStats)}" aria-label={epxStatus($networkStats)}></span>
+      <span class="dot {epxStatus($networkStats)}" aria-label={epxStatusLabel(epxStatus($networkStats))}></span>
     </span>
     <span class="status-label" title={sharedTitle(sharedCount, sharedBytes)}>
       {m.statusbar_shared_label()}
