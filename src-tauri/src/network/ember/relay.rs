@@ -14,6 +14,22 @@ const MSG_RELAY_CONNECT: u8 = 0x03;
 const MSG_RELAY_CLOSE: u8 = 0x05;
 const MSG_RELAY_REJECT: u8 = 0x06;
 
+/// Wire version for signed RELAY_REQUEST payloads (PoP).
+pub const RELAY_REQUEST_VERSION: u8 = 2;
+/// Fixed payload size for v2: version(1) + target(6) + file(16) +
+/// attestation_hash(32) + pubkey(32) + ember_hash(16) + nonce(16) + sig(64).
+pub const RELAY_REQUEST_V2_PAYLOAD_LEN: usize = 183;
+const RELAY_REQUEST_NONCE_LEN: usize = 16;
+const RELAY_REQUEST_SIGNATURE_DOMAIN: &[u8] = b"ember-relay-request-v2\0";
+/// Reject reasons for RELAY_REJECT payload.
+const REJECT_CAPACITY: u8 = 0x01;
+const REJECT_BAD_TARGET: u8 = 0x02;
+const REJECT_AUTH: u8 = 0x03;
+const REJECT_BAD_SIGNATURE: u8 = 0x04;
+/// How long a (requester pubkey, nonce) pair is remembered to block replays.
+const RELAY_REQUEST_NONCE_TTL: Duration = Duration::from_secs(10 * 60);
+const MAX_RELAY_REQUEST_NONCE_CACHE: usize = 4096;
+
 /// Build a hardened reqwest client for relay/punch HTTP calls.
 ///
 /// M8: previously each helper called `reqwest::Client::new()`,
@@ -170,6 +186,9 @@ impl RelaySession {
 pub struct RelayManager {
     sessions: HashMap<u32, RelaySession>,
     attestation_hashes: HashMap<[u8; 32], u64>,
+    /// Recently seen (requester_pubkey, nonce) pairs to reject replays of
+    /// otherwise-valid signed RELAY_REQUESTs within [`RELAY_REQUEST_NONCE_TTL`].
+    recent_request_nonces: HashMap<([u8; 32], [u8; 16]), Instant>,
     next_session_id: u32,
     total_bytes_relayed: u64,
 }
@@ -179,6 +198,7 @@ impl RelayManager {
         Self {
             sessions: HashMap::new(),
             attestation_hashes: HashMap::new(),
+            recent_request_nonces: HashMap::new(),
             next_session_id: 1,
             total_bytes_relayed: 0,
         }
@@ -200,6 +220,24 @@ impl RelayManager {
             .unwrap_or(0);
         self.attestation_hashes.retain(|_, exp| *exp > now);
         self.attestation_hashes.contains_key(hash)
+    }
+
+    /// Returns `true` if this nonce is fresh for `pubkey` and records it.
+    /// Returns `false` on replay (or when the cache is full of still-fresh
+    /// entries for other peers — fail closed rather than accept unbounded growth).
+    fn consume_request_nonce(&mut self, pubkey: &[u8; 32], nonce: &[u8; 16]) -> bool {
+        let now = Instant::now();
+        self.recent_request_nonces
+            .retain(|_, seen| now.duration_since(*seen) < RELAY_REQUEST_NONCE_TTL);
+        let key = (*pubkey, *nonce);
+        if self.recent_request_nonces.contains_key(&key) {
+            return false;
+        }
+        if self.recent_request_nonces.len() >= MAX_RELAY_REQUEST_NONCE_CACHE {
+            return false;
+        }
+        self.recent_request_nonces.insert(key, now);
+        true
     }
 
     /// Create a new relay session if capacity allows.
@@ -285,11 +323,11 @@ impl RelayManager {
 /// Encode a relay protocol message.
 pub fn encode_relay_message(msg_type: u8, session_id: u32, payload: &[u8]) -> Vec<u8> {
     // The wire framing uses a u16 length prefix. Every relay control message
-    // (REQUEST/ACCEPT/CONNECT/CLOSE/REJECT) stays well under that — a few
-    // bytes plus an optional 16-byte file hash and 32-byte attestation hash —
-    // but assert it so a future caller that overflows the prefix (which would
-    // silently corrupt the framing) is caught in debug builds rather than
-    // producing undecodable messages.
+    // stays well under that — ACCEPT/CLOSE are empty, REJECT is 1 byte,
+    // CONNECT carries a 16-byte file hash, and REQUEST is a fixed 183-byte
+    // signed v2 payload — but assert it so a future caller that overflows
+    // the prefix (which would silently corrupt the framing) is caught in
+    // debug builds rather than producing undecodable messages.
     debug_assert!(
         payload.len() <= u16::MAX as usize,
         "relay message payload {} exceeds u16 length prefix",
@@ -337,22 +375,148 @@ pub fn decode_relay_header(data: &[u8]) -> Option<(u8, u32, u16)> {
     Some((msg_type, session_id, payload_len))
 }
 
-/// Build a RELAY_REQUEST message.
-pub fn build_relay_request_with_attestation_hash(
+/// Parsed + verified v2 RELAY_REQUEST fields (signature already checked).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayRequestV2 {
+    pub target_ip: Ipv4Addr,
+    pub target_port: u16,
+    pub file_hash: [u8; 16],
+    pub attestation_hash: [u8; 32],
+    pub requester_pubkey: [u8; 32],
+    pub requester_ember_hash: [u8; 16],
+    pub nonce: [u8; 16],
+}
+
+fn build_relay_request_signed_message(
+    session_id: u32,
+    attestation_hash: &[u8; 32],
+    target_ip: Ipv4Addr,
+    target_port: u16,
+    file_hash: &[u8; 16],
+    requester_pubkey: &[u8; 32],
+    requester_ember_hash: &[u8; 16],
+    nonce: &[u8; 16],
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(
+        RELAY_REQUEST_SIGNATURE_DOMAIN.len() + 4 + 32 + 4 + 2 + 16 + 32 + 16 + 16,
+    );
+    msg.extend_from_slice(RELAY_REQUEST_SIGNATURE_DOMAIN);
+    msg.extend_from_slice(&session_id.to_le_bytes());
+    msg.extend_from_slice(attestation_hash);
+    msg.extend_from_slice(&target_ip.octets());
+    msg.extend_from_slice(&target_port.to_le_bytes());
+    msg.extend_from_slice(file_hash);
+    msg.extend_from_slice(requester_pubkey);
+    msg.extend_from_slice(requester_ember_hash);
+    msg.extend_from_slice(nonce);
+    msg
+}
+
+/// Build a signed v2 RELAY_REQUEST (proof-of-possession).
+///
+/// The requester signs a domain-separated message binding session id,
+/// the relay's public ERAT attestation hash, target, file hash, and a
+/// fresh nonce. The attestation hash alone is no longer accepted as a
+/// bearer credential.
+pub fn build_relay_request_v2(
     session_id: u32,
     target_ip: Ipv4Addr,
     target_port: u16,
     file_hash: &[u8; 16],
-    attestation_hash: Option<[u8; 32]>,
+    attestation_hash: &[u8; 32],
+    requester_pubkey: &[u8; 32],
+    requester_ember_hash: &[u8; 16],
+    requester_secret_key: &[u8; 32],
 ) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(22);
+    use rand::RngCore;
+
+    let mut nonce = [0u8; RELAY_REQUEST_NONCE_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+
+    let signed = build_relay_request_signed_message(
+        session_id,
+        attestation_hash,
+        target_ip,
+        target_port,
+        file_hash,
+        requester_pubkey,
+        requester_ember_hash,
+        &nonce,
+    );
+    let signing_key = super::crypto::signing_key_from_bytes(requester_secret_key);
+    let signature = super::crypto::sign(&signing_key, &signed);
+
+    let mut payload = Vec::with_capacity(RELAY_REQUEST_V2_PAYLOAD_LEN);
+    payload.push(RELAY_REQUEST_VERSION);
     payload.extend_from_slice(&target_ip.octets());
     payload.extend_from_slice(&target_port.to_le_bytes());
     payload.extend_from_slice(file_hash);
-    if let Some(hash) = attestation_hash {
-        payload.extend_from_slice(&hash);
-    }
+    payload.extend_from_slice(attestation_hash);
+    payload.extend_from_slice(requester_pubkey);
+    payload.extend_from_slice(requester_ember_hash);
+    payload.extend_from_slice(&nonce);
+    payload.extend_from_slice(&signature);
+    debug_assert_eq!(payload.len(), RELAY_REQUEST_V2_PAYLOAD_LEN);
     encode_relay_message(MSG_RELAY_REQUEST, session_id, &payload)
+}
+
+/// Parse and cryptographically verify a v2 RELAY_REQUEST payload.
+///
+/// Does **not** check attestation-hash membership or nonce replay —
+/// those are policy checks owned by [`RelayManager`] on the accept path.
+pub fn parse_and_verify_relay_request_v2(
+    session_id: u32,
+    payload: &[u8],
+) -> Result<RelayRequestV2, &'static str> {
+    if payload.len() != RELAY_REQUEST_V2_PAYLOAD_LEN {
+        return Err("unexpected relay request payload length");
+    }
+    if payload[0] != RELAY_REQUEST_VERSION {
+        return Err("unsupported relay request version");
+    }
+    let target_ip = Ipv4Addr::new(payload[1], payload[2], payload[3], payload[4]);
+    let target_port = u16::from_le_bytes([payload[5], payload[6]]);
+    let mut file_hash = [0u8; 16];
+    file_hash.copy_from_slice(&payload[7..23]);
+    let mut attestation_hash = [0u8; 32];
+    attestation_hash.copy_from_slice(&payload[23..55]);
+    let mut requester_pubkey = [0u8; 32];
+    requester_pubkey.copy_from_slice(&payload[55..87]);
+    let mut requester_ember_hash = [0u8; 16];
+    requester_ember_hash.copy_from_slice(&payload[87..103]);
+    let mut nonce = [0u8; 16];
+    nonce.copy_from_slice(&payload[103..119]);
+    let mut signature = [0u8; 64];
+    signature.copy_from_slice(&payload[119..183]);
+
+    if !super::crypto::verify_ember_hash_binding(&requester_pubkey, &requester_ember_hash) {
+        return Err("requester pubkey does not bind to ember_hash");
+    }
+    let Some(vk) = super::crypto::verifying_key_from_bytes(&requester_pubkey) else {
+        return Err("invalid requester pubkey");
+    };
+    let signed = build_relay_request_signed_message(
+        session_id,
+        &attestation_hash,
+        target_ip,
+        target_port,
+        &file_hash,
+        &requester_pubkey,
+        &requester_ember_hash,
+        &nonce,
+    );
+    if !super::crypto::verify(&vk, &signed, &signature) {
+        return Err("bad relay request signature");
+    }
+    Ok(RelayRequestV2 {
+        target_ip,
+        target_port,
+        file_hash,
+        attestation_hash,
+        requester_pubkey,
+        requester_ember_hash,
+        nonce,
+    })
 }
 
 /// Build a RELAY_ACCEPT message.
@@ -374,27 +538,6 @@ pub fn build_relay_connect(session_id: u32, file_hash: &[u8; 16]) -> Vec<u8> {
 /// Build a RELAY_CLOSE message.
 pub fn build_relay_close(session_id: u32) -> Vec<u8> {
     encode_relay_message(MSG_RELAY_CLOSE, session_id, &[])
-}
-
-/// Parse a RELAY_REQUEST payload.
-pub fn parse_relay_request_with_attestation_hash(
-    payload: &[u8],
-) -> Option<(Ipv4Addr, u16, [u8; 16], Option<[u8; 32]>)> {
-    if payload.len() < 22 {
-        return None;
-    }
-    let ip = Ipv4Addr::new(payload[0], payload[1], payload[2], payload[3]);
-    let port = u16::from_le_bytes([payload[4], payload[5]]);
-    let mut hash = [0u8; 16];
-    hash.copy_from_slice(&payload[6..22]);
-    let attestation_hash = if payload.len() >= 54 {
-        let mut h = [0u8; 32];
-        h.copy_from_slice(&payload[22..54]);
-        Some(h)
-    } else {
-        None
-    };
-    Some((ip, port, hash, attestation_hash))
 }
 
 /// Client-side helper: register a hole-punch coordination request.
@@ -489,7 +632,10 @@ pub async fn connect_to_peer_relay(
     target_ip: Ipv4Addr,
     target_port: u16,
     file_hash: &[u8; 16],
-    attestation_hash: Option<[u8; 32]>,
+    attestation_hash: &[u8; 32],
+    requester_pubkey: &[u8; 32],
+    requester_ember_hash: &[u8; 16],
+    requester_secret_key: &[u8; 32],
     pin: Option<(&[u8], &[u8], [u8; 16])>,
 ) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
     info!("Relay: connecting to peer relay at {relay_addr}");
@@ -504,12 +650,15 @@ pub async fn connect_to_peer_relay(
         .map_err(|e| format!("relay open_bi failed: {e}"))?;
 
     let session_id = rand::random::<u32>();
-    let request = build_relay_request_with_attestation_hash(
+    let request = build_relay_request_v2(
         session_id,
         target_ip,
         target_port,
         file_hash,
         attestation_hash,
+        requester_pubkey,
+        requester_ember_hash,
+        requester_secret_key,
     );
 
     tokio::time::timeout(RELAY_CONTROL_TIMEOUT, send.write_all(&request))
@@ -544,16 +693,18 @@ pub async fn connect_to_peer_relay(
 
     if msg_type == MSG_RELAY_REJECT {
         // Payload is a single reason byte (see `build_relay_reject`):
-        // 0x01 capacity, 0x02 bad target, 0x03 attestation/auth failure.
-        // Surfacing it lets callers distinguish "try another relay" from
-        // "this attestation is stale, refresh it" instead of a single
-        // generic error for every rejection cause.
+        // 0x01 capacity, 0x02 bad target, 0x03 auth/attestation, 0x04 bad PoP.
         let reason = payload.first().copied();
         return Err(match reason {
-            Some(0x01) => "relay peer rejected request: at capacity".to_string(),
-            Some(0x02) => "relay peer rejected request: invalid/non-public target".to_string(),
-            Some(0x03) => {
+            Some(REJECT_CAPACITY) => "relay peer rejected request: at capacity".to_string(),
+            Some(REJECT_BAD_TARGET) => {
+                "relay peer rejected request: invalid/non-public target".to_string()
+            }
+            Some(REJECT_AUTH) => {
                 "relay peer rejected request: unauthenticated or unknown attestation".to_string()
+            }
+            Some(REJECT_BAD_SIGNATURE) => {
+                "relay peer rejected request: bad requester signature or replay".to_string()
             }
             Some(other) => format!("relay peer rejected request: reason 0x{other:02X}"),
             None => "relay peer rejected request".to_string(),
@@ -862,9 +1013,7 @@ pub async fn run_quic_accept_loop(
                 // === Peer relay request: initiator wants us to relay ===
                 // We have only read the 7-byte header, so call the
                 // header-only decoder rather than `decode_relay_message`,
-                // which requires the full body (payload_len = 22 for
-                // RELAY_REQUEST) to be present and would otherwise reject
-                // every spec-compliant initiator.
+                // which requires the full body to be present.
                 let (_mt, peer_session_id, payload_len) = match decode_relay_header(&header) {
                     Some(decoded) => decoded,
                     None => {
@@ -872,10 +1021,13 @@ pub async fn run_quic_accept_loop(
                         return;
                     }
                 };
-                if !matches!(payload_len as usize, 22 | 54) {
+                if payload_len as usize != RELAY_REQUEST_V2_PAYLOAD_LEN {
                     debug!(
-                        "QUIC accept: RELAY_REQUEST from {remote} has unexpected payload_len {payload_len} (want 22 or 54)"
+                        "QUIC accept: RELAY_REQUEST from {remote} has unexpected payload_len {payload_len} (want {RELAY_REQUEST_V2_PAYLOAD_LEN}; v1 hash-only requests are rejected)"
                     );
+                    // Echo reject when we can (session id is in the header).
+                    let reject = build_relay_reject(peer_session_id, REJECT_AUTH);
+                    let _ = init_send.write_all(&reject).await;
                     return;
                 }
 
@@ -891,54 +1043,47 @@ pub async fn run_quic_accept_loop(
                     return;
                 }
 
-                let (target_ip, target_port, file_hash, attestation_hash) =
-                    match parse_relay_request_with_attestation_hash(&payload_buf) {
-                        Some(parsed) => parsed,
-                        None => {
-                            debug!("QUIC accept: invalid relay request payload from {remote}");
-                            return;
-                        }
-                    };
+                let verified = match parse_and_verify_relay_request_v2(peer_session_id, &payload_buf)
+                {
+                    Ok(req) => req,
+                    Err(reason) => {
+                        debug!(
+                            "QUIC accept: refusing relay request from {remote}: {reason}"
+                        );
+                        let reject = build_relay_reject(peer_session_id, REJECT_BAD_SIGNATURE);
+                        let _ = init_send.write_all(&reject).await;
+                        return;
+                    }
+                };
 
                 // Refuse to relay to non-public destinations (SSRF/scan guard).
-                if target_port == 0 || !is_public_relay_target(target_ip) {
+                if verified.target_port == 0 || !is_public_relay_target(verified.target_ip) {
                     debug!(
-                        "QUIC accept: refusing relay to non-public target {target_ip}:{target_port} from {remote}"
+                        "QUIC accept: refusing relay to non-public target {}:{} from {remote}",
+                        verified.target_ip, verified.target_port
                     );
-                    let reject = build_relay_reject(peer_session_id, 0x02);
+                    let reject = build_relay_reject(peer_session_id, REJECT_BAD_TARGET);
                     let _ = init_send.write_all(&reject).await;
                     return;
                 }
 
-                let Some(attestation_hash) = attestation_hash else {
-                    debug!(
-                        "QUIC accept: refusing unauthenticated peer relay request from {remote}"
-                    );
-                    let reject = build_relay_reject(peer_session_id, 0x03);
-                    let _ = init_send.write_all(&reject).await;
-                    return;
-                };
-                // The v1 Ember relay request carries only the hash of the
-                // relay's public EPX attestation. That proves the caller saw a
-                // current advertisement, but it is not proof of possession:
-                // the hash is necessarily public and is therefore a bearer
-                // value. Do not pretend that consuming it once or binding it
-                // to the source IP fixes that — one-shot use breaks legitimate
-                // parallel transfers, while an IP binding breaks NAT/mobile
-                // peers and still does not authenticate the requester.
-                //
-                // A compatible fix needs a versioned Ember-native request
-                // carrying the requester's identity plus a signature over the
-                // relay identity, target, file hash, session id, and a fresh
-                // nonce. Until both ends support that wire shape, retain the
-                // current expiry/capacity/target controls and the downstream
-                // authenticated Ember/eMule handshake rather than weakening
-                // interoperability or treating this hash as a secret.
                 {
                     let mut mgr_lock = mgr.lock().await;
-                    if !mgr_lock.accepts_attestation_hash(&attestation_hash) {
-                        debug!("QUIC accept: refusing relay request from {remote}: unknown or expired attestation hash");
-                        let reject = build_relay_reject(peer_session_id, 0x03);
+                    if !mgr_lock.accepts_attestation_hash(&verified.attestation_hash) {
+                        debug!(
+                            "QUIC accept: refusing relay request from {remote}: unknown or expired attestation hash"
+                        );
+                        let reject = build_relay_reject(peer_session_id, REJECT_AUTH);
+                        let _ = init_send.write_all(&reject).await;
+                        return;
+                    }
+                    if !mgr_lock
+                        .consume_request_nonce(&verified.requester_pubkey, &verified.nonce)
+                    {
+                        debug!(
+                            "QUIC accept: refusing relay request from {remote}: replayed or cache-full nonce"
+                        );
+                        let reject = build_relay_reject(peer_session_id, REJECT_BAD_SIGNATURE);
                         let _ = init_send.write_all(&reject).await;
                         return;
                     }
@@ -952,6 +1097,9 @@ pub async fn run_quic_accept_loop(
                     }
                 };
                 let initiator_port = remote.port();
+                let target_ip = verified.target_ip;
+                let target_port = verified.target_port;
+                let file_hash = verified.file_hash;
 
                 let session_id = {
                     let mut mgr_lock = mgr.lock().await;
@@ -964,7 +1112,7 @@ pub async fn run_quic_accept_loop(
                     ) {
                         Some(sid) => sid,
                         None => {
-                            let reject = build_relay_reject(peer_session_id, 0x01);
+                            let reject = build_relay_reject(peer_session_id, REJECT_CAPACITY);
                             let _ = init_send.write_all(&reject).await;
                             debug!("QUIC accept: at capacity, rejected relay from {remote}");
                             return;
@@ -1326,27 +1474,88 @@ mod tests {
     }
 
     #[test]
-    fn relay_request_with_attestation_hash_round_trip() {
+    fn relay_request_v2_round_trip_and_verifies() {
         let ip = Ipv4Addr::new(1, 2, 3, 4);
         let port = 4662u16;
         let file_hash = [0xAA; 16];
         let attestation_hash = [0xBB; 32];
-        let msg = build_relay_request_with_attestation_hash(
+        let sk = super::super::crypto::signing_key_from_bytes(&[7u8; 32]);
+        let pk = sk.verifying_key().to_bytes();
+        let ember_hash = super::super::crypto::node_id_from_public_key(&sk.verifying_key());
+        let secret = sk.to_bytes();
+
+        let msg = build_relay_request_v2(
             1,
             ip,
             port,
             &file_hash,
-            Some(attestation_hash),
+            &attestation_hash,
+            &pk,
+            &ember_hash,
+            &secret,
         );
         let (msg_type, sid, payload) = decode_relay_message(&msg).unwrap();
         assert_eq!(msg_type, MSG_RELAY_REQUEST);
         assert_eq!(sid, 1);
-        let (parsed_ip, parsed_port, parsed_file_hash, parsed_attestation_hash) =
-            parse_relay_request_with_attestation_hash(payload).unwrap();
-        assert_eq!(parsed_ip, ip);
-        assert_eq!(parsed_port, port);
-        assert_eq!(parsed_file_hash, file_hash);
-        assert_eq!(parsed_attestation_hash, Some(attestation_hash));
+        assert_eq!(payload.len(), RELAY_REQUEST_V2_PAYLOAD_LEN);
+        let parsed = parse_and_verify_relay_request_v2(1, payload).unwrap();
+        assert_eq!(parsed.target_ip, ip);
+        assert_eq!(parsed.target_port, port);
+        assert_eq!(parsed.file_hash, file_hash);
+        assert_eq!(parsed.attestation_hash, attestation_hash);
+        assert_eq!(parsed.requester_pubkey, pk);
+        assert_eq!(parsed.requester_ember_hash, ember_hash);
+    }
+
+    #[test]
+    fn relay_request_v2_rejects_tampered_payload() {
+        let sk = super::super::crypto::signing_key_from_bytes(&[9u8; 32]);
+        let pk = sk.verifying_key().to_bytes();
+        let ember_hash = super::super::crypto::node_id_from_public_key(&sk.verifying_key());
+        let secret = sk.to_bytes();
+        let msg = build_relay_request_v2(
+            42,
+            Ipv4Addr::new(8, 8, 8, 8),
+            4662,
+            &[1u8; 16],
+            &[2u8; 32],
+            &pk,
+            &ember_hash,
+            &secret,
+        );
+        let (_, sid, payload) = decode_relay_message(&msg).unwrap();
+        let mut bad = payload.to_vec();
+        bad[7] ^= 0xFF; // flip a file_hash byte under the signature
+        assert!(parse_and_verify_relay_request_v2(sid, &bad).is_err());
+    }
+
+    #[test]
+    fn relay_request_v2_rejects_binding_mismatch() {
+        let sk = super::super::crypto::signing_key_from_bytes(&[3u8; 32]);
+        let pk = sk.verifying_key().to_bytes();
+        let secret = sk.to_bytes();
+        let wrong_hash = [0xABu8; 16];
+        let msg = build_relay_request_v2(
+            7,
+            Ipv4Addr::new(1, 1, 1, 1),
+            4662,
+            &[0u8; 16],
+            &[0u8; 32],
+            &pk,
+            &wrong_hash,
+            &secret,
+        );
+        let (_, sid, payload) = decode_relay_message(&msg).unwrap();
+        assert!(parse_and_verify_relay_request_v2(sid, payload).is_err());
+    }
+
+    #[test]
+    fn relay_manager_rejects_replayed_request_nonce() {
+        let mut mgr = RelayManager::new();
+        let pk = [5u8; 32];
+        let nonce = [6u8; 16];
+        assert!(mgr.consume_request_nonce(&pk, &nonce));
+        assert!(!mgr.consume_request_nonce(&pk, &nonce));
     }
 
     #[test]

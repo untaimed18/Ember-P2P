@@ -902,6 +902,7 @@ peer_count    (u16 LE)
 
     <h3 id="epx-erat">ERAT relay attestations</h3>
     <p>After the peer list, a v4 packet may append a trailer beginning with magic <code>ERAT</code>: version byte, attestation count (max 16), then fixed-size Ed25519-signed entries binding a relay IP/port to an expiry and capability bits. Only cryptographically valid, non-expired attestations (max TTL 30 minutes) become connection-broker relay candidates. The per-source <code>relay-capable</code> flag alone never admits a relay.</p>
+    <p>Peer-relay QUIC <code>RELAY_REQUEST</code> messages are version&nbsp;2 and require proof of possession: the requester includes their Ed25519 public key and Ember hash, a fresh nonce, and a signature over the session id, the relay's ERAT attestation hash, target address, and file hash. Legacy hash-only (bearer) requests are rejected. Relays also reject replayed nonces within a short TTL window.</p>
 
     <h3 id="epx-limits">Safety Limits</h3>
     <p>These caps prevent abuse from poisoned or malicious payloads. Private/reserved IPs and zero-port entries are silently dropped.</p>

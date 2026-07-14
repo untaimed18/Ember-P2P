@@ -14124,8 +14124,29 @@ pub async fn start_network(
                                             .map(|((cert_der, key_der), hash)| {
                                                 (cert_der.as_slice(), key_der.as_slice(), *hash)
                                             });
+                                        let Some(attestation_hash) = relay_attestation_hash else {
+                                            tracing::warn!(
+                                                "Broker: peer relay {attempt_key_owned} missing attestation hash"
+                                            );
+                                            if let Err(send_err) = broker_tx.try_send(ember::broker::BrokerEvent::RelayFailed {
+                                                attempt_key: attempt_key_owned,
+                                                reason: "missing relay attestation hash".into(),
+                                            }) {
+                                                tracing::debug!("Broker: dropping relay failure event (queue full/closed): {send_err}");
+                                            }
+                                            return;
+                                        };
                                         match ember::relay::connect_to_peer_relay(
-                                            &endpoint, relay_addr, source_ip, source_port, &file_hash, relay_attestation_hash, relay_pin,
+                                            &endpoint,
+                                            relay_addr,
+                                            source_ip,
+                                            source_port,
+                                            &file_hash,
+                                            &attestation_hash,
+                                            &ed25519_pubkey,
+                                            &ember_hash,
+                                            &ed25519_secret_key,
+                                            relay_pin,
                                         ).await {
                                             Ok((send, recv)) => {
                                                 tracing::info!("Broker: peer relay connected via {relay_addr}");
