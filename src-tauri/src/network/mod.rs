@@ -87,7 +87,6 @@ struct PeriodicSaveResult {
 }
 
 struct SpamSaveResult {
-    generation: u64,
     result: Result<(), String>,
 }
 
@@ -12464,7 +12463,8 @@ pub async fn start_network(
                 // the only path that promotes `tcp_status` to Open here. UPnP clearing
                 // `firewalled_shared` may clear the aggregate firewalled flag, but must
                 // not pretend a connect-back happened. An active LowID session must not
-                // be overridden by UPnP optimism.
+                // be overridden by UPnP optimism — but a real connect-back still updates
+                // KAD `tcp_status` so proof is not discarded.
                 let connect_back = state
                     .tcp_connect_back_shared
                     .swap(false, std::sync::atomic::Ordering::Relaxed);
@@ -12480,6 +12480,22 @@ pub async fn start_network(
                         state.stats.firewalled = true;
                         state.stats.tcp_status = format!("{:?}", state.firewall_checker.tcp_status());
                         state.stats.udp_status = format!("{:?}", state.firewall_checker.udp_status());
+                        let _ = app_handle.emit("firewall-status", serde_json::json!({
+                            "firewalled": state.firewalled,
+                            "external_ip": state.stats.external_ip,
+                            "tcp_status": state.stats.tcp_status,
+                            "udp_status": state.stats.udp_status,
+                        }));
+                    }
+                    // Keep ed2k LowID/firewalled sticky, but still record KAD TCP
+                    // reachability proof so it survives until HighID / disconnect.
+                    if connect_back {
+                        info!("TCP connect-back during LowID — updating tcp_status only");
+                        state.firewall_checker.handle_tcp_connect_back();
+                        state.stats.tcp_status =
+                            format!("{:?}", state.firewall_checker.tcp_status());
+                        state.stats.udp_status =
+                            format!("{:?}", state.firewall_checker.udp_status());
                         let _ = app_handle.emit("firewall-status", serde_json::json!({
                             "firewalled": state.firewalled,
                             "external_ip": state.stats.external_ip,
@@ -17372,6 +17388,126 @@ pub async fn start_network(
                                 ed2k::server::ServerEvent::CallbackFailed => {
                                     debug!("Server reported callback failure");
                                 }
+                                ed2k::server::ServerEvent::IdChange {
+                                    client_id,
+                                    server_flags,
+                                    server_reported_ip,
+                                } => {
+                                    if client_id == 0 {
+                                        warn!("Server sent OP_IDCHANGE with client_id=0 — disconnecting");
+                                        server_disconnect_reason =
+                                            Some("server revoked client id (OP_IDCHANGE=0)".into());
+                                        break;
+                                    }
+                                    let was_low = state.low_id;
+                                    let is_low = client_id > 0 && client_id < ed2k::server::LOWID_THRESHOLD;
+                                    if let Some(session) = conn.session.as_mut() {
+                                        session.client_id = client_id;
+                                        session.server_flags = server_flags;
+                                        if server_reported_ip != 0 {
+                                            session.server_reported_ip = server_reported_ip;
+                                        }
+                                    }
+                                    state.server_client_id = client_id;
+                                    state.low_id = is_low;
+                                    let id_type = if is_low { "LowID" } else { "HighID" };
+                                    info!(
+                                        "Server OP_IDCHANGE: {} id={client_id} (was_low={was_low})",
+                                        id_type
+                                    );
+                                    emit_server_log(
+                                        &app_handle,
+                                        &format!("Server reassigned {id_type} ({client_id})"),
+                                    );
+                                    if !is_low && client_id >= ed2k::server::LOWID_THRESHOLD {
+                                        if state.firewalled || was_low {
+                                            info!("Mid-session HighID confirms TCP port is open");
+                                            state.firewalled = false;
+                                            state.firewalled_shared.store(
+                                                false,
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            );
+                                            if state.buddy_manager.state() == BuddyState::FindingBuddy
+                                            {
+                                                state.buddy_manager.find_failed();
+                                                info!(
+                                                    "Cancelled buddy search: HighID proves TCP is open"
+                                                );
+                                            }
+                                        }
+                                        state.firewall_checker.handle_tcp_connect_back();
+                                        let ip_bytes = client_id.to_le_bytes();
+                                        let ext_ip = Ipv4Addr::from(ip_bytes);
+                                        if !ext_ip.is_unspecified() && !ext_ip.is_loopback() {
+                                            if state.external_ip.is_none()
+                                                || state.external_ip == Some(ext_ip)
+                                            {
+                                                set_external_ip(&mut state, Some(ext_ip));
+                                                state.stats.external_ip = ext_ip.to_string();
+                                            }
+                                            state
+                                                .firewall_checker
+                                                .handle_server_highid_response(ext_ip);
+                                        }
+                                        update_publish_manager_state(&mut state);
+                                        state.stats.firewalled = state.firewalled;
+                                        state.stats.tcp_status = format!(
+                                            "{:?}",
+                                            state.firewall_checker.tcp_status()
+                                        );
+                                        state.stats.udp_status = format!(
+                                            "{:?}",
+                                            state.firewall_checker.udp_status()
+                                        );
+                                        let _ = app_handle.emit(
+                                            "firewall-status",
+                                            serde_json::json!({
+                                                "firewalled": state.firewalled,
+                                                "external_ip": state.stats.external_ip,
+                                                "tcp_status": state.stats.tcp_status,
+                                                "udp_status": state.stats.udp_status,
+                                            }),
+                                        );
+                                    } else if is_low {
+                                        state.firewalled = true;
+                                        state.firewalled_shared.store(
+                                            true,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
+                                        state.firewall_checker.note_tcp_firewalled();
+                                        update_publish_manager_state(&mut state);
+                                        state.stats.firewalled = true;
+                                        state.stats.tcp_status = format!(
+                                            "{:?}",
+                                            state.firewall_checker.tcp_status()
+                                        );
+                                        state.stats.udp_status = format!(
+                                            "{:?}",
+                                            state.firewall_checker.udp_status()
+                                        );
+                                        let _ = app_handle.emit(
+                                            "firewall-status",
+                                            serde_json::json!({
+                                                "firewalled": state.firewalled,
+                                                "external_ip": state.stats.external_ip,
+                                                "tcp_status": state.stats.tcp_status,
+                                                "udp_status": state.stats.udp_status,
+                                            }),
+                                        );
+                                        if server_reported_ip != 0 {
+                                            let ext_ip = Ipv4Addr::from(
+                                                server_reported_ip.to_le_bytes(),
+                                            );
+                                            if !ext_ip.is_unspecified()
+                                                && !ext_ip.is_loopback()
+                                                && state.external_ip.is_none()
+                                            {
+                                                set_external_ip(&mut state, Some(ext_ip));
+                                                state.stats.external_ip = ext_ip.to_string();
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                         if server_disconnect_reason.is_none()
@@ -19638,9 +19774,9 @@ pub async fn start_network(
                 let __panic_result = std::panic::AssertUnwindSafe(async {
                 spam_save_in_flight = false;
                 spam_save_started_at = None;
-                match result.result {
-                    Ok(()) => spam_filter.write().await.mark_saved(result.generation),
-                    Err(e) => warn!("Failed to save spam filter: {e}"),
+                // `drain_saves` already called `mark_saved` under the gate.
+                if let Err(e) = result.result {
+                    warn!("Failed to save spam filter: {e}");
                 }
                 }).catch_unwind().await;
                 if let Err(__p) = __panic_result {
@@ -19676,33 +19812,22 @@ pub async fn start_network(
                 // `record_server_clean_batch` (server-reputation decay) set the
                 // dirty flag but have no save path of their own; without this
                 // periodic flush they'd persist only on the next user-driven
-                // mark or at shutdown, and be lost on a crash. The serialize
-                // happens under the lock; the write is offloaded so the loop
-                // isn't parked on disk I/O, and `mark_saved(gen)` only clears
-                // dirty if no newer change landed meanwhile.
-                let spam_save = if !spam_save_in_flight {
-                    let mut sf = spam_filter.write().await;
-                    sf.take_save_data()
+                // mark or at shutdown, and be lost on a crash. Shares
+                // `SpamFilter::save_gate` with IPC mark_spam saves so the two
+                // paths cannot overwrite each other out of order.
+                let needs_spam_save = if !spam_save_in_flight {
+                    spam_filter.read().await.is_dirty()
                 } else {
-                    None
+                    false
                 };
-                if let Some((data, path, gen)) = spam_save {
+                if needs_spam_save {
                     spam_save_in_flight = true;
                     spam_save_started_at = Some(tokio::time::Instant::now());
+                    let sf = spam_filter.clone();
                     let tx = spam_save_result_tx.clone();
-                    let ok = tokio::task::spawn_blocking(move || {
-                        crate::security::atomic_write(&path, data.as_bytes(), false)
-                            .map_err(|e| e.to_string())
-                    });
                     tokio::spawn(async move {
-                        let result = ok
-                            .await
-                            .map_err(|e| format!("spam filter save task failed: {e}"))
-                            .and_then(|r| r);
-                        let _ = tx.send(SpamSaveResult {
-                            generation: gen,
-                            result,
-                        });
+                        let result = crate::search::spam::SpamFilter::drain_saves(&sf).await;
+                        let _ = tx.send(SpamSaveResult { result });
                     });
                 }
                 }).catch_unwind().await;
@@ -20921,11 +21046,10 @@ pub async fn start_network(
                     .external_ip
                     .map(|ip| ip.to_string())
                     .unwrap_or_default();
-                let connect_back = state
-                    .tcp_connect_back_shared
-                    .swap(false, std::sync::atomic::Ordering::Relaxed);
+                // Do not swap `tcp_connect_back_shared` here — the firewall-sync
+                // arm is the sole consumer. Dual swap was discarding probe proof
+                // under LowID before that arm could record it.
                 let fw_shared = state.firewalled_shared.load(std::sync::atomic::Ordering::Relaxed);
-                let mut tcp_promoted = false;
                 if state.low_id {
                     if !fw_shared {
                         state.firewalled_shared.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -20934,11 +21058,6 @@ pub async fn start_network(
                         state.firewalled = true;
                         state.firewall_checker.note_tcp_firewalled();
                     }
-                } else if connect_back {
-                    state.firewalled = false;
-                    state.firewalled_shared.store(false, std::sync::atomic::Ordering::Relaxed);
-                    state.firewall_checker.handle_tcp_connect_back();
-                    tcp_promoted = true;
                 } else if state.firewalled && !fw_shared {
                     // UPnP optimism only — do not mark tcp_status Open.
                     state.firewalled = false;
@@ -20952,17 +21071,6 @@ pub async fn start_network(
                     format!("{:?}", state.firewall_checker.tcp_status());
                 state.stats.udp_status =
                     format!("{:?}", state.firewall_checker.udp_status());
-                if tcp_promoted {
-                    let _ = app_handle.emit(
-                        "firewall-status",
-                        serde_json::json!({
-                            "firewalled": state.firewalled,
-                            "external_ip": state.stats.external_ip,
-                            "tcp_status": state.stats.tcp_status,
-                            "udp_status": state.stats.udp_status,
-                        }),
-                    );
-                }
                 update_publish_manager_state(&mut state);
 
                 let cached_s: Vec<KadSearchInfo> = state

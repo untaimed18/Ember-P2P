@@ -11,6 +11,7 @@
   // files in the Library — unshared files are indexed but not counted here.
   let sharedCount = $state(0);
   let sharedBytes = $state(0);
+  let sharedRefreshGen = 0;
 
   function sharedTitle(count: number, bytes: number): string {
     const size = formatBytes(bytes);
@@ -23,9 +24,11 @@
     let active = true;
 
     async function refreshSharedCount() {
+      const gen = ++sharedRefreshGen;
       try {
         const stats = await getSharedFileCount();
-        if (active) {
+        // Ignore stale responses from overlapping shared-files-changed bursts.
+        if (active && gen === sharedRefreshGen) {
           sharedCount = stats.count;
           sharedBytes = stats.total_bytes;
         }
