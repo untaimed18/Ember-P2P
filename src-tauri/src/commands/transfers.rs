@@ -131,12 +131,13 @@ pub(crate) async fn start_promoted_downloads(state: &AppState, promoted: &[Trans
                 file_size: transfer.total_size,
                 peer_ip: parse_peer_ip(&transfer.peer_id),
                 peer_port: parse_peer_port(&transfer.peer_id),
-                // Promoting a queued transfer from the DB doesn't carry
-                // the original search-result address list — the network
-                // task does its own discovery as usual.
+                // Extras were registered into SourceManager at enqueue via
+                // discovery_only StartDownload; the network handler reloads
+                // them from SM when workers start.
                 extra_sources: Vec::new(),
                 transfer_id: transfer.id.clone(),
                 control,
+                discovery_only: false,
             },
         )
         .await
@@ -466,12 +467,10 @@ pub async fn start_download(
 
     let _ = app.emit("transfer-started", &persisted_transfer);
 
-    if !active_now || add_paused {
-        return Ok(StartDownloadResponse {
-            transfer_id,
-            already_queued: false,
-        });
-    }
+    // Always hand the download to the network task: active starts run
+    // MultiSource workers; queued / add-paused use discovery_only so
+    // KAD + TCP + UDP source asking still runs (matching restore).
+    let discovery_only = !active_now || add_paused;
 
     if let Err(e) = bounded_send(
         &state.network_tx,
@@ -484,6 +483,7 @@ pub async fn start_download(
             extra_sources: parsed_extras,
             transfer_id: transfer_id.clone(),
             control,
+            discovery_only,
         },
     )
     .await

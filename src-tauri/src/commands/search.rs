@@ -122,11 +122,39 @@ pub fn apply_search_enrichment(
     cleanup_strings: &[String],
     community: &HashMap<String, CommunityRating>,
 ) {
-    // Statistical signals over the whole batch (same-name/many-hashes,
-    // same-hash/many-names, source-IP concentration). Computed once and shared
-    // across all results. Skipped for the `relaxed` profile (local-only) and
-    // when the filter is off; also a no-op below the minimum batch size.
-    let batch = if spam_enabled && spam_profile != SpamFilterProfile::Relaxed {
+    apply_search_enrichment_with_batch(
+        results,
+        spam,
+        search_keywords,
+        server_ip,
+        spam_enabled,
+        spam_profile,
+        cleanup_strings,
+        community,
+        true,
+    );
+}
+
+/// Like [`apply_search_enrichment`], but `use_batch_context: false` skips
+/// batch-local spam heuristics (same-name/many-hashes). Used for the invoke
+/// return path so a second scoring pass cannot flip already-streamed rows
+/// from clean → spam via a different batch context.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_search_enrichment_with_batch(
+    results: &mut [SearchResult],
+    spam: &SpamFilter,
+    search_keywords: &[String],
+    server_ip: Option<&str>,
+    spam_enabled: bool,
+    spam_profile: SpamFilterProfile,
+    cleanup_strings: &[String],
+    community: &HashMap<String, CommunityRating>,
+    use_batch_context: bool,
+) {
+    let batch = if spam_enabled
+        && spam_profile != SpamFilterProfile::Relaxed
+        && use_batch_context
+    {
         BatchSpamContext::analyze(results)
     } else {
         BatchSpamContext::default()
@@ -157,18 +185,24 @@ pub async fn enrich_results(
     search_keywords: &[String],
     server_ip: Option<&str>,
 ) {
+    enrich_results_with_batch(results, state, search_keywords, server_ip, true).await;
+}
+
+pub async fn enrich_results_with_batch(
+    results: &mut [SearchResult],
+    state: &AppState,
+    search_keywords: &[String],
+    server_ip: Option<&str>,
+    use_batch_context: bool,
+) {
     let (config, spam) = tokio::join!(state.config.read(), state.spam_filter.read(),);
     let spam_enabled = config.settings.spam_filter_enabled;
     let spam_profile = SpamFilterProfile::from_setting(&config.settings.spam_filter_profile);
     let cleanup_strings = parse_cleanup_strings(&config.settings.filename_cleanups);
     drop(config);
 
-    // The synchronous command path (local index + initial returned set) has no
-    // access to the comment manager, so community ratings aren't applied here.
-    // The bulk of network results flow through the streaming path
-    // (`enrich_and_emit_search_results`), which does supply them.
     let community = HashMap::new();
-    apply_search_enrichment(
+    apply_search_enrichment_with_batch(
         results,
         &spam,
         search_keywords,
@@ -177,6 +211,7 @@ pub async fn enrich_results(
         spam_profile,
         &cleanup_strings,
         &community,
+        use_batch_context,
     );
 }
 
@@ -260,23 +295,32 @@ pub async fn search_files(
         _ => local_hits,
     };
 
-    let file_type_filter = file_type.clone();
+    let ui_file_type = file_type.clone();
+    let client_min_size = min_size;
+    let client_max_size = max_size;
+    let client_file_extension = file_extension.clone();
+    let client_min_availability = min_availability;
     let filters = if min_size.is_some()
         || max_size.is_some()
-        || file_type.is_some()
+        || ui_file_type.is_some()
         || file_extension.is_some()
         || min_availability.is_some()
     {
         Some(crate::network::SearchFilters {
             min_size,
             max_size,
-            file_type,
+            file_type: ui_file_type.clone(),
             file_extension,
             min_availability,
         })
     } else {
         None
     };
+
+    // eMule: Program search clears the local type filter; Archive/CD-Image keep
+    // theirs so Pro-wire replies can be narrowed client-side.
+    let file_type_filter =
+        crate::search::merge::client_search_file_type_filter(ui_file_type.as_deref());
 
     state
         .network_tx
@@ -306,18 +350,19 @@ pub async fn search_files(
         };
 
     results = merge::merge_search_vecs(results, local_hits);
-    if let Some(ref ft) = file_type_filter {
-        results.retain(|r| {
-            let inferred = crate::search::index::infer_file_type(&r.file.extension);
-            let result_type = if !inferred.is_empty() {
-                inferred
-            } else {
-                r.file_type.clone()
-            };
-            result_type == *ft
-        });
-    }
-    enrich_results(&mut results, &state, &keywords, None).await;
+    results.retain(|r| {
+        merge::result_matches_client_filters(
+            r,
+            file_type_filter.as_deref(),
+            client_min_size,
+            client_max_size,
+            client_file_extension.as_deref(),
+            client_min_availability,
+        )
+    });
+    // No batch spam context: invoke often re-delivers hashes already shown via
+    // streamed events; batch heuristics can flip clean → spam.
+    enrich_results_with_batch(&mut results, &state, &keywords, None, false).await;
     merge::sort_search_results(&mut results);
     Ok(results)
 }

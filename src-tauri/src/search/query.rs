@@ -126,6 +126,56 @@ impl QueryExpr {
     pub fn is_trivial(&self) -> bool {
         matches!(self, QueryExpr::Term(_))
     }
+
+    /// True if the tree contains an OR node (eMule Kad strip is AND-only).
+    pub fn contains_or(&self) -> bool {
+        match self {
+            QueryExpr::Or(_, _) => true,
+            QueryExpr::And(l, r) | QueryExpr::Not(l, r) => l.contains_or() || r.contains_or(),
+            QueryExpr::Term(_) => false,
+        }
+    }
+
+    /// True if the tree contains a NOT node.
+    pub fn contains_not(&self) -> bool {
+        match self {
+            QueryExpr::Not(_, _) => true,
+            QueryExpr::And(l, r) | QueryExpr::Or(l, r) => l.contains_not() || r.contains_not(),
+            QueryExpr::Term(_) => false,
+        }
+    }
+
+    /// Remove every `Term` equal to `keyword` (case-sensitive; terms are already
+    /// lowercased). Used for Kad AND-only restrictive trees: eMule strips the
+    /// lookup keyword from the packet because the DHT target already selects
+    /// that word. Returns `None` when nothing remains.
+    pub fn without_term(&self, keyword: &str) -> Option<QueryExpr> {
+        match self {
+            QueryExpr::Term(s) => {
+                if s == keyword {
+                    None
+                } else {
+                    Some(QueryExpr::Term(s.clone()))
+                }
+            }
+            QueryExpr::And(l, r) => match (l.without_term(keyword), r.without_term(keyword)) {
+                (None, None) => None,
+                (Some(x), None) | (None, Some(x)) => Some(x),
+                (Some(a), Some(b)) => Some(QueryExpr::And(Box::new(a), Box::new(b))),
+            },
+            QueryExpr::Or(l, r) => {
+                // OR trees are not stripped for Kad (eMule keeps the full tree).
+                Some(QueryExpr::Or(
+                    Box::new(l.as_ref().clone()),
+                    Box::new(r.as_ref().clone()),
+                ))
+            }
+            QueryExpr::Not(l, r) => Some(QueryExpr::Not(
+                Box::new(l.as_ref().clone()),
+                Box::new(r.as_ref().clone()),
+            )),
+        }
+    }
 }
 
 /// Parse a raw user query into a [`QueryExpr`], or `None` when it yields no
@@ -502,6 +552,20 @@ mod tests {
         assert!(!expr.matches("great movie cam rip"));
         // Negated terms are not used for Kad lookup / spam scoring.
         assert_eq!(expr.positive_terms(), vec!["movie".to_string()]);
+    }
+
+    #[test]
+    fn without_term_strips_primary_from_and_tree() {
+        let expr = parse("matrix reloaded").unwrap();
+        let stripped = expr.without_term("matrix").unwrap();
+        assert_eq!(stripped, term("reloaded"));
+        assert!(expr.without_term("matrix").unwrap().without_term("reloaded").is_none());
+        assert!(!expr.contains_or());
+        assert!(!expr.contains_not());
+        let or_expr = parse("matrix OR reloaded").unwrap();
+        assert!(or_expr.contains_or());
+        // OR trees keep both terms when "stripping"
+        assert_eq!(or_expr.without_term("matrix"), Some(or_expr.clone()));
     }
 
     #[test]

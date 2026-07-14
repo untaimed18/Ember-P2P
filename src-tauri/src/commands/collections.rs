@@ -385,8 +385,8 @@ pub async fn download_collection_files(
             if let Err(e) = bounded_send(
                 &state.network_tx,
                 crate::network::NetworkCommand::StartDownload {
-                    file_hash: file.hash,
-                    file_name: safe_name,
+                    file_hash: file.hash.clone(),
+                    file_name: safe_name.clone(),
                     file_size: file.size,
                     peer_ip: String::new(),
                     peer_port: 0,
@@ -395,7 +395,8 @@ pub async fn download_collection_files(
                     // discovery for each.
                     extra_sources: Vec::new(),
                     transfer_id: transfer_id.clone(),
-                    control,
+                    control: control.clone(),
+                    discovery_only: false,
                 },
             )
             .await
@@ -424,6 +425,30 @@ pub async fn download_collection_files(
                     super::transfers::persist_transfer(&state, &failed).await;
                     let _ = app.emit("transfer-failed", &failed);
                 }
+            }
+        } else {
+            // Queued / add-paused: still run KAD+TCP+UDP discovery so sources
+            // are ready when the download is promoted or resumed.
+            if let Err(e) = bounded_send(
+                &state.network_tx,
+                crate::network::NetworkCommand::StartDownload {
+                    file_hash: file.hash,
+                    file_name: safe_name,
+                    file_size: file.size,
+                    peer_ip: String::new(),
+                    peer_port: 0,
+                    extra_sources: Vec::new(),
+                    transfer_id: transfer_id.clone(),
+                    control,
+                    discovery_only: true,
+                },
+            )
+            .await
+            {
+                tracing::warn!(
+                    "Failed to send discovery-only StartDownload for collection entry '{}': {e}",
+                    file.name
+                );
             }
         }
     }
