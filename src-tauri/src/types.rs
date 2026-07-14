@@ -641,11 +641,14 @@ pub struct AppSettings {
     /// Enable IP filter to block known-bad IP ranges (loads ipfilter.dat)
     #[serde(default = "default_true")]
     pub ip_filter_enabled: bool,
-    /// Apply IP filter to incoming peer connections (upload server).
-    /// Off by default: VPN IPs commonly appear in ipfilter.dat "hosting" ranges,
-    /// silently breaking connectivity for a large portion of users. Outbound
-    /// filtering still applies, and the abuse tracker / ban list protect against
-    /// misbehaving inbound peers.
+    /// Apply IP filter ranges / private blocking to incoming peer
+    /// connections (upload server). Off by default: VPN IPs commonly
+    /// appear in ipfilter.dat "hosting" ranges, silently breaking
+    /// connectivity for a large portion of users. Outbound filtering
+    /// still applies, and the abuse tracker / ban list protect against
+    /// misbehaving inbound peers. Truly-unroutable "bogus" IPs
+    /// (loopback, multicast, documentation, class-E, …) are always
+    /// rejected inbound regardless of this toggle.
     #[serde(default)]
     pub filter_incoming_connections: bool,
     /// Answer standard ed2k "View Files" requests (`OP_ASKSHAREDFILES`) from
@@ -661,7 +664,9 @@ pub struct AppSettings {
     /// matching real eMule's "deny" behavior.
     #[serde(default)]
     pub allow_shared_files_browse: bool,
-    /// Block private/reserved IPs from being added to the routing table
+    /// Block private/LAN/CGNAT IPs across KAD contact admission, outbound
+    /// dials, UDP ingest, and (when filter-incoming is on) inbound TCP.
+    /// Bogus/unroutable space is always rejected regardless of this toggle.
     #[serde(default = "default_true")]
     pub block_private_ips: bool,
     /// Also apply IP filter to ed2k servers (eMule: "Filter servers by IP")

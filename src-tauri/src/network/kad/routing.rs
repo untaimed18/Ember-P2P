@@ -1086,6 +1086,53 @@ impl RoutingTable {
         self.range_ip_filter = Some(filter);
     }
 
+    /// Hot-update the private/LAN admission flag used by
+    /// [`ip_filter::is_valid_contact_ip`]. When enabling the block, also
+    /// evict contacts that no longer pass the IP policy (and any that the
+    /// shared range snapshot now blocks).
+    pub fn set_block_private_ips(&mut self, block_private: bool) {
+        let enabling = block_private && !self.block_private_ips;
+        self.block_private_ips = block_private;
+        if enabling {
+            self.evict_filtered_contacts();
+        }
+    }
+
+    /// Drop contacts whose IP is rejected by the current private/bogus
+    /// policy or by the shared `ipfilter.dat` snapshot. Used after
+    /// filter reloads and when enabling private blocking at runtime.
+    pub fn evict_filtered_contacts(&mut self) {
+        let to_remove: Vec<KadId> = self
+            .all_contacts()
+            .filter(|c| self.contact_ip_is_filtered(c.ip))
+            .map(|c| c.id)
+            .collect();
+        if to_remove.is_empty() {
+            return;
+        }
+        let n = to_remove.len();
+        for id in to_remove {
+            self.remove(&id);
+        }
+        tracing::info!("KAD RT evicted {n} contact(s) blocked by IP filter policy");
+    }
+
+    fn contact_ip_is_filtered(&self, ip: Ipv4Addr) -> bool {
+        if !ip_filter::is_valid_contact_ip(ip, self.block_private_ips) {
+            return true;
+        }
+        if let Some(ref filter) = self.range_ip_filter {
+            match filter.read() {
+                Ok(snap) => snap.is_blocked(ip),
+                // Don't mass-evict on a poisoned lock — insert path already
+                // fails closed for new contacts.
+                Err(_) => false,
+            }
+        } else {
+            false
+        }
+    }
+
     pub fn has_contact_ip(&self, ip: Ipv4Addr) -> bool {
         self.global_ip_count.get(&ip).copied().unwrap_or(0) > 0
     }
@@ -1760,6 +1807,38 @@ mod find_closest_tests {
         assert!(
             closest.iter().any(|c| c.id == unverified.id),
             "cold start may seed from unverified contacts"
+        );
+    }
+
+    #[test]
+    fn set_block_private_ips_evicts_existing_lan_contacts() {
+        let mut rt = RoutingTable::new(KadId([0xFF; 16]), false);
+        let now = chrono::Utc::now().timestamp();
+        let mut lan = contact(0x10, 10);
+        lan.ip = Ipv4Addr::new(192, 168, 1, 10);
+        lan.created_at = now;
+        lan.last_seen = now;
+        assert!(
+            rt.insert(lan.clone()),
+            "LAN contact must insert while block_private is off"
+        );
+        assert!(rt.get_contact(&lan.id).is_some());
+
+        let public = contact(0x11, 11);
+        assert!(rt.insert(public.clone()));
+
+        rt.set_block_private_ips(true);
+        assert!(
+            rt.get_contact(&lan.id).is_none(),
+            "enabling block_private must evict LAN contacts"
+        );
+        assert!(
+            rt.get_contact(&public.id).is_some(),
+            "public contacts must survive private-block enable"
+        );
+        assert!(
+            !rt.insert(lan),
+            "LAN contact must be rejected after block_private is on"
         );
     }
 }
