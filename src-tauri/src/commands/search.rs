@@ -730,14 +730,9 @@ pub async fn mark_not_spam(
     Ok(())
 }
 
-/// Serialize happened under the lock; write + `mark_saved` run in the background.
-/// Saves are gated so concurrent mark_spam / mark_not_spam calls cannot write
-/// out of order and leave a stale snapshot on disk with `dirty == false`.
-fn spam_save_gate() -> &'static tokio::sync::Mutex<()> {
-    static GATE: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-    GATE.get_or_init(|| tokio::sync::Mutex::new(()))
-}
-
+/// Persist off the IPC path so the UI isn't parked on disk I/O. Writers share
+/// [`SpamFilter::save_gate`] with the network-loop flush so concurrent marks
+/// cannot leave a stale snapshot on disk.
 fn spawn_spam_filter_save(
     spam_filter: std::sync::Arc<tokio::sync::RwLock<SpamFilter>>,
     save_data: Option<(String, std::path::PathBuf, u64)>,
@@ -746,33 +741,8 @@ fn spawn_spam_filter_save(
         return;
     }
     tokio::spawn(async move {
-        let _guard = spam_save_gate().lock().await;
-        // Drain under the gate: re-snapshot each iteration so concurrent marks
-        // collapse into the latest on-disk state instead of racing.
-        loop {
-            let Some((data, path, gen)) = ({
-                let mut spam = spam_filter.write().await;
-                spam.take_save_data()
-            }) else {
-                break;
-            };
-            let write_result = tokio::task::spawn_blocking(move || {
-                crate::security::atomic_write(&path, data.as_bytes(), false)
-            })
-            .await;
-            match write_result {
-                Ok(Ok(())) => {
-                    spam_filter.write().await.mark_saved(gen);
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!("Failed to save spam filter: {e}");
-                    break;
-                }
-                Err(e) => {
-                    tracing::warn!("Spam filter save task failed: {e}");
-                    break;
-                }
-            }
+        if let Err(e) = SpamFilter::drain_saves(&spam_filter).await {
+            tracing::warn!("Failed to save spam filter: {e}");
         }
     });
 }

@@ -55,6 +55,9 @@
   let historyFetchedHashes = new Set<string>();
   let historyPendingHashes = new Set<string>();
   let historyFetchTimer: ReturnType<typeof setTimeout> | null = null;
+  // Per-hash sequence for optimistic mark/unmark so out-of-order IPC
+  // completions cannot desync the UI from the latest user action.
+  const spamToggleGen = new Map<string, number>();
   // Per-hash "last applied generation". `getDownloadHistory` IPC
   // round-trips can resolve out of order (cold DB vs warm cache),
   // and the previous merge happily let an older batch overwrite a
@@ -1450,34 +1453,47 @@
     const keywords = (activeTab?.query ?? '').split(/\s+/).filter(w => w.length > 0);
     const prevSpam = result.is_spam;
     const prevRating = result.spam_rating ?? 0;
+    const hash = result.file.hash;
+    const gen = (spamToggleGen.get(hash) ?? 0) + 1;
+    spamToggleGen.set(hash, gen);
     // Close the menu first so the dismiss paints before filter/sort work.
     // Persist in the background; waiting on IPC (incl. disk) used to freeze the UI.
     contextMenu = null;
     await new Promise<void>((r) => requestAnimationFrame(() => r()));
-    patchSpamFlagByHash(result.file.hash, true, spamThreshold);
+    patchSpamFlagByHash(hash, true, spamThreshold);
     clearSpamExplainForResult(result);
     try {
-      await markSpam(result.file.hash, result.file.name, result.file.size, result.source_addresses, keywords);
+      await markSpam(hash, result.file.name, result.file.size, result.source_addresses, keywords);
+      // A newer mark/unmark superseded this request — leave its optimistic state.
+      if (spamToggleGen.get(hash) !== gen) return;
     } catch (e) {
       console.error('Failed to mark spam:', e);
-      patchSpamFlagByHash(result.file.hash, prevSpam, prevRating);
-      addToast('error', m.search_failed_mark_spam());
+      if (spamToggleGen.get(hash) === gen) {
+        patchSpamFlagByHash(hash, prevSpam, prevRating);
+        addToast('error', m.search_failed_mark_spam());
+      }
     }
   }
 
   async function handleMarkNotSpam(result: SearchResult) {
     const prevSpam = result.is_spam;
     const prevRating = result.spam_rating ?? 0;
+    const hash = result.file.hash;
+    const gen = (spamToggleGen.get(hash) ?? 0) + 1;
+    spamToggleGen.set(hash, gen);
     contextMenu = null;
     await new Promise<void>((r) => requestAnimationFrame(() => r()));
-    patchSpamFlagByHash(result.file.hash, false, 0);
+    patchSpamFlagByHash(hash, false, 0);
     clearSpamExplainForResult(result);
     try {
-      await markNotSpam(result.file.hash);
+      await markNotSpam(hash);
+      if (spamToggleGen.get(hash) !== gen) return;
     } catch (e) {
       console.error('Failed to unmark spam:', e);
-      patchSpamFlagByHash(result.file.hash, prevSpam, prevRating);
-      addToast('error', m.search_failed_unmark_spam());
+      if (spamToggleGen.get(hash) === gen) {
+        patchSpamFlagByHash(hash, prevSpam, prevRating);
+        addToast('error', m.search_failed_unmark_spam());
+      }
     }
   }
 

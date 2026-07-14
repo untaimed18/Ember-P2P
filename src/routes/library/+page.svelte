@@ -344,6 +344,8 @@
   // `force` to bypass it (e.g. right after removing missing entries).
   let lastMissingScanAt = 0;
   const MISSING_SCAN_MIN_INTERVAL_MS = 30_000;
+  // Suppress repeat toasts while missing scans keep failing under hashing refresh.
+  let missingScanFailToasted = false;
   // A persisted "missing only" filter is applied lazily: enabling it before
   // the first missing-file scan completes would filter against an empty set
   // and blank the whole library. Set from localStorage, consumed by the
@@ -362,6 +364,7 @@
       missingScanTruncated = result.truncated;
       missingTotalCount = result.totalMissing;
       missingScanDone = true;
+      missingScanFailToasted = false;
       // Apply a deferred persisted "missing only" filter now that we know
       // whether any files are actually missing — only enable it if so.
       if (pendingRestoreMissingOnly) {
@@ -372,8 +375,12 @@
         showMissingOnly = false;
       }
     } catch {
-      // Non-fatal: leave previous set in place, but surface the failure.
-      if (mounted) toastWarning(m.library_missing_scan_failed());
+      // Non-fatal: leave previous set in place. Toast once until a scan
+      // succeeds again so hashing-driven refresh() doesn't spam warnings.
+      if (mounted && !missingScanFailToasted) {
+        missingScanFailToasted = true;
+        toastWarning(m.library_missing_scan_failed());
+      }
     } finally {
       if (mounted) missingScanInFlight = false;
     }

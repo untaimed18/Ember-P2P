@@ -128,14 +128,12 @@
             // `links` was already atomically dequeued from the backend
             // buffer by the `takePendingDeepLinks()` call above, so if
             // `destroyed` flips mid-batch (unmount during a locale-change
-            // reload, dev HMR) there is no way to hand these back — bailing
-            // out here would lose them for good. Finish applying every
-            // link already in hand (queue the download, connect the
-            // server, ...); `handlePayload`'s own `destroyed` checks still
-            // skip the toast/goto follow-up for a torn-down component. Only
-            // stop pulling *further* batches once torn down.
+            // reload, dev HMR) there is no way to hand these back — finish
+            // applying every link already in hand (queue the download,
+            // connect the server, ...). `handlePayload`'s own `destroyed`
+            // checks still skip the toast/goto follow-up for a torn-down
+            // component. Only stop pulling *further* batches once torn down.
             await handlePayload(link);
-            if (destroyed) return;
           }
           if (destroyed) break;
           links = await takePendingDeepLinks();
@@ -149,6 +147,9 @@
   }
 
   onMount(() => {
+    // Remount (wizard dismiss / locale reload) must clear the previous
+    // instance's teardown latch so new deep links are processed again.
+    destroyed = false;
     let mounted = true;
     let unlisten: UnlistenFn | null = null;
 

@@ -528,6 +528,46 @@ impl SpamFilter {
         }
     }
 
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Serialize background spam-filter saves across IPC and the network loop
+    /// so concurrent `atomic_write`s cannot leave a stale snapshot on disk.
+    pub fn save_gate() -> &'static tokio::sync::Mutex<()> {
+        static GATE: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        GATE.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    /// Drain dirty spam-filter snapshots to disk under [`Self::save_gate`].
+    /// Safe to call from multiple tasks; writers serialize on the gate.
+    pub async fn drain_saves(
+        spam_filter: &std::sync::Arc<tokio::sync::RwLock<Self>>,
+    ) -> Result<(), String> {
+        let _guard = Self::save_gate().lock().await;
+        loop {
+            let Some((data, path, gen)) = ({
+                let mut spam = spam_filter.write().await;
+                spam.take_save_data()
+            }) else {
+                return Ok(());
+            };
+            let write_result = tokio::task::spawn_blocking(move || {
+                crate::security::atomic_write(&path, data.as_bytes(), false)
+            })
+            .await
+            .map_err(|e| format!("spam filter save task failed: {e}"))?;
+            match write_result {
+                Ok(()) => {
+                    spam_filter.write().await.mark_saved(gen);
+                }
+                Err(e) => {
+                    return Err(e.to_string());
+                }
+            }
+        }
+    }
+
     pub fn stats(&self) -> SpamStats {
         SpamStats {
             spam_hashes: self.db.spam_hashes.len(),

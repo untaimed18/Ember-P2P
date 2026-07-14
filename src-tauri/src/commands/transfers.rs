@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use tauri::Emitter;
@@ -546,6 +546,7 @@ pub async fn cancel_transfers_batch(
     check_batch_size(&transfer_ids)?;
     let mut promoted_by_id: HashMap<String, Transfer> = HashMap::new();
     let mut pending_acks = Vec::with_capacity(transfer_ids.len());
+    let mut cancelled_ids = Vec::with_capacity(transfer_ids.len());
     let mut teardown_failures = 0usize;
     for transfer_id in transfer_ids {
         let (promoted, cancelled_info) = {
@@ -568,6 +569,7 @@ pub async fn cancel_transfers_batch(
         for p in promoted {
             promoted_by_id.entry(p.id.clone()).or_insert(p);
         }
+        cancelled_ids.push(transfer_id.clone());
 
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         if let Err(e) = state.network_tx.try_send(NetworkCommand::CancelDownload {
@@ -575,7 +577,7 @@ pub async fn cancel_transfers_batch(
             cleanup_ack: Some(ack_tx),
         }) {
             tracing::warn!(
-                "cancel_transfers_batch: network task unavailable for {transfer_id}; retaining partial and DB row without teardown ack ({e})"
+                "cancel_transfers_batch: network task unavailable for {transfer_id}; proceeding with best-effort cleanup ({e})"
             );
             teardown_failures += 1;
         } else {
@@ -583,9 +585,9 @@ pub async fn cancel_transfers_batch(
         }
     }
 
-    // Every timeout starts concurrently, preserving one global wall-clock
-    // deadline while still retaining the identities of acks that arrived
-    // before other items timed out.
+    // Wait for teardown acks concurrently (same wall-clock deadline as single cancel),
+    // then always remove DB rows — matching `cancel_transfer`. Retaining rows on
+    // ack timeout caused cancelled downloads to resurrect on the next launch.
     let results = futures::future::join_all(pending_acks.into_iter().map(
         |(transfer_id, ack_rx)| async move {
             (
@@ -595,38 +597,37 @@ pub async fn cancel_transfers_batch(
         },
     ))
     .await;
-    let mut cleanup_ids = HashSet::new();
     for (transfer_id, result) in results {
         match result {
-            Ok(Ok(())) => {
-                cleanup_ids.insert(transfer_id);
-            }
+            Ok(Ok(())) => {}
             Ok(Err(_)) => {
                 teardown_failures += 1;
                 tracing::warn!(
-                    "cancel_transfers_batch: cleanup ack channel closed for {transfer_id}; retaining partial and DB row"
+                    "cancel_transfers_batch: cleanup ack channel closed for {transfer_id}; proceeding with best-effort cleanup"
                 );
             }
             Err(_) => {
                 teardown_failures += 1;
                 tracing::warn!(
-                    "cancel_transfers_batch: cleanup ack timed out for {transfer_id}; retaining partial and DB row"
+                    "cancel_transfers_batch: cleanup ack timed out for {transfer_id}; proceeding with best-effort cleanup"
                 );
             }
         }
     }
 
-    for transfer_id in cleanup_ids {
-        let dl_folder = {
-            let config = state.config.read().await;
-            config.settings.download_folder.clone()
-        };
+    let dl_folder = {
+        let config = state.config.read().await;
+        config.settings.download_folder.clone()
+    };
+    for transfer_id in cancelled_ids {
         cleanup_partial_files(&dl_folder, &transfer_id).await;
         {
             let db = state.db.clone();
             let tid = transfer_id.clone();
             db_blocking(move || {
-                let _ = db.remove_transfer(&tid);
+                if let Err(e) = db.remove_transfer(&tid) {
+                    tracing::warn!("Failed to remove transfer {tid} from database: {e}");
+                }
             })
             .await;
         }
@@ -635,7 +636,7 @@ pub async fn cancel_transfers_batch(
     start_promoted_downloads(&state, &promoted).await;
     if teardown_failures > 0 {
         tracing::warn!(
-            "cancel_transfers_batch: {teardown_failures} teardown ack failure(s); partials retained where cleanup was not acknowledged"
+            "cancel_transfers_batch: {teardown_failures} teardown ack failure(s); DB rows still removed to prevent resurrect-on-restart"
         );
     }
     Ok(())
@@ -1346,7 +1347,12 @@ pub async fn resume_all_transfers(
             .queue
             .iter()
             .filter(|t| {
-                t.status == TransferStatus::Paused || t.status == TransferStatus::Insufficient
+                matches!(
+                    t.status,
+                    TransferStatus::Paused
+                        | TransferStatus::Stopped
+                        | TransferStatus::Insufficient
+                )
             })
             .map(|t| t.id.clone())
             .collect();

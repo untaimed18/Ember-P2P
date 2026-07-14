@@ -914,6 +914,13 @@ pub enum ServerEvent {
         file_hash: [u8; 16],
         sources: Vec<ServerSource>,
     },
+    /// Mid-session `OP_IDCHANGE` — server reassigned our client ID (e.g. after
+    /// a successful port-forward retest promotes LowID → HighID).
+    IdChange {
+        client_id: u32,
+        server_flags: u32,
+        server_reported_ip: u32,
+    },
 }
 
 fn parse_server_event(opcode: u8, payload: &[u8]) -> Vec<ServerEvent> {
@@ -993,6 +1000,33 @@ fn parse_server_event(opcode: u8, payload: &[u8]) -> Vec<ServerEvent> {
                 Err(e) => {
                     debug!("Failed to parse found sources: {e}");
                 }
+            }
+        }
+        OP_IDCHANGE => {
+            if payload.len() >= 4 {
+                let client_id =
+                    u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                let server_flags = if payload.len() >= 8 {
+                    u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]])
+                } else {
+                    0
+                };
+                let server_reported_ip = if payload.len() >= 16 {
+                    let reported =
+                        u32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]);
+                    if reported >= LOWID_THRESHOLD {
+                        reported
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
+                events.push(ServerEvent::IdChange {
+                    client_id,
+                    server_flags,
+                    server_reported_ip,
+                });
             }
         }
         _ => {
