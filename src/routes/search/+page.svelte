@@ -15,6 +15,7 @@
     newSearchNonce,
     openSearchTab,
     patchSearchTabByRequestId,
+    patchSpamFlagByHash,
     attachRetryRequestId,
     clearRetryRequestId,
     searchTabs,
@@ -574,6 +575,10 @@
       historyFetchedHashes.clear();
       historyPendingHashes.clear();
       historyHashGen.clear();
+      // Re-queue visible hashes — clearing the cache alone does not re-run the
+      // searchResultsList effect, so badges would stay blank until results change.
+      const hashes = searchResultsList.map((r) => r.file.hash);
+      if (hashes.length > 0) queueHistoryFetch(hashes);
     }).then((u) => {
       unlistenHistory = u;
     }).catch(() => {});
@@ -1436,49 +1441,46 @@
     contextMenu = null;
   }
 
+  function clearSpamExplainForResult(result: SearchResult) {
+    const key = resultKey(result);
+    delete spamExplainCache[key];
+    delete spamExplainErrors[key];
+    spamExplainPending[key] = false;
+  }
+
   async function handleMarkSpam(result: SearchResult) {
     const keywords = (activeTab?.query ?? '').split(/\s+/).filter(w => w.length > 0);
+    const prevSpam = result.is_spam;
+    const prevRating = result.spam_rating ?? 0;
+    // Close the menu first so the dismiss paints before filter/sort work.
+    // Persist in the background; waiting on IPC (incl. disk) used to freeze the UI.
+    contextMenu = null;
+    await new Promise<void>((r) => requestAnimationFrame(() => r()));
+    patchSpamFlagByHash(result.file.hash, true, spamThreshold);
+    clearSpamExplainForResult(result);
     try {
       await markSpam(result.file.hash, result.file.name, result.file.size, result.source_addresses, keywords);
-      searchTabs.update((tabs) =>
-        tabs.map((t) => ({
-          ...t,
-          results: t.results.map((r) =>
-            r.file.hash === result.file.hash ? { ...r, is_spam: true, spam_rating: spamThreshold } : r
-          ),
-        }))
-      );
-      const key = resultKey(result);
-      delete spamExplainCache[key];
-      delete spamExplainErrors[key];
-      spamExplainPending[key] = false;
     } catch (e) {
       console.error('Failed to mark spam:', e);
+      patchSpamFlagByHash(result.file.hash, prevSpam, prevRating);
       addToast('error', m.search_failed_mark_spam());
     }
-    contextMenu = null;
   }
 
   async function handleMarkNotSpam(result: SearchResult) {
+    const prevSpam = result.is_spam;
+    const prevRating = result.spam_rating ?? 0;
+    contextMenu = null;
+    await new Promise<void>((r) => requestAnimationFrame(() => r()));
+    patchSpamFlagByHash(result.file.hash, false, 0);
+    clearSpamExplainForResult(result);
     try {
       await markNotSpam(result.file.hash);
-      searchTabs.update((tabs) =>
-        tabs.map((t) => ({
-          ...t,
-          results: t.results.map((r) =>
-            r.file.hash === result.file.hash ? { ...r, is_spam: false, spam_rating: 0 } : r
-          ),
-        }))
-      );
-      const key = resultKey(result);
-      delete spamExplainCache[key];
-      delete spamExplainErrors[key];
-      spamExplainPending[key] = false;
     } catch (e) {
       console.error('Failed to unmark spam:', e);
+      patchSpamFlagByHash(result.file.hash, prevSpam, prevRating);
       addToast('error', m.search_failed_unmark_spam());
     }
-    contextMenu = null;
   }
 
   /** Per-row delete from download history. Complements the batch-clear
@@ -1509,6 +1511,12 @@
       addToast('error', m.search_failed_remove_history());
     }
     contextMenu = null;
+  }
+
+  function historyStatusLabel(status: string | undefined): string {
+    if (status === 'completed') return m.search_history_downloaded();
+    if (status === 'cancelled') return m.search_history_cancelled();
+    return status ?? '';
   }
 
   function requestClearResults() {
@@ -2398,9 +2406,9 @@
           <button
             role="menuitem"
             onclick={() => { if (contextMenu) handleRemoveFromHistory(contextMenu.result); }}
-            title={m.search_remove_from_history_title({ status: downloadHistoryMap[contextMenu.result.file.hash] })}
+            title={m.search_remove_from_history_title({ status: historyStatusLabel(downloadHistoryMap[contextMenu.result.file.hash]) })}
           >
-            {m.search_remove_from_history({ status: downloadHistoryMap[contextMenu.result.file.hash] })}
+            {m.search_remove_from_history({ status: historyStatusLabel(downloadHistoryMap[contextMenu.result.file.hash]) })}
           </button>
         {/if}
       </div>

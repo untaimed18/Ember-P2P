@@ -6,15 +6,17 @@
   import { formatBytes, formatSpeed } from '$lib/utils';
   import * as m from '$lib/paraglide/messages';
 
-  // Count of files the user is actively sharing (the `shared` flag is set),
-  // which is intentionally distinct from the total number of files in the
-  // Library — unshared files are indexed but not counted here.
+  // Count / total size of files the user is actively sharing (the `shared`
+  // flag is set), which is intentionally distinct from the total number of
+  // files in the Library — unshared files are indexed but not counted here.
   let sharedCount = $state(0);
+  let sharedBytes = $state(0);
 
-  function sharedTitle(count: number): string {
+  function sharedTitle(count: number, bytes: number): string {
+    const size = formatBytes(bytes);
     return count === 1
-      ? m.statusbar_shared_title_one()
-      : m.statusbar_shared_title_other({ count: count.toLocaleString() });
+      ? m.statusbar_shared_title_one({ size })
+      : m.statusbar_shared_title_other({ count: count.toLocaleString(), size });
   }
 
   onMount(() => {
@@ -22,8 +24,11 @@
 
     async function refreshSharedCount() {
       try {
-        const count = await getSharedFileCount();
-        if (active) sharedCount = count;
+        const stats = await getSharedFileCount();
+        if (active) {
+          sharedCount = stats.count;
+          sharedBytes = stats.total_bytes;
+        }
       } catch {
         // Backend not ready / transient IPC failure — the next
         // shared-files-changed event (or remount) will reconcile.
@@ -99,9 +104,10 @@
       {m.statusbar_epx_label()}
       <span class="dot {epxStatus($networkStats)}" aria-label={epxStatus($networkStats)}></span>
     </span>
-    <span class="status-label" title={sharedTitle(sharedCount)}>
+    <span class="status-label" title={sharedTitle(sharedCount, sharedBytes)}>
       {m.statusbar_shared_label()}
       <span class="shared-count">{sharedCount.toLocaleString()}</span>
+      <span class="shared-size">({formatBytes(sharedBytes)})</span>
     </span>
   </div>
 
@@ -163,9 +169,14 @@
     flex-shrink: 0;
   }
 
-  .shared-count {
+  .shared-count,
+  .shared-size {
     color: var(--text-primary);
     font-variant-numeric: tabular-nums;
+  }
+
+  .shared-size {
+    color: var(--text-muted);
   }
 
   .dot.connected {

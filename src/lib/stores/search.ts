@@ -134,6 +134,28 @@ export function patchSearchTabByRequestId(requestId: number, fn: (tab: SearchTab
 }
 
 /**
+ * Patch `is_spam` / `spam_rating` for a file hash across all tabs.
+ * Only reallocates tabs/results that actually contain a match.
+ */
+export function patchSpamFlagByHash(fileHash: string, isSpam: boolean, spamRating: number) {
+  if (!fileHash) return;
+  searchTabs.update((tabs) => {
+    let anyChanged = false;
+    const next = tabs.map((tab) => {
+      const idx = tab.results.findIndex((r) => r.file.hash === fileHash);
+      if (idx === -1) return tab;
+      const current = tab.results[idx];
+      if (current.is_spam === isSpam && current.spam_rating === spamRating) return tab;
+      anyChanged = true;
+      const results = tab.results.slice();
+      results[idx] = { ...current, is_spam: isSpam, spam_rating: spamRating };
+      return { ...tab, results };
+    });
+    return anyChanged ? next : tabs;
+  });
+}
+
+/**
  * Attach a secondary request id (e.g. from a retry) to an existing tab so
  * incoming search-result/progress/complete events for that id merge into it.
  */

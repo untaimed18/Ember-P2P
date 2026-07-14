@@ -50,6 +50,7 @@
   let {
     sortedFiles,
     selectedPath,
+    contextPath = null,
     onSelectPath,
     onOpenFile,
     onRowContextMenu,
@@ -69,6 +70,8 @@
   }: {
     sortedFiles: FileInfo[];
     selectedPath: string | null;
+    /** Row under an open context menu (highlight without opening properties). */
+    contextPath?: string | null;
     onSelectPath: (path: string) => void;
     onOpenFile: (path: string) => void;
     onRowContextMenu: (e: MouseEvent, file: FileInfo) => void;
@@ -536,7 +539,7 @@
     </thead>
   </table>
 </div>
-<div class="vtable-scroll scroll-shadows" bind:this={scrollContainer} use:passiveScroll={onTableScroll}>
+<div class="vtable-scroll scroll-shadows" bind:this={scrollContainer} use:passiveScroll={onTableScroll} title={m.library_table_hint()}>
   <div class="vtable-spacer" style="height:{sortedFiles.length * ROW_HEIGHT}px;">
     <table class="lib-table vtable-body" style="transform:translateY({virtualSlice.topPad}px);min-width:{tableMinWidth}px;">
       <colgroup>
@@ -550,6 +553,7 @@
           <tr
             class:row-alt={((virtualSlice.startIdx + i) & 1) === 1}
             class:selected={selectedPath === file.path}
+            class:ctx-target={contextPath === file.path && selectedPath !== file.path}
             class:row-missing={missingPaths.has(file.path)}
             onclick={() => onSelectPath(file.path)}
             ondblclick={() => onOpenFile(file.path)}
@@ -797,6 +801,10 @@
     background: color-mix(in srgb, var(--accent-dim) 55%, transparent);
     color: var(--text-primary);
     border-bottom-color: color-mix(in srgb, var(--accent) 30%, var(--border));
+  }
+  .lib-table tbody tr.ctx-target td {
+    background: color-mix(in srgb, var(--accent-dim) 35%, transparent);
+    border-bottom-color: color-mix(in srgb, var(--accent) 22%, var(--border));
   }
 
   .col-check {

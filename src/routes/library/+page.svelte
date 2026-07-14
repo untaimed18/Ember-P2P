@@ -336,7 +336,8 @@
   let missingPathSet: Set<string> = $state(new Set());
   let missingScanTruncated = $state(false);
   let missingTotalCount = $state(0);
-  let missingScanInFlight = false;
+  let missingScanInFlight = $state(false);
+  let missingScanDone = $state(false);
   // `scanMissingFiles` stats every shared file on disk, so it must not run on
   // every data refresh — and `refresh()` itself fires every 3s while hashing.
   // Throttle background scans to once per interval; user-initiated paths pass
@@ -360,6 +361,7 @@
       missingPathSet = new Set(result.paths);
       missingScanTruncated = result.truncated;
       missingTotalCount = result.totalMissing;
+      missingScanDone = true;
       // Apply a deferred persisted "missing only" filter now that we know
       // whether any files are actually missing — only enable it if so.
       if (pendingRestoreMissingOnly) {
@@ -370,7 +372,8 @@
         showMissingOnly = false;
       }
     } catch {
-      // Non-fatal: leave previous set in place.
+      // Non-fatal: leave previous set in place, but surface the failure.
+      if (mounted) toastWarning(m.library_missing_scan_failed());
     } finally {
       if (mounted) missingScanInFlight = false;
     }
@@ -390,6 +393,29 @@
       missingScanTruncated = false;
       missingTotalCount = 0;
       showMissingOnly = false;
+      await refresh();
+    } catch (e: unknown) {
+      toastError(toErr(e));
+    }
+  }
+
+  async function handleRemoveSelectedMissing() {
+    const f = selectedFile;
+    if (!f || !missingPathSet.has(f.path)) return;
+    try {
+      const confirmed = await askConfirm(
+        m.library_confirm_remove_missing_one(),
+        m.library_remove_missing_title(),
+      );
+      if (!confirmed) return;
+      const removed = await removeMissingFiles([f.path]);
+      toastSuccess(removed === 1 ? m.library_removed_missing_one() : m.library_removed_missing_other({ count: removed }));
+      const next = new Set(missingPathSet);
+      next.delete(f.path);
+      missingPathSet = next;
+      missingTotalCount = Math.max(0, missingTotalCount - 1);
+      if (selectedPath === f.path) selectedPath = null;
+      if (showMissingOnly && missingPathSet.size === 0) showMissingOnly = false;
       await refresh();
     } catch (e: unknown) {
       toastError(toErr(e));
@@ -801,6 +827,21 @@
     for (const f of sortedFiles) if (checkedPaths.has(f.path)) n++;
     return n;
   });
+  let checkedHashedCount = $derived.by(() => {
+    let n = 0;
+    for (const f of sortedFiles) if (checkedPaths.has(f.path) && f.hash) n++;
+    return n;
+  });
+  let checkedShareCount = $derived.by(() => {
+    let n = 0;
+    for (const f of sortedFiles) if (checkedPaths.has(f.path) && f.hash && !f.shared) n++;
+    return n;
+  });
+  let checkedUnshareCount = $derived.by(() => {
+    let n = 0;
+    for (const f of sortedFiles) if (checkedPaths.has(f.path) && f.hash && f.shared) n++;
+    return n;
+  });
   // Selections persist across filter changes, but bulk actions only operate on
   // rows currently in `sortedFiles` (see getCheckedFiles). Count how many
   // checked files exist in the library yet are hidden by the active filter so
@@ -869,8 +910,12 @@
 
   async function bulkSetPriority(priority: FileInfo['priority']) {
     if (bulkBusy) return;
-    const targets = getCheckedFiles().filter(f => !!f.hash);
-    if (targets.length === 0) return;
+    const checked = getCheckedFiles();
+    const targets = checked.filter(f => !!f.hash);
+    if (targets.length === 0) {
+      toastWarning(checked.some(f => !f.hash) ? m.library_selection_still_hashing() : m.library_no_hashed_in_selection());
+      return;
+    }
     bulkBusy = true;
     try {
       const count = await batchSetPriority(targets.map(f => f.path), priority);
@@ -884,8 +929,14 @@
 
   async function bulkShare() {
     if (bulkBusy) return;
-    const targets = getCheckedFiles().filter(f => !!f.hash && !f.shared);
-    if (targets.length === 0) return;
+    const checked = getCheckedFiles();
+    const targets = checked.filter(f => !!f.hash && !f.shared);
+    if (targets.length === 0) {
+      if (checked.some(f => !f.hash)) toastWarning(m.library_selection_still_hashing());
+      else if (checked.length > 0) toastWarning(m.library_selection_already_shared());
+      else toastWarning(m.library_no_hashed_in_selection());
+      return;
+    }
     bulkBusy = true;
     try {
       const count = await batchShare(targets.map(f => f.path));
@@ -897,8 +948,14 @@
 
   async function bulkUnshare() {
     if (bulkBusy) return;
-    const targets = getCheckedFiles().filter(f => !!f.hash && f.shared);
-    if (targets.length === 0) return;
+    const checked = getCheckedFiles();
+    const targets = checked.filter(f => !!f.hash && f.shared);
+    if (targets.length === 0) {
+      if (checked.some(f => !f.hash)) toastWarning(m.library_selection_still_hashing());
+      else if (checked.length > 0) toastWarning(m.library_selection_none_shared());
+      else toastWarning(m.library_no_hashed_in_selection());
+      return;
+    }
     bulkBusy = true;
     try {
       const count = await batchUnshare(targets.map(f => f.path));
@@ -949,8 +1006,12 @@
   }
 
   async function bulkCopyLinks() {
-    const targets = getCheckedFiles().filter(f => !!f.hash);
-    if (targets.length === 0) return;
+    const checked = getCheckedFiles();
+    const targets = checked.filter(f => !!f.hash);
+    if (targets.length === 0) {
+      toastWarning(checked.some(f => !f.hash) ? m.library_selection_still_hashing() : m.library_no_hashed_in_selection());
+      return;
+    }
     try {
       const links = await Promise.all(targets.map(f => formatEd2kLink(f.name, f.size, f.hash)));
       await navigator.clipboard.writeText(links.join('\n'));
@@ -1067,7 +1128,7 @@
   let activeFolderLabel = $derived(folderDisplayName(filterFolder));
 
   // --- Top Uploads (popularity panel) ---
-  let topPanelOpen = $state(true);
+  let topPanelOpen = $state(false);
   let topPanelMetric: 'bytes' | 'requests' = $state('bytes');
   let topPanelScope: 'session' | 'alltime' = $state('alltime');
   const TOP_PANEL_SIZE = 10;
@@ -1086,9 +1147,22 @@
       .slice(0, TOP_PANEL_SIZE);
   });
   let topMaxValue = $derived(topFiles.length === 0 ? 0 : topValueFor(topFiles[0]));
-  function selectAndRevealFile(path: string) {
+  async function selectAndRevealFile(path: string) {
     selectedPath = path;
-    clearLibraryFilters();
+    const visibleIdx = sortedFiles.findIndex((f) => f.path === path);
+    if (visibleIdx >= 0) {
+      await tick();
+      libraryTableRef?.scrollRowIntoView(visibleIdx);
+      return;
+    }
+    // Hidden by the active filters — clear them so the file can be shown.
+    if (hasActiveLibraryFilters) {
+      clearLibraryFilters();
+      toastWarning(m.library_cleared_filters_to_reveal());
+      await tick();
+      const idx = sortedFiles.findIndex((f) => f.path === path);
+      if (idx >= 0) libraryTableRef?.scrollRowIntoView(idx);
+    }
   }
 
   // --- File type display ---
@@ -1344,8 +1418,9 @@
     e.preventDefault();
     ctxPrioritySub = false;
     ctxCopySub = false;
+    // Highlight the target row without opening the properties drawer
+    // (drawer stays tied to left-click / Properties menu item).
     ctxMenu = { x: e.clientX, y: e.clientY, file: f };
-    selectedPath = f.path;
     void positionCtxMenu();
   }
   function closeCtx() {
@@ -1381,23 +1456,42 @@
   }
 
   async function copyLinkForSelection() {
-    const targets = checkedCount > 0
-      ? getCheckedFiles().filter(f => !!f.hash)
-      : (selectedFile && selectedFile.hash ? [selectedFile] : []);
-    if (targets.length === 0) return;
+    if (checkedCount > 0) {
+      const checked = getCheckedFiles();
+      const targets = checked.filter(f => !!f.hash);
+      if (targets.length === 0) {
+        toastWarning(checked.some(f => !f.hash) ? m.library_selection_still_hashing() : m.library_no_hashed_in_selection());
+        return;
+      }
+      try {
+        const links = await Promise.all(targets.map(f => formatEd2kLink(f.name, f.size, f.hash)));
+        await navigator.clipboard.writeText(links.join('\n'));
+        const unsharedCount = targets.filter(f => !f.shared).length;
+        if (unsharedCount > 0) {
+          toastWarning(m.library_copied_with_unshared({
+            links: links.length,
+            link_label: links.length === 1 ? m.library_link_singular() : m.library_link_plural(),
+            unshared: unsharedCount,
+            unshared_label: unsharedCount === 1 ? m.library_file_is_unshared() : m.library_files_are_unshared(),
+          }));
+        } else {
+          toastSuccess(links.length === 1 ? m.library_copied_link_one() : m.library_copied_links_other({ count: links.length }));
+        }
+      } catch (e: unknown) { error = toErr(e); }
+      return;
+    }
+    if (selectedFile && !selectedFile.hash) {
+      toastWarning(m.library_selection_still_hashing());
+      return;
+    }
+    if (!selectedFile?.hash) return;
     try {
-      const links = await Promise.all(targets.map(f => formatEd2kLink(f.name, f.size, f.hash)));
-      await navigator.clipboard.writeText(links.join('\n'));
-      const unsharedCount = targets.filter(f => !f.shared).length;
-      if (unsharedCount > 0) {
-        toastWarning(m.library_copied_with_unshared({
-          links: links.length,
-          link_label: links.length === 1 ? m.library_link_singular() : m.library_link_plural(),
-          unshared: unsharedCount,
-          unshared_label: unsharedCount === 1 ? m.library_file_is_unshared() : m.library_files_are_unshared(),
-        }));
+      const links = [await formatEd2kLink(selectedFile.name, selectedFile.size, selectedFile.hash)];
+      await navigator.clipboard.writeText(links[0]);
+      if (!selectedFile.shared) {
+        toastWarning(m.library_copied_link_unshared_single());
       } else {
-        toastSuccess(links.length === 1 ? m.library_copied_link_one() : m.library_copied_links_other({ count: links.length }));
+        toastSuccess(m.library_copied_link_one());
       }
     } catch (e: unknown) { error = toErr(e); }
   }
@@ -1458,8 +1552,9 @@
 
     // Ctrl/Cmd+C copies links for the current check selection or selected row.
     if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && (e.key === 'c' || e.key === 'C')) {
-      const hasTargets = checkedCount > 0 || (selectedFile && !!selectedFile.hash);
-      if (!hasTargets) return;
+      const hasChecked = checkedCount > 0;
+      const hasSelected = !!selectedFile;
+      if (!hasChecked && !hasSelected) return;
       e.preventDefault();
       void copyLinkForSelection();
       return;
@@ -1543,6 +1638,9 @@
     closeCtx();
     try {
       switch (action) {
+        case 'properties':
+          selectedPath = f.path;
+          break;
         case 'open_file': await openSharedFile(f.path); break;
         case 'open_folder': await openSharedFolder(f.path); break;
         case 'delete': {
@@ -1557,7 +1655,13 @@
           await refresh();
           break;
         }
-        case 'priority': if (extra) { await setFilePriority(f.path, extra as 'verylow' | 'low' | 'normal' | 'high' | 'release' | 'auto'); await refresh(); } break;
+        case 'priority':
+          if (extra) {
+            await setFilePriority(f.path, extra as 'verylow' | 'low' | 'normal' | 'high' | 'release' | 'auto');
+            await refresh();
+            toastSuccess(m.library_set_priority_one({ priority: priorityLabel(extra) }));
+          }
+          break;
         case 'copy_link': {
           let link: string;
           if (extra === 'aich') {
@@ -1587,9 +1691,14 @@
           if (!confirmed) break;
           await unshareFile(f.path, f.hash || undefined);
           await refresh();
+          toastSuccess(m.library_unshared_named({ name: f.name }));
           break;
         }
-        case 'share': await shareFile(f.path); await refresh(); break;
+        case 'share':
+          await shareFile(f.path);
+          await refresh();
+          toastSuccess(m.library_shared_named({ name: f.name }));
+          break;
         case 'republish': {
           if (!f.hash || !f.shared) break;
           await republishFile(f.hash);
@@ -1621,6 +1730,7 @@
       if (!confirmed) return;
       await unshareFolder(path);
       await refresh();
+      toastSuccess(sharedCount === 1 ? m.library_unshared_one() : m.library_unshared_other({ count: sharedCount }));
     } catch (e: unknown) { error = toErr(e); }
   }
 
@@ -2029,21 +2139,35 @@
     <button
       class="dupes-toggle missing-toggle"
       class:active={showMissingOnly}
-      disabled={missingPathSet.size === 0 && missingTotalCount === 0}
-      onclick={() => (showMissingOnly = !showMissingOnly)}
+      disabled={missingScanInFlight}
+      onclick={() => {
+        if (missingScanInFlight) return;
+        if (missingTotalCount > 0 || missingPathSet.size > 0) {
+          showMissingOnly = !showMissingOnly;
+          return;
+        }
+        void refreshMissingSet(true);
+      }}
       title={
-        missingTotalCount === 0
-          ? m.library_no_missing()
-          : missingScanTruncated
-            ? m.library_missing_truncated({
-                shown: missingPathSet.size,
-                total: missingTotalCount,
-                limit: 10_000,
-              })
-            : m.library_missing_tooltip({ count: missingTotalCount })
+        missingScanInFlight
+          ? m.library_missing_scanning()
+          : missingTotalCount === 0
+            ? (missingScanDone ? m.library_no_missing() : m.library_missing_scan_now())
+            : missingScanTruncated
+              ? m.library_missing_truncated({
+                  shown: missingPathSet.size,
+                  total: missingTotalCount,
+                  limit: 10_000,
+                })
+              : m.library_missing_tooltip({ count: missingTotalCount })
       }
     >
-      {m.library_missing()}{missingTotalCount > 0 ? ` (${missingTotalCount})` : ''}
+      {#if missingScanInFlight}
+        <span class="scan-spinner" aria-hidden="true"></span>
+        {m.library_missing()}
+      {:else}
+        {m.library_missing()}{missingTotalCount > 0 ? ` (${missingTotalCount})` : ''}
+      {/if}
     </button>
     {#if showMissingOnly && missingPathSet.size > 0}
       <button
@@ -2481,6 +2605,11 @@
           <button class="scan-btn stop-btn" onclick={handleStopRequest}>{m.common_stop()}</button>
         {/if}
       </div>
+      {#if hashProgress && hashProgress.total > 0}
+        <div class="hash-progress-track" role="progressbar" aria-valuemin={0} aria-valuemax={hashProgress.total} aria-valuenow={hashProgress.current} aria-label={m.library_hashing()}>
+          <div class="hash-progress-fill" style="width:{Math.min(100, Math.round((hashProgress.current / hashProgress.total) * 100))}%"></div>
+        </div>
+      {/if}
     {/if}
     {#if stopConfirmVisible}
       <div class="confirm-banner">
@@ -2527,6 +2656,7 @@
         bind:this={libraryTableRef}
         {sortedFiles}
         {selectedPath}
+        contextPath={ctxMenu?.file.path ?? null}
         onSelectPath={(path) => { selectedPath = path; }}
         onOpenFile={openSharedFile}
         onRowContextMenu={onCtx}
@@ -2566,14 +2696,14 @@
           <span class="bulk-label">{m.library_bulk_priority_label()}</span>
           <div class="bulk-prio-seg">
             {#each ['verylow', 'low', 'normal', 'high', 'release', 'auto'] as p}
-              <button class="bulk-prio-btn" disabled={bulkBusy} onclick={() => bulkSetPriority(p as FileInfo['priority'])} title={m.library_set_priority_title({ priority: priorityLabel(p) })}>{priorityLabel(p)}</button>
+              <button class="bulk-prio-btn" disabled={bulkBusy || checkedHashedCount === 0} onclick={() => bulkSetPriority(p as FileInfo['priority'])} title={checkedHashedCount === 0 ? m.library_bulk_need_hashed() : m.library_set_priority_title({ priority: priorityLabel(p) })}>{priorityLabel(p)}</button>
             {/each}
           </div>
         </div>
         <span class="bulk-sep" aria-hidden="true"></span>
-        <button class="tb-btn" disabled={bulkBusy} onclick={bulkShare} title={m.library_bulk_share_title()}>{m.library_bulk_share()}</button>
-        <button class="tb-btn" disabled={bulkBusy} onclick={bulkUnshare} title={m.library_bulk_unshare_title()}>{m.library_bulk_unshare()}</button>
-        <button class="tb-btn" onclick={bulkCopyLinks} title={m.library_bulk_copy_links_title()}>{m.library_copy_links()}</button>
+        <button class="tb-btn" disabled={bulkBusy || checkedShareCount === 0} onclick={bulkShare} title={checkedShareCount === 0 ? m.library_bulk_need_hashed() : m.library_bulk_share_title()}>{m.library_bulk_share()}</button>
+        <button class="tb-btn" disabled={bulkBusy || checkedUnshareCount === 0} onclick={bulkUnshare} title={checkedUnshareCount === 0 ? m.library_bulk_need_hashed() : m.library_bulk_unshare_title()}>{m.library_bulk_unshare()}</button>
+        <button class="tb-btn" disabled={checkedHashedCount === 0} onclick={bulkCopyLinks} title={checkedHashedCount === 0 ? m.library_bulk_need_hashed() : m.library_bulk_copy_links_title()}>{m.library_copy_links()}</button>
         <button class="tb-btn" onclick={openCreateDialogFromSelection} title={m.library_bulk_new_collection_title()}>{m.library_bulk_new_collection()}</button>
         <span class="bulk-spacer"></span>
         <button class="tb-btn tb-danger" disabled={bulkBusy} onclick={bulkDelete} title={m.library_bulk_delete_title()}>{m.common_delete()}</button>
@@ -2600,7 +2730,18 @@
   {#if selectedFile}
     <div class="detail-drawer" transition:fly={{ x: 24, duration: prefersReducedMotion.current ? 0 : 200 }}>
       <div class="drawer-header">
-        <span class="drawer-title" title={selectedFile.name}>{selectedFile.name}</span>
+        <div class="drawer-header-text">
+          <span class="drawer-title" title={selectedFile.name}>{selectedFile.name}</span>
+          <span class="drawer-subtitle">
+            <span>{fileType(selectedFile.extension) || (selectedFile.extension ? selectedFile.extension.toUpperCase() : '—')}</span>
+            <span class="drawer-sub-sep" aria-hidden="true">·</span>
+            <span>{formatSize(selectedFile.size)}</span>
+            {#if selectedFile.shared}
+              <span class="drawer-sub-sep" aria-hidden="true">·</span>
+              <span class="drawer-sub-shared">{m.library_shared()}</span>
+            {/if}
+          </span>
+        </div>
         <button class="ghost drawer-close" onclick={() => selectedPath = null} title={m.library_close_details()} aria-label={m.library_close_details()}>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" width="15" height="15" aria-hidden="true">
             <line x1="6" y1="6" x2="18" y2="18"/>
@@ -2608,87 +2749,159 @@
           </svg>
         </button>
       </div>
+
+      <div class="drawer-actions">
+        {#if selectedPlayableKind}
+          <button class="drawer-action-btn" onclick={() => openSharedFileExternally(selectedFile.path)} title={m.library_open_externally_title()}>
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
+              <path d="M9 3h4v4"/>
+              <path d="M13 3L7 9"/>
+              <path d="M7 3H3.5A1.5 1.5 0 0 0 2 4.5v7A1.5 1.5 0 0 0 3.5 13h7A1.5 1.5 0 0 0 12 11.5V8"/>
+            </svg>
+            {m.library_open_externally()}
+          </button>
+        {:else}
+          <button class="drawer-action-btn" onclick={() => openSharedFile(selectedFile.path)} title={m.library_open_file_title()}>
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
+              <path d="M2 2.5h4.5l1.5 2H14v9H2z"/>
+              <path d="M6 8.5l2 2 2-2"/>
+              <line x1="8" y1="5" x2="8" y2="10.5"/>
+            </svg>
+            {m.library_open_file()}
+          </button>
+        {/if}
+        <button class="drawer-action-btn" onclick={() => openSharedFolder(selectedFile.path)} title={m.library_open_folder_title()}>
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
+            <path d="M2 2.5h4.5l1.5 2H14v9H2z"/>
+          </svg>
+          {m.library_open_folder()}
+        </button>
+      </div>
+
       <div class="drawer-body">
-        <div class="details-meta-grid">
-          <span class="meta-label">{m.library_meta_path()}</span>
-          <span class="meta-value meta-path" title={selectedFile.path}>{selectedFile.path}</span>
-          <span class="meta-label">{m.library_col_size()}</span>
-          <span class="meta-value">{formatSize(selectedFile.size)}</span>
-          {#if selectedFile.modified_at}
-            <span class="meta-label">{m.library_col_modified()}</span>
-            <span class="meta-value">{new Date(selectedFile.modified_at * 1000).toLocaleString()}</span>
-          {/if}
-          {#if selectedFile.hash}
-            <span class="meta-label">{m.library_meta_hash()}</span>
-            <span class="meta-value meta-hash">
-              <code>{selectedFile.hash}</code>
-              <button class="ghost copy-btn" onclick={() => { const f = selectedFile; if (f) copyToClipboard(f.hash, m.library_copied_hash()); }} title={m.library_meta_copy_hash()}>{m.common_copy()}</button>
-            </span>
-          {/if}
-          {#if selectedFile.aich_hash}
-            <span class="meta-label">{m.library_meta_aich()}</span>
-            <span class="meta-value meta-hash">
-              <code>{selectedFile.aich_hash}</code>
-              <button class="ghost copy-btn" onclick={() => { const f = selectedFile; if (f) copyToClipboard(f.aich_hash, m.library_copied_aich()); }} title={m.library_meta_copy_aich()}>{m.common_copy()}</button>
-            </span>
-          {/if}
-          <span class="meta-label">{m.library_col_priority()}</span>
-          <span class="meta-value">
-            <span class="prio-badge prio-{selectedFile.priority}">{priorityLabel(selectedFile.priority)}</span>
-          </span>
-          <span class="meta-label">{m.library_col_shared()}</span>
-          <span class="meta-value">
-            {selectedFile.shared ? m.common_yes() : m.common_no()}
+        {#if missingPathSet.has(selectedFile.path)}
+          <div class="drawer-alert drawer-alert-danger" role="status">
+            <span>{m.library_drawer_missing_banner()}</span>
+            <button type="button" class="drawer-alert-btn" onclick={handleRemoveSelectedMissing}>{m.library_drawer_remove_missing()}</button>
+          </div>
+        {:else if !selectedFile.hash}
+          <div class="drawer-alert drawer-alert-warn" role="status">
+            <span>{m.library_drawer_hashing()}</span>
+          </div>
+        {/if}
+
+        <section class="drawer-block">
+          <h3 class="drawer-block-title">{m.library_section_file()}</h3>
+          <div class="details-meta-grid">
+            <span class="meta-label">{m.library_meta_path()}</span>
+            <span class="meta-value meta-path" title={selectedFile.path}>{selectedFile.path}</span>
+            {#if selectedFile.modified_at}
+              <span class="meta-label">{m.library_col_modified()}</span>
+              <span class="meta-value">{new Date(selectedFile.modified_at * 1000).toLocaleString()}</span>
+            {/if}
             {#if selectedFile.hash}
-              <span class="meta-badges">
-                {#if selectedFile.shared && selectedFile.shared_kad}<span class="meta-badge meta-badge-kad" title={m.library_published_kad()}>KAD</span>{/if}
-                {#if selectedFile.shared && selectedFile.shared_ed2k}<span class="meta-badge meta-badge-ed2k" title={m.library_published_ed2k()}>eD2K</span>{/if}
-                {#if selectedFile.aich_hash}<span class="meta-badge meta-badge-aich" title={m.library_aich_available()}>AICH</span>{/if}
+              <span class="meta-label">{m.library_meta_hash()}</span>
+              <span class="meta-value meta-hash">
+                <code title={selectedFile.hash}>{selectedFile.hash}</code>
+                <button class="ghost copy-btn" onclick={() => { const f = selectedFile; if (f) copyToClipboard(f.hash, m.library_copied_hash()); }} title={m.library_meta_copy_hash()}>{m.common_copy()}</button>
               </span>
             {/if}
-          </span>
-          <span class="meta-label">{m.library_col_requests()}</span>
-          <span class="meta-value">{selectedFile.requests}{selectedFile.alltime_requests ? ` (${m.library_meta_alltime({ value: selectedFile.alltime_requests })})` : ''}</span>
-          <span class="meta-label">{m.library_col_accepted()}</span>
-          <span class="meta-value">{selectedFile.accepted}{selectedFile.alltime_accepted ? ` (${m.library_meta_alltime({ value: selectedFile.alltime_accepted })})` : ''}</span>
-          <span class="meta-label">{m.library_col_transferred()}</span>
-          <span class="meta-value">{formatSize(selectedFile.bytes_transferred)}{selectedFile.alltime_transferred ? ` (${m.library_meta_alltime({ value: formatSize(selectedFile.alltime_transferred) })})` : ''}</span>
-          {#if selectedFile.complete_sources > 0}
-            <span class="meta-label">{m.library_col_peers()}</span>
-            <span class="meta-value" title={m.library_meta_peers_title()}>
-              {m.library_meta_peers_count({ count: selectedFile.complete_sources.toLocaleString() })}
-            </span>
-          {/if}
-        </div>
-
-        {#if selectedMedia}
-          <div class="drawer-section-divider"></div>
-          <div class="details-meta-grid">
-            {#if selectedMedia.title}
-              <span class="meta-label">{m.library_meta_title()}</span>
-              <span class="meta-value"><bdi>{selectedMedia.title}</bdi></span>
-            {/if}
-            {#if selectedMedia.artist}
-              <span class="meta-label">{m.library_meta_artist()}</span>
-              <span class="meta-value"><bdi>{selectedMedia.artist}</bdi></span>
-            {/if}
-            {#if selectedMedia.album}
-              <span class="meta-label">{m.library_meta_album()}</span>
-              <span class="meta-value"><bdi>{selectedMedia.album}</bdi></span>
-            {/if}
-            {#if selectedMedia.duration}
-              <span class="meta-label">{m.library_meta_duration()}</span>
-              <span class="meta-value">{formatMediaLength(selectedMedia.duration)}</span>
-            {/if}
-            {#if selectedMedia.bitrate}
-              <span class="meta-label">{m.library_meta_bitrate()}</span>
-              <span class="meta-value">{m.library_meta_bitrate_value({ kbps: selectedMedia.bitrate })}</span>
-            {/if}
-            {#if selectedMedia.codec}
-              <span class="meta-label">{m.library_meta_codec()}</span>
-              <span class="meta-value">{selectedMedia.codec}</span>
+            {#if selectedFile.aich_hash}
+              <span class="meta-label">{m.library_meta_aich()}</span>
+              <span class="meta-value meta-hash">
+                <code title={selectedFile.aich_hash}>{selectedFile.aich_hash}</code>
+                <button class="ghost copy-btn" onclick={() => { const f = selectedFile; if (f) copyToClipboard(f.aich_hash, m.library_copied_aich()); }} title={m.library_meta_copy_aich()}>{m.common_copy()}</button>
+              </span>
             {/if}
           </div>
+        </section>
+
+        <section class="drawer-block">
+          <h3 class="drawer-block-title">{m.library_section_sharing()}</h3>
+          <div class="details-meta-grid">
+            <span class="meta-label">{m.library_col_shared()}</span>
+            <span class="meta-value meta-shared-row">
+              <span class="shared-status" class:is-shared={selectedFile.shared}>
+                {selectedFile.shared ? m.library_shared() : m.library_not_shared()}
+              </span>
+              {#if selectedFile.hash}
+                <span class="meta-badges">
+                  {#if selectedFile.shared && selectedFile.shared_kad}<span class="meta-badge meta-badge-kad" title={m.library_published_kad()}>KAD</span>{/if}
+                  {#if selectedFile.shared && selectedFile.shared_ed2k}<span class="meta-badge meta-badge-ed2k" title={m.library_published_ed2k()}>eD2K</span>{/if}
+                  {#if selectedFile.aich_hash}<span class="meta-badge meta-badge-aich" title={m.library_aich_available()}>AICH</span>{/if}
+                </span>
+              {/if}
+            </span>
+            <span class="meta-label">{m.library_col_priority()}</span>
+            <span class="meta-value">
+              <span class="prio-badge prio-{selectedFile.priority}">{priorityLabel(selectedFile.priority)}</span>
+            </span>
+            {#if selectedFile.complete_sources > 0}
+              <span class="meta-label">{m.library_col_peers()}</span>
+              <span class="meta-value" title={m.library_meta_peers_title()}>
+                {m.library_meta_peers_count({ count: selectedFile.complete_sources.toLocaleString() })}
+              </span>
+            {/if}
+          </div>
+        </section>
+
+        <section class="drawer-block">
+          <h3 class="drawer-block-title">{m.library_section_activity()}</h3>
+          <div class="activity-stats">
+            <div class="activity-stat">
+              <span class="activity-stat-label">{m.library_col_requests()}</span>
+              <span class="activity-stat-value">{selectedFile.requests.toLocaleString()}</span>
+              {#if selectedFile.alltime_requests}
+                <span class="activity-stat-sub">{m.library_drawer_alltime()}: {selectedFile.alltime_requests.toLocaleString()}</span>
+              {/if}
+            </div>
+            <div class="activity-stat">
+              <span class="activity-stat-label">{m.library_col_accepted()}</span>
+              <span class="activity-stat-value">{selectedFile.accepted.toLocaleString()}</span>
+              {#if selectedFile.alltime_accepted}
+                <span class="activity-stat-sub">{m.library_drawer_alltime()}: {selectedFile.alltime_accepted.toLocaleString()}</span>
+              {/if}
+            </div>
+            <div class="activity-stat">
+              <span class="activity-stat-label">{m.library_col_transferred()}</span>
+              <span class="activity-stat-value">{formatSize(selectedFile.bytes_transferred)}</span>
+              {#if selectedFile.alltime_transferred}
+                <span class="activity-stat-sub">{m.library_drawer_alltime()}: {formatSize(selectedFile.alltime_transferred)}</span>
+              {/if}
+            </div>
+          </div>
+        </section>
+
+        {#if selectedMedia}
+          <section class="drawer-block">
+            <h3 class="drawer-block-title">{m.library_section_media()}</h3>
+            <div class="details-meta-grid">
+              {#if selectedMedia.title}
+                <span class="meta-label">{m.library_meta_title()}</span>
+                <span class="meta-value"><bdi>{selectedMedia.title}</bdi></span>
+              {/if}
+              {#if selectedMedia.artist}
+                <span class="meta-label">{m.library_meta_artist()}</span>
+                <span class="meta-value"><bdi>{selectedMedia.artist}</bdi></span>
+              {/if}
+              {#if selectedMedia.album}
+                <span class="meta-label">{m.library_meta_album()}</span>
+                <span class="meta-value"><bdi>{selectedMedia.album}</bdi></span>
+              {/if}
+              {#if selectedMedia.duration}
+                <span class="meta-label">{m.library_meta_duration()}</span>
+                <span class="meta-value">{formatMediaLength(selectedMedia.duration)}</span>
+              {/if}
+              {#if selectedMedia.bitrate}
+                <span class="meta-label">{m.library_meta_bitrate()}</span>
+                <span class="meta-value">{m.library_meta_bitrate_value({ kbps: selectedMedia.bitrate })}</span>
+              {/if}
+              {#if selectedMedia.codec}
+                <span class="meta-label">{m.library_meta_codec()}</span>
+                <span class="meta-value">{selectedMedia.codec}</span>
+              {/if}
+            </div>
+          </section>
         {/if}
 
         {#if selectedPlayableKind && selectedPath}
@@ -2703,38 +2916,10 @@
           {/key}
         {/if}
 
-        <div class="drawer-actions">
-          {#if selectedPlayableKind}
-            <button class="drawer-action-btn" onclick={() => openSharedFileExternally(selectedFile.path)} title={m.library_open_externally_title()}>
-              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
-                <path d="M9 3h4v4"/>
-                <path d="M13 3L7 9"/>
-                <path d="M7 3H3.5A1.5 1.5 0 0 0 2 4.5v7A1.5 1.5 0 0 0 3.5 13h7A1.5 1.5 0 0 0 12 11.5V8"/>
-              </svg>
-              {m.library_open_externally()}
-            </button>
-          {:else}
-            <button class="drawer-action-btn" onclick={() => openSharedFile(selectedFile.path)} title={m.library_open_file_title()}>
-              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
-                <path d="M2 2.5h4.5l1.5 2H14v9H2z"/>
-                <path d="M6 8.5l2 2 2-2"/>
-                <line x1="8" y1="5" x2="8" y2="10.5"/>
-              </svg>
-              {m.library_open_file()}
-            </button>
-          {/if}
-          <button class="drawer-action-btn" onclick={() => openSharedFolder(selectedFile.path)} title={m.library_open_folder_title()}>
-            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
-              <path d="M2 2.5h4.5l1.5 2H14v9H2z"/>
-            </svg>
-            {m.library_open_folder()}
-          </button>
-        </div>
-
         {#if selectedHash}
-          <div class="drawer-section">
+          <section class="drawer-block drawer-block-comments">
             <div class="drawer-section-header">
-              <span class="drawer-section-title">{m.library_comments_rating()}</span>
+              <h3 class="drawer-block-title">{m.library_comments_rating()}</h3>
               {#if commentLastSavedAt}
                 <span class="comment-last-saved">{m.library_saved_at({ time: formatSavedTime(commentLastSavedAt) })}</span>
               {/if}
@@ -2799,7 +2984,7 @@
                 <div class="comment-empty">{m.library_no_peer_comments()}</div>
               {/if}
             {/if}
-          </div>
+          </section>
         {/if}
       </div>
     </div>
@@ -2810,6 +2995,7 @@
 {#if ctxMenu}
   {@const fileHashed = !!ctxMenu.file.hash}
   <div bind:this={ctxMenuEl} class="ctx-menu" style="left:{ctxMenu.x}px;top:{ctxMenu.y}px;" role="menu">
+    <button class="ctx-item" role="menuitem" onclick={() => ctxAction('properties')}>{m.library_properties()}</button>
     <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_file')}>{m.library_open_file()}</button>
     <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_folder')}>{m.library_open_folder()}</button>
     <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('delete')}>{m.library_delete_file_title()}</button>
@@ -2942,6 +3128,16 @@
     flex-shrink: 0;
   }
   .scan-text { flex: 1; }
+  .hash-progress-track {
+    height: 3px;
+    background: var(--border);
+    flex-shrink: 0;
+  }
+  .hash-progress-fill {
+    height: 100%;
+    background: var(--accent);
+    transition: width 0.2s ease;
+  }
   .confirm-banner {
     display: flex;
     align-items: center;
@@ -3327,21 +3523,46 @@
   }
   .drawer-header {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: space-between;
-    padding: 10px 12px;
+    padding: 12px 14px 10px;
     border-bottom: 1px solid var(--border);
     background: var(--bg-surface);
-    gap: 8px;
+    gap: 10px;
+  }
+  .drawer-header-text {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
   }
   .drawer-title {
     font-weight: 700;
-    font-size: 13px;
+    font-size: 14px;
+    line-height: 1.3;
     color: var(--text-primary);
-    white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    min-width: 0;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    -webkit-box-orient: vertical;
+    white-space: normal;
+    word-break: break-word;
+  }
+  .drawer-subtitle {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 6px;
+    font-size: 11px;
+    color: var(--text-muted);
+    line-height: 1.3;
+  }
+  .drawer-sub-sep { opacity: 0.55; }
+  .drawer-sub-shared {
+    color: var(--accent);
+    font-weight: 600;
   }
   .drawer-close {
     width: 28px;
@@ -3356,6 +3577,7 @@
     align-items: center;
     justify-content: center;
     flex-shrink: 0;
+    margin-top: 1px;
     transition: background 0.12s, border-color 0.12s, color 0.12s;
   }
   .drawer-close:hover {
@@ -3369,19 +3591,64 @@
   .drawer-body {
     flex: 1;
     overflow-y: auto;
-    padding: 12px;
+    padding: 12px 14px 16px;
     font-size: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
   }
-  .drawer-section {
-    margin-top: 16px;
-    padding-top: 12px;
-    border-top: 1px solid var(--border);
+  .drawer-block {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
   }
+  .drawer-block-title {
+    margin: 0;
+    font-weight: 700;
+    font-size: 11px;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+  }
+  .drawer-block-comments .drawer-section-header {
+    margin-bottom: 0;
+  }
+  .drawer-alert {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    font-size: 12px;
+    line-height: 1.35;
+  }
+  .drawer-alert-danger {
+    background: color-mix(in srgb, var(--danger) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--border));
+    color: var(--danger);
+  }
+  .drawer-alert-warn {
+    background: color-mix(in srgb, var(--warning) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--warning) 40%, var(--border));
+    color: var(--warning);
+  }
+  .drawer-alert-btn {
+    flex-shrink: 0;
+    padding: 3px 8px;
+    font-size: 11px;
+    border-radius: 3px;
+    border: 1px solid currentColor;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+  }
+  .drawer-alert-btn:hover { opacity: 0.85; }
   .drawer-section-header {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    margin-bottom: 10px;
+    gap: 8px;
   }
   .drawer-section-title {
     font-weight: 700;
@@ -3599,6 +3866,9 @@
     cursor: pointer;
     white-space: nowrap;
     transition: background 0.12s, border-color 0.12s, color 0.12s;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
   }
   .dupes-toggle:hover:not(:disabled) {
     background: var(--bg-hover);
@@ -3775,38 +4045,104 @@
   /* --- Details meta grid --- */
   .details-meta-grid {
     display: grid;
-    grid-template-columns: auto 1fr;
-    gap: 3px 12px;
+    grid-template-columns: 72px 1fr;
+    gap: 6px 10px;
     align-items: baseline;
   }
   .meta-label {
     color: var(--text-muted);
     font-size: 11px;
-    text-align: right;
+    text-align: left;
     white-space: nowrap;
   }
   .meta-value {
     color: var(--text-primary);
-    word-break: break-all;
+    word-break: break-word;
     font-size: 12px;
+    min-width: 0;
   }
   .meta-path {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     max-width: 100%;
+    color: var(--text-secondary);
   }
   .meta-hash {
-    display: inline-flex;
+    display: flex;
     align-items: center;
     gap: 6px;
     font-family: var(--font-mono, monospace);
     font-size: 11px;
+    min-width: 0;
+  }
+  .meta-hash code {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+    color: var(--text-secondary);
+  }
+  .meta-shared-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .shared-status {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 1px 7px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--bg-surface);
+    color: var(--text-muted);
+  }
+  .shared-status.is-shared {
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+    background: color-mix(in srgb, var(--accent-dim) 40%, transparent);
+  }
+  .activity-stats {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+  }
+  .activity-stat {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 8px 9px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-surface);
+    min-width: 0;
+  }
+  .activity-stat-label {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    color: var(--text-muted);
+  }
+  .activity-stat-value {
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--text-primary);
+    font-variant-numeric: tabular-nums;
+  }
+  .activity-stat-sub {
+    font-size: 10px;
+    color: var(--text-muted);
+    line-height: 1.3;
   }
   .drawer-actions {
     display: flex;
     gap: 6px;
-    margin-top: 12px;
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-secondary);
+    flex-shrink: 0;
   }
   .drawer-action-btn {
     display: inline-flex;
@@ -3841,7 +4177,7 @@
     flex-shrink: 0;
   }
   .copy-btn:hover { color: var(--accent); border-color: var(--accent); }
-  .meta-badges { display: inline-flex; gap: 4px; margin-left: 4px; }
+  .meta-badges { display: inline-flex; gap: 4px; }
   /* Tinted-chip recipe matching the same badges in the file table
      (LibraryVirtualTable's .shared-badge) so KAD/eD2K/AICH read as the
      same concept — and the same color — in both places. */

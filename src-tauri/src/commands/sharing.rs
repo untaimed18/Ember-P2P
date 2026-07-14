@@ -900,15 +900,30 @@ pub async fn get_shared_files(state: tauri::State<'_, AppState>) -> Result<Vec<F
     Ok(cached.clone())
 }
 
-/// Count of files the user is *actively sharing* (the `shared` flag is set),
-/// which is distinct from the total number of files indexed in the library
-/// (the latter includes files the user has unshared). Returns just the
-/// number so the always-mounted status bar can show "Files Shared" without
-/// shipping the whole `Vec<FileInfo>` over IPC on every refresh.
+/// Count and total byte size of files the user is *actively sharing*
+/// (the `shared` flag is set). Distinct from the total number of files
+/// indexed in the library (which includes unshared files). Returns a
+/// compact summary so the always-mounted status bar can show
+/// "Files Shared N (size)" without shipping the whole `Vec<FileInfo>`
+/// over IPC on every refresh.
+#[derive(serde::Serialize)]
+pub struct SharedFileStats {
+    pub count: usize,
+    pub total_bytes: u64,
+}
+
 #[tauri::command]
-pub async fn get_shared_file_count(state: tauri::State<'_, AppState>) -> Result<usize, String> {
+pub async fn get_shared_file_count(
+    state: tauri::State<'_, AppState>,
+) -> Result<SharedFileStats, String> {
     let cached = state.cached_shared_files.read().await;
-    Ok(cached.iter().filter(|f| f.shared).count())
+    let mut count = 0usize;
+    let mut total_bytes = 0u64;
+    for f in cached.iter().filter(|f| f.shared) {
+        count += 1;
+        total_bytes = total_bytes.saturating_add(f.size);
+    }
+    Ok(SharedFileStats { count, total_bytes })
 }
 
 #[tauri::command]

@@ -3601,6 +3601,10 @@ struct NetworkState {
     obfuscation_enabled: bool,
     /// Shared firewall status that can be updated from spawned tasks
     firewalled_shared: Arc<std::sync::atomic::AtomicBool>,
+    /// Set by the upload listener when a KAD firewall-probe IP connects
+    /// back. Consumed by the network loop to call `handle_tcp_connect_back`
+    /// without conflating real proof with UPnP clearing `firewalled_shared`.
+    tcp_connect_back_shared: Arc<std::sync::atomic::AtomicBool>,
     /// Shared external IPv4 encoded as a little-endian u32 — the same
     /// layout ed2k uses for a HighID `client_id` on the wire.
     /// `0` means unknown (no trusted source has reported our public IP yet);
@@ -4755,13 +4759,11 @@ async fn handle_server_disconnect(
 }
 
 /// Establish a new eD2K server connection to `ip`:`port`, tearing down any
-/// existing connection/pending attempt first. Extracted from the body of
-/// `NetworkCommand::ConnectToServer` so `NetworkCommand::KadConnect` can
-/// call the exact same logic: by design, pressing Connect on the KAD page
-/// also brings up a default eD2K server alongside KAD (see the call site in
-/// `KadConnect`), and `start_network`'s boot sequence calls it too when
-/// `settings.auto_connect_server` is set. All three callers must behave
-/// identically, so this is the single place that logic lives.
+/// existing connection/pending attempt first. Shared by
+/// `NetworkCommand::ConnectToServer` (Servers page) and
+/// `start_network`'s boot path when `settings.auto_connect_server` is set.
+/// KAD Connect does **not** call this — eD2K is opt-in via the Servers page
+/// (or the startup auto-connect setting).
 async fn initiate_server_connect(
     state: &mut NetworkState,
     settings: &AppSettings,
@@ -4772,6 +4774,9 @@ async fn initiate_server_connect(
 ) {
     state.server_auto_reconnect = true;
     state.server_reconnect_failures = 0;
+    // Explicit Connect should be allowed to retry servers that recently
+    // failed auto-reconnect — keep fail counts for sort preference.
+    state.server_list.clear_connect_cooldowns();
     if let Some(handle) = state.pending_server_connect.take() {
         handle.abort();
     }
@@ -4816,56 +4821,57 @@ async fn initiate_server_connect(
         serde_json::json!({ "status": "connecting" }),
     );
     state.pending_server_connect = Some(tokio::spawn(async move {
+        // One crypt→plain cycle per server. Retrying the same host 3× used to
+        // burn ~90s on a dead High-priority entry (e.g. eMule Security) before
+        // auto-reconnect could move on; fail once and let `record_failure` +
+        // cooldown hand off to the next server.
         let result = async {
-            const MAX_LOGIN_ATTEMPTS: u32 = 3;
-            let mut last_err = String::new();
-            for attempt in 0..MAX_LOGIN_ATTEMPTS {
-                if attempt > 0 {
-                    info!("Retrying server {ip_clone}:{port} (attempt {})", attempt + 1);
-                    emit_server_log(&app_for_connect, &format!("Retrying ({})...", attempt + 1));
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                }
-                let (mut conn, resolved_addr) = match try_connect_server(&ip_clone, port, obf_port, &app_for_connect, false, obfuscation_enabled).await {
-                    Ok(r) => r,
-                    Err(e) => { last_err = format!("Connect failed: {e}"); continue; }
-                };
-                if attempt == 0 {
+            let (mut conn, resolved_addr) = try_connect_server(
+                &ip_clone,
+                port,
+                obf_port,
+                &app_for_connect,
+                false,
+                obfuscation_enabled,
+            )
+            .await
+            .map_err(|e| format!("Connect failed: {e}"))?;
+            emit_server_log(
+                &app_for_connect,
+                &format!("Sending login request (client TCP port {tcp_port})..."),
+            );
+            match conn.login(&user_hash, &nickname, tcp_port).await {
+                Ok(session) => Ok((conn, session, resolved_addr)),
+                Err(login_err) if conn.is_encrypted() => {
+                    debug!("Encrypted login to {ip_clone}:{port} failed: {login_err}, falling back to plain TCP");
                     emit_server_log(
                         &app_for_connect,
-                        &format!("Sending login request (client TCP port {tcp_port})..."),
+                        &format!("Encrypted login failed ({login_err}), trying plain TCP..."),
                     );
-                }
-                match conn.login(&user_hash, &nickname, tcp_port).await {
-                    Ok(session) => return Ok((conn, session, resolved_addr)),
-                    Err(login_err) if conn.is_encrypted() => {
-                        debug!("Encrypted login to {ip_clone}:{port} failed: {login_err}, falling back to plain TCP");
-                        emit_server_log(
-                            &app_for_connect,
-                            &format!("Encrypted login failed ({login_err}), trying plain TCP..."),
-                        );
-                        drop(conn);
-                        let plain_addr = tokio::net::lookup_host((ip_clone.as_str(), port))
-                            .await
-                            .map_err(|e| format!("Plain fallback resolve failed: {e}"))?
-                            .find(|addr| addr.is_ipv4())
-                            .ok_or_else(|| format!("No IPv4 address for plain fallback {ip_clone}:{port}"))?;
-                        let mut plain_conn = Ed2kServerConnection::connect(plain_addr)
-                            .await
-                            .map_err(|e| format!("Plain fallback connect failed: {e}"))?;
-                        emit_server_log(
-                            &app_for_connect,
-                            &format!("Sending login over plain TCP (port {tcp_port})..."),
-                        );
-                        match plain_conn.login(&user_hash, &nickname, tcp_port).await {
-                            Ok(session) => return Ok((plain_conn, session, plain_addr)),
-                            Err(e) => { last_err = format!("Plain TCP login failed: {e}"); continue; }
-                        }
+                    drop(conn);
+                    let plain_addr = tokio::net::lookup_host((ip_clone.as_str(), port))
+                        .await
+                        .map_err(|e| format!("Plain fallback resolve failed: {e}"))?
+                        .find(|addr| addr.is_ipv4())
+                        .ok_or_else(|| {
+                            format!("No IPv4 address for plain fallback {ip_clone}:{port}")
+                        })?;
+                    let mut plain_conn = Ed2kServerConnection::connect(plain_addr)
+                        .await
+                        .map_err(|e| format!("Plain fallback connect failed: {e}"))?;
+                    emit_server_log(
+                        &app_for_connect,
+                        &format!("Sending login over plain TCP (port {tcp_port})..."),
+                    );
+                    match plain_conn.login(&user_hash, &nickname, tcp_port).await {
+                        Ok(session) => Ok((plain_conn, session, plain_addr)),
+                        Err(e) => Err(format!("Plain TCP login failed: {e}")),
                     }
-                    Err(e) => { last_err = format!("Login failed: {e}"); continue; }
                 }
+                Err(e) => Err(format!("Login failed: {e}")),
             }
-            Err(last_err)
-        }.await;
+        }
+        .await;
         let addr = result
             .as_ref()
             .ok()
@@ -6534,6 +6540,7 @@ pub async fn start_network(
         banned_ips,
         obfuscation_enabled: settings.obfuscation_enabled,
         firewalled_shared: Arc::new(std::sync::atomic::AtomicBool::new(!upnp_success)),
+        tcp_connect_back_shared: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         external_ip_shared: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         self_lookup_done: false,
         last_self_lookup: 0,
@@ -6583,7 +6590,9 @@ pub async fn start_network(
         buddy_event_rx: None,
         serving_event_rx: None,
         pending_outgoing_buddy: None,
-        server_auto_reconnect: true,
+        // Off until the user (or auto_connect_server) calls
+        // `initiate_server_connect`, which flips this on for drop recovery.
+        server_auto_reconnect: false,
         server_reconnect_failures: 0,
         server_last_connect_attempt: None,
         pending_uss_pings: HashMap::new(),
@@ -7065,12 +7074,9 @@ pub async fn start_network(
 
     // Mirrors the `auto_connect_kad` boot check above, but for the eD2K
     // server — independent of it, since a user may want one without the
-    // other. Defaults to off: connecting to a server is still real network
-    // activity (see `upload_disconnected`'s boot-time fix) and shouldn't
-    // happen before the user has asked for it in any way. This is separate
-    // from the always-on "pressing Connect also brings up a server"
-    // behavior in `NetworkCommand::KadConnect` — that's a deliberate
-    // pairing tied to the explicit button press, not to this setting.
+    // other. Defaults to off: connecting to a server is opt-in via this
+    // setting or an explicit Connect on the Servers page. KAD Connect
+    // never starts an eD2K session on its own.
     if settings.auto_connect_server {
         let next = state
             .server_list
@@ -7144,6 +7150,7 @@ pub async fn start_network(
         let ul_download_folder = settings.download_folder.clone();
         let ul_fw_probes = firewall_probe_ips.clone();
         let ul_fw_shared = state.firewalled_shared.clone();
+        let ul_tcp_connect_back = state.tcp_connect_back_shared.clone();
         let ul_ext_ip_shared = state.external_ip_shared.clone();
         let ul_kad_cbs = pending_kad_callbacks.clone();
         let ul_kad_cb_tx = kad_callback_tx.clone();
@@ -7189,6 +7196,7 @@ pub async fn start_network(
                 ul_share_browsing,
                 ul_fw_probes,
                 ul_fw_shared,
+                ul_tcp_connect_back,
                 ul_ext_ip_shared,
                 ul_kad_cbs,
                 ul_kad_cb_tx,
@@ -12392,7 +12400,6 @@ pub async fn start_network(
                 }
 
                 if state.firewall_checker.evaluate() {
-                    let was_udp_fw = state.udp_firewalled;
                     let was_tcp_fw = state.firewalled;
                     let had_ip = state.external_ip.is_some();
                     state.firewalled = state.firewall_checker.tcp_firewalled();
@@ -12430,17 +12437,15 @@ pub async fn start_network(
                             ));
                         }
                     }
-                    let status_changed = was_udp_fw != state.udp_firewalled
-                        || was_tcp_fw != state.firewalled
-                        || (!had_ip && state.external_ip.is_some());
-                    if status_changed {
-                        let _ = app_handle.emit("firewall-status", serde_json::json!({
-                            "firewalled": state.firewalled,
-                            "external_ip": state.stats.external_ip,
-                            "tcp_status": format!("{:?}", tcp_status),
-                            "udp_status": format!("{:?}", udp_status),
-                        }));
-                    }
+                    // Always publish after evaluate — tcp/udp can move
+                    // Unknown→Open/Firewalled without flipping aggregate
+                    // `firewalled` (e.g. UPnP already cleared it).
+                    let _ = app_handle.emit("firewall-status", serde_json::json!({
+                        "firewalled": state.firewalled,
+                        "external_ip": state.stats.external_ip,
+                        "tcp_status": format!("{:?}", tcp_status),
+                        "udp_status": format!("{:?}", udp_status),
+                    }));
                     if was_tcp_fw && !state.firewalled {
                         if state.buddy_manager.state() == BuddyState::FindingBuddy {
                             state.buddy_manager.find_failed();
@@ -12454,10 +12459,42 @@ pub async fn start_network(
                 // Sync firewalled status from TCP connect-back detection or UPnP.
                 // Only allow the atomic to CLEAR the firewalled flag, never re-assert it,
                 // so it doesn't overwrite the FirewallChecker's determination.
+                //
+                // Real KAD probe connect-backs set `tcp_connect_back_shared`; that is
+                // the only path that promotes `tcp_status` to Open here. UPnP clearing
+                // `firewalled_shared` may clear the aggregate firewalled flag, but must
+                // not pretend a connect-back happened. An active LowID session must not
+                // be overridden by UPnP optimism.
+                let connect_back = state
+                    .tcp_connect_back_shared
+                    .swap(false, std::sync::atomic::Ordering::Relaxed);
                 let fw_from_shared = state.firewalled_shared.load(std::sync::atomic::Ordering::Relaxed);
-                if state.firewalled && !fw_from_shared {
-                    info!("TCP confirmed open (connect-back or UPnP), clearing TCP firewalled status");
-                    state.firewalled = false;
+                if state.low_id {
+                    if !fw_from_shared {
+                        state.firewalled_shared.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    if !state.firewalled {
+                        state.firewalled = true;
+                        state.firewall_checker.note_tcp_firewalled();
+                        update_publish_manager_state(&mut state);
+                        state.stats.firewalled = true;
+                        state.stats.tcp_status = format!("{:?}", state.firewall_checker.tcp_status());
+                        state.stats.udp_status = format!("{:?}", state.firewall_checker.udp_status());
+                        let _ = app_handle.emit("firewall-status", serde_json::json!({
+                            "firewalled": state.firewalled,
+                            "external_ip": state.stats.external_ip,
+                            "tcp_status": state.stats.tcp_status,
+                            "udp_status": state.stats.udp_status,
+                        }));
+                    }
+                } else if connect_back {
+                    if state.firewalled {
+                        info!("TCP connect-back confirms port open, clearing TCP firewalled status");
+                        state.firewalled = false;
+                    } else {
+                        info!("TCP connect-back confirms port open (updating tcp_status)");
+                    }
+                    state.firewalled_shared.store(false, std::sync::atomic::Ordering::Relaxed);
                     state.firewall_checker.handle_tcp_connect_back();
                     update_publish_manager_state(&mut state);
                     state.stats.firewalled = state.firewalled;
@@ -12474,6 +12511,19 @@ pub async fn start_network(
                         "external_ip": state.stats.external_ip,
                         "tcp_status": format!("{:?}", tcp_status),
                         "udp_status": format!("{:?}", udp_status),
+                    }));
+                } else if state.firewalled && !fw_from_shared {
+                    // UPnP (or similar) cleared the shared flag without a
+                    // connect-back — drop the aggregate firewalled badge only.
+                    info!("Clearing firewalled flag (UPnP/shared), leaving tcp_status unchanged");
+                    state.firewalled = false;
+                    update_publish_manager_state(&mut state);
+                    state.stats.firewalled = false;
+                    let _ = app_handle.emit("firewall-status", serde_json::json!({
+                        "firewalled": state.firewalled,
+                        "external_ip": state.stats.external_ip,
+                        "tcp_status": state.stats.tcp_status,
+                        "udp_status": state.stats.udp_status,
                     }));
                 }
 
@@ -17432,7 +17482,10 @@ pub async fn start_network(
                     && state.pending_server_connect.is_none()
                     && !state.server_list.is_empty()
                     && state.server_connection.is_none()
-                    && state.stats.status == NetworkStatus::Connected
+                    && matches!(
+                        state.stats.status,
+                        NetworkStatus::Connected | NetworkStatus::Connecting
+                    )
                 {
                     let backoff_secs = match state.server_reconnect_failures {
                         0 => 0,
@@ -17446,11 +17499,14 @@ pub async fn start_network(
                         .map(|t| t.elapsed().as_secs() >= backoff_secs)
                         .unwrap_or(true);
                     if elapsed_ok {
-                    if let Some(server) = state.server_list.get_next_server() {
-                        let addr_str = format!("{}:{}", server.ip, server.port);
-                        let ip = server.ip.clone();
-                        let port = server.port;
-                        let obf_port = server.obfuscation_port_tcp;
+                    // Only connect when a cooldown-eligible server exists.
+                    // Never wipe per-server cooldowns here — that defeated the
+                    // High-priority failure window and hammered dead servers.
+                    let picked = state.server_list.get_next_server().map(|s| {
+                        (s.ip.clone(), s.port, s.obfuscation_port_tcp)
+                    });
+                    if let Some((ip, port, obf_port)) = picked {
+                        let addr_str = format!("{ip}:{port}");
                         let user_hash = state.user_hash;
                         let nickname = settings.nickname.clone();
                         let tcp_port = state.tcp_port;
@@ -17468,56 +17524,55 @@ pub async fn start_network(
                         let _ = app_handle.emit("server-status-changed", serde_json::json!({ "status": "connecting" }));
                         let app_for_auto = app_handle.clone();
                         state.pending_server_connect = Some(tokio::spawn(async move {
+                            // One crypt→plain cycle; outer auto-reconnect + cooldown
+                            // rotates to the next server on failure (see initiate_server_connect).
                             let result = async {
-                                const MAX_LOGIN_ATTEMPTS: u32 = 3;
-                                let mut last_err = String::new();
-                                for attempt in 0..MAX_LOGIN_ATTEMPTS {
-                                    if attempt > 0 {
-                                        info!("Retrying server {ip}:{port} (attempt {})", attempt + 1);
-                                        emit_server_log(&app_for_auto, &format!("Retrying ({})...", attempt + 1));
-                                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                                    }
-                                    let (mut conn, resolved_addr) = match try_connect_server(&ip, port, obf_port, &app_for_auto, force_plain, obfuscation_enabled).await {
-                                        Ok(r) => r,
-                                        Err(e) => { last_err = format!("Connect failed: {e}"); continue; }
-                                    };
-                                    if attempt == 0 {
+                                let (mut conn, resolved_addr) = try_connect_server(
+                                    &ip,
+                                    port,
+                                    obf_port,
+                                    &app_for_auto,
+                                    force_plain,
+                                    obfuscation_enabled,
+                                )
+                                .await
+                                .map_err(|e| format!("Connect failed: {e}"))?;
+                                emit_server_log(
+                                    &app_for_auto,
+                                    &format!("Sending login request (client TCP port {tcp_port})..."),
+                                );
+                                match conn.login(&user_hash, &nickname, tcp_port).await {
+                                    Ok(session) => Ok((conn, session, resolved_addr)),
+                                    Err(login_err) if conn.is_encrypted() => {
+                                        debug!("Encrypted login to {ip}:{port} failed: {login_err}, falling back to plain TCP");
                                         emit_server_log(
                                             &app_for_auto,
-                                            &format!("Sending login request (client TCP port {tcp_port})..."),
+                                            &format!("Encrypted login failed ({login_err}), trying plain TCP..."),
                                         );
-                                    }
-                                    match conn.login(&user_hash, &nickname, tcp_port).await {
-                                        Ok(session) => return Ok((conn, session, resolved_addr)),
-                                        Err(login_err) if conn.is_encrypted() => {
-                                            debug!("Encrypted login to {ip}:{port} failed: {login_err}, falling back to plain TCP");
-                                            emit_server_log(
-                                                &app_for_auto,
-                                                &format!("Encrypted login failed ({login_err}), trying plain TCP..."),
-                                            );
-                                            drop(conn);
-                                            let plain_addr = tokio::net::lookup_host((ip.as_str(), port))
-                                                .await
-                                                .map_err(|e| format!("Plain fallback resolve failed: {e}"))?
-                                                .find(|addr| addr.is_ipv4())
-                                                .ok_or_else(|| format!("No IPv4 address for plain fallback {ip}:{port}"))?;
-                                            let mut plain_conn = Ed2kServerConnection::connect(plain_addr)
-                                                .await
-                                                .map_err(|e| format!("Plain fallback connect failed: {e}"))?;
-                                            emit_server_log(
-                                                &app_for_auto,
-                                                &format!("Sending login over plain TCP (port {tcp_port})..."),
-                                            );
-                                            match plain_conn.login(&user_hash, &nickname, tcp_port).await {
-                                                Ok(session) => return Ok((plain_conn, session, plain_addr)),
-                                                Err(e) => { last_err = format!("Plain TCP login failed: {e}"); continue; }
-                                            }
+                                        drop(conn);
+                                        let plain_addr = tokio::net::lookup_host((ip.as_str(), port))
+                                            .await
+                                            .map_err(|e| format!("Plain fallback resolve failed: {e}"))?
+                                            .find(|addr| addr.is_ipv4())
+                                            .ok_or_else(|| {
+                                                format!("No IPv4 address for plain fallback {ip}:{port}")
+                                            })?;
+                                        let mut plain_conn = Ed2kServerConnection::connect(plain_addr)
+                                            .await
+                                            .map_err(|e| format!("Plain fallback connect failed: {e}"))?;
+                                        emit_server_log(
+                                            &app_for_auto,
+                                            &format!("Sending login over plain TCP (port {tcp_port})..."),
+                                        );
+                                        match plain_conn.login(&user_hash, &nickname, tcp_port).await {
+                                            Ok(session) => Ok((plain_conn, session, plain_addr)),
+                                            Err(e) => Err(format!("Plain TCP login failed: {e}")),
                                         }
-                                        Err(e) => { last_err = format!("Login failed: {e}"); continue; }
                                     }
+                                    Err(e) => Err(format!("Login failed: {e}")),
                                 }
-                                Err(last_err)
-                            }.await;
+                            }
+                            .await;
                             let addr = result
                                 .as_ref()
                                 .ok()
@@ -18098,18 +18153,25 @@ pub async fn start_network(
 
                         // HighID from server is the most reliable TCP firewall test:
                         // the server successfully connected back to our TCP port.
+                        // Always update tcp_status — even when UPnP already cleared
+                        // `state.firewalled` — otherwise the UI stays on Unknown
+                        // until a later KAD probe cycle.
                         if !is_low && our_id >= ed2k::server::LOWID_THRESHOLD {
                             if state.firewalled {
                                 info!("HighID from server confirms TCP port is open, clearing firewalled status");
                                 state.firewalled = false;
                                 state.firewalled_shared.store(false, std::sync::atomic::Ordering::Relaxed);
-                                state.firewall_checker.handle_tcp_connect_back();
                                 update_publish_manager_state(&mut state);
                                 if state.buddy_manager.state() == BuddyState::FindingBuddy {
                                     state.buddy_manager.find_failed();
                                     info!("Cancelled buddy search: HighID proves TCP is open");
                                 }
+                            } else if state.firewall_checker.tcp_status()
+                                != crate::network::kad::firewall::FirewallStatus::Open
+                            {
+                                info!("HighID from server confirms TCP port is open (updating tcp_status)");
                             }
+                            state.firewall_checker.handle_tcp_connect_back();
                             state.stats.firewalled = state.firewalled;
                             state.stats.tcp_status = format!("{:?}", state.firewall_checker.tcp_status());
                             state.stats.udp_status = format!("{:?}", state.firewall_checker.udp_status());
@@ -18156,29 +18218,43 @@ pub async fn start_network(
                                     }
                                 }
                             }
-                        } else if is_low && session.server_reported_ip != 0 {
-                            // eMule ServerSocket OP_IDCHANGE: for a LowID client the
-                            // server reports our real public IP at offset 12 —
-                            // `if (IsLowID(clientid) && dwServerReportedIP != 0)
-                            // SetPublicIP(dwServerReportedIP)`. LowID keeps us
-                            // firewalled, so unlike the HighID branch we do NOT touch
-                            // firewalled status; this only teaches us our external IP,
-                            // which a LowID node otherwise never learns from the
-                            // server side. server_reported_ip is already gated to a
-                            // non-LowID-range value when parsed.
-                            let ext_ip = Ipv4Addr::from(session.server_reported_ip.to_le_bytes());
-                            if !ext_ip.is_unspecified()
-                                && !ext_ip.is_loopback()
-                                && !ext_ip.is_private()
-                                && state.external_ip.is_none()
-                            {
-                                set_external_ip(&mut state, Some(ext_ip));
-                                state.stats.external_ip = ext_ip.to_string();
-                                info!("External IP set from server LowID report");
-                                // Trusted single-reporter path, same as the HighID
-                                // case above (records the confirmed external IP
-                                // without the KAD distinct-/24 vote requirement).
-                                state.firewall_checker.handle_server_highid_response(ext_ip);
+                        } else if is_low {
+                            // LowID: server could not connect back — TCP is firewalled.
+                            state.firewalled = true;
+                            state.firewalled_shared.store(true, std::sync::atomic::Ordering::Relaxed);
+                            state.firewall_checker.note_tcp_firewalled();
+                            update_publish_manager_state(&mut state);
+                            state.stats.firewalled = true;
+                            state.stats.tcp_status = format!("{:?}", state.firewall_checker.tcp_status());
+                            state.stats.udp_status = format!("{:?}", state.firewall_checker.udp_status());
+                            let _ = app_handle.emit("firewall-status", serde_json::json!({
+                                "firewalled": state.firewalled,
+                                "external_ip": state.stats.external_ip,
+                                "tcp_status": state.stats.tcp_status,
+                                "udp_status": state.stats.udp_status,
+                            }));
+                            if session.server_reported_ip != 0 {
+                                // eMule ServerSocket OP_IDCHANGE: for a LowID client the
+                                // server reports our real public IP at offset 12 —
+                                // `if (IsLowID(clientid) && dwServerReportedIP != 0)
+                                // SetPublicIP(dwServerReportedIP)`. LowID keeps us
+                                // firewalled, so unlike the HighID branch we do NOT touch
+                                // firewalled status here beyond note_tcp_firewalled above;
+                                // this only teaches us our external IP.
+                                let ext_ip = Ipv4Addr::from(session.server_reported_ip.to_le_bytes());
+                                if !ext_ip.is_unspecified()
+                                    && !ext_ip.is_loopback()
+                                    && !ext_ip.is_private()
+                                    && state.external_ip.is_none()
+                                {
+                                    set_external_ip(&mut state, Some(ext_ip));
+                                    state.stats.external_ip = ext_ip.to_string();
+                                    info!("External IP set from server LowID report");
+                                    // Trusted single-reporter path, same as the HighID
+                                    // case above (records the confirmed external IP
+                                    // without the KAD distinct-/24 vote requirement).
+                                    state.firewall_checker.handle_server_highid_response(ext_ip);
+                                }
                             }
                         }
 
@@ -18386,8 +18462,11 @@ pub async fn start_network(
                         }
                     }
                     Ok(ServerConnectResult { ip, port, result: Err(e), .. }) => {
-                        debug!("Failed to connect to server {ip}:{port}: {e}");
-                        emit_server_log(&app_handle, &format!("Connection failed: {e}"));
+                        info!("Failed to connect to server {ip}:{port}: {e} — will try another server");
+                        emit_server_log(
+                            &app_handle,
+                            &format!("Connection failed ({e}); trying next server..."),
+                        );
                         state.server_reconnect_failures = state.server_reconnect_failures.saturating_add(1);
                         *shared_server_addr.write().await = None;
                         state.server_list.record_failure(&ip, port);
@@ -18395,6 +18474,10 @@ pub async fn start_network(
                         let _ = state.server_list.save_server_met(&met_path);
                         state.stats.server_status = "disconnected".to_string();
                         let _ = app_handle.emit("server-status-changed", serde_json::json!({ "status": "disconnected" }));
+                        // Keep `server_last_connect_attempt` so the reconnect
+                        // backoff below still applies. Per-server cooldown already
+                        // excludes this host, so the next eligible server is tried
+                        // after backoff_secs — not on the very next 1s tick.
                     }
                     Err(e) => {
                         warn!("Server connection task panicked: {e}");
@@ -19322,7 +19405,12 @@ pub async fn start_network(
                             // (see the sweep that consumes it), never assert
                             // it, so this can't override a FirewallChecker
                             // determination in the other direction.
-                            state.firewalled_shared.store(false, std::sync::atomic::Ordering::Relaxed);
+                            // Do not clear while the ed2k server has us on
+                            // LowID — that assignment is authoritative until
+                            // the server gives HighID.
+                            if !state.low_id {
+                                state.firewalled_shared.store(false, std::sync::atomic::Ordering::Relaxed);
+                            }
                         }
                         // Mirror the startup emission so the UI can toast a
                         // recovery ("forwarding restored") or a loss ("mapping
@@ -20833,12 +20921,48 @@ pub async fn start_network(
                     .external_ip
                     .map(|ip| ip.to_string())
                     .unwrap_or_default();
+                let connect_back = state
+                    .tcp_connect_back_shared
+                    .swap(false, std::sync::atomic::Ordering::Relaxed);
                 let fw_shared = state.firewalled_shared.load(std::sync::atomic::Ordering::Relaxed);
-                if state.firewalled && !fw_shared {
+                let mut tcp_promoted = false;
+                if state.low_id {
+                    if !fw_shared {
+                        state.firewalled_shared.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    if !state.firewalled {
+                        state.firewalled = true;
+                        state.firewall_checker.note_tcp_firewalled();
+                    }
+                } else if connect_back {
                     state.firewalled = false;
+                    state.firewalled_shared.store(false, std::sync::atomic::Ordering::Relaxed);
                     state.firewall_checker.handle_tcp_connect_back();
+                    tcp_promoted = true;
+                } else if state.firewalled && !fw_shared {
+                    // UPnP optimism only — do not mark tcp_status Open.
+                    state.firewalled = false;
                 }
                 state.stats.firewalled = state.firewalled;
+                // Keep polled NetworkStats in lockstep with the checker.
+                // Connect-backs used to flip the checker to Open while leaving
+                // stats.tcp_status as "Unknown", so the UI poll briefly
+                // clobbered a correct firewall-status event back to Unknown.
+                state.stats.tcp_status =
+                    format!("{:?}", state.firewall_checker.tcp_status());
+                state.stats.udp_status =
+                    format!("{:?}", state.firewall_checker.udp_status());
+                if tcp_promoted {
+                    let _ = app_handle.emit(
+                        "firewall-status",
+                        serde_json::json!({
+                            "firewalled": state.firewalled,
+                            "external_ip": state.stats.external_ip,
+                            "tcp_status": state.stats.tcp_status,
+                            "udp_status": state.stats.udp_status,
+                        }),
+                    );
+                }
                 update_publish_manager_state(&mut state);
 
                 let cached_s: Vec<KadSearchInfo> = state
@@ -25723,15 +25847,20 @@ async fn handle_udp_packet_inner(
             }
 
             if state.external_ip.is_some() {
-                let tcp_status = state.firewall_checker.tcp_status();
-                let udp_status = state.firewall_checker.udp_status();
+                // Sync before emit so a FirewalledRes that arrives after TCP
+                // connect-backs already proved Open doesn't push a stale
+                // stats.tcp_status string (often still "Unknown") to the UI.
+                state.stats.tcp_status =
+                    format!("{:?}", state.firewall_checker.tcp_status());
+                state.stats.udp_status =
+                    format!("{:?}", state.firewall_checker.udp_status());
                 let _ = app_handle.emit(
                     "firewall-status",
                     serde_json::json!({
                         "firewalled": state.firewalled,
                         "external_ip": state.stats.external_ip,
-                        "tcp_status": format!("{:?}", tcp_status),
-                        "udp_status": format!("{:?}", udp_status),
+                        "tcp_status": state.stats.tcp_status,
+                        "udp_status": state.stats.udp_status,
                     }),
                 );
             }
@@ -27493,6 +27622,12 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::GetNetworkStatsSnapshot { tx } => {
+            // Always reflect the live checker — poll consumers must not see a
+            // stale "Unknown" after connect-backs / HighID already proved Open.
+            state.stats.tcp_status =
+                format!("{:?}", state.firewall_checker.tcp_status());
+            state.stats.udp_status =
+                format!("{:?}", state.firewall_checker.udp_status());
             let _ = tx.send(state.stats.clone());
         }
 
@@ -28483,35 +28618,9 @@ async fn handle_command_inner(
             // which runs once we have verified contacts (table_size >= 10).
             // Sending checks here against stale nodes.dat contacts produces
             // false Firewalled results because those contacts may be offline.
-
-            // Design decision: pressing Connect brings up a default eD2K
-            // server alongside KAD (eMule Security by default — it's the
-            // only built-in "High" priority entry, so `get_next_server`
-            // picks it first) rather than requiring a second, separate
-            // action on the Servers page. Only kick this off when we're
-            // not already connected to / mid-handshake with a server —
-            // this must never yank the user off a server they picked
-            // themselves or are already using.
-            if state.server_connection.is_none()
-                && !state.server_connected
-                && state.pending_server_connect.is_none()
-            {
-                let next = state
-                    .server_list
-                    .get_next_server()
-                    .map(|s| (s.ip.clone(), s.port));
-                if let Some((server_ip, server_port)) = next {
-                    initiate_server_connect(
-                        state,
-                        settings,
-                        app_handle,
-                        shared_server_addr,
-                        server_ip,
-                        server_port,
-                    )
-                    .await;
-                }
-            }
+            //
+            // eD2K is intentionally not started here — use the Servers page
+            // (or Settings → Auto-Connect Server) to join a server.
         }
 
         NetworkCommand::KadDisconnect => {
