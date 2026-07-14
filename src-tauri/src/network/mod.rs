@@ -490,7 +490,11 @@ async fn handle_epx_sources(
             {
                 continue;
             }
-            if crate::security::is_special_use_v4(ip) || ip.is_multicast() {
+            // Same IP policy as `inject_source_into_active_transfers`:
+            // `IpFilter::is_blocked` (bogus / optional private / ranges)
+            // plus the live banlist. Do not use unconditional
+            // `is_special_use_v4` — that ignores `block_private_ips`.
+            if state.ip_filter.is_blocked(ip) {
                 continue;
             }
             if state.banned_ips.contains(&ip) {
@@ -604,7 +608,7 @@ async fn handle_epx_sources(
     // about don't get pruned by the TTL cycle.
     let mut new_peers = false;
     for &(ip, port) in ember_peers {
-        if crate::security::is_special_use_v4(ip) {
+        if state.ip_filter.is_blocked(ip) {
             continue;
         }
         if state.banned_ips.contains(&ip) {
@@ -1128,19 +1132,17 @@ fn inject_source_into_active_transfers(
     // paths inherit them automatically without each site having to
     // duplicate the gate. Order: cheap rejections first.
     //
-    // 1. Special-use IPv4 (RFC 5735: loopback, link-local, multicast,
-    //    documentation, etc.). These are never reachable peers.
-    // 2. IP filter (`ipfilter.dat`). Drops emule-security-blocked
-    //    ranges, optionally private IPs, etc.
-    // 3. Banned IPs (live runtime banlist).
-    // 4. Reputation-banned user hashes (existing check).
-    // 5. Self-source: our own external IP+port, or our own user hash.
-    // 6. Undialable TCP port 0.
+    // 1. IP filter (`IpFilter::is_blocked`): always rejects bogus /
+    //    unroutable space; rejects RFC1918/CGNAT when
+    //    `block_private_ips` is on; rejects `ipfilter.dat` ranges when
+    //    the filter is enabled. Do not add a separate
+    //    `is_special_use_v4` gate here — that would permanently deny
+    //    LAN peers even when the user turned private blocking off.
+    // 2. Banned IPs (live runtime banlist).
+    // 3. Reputation-banned user hashes (existing check).
+    // 4. Self-source: our own external IP+port, or our own user hash.
+    // 5. Undialable TCP port 0.
     if let Some(v4) = parsed_ip {
-        if crate::security::is_special_use_v4(v4) || v4.is_multicast() {
-            stats.dropped_full += transfer_ids.len();
-            return stats;
-        }
         if state.ip_filter.is_blocked(v4) {
             stats.dropped_full += transfer_ids.len();
             return stats;
@@ -3816,17 +3818,15 @@ fn emit_search_results(
 /// Return true if `ip` is safe to surface as a candidate download source
 /// in a streamed search result. Mirrors the gate used at
 /// `inject_source_into_active_transfers` so the search UI never lists IPs
-/// that we'd refuse to dial: special-use ranges, multicast, the user's
-/// IP filter, and the live runtime banlist.
+/// that we'd refuse to dial: the user's IP filter (bogus always; private
+/// when `block_private_ips` is on; `ipfilter.dat` ranges when enabled)
+/// and the live runtime banlist.
 ///
 /// Uses the readonly form of `IpFilter::is_blocked` because we only have
 /// `&NetworkState` at the call sites; the per-IP cache miss cost is
 /// negligible compared to the per-result string formatting we're already
 /// doing on the same path.
 fn is_search_source_safe(state: &NetworkState, ip: Ipv4Addr) -> bool {
-    if crate::security::is_special_use_v4(ip) || ip.is_multicast() {
-        return false;
-    }
     if state.ip_filter.is_blocked_readonly(ip) {
         return false;
     }
@@ -5264,6 +5264,9 @@ fn apply_network_settings(
         state
             .ip_filter
             .update_shared_snapshot(&state.shared_ip_filter);
+        if new_settings.ip_filter_enabled {
+            state.routing_table.evict_filtered_contacts();
+        }
     }
     if state.ip_filter.blocks_private() != new_settings.block_private_ips {
         state
@@ -5272,6 +5275,11 @@ fn apply_network_settings(
         state
             .ip_filter
             .update_shared_snapshot(&state.shared_ip_filter);
+        // Keep KAD contact admission in sync with the live setting and
+        // drop any contacts that the newly-enabled private block rejects.
+        state
+            .routing_table
+            .set_block_private_ips(new_settings.block_private_ips);
     }
     if settings.ember_native_enabled && !new_settings.ember_native_enabled {
         state.ember_transport.cleanup_all();
@@ -7848,7 +7856,10 @@ pub async fn start_network(
                 }
 
                 if let DownloadEvent::EmberPeerDiscovered { ip, tcp_port } = event {
-                    if !crate::security::is_special_use_v4(ip) && !ip.is_multicast() {
+                    // Respect `block_private_ips` / filter ranges via
+                    // `is_blocked_readonly` so LAN Ember peers are
+                    // learnable when the user opts into private dialing.
+                    if !state.ip_filter.is_blocked_readonly(ip) {
                         if record_known_ember_peer(&mut state.known_ember_peers, ip, tcp_port) {
                             state.stats.ember_peers = state.known_ember_peers.len() as u32;
                             state.ember_payload_dirty = true;
@@ -8573,7 +8584,7 @@ pub async fn start_network(
                 }
 
                 if let UploadEventKind::EmberPeerDiscovered { ip, tcp_port } = event.kind {
-                    if !crate::security::is_special_use_v4(ip) && !ip.is_multicast() {
+                    if !state.ip_filter.is_blocked_readonly(ip) {
                         if record_known_ember_peer(&mut state.known_ember_peers, ip, tcp_port) {
                             state.stats.ember_peers = state.known_ember_peers.len() as u32;
                             state.ember_payload_dirty = true;
@@ -15903,9 +15914,7 @@ pub async fn start_network(
                                                             src.user_hash,
                                                             Some(uh) if uh != [0u8; 16] && uh == state.user_hash
                                                         );
-                                                    if crate::security::is_special_use_v4(v4)
-                                                        || v4.is_multicast()
-                                                        || state.ip_filter.is_blocked(v4)
+                                                    if state.ip_filter.is_blocked(v4)
                                                         || state.banned_ips.contains(&v4)
                                                         || src.port == 0
                                                         || is_self
@@ -16642,19 +16651,14 @@ pub async fn start_network(
                                             );
                                         } else {
                                             // HighID source — apply
-                                            // the same IP filter /
-                                            // banned / special-use
-                                            // gate as
-                                            // `inject_source_into_active_transfers`
+                                            // Same IP filter / ban gate
+                                            // as `inject_source_into_active_transfers`
                                             // BEFORE registering, so
                                             // banned IPs don't end up
                                             // in the source manager
                                             // (where they would
                                             // pollute SX out and
                                             // future retries).
-                                            if crate::security::is_special_use_v4(*ip) || ip.is_multicast() {
-                                                continue;
-                                            }
                                             if state.ip_filter.is_blocked(*ip) {
                                                 continue;
                                             }
@@ -18903,9 +18907,7 @@ pub async fn start_network(
                     let mut candidates: Vec<((Ipv4Addr, u16), std::time::Instant)> = state
                         .known_ember_peers
                         .iter()
-                        .filter(|((ip, _), _)| {
-                            !crate::security::is_special_use_v4(*ip) && !ip.is_multicast()
-                        })
+                        .filter(|((ip, _), _)| !state.ip_filter.is_blocked_readonly(*ip))
                         .map(|((ip, port), ts)| ((*ip, *port), *ts))
                         .collect();
                     candidates.sort_by(|a, b| b.1.cmp(&a.1));
@@ -25228,37 +25230,28 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::ReloadIpFilter { path } => {
-            // Persist the imported filter to ipfilter.dat so it loads on next startup.
+            // Persist the imported filter to ipfilter.dat so it loads on
+            // next startup, then parse on a blocking-pool thread.
             //
-            // The whole sequence below (stat, up-to-50MB copy, then a
-            // line-by-line parse of the destination file) is synchronous
-            // filesystem I/O that would otherwise run inline on the
-            // network task, stalling all UDP/TCP/IPC processing for its
-            // duration. It's a rare, manually-triggered admin action
-            // (import a filter list), but there's no reason for it to
-            // share the hang-prone anti-pattern the rest of this file was
-            // hardened against — move it to a blocking-pool thread. We
-            // temporarily swap `state.ip_filter` out for an equivalent
-            // empty placeholder (same enabled/block_private flags) for
-            // the duration; nothing else can observe or mutate `state`
-            // while this command handler is still awaiting, since the
-            // network task processes one command at a time.
+            // IMPORTANT: leave `state.ip_filter` in place for the entire
+            // await. The network `select!` still drains UDP/TCP while we
+            // wait, so swapping in an empty placeholder would fail-open
+            // for every packet that arrives mid-reload. Load into a
+            // fresh filter on the side and only replace on success; on
+            // I/O failure or task panic keep the previous ranges.
             let default_path = state.data_dir.join("ipfilter.dat");
-            let placeholder = IpFilter::new(
-                state.ip_filter.is_enabled(),
-                state.ip_filter.blocks_private(),
-            );
-            let mut filter = std::mem::replace(&mut state.ip_filter, placeholder);
+            let enabled = state.ip_filter.is_enabled();
+            let block_private = state.ip_filter.blocks_private();
             let load_path = default_path.clone();
-            filter = tokio::task::spawn_blocking(move || {
+            let loaded = tokio::task::spawn_blocking(move || {
                 if path != load_path {
-                    // Defense in depth: `import_ipfilter_file` (the only caller
-                    // that can supply an arbitrary local path rather than one
-                    // of our own already-size-capped downloads) enforces this
-                    // same limit before sending this command, but a `path` !=
-                    // `default_path` can in principle reach this handler from
-                    // any future caller too. Stat-and-reject here so this
-                    // command can never be tricked into copying an unbounded
+                    // Defense in depth: `import_ipfilter_file` (the only
+                    // caller that can supply an arbitrary local path)
+                    // enforces this same limit before sending this
+                    // command, but a `path` != `default_path` can in
+                    // principle reach this handler from any future
+                    // caller too. Stat-and-reject here so this command
+                    // can never be tricked into copying an unbounded
                     // file into ipfilter.dat regardless of caller.
                     const MAX_IMPORTED_IPFILTER_BYTES: u64 = 50 * 1024 * 1024;
                     match std::fs::metadata(&path) {
@@ -25269,53 +25262,63 @@ async fn handle_command_inner(
                                 meta.len(),
                                 MAX_IMPORTED_IPFILTER_BYTES / (1024 * 1024)
                             );
+                            return None;
                         }
                         Ok(_) => {
                             if let Err(e) = std::fs::copy(&path, &load_path) {
                                 warn!("Failed to persist IP filter to {:?}: {}", load_path, e);
-                            } else {
-                                info!("Persisted imported IP filter to {:?}", load_path);
+                                return None;
                             }
+                            info!("Persisted imported IP filter to {:?}", load_path);
                         }
                         Err(e) => {
                             warn!("Failed to stat IP filter import path {:?}: {}", path, e);
+                            return None;
                         }
                     }
                 }
-                // Load from the (now updated) default path. A failed read
-                // (missing file, I/O error, corrupt header) leaves `filter`
-                // untouched — see `IpFilter::load_from_file` — so the
-                // previous ranges keep protecting the user instead of the
-                // reload silently emptying the filter.
-                match filter.load_from_file(&load_path) {
-                    Some(n) => info!("ReloadIpFilter: parsed {n} ranges from {load_path:?}"),
-                    None => warn!(
-                        "ReloadIpFilter: failed to read {load_path:?}; keeping the previous {} ranges",
-                        filter.range_count()
-                    ),
+                let mut fresh = IpFilter::new(enabled, block_private);
+                match fresh.load_from_file(&load_path) {
+                    Some(n) => {
+                        info!("ReloadIpFilter: parsed {n} ranges from {load_path:?}");
+                        Some(fresh)
+                    }
+                    None => {
+                        warn!(
+                            "ReloadIpFilter: failed to read {load_path:?}; keeping the previous filter"
+                        );
+                        None
+                    }
                 }
-                filter
             })
-            .await
-            .unwrap_or_else(|e| {
-                error!("ReloadIpFilter background task panicked: {e}");
-                IpFilter::new(state.ip_filter.is_enabled(), state.ip_filter.blocks_private())
-            });
-            state.ip_filter = filter;
-            state
-                .ip_filter
-                .update_shared_snapshot(&state.shared_ip_filter);
-            info!(
-                "Reloaded IP filter: {} ranges",
-                state.ip_filter.range_count(),
-            );
-            // Purge servers now blocked by the updated filter
-            if settings.filter_servers_by_ip {
-                let removed = state.server_list.remove_filtered(&mut state.ip_filter);
-                if removed > 0 {
-                    let met_path = state.data_dir.join("server.met");
-                    let _ = state.server_list.save_server_met(&met_path);
-                    info!("Removed {removed} servers blocked by updated IP filter");
+            .await;
+            match loaded {
+                Ok(Some(fresh)) => {
+                    state.ip_filter = fresh;
+                    state
+                        .ip_filter
+                        .update_shared_snapshot(&state.shared_ip_filter);
+                    state.routing_table.evict_filtered_contacts();
+                    info!(
+                        "Reloaded IP filter: {} ranges",
+                        state.ip_filter.range_count(),
+                    );
+                    if settings.filter_servers_by_ip {
+                        let removed = state.server_list.remove_filtered(&mut state.ip_filter);
+                        if removed > 0 {
+                            let met_path = state.data_dir.join("server.met");
+                            let _ = state.server_list.save_server_met(&met_path);
+                            info!("Removed {removed} servers blocked by updated IP filter");
+                        }
+                    }
+                }
+                Ok(None) => {
+                    // Keep previous ranges — load/copy failed closed.
+                }
+                Err(e) => {
+                    error!(
+                        "ReloadIpFilter background task panicked: {e}; keeping the previous filter"
+                    );
                 }
             }
         }
@@ -25335,6 +25338,7 @@ async fn handle_command_inner(
                 state
                     .ip_filter
                     .update_shared_snapshot(&state.shared_ip_filter);
+                state.routing_table.evict_filtered_contacts();
                 info!(
                     "Added IP filter range {start_ip} - {end_ip}, total ranges: {}",
                     state.ip_filter.range_count()
@@ -25372,36 +25376,54 @@ async fn handle_command_inner(
             // effect after a manual re-import or a restart-while-enabled.
             // Load the persisted file now (only when we have no ranges, so
             // a Reload/import that already populated them isn't re-read).
+            //
+            // Keep the live filter in place during the await so UDP/TCP
+            // arms don't see an empty placeholder if the load task panics.
             if enabled && state.ip_filter.range_count() == 0 {
                 let default_path = state.data_dir.join("ipfilter.dat");
                 if default_path.exists() {
                     let block_private = state.ip_filter.blocks_private();
-                    let mut filter = std::mem::replace(
-                        &mut state.ip_filter,
-                        IpFilter::new(enabled, block_private),
-                    );
-                    filter = tokio::task::spawn_blocking(move || {
-                        if filter.load_from_file(&default_path).is_none() {
-                            warn!("Failed to read ipfilter.dat while enabling the filter; it will stay empty until a valid file is available");
+                    let loaded = tokio::task::spawn_blocking(move || {
+                        let mut fresh = IpFilter::new(true, block_private);
+                        match fresh.load_from_file(&default_path) {
+                            Some(n) => {
+                                info!(
+                                    "SetIpFilterEnabled: parsed {n} ranges from {default_path:?}"
+                                );
+                                Some(fresh)
+                            }
+                            None => {
+                                warn!(
+                                    "Failed to read ipfilter.dat while enabling the filter; ranges stay empty until a valid file is available"
+                                );
+                                None
+                            }
                         }
-                        filter
                     })
-                    .await
-                    .unwrap_or_else(|e| {
-                        error!("SetIpFilterEnabled load task failed: {e}");
-                        IpFilter::new(enabled, block_private)
-                    });
-                    let n = filter.range_count();
-                    state.ip_filter = filter;
-                    info!(
-                        "Loaded {n} IP filter entries on enable ({} ranges after merge)",
-                        state.ip_filter.range_count()
-                    );
+                    .await;
+                    match loaded {
+                        Ok(Some(fresh)) => {
+                            state.ip_filter = fresh;
+                            info!(
+                                "Loaded {} IP filter entries on enable",
+                                state.ip_filter.range_count()
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            error!(
+                                "SetIpFilterEnabled load task panicked: {e}; keeping previous filter"
+                            );
+                        }
+                    }
                 }
             }
             state
                 .ip_filter
                 .update_shared_snapshot(&state.shared_ip_filter);
+            if enabled {
+                state.routing_table.evict_filtered_contacts();
+            }
             info!("IP filter enabled: {enabled}");
         }
 
@@ -25410,6 +25432,7 @@ async fn handle_command_inner(
             state
                 .ip_filter
                 .update_shared_snapshot(&state.shared_ip_filter);
+            state.routing_table.set_block_private_ips(block_private);
             info!("Block private IPs: {block_private}");
         }
 

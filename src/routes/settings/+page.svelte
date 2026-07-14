@@ -1675,7 +1675,7 @@
 
           <div class="field toggle-row">
             <div class="toggle-info">
-              <span class="toggle-title">{m.settings_ip_filter_label()} <span class="restart-badge">{m.settings_restart_badge()}</span></span>
+              <span class="toggle-title">{m.settings_ip_filter_label()}</span>
               <span class="hint">{m.settings_ip_filter_hint()}</span>
             </div>
             <ToggleSwitch bind:checked={settings.ip_filter_enabled} ariaLabel={m.settings_ip_filter_label()} />
@@ -1694,7 +1694,7 @@
 
           <div class="field toggle-row">
             <div class="toggle-info">
-              <span class="toggle-title">{m.settings_filter_incoming_label()} <span class="restart-badge">{m.settings_restart_badge()}</span></span>
+              <span class="toggle-title">{m.settings_filter_incoming_label()}</span>
               <span class="hint">{m.settings_filter_incoming_hint()}</span>
             </div>
             <ToggleSwitch bind:checked={settings.filter_incoming_connections} ariaLabel={m.settings_filter_incoming_label()} />
@@ -1702,7 +1702,7 @@
 
           <div class="field toggle-row">
             <div class="toggle-info">
-              <span class="toggle-title">{m.settings_block_private_label()} <span class="restart-badge">{m.settings_restart_badge()}</span></span>
+              <span class="toggle-title">{m.settings_block_private_label()}</span>
               <span class="hint">{m.settings_block_private_hint()}</span>
             </div>
             <ToggleSwitch bind:checked={settings.block_private_ips} ariaLabel={m.settings_block_private_label()} />

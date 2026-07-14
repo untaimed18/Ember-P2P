@@ -1806,6 +1806,19 @@ pub async fn start_upload_server(
                             },
                         };
 
+                        // Always reject truly-unroutable bogus IPs (loopback,
+                        // multicast, documentation, class-E, …) even when
+                        // "filter incoming" is off. That toggle only skips
+                        // `ipfilter.dat` ranges and optional private/LAN
+                        // blocking — VPN hosting ranges are never classified
+                        // as bogus, so this does not reopen the VPN breakage
+                        // that motivated the default-off policy.
+                        if crate::security::is_bogus_v4(peer_ipv4) {
+                            debug!("Rejecting incoming TCP from bogus IP {peer_addr}");
+                            drop(stream);
+                            continue;
+                        }
+
                         if server.filter_incoming_connections.load(std::sync::atomic::Ordering::Relaxed) {
                             // Fail closed on poisoned lock: if we can't read
                             // the filter snapshot we refuse the connection
