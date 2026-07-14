@@ -1801,6 +1801,7 @@ mod tests {
             udp_pending: false,
             ember_pending: false,
             udp_search_deadline: 0,
+            udp_search_sent_ips: HashSet::new(),
             file_type_filter: None,
             keywords: Vec::new(),
             server_ip: None,
@@ -3300,12 +3301,15 @@ struct ActiveSearchRequest {
     /// counter resets to 0 every time a non-empty `SearchResult` batch
     /// arrives (see the `ServerUdpResponse::SearchResult` handler) so a
     /// straggler server can still contribute — intentional — but without
-    /// an absolute ceiling a server (or a spoofed sender, since UDP
-    /// search replies carry no auth) that keeps trickling results
+    /// an absolute ceiling a server that keeps trickling results
     /// indefinitely would keep `udp_pending`, and so the whole search's
     /// `search-complete` event, alive forever. Only meaningful while
     /// `udp_pending` is true; see `UDP_SEARCH_HARD_DEADLINE_BUFFER_SECS`.
     udp_search_deadline: i64,
+    /// IPv4s we successfully sent an `OP_GLOBSEARCHREQ*` to for this
+    /// request (eMule `SentUDPRequestNotification`). UDP search replies
+    /// from any other IP are ignored as unsolicited / late.
+    udp_search_sent_ips: HashSet<Ipv4Addr>,
     file_type_filter: Option<String>,
     /// Keywords extracted from the original query, used by the spam-filter
     /// scorer when streamed results arrive from the network event loop.
@@ -14539,8 +14543,19 @@ pub async fn start_network(
                         // dead server. Log at debug to avoid spam; aggregate
                         // visibility is in the periodic discovery health log.
                         debug!("UDP global search send_to {addr} failed: {e}");
-                    } else if state.udp_search_queue.is_empty() {
-                        debug!("UDP global search: all servers queried");
+                    } else {
+                        // eMule SentUDPRequestNotification: only accept replies
+                        // from IPs we successfully queried this search.
+                        if let (Some(active), IpAddr::V4(ip)) =
+                            (state.active_search_request.as_mut(), addr.ip())
+                        {
+                            if active.udp_pending {
+                                active.udp_search_sent_ips.insert(ip);
+                            }
+                        }
+                        if state.udp_search_queue.is_empty() {
+                            debug!("UDP global search: all servers queried");
+                        }
                     }
                 }
                 }).catch_unwind().await;
@@ -17798,6 +17813,9 @@ pub async fn start_network(
                         let resp_addr = match &resp {
                             ServerUdpResponse::StatusResponse { addr, .. }
                             | ServerUdpResponse::FoundSources { addr, .. } => Some(*addr),
+                            // Search replies are recorded only after the
+                            // sent-IP allowlist check below (eMule
+                            // ProcessUDPSearchAnswer).
                             ServerUdpResponse::SearchResult { .. } => None,
                         };
                         if let Some(a) = resp_addr {
@@ -18123,9 +18141,27 @@ pub async fn start_network(
                             }
                           } // end `for (file_hash, sources) in files`
                         }
-                        ServerUdpResponse::SearchResult { results } => {
-                            if !results.is_empty() {
-                                debug!("UDP search returned {} results", results.len());
+                        ServerUdpResponse::SearchResult { addr, results } => {
+                            // eMule ProcessUDPSearchAnswer: ignore replies from
+                            // IPs we did not successfully UDP-query this search.
+                            let src_ip = match addr.ip() {
+                                IpAddr::V4(ip) => Some(ip),
+                                _ => None,
+                            };
+                            let allowed = state.active_search_request.as_ref().is_some_and(|a| {
+                                a.udp_pending
+                                    && src_ip.is_some_and(|ip| a.udp_search_sent_ips.contains(&ip))
+                            });
+                            if !allowed {
+                                debug!(
+                                    "Ignoring unsolicited or late UDP search result from {addr}"
+                                );
+                            } else if !results.is_empty() {
+                                let ip_str = addr.ip().to_string();
+                                let tcp_port = addr.port().saturating_sub(4);
+                                state.server_list.record_udp_reply(&ip_str, tcp_port);
+
+                                debug!("UDP search returned {} results from {addr}", results.len());
                                 let search_results: Vec<SearchResult> = results.iter().map(|sr| {
                                     let hash_hex = hex::encode(sr.file_hash);
                                     let extension = sr.file_name
@@ -18141,6 +18177,13 @@ pub async fn start_network(
                                         }
                                     } else {
                                         Vec::new()
+                                    };
+                                    // Prefer advertised FT_SOURCES; fall back to 1
+                                    // so a hit without the tag still ranks as present.
+                                    let availability = if sr.source_count > 0 {
+                                        sr.source_count
+                                    } else {
+                                        1
                                     };
                                     SearchResult {
                                         file: FileInfo {
@@ -18159,7 +18202,7 @@ pub async fn start_network(
                                             alltime_requests: 0,
                                             alltime_accepted: 0,
                                             alltime_transferred: 0,
-                                            complete_sources: 0,
+                                            complete_sources: sr.complete_source_count,
                                             folder: String::new(),
                                             shared: false,
                                             shared_kad: false,
@@ -18167,7 +18210,7 @@ pub async fn start_network(
                                         },
                                         peer_id: format!("{}:{}", sr.client_id, sr.client_port),
                                         peer_name: String::new(),
-                                        availability: 1,
+                                        availability,
                                         file_type: crate::search::index::infer_file_type(&extension),
                                         source_addresses,
                                         rating: sr.rating,
@@ -26469,6 +26512,7 @@ async fn handle_command_inner(
                 udp_pending: false,
                 ember_pending: false,
                 udp_search_deadline: 0,
+                udp_search_sent_ips: HashSet::new(),
                 file_type_filter: file_type_filter.clone(),
                 keywords: Vec::new(),
                 server_ip: state.server_addr.map(|a| a.ip().to_string()),
@@ -26557,12 +26601,20 @@ async fn handle_command_inner(
 
             // --- UDP global search ---
             if run_udp {
-                let servers = state.server_list.servers();
+                let uses_64bit_search =
+                    kad::messages::search_expression_uses_64bit(&search_expr);
+                let connected_addr = state.server_addr;
+                let servers = state.server_list.servers().to_vec();
                 let mut dropped = 0usize;
-                for server in servers {
-                    if let Some(pkt) =
-                        ServerUdpSocket::build_global_search_packet(server, &search_expr)
-                    {
+                for server in &servers {
+                    if !is_eligible_udp_server(server, connected_addr) {
+                        continue;
+                    }
+                    if let Some(pkt) = ServerUdpSocket::build_global_search_packet(
+                        server,
+                        &search_expr,
+                        uses_64bit_search,
+                    ) {
                         if state.udp_search_queue.len() >= MAX_UDP_SEARCH_QUEUE {
                             dropped = dropped.saturating_add(1);
                             continue;

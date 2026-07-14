@@ -210,6 +210,10 @@ impl ServerUdpSocket {
     ///  - `OP_GLOBSEARCHREQ2`: server supports EXT_GETFILES
     ///  - `OP_GLOBSEARCHREQ`:  fallback for all other servers
     ///
+    /// When `uses_64bit_search` is true (search tree contains type-`0x08`
+    /// size leaves), servers lacking `SRV_UDPFLG_LARGEFILES` are skipped —
+    /// same gate as eMule's `m_b64BitSearchPacket && !SupportsLargeFilesUDP()`.
+    ///
     /// Live caller: the search-command handler in `network/mod.rs`
     /// fans this out to every eligible server in the list when a
     /// keyword search runs (`run_udp` branch). Replies arrive as
@@ -218,12 +222,19 @@ impl ServerUdpSocket {
     pub fn build_global_search_packet(
         server: &ServerEntry,
         search_expr: &[u8],
+        uses_64bit_search: bool,
     ) -> Option<(Vec<u8>, SocketAddr)> {
         let udp_port = server.port.checked_add(4)?;
         let addr: SocketAddr = format!("{}:{}", server.ip, udp_port).parse().ok()?;
 
         let ext_getfiles = (server.udp_flags & SRV_UDPFLG_EXT_GETFILES) != 0;
         let large_files = (server.udp_flags & SRV_UDPFLG_LARGEFILES) != 0;
+
+        // eMule SearchResultsWnd.cpp: skip UDP targets that cannot parse a
+        // 64-bit size constraint in the shared search tree.
+        if uses_64bit_search && !large_files {
+            return None;
+        }
 
         let plain = if ext_getfiles && large_files {
             // OP_GLOBSEARCHREQ3: prepend a tag set with SRVCAP_UDP_NEWTAGS_LARGEFILES
@@ -514,6 +525,7 @@ pub enum ServerUdpResponse {
         files: Vec<([u8; 16], Vec<(Ipv4Addr, u16, u32)>)>,
     },
     SearchResult {
+        addr: SocketAddr,
         results: Vec<ServerSearchResult>,
     },
 }
@@ -525,6 +537,10 @@ pub struct ServerSearchResult {
     pub client_port: u16,
     pub file_name: String,
     pub file_size: u64,
+    /// FT_SOURCES (0x15). `0` when the server omitted the tag.
+    pub source_count: u32,
+    /// FT_COMPLETE_SOURCES (0x30). `0` when omitted.
+    pub complete_source_count: u32,
     pub rating: Option<u8>,
     pub comment: Option<String>,
     pub media: crate::types::MediaMetadata,
@@ -689,7 +705,7 @@ fn parse_server_udp_response(data: &[u8], addr: SocketAddr) -> Option<ServerUdpR
                 files: all_files,
             })
         }
-        OP_GLOBSEARCHRES => parse_search_results(payload),
+        OP_GLOBSEARCHRES => parse_search_results(payload, addr),
         _ => {
             debug!(
                 "Server UDP: unhandled opcode 0x{opcode:02X} ({} bytes) from {addr}",
@@ -759,11 +775,16 @@ fn apply_udp_uint_tag(
     name_id: u8,
     name: Option<&str>,
     value: u64,
+    source_count: &mut u32,
+    complete_source_count: &mut u32,
     rating: &mut Option<u8>,
     media: &mut crate::types::MediaMetadata,
 ) {
     let is = |n: &str| name == Some(n);
     match name_id {
+        // FT_SOURCES / FT_COMPLETE_SOURCES — same ids as TCP OP_SEARCHRESULT.
+        0x15 => *source_count = value.min(u32::MAX as u64) as u32,
+        0x30 => *complete_source_count = value.min(u32::MAX as u64) as u32,
         0xD3 if value > 0 => media.duration = Some(value as u32),
         0xD4 if value > 0 => media.bitrate = Some(value as u32),
         // eMule file ratings are 0..=5; clamp rather than `as u8`-truncate so a
@@ -793,6 +814,8 @@ fn read_udp_search_tag(
     payload: &[u8],
     file_name: &mut String,
     file_size: &mut u64,
+    source_count: &mut u32,
+    complete_source_count: &mut u32,
     rating: &mut Option<u8>,
     comment: &mut Option<String>,
     media: &mut crate::types::MediaMetadata,
@@ -875,7 +898,15 @@ fn read_udp_search_tag(
                 match name_id {
                     0x02 => *file_size = (*file_size & 0xFFFF_FFFF_0000_0000) | v as u64,
                     0x3A => *file_size = (*file_size & 0x0000_0000_FFFF_FFFF) | ((v as u64) << 32),
-                    _ => apply_udp_uint_tag(name_id, tag_name, v as u64, rating, media),
+                    _ => apply_udp_uint_tag(
+                        name_id,
+                        tag_name,
+                        v as u64,
+                        source_count,
+                        complete_source_count,
+                        rating,
+                        media,
+                    ),
                 }
                 true
             } else {
@@ -926,7 +957,15 @@ fn read_udp_search_tag(
                 if name_id == 0x02 {
                     *file_size = v as u64;
                 } else {
-                    apply_udp_uint_tag(name_id, tag_name, v as u64, rating, media);
+                    apply_udp_uint_tag(
+                        name_id,
+                        tag_name,
+                        v as u64,
+                        source_count,
+                        complete_source_count,
+                        rating,
+                        media,
+                    );
                 }
                 true
             } else {
@@ -939,7 +978,15 @@ fn read_udp_search_tag(
                 if name_id == 0x02 {
                     *file_size = v as u64;
                 } else {
-                    apply_udp_uint_tag(name_id, tag_name, v as u64, rating, media);
+                    apply_udp_uint_tag(
+                        name_id,
+                        tag_name,
+                        v as u64,
+                        source_count,
+                        complete_source_count,
+                        rating,
+                        media,
+                    );
                 }
                 true
             } else {
@@ -966,7 +1013,15 @@ fn read_udp_search_tag(
                 if name_id == 0x02 {
                     *file_size = v;
                 } else {
-                    apply_udp_uint_tag(name_id, tag_name, v, rating, media);
+                    apply_udp_uint_tag(
+                        name_id,
+                        tag_name,
+                        v,
+                        source_count,
+                        complete_source_count,
+                        rating,
+                        media,
+                    );
                 }
                 true
             } else {
@@ -989,7 +1044,7 @@ fn read_udp_search_tag(
     }
 }
 
-fn parse_search_results(payload: &[u8]) -> Option<ServerUdpResponse> {
+fn parse_search_results(payload: &[u8], addr: SocketAddr) -> Option<ServerUdpResponse> {
     let mut cursor = Cursor::new(payload);
     let mut results = Vec::new();
 
@@ -1021,6 +1076,8 @@ fn parse_search_results(payload: &[u8]) -> Option<ServerUdpResponse> {
 
         let mut file_name = String::new();
         let mut file_size: u64 = 0;
+        let mut source_count: u32 = 0;
+        let mut complete_source_count: u32 = 0;
         let mut rating: Option<u8> = None;
         let mut comment: Option<String> = None;
         let mut media = crate::types::MediaMetadata::default();
@@ -1040,6 +1097,8 @@ fn parse_search_results(payload: &[u8]) -> Option<ServerUdpResponse> {
                 payload,
                 &mut file_name,
                 &mut file_size,
+                &mut source_count,
+                &mut complete_source_count,
                 &mut rating,
                 &mut comment,
                 &mut media,
@@ -1057,9 +1116,19 @@ fn parse_search_results(payload: &[u8]) -> Option<ServerUdpResponse> {
         // in `server.rs::parse_search_result`. Only safe to run when the
         // capped loop above stayed in sync.
         if tags_in_sync && tag_count > applied_tags {
-            let (mut d_name, mut d_size, mut d_rating, mut d_comment, mut d_media) = (
+            let (
+                mut d_name,
+                mut d_size,
+                mut d_sources,
+                mut d_complete,
+                mut d_rating,
+                mut d_comment,
+                mut d_media,
+            ) = (
                 String::new(),
                 0u64,
+                0u32,
+                0u32,
                 None,
                 None,
                 crate::types::MediaMetadata::default(),
@@ -1070,6 +1139,8 @@ fn parse_search_results(payload: &[u8]) -> Option<ServerUdpResponse> {
                     payload,
                     &mut d_name,
                     &mut d_size,
+                    &mut d_sources,
+                    &mut d_complete,
                     &mut d_rating,
                     &mut d_comment,
                     &mut d_media,
@@ -1086,6 +1157,8 @@ fn parse_search_results(payload: &[u8]) -> Option<ServerUdpResponse> {
             client_port,
             file_name,
             file_size,
+            source_count,
+            complete_source_count,
             rating,
             comment,
             media,
@@ -1099,12 +1172,24 @@ fn parse_search_results(payload: &[u8]) -> Option<ServerUdpResponse> {
         if !tags_in_sync {
             break;
         }
+
+        // eMule UDPSocket.cpp OP_GLOBSEARCHRES: multi-result datagrams may
+        // re-emit `<OP_EDONKEYPROT><OP_GLOBSEARCHRES>` between entries.
+        // Skip that optional frame header when present so both the eMule
+        // chained layout and contiguous packing (no separator) work.
+        let pos = cursor.position() as usize;
+        if pos + 2 <= payload.len()
+            && payload[pos] == OP_EDONKEYPROT
+            && payload[pos + 1] == OP_GLOBSEARCHRES
+        {
+            cursor.set_position((pos + 2) as u64);
+        }
     }
 
     if results.is_empty() {
         None
     } else {
-        Some(ServerUdpResponse::SearchResult { results })
+        Some(ServerUdpResponse::SearchResult { addr, results })
     }
 }
 
@@ -1274,7 +1359,7 @@ mod tests {
 
         let parsed = parse_server_udp_response(&packet, addr).unwrap();
         match parsed {
-            ServerUdpResponse::SearchResult { results } => {
+            ServerUdpResponse::SearchResult { results, .. } => {
                 assert_eq!(
                     results.len(),
                     2,
@@ -1289,6 +1374,111 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    fn push_minimal_search_record(packet: &mut Vec<u8>, hash: &[u8; 16], name: &[u8]) {
+        packet.extend_from_slice(hash);
+        packet.extend_from_slice(&1234u32.to_le_bytes());
+        packet.extend_from_slice(&4662u16.to_le_bytes());
+        packet.extend_from_slice(&1u32.to_le_bytes()); // tag_count
+        packet.push(0x80 | 0x02); // short-name TAGTYPE_STRING
+        packet.push(0x01); // FT_FILENAME
+        packet.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        packet.extend_from_slice(name);
+    }
+
+    #[test]
+    fn parse_search_results_handles_e3_99_chained_frames() {
+        let addr: SocketAddr = "127.0.0.1:4665".parse().unwrap();
+        let hash_a = [0xAAu8; 16];
+        let hash_b = [0xBBu8; 16];
+
+        let mut packet = vec![OP_GLOBSEARCHRES];
+        push_minimal_search_record(&mut packet, &hash_a, b"a.bin");
+        // eMule-style re-emitted frame header between results
+        packet.push(OP_EDONKEYPROT);
+        packet.push(OP_GLOBSEARCHRES);
+        push_minimal_search_record(&mut packet, &hash_b, b"b.bin");
+
+        let parsed = parse_server_udp_response(&packet, addr).unwrap();
+        match parsed {
+            ServerUdpResponse::SearchResult {
+                addr: parsed_addr,
+                results,
+            } => {
+                assert_eq!(parsed_addr, addr);
+                assert_eq!(results.len(), 2);
+                assert_eq!(results[0].file_hash, hash_a);
+                assert_eq!(results[0].file_name, "a.bin");
+                assert_eq!(results[1].file_hash, hash_b);
+                assert_eq!(results[1].file_name, "b.bin");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_search_results_reads_sources_tags() {
+        let addr: SocketAddr = "127.0.0.1:4665".parse().unwrap();
+        let hash = [0xCCu8; 16];
+        let mut packet = vec![OP_GLOBSEARCHRES];
+        packet.extend_from_slice(&hash);
+        packet.extend_from_slice(&1u32.to_le_bytes());
+        packet.extend_from_slice(&4662u16.to_le_bytes());
+        packet.extend_from_slice(&3u32.to_le_bytes()); // filename + sources + complete
+        // FT_FILENAME
+        packet.push(0x80 | 0x02);
+        packet.push(0x01);
+        let name = b"movie.mkv";
+        packet.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        packet.extend_from_slice(name);
+        // FT_SOURCES = 0x15 as UINT32
+        packet.push(0x80 | 0x03);
+        packet.push(0x15);
+        packet.extend_from_slice(&42u32.to_le_bytes());
+        // FT_COMPLETE_SOURCES = 0x30 as UINT32
+        packet.push(0x80 | 0x03);
+        packet.push(0x30);
+        packet.extend_from_slice(&7u32.to_le_bytes());
+
+        let parsed = parse_server_udp_response(&packet, addr).unwrap();
+        match parsed {
+            ServerUdpResponse::SearchResult { results, .. } => {
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0].source_count, 42);
+                assert_eq!(results[0].complete_source_count, 7);
+                assert_eq!(results[0].file_name, "movie.mkv");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_global_search_packet_selects_opcode_and_skips_64bit_without_largefiles() {
+        let mut server = ServerEntry::new("1.2.3.4".into(), 4661);
+        // Minimal string-leaf expr is fine for opcode inspection
+        let expr = b"\x01\x03\x00abc".as_slice();
+
+        // No flags → REQ
+        let (pkt, _) = ServerUdpSocket::build_global_search_packet(&server, expr, false).unwrap();
+        assert_eq!(pkt[1], OP_GLOBSEARCHREQ);
+
+        server.udp_flags = SRV_UDPFLG_EXT_GETFILES;
+        let (pkt, _) = ServerUdpSocket::build_global_search_packet(&server, expr, false).unwrap();
+        assert_eq!(pkt[1], OP_GLOBSEARCHREQ2);
+
+        server.udp_flags = SRV_UDPFLG_EXT_GETFILES | SRV_UDPFLG_LARGEFILES;
+        let (pkt, _) = ServerUdpSocket::build_global_search_packet(&server, expr, false).unwrap();
+        assert_eq!(pkt[1], OP_GLOBSEARCHREQ3);
+
+        // 64-bit expression without LARGEFILES → skipped
+        server.udp_flags = SRV_UDPFLG_EXT_GETFILES;
+        assert!(ServerUdpSocket::build_global_search_packet(&server, expr, true).is_none());
+
+        // 64-bit with LARGEFILES → REQ3
+        server.udp_flags = SRV_UDPFLG_EXT_GETFILES | SRV_UDPFLG_LARGEFILES;
+        let (pkt, _) = ServerUdpSocket::build_global_search_packet(&server, expr, true).unwrap();
+        assert_eq!(pkt[1], OP_GLOBSEARCHREQ3);
     }
 
     #[tokio::test]

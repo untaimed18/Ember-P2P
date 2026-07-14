@@ -1225,6 +1225,89 @@ pub fn build_search_expression_with_node(
     buf
 }
 
+/// True when an eD2k search expression tree contains at least one type-`0x08`
+/// (int64 meta) leaf. Used to skip UDP servers lacking `SRV_UDPFLG_LARGEFILES`,
+/// matching eMule's `m_b64BitSearchPacket` gate.
+pub fn search_expression_uses_64bit(expr: &[u8]) -> bool {
+    fn walk(data: &[u8], mut pos: usize) -> Option<(bool, usize)> {
+        if pos >= data.len() {
+            return None;
+        }
+        let kind = data[pos];
+        pos += 1;
+        match kind {
+            0x00 => {
+                // Boolean: op byte + left + right
+                if pos >= data.len() {
+                    return None;
+                }
+                pos += 1; // AND/OR/NOT
+                let (left_64, pos) = walk(data, pos)?;
+                let (right_64, pos) = walk(data, pos)?;
+                Some((left_64 || right_64, pos))
+            }
+            0x01 => {
+                // String term
+                if pos + 2 > data.len() {
+                    return None;
+                }
+                let len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+                pos += 2;
+                if pos + len > data.len() {
+                    return None;
+                }
+                Some((false, pos + len))
+            }
+            0x02 => {
+                // String meta
+                if pos + 2 > data.len() {
+                    return None;
+                }
+                let len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+                pos += 2;
+                if pos + len + 2 > data.len() {
+                    return None;
+                }
+                pos += len;
+                let name_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+                pos += 2;
+                if pos + name_len > data.len() {
+                    return None;
+                }
+                Some((false, pos + name_len))
+            }
+            0x03 => {
+                // Int32 meta: u32 + op + u16 name_len + name/tag
+                if pos + 4 + 1 + 2 > data.len() {
+                    return None;
+                }
+                pos += 4 + 1;
+                let name_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+                pos += 2;
+                if pos + name_len > data.len() {
+                    return None;
+                }
+                Some((false, pos + name_len))
+            }
+            0x08 => {
+                // Int64 meta
+                if pos + 8 + 1 + 2 > data.len() {
+                    return None;
+                }
+                pos += 8 + 1;
+                let name_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+                pos += 2;
+                if pos + name_len > data.len() {
+                    return None;
+                }
+                Some((true, pos + name_len))
+            }
+            _ => None,
+        }
+    }
+    walk(expr, 0).map(|(uses, _)| uses).unwrap_or(false)
+}
+
 #[cfg(test)]
 mod search_expr_tests {
     use super::*;
@@ -1314,6 +1397,28 @@ mod search_expr_tests {
         expected.extend_from_slice(&1u16.to_le_bytes());
         expected.push(TAG_FILESIZE);
         assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn search_expression_uses_64bit_detects_u64_size_leaf() {
+        let big = (u32::MAX as u64) + 1;
+        let with_64 = build_search_expression(
+            &kw("iso"),
+            &SearchConstraints {
+                max_size: Some(big),
+                ..Default::default()
+            },
+        );
+        let with_32 = build_search_expression(
+            &kw("iso"),
+            &SearchConstraints {
+                max_size: Some(1024),
+                ..Default::default()
+            },
+        );
+        assert!(search_expression_uses_64bit(&with_64));
+        assert!(!search_expression_uses_64bit(&with_32));
+        assert!(!search_expression_uses_64bit(&string_leaf("movie")));
     }
 
     #[test]
