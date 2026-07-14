@@ -889,7 +889,7 @@ impl Database {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at, priority, category
-             FROM transfers WHERE status NOT IN ('completed', 'failed', 'insufficient', 'noneneeded') AND direction = 'download'"
+             FROM transfers WHERE status NOT IN ('completed', 'failed', 'noneneeded') AND direction = 'download'"
         )?;
 
         let transfers = stmt

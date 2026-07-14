@@ -155,6 +155,8 @@ pub enum SourceFailureKind {
     Permanent,
     /// Download timed out (100s no data) -- source goes back to OnQueue
     DownloadTimeout,
+    /// Local disk is full — transfer-level Insufficient, not a peer fault
+    InsufficientDisk,
 }
 
 #[derive(Debug, Clone)]
@@ -336,7 +338,9 @@ pub struct SourceExchangeEntry {
 /// Classify an error string into transient vs permanent failure.
 pub fn classify_error(err: &str) -> SourceFailureKind {
     let lower = err.to_lowercase();
-    if lower.contains("does not have the file")
+    if is_disk_full_error(err) {
+        SourceFailureKind::InsufficientDisk
+    } else if lower.contains("does not have the file")
         || lower.contains("filereqansnofil")
         || lower.contains("file not found")
         || lower.contains("hash mismatch")
@@ -350,11 +354,25 @@ pub fn classify_error(err: &str) -> SourceFailureKind {
     }
 }
 
+/// True when a write/IO error indicates the download volume is out of space.
+pub fn is_disk_full_error(err: &str) -> bool {
+    let lower = err.to_lowercase();
+    lower.contains("stage:insufficient_disk")
+        || lower.contains("no space left")
+        || lower.contains("not enough space")
+        || lower.contains("disk full")
+        || lower.contains("there is not enough space")
+        || lower.contains("os error 28") // ENOSPC
+        || lower.contains("os error 112") // ERROR_DISK_FULL (Windows)
+        || lower.contains("storagefull")
+}
+
 pub(crate) fn failure_kind_name(kind: &SourceFailureKind) -> String {
     match kind {
         SourceFailureKind::Transient => "transient".to_string(),
         SourceFailureKind::Permanent => "permanent".to_string(),
         SourceFailureKind::DownloadTimeout => "download_timeout".to_string(),
+        SourceFailureKind::InsufficientDisk => "insufficient_disk".to_string(),
     }
 }
 
@@ -375,6 +393,9 @@ pub(crate) fn summarize_error(error: &str, kind: &SourceFailureKind) -> String {
     if matches!(kind, SourceFailureKind::DownloadTimeout) {
         return "Download timed out".to_string();
     }
+    if matches!(kind, SourceFailureKind::InsufficientDisk) || is_disk_full_error(error) {
+        return "Insufficient disk space".to_string();
+    }
     match infer_stage_from_error(error) {
         "tcp_connect" => "Connection failed".to_string(),
         "hello_wait" | "emule_info_wait" | "file_status_wait" => {
@@ -387,6 +408,7 @@ pub(crate) fn summarize_error(error: &str, kind: &SourceFailureKind) -> String {
             SourceFailureKind::Permanent => "Permanent transfer failure".to_string(),
             SourceFailureKind::Transient => "Transient connection failure".to_string(),
             SourceFailureKind::DownloadTimeout => "Download timed out".to_string(),
+            SourceFailureKind::InsufficientDisk => "Insufficient disk space".to_string(),
         },
     }
 }
@@ -3177,6 +3199,13 @@ impl Ed2kDownload {
                                             )
                                             .await;
                                         }
+                                        if e.kind() == std::io::ErrorKind::StorageFull
+                                            || is_disk_full_error(&e.to_string())
+                                        {
+                                            return Err(anyhow::anyhow!(
+                                                "stage:insufficient_disk part write at {gs}: {e}"
+                                            ));
+                                        }
                                         return Err(anyhow::anyhow!("part write at {gs}: {e}"));
                                     }
                                     // Commit immediately after each successful
@@ -3317,6 +3346,13 @@ impl Ed2kDownload {
                                                 tracker.snapshot_for_save(),
                                             )
                                             .await;
+                                        }
+                                        if e.kind() == std::io::ErrorKind::StorageFull
+                                            || is_disk_full_error(&e.to_string())
+                                        {
+                                            return Err(anyhow::anyhow!(
+                                                "stage:insufficient_disk part write at {gs}: {e}"
+                                            ));
                                         }
                                         return Err(anyhow::anyhow!("part write at {gs}: {e}"));
                                     }

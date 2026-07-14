@@ -12,12 +12,14 @@
     label = '',
     ariaLabel = '',
     ariaLabelledby = '',
+    onchange,
   }: {
     checked: boolean;
     disabled?: boolean;
     label?: string;
     ariaLabel?: string;
     ariaLabelledby?: string;
+    onchange?: (checked: boolean) => void;
   } = $props();
 
   let computedAriaLabel = $derived(ariaLabel || label || undefined);
@@ -33,7 +35,11 @@
     {disabled}
     class="track"
     class:on={checked}
-    onclick={() => { if (!disabled) checked = !checked; }}
+    onclick={() => {
+      if (disabled) return;
+      checked = !checked;
+      onchange?.(checked);
+    }}
   >
     <span class="knob"></span>
   </button>

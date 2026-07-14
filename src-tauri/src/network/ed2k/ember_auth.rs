@@ -83,31 +83,25 @@ fn auth_signature_message(nonce: &[u8]) -> Vec<u8> {
     message
 }
 
-/// Sign an auth nonce for wire RESPONSE payloads.
-///
-/// **Transitional emit (this release):** signs the raw nonce so v1.1 can
-/// authenticate with v1.0.14 peers that only verify bare nonces. The next
-/// release can switch emit back to domain-separated `auth_signature_message`.
-/// Verification stays dual via [`verify_auth_nonce_compat`].
+/// Sign an auth nonce for wire RESPONSE payloads over the domain-separated
+/// message [`auth_signature_message`]. Wire bytes remain `pubkey || sig`;
+/// only the signed preimage is contextualized.
 pub(crate) fn sign_auth_nonce(signing_key: &SigningKey, nonce: &[u8]) -> Signature {
-    signing_key.sign(nonce)
+    signing_key.sign(&auth_signature_message(nonce))
 }
 
-pub(crate) fn verify_auth_nonce_compat(
+/// Verify an auth RESPONSE signature. Accepts only domain-separated
+/// signatures (`ember-ed2k-auth-v1`). Bare-nonce signatures from older
+/// builds are rejected — there is no mixed-version rollout population
+/// left to support.
+pub(crate) fn verify_auth_nonce(
     verifying_key: &VerifyingKey,
     nonce: &[u8],
     signature: &Signature,
 ) -> bool {
-    if verifying_key
+    verifying_key
         .verify_strict(&auth_signature_message(nonce), signature)
         .is_ok()
-    {
-        return true;
-    }
-    // Dual verify during mixed-version rollout: accept domain-separated
-    // signatures from peers that still emit them, and bare-nonce signatures
-    // from this transitional emit / older releases.
-    verifying_key.verify_strict(nonce, signature).is_ok()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -302,7 +296,7 @@ pub fn handle_response(
     let peer_sig = Signature::from_bytes(&sig_bytes);
     // verify_strict rejects non-canonical / small-order signatures (Ed25519
     // malleability), matching `crypto::verify` used elsewhere in the codebase.
-    if !verify_auth_nonce_compat(&peer_vk, &our_nonce, &peer_sig) {
+    if !verify_auth_nonce(&peer_vk, &our_nonce, &peer_sig) {
         *state = EmberAuthState::Failed;
         return Err(AuthError::BadSignature);
     }
@@ -360,16 +354,20 @@ mod tests {
         let resp_response_sig_bytes: [u8; 64] = resp_response[32..].try_into().unwrap();
         let resp_response_sig = Signature::from_bytes(&resp_response_sig_bytes);
         let resp_vk = VerifyingKey::from_bytes(&resp_response_pk).unwrap();
-        assert!(verify_auth_nonce_compat(
+        assert!(verify_auth_nonce(
             &resp_vk,
             &init_nonce,
             &resp_response_sig
         ));
         assert!(
             resp_vk
-                .verify_strict(&init_nonce, &resp_response_sig)
+                .verify_strict(&auth_signature_message(&init_nonce), &resp_response_sig)
                 .is_ok(),
-            "transitional emit signs the bare nonce for v1.0.14 interop"
+            "emit signs the domain-separated auth message"
+        );
+        assert!(
+            resp_vk.verify_strict(&init_nonce, &resp_response_sig).is_err(),
+            "bare-nonce signatures are no longer accepted"
         );
         assert!(crate::network::ember::crypto::verify_ember_hash_binding(
             &resp_response_pk,
@@ -383,16 +381,15 @@ mod tests {
     }
 
     #[test]
-    fn verify_compat_accepts_domain_separated_signatures() {
-        // Peers that still emit domain-separated signatures (e.g. interim
-        // v1.1.1 builds) must continue to verify via the dual path.
+    fn verify_rejects_bare_nonce_signatures() {
         let sk = SigningKey::generate(&mut OsRng);
         let vk = sk.verifying_key();
         let mut nonce = [0u8; NONCE_LEN];
         OsRng.fill_bytes(&mut nonce);
+        let bare_sig = sk.sign(&nonce);
+        assert!(!verify_auth_nonce(&vk, &nonce, &bare_sig));
         let domain_sig = sk.sign(&auth_signature_message(&nonce));
-        assert!(verify_auth_nonce_compat(&vk, &nonce, &domain_sig));
-        assert!(vk.verify_strict(&nonce, &domain_sig).is_err());
+        assert!(verify_auth_nonce(&vk, &nonce, &domain_sig));
     }
 
     #[test]
@@ -449,7 +446,7 @@ mod tests {
         // what's "advertised" (we'll pass `expected_peer_pubkey =
         // init_pk` but embed a bogus one in the response).
         let init_signing = SigningKey::from_bytes(&init_sk);
-        let init_sig = init_signing.sign(&resp_nonce);
+        let init_sig = sign_auth_nonce(&init_signing, &resp_nonce);
         let mut bad_response = [0u8; RESPONSE_LEN];
         bad_response[..32].copy_from_slice(&[0xFFu8; 32]);
         bad_response[32..].copy_from_slice(&init_sig.to_bytes());
@@ -493,7 +490,7 @@ mod tests {
         // Real signature, real pubkey — but pubkey doesn't BLAKE3-bind
         // to the claimed ember_hash. Should reject.
         let init_signing = SigningKey::from_bytes(&init_sk);
-        let init_sig = init_signing.sign(&resp_nonce);
+        let init_sig = sign_auth_nonce(&init_signing, &resp_nonce);
         let mut response = [0u8; RESPONSE_LEN];
         response[..32].copy_from_slice(&init_pk);
         response[32..].copy_from_slice(&init_sig.to_bytes());
@@ -514,7 +511,7 @@ mod tests {
         let resp_nonce = outbound.our_challenge_payload.unwrap();
 
         let init_signing = SigningKey::from_bytes(&init_sk);
-        let init_sig = init_signing.sign(&resp_nonce);
+        let init_sig = sign_auth_nonce(&init_signing, &resp_nonce);
         let mut response = [0u8; RESPONSE_LEN];
         response[..32].copy_from_slice(&init_pk);
         response[32..].copy_from_slice(&init_sig.to_bytes());

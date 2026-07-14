@@ -24,6 +24,7 @@
   import { networkStats, serverStatus } from '$lib/stores/network';
   import { onDestroy, onMount, untrack } from 'svelte';
   import { get } from 'svelte/store';
+  import { listen } from '@tauri-apps/api/event';
   import type { SearchResult, SpamExplanation } from '$lib/types';
   import { formatSize, formatSpeed } from '$lib/utils';
   import { addToast } from '$lib/stores/toast';
@@ -266,7 +267,10 @@
     const net = (r.source_addresses ?? []).filter((a) => a && a !== 'local');
     return net.length === 0;
   }
-  let spamProfile = $state<'relaxed' | 'balanced' | 'aggressive'>('balanced');
+  let spamProfile = $derived(
+    ($appSettings?.spam_filter_profile as 'relaxed' | 'balanced' | 'aggressive' | undefined)
+      ?? 'balanced',
+  );
   let showSpamHelp = $state(false);
   let contextMenu: { x: number; y: number; result: SearchResult } | null = $state(null);
   let notesRequestId = $state(0);
@@ -561,10 +565,21 @@
     getSettings()
       .then((s) => {
         searchTimeoutSecs = s.search_timeout_secs;
-        spamProfile = s.spam_filter_profile ?? 'balanced';
         emberEnabled = !!s.ember_native_enabled;
       })
       .catch(() => {});
+    let unlistenHistory: (() => void) | undefined;
+    listen('download-history-cleared', () => {
+      downloadHistoryMap = {};
+      historyFetchedHashes.clear();
+      historyPendingHashes.clear();
+      historyHashGen.clear();
+    }).then((u) => {
+      unlistenHistory = u;
+    }).catch(() => {});
+    return () => {
+      unlistenHistory?.();
+    };
   });
   let spamHiddenCount = $derived(searchResultsList.filter(r => r.is_spam).length);
   let spamThreshold = $derived(spamProfile === 'aggressive' ? 45 : spamProfile === 'relaxed' ? 80 : 60);
@@ -1086,7 +1101,7 @@
           searchTimeoutSecs = timeoutSec;
           armTimeout(timeoutSec);
         }
-        spamProfile = s.spam_filter_profile ?? 'balanced';
+        // spamProfile tracks $appSettings reactively
       })
       .catch(() => {
         /* use cached timeout already set */

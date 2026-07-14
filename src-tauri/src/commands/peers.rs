@@ -395,6 +395,12 @@ pub async fn send_chat_message(
     }
     let canonical = user_hash_hex.to_lowercase();
     let hash = parse_user_hash(&canonical)?;
+    if !state.friend_hashes.read().await.contains(&hash) {
+        return Err(coded(
+            "peers_not_friend",
+            "Can only chat with friends",
+        ));
+    }
     let (tx, rx) = tokio::sync::oneshot::channel();
     bounded_send(
         &state.network_tx,
@@ -416,7 +422,13 @@ pub async fn get_chat_messages(
     before_id: Option<i64>,
 ) -> Result<Vec<ChatMessageInfo>, String> {
     let friend_hash = friend_hash.to_lowercase();
-    parse_user_hash(&friend_hash)?;
+    let eh = parse_user_hash(&friend_hash)?;
+    if !state.friend_hashes.read().await.contains(&eh) {
+        return Err(coded(
+            "peers_not_friend",
+            "Can only load chat for friends",
+        ));
+    }
     let db = state.db.clone();
     let lim = limit.unwrap_or(50).clamp(1, 200);
     let rows =
@@ -444,7 +456,13 @@ pub async fn mark_messages_read(
     friend_hash: String,
 ) -> Result<(), String> {
     let friend_hash = friend_hash.to_lowercase();
-    parse_user_hash(&friend_hash)?;
+    let eh = parse_user_hash(&friend_hash)?;
+    if !state.friend_hashes.read().await.contains(&eh) {
+        return Err(coded(
+            "peers_not_friend",
+            "Can only mark chat for friends",
+        ));
+    }
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.mark_messages_read(&friend_hash))
         .await

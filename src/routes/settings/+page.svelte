@@ -403,6 +403,52 @@
     }
   }
 
+  /** Friend toggles apply immediately (frontend store + persist) so Chat /
+   * online toasts / browse gate don't wait for the page Save button. */
+  let friendTogglePersistInFlight = false;
+  async function applyFriendTogglesLive() {
+    if (!settings) return;
+    setAppSettings({ ...settings });
+    if (friendTogglePersistInFlight) return;
+    friendTogglePersistInFlight = true;
+    try {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const latest = await getSettings();
+        const candidate = {
+          ...latest,
+          friend_require_approval: settings.friend_require_approval,
+          friend_online_notifications: settings.friend_online_notifications,
+          friend_chat_disabled: settings.friend_chat_disabled,
+          friend_browse_disabled: settings.friend_browse_disabled,
+          friend_session_encryption: settings.friend_session_encryption,
+        };
+        try {
+          const saved = await updateSettings(candidate);
+          setAppSettings(saved);
+          settings.settings_revision = saved.settings_revision;
+          if (originalSettings) {
+            const baseline = JSON.parse(originalSettings) as AppSettings;
+            baseline.friend_require_approval = saved.friend_require_approval;
+            baseline.friend_online_notifications = saved.friend_online_notifications;
+            baseline.friend_chat_disabled = saved.friend_chat_disabled;
+            baseline.friend_browse_disabled = saved.friend_browse_disabled;
+            baseline.friend_session_encryption = saved.friend_session_encryption;
+            baseline.settings_revision = saved.settings_revision;
+            originalSettings = JSON.stringify(baseline);
+          }
+          break;
+        } catch (e) {
+          if (attempt === 0 && isSettingsRevisionConflict(e)) continue;
+          throw e;
+        }
+      }
+    } catch {
+      // Optimistic UI already updated; full Save can still persist.
+    } finally {
+      friendTogglePersistInFlight = false;
+    }
+  }
+
   /**
    * Fold the persisted snapshot back into untouched form fields after save.
    * Fields edited again while IPC was in flight remain as unsaved changes.
@@ -1641,11 +1687,10 @@
 
           <!--
             eD2K server-list discovery. These mirror the three eMule
-            options under Options -> Servers and are saved live (no
-            restart). When "Update server list when connecting" is on,
-            Ember sends OP_GETSERVERLIST shortly after login and merges
-            the response into server.met; otherwise the current server
-            list stays exactly as curated.
+            options under Options -> Servers. New-server admission from
+            server/client lists is read live after Save; purging already-
+            listed servers when "filter servers by IP" turns on also runs
+            on Save (and at startup / IP-filter reload).
           -->
           <div class="field toggle-row">
             <div class="toggle-info">
@@ -1819,7 +1864,7 @@
               <span class="toggle-title">{m.settings_friend_require_approval()}</span>
               <span class="hint">{m.settings_friend_require_approval_hint()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.friend_require_approval} ariaLabel={m.settings_friend_require_approval()} />
+            <ToggleSwitch bind:checked={settings.friend_require_approval} ariaLabel={m.settings_friend_require_approval()} onchange={() => void applyFriendTogglesLive()} />
           </div>
 
           <div class="field toggle-row">
@@ -1827,7 +1872,7 @@
               <span class="toggle-title">{m.settings_friend_online_notif()}</span>
               <span class="hint">{m.settings_friend_online_notif_hint()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.friend_online_notifications} ariaLabel={m.settings_friend_online_notif()} />
+            <ToggleSwitch bind:checked={settings.friend_online_notifications} ariaLabel={m.settings_friend_online_notif()} onchange={() => void applyFriendTogglesLive()} />
           </div>
 
           <div class="field toggle-row">
@@ -1835,7 +1880,7 @@
               <span class="toggle-title">{m.settings_friend_chat_disabled()}</span>
               <span class="hint">{m.settings_friend_chat_disabled_hint()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.friend_chat_disabled} ariaLabel={m.settings_friend_chat_disabled()} />
+            <ToggleSwitch bind:checked={settings.friend_chat_disabled} ariaLabel={m.settings_friend_chat_disabled()} onchange={() => void applyFriendTogglesLive()} />
           </div>
 
           <div class="field toggle-row">
@@ -1843,7 +1888,7 @@
               <span class="toggle-title">{m.settings_friend_browse_disabled()}</span>
               <span class="hint">{m.settings_friend_browse_disabled_hint()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.friend_browse_disabled} ariaLabel={m.settings_friend_browse_disabled()} />
+            <ToggleSwitch bind:checked={settings.friend_browse_disabled} ariaLabel={m.settings_friend_browse_disabled()} onchange={() => void applyFriendTogglesLive()} />
           </div>
 
           <div class="field toggle-row">
@@ -1851,7 +1896,7 @@
               <span class="toggle-title">{m.settings_friend_session_encryption()}</span>
               <span class="hint">{m.settings_friend_session_encryption_hint()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.friend_session_encryption} ariaLabel={m.settings_friend_session_encryption()} />
+            <ToggleSwitch bind:checked={settings.friend_session_encryption} ariaLabel={m.settings_friend_session_encryption()} onchange={() => void applyFriendTogglesLive()} />
           </div>
 
           <div class="field">
