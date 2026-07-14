@@ -857,7 +857,7 @@
 
     <div class="download-box">
       <img src="icon.png" alt="Ember" width="80" height="80" style="border-radius: 16px; margin-bottom: 16px; box-shadow: 0 4px 16px rgba(0,0,0,0.12);">
-      <h3>Get Ember 1.1.5</h3>
+      <h3>Get Ember 1.1.6</h3>
       <p>The latest release is available on GitHub for Windows 10 and Windows 11.</p>
       <div class="btn-group">
         <a href="https://github.com/untaimed18/Ember-P2P/releases/latest" class="btn btn-primary" target="_blank" rel="noopener">
@@ -1309,6 +1309,52 @@ npm run tauri build</code></pre>
   <section id="releases">
     <h2>Release History</h2>
     <p>Official Ember releases for Windows. Notes mirror the <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">GitHub Releases</a> changelog style. Ember can also update itself in-app when a signed release is published.</p>
+
+    <article class="release" id="release-1-1-6">
+      <div class="release-header">
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.1.6" target="_blank" rel="noopener">Ember v1.1.6</a></h3>
+        <time class="release-date" datetime="2026-07-14">July 14, 2026</time>
+      </div>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.1.6" target="_blank" rel="noopener"><code>v1.1.6</code></a></p>
+      <div class="release-notes">
+        <h4>What's New</h4>
+
+        <h5>Library</h5>
+        <ul>
+          <li>Add an in-app media player for playable audio and video in Library</li>
+          <li>Open playable files from the detail drawer while keeping <strong>Open Externally</strong></li>
+        </ul>
+
+        <h5>Search</h5>
+        <ul>
+          <li>Polish search tab stop/close controls</li>
+          <li>Align Kad store/search/verify paths more closely with eMule behavior (wire publisher IDs, verified contact seeding after cold start, legacy Hello challenges, drop oversized KadRes)</li>
+        </ul>
+
+        <h4>What's Fixed / Hardened</h4>
+
+        <h5>Security &amp; trust</h5>
+        <ul>
+          <li>Require Ed25519 proof-of-possession on peer-relay (<code>ERAT</code>) requests; reject legacy hash-only <code>RELAY_REQUEST</code> payloads</li>
+          <li>Harden EPX trust: require PoP on TCP source exchange, pin KAD Noise keys, and align ERAT TTL handling</li>
+          <li>Drop bare-nonce Ember auth in favor of domain-separated signed auth only</li>
+          <li>Harden IP filtering: keep the live filter during async reload/enable, fail closed on reload errors, always reject bogus inbound TCP, and honor <code>block_private</code> on source inject paths</li>
+        </ul>
+
+        <h5>Downloads &amp; sources</h5>
+        <ul>
+          <li>Unify IP-filter / ban / reputation checks across dial and inject paths</li>
+          <li>Keep insufficient-space downloads across restart</li>
+          <li>Classify mid-download disk-full as insufficient instead of a generic failure</li>
+          <li>Apply friend-related and settings hot-reload fixes from the audit pass (live friend toggles, browse/chat gates, nickname / max-sources / filter-server updates without restart noise)</li>
+        </ul>
+
+        <p class="full-changelog">
+          <strong>Full Changelog</strong>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.1.5...v1.1.6" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.1.5...v1.1.6</a>
+        </p>
+      </div>
+    </article>
 
     <article class="release" id="release-1-1-5">
       <div class="release-header">
