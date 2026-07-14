@@ -72,14 +72,36 @@ function combineOrigin(a: string, b: string): string {
 
 function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResult {
   const mergedAddresses = Array.from(new Set([...(existing.source_addresses || []), ...(incoming.source_addresses || [])]));
-  const combinedAvailability = Math.max(existing.availability || 0, incoming.availability || 0);
+  // Backend ed2k resights emit absolute noted availability; take max so we do
+  // not double-sum. Cross-server summing happens in Rust before the emit.
+  // Kad / mixed origins also use max (matches merge.rs).
+  const availability = Math.max(
+    existing.availability || 0,
+    incoming.availability || 0,
+    mergedAddresses.length,
+  );
+  const existingMedia = existing.media || {};
+  const incomingMedia = incoming.media || {};
+  const media = {
+    duration: existingMedia.duration ?? incomingMedia.duration,
+    bitrate: existingMedia.bitrate ?? incomingMedia.bitrate,
+    codec: existingMedia.codec || incomingMedia.codec,
+    artist: existingMedia.artist || incomingMedia.artist,
+    album: existingMedia.album || incomingMedia.album,
+    title: existingMedia.title || incomingMedia.title,
+  };
+  const hasMedia = Object.values(media).some((v) => v != null && v !== '');
+  const existingName = existing.file.name || '';
+  const incomingName = incoming.file.name || '';
+  const preferredName =
+    incomingName.length > existingName.length ? incomingName : existingName || incomingName;
   return {
     ...existing,
     ...incoming,
     file: {
       ...existing.file,
       ...incoming.file,
-      name: incoming.file.name || existing.file.name,
+      name: preferredName,
       size: incoming.file.size ?? existing.file.size,
       hash: incoming.file.hash || existing.file.hash,
       extension: incoming.file.extension || existing.file.extension,
@@ -88,11 +110,12 @@ function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResu
     },
     peer_id: existing.peer_id || incoming.peer_id,
     peer_name: existing.peer_name || incoming.peer_name,
-    availability: Math.max(combinedAvailability, mergedAddresses.length),
+    availability,
     file_type: incoming.file_type || existing.file_type,
     source_addresses: mergedAddresses,
     rating: incoming.rating ?? existing.rating,
     comment: incoming.comment ?? existing.comment,
+    media: hasMedia ? media : existing.media || incoming.media,
     // Search channels can disagree or report partial spam evaluation. Treat a
     // positive classification and the highest observed score conservatively;
     // a later unflagged hit must not erase an earlier warning for the same file.
@@ -352,18 +375,25 @@ export async function initSearchStore() {
         updateTabByRequestId(tabs, requestId, (t) => {
           const isRetry = t.retryRequestId === requestId;
           const isPrimary = t.requestId === requestId;
-          // Only flip isSearching off once both primary and any in-flight
-          // retry have finished, so the spinner doesn't disappear between
-          // the two phases of a retry-server search.
-          const stillRetrying = t.retryRequestId != null && !isRetry;
-          const stillPrimary = !isPrimary && t.isSearching;
-          const done = !(stillRetrying || stillPrimary);
-          return {
-            ...t,
-            retryRequestId: isRetry ? null : t.retryRequestId,
-            isSearching: done ? false : t.isSearching,
-            progress: done ? null : t.progress,
-          };
+          if (isRetry) {
+            // Retry finished — clear secondary routing and stop the spinner.
+            return {
+              ...t,
+              retryRequestId: null,
+              isSearching: false,
+              progress: null,
+            };
+          }
+          if (isPrimary) {
+            // Primary finished; keep spinning if a server retry is still live.
+            const stillRetrying = t.retryRequestId != null;
+            return {
+              ...t,
+              isSearching: stillRetrying ? true : false,
+              progress: stillRetrying ? t.progress : null,
+            };
+          }
+          return t;
         }),
       );
     }));

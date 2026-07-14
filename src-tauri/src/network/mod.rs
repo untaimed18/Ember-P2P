@@ -717,6 +717,12 @@ const MAX_UDP_SEARCH_QUEUE: usize = 500;
 /// before the hard deadline steps in.
 const UDP_SEARCH_HARD_DEADLINE_BUFFER_SECS: i64 = 90;
 
+/// eMule `MAX_RESULTS` — cancel the ed2k (TCP More / UDP global) sweep once
+/// the **summed** availability of accepted ed2k hits exceeds this. Counts are
+/// per-result FT_SOURCES, spam-capped at 5 (eMule `AddResultCount`).
+const MAX_ED2K_SEARCH_RESULTS: u32 = 100;
+const ED2K_SEARCH_SOURCE_CAP: u32 = 5;
+
 /// Whether the UDP global-search leg should be force-completed this tick.
 /// True once the post-drain quiet-period grace expires (`server_udp_search_age`
 /// exceeds `udp_grace_secs` — this counter resets on every non-empty
@@ -733,6 +739,116 @@ fn udp_search_leg_should_complete(
     let grace_expired = u64::from(server_udp_search_age) > udp_grace_secs;
     let hard_deadline_passed = now >= udp_search_deadline;
     grace_expired || hard_deadline_passed
+}
+
+/// Contribute one ed2k result's sources toward `MAX_ED2K_SEARCH_RESULTS`
+/// (eMule spam-caps each result at 5).
+fn ed2k_result_source_contribution(availability: u32) -> u32 {
+    availability.max(1).min(ED2K_SEARCH_SOURCE_CAP)
+}
+
+/// Record ed2k (TCP/UDP) result availability toward the global-search cap.
+/// UDP re-sights **sum** availability (cross-server); TCP/Server re-sights use
+/// **max** (OP_QUERY_MORE can re-list the same sources). Only the spam-capped
+/// contribution *delta* is added to `ed2k_found_sources`.
+fn note_ed2k_search_results(active: &mut ActiveSearchRequest, results: &[SearchResult]) -> bool {
+    for r in results {
+        if r.file.hash.is_empty() {
+            active.ed2k_found_sources = active
+                .ed2k_found_sources
+                .saturating_add(ed2k_result_source_contribution(r.availability));
+            continue;
+        }
+        let prev = active.ed2k_noted_availability.get(&r.file.hash).copied();
+        let sum_incoming = crate::search::merge::is_ed2k_network_origin(&r.result_origin)
+            && r.result_origin.split('·').any(|p| p.trim() == crate::search::merge::ORIGIN_SERVER_UDP);
+        let (new_avail, old_contrib) = match prev {
+            Some(p) => {
+                let merged = if sum_incoming {
+                    p.saturating_add(r.availability)
+                } else {
+                    p.max(r.availability)
+                };
+                (merged, ed2k_result_source_contribution(p))
+            }
+            None => (r.availability, 0),
+        };
+        let new_contrib = ed2k_result_source_contribution(new_avail);
+        if new_contrib > old_contrib {
+            active.ed2k_found_sources = active
+                .ed2k_found_sources
+                .saturating_add(new_contrib - old_contrib);
+        }
+        active
+            .ed2k_noted_availability
+            .insert(r.file.hash.clone(), new_avail);
+    }
+    active.ed2k_found_sources > MAX_ED2K_SEARCH_RESULTS
+}
+
+/// Mark hashes as streamed only after a row was actually accepted/emitted
+/// (so a type-filter miss does not permanently block later Kad sightings).
+fn mark_streamed_hashes(active: &mut ActiveSearchRequest, results: &[SearchResult]) {
+    for r in results {
+        if r.file.hash.is_empty() {
+            continue;
+        }
+        if active.streamed_hashes.len() >= MAX_STREAMED_HASHES_SOFT_CAP
+            && !active.streamed_hashes.contains(&r.file.hash)
+        {
+            continue;
+        }
+        active.streamed_hashes.insert(r.file.hash.clone());
+    }
+}
+
+/// Emit already-seen-hash updates without spam re-scoring. Ed2k rows update
+/// the cap map and carry **absolute** summed/max availability for the UI
+/// (frontend takes max). Kad rows only refresh availability/sources/origin.
+fn emit_search_resight_updates(
+    app_handle: &tauri::AppHandle,
+    request_id: u64,
+    updates: Vec<SearchResult>,
+    active: &mut ActiveSearchRequest,
+) {
+    if updates.is_empty() {
+        return;
+    }
+    let mut updates = filter_results_by_client_constraints(updates, active);
+    if updates.is_empty() {
+        return;
+    }
+    for r in &mut updates {
+        if crate::search::merge::is_ed2k_network_origin(&r.result_origin) {
+            let _ = note_ed2k_search_results(active, std::slice::from_ref(r));
+            if let Some(&total) = active.ed2k_noted_availability.get(&r.file.hash) {
+                r.availability = total;
+            }
+        }
+    }
+    emit_search_results_event(app_handle, request_id, updates);
+}
+
+fn stop_ed2k_udp_search_if_capped(state: &mut NetworkState, app_handle: &tauri::AppHandle) {
+    let Some(active) = state.active_search_request.as_mut() else {
+        return;
+    };
+    if !active.udp_pending {
+        return;
+    }
+    if active.ed2k_found_sources <= MAX_ED2K_SEARCH_RESULTS {
+        return;
+    }
+    let request_id = active.request_id;
+    active.udp_pending = false;
+    state.server_udp_search_age = 0;
+    state.udp_search_queue.clear();
+    state.server_search_more_needed = false;
+    debug!(
+        "Stopping ed2k UDP search: summed sources {} > MAX_RESULTS ({})",
+        active.ed2k_found_sources, MAX_ED2K_SEARCH_RESULTS
+    );
+    maybe_finish_active_search(state, app_handle, request_id);
 }
 
 /// Minimum number of *verified* routing-table contacts before we report the
@@ -1029,6 +1145,16 @@ fn is_eligible_udp_server(
         }
     }
     true
+}
+
+/// True once the connected eD2k server has been up long enough that
+/// `OP_GETSOURCES` is unlikely to be dropped by Lugdunum flood protection.
+fn server_source_settle_elapsed(state: &NetworkState) -> bool {
+    state.server_connected
+        && chrono::Utc::now()
+            .timestamp()
+            .saturating_sub(state.server_connected_at)
+            >= SERVER_SOURCE_SETTLE_SECS
 }
 
 /// Build UDP GETSOURCES packets for ALL eligible servers (single file).
@@ -1802,7 +1928,13 @@ mod tests {
             ember_pending: false,
             udp_search_deadline: 0,
             udp_search_sent_ips: HashSet::new(),
+            ed2k_found_sources: 0,
+            ed2k_noted_availability: HashMap::new(),
             file_type_filter: None,
+            min_size: None,
+            max_size: None,
+            file_extension: None,
+            min_availability: None,
             keywords: Vec::new(),
             server_ip: None,
             server_result_count: 0,
@@ -1847,25 +1979,77 @@ mod tests {
         let mut active = Some(sample_active_search_request(42));
 
         let mut batch1 = vec![sample_search_result("aaaa"), sample_search_result("bbbb")];
-        dedup_streamed_batch(&mut active, 42, &mut batch1);
-        assert_eq!(
-            batch1.len(),
-            2,
-            "first sighting of both hashes must pass through"
-        );
+        let resights1 = dedup_streamed_batch(&mut active, 42, &mut batch1);
+        assert_eq!(batch1.len(), 2);
+        assert!(resights1.is_empty());
+        // Hashes are marked only after a successful emit.
+        mark_streamed_hashes(active.as_mut().unwrap(), &batch1);
 
-        // "aaaa" reappears (a different node/server re-announcing the same
-        // file); "cccc" is genuinely new.
         let mut batch2 = vec![sample_search_result("aaaa"), sample_search_result("cccc")];
-        dedup_streamed_batch(&mut active, 42, &mut batch2);
+        let resights2 = dedup_streamed_batch(&mut active, 42, &mut batch2);
         assert_eq!(
             batch2
                 .iter()
                 .map(|r| r.file.hash.as_str())
                 .collect::<Vec<_>>(),
             vec!["cccc"],
-            "already-streamed hash must be dropped, new hash must pass through"
         );
+        assert_eq!(resights2.len(), 1);
+        assert_eq!(resights2[0].file.hash, "aaaa");
+    }
+
+    #[test]
+    fn dedup_streamed_batch_returns_ed2k_resights_without_keeping_in_batch() {
+        let mut active = Some(sample_active_search_request(42));
+        let mut first = vec![SearchResult {
+            result_origin: crate::search::merge::ORIGIN_SERVER_TCP.to_string(),
+            availability: 10,
+            ..sample_search_result("deadbeef")
+        }];
+        assert!(dedup_streamed_batch(&mut active, 42, &mut first).is_empty());
+        mark_streamed_hashes(active.as_mut().unwrap(), &first);
+
+        let mut second = vec![SearchResult {
+            result_origin: crate::search::merge::ORIGIN_SERVER_UDP.to_string(),
+            availability: 7,
+            ..sample_search_result("deadbeef")
+        }];
+        let resights = dedup_streamed_batch(&mut active, 42, &mut second);
+        assert!(second.is_empty());
+        assert_eq!(resights.len(), 1);
+        assert_eq!(resights[0].availability, 7);
+    }
+
+    #[test]
+    fn note_ed2k_search_results_udp_sums_tcp_uses_max() {
+        let mut active = sample_active_search_request(1);
+        let a = SearchResult {
+            result_origin: crate::search::merge::ORIGIN_SERVER_TCP.to_string(),
+            availability: 2,
+            ..sample_search_result("hash1")
+        };
+        assert!(!note_ed2k_search_results(&mut active, &[a]));
+        assert_eq!(active.ed2k_found_sources, 2);
+
+        // TCP More re-list: max, not sum.
+        let more = SearchResult {
+            result_origin: crate::search::merge::ORIGIN_SERVER_TCP.to_string(),
+            availability: 3,
+            ..sample_search_result("hash1")
+        };
+        assert!(!note_ed2k_search_results(&mut active, &[more]));
+        assert_eq!(active.ed2k_noted_availability.get("hash1"), Some(&3));
+        assert_eq!(active.ed2k_found_sources, 3);
+
+        // UDP cross-server: sum onto noted total.
+        let udp = SearchResult {
+            result_origin: crate::search::merge::ORIGIN_SERVER_UDP.to_string(),
+            availability: 4,
+            ..sample_search_result("hash1")
+        };
+        assert!(!note_ed2k_search_results(&mut active, &[udp]));
+        assert_eq!(active.ed2k_noted_availability.get("hash1"), Some(&7));
+        assert_eq!(active.ed2k_found_sources, 5); // spam-capped at 5
     }
 
     /// A batch with no matching active search (already replaced by a newer
@@ -1876,7 +2060,7 @@ mod tests {
     fn dedup_streamed_batch_is_noop_for_mismatched_or_missing_request() {
         let mut none_active: Option<ActiveSearchRequest> = None;
         let mut batch = vec![sample_search_result("aaaa")];
-        dedup_streamed_batch(&mut none_active, 1, &mut batch);
+        assert!(dedup_streamed_batch(&mut none_active, 1, &mut batch).is_empty());
         assert_eq!(
             batch.len(),
             1,
@@ -1885,7 +2069,7 @@ mod tests {
 
         let mut active = Some(sample_active_search_request(1));
         let mut batch = vec![sample_search_result("aaaa")];
-        dedup_streamed_batch(&mut active, 999, &mut batch);
+        assert!(dedup_streamed_batch(&mut active, 999, &mut batch).is_empty());
         assert_eq!(
             batch.len(),
             1,
@@ -1910,7 +2094,7 @@ mod tests {
             sample_search_result("preexisting-0"),
             sample_search_result("brand-new"),
         ];
-        dedup_streamed_batch(&mut active, 7, &mut batch);
+        let resights = dedup_streamed_batch(&mut active, 7, &mut batch);
         assert_eq!(
             batch
                 .iter()
@@ -1920,6 +2104,7 @@ mod tests {
             "already-tracked hash must still be dropped even past the soft cap, \
              and a genuinely new hash must still pass through"
         );
+        assert_eq!(resights.len(), 1);
         let active_ref = active.as_ref().unwrap();
         assert_eq!(
             active_ref.streamed_hashes.len(),
@@ -2657,6 +2842,10 @@ pub enum NetworkCommand {
         extra_sources: Vec<(String, u16)>,
         transfer_id: String,
         control: Arc<TransferControl>,
+        /// When true, register seeds + run KAD/TCP/UDP source discovery
+        /// without starting `MultiSourceDownload` workers. Used for
+        /// queued / add-paused downloads so sources are ready at promote.
+        discovery_only: bool,
     },
     AnnounceFiles {
         files: Vec<FileInfo>,
@@ -3310,7 +3499,18 @@ struct ActiveSearchRequest {
     /// request (eMule `SentUDPRequestNotification`). UDP search replies
     /// from any other IP are ignored as unsolicited / late.
     udp_search_sent_ips: HashSet<Ipv4Addr>,
+    /// Running sum of ed2k (TCP/UDP) result availability toward
+    /// [`MAX_ED2K_SEARCH_RESULTS`] (eMule `m_foundSourcesCount`).
+    ed2k_found_sources: u32,
+    /// Per-hash summed availability already folded into `ed2k_found_sources`
+    /// (so a later UDP/TCP re-sight only adds the spam-capped contribution
+    /// delta after summing, matching eMule `UpdateResultCount`).
+    ed2k_noted_availability: HashMap<String, u32>,
     file_type_filter: Option<String>,
+    min_size: Option<u64>,
+    max_size: Option<u64>,
+    file_extension: Option<String>,
+    min_availability: Option<u32>,
     /// Keywords extracted from the original query, used by the spam-filter
     /// scorer when streamed results arrive from the network event loop.
     /// Empty for queries where extraction yielded nothing (no spam scoring
@@ -3333,9 +3533,11 @@ struct ActiveSearchRequest {
     /// batch-local heuristics — `is_spam` can flip false→true (never back,
     /// since the frontend merges with OR) well after the row was already
     /// shown, making it vanish under "hide spam" and look like the same
-    /// file flickering. Once a hash has been streamed we drop further
-    /// sightings of it here rather than re-emitting/re-scoring; the vec is
-    /// bounded well below `MAX_STREAMED_HASHES_SOFT_CAP` in practice since
+    /// file flickering. Once a hash has been streamed, further **Kad**
+    /// sightings are dropped (no re-score). Further **ed2k** (Server/UDP)
+    /// sightings are returned separately as lightweight availability/origin
+    /// updates (no spam re-score) so the UI can sum sources like eMule.
+    /// Bounded well below `MAX_STREAMED_HASHES_SOFT_CAP` in practice since
     /// KAD/TCP/UDP each cap their own result counts, but a hard cap keeps
     /// a pathological all-servers global search from growing this
     /// unboundedly for the lifetime of one search.
@@ -4308,64 +4510,83 @@ fn replace_offered_ed2k_hashes(state: &mut NetworkState, files: &[ed2k::server::
     record_offered_ed2k_hashes(state, files);
 }
 
-/// Filter search results by file type, matching eMule's AddToList behavior:
-/// when a type filter is active, reject any result whose inferred type
-/// doesn't match the requested type.
-fn filter_results_by_type(
+/// Filter search results by client constraints (type / size / extension /
+/// min availability), matching eMule's AddToList post-filter behavior.
+fn filter_results_by_client_constraints(
     mut results: Vec<SearchResult>,
+    active: &ActiveSearchRequest,
+) -> Vec<SearchResult> {
+    results.retain(|r| {
+        crate::search::merge::result_matches_client_filters(
+            r,
+            active.file_type_filter.as_deref(),
+            active.min_size,
+            active.max_size,
+            active.file_extension.as_deref(),
+            active.min_availability,
+        )
+    });
+    results
+}
+
+fn filter_results_by_type(
+    results: Vec<SearchResult>,
     file_type_filter: &Option<String>,
 ) -> Vec<SearchResult> {
+    let mut results = results;
     if let Some(ref ft) = file_type_filter {
         results.retain(|r| {
-            let inferred = crate::search::index::infer_file_type(&r.file.extension);
-            let result_type = if !inferred.is_empty() {
-                inferred
-            } else {
-                r.file_type.clone()
-            };
-            result_type == *ft
+            crate::search::merge::result_matches_client_filters(
+                r,
+                Some(ft.as_str()),
+                None,
+                None,
+                None,
+                None,
+            )
         });
     }
     results
 }
 
-/// Drop entries from `results` whose file hash has already been streamed
-/// for `request_id` in this active search, recording newly-seen hashes as
-/// it goes (up to `MAX_STREAMED_HASHES_SOFT_CAP` — see that constant for
-/// what happens beyond it). A no-op (passes everything through unfiltered)
-/// if there's no matching active search. Must be called before
-/// spam-scoring/enrichment so a repeat sighting of the same file never
-/// reaches `BatchSpamContext`.
+/// Partition a streamed batch for `request_id`:
+/// - **New** hashes stay in `results` for full spam enrichment (hashes are
+///   recorded in `streamed_hashes` only after a successful emit).
+/// - **Already-streamed** hashes are returned as lightweight availability /
+///   origin updates (no spam re-score) — ed2k and Kad alike.
+///
+/// A no-op (passes everything through, returns empty updates) if there's no
+/// matching active search. Must run before spam enrichment so repeats never
+/// reach `BatchSpamContext`.
 fn dedup_streamed_batch(
     active_search_request: &mut Option<ActiveSearchRequest>,
     request_id: u64,
     results: &mut Vec<SearchResult>,
-) {
+) -> Vec<SearchResult> {
     let Some(active) = active_search_request.as_mut() else {
-        return;
+        return Vec::new();
     };
     if active.request_id != request_id {
-        return;
+        return Vec::new();
     }
-    results.retain(|r| {
-        if active.streamed_hashes.contains(&r.file.hash) {
-            false
-        } else if active.streamed_hashes.len() < MAX_STREAMED_HASHES_SOFT_CAP {
-            active.streamed_hashes.insert(r.file.hash.clone());
-            true
+    let mut resights = Vec::new();
+    let mut kept = Vec::with_capacity(results.len());
+    for r in results.drain(..) {
+        if !r.file.hash.is_empty() && active.streamed_hashes.contains(&r.file.hash) {
+            resights.push(r);
         } else {
-            true
+            kept.push(r);
         }
-    });
+    }
+    *results = kept;
+    resights
 }
 
-fn emit_search_results(
+fn emit_search_results_event(
     app_handle: &tauri::AppHandle,
     request_id: u64,
     results: Vec<SearchResult>,
-    file_type_filter: &Option<String>,
 ) {
-    let results = filter_results_by_type(results, file_type_filter);
     if results.is_empty() {
         return;
     }
@@ -4435,8 +4656,10 @@ fn is_search_source_safe(state: &NetworkState, ip: Ipv4Addr) -> bool {
 /// trusts them.
 ///
 /// Acquires only a read lock on `spam_filter`, so it's safe to call
-/// from any event-loop arm. `keywords` and `server_ip` come from
-/// `ActiveSearchRequest`, populated at request start.
+/// Enrich, type/size/ext/avail-filter, and emit. Returns the rows actually
+/// emitted so ed2k callers can count toward `MAX_ED2K_SEARCH_RESULTS` only for
+/// accepted results. Hashes must be marked streamed by the caller via
+/// [`mark_streamed_hashes`] after this returns.
 #[allow(clippy::too_many_arguments)]
 async fn enrich_and_emit_search_results(
     app_handle: &tauri::AppHandle,
@@ -4446,11 +4669,15 @@ async fn enrich_and_emit_search_results(
     request_id: u64,
     mut results: Vec<SearchResult>,
     file_type_filter: &Option<String>,
+    min_size: Option<u64>,
+    max_size: Option<u64>,
+    file_extension: Option<&str>,
+    min_availability: Option<u32>,
     keywords: &[String],
     server_ip: Option<&str>,
-) {
+) -> Vec<SearchResult> {
     if results.is_empty() {
-        return;
+        return Vec::new();
     }
     let spam_enabled = settings.spam_filter_enabled;
     let spam_profile =
@@ -4516,7 +4743,18 @@ async fn enrich_and_emit_search_results(
         }
     }
 
-    emit_search_results(app_handle, request_id, results, file_type_filter);
+    results.retain(|r| {
+        crate::search::merge::result_matches_client_filters(
+            r,
+            file_type_filter.as_deref(),
+            min_size,
+            max_size,
+            file_extension,
+            min_availability,
+        )
+    });
+    emit_search_results_event(app_handle, request_id, results.clone());
+    results
 }
 
 fn maybe_finish_active_search(
@@ -9296,6 +9534,7 @@ pub async fn start_network(
                             extra_sources: Vec::new(),
                             transfer_id: t.id.clone(),
                             control,
+                            discovery_only: false,
                         },
                         &mut state,
                         &local_index,
@@ -9916,6 +10155,7 @@ pub async fn start_network(
                             extra_sources: Vec::new(),
                             transfer_id: t.id.clone(),
                             control,
+                            discovery_only: false,
                         },
                         &mut state,
                         &local_index,
@@ -10306,14 +10546,18 @@ pub async fn start_network(
                             if !pending_expr.is_trivial() {
                                 batch.retain(|r| pending_expr.matches(&r.file.name.to_lowercase()));
                             }
-                            // See `ActiveSearchRequest::streamed_hashes`: the same
-                            // file can legitimately reappear in a later, disjoint
-                            // tail slice (a different KAD node re-announcing it),
-                            // and re-scoring it a second time can flip its spam
-                            // classification after the row's already visible.
-                            dedup_streamed_batch(&mut state.active_search_request, pending_request_id, &mut batch);
+                            let resights = dedup_streamed_batch(
+                                &mut state.active_search_request,
+                                pending_request_id,
+                                &mut batch,
+                            );
+                            let filter_ctx = state.active_search_request.as_ref().map(|a| {
+                                (a.min_size, a.max_size, a.file_extension.clone(), a.min_availability)
+                            });
+                            let (min_size, max_size, file_extension, min_availability) =
+                                filter_ctx.unwrap_or((None, None, None, None));
                             if !batch.is_empty() {
-                                enrich_and_emit_search_results(
+                                let emitted = enrich_and_emit_search_results(
                                     &app_handle,
                                     &spam_filter,
                                     &comment_manager,
@@ -10321,9 +10565,35 @@ pub async fn start_network(
                                     pending_request_id,
                                     batch,
                                     &pending_file_type_filter,
+                                    min_size,
+                                    max_size,
+                                    file_extension.as_deref(),
+                                    min_availability,
                                     &pending_keywords,
                                     None,
                                 ).await;
+                                if let Some(active) = state.active_search_request.as_mut() {
+                                    if active.request_id == pending_request_id {
+                                        mark_streamed_hashes(active, &emitted);
+                                        emit_search_resight_updates(
+                                            &app_handle,
+                                            pending_request_id,
+                                            resights,
+                                            active,
+                                        );
+                                    }
+                                }
+                            } else if !resights.is_empty() {
+                                if let Some(active) = state.active_search_request.as_mut() {
+                                    if active.request_id == pending_request_id {
+                                        emit_search_resight_updates(
+                                            &app_handle,
+                                            pending_request_id,
+                                            resights,
+                                            active,
+                                        );
+                                    }
+                                }
                             }
                             if let Some(p) = state.pending_keyword_searches.get_mut(&sid) {
                                 p.last_streamed_count = new_results;
@@ -10580,7 +10850,7 @@ pub async fn start_network(
 
                 for sid in completed_ids {
                     if let Some(PendingKeywordSearch { tx, mut local_results, query_expr, request_id, file_type_filter, .. }) = state.pending_keyword_searches.remove(&sid) {
-                        let network_results = if let Some(search) = state.search_manager.get(&sid) {
+                        let mut network_results = if let Some(search) = state.search_manager.get(&sid) {
                             let unique: std::collections::HashSet<&kad::types::KadId> =
                                 search.results.iter().map(|r| &r.id).collect();
                             info!(
@@ -10605,8 +10875,45 @@ pub async fn start_network(
                         } else {
                             Vec::new()
                         };
+                        // Already-streamed Kad hashes: push absolute availability
+                        // via lightweight events (no spam re-score / invoke flip).
+                        // Oneshot return keeps only fresh hashes + local hits.
+                        if let Some(active) = state.active_search_request.as_mut() {
+                            if active.request_id == request_id {
+                                let mut resights = Vec::new();
+                                network_results.retain(|r| {
+                                    if !r.file.hash.is_empty()
+                                        && active.streamed_hashes.contains(&r.file.hash)
+                                    {
+                                        resights.push(r.clone());
+                                        false
+                                    } else {
+                                        true
+                                    }
+                                });
+                                emit_search_resight_updates(
+                                    &app_handle,
+                                    request_id,
+                                    resights,
+                                    active,
+                                );
+                            }
+                        }
                         local_results.extend(network_results);
-                        local_results = filter_results_by_type(local_results, &file_type_filter);
+                        if let Some(active) = state.active_search_request.as_ref() {
+                            if active.request_id == request_id {
+                                local_results = filter_results_by_client_constraints(
+                                    local_results,
+                                    active,
+                                );
+                            } else {
+                                local_results =
+                                    filter_results_by_type(local_results, &file_type_filter);
+                            }
+                        } else {
+                            local_results =
+                                filter_results_by_type(local_results, &file_type_filter);
+                        }
                         local_results.sort_by(|a, b| b.availability.cmp(&a.availability));
                         local_results.truncate(2000);
                         // Intentional: the `search_files` IPC call returns as soon as
@@ -12646,7 +12953,7 @@ pub async fn start_network(
                         for tid in tids {
                             let (hash_bytes, file_size) = {
                                 let Some(pd) = state.pending_downloads.get_mut(&tid) else { continue; };
-                                if pd.control.is_cancelled() || pd.control.is_paused() { continue; }
+                                if pd.control.is_cancelled() { continue; }
                                 let hash_bytes = match hex::decode(&pd.file_hash) {
                                     Ok(b) if b.len() == 16 => b,
                                     _ => continue,
@@ -16101,7 +16408,7 @@ pub async fn start_network(
                 for tid in to_retry {
                     let (hash_bytes, file_size) = {
                         let Some(pd) = state.pending_downloads.get_mut(&tid) else { continue; };
-                        if pd.control.is_cancelled() || pd.control.is_paused() {
+                        if pd.control.is_cancelled() {
                             continue;
                         }
                         let hash_bytes = match hex::decode(&pd.file_hash) {
@@ -16387,7 +16694,7 @@ pub async fn start_network(
                 // for that file's sources on a flood-safe per-file cadence
                 // (STARVED_SERVER_REASK_SECS). This is the path that surfaces
                 // the LowID server sources eMule reaches via OP_CALLBACKREQUEST.
-                if !state.low_id && state.server_connected && state.server_connection.is_some() {
+                if state.server_connected && state.server_connection.is_some() {
                     const MAX_STARVED_REASK_PER_TICK: usize = 10;
                     let starved: Vec<(String, [u8; 16], u64)> = {
                         let mgr = transfer_manager.read().await;
@@ -16933,11 +17240,20 @@ pub async fn start_network(
                                             }
                                         }
                                         if let Some(tx) = pending.tx.take() {
+                                            // Legacy oneshot accumulate path (not used by
+                                            // live SearchFiles, which always sets tx: None).
                                             let mut local = pending.results;
                                             local.extend(search_results);
                                             if count >= 200
                                                 && local.len() < 1000
                                                 && state.server_search_more_requests < 5
+                                                && state
+                                                    .active_search_request
+                                                    .as_ref()
+                                                    .map(|a| {
+                                                        a.ed2k_found_sources <= MAX_ED2K_SEARCH_RESULTS
+                                                    })
+                                                    .unwrap_or(true)
                                             {
                                                 state.server_search_more_needed = true;
                                                 state.pending_server_search = Some(PendingServerSearch {
@@ -16955,18 +17271,58 @@ pub async fn start_network(
                                                 finished_search_requests.push(request_id);
                                             }
                                         } else {
-                                            let (ft_filter, kws, srv_ip) = state
+                                            // Drop late More pages once the ed2k source cap
+                                            // has already stopped the UDP/More sweep.
+                                            let capped = state
                                                 .active_search_request
                                                 .as_ref()
-                                                .map(|a| (a.file_type_filter.clone(), a.keywords.clone(), a.server_ip.clone()))
-                                                .unwrap_or((None, Vec::new(), None));
+                                                .filter(|a| a.request_id == request_id)
+                                                .is_some_and(|a| {
+                                                    a.ed2k_found_sources > MAX_ED2K_SEARCH_RESULTS
+                                                });
+                                            if capped {
+                                                if let Some(active) =
+                                                    state.active_search_request.as_mut()
+                                                {
+                                                    if active.request_id == request_id {
+                                                        active.server_pending = false;
+                                                    }
+                                                }
+                                                finished_search_requests.push(request_id);
+                                            } else {
+                                            let filter_ctx = state
+                                                .active_search_request
+                                                .as_ref()
+                                                .map(|a| {
+                                                    (
+                                                        a.file_type_filter.clone(),
+                                                        a.min_size,
+                                                        a.max_size,
+                                                        a.file_extension.clone(),
+                                                        a.min_availability,
+                                                        a.keywords.clone(),
+                                                        a.server_ip.clone(),
+                                                    )
+                                                })
+                                                .unwrap_or((
+                                                    None, None, None, None, None, Vec::new(), None,
+                                                ));
+                                            let (
+                                                ft_filter,
+                                                min_size,
+                                                max_size,
+                                                file_extension,
+                                                min_availability,
+                                                kws,
+                                                srv_ip,
+                                            ) = filter_ctx;
                                             let mut search_results = search_results;
-                                            // See `ActiveSearchRequest::streamed_hashes` — an
-                                            // OP_QUERY_MORE_RESULT page could in principle
-                                            // re-return a hash already streamed on an earlier
-                                            // page.
-                                            dedup_streamed_batch(&mut state.active_search_request, request_id, &mut search_results);
-                                            enrich_and_emit_search_results(
+                                            let resights = dedup_streamed_batch(
+                                                &mut state.active_search_request,
+                                                request_id,
+                                                &mut search_results,
+                                            );
+                                            let emitted = enrich_and_emit_search_results(
                                                 &app_handle,
                                                 &spam_filter,
                                                 &comment_manager,
@@ -16974,16 +17330,41 @@ pub async fn start_network(
                                                 request_id,
                                                 search_results,
                                                 &ft_filter,
+                                                min_size,
+                                                max_size,
+                                                file_extension.as_deref(),
+                                                min_availability,
                                                 &kws,
                                                 srv_ip.as_deref(),
                                             ).await;
+                                            if let Some(active) = state.active_search_request.as_mut() {
+                                                if active.request_id == request_id {
+                                                    mark_streamed_hashes(active, &emitted);
+                                                    let _ = note_ed2k_search_results(active, &emitted);
+                                                    emit_search_resight_updates(
+                                                        &app_handle,
+                                                        request_id,
+                                                        resights,
+                                                        active,
+                                                    );
+                                                }
+                                            }
+                                            stop_ed2k_udp_search_if_capped(&mut state, &app_handle);
                                             let under_result_cap = state
                                                 .active_search_request
                                                 .as_ref()
                                                 .filter(|active| active.request_id == request_id)
                                                 .map(|active| active.server_result_count < 1000)
                                                 .unwrap_or(true);
-                                            if count >= 200 && under_result_cap && state.server_search_more_requests < 5 {
+                                            if count >= 200
+                                                && under_result_cap
+                                                && state.server_search_more_requests < 5
+                                                && state
+                                                    .active_search_request
+                                                    .as_ref()
+                                                    .map(|a| a.ed2k_found_sources <= MAX_ED2K_SEARCH_RESULTS)
+                                                    .unwrap_or(true)
+                                            {
                                                 state.server_search_more_needed = true;
                                                 state.pending_server_search = Some(PendingServerSearch {
                                                     tx: None,
@@ -16998,6 +17379,7 @@ pub async fn start_network(
                                                 }
                                                 finished_search_requests.push(request_id);
                                             }
+                                            } // end !capped
                                         }
                                     }
                                 }
@@ -18227,20 +18609,34 @@ pub async fn start_network(
                                 // `dedup_streamed_batch` call can take `active_search_request`
                                 // mutably afterward without fighting the borrow checker.
                                 let active_ctx = state.active_search_request.as_ref().map(|a| {
-                                    (a.request_id, a.file_type_filter.clone(), a.keywords.clone())
+                                    (
+                                        a.request_id,
+                                        a.file_type_filter.clone(),
+                                        a.min_size,
+                                        a.max_size,
+                                        a.file_extension.clone(),
+                                        a.min_availability,
+                                        a.keywords.clone(),
+                                    )
                                 });
-                                if let Some((request_id, ft_filter, kws)) = active_ctx {
+                                if let Some((
+                                    request_id,
+                                    ft_filter,
+                                    min_size,
+                                    max_size,
+                                    file_extension,
+                                    min_availability,
+                                    kws,
+                                )) = active_ctx
+                                {
                                     state.server_udp_search_age = 0;
                                     let mut search_results = search_results;
-                                    // See `ActiveSearchRequest::streamed_hashes`: a global
-                                    // search fans out to every known server, and the same
-                                    // popular file is very likely to be indexed by more
-                                    // than one of them — each server's reply is its own
-                                    // batch here, so without this the file gets re-scored
-                                    // (and can flip spam-hidden) on every server that also
-                                    // has it.
-                                    dedup_streamed_batch(&mut state.active_search_request, request_id, &mut search_results);
-                                    enrich_and_emit_search_results(
+                                    let resights = dedup_streamed_batch(
+                                        &mut state.active_search_request,
+                                        request_id,
+                                        &mut search_results,
+                                    );
+                                    let emitted = enrich_and_emit_search_results(
                                         &app_handle,
                                         &spam_filter,
                                         &comment_manager,
@@ -18248,9 +18644,26 @@ pub async fn start_network(
                                         request_id,
                                         search_results,
                                         &ft_filter,
+                                        min_size,
+                                        max_size,
+                                        file_extension.as_deref(),
+                                        min_availability,
                                         &kws,
                                         None,
                                     ).await;
+                                    if let Some(active) = state.active_search_request.as_mut() {
+                                        if active.request_id == request_id {
+                                            mark_streamed_hashes(active, &emitted);
+                                            let _ = note_ed2k_search_results(active, &emitted);
+                                            emit_search_resight_updates(
+                                                &app_handle,
+                                                request_id,
+                                                resights,
+                                                active,
+                                            );
+                                        }
+                                    }
+                                    stop_ed2k_udp_search_if_capped(&mut state, &app_handle);
                                 }
                             }
                         }
@@ -20840,7 +21253,7 @@ pub async fn start_network(
             _ = server_udp_source_timer.tick() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
                 let mut all_for_udp: Vec<([u8; 16], u64)> = state.pending_downloads.values()
-                    .filter(|pd| !pd.control.is_cancelled() && !pd.control.is_paused())
+                    .filter(|pd| !pd.control.is_cancelled())
                     .filter_map(|pd| {
                         let hash_bytes = hex::decode(&pd.file_hash).ok()?;
                         if hash_bytes.len() != 16 {
@@ -20915,7 +21328,7 @@ pub async fn start_network(
                 {
                     let sm = source_manager.read().await;
                     for (tid, pd) in &state.pending_downloads {
-                        if pd.control.is_cancelled() || pd.control.is_paused() { continue; }
+                        if pd.control.is_cancelled() { continue; }
                         if let Ok(raw) = hex::decode(&pd.file_hash) {
                             if raw.len() == 16 {
                                 let mut fh = [0u8; 16];
@@ -20947,9 +21360,10 @@ pub async fn start_network(
                     }
                 }
 
+                // Prioritize files with fewer sources; skip files already
+                // at the soft source cap (same gate as UDP/KAD sweeps).
+                all_downloads.retain(|(_, _, _, sc)| *sc < MAX_SOURCES_FOR_UDP);
                 if all_downloads.is_empty() { return; }
-
-                // Prioritize files with fewer sources
                 all_downloads.sort_by_key(|(_, _, _, sc)| *sc);
 
                 let total = all_downloads.len();
@@ -26504,7 +26918,14 @@ async fn handle_command_inner(
 
             let mut tx = Some(tx);
             let mut local_results: Option<Vec<SearchResult>> = Some(Vec::new());
-            let file_type_filter = search_filters.as_ref().and_then(|f| f.file_type.clone());
+            let ui_file_type = search_filters.as_ref().and_then(|f| f.file_type.clone());
+            // eMule: Arc/Iso → Pro on the wire; Program clears local filter;
+            // Arc/Iso keep theirs for post-filter.
+            let file_type_filter =
+                crate::search::merge::client_search_file_type_filter(ui_file_type.as_deref());
+            let wire_file_type =
+                crate::search::merge::wire_search_file_type(ui_file_type.as_deref())
+                    .map(|s| s.to_string());
             let mut active_request = ActiveSearchRequest {
                 request_id,
                 server_pending: false,
@@ -26513,7 +26934,13 @@ async fn handle_command_inner(
                 ember_pending: false,
                 udp_search_deadline: 0,
                 udp_search_sent_ips: HashSet::new(),
+                ed2k_found_sources: 0,
+                ed2k_noted_availability: HashMap::new(),
                 file_type_filter: file_type_filter.clone(),
+                min_size: search_filters.as_ref().and_then(|f| f.min_size),
+                max_size: search_filters.as_ref().and_then(|f| f.max_size),
+                file_extension: search_filters.as_ref().and_then(|f| f.file_extension.clone()),
+                min_availability: search_filters.as_ref().and_then(|f| f.min_availability),
                 keywords: Vec::new(),
                 server_ip: state.server_addr.map(|a| a.ip().to_string()),
                 server_result_count: 0,
@@ -26554,9 +26981,9 @@ async fn handle_command_inner(
             // numeric/meta-string leaves (eMule `GetSearchPacket`) so the
             // remote node filters *before* truncating to its result cap —
             // a client-side-only filter can't recover hits lost to that cap.
-            let kad_file_type = search_filters.as_ref().and_then(|f| f.file_type.clone());
+            // Arc/Iso are remapped to Pro on the wire (eMule ED2KFTSTR).
             let search_constraints = kad::messages::SearchConstraints {
-                file_type: kad_file_type.as_deref(),
+                file_type: wire_file_type.as_deref(),
                 file_extension: search_filters
                     .as_ref()
                     .and_then(|f| f.file_extension.as_deref()),
@@ -26692,8 +27119,23 @@ async fn handle_command_inner(
                     info!("KAD search: rejected (too many active searches)");
                     break 'kad false;
                 }
+                // eMule GetSearchPacket (Kad): for AND-only trees, strip the
+                // lookup keyword from restrictive terms — the DHT target
+                // already selects that word. Empty terms are valid
+                // (unrestricted startPos). OR/NOT keep the full tree.
+                let kad_keyword_node = if !query_expr.contains_or() && !query_expr.contains_not() {
+                    query_expr
+                        .without_term(primary_keyword)
+                        .map(|e| e.to_wire_bytes())
+                } else {
+                    Some(query_expr.to_wire_bytes())
+                };
+                let kad_search_expr = kad::messages::build_search_expression_with_node(
+                    kad_keyword_node,
+                    &search_constraints,
+                );
                 if let Some(search) = state.search_manager.get_mut(&sid) {
-                    search.search_terms_data = search_expr;
+                    search.search_terms_data = kad_search_expr;
                 }
                 active_request.kad_pending = true;
                 let Some(search_tx) = tx.take() else {
@@ -26929,6 +27371,7 @@ async fn handle_command_inner(
             extra_sources,
             transfer_id,
             control,
+            discovery_only,
         } => {
             let has_source = !peer_ip.is_empty() && peer_ip != "0.0.0.0" && peer_port > 0;
 
@@ -27016,6 +27459,145 @@ async fn handle_command_inner(
                         sm.register_source(hash_bytes, *parsed_ip, *extra_port);
                     }
                 }
+
+                // Queued / add-paused: keep seeds in SourceManager and run
+                // full-network discovery without starting dial workers.
+                if discovery_only {
+                    let now = chrono::Utc::now().timestamp();
+                    let pending_priority = {
+                        let mgr = transfer_manager.read().await;
+                        mgr.get_transfer(&transfer_id)
+                            .map(|t| priority_str_to_u32(&t.priority))
+                            .unwrap_or(1)
+                    };
+                    let kad_available = state.stats.status != NetworkStatus::Disconnected;
+                    let kad_hash = md4_bytes_to_kad_id(&hash_bytes);
+                    let mut closest = state
+                        .routing_table
+                        .find_closest_prefer_verified(&kad_hash, SEARCH_INITIAL_CONTACTS);
+                    let kad_search_started = if kad_available && !closest.is_empty() {
+                        closest.sort_by_key(|c| c.is_tcp_firewalled() as u8);
+                        let sid = state.search_manager.start_search(
+                            kad_hash,
+                            SearchType::FindSource { file_size },
+                            closest,
+                        );
+                        if sid != SearchId(0) {
+                            state
+                                .download_source_searches
+                                .insert(sid, (transfer_id.clone(), hash_bytes));
+                            stats_manager.add_overhead(
+                                crate::storage::statistics::OverheadCategory::FileRequest,
+                                crate::storage::statistics::OverheadDirection::Upload,
+                                48,
+                            );
+                            info!(
+                                "Started KAD source search {} for queued/paused download {}",
+                                sid.0, transfer_id
+                            );
+                            let _ = app_handle.emit(
+                                "transfer:source-search",
+                                serde_json::json!({
+                                    "transfer_id": &transfer_id,
+                                    "kind": "kad_search",
+                                }),
+                            );
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    state.pending_downloads.insert(
+                        transfer_id.clone(),
+                        PendingDownload {
+                            transfer_id: transfer_id.clone(),
+                            file_hash: file_hash.clone(),
+                            file_name: file_name.clone(),
+                            file_size,
+                            control,
+                            search_count: if kad_search_started { 1 } else { 0 },
+                            last_search_at: if kad_search_started { now } else { 0 },
+                            priority: pending_priority,
+                        },
+                    );
+                    if server_source_settle_elapsed(state) {
+                        if let Some(conn) = state.server_connection.as_mut() {
+                            if let Ok(bytes) = conn.send_get_sources(&hash_bytes, file_size).await {
+                                if bytes > 0 {
+                                    stats_manager.add_overhead(
+                                        crate::storage::statistics::OverheadCategory::SourceExchange,
+                                        crate::storage::statistics::OverheadDirection::Upload,
+                                        bytes,
+                                    );
+                                    let _ = app_handle.emit(
+                                        "transfer:source-search",
+                                        serde_json::json!({
+                                            "transfer_id": &transfer_id,
+                                            "kind": "server_query",
+                                        }),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    {
+                        let packets = build_all_getsources_packets(state, &hash_bytes, file_size);
+                        if !packets.is_empty() {
+                            let room =
+                                MAX_UDP_SOURCE_QUEUE.saturating_sub(state.udp_source_queue.len());
+                            state
+                                .udp_source_queue
+                                .extend(packets.into_iter().take(room));
+                        }
+                    }
+                    if let Ok(hb) = hex::decode(&file_hash) {
+                        if hb.len() >= 16 {
+                            state.publish_manager.add_file(PublishableFile {
+                                file_hash: md4_bytes_to_kad_id(&hb[..16]),
+                                file_name: publish_file_name,
+                                file_size,
+                                file_type: crate::search::index::infer_file_type(&publish_ext),
+                                complete_sources: 0,
+                                keyword_publishable: false,
+                                last_source_publish: {
+                                    let mut raw = [0u8; 16];
+                                    raw.copy_from_slice(&hb[..16]);
+                                    known_files
+                                        .find_by_hash(&raw)
+                                        .map(|r| r.last_publish_src as i64)
+                                        .unwrap_or(0)
+                                },
+                            });
+                        }
+                    }
+                    info!(
+                        "Discovery-only StartDownload for {}: seeds registered, KAD/TCP/UDP asked",
+                        transfer_id
+                    );
+                    return;
+                }
+
+                // Promoting / active start: drop any prior discovery-only
+                // pending entry and pull SM sources into the seed list.
+                state.pending_downloads.remove(&transfer_id);
+                {
+                    let sm = source_manager.read().await;
+                    for (ip, port) in sm.get_sources(&hash_bytes) {
+                        if validated_extras.len() >= MAX_SEED_EXTRA_SOURCES {
+                            break;
+                        }
+                        if !is_source_admissible(&state, ip, port, None) {
+                            continue;
+                        }
+                        if !seen_addrs.insert((ip, port)) {
+                            continue;
+                        }
+                        validated_extras.push((ip, port, ip.to_string()));
+                    }
+                }
+
                 let download_sources = {
                     let sm = source_manager.read().await;
                     let mut sources = Vec::with_capacity(
@@ -27041,12 +27623,6 @@ async fn handle_command_inner(
                         });
                     }
                     for (parsed_ip, extra_port, extra_ip_str) in &validated_extras {
-                        // Look up cached identity for the extra in the
-                        // same way as the primary, so a peer the source
-                        // manager already has metadata for (from a
-                        // previous session) gets a head start on
-                        // authentication when the multi-source worker
-                        // dials it.
                         let uh = sm.get_user_hash(&hash_bytes, *parsed_ip, *extra_port);
                         let co = sm.get_connect_options(&hash_bytes, *parsed_ip, *extra_port);
                         sources.push(DownloadSource {
@@ -27241,9 +27817,8 @@ async fn handle_command_inner(
                 );
 
                 // Immediate TCP `OP_GETSOURCES` to the connected eD2K
-                // server. Mirrors the on-login batch and the periodic
-                // 4-minute batch.
-                if state.server_connected {
+                // server after post-login settle (Lugdunum drops early asks).
+                if server_source_settle_elapsed(state) {
                     if let Some(conn) = state.server_connection.as_mut() {
                         if let Ok(bytes) = conn.send_get_sources(&hash_bytes, file_size).await {
                             if bytes > 0 {
@@ -27440,7 +28015,8 @@ async fn handle_command_inner(
                 }
 
                 // Request sources from the connected ed2k server (non-blocking)
-                if state.server_connected {
+                // after post-login settle so Lugdunum does not drop the ask.
+                if server_source_settle_elapsed(state) {
                     if let Some(conn) = &mut state.server_connection {
                         let mut file_hash_arr = [0u8; 16];
                         file_hash_arr.copy_from_slice(&hash_bytes);

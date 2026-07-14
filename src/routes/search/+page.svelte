@@ -439,7 +439,8 @@
         searchFileType = p.searchFileType;
       }
       if (typeof p.filterType === 'string' && VALID_FILE_TYPES.has(p.filterType)) {
-        filterType = p.filterType;
+        // Program is not a client display filter (matches backend / handleSearch).
+        filterType = p.filterType === 'Pro' ? '' : p.filterType;
       }
       if (typeof p.filterColumn === 'string' && VALID_FILTER_COLUMNS.has(p.filterColumn as FilterColumn)) {
         filterColumn = p.filterColumn as FilterColumn;
@@ -545,14 +546,47 @@
   }
 
   function inferSearchTypeFromExtension(extension: string | null | undefined): string {
+    // Keep in sync with `search::index::infer_file_type` (eMule ED2KFT_*).
     const ext = (extension ?? '').toLowerCase();
-    if (['mp3', 'ogg', 'wav', 'flac', 'aac', 'm4a', 'wma', 'opus'].includes(ext)) return 'Audio';
-    if (['avi', 'mkv', 'mp4', 'wmv', 'mov', 'mpeg', 'mpg', 'webm', 'flv'].includes(ext)) return 'Video';
-    if (['jpg', 'jpeg', 'png', 'gif', 'bmp', 'svg', 'webp'].includes(ext)) return 'Image';
-    if (['exe', 'msi', 'apk', 'app', 'deb', 'rpm', 'scr'].includes(ext)) return 'Pro';
-    if (['pdf', 'doc', 'docx', 'txt', 'rtf', 'odt', 'xls', 'xlsx', 'ppt', 'pptx'].includes(ext)) return 'Doc';
-    if (['zip', 'rar', '7z', 'tar', 'gz', 'ace'].includes(ext)) return 'Arc';
-    if (['iso', 'bin', 'cue', 'mdf', 'nrg', 'img'].includes(ext)) return 'Iso';
+    if ([
+      'aac', 'ac3', 'aif', 'aifc', 'aiff', 'amr', 'ape', 'au', 'aud', 'audio',
+      'cda', 'dmf', 'dsm', 'dts', 'far', 'flac', 'it', 'm1a', 'm2a', 'm4a', 'mdl',
+      'med', 'mid', 'midi', 'mka', 'mod', 'mp1', 'mp2', 'mp3', 'mpa', 'mpc',
+      'mtm', 'ogg', 'opus', 'psm', 'ptm', 'ra', 'rmi', 's3m', 'snd', 'stm', 'umx',
+      'wav', 'wma', 'xm',
+    ].includes(ext)) return 'Audio';
+    if ([
+      '3g2', '3gp', '3gp2', '3gpp', 'amv', 'asf', 'avi', 'bik', 'divx', 'dvr-ms',
+      'flc', 'fli', 'flic', 'flv', 'hdmov', 'ifo', 'm1v', 'm2t', 'm2ts', 'm2v',
+      'm4b', 'm4v', 'mkv', 'mov', 'movie', 'mp1v', 'mp2v', 'mp4', 'mpe', 'mpeg',
+      'mpg', 'mpv', 'mpv1', 'mpv2', 'ogm', 'pva', 'qt', 'ram', 'ratdvd', 'rm',
+      'rmm', 'rmvb', 'rv', 'smil', 'smk', 'swf', 'tp', 'ts', 'vid', 'video',
+      'vob', 'vp6', 'webm', 'wm', 'wmv', 'xvid',
+    ].includes(ext)) return 'Video';
+    if ([
+      'bmp', 'emf', 'gif', 'ico', 'jfif', 'jpe', 'jpeg', 'jpg', 'pct', 'pcx', 'pic',
+      'pict', 'png', 'psd', 'psp', 'svg', 'tga', 'tif', 'tiff', 'webp', 'wmf',
+      'wmp', 'xif',
+    ].includes(ext)) return 'Image';
+    if ([
+      'bat', 'cmd', 'com', 'exe', 'hta', 'js', 'jse', 'msc', 'vbe', 'vbs', 'wsf',
+      'wsh', 'apk', 'app', 'deb', 'rpm', 'scr',
+    ].includes(ext)) return 'Pro';
+    if ([
+      'chm', 'css', 'diz', 'doc', 'dot', 'hlp', 'htm', 'html', 'nfo', 'pdf', 'pps',
+      'ppt', 'ps', 'rtf', 'text', 'txt', 'wri', 'xls', 'xml', 'docx', 'xlsx',
+      'pptx', 'odt', 'ods', 'odp', 'epub', 'djvu', 'lit', 'mobi', 'azw',
+    ].includes(ext)) return 'Doc';
+    if ([
+      '7z', 'ace', 'alz', 'arc', 'arj', 'bz2', 'cab', 'cbr', 'cbz', 'gz', 'hqx',
+      'lha', 'lzh', 'msi', 'pak', 'par', 'par2', 'rar', 'sit', 'sitx', 'tar',
+      'tbz2', 'tgz', 'xpi', 'xz', 'z', 'zip',
+    ].includes(ext)) return 'Arc';
+    if ([
+      'bin', 'bwa', 'bwi', 'bws', 'bwt', 'ccd', 'cue', 'dmg', 'img', 'iso', 'mdf',
+      'mds', 'nrg', 'sub', 'toast',
+    ].includes(ext)) return 'Iso';
+    if (ext === 'emulecollection') return 'EmuleCollection';
     return '';
   }
 
@@ -649,6 +683,11 @@
     // the user closes the tab mid-retry.
     const retryRequestId = newSearchNonce();
     attachRetryRequestId(tabId, retryRequestId);
+    // Show spinner for the retry leg until search-complete (server streams
+    // after the invoke oneshot returns empty/local).
+    searchTabs.update((tabs) =>
+      tabs.map((t) => (t.id === tabId ? { ...t, isSearching: true, progress: null, error: null } : t)),
+    );
     let retryTimeout: ReturnType<typeof setTimeout> | undefined;
     try {
       const results = await Promise.race([
@@ -675,23 +714,20 @@
             : t
         )));
         addToast('success', results.length === 1 ? m.search_server_returned_one() : m.search_server_returned_other({ count: results.length }));
-      } else {
-        addToast('info', m.search_server_no_results_retry());
       }
+      // Do not toast "no results" here: server method returns the oneshot
+      // immediately while TCP still streams. Keep retryRequestId until
+      // search-complete clears it in the store.
     } catch (e: unknown) {
-      // Suppress the error toast too when the retry was stopped/closed
-      // mid-flight (e.g. cancel surfaced as a rejected invoke).
       const liveTab = get(searchTabs).find((t) => t.id === tabId);
       if (!liveTab || liveTab.retryRequestId !== retryRequestId) {
         return;
       }
       const msg = translateError(e, m.search_retry_failed());
       addToast('error', msg);
-    } finally {
-      // Clear the watchdog so the loser timer doesn't keep running (and can't
-      // fire a late rejection) after the search resolves first.
-      if (retryTimeout) clearTimeout(retryTimeout);
       clearRetryRequestId(tabId);
+    } finally {
+      if (retryTimeout) clearTimeout(retryTimeout);
     }
   }
 
@@ -933,10 +969,15 @@
   // ever dropped on the IPC bridge the spinner would spin forever, so this
   // fallback clears it — but only when no retry phase is still running
   // (the retry path owns the spinner until its own completion).
-  const SEARCH_COMPLETE_GRACE_MS = 5000;
+  // Kad-only: short grace (oneshot ≈ search end). Global/server: TCP/UDP can
+  // still stream for ~90s+ after the invoke returns.
+  const SEARCH_COMPLETE_GRACE_KAD_MS = 5000;
+  const SEARCH_COMPLETE_GRACE_ED2K_MS = 120_000;
 
-  function armSearchCompletionFallback(requestId: number) {
+  function armSearchCompletionFallback(requestId: number, method: SearchMethod) {
     clearSearchTimeoutForRequest(requestId);
+    const graceMs =
+      method === 'kad' ? SEARCH_COMPLETE_GRACE_KAD_MS : SEARCH_COMPLETE_GRACE_ED2K_MS;
     searchTimeouts.set(
       requestId,
       setTimeout(() => {
@@ -945,7 +986,7 @@
           if (!tab.isSearching || tab.retryRequestId != null) return tab;
           return { ...tab, isSearching: false, progress: null };
         });
-      }, SEARCH_COMPLETE_GRACE_MS),
+      }, graceMs),
     );
   }
 
@@ -1047,7 +1088,9 @@
     // short, and an unbounded string is a needless payload/edge-case vector.
     const q = query.trim().slice(0, MAX_SEARCH_QUERY_LEN);
     const method = searchMethod;
-    filterType = searchFileType;
+    // eMule/backend: Program clears the local type filter so Arc/Iso hits
+    // from a Pro-wire search remain visible. Keep Arc/Iso as client filters.
+    filterType = searchFileType === 'Pro' ? '' : searchFileType;
     const parsedMinSize = filterMinSize !== '' ? parseFloat(filterMinSize) * filterMinUnit : undefined;
     const parsedMaxSize = filterMaxSize !== '' ? parseFloat(filterMaxSize) * filterMaxUnit : undefined;
     const parsedMinAvail = filterMinSources !== '' ? parseInt(filterMinSources, 10) : undefined;
@@ -1131,7 +1174,7 @@
           results: mergeSearchResults(tab.results, results),
         }));
       }
-      armSearchCompletionFallback(requestId);
+      armSearchCompletionFallback(requestId, method);
     } catch (e: unknown) {
       clearSearchTimeoutForRequest(requestId);
       if (!get(searchTabs).some((t) => t.requestId === requestId)) return;
