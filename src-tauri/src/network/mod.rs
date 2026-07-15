@@ -1129,6 +1129,19 @@ fn server_source_settle_elapsed(state: &NetworkState) -> bool {
             >= SERVER_SOURCE_SETTLE_SECS
 }
 
+/// KAD is actually usable for FindSource (not merely `Connecting` while
+/// bootstrapping `nodes.dat`).
+fn kad_ready_for_sources(state: &NetworkState) -> bool {
+    state.stats.status == NetworkStatus::Connected
+}
+
+/// At least one download source network is up: KAD Connected and/or an
+/// eD2k server session. Used to defer warm-start dials and discovery on
+/// launch so restored downloads do not search/dial during KAD Connecting.
+fn network_ready_for_sources(state: &NetworkState) -> bool {
+    kad_ready_for_sources(state) || state.server_connected
+}
+
 /// Build UDP GETSOURCES packets for ALL eligible servers (single file).
 fn build_all_getsources_packets(
     state: &mut NetworkState,
@@ -12108,10 +12121,12 @@ pub async fn start_network(
                 }
 
                 // Start initial KAD source searches for pending downloads once KAD
-                // is connected (separate from the status transition above because
-                // the KAD response handler may set Connected before this timer fires).
-                if count > 0 && !state.kad_initial_source_burst_done && !state.pending_downloads.is_empty() {
-                    {
+                // is Connected (not merely Connecting / nodes.dat loaded).
+                if state.stats.status == NetworkStatus::Connected
+                    && count > 0
+                    && !state.kad_initial_source_burst_done
+                    && !state.pending_downloads.is_empty()
+                {
                         let pending_count = state.pending_downloads.len();
                         info!("KAD connected: triggering source search for {pending_count} pending downloads");
                         let now = chrono::Utc::now().timestamp();
@@ -12201,7 +12216,6 @@ pub async fn start_network(
                         if pending_count > MAX_INITIAL_KAD {
                             info!("Started {kad_started} KAD searches initially; remaining {} will search on next retry cycle", pending_count - kad_started);
                         }
-                    }
                 }
                 // Register with the rendezvous server as soon as we have a
                 // confirmed external IP so other Ember clients can find us.
@@ -14533,7 +14547,7 @@ pub async fn start_network(
             _ = source_retry_timer.tick() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
                 let now = chrono::Utc::now().timestamp();
-                let kad_available = state.stats.status != NetworkStatus::Disconnected;
+                let kad_available = kad_ready_for_sources(&state);
                 let server_connected = state.server_connected;
 
                 // Path B: refresh the inbound reconnect index from the current
@@ -14558,7 +14572,10 @@ pub async fn start_network(
                                 idx_map
                                     .entry(src.ip)
                                     .or_default()
-                                    .push((pfs.file_hash, src.source_user_hash));
+                                    .push((
+                                        pfs.file_hash,
+                                        upload_server::reconnect_user_hash(src.source_user_hash),
+                                    ));
                             }
                         }
                     }
@@ -14758,10 +14775,12 @@ pub async fn start_network(
                     }
                 }
 
-                // Skip source searches when neither KAD nor a server is connected --
-                // there is no network to search. Avoids burning retry budget on startup
-                // before any connection is established.
-                if !kad_available && !server_connected {
+                // Skip source searches and warm-start dials until KAD is
+                // Connected or an eD2k server session exists. `Connecting`
+                // (nodes.dat bootstrap) must not count — otherwise restored
+                // downloads dial cached HighIDs and fire FindSource/UDP
+                // before either network is usable.
+                if !network_ready_for_sources(&state) {
                     return;
                 }
 
@@ -16693,6 +16712,8 @@ pub async fn start_network(
                                                 peer_addr: cb_addr,
                                                 crypt_options: crypt_options.unwrap_or(0),
                                                 user_hash,
+                                                push_grant_file_hash: None,
+                                                push_grant_accepted: None,
                                             },
                                         ) {
                                             debug!("Could not enqueue callback-serve for {cb_addr}: {e}");
@@ -18137,6 +18158,8 @@ pub async fn start_network(
                                     peer_addr: cb_addr,
                                     crypt_options: 0,
                                     user_hash: None,
+                                    push_grant_file_hash: None,
+                                    push_grant_accepted: None,
                                 },
                             ) {
                                 debug!("Could not enqueue buddy callback-serve for {cb_addr}: {e}");
@@ -19897,7 +19920,7 @@ pub async fn start_network(
                 }
 
                 if !state.pending_downloads.is_empty()
-                    && state.stats.status != NetworkStatus::Disconnected
+                    && network_ready_for_sources(&state)
                     && now.saturating_sub(last_kad_activity_at) > 180
                 {
                     for pending in state.pending_downloads.values_mut() {
@@ -19919,6 +19942,9 @@ pub async fn start_network(
             // Periodic UDP source requests (eMule UDPSERVERREASKTIME)
             _ = server_udp_source_timer.tick() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
+                if !network_ready_for_sources(&state) {
+                    return;
+                }
                 let mut all_for_udp: Vec<([u8; 16], u64)> = state.pending_downloads.values()
                     .filter(|pd| !pd.control.is_cancelled())
                     .filter_map(|pd| {
@@ -25010,7 +25036,7 @@ async fn handle_command_inner(
                             .map(|t| priority_str_to_u32(&t.priority))
                             .unwrap_or(1)
                     };
-                    let kad_available = state.stats.status != NetworkStatus::Disconnected;
+                    let kad_available = kad_ready_for_sources(state);
                     let kad_hash = md4_bytes_to_kad_id(&hash_bytes);
                     let mut closest = state
                         .routing_table
@@ -25082,7 +25108,7 @@ async fn handle_command_inner(
                             }
                         }
                     }
-                    {
+                    if network_ready_for_sources(state) {
                         let packets = build_all_getsources_packets(state, &hash_bytes, file_size);
                         if !packets.is_empty() {
                             let room =
@@ -25283,7 +25309,7 @@ async fn handle_command_inner(
                 // download starts, every source-discovery channel is
                 // already in flight.
                 let now_ts = chrono::Utc::now().timestamp();
-                let kad_available = state.stats.status != NetworkStatus::Disconnected;
+                let kad_available = kad_ready_for_sources(state);
                 let kad_hash = md4_bytes_to_kad_id(&hash_bytes);
 
                 let initial_kad_search_started = if kad_available {
@@ -25365,7 +25391,7 @@ async fn handle_command_inner(
 
                 // UDP fan-out to every eligible known server, paced via
                 // `udp_source_queue` so we don't burst-send on add.
-                {
+                if network_ready_for_sources(state) {
                     let packets = build_all_getsources_packets(state, &hash_bytes, file_size);
                     if !packets.is_empty() {
                         let room =
@@ -25464,7 +25490,7 @@ async fn handle_command_inner(
                     });
                 }
 
-                let kad_search_started = if !closest.is_empty() {
+                let kad_search_started = if kad_ready_for_sources(state) && !closest.is_empty() {
                     closest.sort_by_key(|c| c.is_tcp_firewalled() as u8);
                     let sid = state.search_manager.start_search(
                         kad_hash,
@@ -25549,7 +25575,7 @@ async fn handle_command_inner(
                 }
 
                 // Queue UDP source requests to ALL eligible servers (paced via udp_source_queue)
-                {
+                if network_ready_for_sources(state) {
                     let mut file_hash_arr = [0u8; 16];
                     file_hash_arr.copy_from_slice(&hash_bytes);
                     let packets = build_all_getsources_packets(state, &file_hash_arr, file_size);
