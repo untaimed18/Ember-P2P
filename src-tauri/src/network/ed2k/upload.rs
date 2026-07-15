@@ -260,6 +260,11 @@ struct OutboundServeState {
     /// eMule answers EmuleInfo first — but when present it is fed to the serve
     /// loop as its first `deferred_packet` so nothing is dropped.
     first_packet: Option<(u8, u8, Vec<u8>)>,
+    /// HighID push-grant file (AddUpNextClient). When set, the serve loop
+    /// starts with this file and has already sent `OP_ACCEPTUPLOADREQ`.
+    push_grant_file_hash: Option<[u8; 16]>,
+    /// See [`ConnectServeRequest::push_grant_accepted`].
+    push_grant_accepted: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Request from the network task asking the upload listener to dial `peer_addr`
@@ -277,6 +282,14 @@ pub struct ConnectServeRequest {
     /// RC4 key for an obfuscated dial (eMule derives obfuscation from the user
     /// hash); `None`/zero forces a plain dial.
     pub user_hash: Option<[u8; 16]>,
+    /// When `Some`, this is an eMule `AddUpNextClient` HighID push-grant: after
+    /// handshake we send `OP_ACCEPTUPLOADREQ` and seed the file hash so the
+    /// peer can start `OP_REQUESTPARTS` without another `STARTUPLOADREQ`.
+    pub push_grant_file_hash: Option<[u8; 16]>,
+    /// Set to `true` once `OP_ACCEPTUPLOADREQ` is sent for a push-grant so the
+    /// caller can distinguish pre-grant dial failures (restore seniority) from
+    /// post-grant session errors (do not restore).
+    pub push_grant_accepted: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 struct UploadSlotGuard {
@@ -424,6 +437,45 @@ pub struct KadCallbackParts {
 pub type ReconnectIndex =
     std::collections::HashMap<std::net::Ipv4Addr, Vec<([u8; 16], Option<[u8; 16]>)>>;
 
+/// Normalize a source user hash for Path B indexing: all-zero is treated as
+/// unknown (`None`) so it never equality-matches a Hello of `[0;16]`.
+pub fn reconnect_user_hash(uh: Option<[u8; 16]>) -> Option<[u8; 16]> {
+    uh.filter(|h| *h != [0u8; 16])
+}
+
+/// Pick a file hash for Path B diversion from the reconnect index entries at
+/// `peer_v4`. Prefers an exact non-zero user-hash match; falls back to
+/// unknown-hash entries only when the peer hash is also unknown or there is
+/// no conflicting known-hash entry for a different user at this IP.
+pub(crate) fn path_b_divert_file(
+    entries: &[([u8; 16], Option<[u8; 16]>)],
+    peer_user_hash: [u8; 16],
+) -> Option<[u8; 16]> {
+    let peer_uh = reconnect_user_hash(Some(peer_user_hash));
+    if let Some(puh) = peer_uh {
+        if let Some((fh, _)) = entries.iter().find(|(_, uh)| *uh == Some(puh)) {
+            return Some(*fh);
+        }
+        // Known peer identity but no matching entry — do not steal another
+        // user's unknown-hash OnQueue row at the same NAT IP.
+        let has_other_known = entries
+            .iter()
+            .any(|(_, uh)| matches!(uh, Some(h) if *h != puh));
+        if has_other_known {
+            return None;
+        }
+        return entries
+            .iter()
+            .find(|(_, uh)| uh.is_none())
+            .map(|(fh, _)| *fh);
+    }
+    // Peer Hello hash unknown: only match unknown-hash entries.
+    entries
+        .iter()
+        .find(|(_, uh)| uh.is_none())
+        .map(|(fh, _)| *fh)
+}
+
 static RECONNECT_INDEX: std::sync::OnceLock<std::sync::Arc<std::sync::RwLock<ReconnectIndex>>> =
     std::sync::OnceLock::new();
 
@@ -527,6 +579,11 @@ const UPLOAD_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from
 /// serving loop.
 const UPLOAD_SLOW_WRITE_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(1000);
 
+/// Max concurrent outbound HighID push-grant dials (AddUpNextClient).
+const MAX_PUSH_GRANT_DIALS: usize = 3;
+/// Backoff after a failed HighID push dial before retrying the same peer.
+const PUSH_GRANT_BACKOFF_SECS: u64 = 30;
+
 /// Maximum concurrent TCP connections from a single IP address
 const MAX_CONNECTIONS_PER_IP: usize = 3;
 /// Maximum waiting-list entries permitted from a single IP address
@@ -622,7 +679,7 @@ impl FileRequestTracker {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum QueueIdentity {
     UserHash([u8; 16]),
     Ip(IpAddr),
@@ -766,6 +823,14 @@ pub(crate) struct QueueEntry {
     /// counts lingering waiting-list entries from a churning peer.
     pub(crate) last_ip: Option<std::net::IpAddr>,
     pub(crate) udp_port: u16,
+    /// Peer's advertised TCP listen port from Hello — required to dial
+    /// HighID push-grants (`AddUpNextClient`).
+    pub(crate) tcp_port: u16,
+    /// Crypt options byte (supports/requests/requires) for obfuscated dial.
+    pub(crate) crypt_options: u8,
+    /// True when the peer's Hello client_id is HighID (dialable when
+    /// disconnected). LowID disconnected peers use `add_next_connect` instead.
+    pub(crate) is_high_id: bool,
     pub(crate) user_hash: [u8; 16],
     pub(crate) file_hash: [u8; 16],
     pub(crate) join_time: std::time::Instant,
@@ -790,6 +855,57 @@ pub(crate) struct QueueEntry {
     /// insertion/update time — re-evaluated each time the peer
     /// re-enters the queue (session-expired, queue-full rotation).
     pub(crate) ember_verified: bool,
+}
+
+/// Classify a peer as HighID for upload-queue dialability (`AddUpNextClient`).
+///
+/// When Hello reports a real client_id, trust HighID/LowID from that alone —
+/// LowIDs almost always advertise a listen `tcp_port` that is not reachable,
+/// so a port-based OR would incorrectly mark them dialable. The port heuristic
+/// is only used when `client_id == 0` (omitted / unknown).
+fn peer_is_high_id_for_queue(hello_caps: &PeerCapabilities, peer_addr: SocketAddr) -> bool {
+    if hello_caps.client_id != 0 {
+        return hello_caps.is_high_id();
+    }
+    hello_caps.tcp_port > 0
+        && match peer_addr.ip() {
+            IpAddr::V4(v4) => !crate::security::is_special_use_v4(v4),
+            IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map(|v4| !crate::security::is_special_use_v4(v4))
+                .unwrap_or(false),
+        }
+}
+
+/// Build a queue entry snapshot from the current session Hello capabilities.
+fn queue_entry_from_hello(
+    identity: QueueIdentity,
+    peer_addr: SocketAddr,
+    peer_user_hash: [u8; 16],
+    file_hash: [u8; 16],
+    join_time: std::time::Instant,
+    hello_caps: &PeerCapabilities,
+    is_friend_slot: bool,
+    ember_verified: bool,
+) -> QueueEntry {
+    let is_high_id = peer_is_high_id_for_queue(hello_caps, peer_addr);
+    QueueEntry {
+        identity,
+        current_addr: Some(peer_addr),
+        last_ip: Some(peer_addr.ip()),
+        udp_port: hello_caps.udp_port,
+        tcp_port: hello_caps.tcp_port,
+        crypt_options: hello_caps.crypt_options_byte(),
+        is_high_id,
+        user_hash: peer_user_hash,
+        file_hash,
+        join_time,
+        add_next_connect: false,
+        emule_version: hello_caps.emule_version_min,
+        is_friend_slot,
+        ember_pubkey: hello_caps.ember_pubkey,
+        ember_verified,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1069,6 +1185,13 @@ struct UploadHandler {
     /// Notify queued clients when a slot becomes available (fired by UploadSlotGuard
     /// on deactivate/drop, and by the proactive slot opener timer).
     slot_notify: Arc<tokio::sync::Notify>,
+    /// Identities currently being dialed for HighID AddUpNextClient push-grants.
+    push_grant_in_flight: Arc<tokio::sync::Mutex<std::collections::HashSet<QueueIdentity>>>,
+    /// Per-identity backoff after a failed HighID push dial.
+    push_grant_backoff:
+        Arc<tokio::sync::Mutex<HashMap<QueueIdentity, std::time::Instant>>>,
+    /// Count of concurrent outbound HighID push-grant dials.
+    push_grant_dials: Arc<std::sync::atomic::AtomicUsize>,
     /// Per-slot smoothed upload rates for dynamic slot decisions.
     slot_rates: SlotRateRegistry,
     /// Active Ember friend sessions: ember_hash -> outbound packet sender
@@ -1313,6 +1436,71 @@ pub(crate) fn priority_weight(priority: &str) -> f64 {
     }
 }
 
+/// eMule `CUpDownClient::GetFilePrioAsNumber` integer (used by soft-zone admission).
+pub(crate) fn file_prio_as_number(priority: &str) -> i32 {
+    match priority {
+        "release" => 18,
+        "high" => 9,
+        "normal" => 7,
+        "low" => 6,
+        "verylow" => 2,
+        _ => 7,
+    }
+}
+
+/// Normalize a socket address to the IPv4 u32 used by credit scoring.
+fn peer_ip_u32(current_addr: Option<SocketAddr>) -> u32 {
+    current_addr
+        .map(|a| match a.ip() {
+            IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
+            IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map(|v4| u32::from_be_bytes(v4.octets()))
+                .unwrap_or(0),
+        })
+        .unwrap_or(0)
+}
+
+/// eMule `GetCombinedFilePrioAndCredit` — wait-independent soft-zone ranking:
+/// `10 * credit_ratio * GetFilePrioAsNumber()`. Friends with a verified friend
+/// slot bypass soft-zone checks entirely (caller responsibility).
+pub(crate) fn combined_file_prio_and_credit(
+    cm: &CreditManager,
+    idx: &LocalIndex,
+    user_hash: &[u8; 16],
+    file_hash: [u8; 16],
+    peer_ip: u32,
+    ember_pubkey: Option<&[u8; 32]>,
+    ember_verified: bool,
+) -> f64 {
+    let prio_num = idx
+        .get_by_hash(&hex::encode(file_hash))
+        .map(|f| file_prio_as_number(&f.priority))
+        .unwrap_or(7) as f64;
+    // BadGuy short-circuit via eMule path (same as score_queue_entry).
+    if matches!(
+        cm.get_current_ident_state(user_hash, peer_ip),
+        crate::network::ed2k::credits::IdentState::BadGuy
+    ) {
+        return 0.0;
+    }
+    let ratio = if ember_verified && ember_pubkey.is_some() {
+        cm.get_ember_score_ratio(ember_pubkey.expect("guarded"))
+    } else {
+        cm.get_score_ratio(user_hash, peer_ip)
+    };
+    10.0 * ratio * prio_num
+}
+
+/// Soft-zone admit decision matching eMule `AddClientToQueue` soft→hard gate.
+pub(crate) fn soft_zone_should_admit(
+    is_verified_friend: bool,
+    new_combined: f64,
+    avg_combined: f64,
+) -> bool {
+    is_verified_friend || new_combined >= avg_combined
+}
+
 /// Consistent eMule-style queue score for a single entry.
 /// All code paths that compare or rank queue entries MUST use this function
 /// to avoid scoring asymmetry (eMule version penalty, friend slot, download
@@ -1349,15 +1537,7 @@ pub(crate) fn score_queue_entry(
     // Previously these peers got peer_ip=0, which defeated the credit
     // IP-pinning used by `get_current_ident_state` to detect identity
     // spoofing via IP switches.
-    let peer_ip = current_addr
-        .map(|a| match a.ip() {
-            IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
-            IpAddr::V6(v6) => v6
-                .to_ipv4_mapped()
-                .map(|v4| u32::from_be_bytes(v4.octets()))
-                .unwrap_or(0),
-        })
-        .unwrap_or(0);
+    let peer_ip = peer_ip_u32(current_addr);
 
     // Verified Ember peers get the enhanced-scoring path. Two guards
     // on the same branch (pubkey present AND PoP verified) so
@@ -1767,6 +1947,9 @@ pub async fn start_upload_server(
         geoip,
         file_request_tracker: Arc::new(tokio::sync::Mutex::new(FileRequestTracker::new())),
         slot_notify,
+        push_grant_in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+        push_grant_backoff: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        push_grant_dials: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         slot_rates,
         ember_sessions,
         network_disconnected,
@@ -2010,12 +2193,25 @@ pub async fn start_upload_server(
                 if active < dynamic_slots {
                     let queue = server.upload_queue.lock().await;
                     let has_waiters = queue.iter().any(|e| e.current_addr.is_some());
+                    let has_dialable_highid = queue.iter().any(|e| {
+                        e.current_addr.is_none()
+                            && e.is_high_id
+                            && e.tcp_port > 0
+                            && e.last_ip.is_some()
+                    });
                     drop(queue);
                     if has_waiters {
                         debug!(
                             "Proactive slot opener: {active}/{dynamic_slots} active, signalling queued clients"
                         );
                         server.slot_notify.notify_waiters();
+                    }
+                    // eMule AddUpNextClient: dial disconnected HighID winners.
+                    if has_dialable_highid {
+                        let server = server.clone();
+                        tokio::spawn(async move {
+                            server.try_add_up_next_client().await;
+                        });
                     }
                 }
 
@@ -2761,6 +2957,221 @@ impl UploadHandler {
             .await
     }
 
+    /// eMule `AddUpNextClient` for disconnected HighID winners: dial the peer,
+    /// handshake, send `OP_ACCEPTUPLOADREQ`, and serve. Called from the
+    /// proactive slot opener when `active < dynamic_slots`.
+    async fn try_add_up_next_client(self: &Arc<Self>) {
+        let active = self.active_count.load(std::sync::atomic::Ordering::Relaxed);
+        let dynamic_slots = self.compute_dynamic_slot_count();
+        if active >= dynamic_slots {
+            return;
+        }
+        let in_flight_n = self
+            .push_grant_dials
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if in_flight_n >= MAX_PUSH_GRANT_DIALS {
+            return;
+        }
+
+        let now = std::time::Instant::now();
+        {
+            let mut backoff = self.push_grant_backoff.lock().await;
+            backoff.retain(|_, until| *until > now);
+        }
+
+        let candidate = {
+            let cm = self.credit_manager.read().await;
+            let idx = self.local_index.read().await;
+            let in_flight = self.push_grant_in_flight.lock().await;
+            let backoff = self.push_grant_backoff.lock().await;
+            let queue = self.upload_queue.lock().await;
+
+            let mut best_connected_score = f64::MIN;
+            let mut best_dial: Option<(QueueEntry, f64)> = None;
+
+            for e in queue.iter() {
+                if e.join_time.elapsed().as_secs() >= MAX_PURGEQUEUETIME_SECS {
+                    continue;
+                }
+                let score = score_queue_entry(
+                    &cm,
+                    &idx,
+                    &e.user_hash,
+                    e.file_hash,
+                    e.join_time.elapsed().as_secs(),
+                    e.current_addr,
+                    e.emule_version,
+                    e.is_friend_slot,
+                    e.ember_pubkey.as_ref(),
+                    e.ember_verified,
+                );
+                if e.current_addr.is_some() {
+                    if score > best_connected_score {
+                        best_connected_score = score;
+                    }
+                    continue;
+                }
+                if !e.is_high_id || e.tcp_port == 0 || e.last_ip.is_none() {
+                    continue;
+                }
+                if e.file_hash == [0u8; 16] {
+                    continue;
+                }
+                if in_flight.contains(&e.identity) || backoff.contains_key(&e.identity) {
+                    continue;
+                }
+                let better = match &best_dial {
+                    None => true,
+                    Some((_, bs)) => {
+                        score > *bs
+                            || (score == *bs
+                                && best_dial
+                                    .as_ref()
+                                    .map(|(be, _)| e.join_time < be.join_time)
+                                    .unwrap_or(true))
+                    }
+                };
+                if better {
+                    best_dial = Some((e.clone(), score));
+                }
+            }
+            drop(queue);
+            drop(backoff);
+            drop(in_flight);
+            drop(idx);
+            drop(cm);
+
+            // Only dial when this HighID outscores every connected waiter
+            // (or there are no connected waiters) — same priority as
+            // FindBestClientInQueue returning a disconnected HighID.
+            best_dial.and_then(|(entry, score)| {
+                if score > best_connected_score || best_connected_score == f64::MIN {
+                    Some(entry)
+                } else {
+                    None
+                }
+            })
+        };
+
+        let Some(entry) = candidate else {
+            return;
+        };
+        let Some(ip) = entry.last_ip else {
+            return;
+        };
+        let peer_addr = SocketAddr::new(ip, entry.tcp_port);
+        if peer_addr.port() == 0 {
+            return;
+        }
+        if let IpAddr::V4(v4) = ip {
+            if crate::security::is_special_use_v4(v4) {
+                return;
+            }
+        }
+
+        // Keep the waiting-list entry until grant succeeds so a concurrent
+        // re-ask cannot replace it with a fresh join_time. in_flight blocks
+        // a second dial of the same identity.
+        {
+            let mut in_flight = self.push_grant_in_flight.lock().await;
+            if !in_flight.insert(entry.identity.clone()) {
+                return;
+            }
+        }
+        self.push_grant_dials
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let identity = entry.identity.clone();
+        let grant_accepted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let req = ConnectServeRequest {
+            peer_addr,
+            crypt_options: entry.crypt_options,
+            user_hash: (entry.user_hash != [0u8; 16]).then_some(entry.user_hash),
+            push_grant_file_hash: Some(entry.file_hash),
+            push_grant_accepted: Some(grant_accepted.clone()),
+        };
+
+        info!(
+            "AddUpNextClient: dialing HighID push-grant to {peer_addr} for file {}",
+            hex::encode(entry.file_hash)
+        );
+
+        // Reserve global + per-IP connection slots like the callback-serve arm.
+        let reserved = {
+            let mut cur = self
+                .total_connections
+                .load(std::sync::atomic::Ordering::Relaxed);
+            loop {
+                if cur >= MAX_TOTAL_CONNECTIONS {
+                    break false;
+                }
+                match self.total_connections.compare_exchange_weak(
+                    cur,
+                    cur + 1,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Relaxed,
+                ) {
+                    Ok(_) => break true,
+                    Err(c) => cur = c,
+                }
+            }
+        };
+        if !reserved {
+            self.push_grant_dials
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.push_grant_in_flight.lock().await.remove(&identity);
+            return;
+        }
+        {
+            let mut counts = self.ip_connection_counts.lock().await;
+            let count = counts.entry(ip).or_insert(0);
+            if *count >= MAX_CONNECTIONS_PER_IP {
+                drop(counts);
+                self.total_connections
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                self.push_grant_dials
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                self.push_grant_in_flight.lock().await.remove(&identity);
+                debug!(
+                    "AddUpNextClient: dropping dial to {peer_addr}: per-IP limit reached"
+                );
+                return;
+            }
+            *count += 1;
+        }
+
+        let result = self.connect_and_serve(req).await;
+        {
+            let mut counts = self.ip_connection_counts.lock().await;
+            if let Some(count) = counts.get_mut(&ip) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    counts.remove(&ip);
+                }
+            }
+        }
+        self.total_connections
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.push_grant_dials
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.push_grant_in_flight.lock().await.remove(&identity);
+
+        let accepted = grant_accepted.load(std::sync::atomic::Ordering::Relaxed);
+        if accepted || result.is_ok() {
+            // Granted (or session completed cleanly): drop waiting-list seniority.
+            let mut queue = self.upload_queue.lock().await;
+            queue.retain(|e| e.identity != identity);
+        } else if let Err(e) = result {
+            // Pre-grant failure: leave the queue entry (seniority intact) and backoff.
+            debug!("AddUpNextClient dial to {peer_addr} failed before grant: {e}");
+            self.push_grant_backoff.lock().await.insert(
+                identity,
+                std::time::Instant::now()
+                    + std::time::Duration::from_secs(PUSH_GRANT_BACKOFF_SECS),
+            );
+        }
+    }
+
     /// Dial `peer_addr` and serve it as an upload peer — the LowID callback
     /// upload path. This mirrors eMule's `OP_CALLBACKREQUESTED` → `TryToConnect`
     /// → unified-client-serve behaviour: a firewalled node that a peer can only
@@ -2775,8 +3186,13 @@ impl UploadHandler {
     /// peer's callback crypt options ask for it, we hold the peer's user hash to
     /// seed RC4, and our own obfuscation layer is enabled. A crypt-*required*
     /// peer that fails obfuscation is abandoned; otherwise we retry once plain.
+    ///
+    /// When `push_grant_file_hash` is set, this is also the HighID
+    /// `AddUpNextClient` path: after handshake we send `OP_ACCEPTUPLOADREQ`.
     async fn connect_and_serve(&self, req: ConnectServeRequest) -> anyhow::Result<()> {
         let peer_addr = req.peer_addr;
+        let push_grant_file_hash = req.push_grant_file_hash;
+        let push_grant_accepted = req.push_grant_accepted;
         let peer_hash = req.user_hash.filter(|h| *h != [0u8; 16]);
         let obf_enabled = self
             .obfuscation_enabled
@@ -2934,6 +3350,8 @@ impl UploadHandler {
                 peer_user_hash,
                 hello_caps,
                 first_packet,
+                push_grant_file_hash,
+                push_grant_accepted,
             };
             return self
                 .run_session(peer_addr, ConnInit::OutboundServe(Box::new(state)))
@@ -2987,6 +3405,8 @@ impl UploadHandler {
         // loop's first packet (see `OutboundServeState::first_packet`). Always
         // `None` for inbound.
         let mut outbound_first_packet: Option<(u8, u8, Vec<u8>)> = None;
+        let mut push_grant_file_hash: Option<[u8; 16]> = None;
+        let mut push_grant_accepted: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = None;
         let (mut reader, mut writer, hello_data, peer_user_hash, mut hello_caps) = match init {
             ConnInit::OutboundServe(state) => {
                 let OutboundServeState {
@@ -2996,8 +3416,12 @@ impl UploadHandler {
                     peer_user_hash,
                     hello_caps,
                     first_packet,
+                    push_grant_file_hash: pg,
+                    push_grant_accepted: pga,
                 } = *state;
                 outbound_first_packet = first_packet;
+                push_grant_file_hash = pg;
+                push_grant_accepted = pga;
                 (reader, writer, hello_data, peer_user_hash, hello_caps)
             }
             ConnInit::InboundStream {
@@ -3702,16 +4126,7 @@ impl UploadHandler {
                 let idx = reconnect_index();
                 let guard = idx.read().unwrap_or_else(|e| e.into_inner());
                 guard.get(&peer_v4).and_then(|entries| {
-                    // Prefer an entry whose stored user hash matches the peer's
-                    // Hello identity; otherwise accept an entry we only know by
-                    // IP (user hash not yet learned). Never match an entry whose
-                    // known user hash differs — that's a different client at the
-                    // same address and must not be diverted.
-                    entries
-                        .iter()
-                        .find(|(_, uh)| *uh == Some(peer_user_hash))
-                        .or_else(|| entries.iter().find(|(_, uh)| uh.is_none()))
-                        .map(|(fh, _)| *fh)
+                    path_b_divert_file(entries, peer_user_hash)
                 })
             };
             if let Some(file_hash) = divert_file {
@@ -4145,6 +4560,70 @@ impl UploadHandler {
         let mut recorded_share_request: Option<[u8; 16]> = None;
         let mut last_preempt_check: std::time::Instant = std::time::Instant::now();
         let mut epx_packets_received: u8 = 0;
+        let mut last_part_request: std::time::Instant = std::time::Instant::now();
+
+        // HighID AddUpNextClient push-grant: we dialed this peer, so seed the
+        // file hash, reserve a slot, and send OP_ACCEPTUPLOADREQ before the
+        // packet loop (peer will follow with OP_REQUESTPARTS).
+        if let Some(fh) = push_grant_file_hash {
+            let dynamic_slots = self.compute_dynamic_slot_count();
+            if !slot_guard.try_activate(dynamic_slots) {
+                anyhow::bail!(
+                    "push-grant session {peer_addr}: no free upload slot after dial"
+                );
+            }
+            current_file_hash = Some(fh);
+            write_packet_async(
+                &mut writer,
+                OP_EDONKEYHEADER,
+                OP_ACCEPTUPLOADREQ,
+                &[],
+            )
+            .await?;
+            if let Some(flag) = push_grant_accepted.as_ref() {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            // Drop waiting-list entry now that the slot is granted (eMule
+            // RemoveFromWaitingQueue before/at AcceptUploadReq).
+            {
+                let mut queue = self.upload_queue.lock().await;
+                queue.retain(|e| e.identity != queue_identity);
+            }
+            self.record_share_accepted(&fh).await;
+            queue_wait_at_grant = 0;
+            session_start = Some(std::time::Instant::now());
+            last_part_request = std::time::Instant::now();
+            let tid = uuid::Uuid::new_v4().to_string();
+            transfer_id = Some(tid.clone());
+            if let Some(resolved) = self.resolve_upload_file(&fh).await {
+                total_size = resolved.size;
+                let _ = self
+                    .upload_event_tx
+                    .send(UploadEvent {
+                        transfer_id: tid,
+                        kind: UploadEventKind::Started {
+                            file_name: resolved.name,
+                            file_hash: hex::encode(fh),
+                            total_size: resolved.size,
+                            peer_addr: peer_addr.to_string(),
+                            peer_name: ul_peer_name.clone(),
+                            client_software: ul_client_software.clone(),
+                            country_code: ul_country_code.clone(),
+                            user_hash: if peer_user_hash != [0u8; 16] {
+                                Some(hex::encode(peer_user_hash))
+                            } else {
+                                None
+                            },
+                            wait_seconds: 0,
+                        },
+                    })
+                    .await;
+            }
+            info!(
+                "AddUpNextClient: push-grant session ready for {peer_addr} file {}",
+                hex::encode(fh)
+            );
+        }
 
         // Time-of-last-useful-peer-activity gauge. The read-side
         // `tokio::time::timeout(SLOT_IDLE_TIMEOUT_SECS, pkt_rx.recv())`
@@ -4159,7 +4638,6 @@ impl UploadHandler {
         // symptom before this fix: an upload row that sat at a few
         // hundred KB transferred with status "Transferring" for many
         // minutes and only cleared when the app closed.
-        let mut last_part_request: std::time::Instant = std::time::Instant::now();
 
         // Diagnostic: when the last per-session heartbeat log was emitted,
         // and how many outer-loop iterations have run since the session
@@ -5154,11 +5632,28 @@ impl UploadHandler {
                             let mut queue = self.upload_queue.lock().await;
                             queue.retain(|e| e.join_time.elapsed().as_secs() < MAX_PURGEQUEUETIME_SECS);
                             let empty = queue.is_empty();
-                            let snap: Vec<_> = queue.iter().enumerate().map(|(i, e)| {
-                                (i, e.identity.clone(), e.current_addr, e.join_time, e.file_hash,
-                                 e.user_hash, e.emule_version, e.is_friend_slot, e.add_next_connect,
-                                 e.ember_pubkey, e.ember_verified)
-                            }).collect();
+                            let snap: Vec<_> = queue
+                                .iter()
+                                .enumerate()
+                                .map(|(i, e)| {
+                                    (
+                                        i,
+                                        e.identity.clone(),
+                                        e.current_addr,
+                                        e.join_time,
+                                        e.file_hash,
+                                        e.user_hash,
+                                        e.emule_version,
+                                        e.is_friend_slot,
+                                        e.add_next_connect,
+                                        e.ember_pubkey,
+                                        e.ember_verified,
+                                        e.is_high_id,
+                                        e.tcp_port,
+                                        e.last_ip,
+                                    )
+                                })
+                                .collect();
                             (empty, snap)
                         };
                         if queue_empty {
@@ -5178,59 +5673,86 @@ impl UploadHandler {
                         } else {
                             let cm = self.credit_manager.read().await;
                             let idx_snap = self.local_index.read().await;
-                            let mut best_identity: Option<QueueIdentity> = None;
-                            let mut best_join: Option<std::time::Instant> = None;
-                            let mut best_score = f64::MIN;
+                            // eMule FindBestClientInQueue: connected peers OR dialable
+                            // HighIDs compete for the slot; disconnected LowIDs only
+                            // get m_bAddNextConnect.
+                            let mut best_ready_identity: Option<QueueIdentity> = None;
+                            let mut best_ready_join: Option<std::time::Instant> = None;
+                            let mut best_ready_score = f64::MIN;
+                            let mut best_ready_needs_dial = false;
                             let mut best_low_identity: Option<QueueIdentity> = None;
                             let mut best_low_score = f64::MIN;
-                            for &(_i, ref identity, current_addr, join_time, file_hash, ref user_hash, emule_version, is_friend_slot, add_next_connect, ref ember_pubkey, ember_verified) in &queue_snapshot {
+                            for &(
+                                _i,
+                                ref identity,
+                                current_addr,
+                                join_time,
+                                file_hash,
+                                ref user_hash,
+                                emule_version,
+                                is_friend_slot,
+                                add_next_connect,
+                                ref ember_pubkey,
+                                ember_verified,
+                                is_high_id,
+                                tcp_port,
+                                last_ip,
+                            ) in &queue_snapshot
+                            {
                                 let score = score_queue_entry(
-                                    &cm, &idx_snap, user_hash, file_hash,
-                                    join_time.elapsed().as_secs(), current_addr,
-                                    emule_version, is_friend_slot,
-                                    ember_pubkey.as_ref(), ember_verified,
+                                    &cm,
+                                    &idx_snap,
+                                    user_hash,
+                                    file_hash,
+                                    join_time.elapsed().as_secs(),
+                                    current_addr,
+                                    emule_version,
+                                    is_friend_slot,
+                                    ember_pubkey.as_ref(),
+                                    ember_verified,
                                 );
-                                if current_addr.is_some() {
-                                    // Tie-break by earlier join_time so this grant
-                                    // decision agrees with compute_queue_rank (which
-                                    // ranks equal-score peers FIFO). Without this, the
-                                    // peer shown rank #1 could lose the grant to a
-                                    // later joiner with the same score.
-                                    if score > best_score
-                                        || (score == best_score && best_join.map_or(true, |bj| join_time < bj))
+                                let connected = current_addr.is_some();
+                                let dialable = !connected
+                                    && is_high_id
+                                    && tcp_port > 0
+                                    && last_ip.is_some();
+                                if connected || dialable {
+                                    if score > best_ready_score
+                                        || (score == best_ready_score
+                                            && best_ready_join.map_or(true, |bj| join_time < bj))
                                     {
-                                        best_score = score;
-                                        best_identity = Some(identity.clone());
-                                        best_join = Some(join_time);
+                                        best_ready_score = score;
+                                        best_ready_identity = Some(identity.clone());
+                                        best_ready_join = Some(join_time);
+                                        best_ready_needs_dial = dialable;
                                     }
                                 } else if !add_next_connect && score > best_low_score {
                                     best_low_score = score;
                                     best_low_identity = Some(identity.clone());
                                 }
                             }
-                            // H4: if a disconnected Low-ID would have won, flag it so it
-                            // gets priority on reconnect. Match by IDENTITY, not a stale
-                            // snapshot index (the queue may have shifted across the
-                            // .await points above).
                             if let Some(low_id) = best_low_identity {
-                                if best_low_score > best_score {
+                                if best_low_score > best_ready_score {
                                     let mut queue = self.upload_queue.lock().await;
-                                    if let Some(e) = queue.iter_mut().find(|e| e.identity == low_id) {
+                                    if let Some(e) = queue.iter_mut().find(|e| e.identity == low_id)
+                                    {
                                         e.add_next_connect = true;
                                     }
                                 }
                             }
                             drop(idx_snap);
                             drop(cm);
-                            // Grant iff THIS peer is the best-scoring connected queued
-                            // peer. Compare by IDENTITY, never the snapshot index: the
-                            // queue can shift across the .await points above, so an
-                            // index-based check (`queue[best_idx]`) could deny the
-                            // rightful winner or match an unrelated entry.
-                            match best_identity {
-                                Some(bi) if bi == queue_identity => {
+                            // Grant iff THIS peer is the best ready *connected* peer.
+                            // A disconnected HighID that outscores everyone is left for
+                            // the proactive AddUpNextClient dial (slot opener), matching
+                            // eMule FindBestClient → TryToConnect rather than granting
+                            // a lower-scoring connected peer.
+                            match best_ready_identity {
+                                Some(bi) if bi == queue_identity && !best_ready_needs_dial => {
                                     let mut queue = self.upload_queue.lock().await;
-                                    if let Some(pos) = queue.iter().position(|e| e.identity == queue_identity) {
+                                    if let Some(pos) =
+                                        queue.iter().position(|e| e.identity == queue_identity)
+                                    {
                                         let removed = queue.remove(pos);
                                         removed_queue_entry = Some(removed);
                                     }
@@ -5284,6 +5806,10 @@ impl UploadHandler {
                             queue[pos].current_addr = Some(peer_addr);
                             queue[pos].last_ip = Some(peer_addr.ip());
                             queue[pos].udp_port = hello_caps.udp_port;
+                            queue[pos].tcp_port = hello_caps.tcp_port;
+                            queue[pos].crypt_options = hello_caps.crypt_options_byte();
+                            queue[pos].is_high_id =
+                                peer_is_high_id_for_queue(&hello_caps, peer_addr);
                             queue[pos].user_hash = peer_user_hash;
                             queue[pos].file_hash = current_file_hash.unwrap_or([0u8; 16]);
                             // If the peer has since completed PoP, upgrade
@@ -5348,95 +5874,117 @@ impl UploadHandler {
                             write_packet_async(&mut writer, OP_EMULEPROT, OP_QUEUEFULL, &[]).await?;
                             break;
                         } else if queue.len() >= MAX_UPLOAD_QUEUE_SIZE {
-                            // m7: Soft-to-hard zone – only admit if above-average score
+                            // eMule soft→hard zone: admit when CombinedFilePrioAndCredit
+                            // is at/above the queue average (wait-independent), or the
+                            // peer holds a verified friend slot. Scoring newcomers with
+                            // wait=0 made almost everyone get OP_QUEUEFULL.
                             let new_fh = current_file_hash.unwrap_or([0u8; 16]);
                             let ember_verified = ember_auth_state.is_verified();
-                            let new_score = score_queue_entry(
-                                &cm, &idx_snap, &peer_user_hash, new_fh,
-                                0, Some(peer_addr), hello_caps.emule_version_min,
-                                is_verified_friend,
-                                hello_caps.ember_pubkey.as_ref(), ember_verified,
+                            let peer_ip = peer_ip_u32(Some(peer_addr));
+                            let new_combined = combined_file_prio_and_credit(
+                                &cm,
+                                &idx_snap,
+                                &peer_user_hash,
+                                new_fh,
+                                peer_ip,
+                                hello_caps.ember_pubkey.as_ref(),
+                                ember_verified,
                             );
-                            // Score every existing entry exactly once and reuse
-                            // those scores for BOTH the admission average and the
-                            // queue rank below, instead of scanning (and
-                            // re-scoring) the whole queue twice — the old code ran
-                            // an avg loop AND a full `compute_queue_rank` re-scan.
-                            let entry_scores: Vec<f64> = queue
-                                .iter()
-                                .map(|e| {
-                                    score_queue_entry(
-                                        &cm, &idx_snap, &e.user_hash, e.file_hash,
-                                        e.join_time.elapsed().as_secs(), e.current_addr,
-                                        e.emule_version, e.is_friend_slot,
-                                        e.ember_pubkey.as_ref(), e.ember_verified,
-                                    )
-                                })
-                                .collect();
-                            let avg_score = if entry_scores.is_empty() {
+                            let avg_combined = if queue.is_empty() {
                                 0.0
                             } else {
-                                entry_scores.iter().sum::<f64>() / entry_scores.len() as f64
+                                let total: f64 = queue
+                                    .iter()
+                                    .map(|e| {
+                                        combined_file_prio_and_credit(
+                                            &cm,
+                                            &idx_snap,
+                                            &e.user_hash,
+                                            e.file_hash,
+                                            peer_ip_u32(e.current_addr.or_else(|| {
+                                                e.last_ip.map(|ip| SocketAddr::new(ip, 0))
+                                            })),
+                                            e.ember_pubkey.as_ref(),
+                                            e.ember_verified,
+                                        )
+                                    })
+                                    .sum();
+                                total / queue.len() as f64
                             };
-                            if new_score >= avg_score {
+                            if soft_zone_should_admit(is_verified_friend, new_combined, avg_combined)
+                            {
                                 let join_time = queue_join_time;
-                                // Rank = 1 + existing entries that outrank the
-                                // newcomer. Mirrors `compute_queue_rank`'s ordering
-                                // exactly (higher score wins; equal score breaks
-                                // toward the earlier join_time) but reuses
-                                // `entry_scores` so the queue isn't re-scored.
+                                let new_score = score_queue_entry(
+                                    &cm,
+                                    &idx_snap,
+                                    &peer_user_hash,
+                                    new_fh,
+                                    0,
+                                    Some(peer_addr),
+                                    hello_caps.emule_version_min,
+                                    is_verified_friend,
+                                    hello_caps.ember_pubkey.as_ref(),
+                                    ember_verified,
+                                );
                                 let mut rank_val: u16 = 1;
-                                for (e, &es) in queue.iter().zip(entry_scores.iter()) {
+                                for e in queue.iter() {
                                     if e.identity == queue_identity {
                                         continue;
                                     }
+                                    let es = score_queue_entry(
+                                        &cm,
+                                        &idx_snap,
+                                        &e.user_hash,
+                                        e.file_hash,
+                                        e.join_time.elapsed().as_secs(),
+                                        e.current_addr,
+                                        e.emule_version,
+                                        e.is_friend_slot,
+                                        e.ember_pubkey.as_ref(),
+                                        e.ember_verified,
+                                    );
                                     if es > new_score
                                         || (es == new_score && e.join_time < join_time)
                                     {
                                         rank_val = rank_val.saturating_add(1);
                                     }
                                 }
-                                queue.push(QueueEntry {
-                                    identity: queue_identity.clone(),
-                                    current_addr: Some(peer_addr),
-                                    last_ip: Some(peer_addr.ip()),
-                                    udp_port: hello_caps.udp_port,
-                                    user_hash: peer_user_hash,
-                                    file_hash: new_fh,
+                                queue.push(queue_entry_from_hello(
+                                    queue_identity.clone(),
+                                    peer_addr,
+                                    peer_user_hash,
+                                    new_fh,
                                     join_time,
-                                    add_next_connect: false,
-                                    emule_version: hello_caps.emule_version_min,
-                                    is_friend_slot: is_verified_friend,
-                                    ember_pubkey: hello_caps.ember_pubkey,
+                                    &hello_caps,
+                                    is_verified_friend,
                                     ember_verified,
-                                });
+                                ));
                                 rank_val
                             } else {
-                                debug!("Upload queue in soft-hard zone, peer score {new_score:.1} below avg {avg_score:.1}, rejecting {peer_addr}");
+                                debug!(
+                                    "Upload queue in soft-hard zone, peer combined {new_combined:.1} below avg {avg_combined:.1}, rejecting {peer_addr}"
+                                );
                                 drop(queue);
                                 drop(idx_snap);
                                 drop(cm);
-                                write_packet_async(&mut writer, OP_EMULEPROT, OP_QUEUEFULL, &[]).await?;
+                                write_packet_async(&mut writer, OP_EMULEPROT, OP_QUEUEFULL, &[])
+                                    .await?;
                                 break;
                             }
                         } else {
                             let new_fh = current_file_hash.unwrap_or([0u8; 16]);
                             let join_time = queue_join_time;
                             let ember_verified = ember_auth_state.is_verified();
-                            queue.push(QueueEntry {
-                                identity: queue_identity.clone(),
-                                current_addr: Some(peer_addr),
-                                last_ip: Some(peer_addr.ip()),
-                                udp_port: hello_caps.udp_port,
-                                user_hash: peer_user_hash,
-                                file_hash: new_fh,
+                            queue.push(queue_entry_from_hello(
+                                queue_identity.clone(),
+                                peer_addr,
+                                peer_user_hash,
+                                new_fh,
                                 join_time,
-                                add_next_connect: false,
-                                emule_version: hello_caps.emule_version_min,
-                                is_friend_slot: is_verified_friend,
-                                ember_pubkey: hello_caps.ember_pubkey,
+                                &hello_caps,
+                                is_verified_friend,
                                 ember_verified,
-                            });
+                            ));
                             let my_score = score_queue_entry(
                                 &cm, &idx_snap, &peer_user_hash, new_fh,
                                 0, Some(peer_addr), hello_caps.emule_version_min,
@@ -6585,6 +7133,10 @@ impl UploadHandler {
                                 entry.current_addr = Some(peer_addr);
                                 entry.last_ip = Some(peer_addr.ip());
                                 entry.udp_port = hello_caps.udp_port;
+                                entry.tcp_port = hello_caps.tcp_port;
+                                entry.crypt_options = hello_caps.crypt_options_byte();
+                                entry.is_high_id =
+                                    peer_is_high_id_for_queue(&hello_caps, peer_addr);
                                 entry.user_hash = peer_user_hash;
                                 entry.file_hash = current_file_hash.unwrap_or([0u8; 16]);
                                 if is_verified_friend {
@@ -6606,57 +7158,67 @@ impl UploadHandler {
                                 }
                                 true
                             } else if queue.len() < MAX_UPLOAD_QUEUE_SIZE {
-                                queue.push(QueueEntry {
-                                    identity: queue_identity.clone(),
-                                    current_addr: Some(peer_addr),
-                                    last_ip: Some(peer_addr.ip()),
-                                    udp_port: hello_caps.udp_port,
-                                    user_hash: peer_user_hash,
-                                    file_hash: current_file_hash.unwrap_or([0u8; 16]),
-                                    join_time: queue_join_time,
-                                    add_next_connect: false,
-                                    emule_version: hello_caps.emule_version_min,
-                                    is_friend_slot: is_verified_friend,
-                                    ember_pubkey: hello_caps.ember_pubkey,
-                                    ember_verified: ember_auth_state.is_verified(),
-                                });
+                                queue.push(queue_entry_from_hello(
+                                    queue_identity.clone(),
+                                    peer_addr,
+                                    peer_user_hash,
+                                    current_file_hash.unwrap_or([0u8; 16]),
+                                    queue_join_time,
+                                    &hello_caps,
+                                    is_verified_friend,
+                                    ember_auth_state.is_verified(),
+                                ));
                                 true
                             } else if queue.len() < HARD_UPLOAD_QUEUE_SIZE {
-                                // m7: Soft-to-hard zone – re-admit after session with score check
+                                // eMule soft→hard: CombinedFilePrioAndCredit (no wait)
                                 let new_fh = current_file_hash.unwrap_or([0u8; 16]);
                                 let ember_verified = ember_auth_state.is_verified();
-                                let new_score = score_queue_entry(
-                                    &cm, &idx_snap, &peer_user_hash, new_fh,
-                                    0, Some(peer_addr), hello_caps.emule_version_min,
-                                    is_verified_friend,
-                                    hello_caps.ember_pubkey.as_ref(), ember_verified,
+                                let peer_ip = peer_ip_u32(Some(peer_addr));
+                                let new_combined = combined_file_prio_and_credit(
+                                    &cm,
+                                    &idx_snap,
+                                    &peer_user_hash,
+                                    new_fh,
+                                    peer_ip,
+                                    hello_caps.ember_pubkey.as_ref(),
+                                    ember_verified,
                                 );
-                                let avg_score = if queue.is_empty() { 0.0 } else {
-                                    let total: f64 = queue.iter().map(|e| {
-                                        score_queue_entry(
-                                            &cm, &idx_snap, &e.user_hash, e.file_hash,
-                                            e.join_time.elapsed().as_secs(), e.current_addr,
-                                            e.emule_version, e.is_friend_slot,
-                                            e.ember_pubkey.as_ref(), e.ember_verified,
-                                        )
-                                    }).sum();
+                                let avg_combined = if queue.is_empty() {
+                                    0.0
+                                } else {
+                                    let total: f64 = queue
+                                        .iter()
+                                        .map(|e| {
+                                            combined_file_prio_and_credit(
+                                                &cm,
+                                                &idx_snap,
+                                                &e.user_hash,
+                                                e.file_hash,
+                                                peer_ip_u32(e.current_addr.or_else(|| {
+                                                    e.last_ip.map(|ip| SocketAddr::new(ip, 0))
+                                                })),
+                                                e.ember_pubkey.as_ref(),
+                                                e.ember_verified,
+                                            )
+                                        })
+                                        .sum();
                                     total / queue.len() as f64
                                 };
-                                if new_score >= avg_score {
-                                    queue.push(QueueEntry {
-                                        identity: queue_identity.clone(),
-                                        current_addr: Some(peer_addr),
-                                        last_ip: Some(peer_addr.ip()),
-                                        udp_port: hello_caps.udp_port,
-                                        user_hash: peer_user_hash,
-                                        file_hash: new_fh,
-                                        join_time: queue_join_time,
-                                        add_next_connect: false,
-                                        emule_version: hello_caps.emule_version_min,
-                                        is_friend_slot: is_verified_friend,
-                                        ember_pubkey: hello_caps.ember_pubkey,
+                                if soft_zone_should_admit(
+                                    is_verified_friend,
+                                    new_combined,
+                                    avg_combined,
+                                ) {
+                                    queue.push(queue_entry_from_hello(
+                                        queue_identity.clone(),
+                                        peer_addr,
+                                        peer_user_hash,
+                                        new_fh,
+                                        queue_join_time,
+                                        &hello_caps,
+                                        is_verified_friend,
                                         ember_verified,
-                                    });
+                                    ));
                                     true
                                 } else {
                                     false
@@ -8597,6 +9159,77 @@ mod scoring_tests {
             observed_ratio > expected_ratio * 0.85,
             "reliability differential should produce ≳{expected_ratio:.2}× score gap, got {observed_ratio:.3}×",
         );
+    }
+
+    #[test]
+    fn soft_zone_admits_high_combined_without_wait() {
+        // Newcomers scored with wait=0 must still enter soft-zone when their
+        // CombinedFilePrioAndCredit beats the average (eMule AddClientToQueue).
+        assert!(soft_zone_should_admit(false, 100.0, 50.0));
+        assert!(!soft_zone_should_admit(false, 10.0, 50.0));
+        assert!(soft_zone_should_admit(true, 0.0, 999.0), "verified friend bypasses soft zone");
+        assert!(soft_zone_should_admit(false, 50.0, 50.0), "equal combined is admitted");
+    }
+
+    #[test]
+    fn combined_prio_ignores_wait_and_scales_with_ratio() {
+        let mut cm = CreditManager::new();
+        let idx = LocalIndex::new();
+        let user = [0xABu8; 16];
+        seed_emule_credits(&mut cm, user);
+        let peer_ip = u32::from_be_bytes([10, 0, 0, 1]);
+        let low = combined_file_prio_and_credit(&cm, &idx, &user, [0u8; 16], peer_ip, None, false);
+        // Unknown file → prio 7 → combined = 10 * ratio * 7
+        assert!(low > 0.0, "combined must be wait-independent and non-zero for credited peers");
+        let ratio = cm.get_score_ratio(&user, peer_ip);
+        let expected = 10.0 * ratio * 7.0;
+        assert!((low - expected).abs() < 0.01, "got {low}, expected ~{expected}");
+    }
+
+    #[test]
+    fn path_b_divert_prefers_exact_hash_and_rejects_zero_hash_collision() {
+        let file_a = [0x11u8; 16];
+        let file_b = [0x22u8; 16];
+        let user_a = [0xAAu8; 16];
+        let user_b = [0xBBu8; 16];
+        // Index rebuild stores zero hashes as None via reconnect_user_hash.
+        let normalized = vec![
+            (file_a, reconnect_user_hash(Some(user_a))),
+            (file_b, reconnect_user_hash(Some([0u8; 16]))),
+        ];
+        assert_eq!(normalized[1].1, None);
+        assert_eq!(path_b_divert_file(&normalized, user_a), Some(file_a));
+        // Unknown peer Hello may match unknown-hash OnQueue rows only.
+        assert_eq!(path_b_divert_file(&normalized, [0u8; 16]), Some(file_b));
+        // Different known user must not steal via the unknown-hash fallback
+        // while another known-hash entry exists at this IP.
+        assert_eq!(path_b_divert_file(&normalized, user_b), None);
+        let unknown_only = vec![(file_b, None)];
+        assert_eq!(
+            path_b_divert_file(&unknown_only, [0u8; 16]),
+            Some(file_b)
+        );
+    }
+
+    #[test]
+    fn peer_high_id_classification_trusts_client_id() {
+        let addr: SocketAddr = "8.8.8.8:4662".parse().unwrap();
+        let mut caps = PeerCapabilities::default();
+        caps.tcp_port = 4662;
+
+        // Real LowID must NOT become dialable just because tcp_port is set.
+        caps.client_id = 12345; // < LOWID_THRESHOLD
+        assert!(!peer_is_high_id_for_queue(&caps, addr));
+
+        caps.client_id = crate::network::ed2k::server::LOWID_THRESHOLD;
+        assert!(peer_is_high_id_for_queue(&caps, addr));
+
+        // Omitted client_id: port + public IP heuristic.
+        caps.client_id = 0;
+        assert!(peer_is_high_id_for_queue(&caps, addr));
+
+        let lan: SocketAddr = "192.168.1.2:4662".parse().unwrap();
+        assert!(!peer_is_high_id_for_queue(&caps, lan));
     }
 }
 

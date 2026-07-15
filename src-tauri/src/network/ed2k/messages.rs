@@ -333,6 +333,9 @@ impl HelloOptions {
 /// Peer capability flags parsed from Hello/EmuleInfo exchanges.
 #[derive(Debug, Clone, Default)]
 pub struct PeerCapabilities {
+    /// Peer ED2K client ID from Hello / HelloAnswer. Used for HighID/LowID
+    /// classification (`id >= LOWID_THRESHOLD` ⇒ HighID).
+    pub client_id: u32,
     pub tcp_port: u16,
     pub udp_port: u16,
     pub kad_port: u16,
@@ -915,11 +918,12 @@ pub fn parse_hello_answer(payload: &[u8]) -> io::Result<([u8; 16], PeerCapabilit
     let mut cursor = Cursor::new(payload);
     let mut user_hash = [0u8; 16];
     cursor.read_exact(&mut user_hash)?;
-    let _client_id = cursor.read_u32::<LittleEndian>()?;
+    let client_id = cursor.read_u32::<LittleEndian>()?;
     let hello_tcp_port = cursor.read_u16::<LittleEndian>()?;
     let tag_count = cursor.read_u32::<LittleEndian>()?;
 
     let mut caps = PeerCapabilities::default();
+    caps.client_id = client_id;
     caps.tcp_port = hello_tcp_port;
     let safe_count = tag_count.min(256);
     if tag_count > 256 {
@@ -1534,7 +1538,35 @@ pub struct Hashset2Response {
     pub aich_part_hashes: Option<Vec<[u8; 20]>>,
 }
 
+impl PeerCapabilities {
+    /// eMule `SetConnectOptions` crypt bits: bit0=supports, bit1=requests, bit2=requires.
+    pub fn crypt_options_byte(&self) -> u8 {
+        let mut opts = 0u8;
+        if self.supports_crypt_layer {
+            opts |= 0x01;
+        }
+        if self.requests_crypt_layer {
+            opts |= 0x02;
+        }
+        if self.requires_crypt_layer {
+            opts |= 0x04;
+        }
+        opts
+    }
+
+    /// True when Hello client_id is a HighID (`>= LOWID_THRESHOLD`).
+    pub fn is_high_id(&self) -> bool {
+        self.client_id >= crate::network::ed2k::server::LOWID_THRESHOLD
+    }
+}
+
 pub fn merge_caps(base: &mut PeerCapabilities, update: PeerCapabilities) {
+    if update.client_id != 0 {
+        base.client_id = update.client_id;
+    }
+    if update.tcp_port != 0 {
+        base.tcp_port = update.tcp_port;
+    }
     if update.udp_port != 0 {
         base.udp_port = update.udp_port;
     }
