@@ -12,12 +12,9 @@
     activeSearchTabId,
     closeSearchTab,
     mergeSearchResults,
-    newSearchNonce,
     openSearchTab,
     patchSearchTabByRequestId,
     patchSpamFlagByHash,
-    attachRetryRequestId,
-    clearRetryRequestId,
     searchTabs,
     setActiveSearchTab,
     type SearchTab,
@@ -626,39 +623,6 @@
   let spamHiddenCount = $derived(searchResultsList.filter(r => r.is_spam).length);
   let spamThreshold = $derived(spamProfile === 'aggressive' ? 45 : spamProfile === 'relaxed' ? 80 : 60);
 
-  let serverHintDismissedTabs = $state(new Set<string>());
-
-  function hasServerOrigin(r: SearchResult): boolean {
-    return (r.result_origin || '').includes('Server');
-  }
-
-  let serverNoResultsHint = $derived.by(() => {
-    if (!activeTab || activeTab.isSearching) return null;
-    if (serverHintDismissedTabs.has(activeTab.id)) return null;
-    const method = activeTab.method;
-    if (method !== 'global' && method !== 'server') return null;
-    if (searchResultsList.some(hasServerOrigin)) return null;
-    const srvConnected = $serverStatus === 'connected';
-    if (method === 'server') {
-      if (!srvConnected) return m.search_hint_not_connected();
-      return searchResultsList.length === 0
-        ? m.search_hint_server_empty_only()
-        : m.search_hint_server_empty_mixed();
-    }
-    if (searchResultsList.length > 0 && srvConnected) {
-      return m.search_hint_server_empty_global();
-    }
-    return null;
-  });
-
-  // `activeTab.retryRequestId` (rather than a separate global flag) is the
-  // source of truth for "a server retry is pending" — it's per-tab, so a
-  // retry running on another tab can no longer block this one, and it's
-  // impossible for it to drift out of sync with the tab it describes.
-  let serverRetryAllowed = $derived(
-    !!serverNoResultsHint && $serverStatus === 'connected' && activeTab?.retryRequestId == null
-  );
-
   function hasSearchFilters(filters: import('$lib/api/search').SearchFilters | undefined, fileType?: string): boolean {
     return !!(
       fileType ||
@@ -668,67 +632,6 @@
       filters?.maxSize !== undefined ||
       filters?.minAvailability !== undefined
     );
-  }
-
-  async function retryServerSearch() {
-    if (!activeTab || activeTab.retryRequestId != null || $serverStatus !== 'connected') return;
-    const tabQuery = activeTab.query;
-    const tabId = activeTab.id;
-    if (!tabQuery.trim() && !hasSearchFilters(activeTab.filters, activeTab.fileType || undefined)) return;
-    // Keep the tab's canonical requestId unchanged so late streaming events
-    // for the original search still land in the correct tab. The retry runs
-    // under its own nonce; we attach it as the tab's secondary request id so
-    // search-results / search-progress / search-complete events for the retry
-    // merge into this tab live, and the backend's cancel path still works if
-    // the user closes the tab mid-retry.
-    const retryRequestId = newSearchNonce();
-    attachRetryRequestId(tabId, retryRequestId);
-    // Show spinner for the retry leg until search-complete (server streams
-    // after the invoke oneshot returns empty/local).
-    searchTabs.update((tabs) =>
-      tabs.map((t) => (t.id === tabId ? { ...t, isSearching: true, progress: null, error: null } : t)),
-    );
-    let retryTimeout: ReturnType<typeof setTimeout> | undefined;
-    try {
-      const results = await Promise.race([
-        searchFiles(tabQuery, 'server', retryRequestId, activeTab.fileType || undefined, activeTab.filters),
-        new Promise<never>((_, reject) => {
-          retryTimeout = setTimeout(() => reject(new Error(m.search_retry_timeout())), 60_000);
-        }),
-      ]);
-      // Bail out if the user stopped this retry or closed the tab while the
-      // invoke was in flight: the backend resolves `search_files` with
-      // partial results on cancel (it sends on the oneshot rather than
-      // rejecting), so without this guard a stopped/closed retry would still
-      // merge rows and flash a "server returned N" toast. `stopSearch()` and
-      // `closeSearchTab()` both detach the retry id, so a mismatch (or a
-      // missing tab) means this result is stale.
-      const liveTab = get(searchTabs).find((t) => t.id === tabId);
-      if (!liveTab || liveTab.retryRequestId !== retryRequestId) {
-        return;
-      }
-      if (results && results.length > 0) {
-        searchTabs.update((tabs) => tabs.map((t) => (
-          t.id === tabId
-            ? { ...t, results: mergeSearchResults(t.results, results) }
-            : t
-        )));
-        addToast('success', results.length === 1 ? m.search_server_returned_one() : m.search_server_returned_other({ count: results.length }));
-      }
-      // Do not toast "no results" here: server method returns the oneshot
-      // immediately while TCP still streams. Keep retryRequestId until
-      // search-complete clears it in the store.
-    } catch (e: unknown) {
-      const liveTab = get(searchTabs).find((t) => t.id === tabId);
-      if (!liveTab || liveTab.retryRequestId !== retryRequestId) {
-        return;
-      }
-      const msg = translateError(e, m.search_retry_failed());
-      addToast('error', msg);
-      clearRetryRequestId(tabId);
-    } finally {
-      if (retryTimeout) clearTimeout(retryTimeout);
-    }
   }
 
   const DL_STATUS_PRIORITY: Record<string, number> = {
@@ -983,7 +886,7 @@
       setTimeout(() => {
         searchTimeouts.delete(requestId);
         patchSearchTabByRequestId(requestId, (tab) => {
-          if (!tab.isSearching || tab.retryRequestId != null) return tab;
+          if (!tab.isSearching) return tab;
           return { ...tab, isSearching: false, progress: null };
         });
       }, graceMs),
@@ -1195,36 +1098,12 @@
   // passes its own tab's id explicitly.
   async function stopSearch(tabId?: string) {
     const t = tabId != null ? get(searchTabs).find((tab) => tab.id === tabId) ?? null : activeTab;
-    if (!t) return;
-    // Nothing to stop if neither the primary search nor a server retry
-    // is in flight.
-    if (!t.isSearching && t.retryRequestId == null) return;
-    const retryRequestId = t.retryRequestId;
-    // Detach the retry routing synchronously, BEFORE awaiting the cancel
-    // round-trips. The in-flight `retryServerSearch()` promise guards on the
-    // tab still carrying its retry id, so clearing it here ensures a stopped
-    // retry can't merge late results or flash a toast once `search_files`
-    // resolves on cancel.
-    if (retryRequestId != null) {
-      clearRetryRequestId(t.id);
-    }
-    if (t.isSearching) {
-      clearSearchTimeoutForRequest(t.requestId);
-      try {
-        await cancelSearch(t.requestId);
-      } catch (e) {
-        console.error('Failed to cancel search:', e);
-      }
-    }
-    // The server-retry leg can still be running after the primary
-    // search completed (isSearching === false); cancel it too so Stop
-    // actually stops all backend work for this tab.
-    if (retryRequestId != null) {
-      try {
-        await cancelSearch(retryRequestId);
-      } catch (e) {
-        console.error('Failed to cancel server retry:', e);
-      }
+    if (!t?.isSearching) return;
+    clearSearchTimeoutForRequest(t.requestId);
+    try {
+      await cancelSearch(t.requestId);
+    } catch (e) {
+      console.error('Failed to cancel search:', e);
     }
     patchSearchTabByRequestId(t.requestId, (tab) => ({
       ...tab,
@@ -1843,10 +1722,7 @@
       <option value={ft.value}>{ft.label}</option>
     {/each}
   </select>
-  {#if activeTab?.isSearching || activeTab?.retryRequestId != null}
-    <!-- Also show Stop while a server retry is in flight (isSearching is
-         false then, but retryRequestId is set) so the user can cancel it;
-         stopSearch already cancels the retry leg. -->
+  {#if activeTab?.isSearching}
     <button class="stop-btn" type="button" onclick={() => stopSearch()}>
       <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true">
         <rect x="3.5" y="3.5" width="9" height="9" rx="2"/>
@@ -1874,23 +1750,19 @@
           tabindex={tab.id === $activeSearchTabId ? 0 : -1}
         >
           <span class="search-tab-label">{shortenTabLabel(tab.query)}</span>
-          <!-- A server retry runs with `isSearching === false` (only
-               `retryRequestId` is set — see the `SearchTab` type), so this
-               must check both; otherwise a tab retrying in the background
-               looks idle: static result count, no spinner. -->
-          <span class="search-tab-meta" aria-label={(tab.isSearching || tab.retryRequestId != null) ? m.search_in_progress_aria() : m.search_results_aria({ count: tab.results.length })}>
-            {#if tab.isSearching || tab.retryRequestId != null}
+          <span class="search-tab-meta" aria-label={tab.isSearching ? m.search_in_progress_aria() : m.search_results_aria({ count: tab.results.length })}>
+            {#if tab.isSearching}
               {m.search_searching_label()}
             {:else}
               {tab.results.length}
             {/if}
           </span>
-          {#if tab.isSearching || tab.retryRequestId != null}
+          {#if tab.isSearching}
             <span class="search-tab-spinner" aria-hidden="true"></span>
           {/if}
         </button>
         <div class="search-tab-actions">
-          {#if tab.isSearching || tab.retryRequestId != null}
+          {#if tab.isSearching}
             <!-- Lets a search running in a background tab be stopped without
                  switching to it first — the toolbar Stop button only ever
                  acts on `activeTab`. -->
@@ -2112,19 +1984,6 @@
       <button class="ghost" onclick={dismissTabError}>{m.common_dismiss()}</button>
     </div>
   {/if}
-  {#if serverNoResultsHint}
-    <div class="server-hint-banner" role="status">
-      <span>{serverNoResultsHint}</span>
-      <div class="server-hint-actions">
-        {#if serverRetryAllowed}
-          <button class="server-retry-btn" onclick={retryServerSearch}>{m.search_retry_server()}</button>
-        {:else if activeTab?.retryRequestId != null}
-          <button class="server-retry-btn" disabled>{m.search_retrying()}</button>
-        {/if}
-        <button class="ghost" onclick={() => { if (activeTab?.id) { const next = new Set(serverHintDismissedTabs); next.add(activeTab.id); serverHintDismissedTabs = next; } }}>{m.common_dismiss()}</button>
-      </div>
-    </div>
-  {/if}
   {#if $searchTabs.length === 0}
     <div class="empty-state">
       <div class="icon" aria-hidden="true">
@@ -2136,7 +1995,7 @@
       <p>{m.search_empty_title()}</p>
       <p class="hint">{m.search_empty_hint()}</p>
     </div>
-  {:else if (activeTab?.isSearching || activeTab?.retryRequestId != null) && searchResultsList.length === 0}
+  {:else if activeTab?.isSearching && searchResultsList.length === 0}
     <div class="empty-state">
       <div class="spinner lg"></div>
       <p>{m.search_searching_network()}</p>
@@ -2150,7 +2009,7 @@
         </p>
       {/if}
     </div>
-  {:else if searchResultsList.length === 0 && !activeTab?.isSearching && activeTab?.retryRequestId == null}
+  {:else if searchResultsList.length === 0 && !activeTab?.isSearching}
     <div class="empty-state">
       <div class="icon" aria-hidden="true">
         <svg viewBox="0 0 48 48" width="48" height="48" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -3447,49 +3306,6 @@
     border-left: 3px solid var(--danger);
     color: var(--danger);
     font-size: 13px;
-  }
-
-  .server-hint-banner {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    padding: 8px 20px;
-    background: var(--bg-secondary);
-    border-bottom: 1px solid var(--warning);
-    border-left: 3px solid var(--warning);
-    color: var(--text-secondary);
-    font-size: 12px;
-    line-height: 1.4;
-  }
-
-  .server-hint-actions {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    flex-shrink: 0;
-  }
-
-  .server-retry-btn {
-    padding: 3px 10px;
-    font-size: 11px;
-    font-weight: 600;
-    border: 1px solid var(--warning);
-    border-radius: var(--radius-md);
-    background: color-mix(in srgb, var(--warning) 15%, transparent);
-    color: var(--warning);
-    cursor: pointer;
-    transition: background 0.15s, opacity 0.15s;
-    white-space: nowrap;
-  }
-
-  .server-retry-btn:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--warning) 25%, transparent);
-  }
-
-  .server-retry-btn:disabled {
-    opacity: 0.55;
-    cursor: not-allowed;
   }
 
   .file-details-panel {

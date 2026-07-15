@@ -9,14 +9,6 @@ import { dev } from '$app/environment';
 export type SearchTab = {
   id: string;
   requestId: number;
-  /**
-   * When a retry is in flight (e.g. retryServerSearch), this is the
-   * secondary request id used by the backend for the retry. Events
-   * with either `requestId` OR `retryRequestId` are routed into this
-   * tab, so live progress/results during a retry are not dropped.
-   * Cleared when the retry completes.
-   */
-  retryRequestId: number | null;
   query: string;
   method: SearchMethod;
   fileType?: string;
@@ -144,7 +136,7 @@ function updateTabByRequestId(
   requestId: number,
   fn: (tab: SearchTab) => SearchTab,
 ): SearchTab[] {
-  const i = tabs.findIndex((t) => t.requestId === requestId || t.retryRequestId === requestId);
+  const i = tabs.findIndex((t) => t.requestId === requestId);
   if (i === -1) return tabs;
   const next = [...tabs];
   next[i] = fn(next[i]);
@@ -178,37 +170,6 @@ export function patchSpamFlagByHash(fileHash: string, isSpam: boolean, spamRatin
   });
 }
 
-/**
- * Attach a secondary request id (e.g. from a retry) to an existing tab so
- * incoming search-result/progress/complete events for that id merge into it.
- */
-export function attachRetryRequestId(tabId: string, retryRequestId: number) {
-  searchTabs.update((tabs) => {
-    const i = tabs.findIndex((t) => t.id === tabId);
-    if (i === -1) return tabs;
-    const next = [...tabs];
-    next[i] = { ...next[i], retryRequestId };
-    return next;
-  });
-}
-
-/** Clear retry routing when the retry completes or is cancelled. */
-export function clearRetryRequestId(tabId: string) {
-  searchTabs.update((tabs) => {
-    const i = tabs.findIndex((t) => t.id === tabId);
-    if (i === -1 || tabs[i].retryRequestId == null) return tabs;
-    const next = [...tabs];
-    // The retry is always the last search phase (it's user-triggered only
-    // after the primary search has already finished and reported no/low
-    // results), so its completion ends all searching for the tab. Also clear
-    // `isSearching`/`progress` here: if the primary's `search-complete` event
-    // was ever lost, the completion fallback refuses to fire while a retry is
-    // attached, which would otherwise leave the spinner stuck on forever.
-    next[i] = { ...next[i], retryRequestId: null, isSearching: false, progress: null };
-    return next;
-  });
-}
-
 /** Start a new search tab and select it. Returns tab id and request id for invoke/searchFiles. */
 export function openSearchTab(query: string, method: SearchMethod, fileType?: string, filters?: SearchFilters): { tabId: string; requestId: number } {
   const requestId = newSearchNonce();
@@ -216,7 +177,6 @@ export function openSearchTab(query: string, method: SearchMethod, fileType?: st
   const tab: SearchTab = {
     id,
     requestId,
-    retryRequestId: null,
     query,
     method,
     fileType,
@@ -243,18 +203,6 @@ export async function closeSearchTab(tabId: string): Promise<void> {
   if (tab.isSearching) {
     try {
       await cancelSearch(tab.requestId);
-    } catch {
-      /* best effort */
-    }
-  }
-  // The server-retry leg often runs AFTER the primary search has
-  // finished (so `isSearching` is already false). Cancel it
-  // independently of `isSearching`, otherwise closing the tab would
-  // leave the backend retry running and its completion handlers firing
-  // against a tab that no longer exists.
-  if (tab.retryRequestId != null) {
-    try {
-      await cancelSearch(tab.retryRequestId);
     } catch {
       /* best effort */
     }
@@ -372,29 +320,11 @@ export async function initSearchStore() {
         flushSearchResults();
       }
       searchTabs.update((tabs) =>
-        updateTabByRequestId(tabs, requestId, (t) => {
-          const isRetry = t.retryRequestId === requestId;
-          const isPrimary = t.requestId === requestId;
-          if (isRetry) {
-            // Retry finished — clear secondary routing and stop the spinner.
-            return {
-              ...t,
-              retryRequestId: null,
-              isSearching: false,
-              progress: null,
-            };
-          }
-          if (isPrimary) {
-            // Primary finished; keep spinning if a server retry is still live.
-            const stillRetrying = t.retryRequestId != null;
-            return {
-              ...t,
-              isSearching: stillRetrying ? true : false,
-              progress: stillRetrying ? t.progress : null,
-            };
-          }
-          return t;
-        }),
+        updateTabByRequestId(tabs, requestId, (t) => ({
+          ...t,
+          isSearching: false,
+          progress: null,
+        })),
       );
     }));
     registered.push(await listen<{ request_id: number; nodes_contacted: number; results_so_far: number; phase: string }>(
@@ -404,12 +334,7 @@ export async function initSearchStore() {
         if (requestId === null) return;
         searchTabs.update((tabs) =>
           updateTabByRequestId(tabs, requestId, (t) => {
-            // A server retry runs with `isSearching === false` (only
-            // `retryRequestId` is set), so it must still accept progress —
-            // otherwise retry progress is silently dropped on the floor even
-            // though the retry is genuinely in flight and results/complete
-            // events for it merge normally.
-            if (!t.isSearching && t.retryRequestId !== requestId) return t;
+            if (!t.isSearching) return t;
             return {
               ...t,
               progress: {

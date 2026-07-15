@@ -747,11 +747,46 @@ fn ed2k_result_source_contribution(availability: u32) -> u32 {
     availability.max(1).min(ED2K_SEARCH_SOURCE_CAP)
 }
 
+/// Hashes already shared or downloading — eMule `AddResultCount` skips these
+/// when updating the search stop counter (`sharedfiles` / `downloadqueue`
+/// `GetFileByID`). Results are still shown; only the cap counter ignores them.
+fn owned_or_downloading_search_hashes(
+    hashes: impl IntoIterator<Item = impl AsRef<str>>,
+    local_index: &LocalIndex,
+    transfer_manager: &TransferManager,
+    pending_downloads: &HashMap<String, PendingDownload>,
+) -> HashSet<String> {
+    let mut owned = HashSet::new();
+    for hash in hashes {
+        let hash = hash.as_ref();
+        if hash.is_empty() || owned.contains(hash) {
+            continue;
+        }
+        if local_index.get_by_hash(hash).is_some()
+            || transfer_manager.has_pending_for_hash(hash)
+            || pending_downloads
+                .values()
+                .any(|pd| pd.file_hash == hash)
+        {
+            owned.insert(hash.to_string());
+        }
+    }
+    owned
+}
+
 /// Record ed2k (TCP/UDP) result availability toward the global-search cap.
 /// UDP re-sights **sum** availability (cross-server); TCP/Server re-sights use
 /// **max** (OP_QUERY_MORE can re-list the same sources). Only the spam-capped
 /// contribution *delta* is added to `ed2k_found_sources`.
-fn note_ed2k_search_results(active: &mut ActiveSearchRequest, results: &[SearchResult]) -> bool {
+///
+/// `skip_hashes` are shared/downloading files (eMule `AddResultCount`): their
+/// availability is still tracked for UI resights, but they do not advance the
+/// stop counter.
+fn note_ed2k_search_results(
+    active: &mut ActiveSearchRequest,
+    results: &[SearchResult],
+    skip_hashes: &HashSet<String>,
+) -> bool {
     for r in results {
         if r.file.hash.is_empty() {
             active.ed2k_found_sources = active
@@ -759,6 +794,7 @@ fn note_ed2k_search_results(active: &mut ActiveSearchRequest, results: &[SearchR
                 .saturating_add(ed2k_result_source_contribution(r.availability));
             continue;
         }
+        let skip_count = skip_hashes.contains(&r.file.hash);
         let prev = active.ed2k_noted_availability.get(&r.file.hash).copied();
         let sum_incoming = crate::search::merge::is_ed2k_network_origin(&r.result_origin)
             && r.result_origin.split('·').any(|p| p.trim() == crate::search::merge::ORIGIN_SERVER_UDP);
@@ -774,7 +810,7 @@ fn note_ed2k_search_results(active: &mut ActiveSearchRequest, results: &[SearchR
             None => (r.availability, 0),
         };
         let new_contrib = ed2k_result_source_contribution(new_avail);
-        if new_contrib > old_contrib {
+        if !skip_count && new_contrib > old_contrib {
             active.ed2k_found_sources = active
                 .ed2k_found_sources
                 .saturating_add(new_contrib - old_contrib);
@@ -810,6 +846,7 @@ fn emit_search_resight_updates(
     request_id: u64,
     updates: Vec<SearchResult>,
     active: &mut ActiveSearchRequest,
+    skip_hashes: &HashSet<String>,
 ) {
     if updates.is_empty() {
         return;
@@ -820,7 +857,7 @@ fn emit_search_resight_updates(
     }
     for r in &mut updates {
         if crate::search::merge::is_ed2k_network_origin(&r.result_origin) {
-            let _ = note_ed2k_search_results(active, std::slice::from_ref(r));
+            let _ = note_ed2k_search_results(active, std::slice::from_ref(r), skip_hashes);
             if let Some(&total) = active.ed2k_noted_availability.get(&r.file.hash) {
                 r.availability = total;
             }
@@ -2036,12 +2073,13 @@ mod tests {
     #[test]
     fn note_ed2k_search_results_udp_sums_tcp_uses_max() {
         let mut active = sample_active_search_request(1);
+        let none = HashSet::new();
         let a = SearchResult {
             result_origin: crate::search::merge::ORIGIN_SERVER_TCP.to_string(),
             availability: 2,
             ..sample_search_result("hash1")
         };
-        assert!(!note_ed2k_search_results(&mut active, &[a]));
+        assert!(!note_ed2k_search_results(&mut active, &[a], &none));
         assert_eq!(active.ed2k_found_sources, 2);
 
         // TCP More re-list: max, not sum.
@@ -2050,7 +2088,7 @@ mod tests {
             availability: 3,
             ..sample_search_result("hash1")
         };
-        assert!(!note_ed2k_search_results(&mut active, &[more]));
+        assert!(!note_ed2k_search_results(&mut active, &[more], &none));
         assert_eq!(active.ed2k_noted_availability.get("hash1"), Some(&3));
         assert_eq!(active.ed2k_found_sources, 3);
 
@@ -2060,9 +2098,33 @@ mod tests {
             availability: 4,
             ..sample_search_result("hash1")
         };
-        assert!(!note_ed2k_search_results(&mut active, &[udp]));
+        assert!(!note_ed2k_search_results(&mut active, &[udp], &none));
         assert_eq!(active.ed2k_noted_availability.get("hash1"), Some(&7));
         assert_eq!(active.ed2k_found_sources, 5); // spam-capped at 5
+    }
+
+    /// eMule `AddResultCount`: shared/downloading hashes update the noted
+    /// availability map (UI) but must not advance `ed2k_found_sources`.
+    #[test]
+    fn note_ed2k_search_results_skips_owned_hashes_for_cap() {
+        let mut active = sample_active_search_request(1);
+        let skip: HashSet<String> = ["ownedhash".to_string()].into_iter().collect();
+        let owned = SearchResult {
+            result_origin: crate::search::merge::ORIGIN_SERVER_TCP.to_string(),
+            availability: 4,
+            ..sample_search_result("ownedhash")
+        };
+        assert!(!note_ed2k_search_results(&mut active, &[owned], &skip));
+        assert_eq!(active.ed2k_found_sources, 0);
+        assert_eq!(active.ed2k_noted_availability.get("ownedhash"), Some(&4));
+
+        let other = SearchResult {
+            result_origin: crate::search::merge::ORIGIN_SERVER_TCP.to_string(),
+            availability: 2,
+            ..sample_search_result("otherhash")
+        };
+        assert!(!note_ed2k_search_results(&mut active, &[other], &skip));
+        assert_eq!(active.ed2k_found_sources, 2);
     }
 
     /// A batch with no matching active search (already replaced by a newer
@@ -9675,7 +9737,7 @@ pub async fn start_network(
                     }
                 }
 
-                let completed_payload = if matches!(&event.kind, UploadEventKind::Completed) {
+                let completed_payload = if matches!(&event.kind, UploadEventKind::Completed { .. }) {
                     let mgr = transfer_manager.read().await;
                     let out = mgr
                         .get_transfer(&event.transfer_id)
@@ -10022,7 +10084,7 @@ pub async fn start_network(
                             }
                         }
                     }
-                    UploadEventKind::Completed => {
+                    UploadEventKind::Completed { .. } => {
                         let mgr = transfer_manager.read().await;
                         if let Some(t) = mgr.get_transfer(&event.transfer_id) {
                             if let Some(ref uh_hex) = t.user_hash {
@@ -10588,22 +10650,28 @@ pub async fn start_network(
                                 if let Some(active) = state.active_search_request.as_mut() {
                                     if active.request_id == pending_request_id {
                                         mark_streamed_hashes(active, &emitted);
+                                        // KAD origins never advance the ed2k stop
+                                        // counter; skip set is unused for these rows.
+                                        let no_skip = HashSet::new();
                                         emit_search_resight_updates(
                                             &app_handle,
                                             pending_request_id,
                                             resights,
                                             active,
+                                            &no_skip,
                                         );
                                     }
                                 }
                             } else if !resights.is_empty() {
                                 if let Some(active) = state.active_search_request.as_mut() {
                                     if active.request_id == pending_request_id {
+                                        let no_skip = HashSet::new();
                                         emit_search_resight_updates(
                                             &app_handle,
                                             pending_request_id,
                                             resights,
                                             active,
+                                            &no_skip,
                                         );
                                     }
                                 }
@@ -10909,6 +10977,7 @@ pub async fn start_network(
                                     request_id,
                                     resights,
                                     active,
+                                    &HashSet::new(),
                                 );
                             }
                         }
@@ -17356,15 +17425,33 @@ pub async fn start_network(
                                                 &kws,
                                                 srv_ip.as_deref(),
                                             ).await;
+                                            let skip_hashes = {
+                                                let idx = local_index.read().await;
+                                                let mgr = transfer_manager.read().await;
+                                                owned_or_downloading_search_hashes(
+                                                    emitted
+                                                        .iter()
+                                                        .chain(resights.iter())
+                                                        .map(|r| r.file.hash.as_str()),
+                                                    &*idx,
+                                                    &*mgr,
+                                                    &state.pending_downloads,
+                                                )
+                                            };
                                             if let Some(active) = state.active_search_request.as_mut() {
                                                 if active.request_id == request_id {
                                                     mark_streamed_hashes(active, &emitted);
-                                                    let _ = note_ed2k_search_results(active, &emitted);
+                                                    let _ = note_ed2k_search_results(
+                                                        active,
+                                                        &emitted,
+                                                        &skip_hashes,
+                                                    );
                                                     emit_search_resight_updates(
                                                         &app_handle,
                                                         request_id,
                                                         resights,
                                                         active,
+                                                        &skip_hashes,
                                                     );
                                                 }
                                             }
@@ -18672,15 +18759,33 @@ pub async fn start_network(
                                         &kws,
                                         None,
                                     ).await;
+                                    let skip_hashes = {
+                                        let idx = local_index.read().await;
+                                        let mgr = transfer_manager.read().await;
+                                        owned_or_downloading_search_hashes(
+                                            emitted
+                                                .iter()
+                                                .chain(resights.iter())
+                                                .map(|r| r.file.hash.as_str()),
+                                            &*idx,
+                                            &*mgr,
+                                            &state.pending_downloads,
+                                        )
+                                    };
                                     if let Some(active) = state.active_search_request.as_mut() {
                                         if active.request_id == request_id {
                                             mark_streamed_hashes(active, &emitted);
-                                            let _ = note_ed2k_search_results(active, &emitted);
+                                            let _ = note_ed2k_search_results(
+                                                active,
+                                                &emitted,
+                                                &skip_hashes,
+                                            );
                                             emit_search_resight_updates(
                                                 &app_handle,
                                                 request_id,
                                                 resights,
                                                 active,
+                                                &skip_hashes,
                                             );
                                         }
                                     }
@@ -21926,6 +22031,60 @@ pub async fn start_network(
         let ember_nodes_path = state.data_dir.join("nodes_ember.dat");
         if let Err(e) = ember::dht::bootstrap::save_nodes(&ember_nodes_path, &ember_contacts) {
             error!("Failed to save nodes_ember.dat on shutdown: {e}");
+        }
+    }
+
+    // Drain any in-flight periodic statistics save before the final write.
+    // The 60s timer spawns a detached `spawn_blocking` with a snapshot of
+    // `cumulative_save_pairs()` — the same stale-overwrite race we already
+    // document for known.met. If that task lands after this final save, it
+    // silently rolls back session bytes (and completed counts) accrued
+    // after the snapshot was taken.
+    if stats_save_in_flight {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while stats_save_in_flight {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                warn!(
+                    "Periodic statistics save still in flight 5s into shutdown; \
+                     proceeding with the final save anyway"
+                );
+                break;
+            }
+            match tokio::time::timeout(remaining, periodic_save_result_rx.recv()).await {
+                Ok(Some(result)) => match result.job {
+                    PeriodicSaveJob::Stats => {
+                        stats_save_in_flight = false;
+                        if let Err(e) = result.result {
+                            error!(
+                                "Periodic statistics save (drained at shutdown) failed: {e}"
+                            );
+                        }
+                    }
+                    // Sibling periodic jobs may finish while we wait for Stats;
+                    // log failures but don't touch their in-flight flags — we're
+                    // past the event loop and about to exit.
+                    other => {
+                        if let Err(e) = result.result {
+                            let name = match other {
+                                PeriodicSaveJob::Reputation => "reputation.json",
+                                PeriodicSaveJob::Known2 => "known2_64.met",
+                                PeriodicSaveJob::Nodes => "nodes.dat",
+                                PeriodicSaveJob::Stats => unreachable!(),
+                            };
+                            error!("Periodic {name} save (drained at shutdown) failed: {e}");
+                        }
+                    }
+                },
+                Ok(None) => break,
+                Err(_) => {
+                    warn!(
+                        "Periodic statistics save still in flight 5s into shutdown; \
+                         proceeding with the final save anyway"
+                    );
+                    break;
+                }
+            }
         }
     }
 
@@ -32037,7 +32196,7 @@ async fn handle_upload_event(
             );
         }
         UploadEventKind::ShareInterest { .. } => {}
-        UploadEventKind::Completed => {
+        UploadEventKind::Completed { full_file } => {
             // Match eMule's "session ends → row vanishes" UX. We still
             // call `mgr.complete()` so the queued-promotion logic fires
             // and stats are accurate, but we then immediately drop the
@@ -32056,12 +32215,15 @@ async fn handle_upload_event(
                 Some(promoted) => promoted,
                 None => return,
             };
-            // Only count a completed upload once `mgr.complete()` confirms the
-            // transfer existed and transitioned. Counting before the match
-            // over-reported the stat for duplicate or stale `Completed` events
-            // (e.g. a session that emitted Completed twice, or whose row was
-            // already removed) which returned `None` here.
-            stats_manager.record_completed_upload();
+            // Only count Statistics "Completed Uploads" when this peer
+            // received the entire file — matching hash-verified download
+            // completion. Partial sessions (idle timeout, preemption, mid-
+            // slot file switch) still dismiss the row above but must not
+            // inflate the counter. Also require `mgr.complete()` success so
+            // duplicate/stale Completed events don't over-report.
+            if full_file {
+                stats_manager.record_completed_upload();
+            }
             for t in &promoted {
                 info!(
                     "Promoted queued transfer {} ({}) to active",

@@ -380,7 +380,11 @@
           <div class="oh-row">
             <span class="oh-label">{row.label}</span>
             <div class="oh-track">
-              <div class="oh-fill {row.cls}" style="width: {overheadPct(row.value)}%"></div>
+              <div
+                class="oh-fill {row.cls}"
+                class:oh-nonzero={row.value > 0}
+                style="width: {overheadPct(row.value)}%"
+              ></div>
             </div>
             <span class="oh-value">{formatBytes(row.value)}</span>
           </div>
@@ -640,6 +644,10 @@
     height: 100%;
     border-radius: 4px;
     transition: width 0.4s ease;
+  }
+  /* Visible sliver only when the category contributed — a blanket
+     min-width made every zero row look slightly active. */
+  .oh-fill.oh-nonzero {
     min-width: 2px;
   }
   .oh-server { background: var(--accent); }
