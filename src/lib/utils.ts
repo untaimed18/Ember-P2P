@@ -139,7 +139,8 @@ export function formatDuration(ms: number): string {
 
 /** Format seconds as a human-readable duration (e.g. "2h 15m"). */
 export function formatDurationSecs(secs: number): string {
-  if (!Number.isFinite(secs) || secs <= 0) return '\u2014';
+  if (!Number.isFinite(secs) || secs < 0) return '\u2014';
+  if (secs === 0) return '0s';
   const days = Math.floor(secs / 86400);
   const hrs = Math.floor((secs % 86400) / 3600);
   const mins = Math.floor((secs % 3600) / 60);

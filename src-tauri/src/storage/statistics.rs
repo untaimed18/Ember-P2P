@@ -313,6 +313,9 @@ impl StatsManager {
         self.stats.session_completed_down = self.stats.session_completed_down.saturating_add(1);
     }
 
+    /// Count a fully completed upload (peer received the entire file this
+    /// session). Partial upload sessions must not call this — they still
+    /// contribute bytes via `session_up_counter`.
     pub fn record_completed_upload(&mut self) {
         self.stats.session_completed_up = self.stats.session_completed_up.saturating_add(1);
     }

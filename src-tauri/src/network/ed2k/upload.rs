@@ -922,6 +922,15 @@ pub struct UploadEvent {
     pub kind: UploadEventKind,
 }
 
+/// Terminal upload kind for a session that moved at least one byte.
+/// Statistics "Completed Uploads" only increments when the peer received
+/// the entire file (`uploaded >= total_size`).
+fn upload_session_completed(uploaded: u64, total_size: u64) -> UploadEventKind {
+    UploadEventKind::Completed {
+        full_file: total_size > 0 && uploaded >= total_size,
+    }
+}
+
 pub enum UploadEventKind {
     Started {
         file_name: String,
@@ -950,7 +959,12 @@ pub enum UploadEventKind {
         /// [`crate::types::Transfer::up_peer_part_status`].
         peer_part_status: Option<String>,
     },
-    Completed,
+    /// Session ended after sending data (or after a full-file serve).
+    /// `full_file` is true only when this peer received the entire file from
+    /// us in this session — that alone increments Statistics "Completed
+    /// Uploads", matching hash-verified download completion. Partial
+    /// sessions still dismiss the transfer row and credit byte totals.
+    Completed { full_file: bool },
     Failed {
         error: String,
     },
@@ -5356,7 +5370,7 @@ impl UploadHandler {
                             if prev != hash {
                                 if let Some(tid) = transfer_id.take() {
                                     let kind = if uploaded > 0 {
-                                        UploadEventKind::Completed
+                                        upload_session_completed(uploaded, total_size)
                                     } else {
                                         UploadEventKind::Failed {
                                             error: "Peer switched files before any data was sent".to_string(),
@@ -6093,7 +6107,7 @@ impl UploadHandler {
                                 if prev != requested {
                                     if let Some(tid) = transfer_id.take() {
                                         let kind = if uploaded > 0 {
-                                            UploadEventKind::Completed
+                                            upload_session_completed(uploaded, total_size)
                                         } else {
                                             UploadEventKind::Failed {
                                                 error: "Peer switched files before any data was sent".to_string(),
@@ -6953,7 +6967,7 @@ impl UploadHandler {
                                 .upload_event_tx
                                 .send(UploadEvent {
                                     transfer_id: tid.clone(),
-                                    kind: UploadEventKind::Completed,
+                                    kind: UploadEventKind::Completed { full_file: true },
                                 })
                                 .await;
                         }
@@ -7083,10 +7097,10 @@ impl UploadHandler {
                             // Completed only if we actually moved bytes; a slot
                             // that was granted then immediately rotated (e.g. score
                             // preemption) without sending any data emits Failed so
-                            // the UI row is distinguishable from a real transfer and
-                            // the stats don't record a phantom completed upload.
+                            // the UI row is distinguishable from a real transfer.
+                            // Statistics only count full-file serves as completed.
                             let kind = if uploaded > 0 {
-                                UploadEventKind::Completed
+                                upload_session_completed(uploaded, total_size)
                             } else {
                                 UploadEventKind::Failed {
                                     error: "Slot rotated before any data was sent".to_string(),
@@ -7289,7 +7303,7 @@ impl UploadHandler {
                         // the zero-byte row is visibly distinguishable from
                         // a real upload.
                         let kind = if uploaded > 0 {
-                            UploadEventKind::Completed
+                            upload_session_completed(uploaded, total_size)
                         } else {
                             UploadEventKind::Failed {
                                 error: "Peer ended transfer before any data was sent".to_string(),
@@ -7533,7 +7547,7 @@ impl UploadHandler {
                                 if prev != mpreq.file_hash {
                                     if let Some(tid) = transfer_id.take() {
                                         let kind = if uploaded > 0 {
-                                            UploadEventKind::Completed
+                                            upload_session_completed(uploaded, total_size)
                                         } else {
                                             UploadEventKind::Failed {
                                                 error: "Peer switched files before any data was sent".to_string(),
@@ -8468,7 +8482,7 @@ impl UploadHandler {
                 last_part_request.elapsed().as_secs(),
             );
             let kind = if uploaded > 0 {
-                UploadEventKind::Completed
+                upload_session_completed(uploaded, total_size)
             } else if let Err(e) = &session_result {
                 UploadEventKind::Failed {
                     error: format!("Session ended: {e}"),

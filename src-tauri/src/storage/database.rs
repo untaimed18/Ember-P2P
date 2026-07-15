@@ -1129,10 +1129,22 @@ impl Database {
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
         {
-            let mut stmt =
+            // Cumulative counters must never shrink: a delayed periodic save
+            // started with an older snapshot can otherwise race a newer save
+            // (including the shutdown write) and roll totals backwards.
+            let mut read_stmt = tx.prepare("SELECT value FROM statistics WHERE key = ?1")?;
+            let mut write_stmt =
                 tx.prepare("INSERT OR REPLACE INTO statistics (key, value) VALUES (?1, ?2)")?;
             for (key, value) in pairs {
-                stmt.execute(params![key, value])?;
+                let to_write = if key.starts_with("cum_") {
+                    let existing: i64 = read_stmt
+                        .query_row(params![key], |row| row.get(0))
+                        .unwrap_or(0);
+                    (*value).max(existing)
+                } else {
+                    *value
+                };
+                write_stmt.execute(params![key, to_write])?;
             }
         }
         tx.commit()?;
