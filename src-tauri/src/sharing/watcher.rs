@@ -88,6 +88,11 @@ impl SharedFoldersWatcher {
                     .hashing_paused
                     .load(std::sync::atomic::Ordering::Relaxed)
                 {
+                    // Latch dirty so a later pause-clear that does not run a
+                    // full reload (e.g. add_shared_folder) still rescans.
+                    state_ref
+                        .hashing_fs_dirty
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     info!("FS watcher: hashing paused; deferring rescan until resume");
                     let _ = app_for_handler.emit(
                         "shared-files-changed",

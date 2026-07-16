@@ -33,6 +33,11 @@ impl FileIndexer {
             return DiscoveryResult { files, truncated };
         }
 
+        // Defense in depth: if a parent of the Ember data dir was somehow
+        // shared, never walk into it (config, identity, known.met, …).
+        let data_dir = crate::storage::paths::resolve_data_dir();
+        let data_canon = data_dir.canonicalize().unwrap_or(data_dir);
+
         info!("Discovering files in: {dir}");
 
         for entry in WalkDir::new(path)
@@ -52,9 +57,17 @@ impl FileIndexer {
                         }
                     }
                 }
+                if let Ok(canon) = e.path().canonicalize() {
+                    if canon == data_canon || canon.starts_with(&data_canon) {
+                        return false;
+                    }
+                }
                 if e.file_type().is_dir() {
+                    // Skip sensitive basenames (.ssh, AppData, temp, …) even
+                    // when nested under an allowed share root — see
+                    // `sharing::SENSITIVE_DIR_NAMES`.
                     let name = e.file_name().to_string_lossy();
-                    return !name.eq_ignore_ascii_case("temp");
+                    return !crate::sharing::is_sensitive_dir_name(&name);
                 }
                 true
             })

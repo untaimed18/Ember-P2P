@@ -358,6 +358,7 @@ pub fn run() {
                 scanning_count: scanning_count.clone(),
                 scan_coordination: scan_coordination.clone(),
                 hashing_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                hashing_fs_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 cached_transfer_stats,
                 cached_shared_files: cached_shared_files.clone(),
                 hash_cancel_flags: hash_cancel_flags.clone(),

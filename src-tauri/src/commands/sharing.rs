@@ -344,58 +344,37 @@ pub async fn add_shared_folder(
         ));
     }
 
-    let blocked_segments: &[&str] = &[
-        "windows",
-        "program files",
-        "program files (x86)",
-        "programdata",
-        ".ssh",
-        ".gnupg",
-        "etc",
-        "usr",
-        "bin",
-        "sbin",
-        "var",
-        "root",
-        "tmp",
-        "temp",
-        "proc",
-        "sys",
-        "dev",
-    ];
+    // Refuse system / sensitive path segments (shared with the indexer so
+    // nested `.ssh` etc. are also skipped when walking an allowed parent).
     for component in canonical.components() {
         if let std::path::Component::Normal(seg) = component {
-            let seg_lower = seg.to_string_lossy().to_lowercase();
-            if blocked_segments.contains(&seg_lower.as_str()) {
+            if crate::sharing::is_sensitive_dir_name(&seg.to_string_lossy()) {
                 return Err(coded_ctx(
                     "sharing_cannot_share_system_dir",
                     "Cannot share system directory",
                     canonical.display(),
                 ));
             }
-            if seg_lower == "appdata" {
-                let rest: String = canonical
-                    .components()
-                    .skip_while(|c| {
-                        if let std::path::Component::Normal(s) = c {
-                            s.to_string_lossy().to_lowercase() != "appdata"
-                        } else {
-                            true
-                        }
-                    })
-                    .skip(1)
-                    .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
-                    .collect::<Vec<_>>()
-                    .join("/");
-                if rest.starts_with("local/temp") || rest.starts_with("local\\temp") {
-                    return Err(coded_ctx(
-                        "sharing_cannot_share_system_dir",
-                        "Cannot share system directory",
-                        canonical.display(),
-                    ));
-                }
-            }
         }
+    }
+
+    // Refuse Ember's own data directory (config, identity, known.met, …),
+    // and refuse a parent that contains it (indexer would otherwise walk in).
+    let data_dir = crate::storage::paths::resolve_data_dir();
+    let data_canon = data_dir.canonicalize().unwrap_or(data_dir.clone());
+    let share_covers_data_dir = data_canon == canonical
+        || data_canon.starts_with(&canonical)
+        || paths_equal_ignore_case(&canonical.to_string_lossy(), &data_dir.to_string_lossy())
+        || crate::security::path_matches_dir(
+            &data_canon.to_string_lossy(),
+            &canonical.to_string_lossy(),
+        );
+    if share_covers_data_dir {
+        return Err(coded_ctx(
+            "sharing_cannot_share_data_dir",
+            "Cannot share Ember data directory or a parent of it",
+            canonical.display(),
+        ));
     }
 
     let canonical_str = canonical.to_string_lossy().to_string();
@@ -486,6 +465,14 @@ pub async fn add_shared_folder(
     {
         let config = state.config.read().await;
         sync_asset_protocol_scope(&app, &config);
+    }
+
+    // FS changes deferred during pause must not be lost when add-folder
+    // clears the latch but only scans the new path. A full reload covers
+    // every share (including the folder just added) and clears the dirty bit.
+    if state.hashing_fs_dirty.load(Ordering::Relaxed) {
+        info!("FS changes deferred during pause; running full shared-folder reload");
+        return reload_shared_files(app, state).await;
     }
 
     let local_index = state.local_index.clone();
@@ -1325,6 +1312,7 @@ pub async fn reload_shared_files(
     // Manual reload / resume always clear the pause latch. The FS watcher
     // never reaches this path while paused (it checks hashing_paused first).
     state.hashing_paused.store(false, Ordering::Relaxed);
+    state.hashing_fs_dirty.store(false, Ordering::Relaxed);
 
     let folders = {
         let config = state.config.read().await;

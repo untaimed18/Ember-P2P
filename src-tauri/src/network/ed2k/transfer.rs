@@ -929,6 +929,7 @@ impl Ed2kDownload {
         // session so the dispatcher doesn't get repeated address-
         // update events for the same peer.
         let mut friend_seen_emitted = false;
+        let mut friend_request_sent = false;
         // FIFO of non-AUTH packets captured by
         // `perform_ember_auth_buffered` while it waited for CHALLENGE /
         // RESPONSE. The uploader emits proactive
@@ -1539,6 +1540,21 @@ impl Ed2kDownload {
                                                         })
                                                         .await;
                                                     friend_seen_emitted = true;
+                                                    if !friend_request_sent {
+                                                        let nick_bytes =
+                                                            self.our_nickname.as_bytes();
+                                                        if write_packet_async(
+                                                            &mut writer,
+                                                            OP_EMULEPROT,
+                                                            OP_EMBER_FRIEND_REQ,
+                                                            nick_bytes,
+                                                        )
+                                                        .await
+                                                        .is_ok()
+                                                        {
+                                                            friend_request_sent = true;
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
@@ -1639,17 +1655,7 @@ impl Ed2kDownload {
             } else {
                 false
             };
-        if peer_is_ember && peer_is_friend {
-            let nick_bytes = self.our_nickname.as_bytes();
-            let _ = write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_FRIEND_REQ, nick_bytes)
-                .await;
-        }
-        // FriendSeen emit is deferred to PoP-success sites. The
-        // dispatcher promotes FriendSeen to `update_friend_address`
-        // (overwriting the friend's last known IP) and an
-        // `ember:friend-online` UI event; both are user-facing facts
-        // about *that friend*, so they require Ed25519 PoP, not just
-        // the unauthenticated `is_friend && hello_caps.is_ember` claim.
+        // Friend request deferred until PoP (membership oracle otherwise).
         let is_ember_friend = peer_is_ember && peer_is_friend;
 
         // Send file request in eMule order:
@@ -2178,6 +2184,20 @@ impl Ed2kDownload {
                                                     })
                                                     .await;
                                                 friend_seen_emitted = true;
+                                                if !friend_request_sent {
+                                                    let nick_bytes = self.our_nickname.as_bytes();
+                                                    if write_packet_async(
+                                                        &mut writer,
+                                                        OP_EMULEPROT,
+                                                        OP_EMBER_FRIEND_REQ,
+                                                        nick_bytes,
+                                                    )
+                                                    .await
+                                                    .is_ok()
+                                                    {
+                                                        friend_request_sent = true;
+                                                    }
+                                                }
                                             }
                                         }
                                     }

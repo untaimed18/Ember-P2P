@@ -621,7 +621,10 @@ pub enum NetworkStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+// Do not use `deny_unknown_fields`: a config.json written by a newer Ember
+// build (extra keys) must still load on downgrade. Unknown keys are ignored;
+// missing known fields use `#[serde(default)]` / field defaults where set.
+// Completely unreadable JSON still falls back to defaults after backup.
 pub struct AppSettings {
     pub nickname: String,
     pub shared_folders: Vec<String>,
@@ -825,11 +828,11 @@ pub struct AppSettings {
     /// the next launch. Off by default.
     ///
     /// `alias = "launch_fullscreen"` accepts this field's former name (shipped
-    /// in an intermediate build) so an existing `config.json` still
-    /// deserializes — without it, the unknown key would trip
-    /// `deny_unknown_fields`, and the loader would treat the whole config as
-    /// corrupt and reset every setting to defaults. The old boolean carries
-    /// over unchanged; the canonical name is written back on the next save.
+    /// in an intermediate build) so an existing `config.json` still maps the
+    /// old key onto `launch_maximized`. Without the alias the legacy key would
+    /// be ignored as unknown and the preference would silently reset to the
+    /// default. The old boolean carries over unchanged; the canonical name is
+    /// written back on the next save.
     #[serde(default, alias = "launch_fullscreen")]
     pub launch_maximized: bool,
     /// Per-shared-folder default upload priority (eMule: directory priority).
@@ -1240,12 +1243,30 @@ pub struct TransferSourcesPayload<'a> {
 mod tests {
     use super::*;
 
+    /// Configs from a newer build may include unknown keys. Those must be
+    /// ignored on downgrade rather than failing deserialize (which would
+    /// wipe settings). This guards against reintroducing `deny_unknown_fields`.
+    #[test]
+    fn unknown_settings_keys_are_ignored() {
+        let mut value =
+            serde_json::to_value(AppSettings::default()).expect("serialize default settings");
+        value
+            .as_object_mut()
+            .expect("AppSettings serializes to a JSON object")
+            .insert(
+                "future_setting_from_newer_build".to_string(),
+                serde_json::json!(true),
+            );
+        let parsed: AppSettings = serde_json::from_value(value)
+            .expect("unknown keys must not fail AppSettings deserialize");
+        assert!(!parsed.nickname.is_empty());
+    }
+
     /// A `config.json` written by the intermediate build stores the launch
-    /// preference under the old key `launch_fullscreen`. Because `AppSettings`
-    /// is `#[serde(deny_unknown_fields)]`, that key must be accepted via the
-    /// serde alias — otherwise the loader would reject the whole file as
-    /// corrupt and silently reset every setting to defaults. This guards the
-    /// rename so the migration can't regress.
+    /// preference under the old key `launch_fullscreen`. The serde alias must
+    /// map that key onto `launch_maximized` — otherwise the legacy key is
+    /// ignored and the preference silently resets to the default. This guards
+    /// the rename so the migration can't regress.
     #[test]
     fn legacy_launch_fullscreen_key_maps_to_launch_maximized() {
         let mut value =

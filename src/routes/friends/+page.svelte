@@ -19,6 +19,8 @@
     clearFriendSearch,
     isDiscoverable as isDiscoverableStore,
     clearUnread,
+    beginFriendRequestMutation,
+    endFriendRequestMutation,
   } from '$lib/stores/friends';
   import { appSettings } from '$lib/stores/settings';
 
@@ -170,6 +172,7 @@
     if (processingRequests.has(req.sender_hash)) return;
     processingRequests.add(req.sender_hash);
     processingRequests = new Set(processingRequests);
+    beginFriendRequestMutation();
     try {
       await acceptFriendRequest(req.sender_hash);
       // Optimistically drop the accepted row so it disappears immediately even
@@ -184,6 +187,7 @@
       // handled in another window). Resync so a stale row doesn't linger.
       await reloadFriendRequests();
     } finally {
+      endFriendRequestMutation();
       processingRequests.delete(req.sender_hash);
       processingRequests = new Set(processingRequests);
     }
@@ -211,12 +215,14 @@
     if (processingRequests.has(req.sender_hash)) return;
     processingRequests.add(req.sender_hash);
     processingRequests = new Set(processingRequests);
+    beginFriendRequestMutation();
     try {
       await rejectFriendRequest(req.sender_hash);
       friendRequestsStore.update(reqs => reqs.filter(r => r.sender_hash !== req.sender_hash));
     } catch (e: unknown) {
       error = toErr(e);
     } finally {
+      endFriendRequestMutation();
       processingRequests.delete(req.sender_hash);
       processingRequests = new Set(processingRequests);
     }

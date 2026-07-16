@@ -1155,20 +1155,24 @@ pub struct SearchManager {
     /// Contact IDs that need to be marked in-use on the routing table.
     /// Accumulated by start_search, drained by the caller via `drain_in_use_ids`.
     pending_in_use: Vec<KadId>,
-    /// In-use contact IDs of searches that were evicted *outside* the normal
-    /// `cleanup()` path (currently the search-storm eviction in `start_search`).
-    /// Those evictions remove the search before `cleanup()` would, so their
-    /// in-use marks must be released here or the routing table would pin those
-    /// contacts as in-use forever (blocking dead-contact eviction). Drained by
-    /// the main loop via `drain_pending_release`.
+    /// In-use contact IDs of searches that were removed *outside* the normal
+    /// `cleanup()` / `start_search` return path. Reserved for future callers;
+    /// search-storm eviction now returns released ids directly from
+    /// `start_search` so finalize can run immediately. Drained by the main
+    /// loop via `drain_pending_release`.
     pending_release: Vec<KadId>,
 }
 
 impl SearchManager {
     fn reuses_existing_search(search_type: SearchType) -> bool {
+        // FindSource is intentionally *not* reused across callers: each
+        // download (and each find_sources IPC) owns its own search id so
+        // `download_source_searches` / `pending_source_searches` cannot be
+        // overwritten when a second transfer looks up the same hash. FindNode
+        // / FindBuddy are still safe to coalesce (no per-caller result map).
         matches!(
             search_type,
-            SearchType::FindNode | SearchType::FindBuddy | SearchType::FindSource { .. }
+            SearchType::FindNode | SearchType::FindBuddy
         )
     }
 
@@ -1192,18 +1196,27 @@ impl SearchManager {
         }
     }
 
+    /// Start a search. Returns `(new_id, evicted_ids, released_in_use)`.
+    ///
+    /// `new_id` is `SearchId(0)` when the request is rejected (capacity /
+    /// priority). `evicted_ids` are searches removed by the capacity reap or
+    /// live eviction; callers **must** run the same finalize path used by
+    /// `CancelKadSearch` (`finalize_removed_searches`) so pending-result maps
+    /// keyed by those ids are cleared. `released_in_use` are the evicted
+    /// searches' routing-table in-use marks (pass them to finalize together
+    /// with the ids). When nothing is evicted both vecs are empty.
     pub fn start_search(
         &mut self,
         target: KadId,
         search_type: SearchType,
         initial_contacts: Vec<KadContact>,
-    ) -> SearchId {
+    ) -> (SearchId, Vec<SearchId>, Vec<KadId>) {
         let key = (target, search_type);
         if Self::reuses_existing_search(search_type) {
             if let Some(existing_id) = self.target_map.get(&key) {
                 if let Some(state) = self.active.get(existing_id) {
                     if !state.completed && state.search_type == search_type {
-                        return *existing_id;
+                        return (*existing_id, Vec::new(), Vec::new());
                     }
                 }
             }
@@ -1215,6 +1228,8 @@ impl SearchManager {
         // oldest least-important live search when it is no more important
         // than the new request.
         const MAX_ACTIVE_SEARCHES: usize = 20;
+        let mut evicted_ids: Vec<SearchId> = Vec::new();
+        let mut released_in_use: Vec<KadId> = Vec::new();
         let active = self.active_count();
         if active >= MAX_ACTIVE_SEARCHES {
             let completed: Vec<SearchId> = self
@@ -1229,10 +1244,11 @@ impl SearchManager {
                     if self.target_map.get(&k) == Some(&id) {
                         self.target_map.remove(&k);
                     }
-                    // Release this evicted search's in-use marks (see
-                    // `pending_release`). Without this the routing table would
-                    // keep these contacts pinned in-use indefinitely.
-                    self.pending_release.extend(s.in_use_ids);
+                    // Caller finalizes pending maps for these ids; in-use
+                    // marks go back via `released_in_use` (not pending_release)
+                    // so finalize can release them immediately.
+                    released_in_use.extend(s.in_use_ids);
+                    evicted_ids.push(id);
                 }
             }
             if self.active_count() >= MAX_ACTIVE_SEARCHES {
@@ -1259,7 +1275,8 @@ impl SearchManager {
                         if self.target_map.get(&old_key) == Some(&id) {
                             self.target_map.remove(&old_key);
                         }
-                        self.pending_release.extend(state.in_use_ids);
+                        released_in_use.extend(state.in_use_ids);
+                        evicted_ids.push(id);
                         debug!(
                             "Evicted oldest lower/equal-priority search {} ({:?}) to start {:?}",
                             id.0, state.search_type, search_type
@@ -1270,7 +1287,9 @@ impl SearchManager {
                         "Rejecting search ({search_type:?}): {} more-important active searches at cap",
                         self.active_count()
                     );
-                    return SearchId(0);
+                    // Still return any completed rows we reaped above so the
+                    // caller can finalize their pending maps.
+                    return (SearchId(0), evicted_ids, released_in_use);
                 }
             }
         }
@@ -1285,7 +1304,7 @@ impl SearchManager {
         self.active.insert(id, state);
         self.pending_in_use.extend(in_use);
         debug!("Started search {}: target={}", id.0, target);
-        id
+        (id, evicted_ids, released_in_use)
     }
 
     pub fn get_mut(&mut self, id: &SearchId) -> Option<&mut SearchState> {
@@ -1296,41 +1315,49 @@ impl SearchManager {
         self.active.get(id)
     }
 
-    /// Get the expected response contact count for a target (eMule GetExpectedResponseContactCount).
-    /// Returns 0 if no active search for this target (meaning the response should be rejected).
-    pub fn get_expected_response_count(&self, target: &KadId) -> u8 {
-        // K13: target_map is keyed by (target, kind) so we can't look up
-        // by target alone. Scan active searches instead — this is the
-        // response-routing hot path and ties are rare (typically a single
-        // FindNode/FindSource search per target at any time). Preferring
-        // the search with the highest expected count matches the earlier
-        // behaviour of returning whichever search was registered last.
+    /// Whether any incomplete search is walking `target` (existence gate for
+    /// unsolicited KadRes). Per-search acceptance uses
+    /// [`Self::max_accepted_response_count_for`].
+    pub fn has_active_search_for_target(&self, target: &KadId) -> bool {
         self.active
             .values()
-            .filter(|s| s.target == *target && !s.completed)
+            .any(|s| s.target == *target && !s.completed)
+    }
+
+    /// Expected response contact count for a specific active search
+    /// (eMule GetExpectedResponseContactCount / GetRequestContactCount).
+    /// Returns 0 if the id is missing or already completed.
+    #[allow(dead_code)] // exercised by unit tests; KadRes uses max_accepted_response_count_for
+    pub fn get_expected_response_count(&self, id: &SearchId) -> u8 {
+        self.active
+            .get(id)
+            .filter(|s| !s.completed)
             .map(|s| s.get_expected_response_count())
-            .max()
             .unwrap_or(0)
     }
 
-    /// Maximum contacts accepted in a KadRes for `target` from `from_id`.
+    /// Maximum contacts accepted in a KadRes for the matched search `id`
+    /// from `from_id`.
     ///
     /// Matches eMule `ProcessResponse`: normally `GetRequestContactCount()`,
-    /// but when this responder is the FIND_VALUE_MORE re-ask target, allow up
-    /// to `KADEMLIA_FIND_NODE` (11). Oversized responses must be dropped, not
-    /// truncated.
-    pub fn max_accepted_response_count(&self, target: &KadId, from_id: Option<&KadId>) -> u8 {
-        let expected = self.get_expected_response_count(target);
+    /// but when this responder is that search's FIND_VALUE_MORE re-ask
+    /// target, allow up to `KADEMLIA_FIND_NODE` (11). Oversized responses
+    /// must be dropped for that search, not truncated — and must not borrow
+    /// a higher expected count from a different same-target search.
+    pub fn max_accepted_response_count_for(
+        &self,
+        id: &SearchId,
+        from_id: Option<&KadId>,
+    ) -> u8 {
+        let Some(search) = self.active.get(id).filter(|s| !s.completed) else {
+            return 0;
+        };
+        let expected = search.get_expected_response_count();
         if expected == 0 {
             return 0;
         }
         if let Some(from_id) = from_id {
-            let is_reask = self.active.values().any(|s| {
-                s.target == *target
-                    && !s.completed
-                    && s.lookup_reask_more_target == Some(*from_id)
-            });
-            if is_reask {
+            if search.lookup_reask_more_target == Some(*from_id) {
                 return KADEMLIA_FIND_NODE;
             }
         }
@@ -1827,8 +1854,8 @@ mod tests {
         let target = kad_id(9);
         let mut manager = SearchManager::new();
 
-        let first = manager.start_search(target, SearchType::FindKeyword, Vec::new());
-        let second = manager.start_search(target, SearchType::FindKeyword, Vec::new());
+        let (first, ..) = manager.start_search(target, SearchType::FindKeyword, Vec::new());
+        let (second, ..) = manager.start_search(target, SearchType::FindKeyword, Vec::new());
 
         assert_ne!(first, second);
         assert_eq!(
@@ -1843,29 +1870,32 @@ mod tests {
         let target = kad_id(7);
         let mut manager = SearchManager::new();
 
-        let first = manager.start_search(target, SearchType::FindNode, Vec::new());
-        let second = manager.start_search(target, SearchType::FindNode, Vec::new());
+        let (first, ..) = manager.start_search(target, SearchType::FindNode, Vec::new());
+        let (second, ..) = manager.start_search(target, SearchType::FindNode, Vec::new());
 
         assert_eq!(first, second);
     }
 
     #[test]
-    fn findsource_reuses_when_same_file_size() {
+    fn findsource_does_not_reuse_existing_search() {
         let target = kad_id(11);
         let mut manager = SearchManager::new();
 
-        let first = manager.start_search(
+        let (first, ..) = manager.start_search(
             target,
             SearchType::FindSource { file_size: 50000 },
             Vec::new(),
         );
-        let second = manager.start_search(
+        let (second, ..) = manager.start_search(
             target,
             SearchType::FindSource { file_size: 50000 },
             Vec::new(),
         );
 
-        assert_eq!(first, second, "same target + same file_size should reuse");
+        assert_ne!(
+            first, second,
+            "FindSource must not reuse across callers (download map overwrite)"
+        );
     }
 
     #[test]
@@ -1873,12 +1903,12 @@ mod tests {
         let target = kad_id(13);
         let mut manager = SearchManager::new();
 
-        let download = manager.start_search(
+        let (download, ..) = manager.start_search(
             target,
             SearchType::FindSource { file_size: 50000 },
             Vec::new(),
         );
-        let friend =
+        let (friend, ..) =
             manager.start_search(target, SearchType::FindSource { file_size: 1 }, Vec::new());
 
         assert_ne!(
@@ -1892,18 +1922,39 @@ mod tests {
         let target = kad_id(5);
         let mut manager = SearchManager::new();
 
-        let sid = manager.start_search(target, SearchType::FindKeyword, Vec::new());
+        let (sid, ..) = manager.start_search(target, SearchType::FindKeyword, Vec::new());
         assert_ne!(sid, SearchId(0));
 
-        let expected = manager.get_expected_response_count(&target);
+        let expected = manager.get_expected_response_count(&sid);
         assert!(
             expected > 0,
             "keyword search must have nonzero expected response count"
         );
         assert_eq!(
-            manager.max_accepted_response_count(&target, None),
+            manager.max_accepted_response_count_for(&sid, None),
             expected,
             "default max accepted must equal GetRequestContactCount"
+        );
+    }
+
+    #[test]
+    fn max_accepted_uses_matched_search_not_max_across_target() {
+        let target = kad_id(17);
+        let mut manager = SearchManager::new();
+        let (keyword_sid, ..) =
+            manager.start_search(target, SearchType::FindKeyword, Vec::new());
+        let (node_sid, ..) = manager.start_search(target, SearchType::FindNode, Vec::new());
+        assert_ne!(keyword_sid, SearchId(0));
+        assert_ne!(node_sid, SearchId(0));
+
+        assert_eq!(
+            manager.max_accepted_response_count_for(&keyword_sid, None),
+            KADEMLIA_FIND_VALUE,
+            "keyword search must not inherit FindNode's higher expected count"
+        );
+        assert_eq!(
+            manager.max_accepted_response_count_for(&node_sid, None),
+            KADEMLIA_FIND_NODE,
         );
     }
 
@@ -1912,7 +1963,8 @@ mod tests {
         let target = kad_id(9);
         let mut manager = SearchManager::new();
         let responder = contact(near_kad_id(1), 1);
-        let sid = manager.start_search(target, SearchType::FindKeyword, vec![responder.clone()]);
+        let (sid, ..) =
+            manager.start_search(target, SearchType::FindKeyword, vec![responder.clone()]);
         assert_ne!(sid, SearchId(0));
 
         let search = manager.get_mut(&sid).unwrap();
@@ -1920,12 +1972,12 @@ mod tests {
         search.responded_during_lookup.insert(responder.id);
 
         assert_eq!(
-            manager.max_accepted_response_count(&target, Some(&responder.id)),
+            manager.max_accepted_response_count_for(&sid, Some(&responder.id)),
             KADEMLIA_FIND_NODE,
             "FIND_VALUE_MORE re-ask responder may return up to FIND_NODE contacts"
         );
         assert_eq!(
-            manager.max_accepted_response_count(&target, Some(&kad_id(99))),
+            manager.max_accepted_response_count_for(&sid, Some(&kad_id(99))),
             KADEMLIA_FIND_VALUE,
             "other responders stay at FIND_VALUE"
         );
@@ -1935,7 +1987,7 @@ mod tests {
     fn prune_stopped_reaps_completed_after_grace() {
         let mut manager = SearchManager::new();
         let target = kad_id(5);
-        let sid = manager.start_search(target, SearchType::StoreKeyword, Vec::new());
+        let (sid, ..) = manager.start_search(target, SearchType::StoreKeyword, Vec::new());
 
         // An active (not-yet-completed) search is never reaped, regardless of grace.
         let (removed, _) = manager.prune_stopped(0);

@@ -527,13 +527,12 @@ impl PartTracker {
             cur.write_all(&self.file_hash)?;
             let part_hash_count = self.part_hashes.len();
             if part_hash_count > u16::MAX as usize {
-                tracing::warn!(
-                    "part.met: {} part hashes exceeds u16 limit, clamping to {}",
-                    part_hash_count,
-                    u16::MAX
+                anyhow::bail!(
+                    "part.met: {} part hashes exceeds u16::MAX — refusing to write a mismatched count (file too large for classic part.met)",
+                    part_hash_count
                 );
             }
-            cur.write_u16::<LittleEndian>(part_hash_count.min(u16::MAX as usize) as u16)?;
+            cur.write_u16::<LittleEndian>(part_hash_count as u16)?;
             for ph in &self.part_hashes {
                 cur.write_all(ph)?;
             }
@@ -916,13 +915,12 @@ impl SaveSnapshot {
             cur.write_all(&self.file_hash)?;
             let part_hash_count = self.part_hashes.len();
             if part_hash_count > u16::MAX as usize {
-                tracing::warn!(
-                    "part.met: {} part hashes exceeds u16 limit, clamping to {}",
-                    part_hash_count,
-                    u16::MAX
+                anyhow::bail!(
+                    "part.met: {} part hashes exceeds u16::MAX — refusing to write a mismatched count (file too large for classic part.met)",
+                    part_hash_count
                 );
             }
-            cur.write_u16::<LittleEndian>(part_hash_count.min(u16::MAX as usize) as u16)?;
+            cur.write_u16::<LittleEndian>(part_hash_count as u16)?;
             for ph in &self.part_hashes {
                 cur.write_all(ph)?;
             }

@@ -406,46 +406,58 @@
   /** Friend toggles apply immediately (frontend store + persist) so Chat /
    * online toasts / browse gate don't wait for the page Save button. */
   let friendTogglePersistInFlight = false;
+  let friendTogglePersistPending = false;
   async function applyFriendTogglesLive() {
     if (!settings) return;
     setAppSettings({ ...settings });
-    if (friendTogglePersistInFlight) return;
+    if (friendTogglePersistInFlight) {
+      // A later toggle flipped while we were writing — coalesce and re-run
+      // with the latest values once the in-flight persist finishes.
+      friendTogglePersistPending = true;
+      return;
+    }
     friendTogglePersistInFlight = true;
     try {
-      for (let attempt = 0; attempt < 2; attempt++) {
-        const latest = await getSettings();
-        const candidate = {
-          ...latest,
-          friend_require_approval: settings.friend_require_approval,
-          friend_online_notifications: settings.friend_online_notifications,
-          friend_chat_disabled: settings.friend_chat_disabled,
-          friend_browse_disabled: settings.friend_browse_disabled,
-          friend_session_encryption: settings.friend_session_encryption,
-        };
-        try {
-          const saved = await updateSettings(candidate);
-          setAppSettings(saved);
-          settings.settings_revision = saved.settings_revision;
-          if (originalSettings) {
-            const baseline = JSON.parse(originalSettings) as AppSettings;
-            baseline.friend_require_approval = saved.friend_require_approval;
-            baseline.friend_online_notifications = saved.friend_online_notifications;
-            baseline.friend_chat_disabled = saved.friend_chat_disabled;
-            baseline.friend_browse_disabled = saved.friend_browse_disabled;
-            baseline.friend_session_encryption = saved.friend_session_encryption;
-            baseline.settings_revision = saved.settings_revision;
-            originalSettings = JSON.stringify(baseline);
+      do {
+        friendTogglePersistPending = false;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const latest = await getSettings();
+          const candidate = {
+            ...latest,
+            friend_require_approval: settings.friend_require_approval,
+            friend_online_notifications: settings.friend_online_notifications,
+            friend_chat_disabled: settings.friend_chat_disabled,
+            friend_browse_disabled: settings.friend_browse_disabled,
+            friend_session_encryption: settings.friend_session_encryption,
+          };
+          try {
+            const saved = await updateSettings(candidate);
+            setAppSettings(saved);
+            settings.settings_revision = saved.settings_revision;
+            if (originalSettings) {
+              const baseline = JSON.parse(originalSettings) as AppSettings;
+              baseline.friend_require_approval = saved.friend_require_approval;
+              baseline.friend_online_notifications = saved.friend_online_notifications;
+              baseline.friend_chat_disabled = saved.friend_chat_disabled;
+              baseline.friend_browse_disabled = saved.friend_browse_disabled;
+              baseline.friend_session_encryption = saved.friend_session_encryption;
+              baseline.settings_revision = saved.settings_revision;
+              originalSettings = JSON.stringify(baseline);
+            }
+            break;
+          } catch (e) {
+            if (attempt === 0 && isSettingsRevisionConflict(e)) continue;
+            throw e;
           }
-          break;
-        } catch (e) {
-          if (attempt === 0 && isSettingsRevisionConflict(e)) continue;
-          throw e;
         }
-      }
+      } while (friendTogglePersistPending);
     } catch {
       // Optimistic UI already updated; full Save can still persist.
     } finally {
       friendTogglePersistInFlight = false;
+      if (friendTogglePersistPending) {
+        void applyFriendTogglesLive();
+      }
     }
   }
 

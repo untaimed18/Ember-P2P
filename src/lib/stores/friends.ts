@@ -127,12 +127,34 @@ let storeEpoch = 0;
 // that a duplicate event from the upload + download side of a
 // single peer connection collapses into one fetch.
 let friendRequestRefetchTimer: ReturnType<typeof setTimeout> | null = null;
+/** Bumped on optimistic accept/reject so in-flight debounced refetches
+ *  can't resurrect a row the user just dismissed. */
+let friendRequestsGen = 0;
+/** >0 while an accept/reject IPC is in flight — refetch must not
+ *  blind-set the store over the optimistic removal. */
+let friendRequestMutationInFlight = 0;
+
+/** Call around optimistic accept/reject so stale refetches are ignored. */
+export function beginFriendRequestMutation() {
+  friendRequestMutationInFlight++;
+  friendRequestsGen++;
+}
+
+export function endFriendRequestMutation() {
+  friendRequestMutationInFlight = Math.max(0, friendRequestMutationInFlight - 1);
+  friendRequestsGen++;
+}
+
 function scheduleFriendRequestRefetch() {
   if (friendRequestRefetchTimer !== null) return;
   friendRequestRefetchTimer = setTimeout(() => {
     friendRequestRefetchTimer = null;
+    const gen = friendRequestsGen;
     getFriendRequests()
-      .then((reqs) => friendRequests.set(reqs))
+      .then((reqs) => {
+        if (friendRequestMutationInFlight > 0 || gen !== friendRequestsGen) return;
+        friendRequests.set(reqs);
+      })
       .catch((err) => {
         // L16: previously a bare comment swallowed every failure
         // including transient IPC errors that we'd want to know
@@ -398,6 +420,8 @@ export function cleanupFriendsStore() {
     clearTimeout(friendRequestRefetchTimer);
     friendRequestRefetchTimer = null;
   }
+  friendRequestsGen++;
+  friendRequestMutationInFlight = 0;
   // L19: tear down any outstanding search-TTL timers; otherwise
   // a re-init would re-arm them on top of stale state.
   for (const t of searchTimers.values()) clearTimeout(t);

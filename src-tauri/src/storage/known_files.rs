@@ -160,19 +160,20 @@ impl KnownFileList {
         // No artificial record cap here: `save()` writes the full `files.len()`
         // header, so a hard parse cap would silently drop the tail on restart.
         // A mid-record parse failure has no framing marker to resync from, so we
-        // stop without inventing further records — but we keep every complete
-        // record already inserted. That preserves a large library prefix instead
-        // of failing the whole parse and wiping known.met on the next save.
+        // bail and let the caller quarantine known.met rather than keep a prefix
+        // that the next dirty save would permanently truncate.
         for record_index in 0..count {
             let record = match Self::read_record(&mut cursor, version) {
                 Ok(record) => record,
                 Err(e) => {
-                    warn!(
-                        "failed to parse known.met record {} of {count}: {e}; keeping {} previously loaded records",
+                    // Quarantine: a mid-file parse error means the on-disk
+                    // known.met is corrupt. Returning Ok with a prefix would
+                    // let the next dirty save permanently drop the unread tail.
+                    anyhow::bail!(
+                        "failed to parse known.met record {} of {count}: {e} (loaded {} records before failure)",
                         record_index + 1,
                         self.files.len()
                     );
-                    return Ok(());
                 }
             };
             let hash = record.file_hash;
