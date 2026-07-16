@@ -857,7 +857,7 @@
 
     <div class="download-box">
       <img src="icon.png" alt="Ember" width="80" height="80" style="border-radius: 16px; margin-bottom: 16px; box-shadow: 0 4px 16px rgba(0,0,0,0.12);">
-      <h3>Get Ember 1.1.6</h3>
+      <h3>Get Ember 1.1.7</h3>
       <p>The latest release is available on GitHub for Windows 10 and Windows 11.</p>
       <div class="btn-group">
         <a href="https://github.com/untaimed18/Ember-P2P/releases/latest" class="btn btn-primary" target="_blank" rel="noopener">
@@ -1309,6 +1309,76 @@ npm run tauri build</code></pre>
   <section id="releases">
     <h2>Release History</h2>
     <p>Official Ember releases for Windows. Notes mirror the <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">GitHub Releases</a> changelog style. Ember can also update itself in-app when a signed release is published.</p>
+
+    <article class="release" id="release-1-1-7">
+      <div class="release-header">
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.1.7" target="_blank" rel="noopener">Ember v1.1.7</a></h3>
+        <time class="release-date" datetime="2026-07-15">July 15, 2026</time>
+      </div>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.1.7" target="_blank" rel="noopener"><code>v1.1.7</code></a></p>
+      <div class="release-notes">
+        <h4>What's New</h4>
+
+        <h5>Search</h5>
+        <ul>
+          <li>Align Global / Server / Kad search more closely with eMule (UDP eligibility &amp; reply auth, Arc/Iso→Pro wire types, Kad AND stripping, availability merge, and stop-cap accounting)</li>
+          <li>Automatically request more server results (<code>OP_QUERY_MORE</code>) when a page is full, up to the eMule-style limits</li>
+          <li>Skip shared and downloading files when counting toward the ed2k search stop limit (results still appear)</li>
+          <li>Move <strong>Hide spam</strong> into Advanced Filters; remove the empty-server “retry” banner</li>
+        </ul>
+
+        <h5>Uploads</h5>
+        <ul>
+          <li>Dial HighID waiting peers to grant upload slots (<code>AddUpNextClient</code> / push-grant), with concurrency and backoff limits</li>
+          <li>Fix soft-zone admission so newcomers are judged by credit + file priority (not a zero-wait score)</li>
+        </ul>
+
+        <h5>Downloads &amp; transfers</h5>
+        <ul>
+          <li>Start KAD / TCP / UDP source discovery for queued and add-paused downloads so sources are ready on resume</li>
+          <li><strong>Resume All</strong> now includes Stopped downloads</li>
+          <li>Collapse Pause All / Resume All / Clear Completed into a <strong>More</strong> menu (closes on Escape and outside click)</li>
+        </ul>
+
+        <h5>Library &amp; status</h5>
+        <ul>
+          <li>Redesign the Library detail drawer (sections, missing/hashing banners, context Properties)</li>
+          <li>Show total shared size next to the shared-file count in the status bar</li>
+          <li>Improve missing-file scan feedback and bulk selection toasts</li>
+        </ul>
+
+        <h5>Statistics</h5>
+        <ul>
+          <li>Count <strong>Completed Uploads</strong> only when a peer received the entire file in that session</li>
+          <li>Keep cumulative counters from rolling backward across save races; show <code>0s</code> for zero durations; hide empty overhead bars</li>
+        </ul>
+
+        <h4>What's Fixed / Hardened</h4>
+
+        <h5>Connectivity &amp; firewall</h5>
+        <ul>
+          <li>Honor reconnect backoff and per-server cooldowns; keep LowID sticky against false “Open” from UPnP</li>
+          <li>Handle mid-session <code>OP_IDCHANGE</code> (LowID ↔ HighID) without a full disconnect when possible</li>
+          <li>Prefer a known Open/Firewalled status over a stale Unknown in the UI</li>
+        </ul>
+
+        <h5>Transfers</h5>
+        <ul>
+          <li>Batch cancel always removes DB rows so cancelled downloads no longer resurrect after restart</li>
+          <li>Serialize spam-filter saves to avoid lost/out-of-order writes</li>
+        </ul>
+
+        <h5>Installer</h5>
+        <ul>
+          <li>Skip recreating the desktop shortcut during in-app updates (<code>/UPDATE</code>), fixing duplicate desktop icons</li>
+        </ul>
+
+        <p class="full-changelog">
+          <strong>Full Changelog</strong>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.1.6...v1.1.7" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.1.6...v1.1.7</a>
+        </p>
+      </div>
+    </article>
 
     <article class="release" id="release-1-1-6">
       <div class="release-header">
