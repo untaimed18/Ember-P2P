@@ -416,8 +416,7 @@ pub async fn start_token_refill(
     const TICKS_PER_SECOND: u64 = 1000 / REFILL_INTERVAL_MS;
 
     let max_up = limiter.max_upload_rate.load(Ordering::Relaxed);
-    let mut uss = super::uss::UploadSpeedSense::new(1024, max_up);
-    uss.set_tolerance(1.5);
+    let mut uss = super::uss::UploadSpeedSense::new(0, max_up);
 
     let mut interval = tokio::time::interval(Duration::from_millis(REFILL_INTERVAL_MS));
     let mut last_uploaded = limiter.total_uploaded();
@@ -432,10 +431,39 @@ pub async fn start_token_refill(
         }
         limiter.refill_tokens_incremental(1, TICKS_PER_SECOND);
 
-        // Drain real KAD RTT samples from the network loop
+        // Drain real KAD RTT samples from the network loop. Cap drain size so a
+        // stuck lock elsewhere cannot leave an ever-growing queue.
+        let uss_state_before_drain = uss.state();
         if let Ok(mut queue) = uss_rtt_queue.try_lock() {
-            while let Some(rtt_ms) = queue.pop_front() {
+            let mut drained = 0;
+            while drained < 64 {
+                let Some(rtt_ms) = queue.pop_front() else {
+                    break;
+                };
                 uss.record_ping(rtt_ms);
+                drained += 1;
+            }
+            // Drop stale backlog rather than applying minutes-old RTTs.
+            if queue.len() > 64 {
+                let overflow = queue.len() - 64;
+                queue.drain(0..overflow);
+            }
+        }
+        // When Preparing→Monitoring flips mid-interval, apply the new ceiling
+        // immediately so uploads are not stuck at the quiet baseline for up to
+        // another second waiting on the 1 Hz tick.
+        if uss.is_enabled()
+            && uss_state_before_drain == super::uss::UssState::Preparing
+            && uss.state() == super::uss::UssState::Monitoring
+        {
+            let configured_max = limiter.configured_upload_rate();
+            if let Some(new_limit) = uss.compute_limit() {
+                let capped = if configured_max > 0 {
+                    new_limit.min(configured_max)
+                } else {
+                    new_limit
+                };
+                limiter.set_upload_limit(capped);
             }
         }
 
@@ -444,15 +472,20 @@ pub async fn start_token_refill(
             uss_enabled_flag.load(Ordering::Relaxed) && limiter.configured_upload_rate() > 0;
         if want_enabled && !uss.is_enabled() {
             let max = limiter.configured_upload_rate();
-            uss.set_limits(1024, max);
+            uss.set_limits(0, max);
             uss.enable();
             limiter.set_uss_active(true);
+            // Begin the quiet baseline immediately rather than waiting up to
+            // a second for the next compute_limit tick.
+            if let Some(prep) = uss.compute_limit() {
+                limiter.set_upload_limit(prep);
+            }
         } else if !want_enabled && uss.is_enabled() {
             uss.disable();
             limiter.set_uss_active(false);
-            limiter
-                .max_upload_rate
-                .store(limiter.configured_upload_rate(), Ordering::Relaxed);
+            // Restore the configured cap through set_upload_limit so the token
+            // bucket burst cap is reclamped consistently with other paths.
+            limiter.set_upload_limit(limiter.configured_upload_rate());
         }
 
         speed_tick_count += 1;
@@ -467,12 +500,20 @@ pub async fn start_token_refill(
             last_downloaded = current_down;
 
             if uss.is_enabled() {
-                if let Some(new_limit) = uss.compute_limit() {
-                    limiter.set_upload_limit(new_limit);
-                }
+                // Apply the live configured cap *before* computing the next
+                // USS limit so a user-lowered max cannot be exceeded for a
+                // full second by a stale current_limit.
                 let configured_max = limiter.configured_upload_rate();
                 if configured_max > 0 {
-                    uss.set_limits(1024, configured_max);
+                    uss.set_limits(0, configured_max);
+                }
+                if let Some(new_limit) = uss.compute_limit() {
+                    let capped = if configured_max > 0 {
+                        new_limit.min(configured_max)
+                    } else {
+                        new_limit
+                    };
+                    limiter.set_upload_limit(capped);
                 }
             }
         }
