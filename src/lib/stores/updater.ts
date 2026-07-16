@@ -125,6 +125,9 @@ let pending: Update | null = null;
 // otherwise corrupt the download / surface a spurious error.
 let installInFlight = false;
 
+/** True while `checkForUpdates` is awaiting the plugin `check()` call. */
+let checkInFlight = false;
+
 async function disposePending(): Promise<void> {
   if (!pending) return;
   const stale = pending;
@@ -161,13 +164,19 @@ export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<
   // Never run while a download/install is in progress: `disposePending()`
   // below would `close()` the very `Update` resource `installUpdate()` is
   // mid-way through streaming, aborting it. A check during install is a no-op.
-  if (installInFlight) return false;
-  await disposePending();
+  // Also skip when another check is already in flight — a second entry would
+  // dispose the first check's result (or the currently-available pending).
+  if (installInFlight || checkInFlight) return false;
+  checkInFlight = true;
+  // Keep an existing `available` pending until the new check succeeds, so a
+  // failed/empty re-check doesn't wipe the Install button's resource.
+  const keepPendingUntilSuccess = pending != null;
   recordCheckedNow();
   updater.update((s) => ({ ...s, phase: 'checking', error: null }));
   try {
     const found = await check();
     if (found) {
+      await disposePending();
       pending = found;
       updater.set({
         phase: 'available',
@@ -181,15 +190,36 @@ export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<
       });
       return true;
     }
+    if (keepPendingUntilSuccess && pending) {
+      // Empty re-check: keep the Install resource rather than wiping a
+      // previously-available update (manifest flap / transient empty).
+      updater.update((s) => ({
+        ...s,
+        phase: 'available',
+        error: null,
+      }));
+      return true;
+    }
+    await disposePending();
     updater.set({ ...INITIAL, phase: opts.silent ? 'idle' : 'uptodate' });
     return false;
   } catch (e) {
-    if (opts.silent) {
+    if (keepPendingUntilSuccess && pending) {
+      // Re-check failed but we still have a usable Update resource — restore
+      // the available phase instead of disposing it.
+      updater.update((s) => ({
+        ...s,
+        phase: 'available',
+        error: opts.silent ? s.error : toMessage(e),
+      }));
+    } else if (opts.silent) {
       updater.set({ ...INITIAL, phase: 'idle' });
     } else {
       updater.update((s) => ({ ...s, phase: 'error', error: toMessage(e) }));
     }
     return false;
+  } finally {
+    checkInFlight = false;
   }
 }
 

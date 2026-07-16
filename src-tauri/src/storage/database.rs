@@ -887,9 +887,12 @@ impl Database {
 
     pub fn get_incomplete_downloads(&self) -> anyhow::Result<Vec<Transfer>> {
         let conn = self.conn.lock();
+        // Include `failed` so Temp `.part` files for hash-failed downloads are
+        // still owned by a known transfer id and survive orphan sweep. They are
+        // restored into the manager as Failed (not auto-started).
         let mut stmt = conn.prepare(
             "SELECT id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at, priority, category
-             FROM transfers WHERE status NOT IN ('completed', 'failed', 'noneneeded') AND direction = 'download'"
+             FROM transfers WHERE status NOT IN ('completed', 'noneneeded') AND direction = 'download'"
         )?;
 
         let transfers = stmt
@@ -1467,6 +1470,7 @@ impl Database {
              ON CONFLICT(user_hash) DO UPDATE SET nickname = excluded.nickname",
             params![user_hash, nickname, now],
         )?;
+        tx.commit()?;
         Ok(())
     }
 

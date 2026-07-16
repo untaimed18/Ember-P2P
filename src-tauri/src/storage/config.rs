@@ -111,14 +111,12 @@ impl AppConfig {
             };
             match data.as_deref().map(serde_json::from_str::<AppSettings>) {
                 None => AppSettings::default(),
-                // Parsed cleanly *and* passes the same validation enforced on
-                // every save. Re-validating here stops a hand-edited or
-                // downgraded config.json with out-of-range values (e.g.
-                // `tcp_port: 0`) from reaching bind/connection logic. App-written
-                // configs always pass, so this only trips on foreign input —
-                // which we treat like corruption: preserve and reset.
-                // Overlapping shared folders from older builds are soft-fixed
-                // first so upgrade does not wipe the whole settings file.
+                // Parsed cleanly. Soft-repair out-of-range numerics / invalid
+                // enums first so a hand-edited or downgraded config.json does
+                // not wipe every setting. Overlapping shared folders from older
+                // builds are also soft-fixed. Only if validation still fails
+                // (e.g. forbidden paths) do we backup and reset — last resort.
+                // Completely unreadable JSON is handled in the Err branch below.
                 Some(Ok(mut s)) => {
                     let (deduped, deduped_changed) =
                         crate::commands::settings::dedupe_overlapping_shared_folders(
@@ -131,15 +129,10 @@ impl AppConfig {
                         );
                         config_changed = true;
                     }
-                    // Soft-fix legacy configs that had USS on with unlimited
-                    // upload. validate_settings rejects that combo on save; if
-                    // we didn't clear here, load would treat the file as
-                    // corrupt and reset the whole settings file.
-                    if s.uss_enabled && s.max_upload_speed == 0 {
+                    if crate::commands::settings::soft_repair_settings(&mut s) {
                         tracing::warn!(
-                            "Disabled Upload Speed Sense because no upload speed limit is set"
+                            "Soft-repaired out-of-range or invalid settings fields on load"
                         );
-                        s.uss_enabled = false;
                         config_changed = true;
                     }
                     match crate::commands::settings::validate_settings(&s) {
@@ -147,7 +140,7 @@ impl AppConfig {
                         Err(e) => {
                             corrupt_backup = Some(backup_corrupt_config(
                                 &config_path,
-                                &format!("has invalid settings ({e})"),
+                                &format!("has invalid settings after soft-repair ({e})"),
                             )?);
                             config_changed = true;
                             AppSettings::default()

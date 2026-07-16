@@ -4472,23 +4472,12 @@ impl UploadHandler {
         // `OP_EMBER_AUTH_RESPONSE` below.
 
         // Tracks whether we've already shipped our outbound
-        // `OP_EMBER_FRIEND_REQ` on this session. Both the early gate
-        // here and the deferred re-check in the `OP_EMBER_HELLO` arm
-        // gate on it so a peer who beat us to it (sent us their
-        // `OP_EMBER_HELLO` *and* a FRIEND_REQ before we got around to
-        // ours) doesn't get a duplicate from us.
+        // `OP_EMBER_FRIEND_REQ` on this session. Send only after Ed25519
+        // PoP succeeds (AUTH_RESPONSE OK) — shipping it earlier lets an
+        // attacker who knows a candidate ember_hash probe whether that
+        // hash is on our friend list.
         let mut friend_request_sent = false;
-        if is_friend && hello_caps.is_ember {
-            info!("Sending friend request to Ember peer {peer_addr}");
-            let nickname = self.nickname_snapshot().await;
-            let nick_bytes = nickname.as_bytes();
-            if write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_FRIEND_REQ, nick_bytes)
-                .await
-                .is_ok()
-            {
-                friend_request_sent = true;
-            }
-        } else if is_friend {
+        if is_friend && !hello_caps.is_ember {
             info!("Peer {peer_addr} is a friend but is_ember=false, skipping friend request");
         }
 
@@ -8016,24 +8005,8 @@ impl UploadHandler {
                                 }
                             }
                         }
-                        if is_friend && hello_caps.is_ember && !friend_request_sent {
-                            info!(
-                                "Sending deferred friend request to Ember peer {peer_addr} after OP_EMBER_HELLO",
-                            );
-                            let nickname = self.nickname_snapshot().await;
-                            let nick_bytes = nickname.as_bytes();
-                            if write_packet_async(
-                                &mut writer,
-                                OP_EMULEPROT,
-                                OP_EMBER_FRIEND_REQ,
-                                nick_bytes,
-                            )
-                            .await
-                            .is_ok()
-                            {
-                                friend_request_sent = true;
-                            }
-                        }
+                        // FRIEND_REQ is deferred until AUTH_RESPONSE PoP
+                        // (membership oracle otherwise).
                     }
                 }
 
@@ -8261,6 +8234,26 @@ impl UploadHandler {
                                             port: peer_addr.port(),
                                         },
                                     }).await;
+                                }
+                            }
+                            // Reciprocal friend request only after PoP —
+                            // same bar as FriendSeen / EPX / chat.
+                            if is_friend && hello_caps.is_ember && !friend_request_sent {
+                                info!(
+                                    "Sending friend request to verified Ember peer {peer_addr}"
+                                );
+                                let nickname = self.nickname_snapshot().await;
+                                let nick_bytes = nickname.as_bytes();
+                                if write_packet_async(
+                                    &mut writer,
+                                    OP_EMULEPROT,
+                                    OP_EMBER_FRIEND_REQ,
+                                    nick_bytes,
+                                )
+                                .await
+                                .is_ok()
+                                {
+                                    friend_request_sent = true;
                                 }
                             }
                         }

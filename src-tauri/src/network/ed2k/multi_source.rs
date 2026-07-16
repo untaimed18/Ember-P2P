@@ -4364,6 +4364,7 @@ async fn download_parts_from_source(
     // the dispatcher doesn't get repeated address-update events for
     // the same peer.
     let mut friend_seen_emitted = false;
+    let mut friend_request_sent = false;
     // FIFO of non-AUTH packets captured by `perform_ember_auth_buffered`
     // while it waited for CHALLENGE / RESPONSE frames. The uploader's
     // proactive `OP_SECIDENTSTATE` / `OP_PUBLICKEY` / `OP_SIGNATURE`
@@ -4813,6 +4814,24 @@ async fn download_parts_from_source(
                                                     .await;
                                                 friend_seen_emitted = true;
                                             }
+                                            if !friend_request_sent {
+                                                let nick_bytes = our_nickname.as_bytes();
+                                                if write_packet_async_ms(
+                                                    &mut *writer,
+                                                    OP_EMULEPROT,
+                                                    OP_EMBER_FRIEND_REQ,
+                                                    nick_bytes,
+                                                )
+                                                .await
+                                                .is_ok()
+                                                {
+                                                    friend_request_sent = true;
+                                                    info!(
+                                                        "Sending friend request to verified Ember source {}",
+                                                        _src_idx
+                                                    );
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -4925,22 +4944,14 @@ async fn download_parts_from_source(
     } else {
         false
     };
-    if hello_caps.is_ember && peer_is_friend {
-        info!("Sending friend request to Ember source {}", _src_idx);
-        let nick_bytes = our_nickname.as_bytes();
-        let _ = write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMBER_FRIEND_REQ, nick_bytes)
-            .await;
-    } else if peer_is_friend {
+    if peer_is_friend && !hello_caps.is_ember {
         info!(
             "Source {} is a friend but is_ember=false, skipping friend request",
             _src_idx
         );
     }
-    // FriendSeen emit is deferred to the PoP-success sites in the
-    // file-status-wait loop and the runtime loop. Without PoP a peer
-    // who only knows the friend's `ember_hash` (KAD publishes, EPX,
-    // public trackers) could overwrite the friend's last known IP in
-    // the DB and flip the UI online state for that friend.
+    // Friend request + FriendSeen are deferred until PoP succeeds —
+    // early FRIEND_REQ is a friend-list membership oracle.
     let is_ember_friend = hello_caps.is_ember && peer_is_friend;
 
     // File request in eMule order:
@@ -5450,6 +5461,20 @@ async fn download_parts_from_source(
                                                 })
                                                 .await;
                                             friend_seen_emitted = true;
+                                        }
+                                        if !friend_request_sent {
+                                            let nick_bytes = our_nickname.as_bytes();
+                                            if write_packet_async_ms(
+                                                &mut *writer,
+                                                OP_EMULEPROT,
+                                                OP_EMBER_FRIEND_REQ,
+                                                nick_bytes,
+                                            )
+                                            .await
+                                            .is_ok()
+                                            {
+                                                friend_request_sent = true;
+                                            }
                                         }
                                     }
                                 }

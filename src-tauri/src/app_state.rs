@@ -45,6 +45,12 @@ pub struct AppState {
     /// must not call `reload_shared_files` (that would resume hashing behind
     /// the user's back). Cleared by resume, manual reload, and add-folder.
     pub hashing_paused: Arc<AtomicBool>,
+    /// Set by the FS watcher when disk changes arrive while [`Self::hashing_paused`]
+    /// is true. Cleared on a full `reload_shared_files`. Without this, clearing
+    /// the pause latch via `add_shared_folder` (which only scans the new folder)
+    /// would permanently miss changes that happened under other shares during
+    /// the pause.
+    pub hashing_fs_dirty: Arc<AtomicBool>,
     /// Per-folder cancellation flags for background hashing tasks.
     /// Key = folder path (or "__reload__" / "__startup__" for special tasks).
     pub hash_cancel_flags: Arc<RwLock<HashMap<String, Arc<AtomicBool>>>>,

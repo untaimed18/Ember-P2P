@@ -4318,6 +4318,27 @@ fn finalize_removed_searches(
     }
 }
 
+/// Start a KAD search and immediately finalize any searches evicted by the
+/// search-storm capacity path. Without this, `start_search` would drop those
+/// SearchIds from the manager while leaving `pending_keyword_searches` /
+/// `download_source_searches` / store maps orphaned until their own timeouts.
+fn start_kad_search(
+    state: &mut NetworkState,
+    app_handle: &tauri::AppHandle,
+    target: KadId,
+    search_type: SearchType,
+    initial_contacts: Vec<KadContact>,
+) -> SearchId {
+    let (sid, evicted, released) =
+        state
+            .search_manager
+            .start_search(target, search_type, initial_contacts);
+    if !evicted.is_empty() {
+        finalize_removed_searches(state, app_handle, &evicted, &released);
+    }
+    sid
+}
+
 fn cancel_search_request(state: &mut NetworkState, app_handle: &tauri::AppHandle, request_id: u64) {
     // Match by `request_id` across all three IPC-facing search kinds that
     // carry one (keyword `search_files`, plus `find_sources`/`find_notes`,
@@ -6993,6 +7014,18 @@ pub async fn start_network(
             info!("Resuming {count} incomplete downloads from previous session");
             let dl_folder = settings.download_folder.clone();
             for mut transfer in incomplete {
+                // Hash-failed downloads are restored only to keep their Temp
+                // `.part` owned (orphan sweep). Do not auto-start them.
+                if transfer.status == TransferStatus::Failed {
+                    let mut mgr = transfer_manager.write().await;
+                    mgr.completed.push(transfer);
+                    if mgr.completed.len() > 1000 {
+                        let keep_from = mgr.completed.len() - 1000;
+                        mgr.completed.drain(..keep_from);
+                    }
+                    continue;
+                }
+
                 let control = TransferControl::new();
                 if matches!(
                     transfer.status,
@@ -8085,7 +8118,9 @@ pub async fn start_network(
                     // eMule-style: downloads never auto-fail. Re-queue for source
                     // retry unless the user explicitly cancelled — or the local
                     // disk is full (Insufficient), which is transfer-level.
-                    let is_user_cancel = error.to_lowercase().contains("cancelled") || {
+                    // Prefer is_user_cancel_error for source-failure classification;
+                    // also honour an already-cancelled control (cancel race).
+                    let is_user_cancel = ed2k::transfer::is_user_cancel_error(error) || {
                         let mgr = transfer_manager.read().await;
                         mgr.is_control_cancelled(transfer_id)
                     };
@@ -8107,6 +8142,10 @@ pub async fn start_network(
                             &file_name,
                         )
                         .await;
+                        // Must not fall through to handle_download_event →
+                        // fail()/transfer-failed, which would overwrite the
+                        // resumable Insufficient state as Failed.
+                        continue;
                     } else {
                     let is_terminal_final_hash_failure = *failure_kind == SourceFailureKind::Permanent
                         && error.to_lowercase().contains("final hash verification failed");
@@ -8852,53 +8891,86 @@ pub async fn start_network(
                     ).await;
                 }
 
-                // M10: auto-resume the highest-priority paused download
+                // M10: auto-resume the highest-priority paused download when a
+                // free concurrent slot exists (complete→promote already filled
+                // active slots up to the cap).
                 if was_completed {
                     let resume_candidate = {
                         let mgr = transfer_manager.read().await;
-                        let mut paused: Vec<_> = mgr.active.values()
-                            .chain(mgr.queue.iter())
-                            .filter(|t| {
-                                t.direction == TransferDirection::Download
-                                    && t.status == TransferStatus::Paused
+                        if mgr.active_download_count() >= mgr.max_concurrent as usize {
+                            None
+                        } else {
+                            let mut paused: Vec<_> = mgr
+                                .active
+                                .values()
+                                .chain(mgr.queue.iter())
+                                .filter(|t| {
+                                    t.direction == TransferDirection::Download
+                                        && t.status == TransferStatus::Paused
+                                })
+                                .collect();
+                            paused.sort_by(|a, b| {
+                                priority_str_to_u32(&b.priority)
+                                    .cmp(&priority_str_to_u32(&a.priority))
+                            });
+                            paused.first().map(|t| {
+                                (
+                                    t.id.clone(),
+                                    t.file_hash.clone(),
+                                    t.file_name.clone(),
+                                    t.total_size,
+                                    t.priority.clone(),
+                                )
                             })
-                            .collect();
-                        paused.sort_by(|a, b| {
-                            priority_str_to_u32(&b.priority).cmp(&priority_str_to_u32(&a.priority))
-                        });
-                        paused.first().map(|t| (t.id.clone(), t.file_hash.clone(), t.file_name.clone(), t.total_size, t.priority.clone()))
+                        }
                     };
                     if let Some((rid, fhash, fname, fsize, prio)) = resume_candidate {
                         let control = TransferControl::new();
+                        let mut started = false;
                         {
                             let mut mgr = transfer_manager.write().await;
-                            mgr.update_status(&rid, TransferStatus::Searching);
-                            mgr.register_control(&rid, control.clone());
+                            // Re-check under write lock — another promotion may
+                            // have filled the last slot since the read above.
+                            if mgr.active_download_count() < mgr.max_concurrent as usize {
+                                mgr.update_status(&rid, TransferStatus::Searching);
+                                mgr.register_control(&rid, control.clone());
+                                started = true;
+                            }
                         }
-                        state.pending_downloads.insert(rid.clone(), PendingDownload {
-                            transfer_id: rid.clone(),
-                            file_hash: fhash.clone(),
-                            file_name: fname.clone(),
-                            file_size: fsize,
-                            control,
-                            search_count: 0,
-                            last_search_at: 0,
-                            priority: priority_str_to_u32(&prio),
-                        });
-                        {
-                            let db = db.clone();
-                            let rid = rid.clone();
-                            tokio::task::spawn_blocking(move || {
-                                if let Err(e) = db.update_transfer_status(&rid, "searching") {
-                                    warn!("DB update_transfer_status('searching') failed for {rid}: {e}");
-                                }
-                            });
+                        if started {
+                            state.pending_downloads.insert(
+                                rid.clone(),
+                                PendingDownload {
+                                    transfer_id: rid.clone(),
+                                    file_hash: fhash.clone(),
+                                    file_name: fname.clone(),
+                                    file_size: fsize,
+                                    control,
+                                    search_count: 0,
+                                    last_search_at: 0,
+                                    priority: priority_str_to_u32(&prio),
+                                },
+                            );
+                            {
+                                let db = db.clone();
+                                let rid = rid.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    if let Err(e) = db.update_transfer_status(&rid, "searching") {
+                                        warn!(
+                                            "DB update_transfer_status('searching') failed for {rid}: {e}"
+                                        );
+                                    }
+                                });
+                            }
+                            let _ = app_handle.emit(
+                                "transfer-status",
+                                serde_json::json!({ "id": rid, "status": "searching" }),
+                            );
+                            info!(
+                                "Auto-resumed paused download {} ({}) after completion",
+                                rid, fname
+                            );
                         }
-                        let _ = app_handle.emit(
-                            "transfer-status",
-                            serde_json::json!({ "id": rid, "status": "searching" }),
-                        );
-                        info!("Auto-resumed paused download {} ({}) after completion", rid, fname);
                     }
                 }
             }
@@ -9528,8 +9600,10 @@ pub async fn start_network(
                 if !new_in_use.is_empty() {
                     state.routing_table.mark_contacts_in_use(&new_in_use);
                 }
-                // Release in-use marks for searches evicted by the search-storm
-                // cap in start_search (cleanup() handles the normal path).
+                // Release in-use marks for any searches still queued on
+                // pending_release (legacy / non-start_search path). Search-storm
+                // eviction now returns released ids from start_search and
+                // finalize_removed_searches handles them immediately.
                 let to_release = state.search_manager.drain_pending_release();
                 if !to_release.is_empty() {
                     state.routing_table.release_contacts_in_use(&to_release);
@@ -11846,8 +11920,11 @@ pub async fn start_network(
                 if table_size >= 2 && self_lookup_due {
                     let closest = state.routing_table.find_closest(&state.local_id, SEARCH_INITIAL_CONTACTS);
                     if !closest.is_empty() {
-                        let sid = state.search_manager.start_search(
-                            state.local_id,
+                        let self_id = state.local_id;
+                        let sid = start_kad_search(
+                            &mut state,
+                            &app_handle,
+                            self_id,
                             SearchType::FindNode,
                             closest,
                         );
@@ -11976,7 +12053,7 @@ pub async fn start_network(
                     // available in firewall_checker; otherwise the function
                     // falls back to settings.udp_port.  The Pong handler will
                     // also call dispatch again once fresh pongs refine the port.
-                    dispatch_udp_firewall_probe_requests(&mut state, &settings);
+                    dispatch_udp_firewall_probe_requests(&mut state, &app_handle, &settings);
                 }
 
                 if state.firewall_checker.evaluate() {
@@ -12241,7 +12318,9 @@ pub async fn start_network(
                                 let kad_hash = md4_bytes_to_kad_id(&hash_bytes);
                                 let closest = state.routing_table.find_closest_prefer_verified(&kad_hash, SEARCH_INITIAL_CONTACTS);
                                 if !closest.is_empty() {
-                                    let sid = state.search_manager.start_search(
+                                    let sid = start_kad_search(
+                                        &mut state,
+                                        &app_handle,
                                         kad_hash,
                                         SearchType::FindSource { file_size },
                                         closest,
@@ -12892,7 +12971,9 @@ pub async fn start_network(
                                 .routing_table
                                 .find_closest_prefer_verified(&file.file_hash, SEARCH_INITIAL_CONTACTS);
                             if !closest.is_empty() {
-                                let sid = state.search_manager.start_search(
+                                let sid = start_kad_search(
+                                    &mut state,
+                                    &app_handle,
                                     file.file_hash,
                                     SearchType::StoreFile,
                                     closest,
@@ -12929,7 +13010,9 @@ pub async fn start_network(
                                 .routing_table
                                 .find_closest_prefer_verified(&batch.keyword_hash, SEARCH_INITIAL_CONTACTS);
                             if !closest.is_empty() {
-                                let sid = state.search_manager.start_search(
+                                let sid = start_kad_search(
+                                    &mut state,
+                                    &app_handle,
                                     batch.keyword_hash,
                                     SearchType::StoreKeyword,
                                     closest,
@@ -12969,7 +13052,9 @@ pub async fn start_network(
                             .routing_table
                             .find_closest_prefer_verified(&file_hash, SEARCH_INITIAL_CONTACTS);
                         if !closest.is_empty() {
-                            let sid = state.search_manager.start_search(
+                            let sid = start_kad_search(
+                                &mut state,
+                                &app_handle,
                                 file_hash,
                                 SearchType::StoreNotes,
                                 closest,
@@ -14017,7 +14102,9 @@ pub async fn start_network(
                         .routing_table
                         .find_closest(&target, SEARCH_INITIAL_CONTACTS);
                     if !closest.is_empty() {
-                        let sid = state.search_manager.start_search(
+                        let sid = start_kad_search(
+                            &mut state,
+                            &app_handle,
                             target,
                             SearchType::FindNode,
                             closest,
@@ -14303,7 +14390,9 @@ pub async fn start_network(
                     );
                     let closest = state.routing_table.find_closest(&target, SEARCH_INITIAL_CONTACTS);
                     if !closest.is_empty() {
-                        let sid = state.search_manager.start_search(
+                        let sid = start_kad_search(
+                            &mut state,
+                            &app_handle,
                             target,
                             SearchType::FindBuddy,
                             closest,
@@ -14816,6 +14905,34 @@ pub async fn start_network(
                         .map(|(tid, _)| tid.clone())
                         .collect();
                     for tid in &to_cancel {
+                        // Resume/promote cancels the old control and registers a
+                        // fresh one before StartDownload replaces pending. If a
+                        // live non-cancelled control already exists, this pending
+                        // entry is stale — drop it without failing the transfer.
+                        let live_control_active = {
+                            let mgr = transfer_manager.read().await;
+                            mgr.get_control(tid)
+                                .is_some_and(|c| !c.is_cancelled())
+                        };
+                        if live_control_active {
+                            if let Some(_pending) = state.pending_downloads.remove(tid) {
+                                let stale_sids: Vec<SearchId> = state
+                                    .download_source_searches
+                                    .iter()
+                                    .filter(|(_, (t, _))| t == tid)
+                                    .map(|(sid, _)| *sid)
+                                    .collect();
+                                for sid in &stale_sids {
+                                    state.download_source_searches.remove(sid);
+                                    if let Some(removed) = state.search_manager.remove(sid) {
+                                        state
+                                            .routing_table
+                                            .release_contacts_in_use(&removed.in_use_ids);
+                                    }
+                                }
+                            }
+                            continue;
+                        }
                         if let Some(_pending) = state.pending_downloads.remove(tid) {
                             let stale_sids: Vec<SearchId> = state.download_source_searches.iter()
                                 .filter(|(_, (t, _))| t == tid)
@@ -15372,7 +15489,9 @@ pub async fn start_network(
                                     .routing_table
                                     .find_closest_prefer_verified(&kad_hash, SEARCH_INITIAL_CONTACTS);
                                 if !closest.is_empty() {
-                                    let sid = state.search_manager.start_search(
+                                    let sid = start_kad_search(
+                                        &mut state,
+                                        &app_handle,
                                         kad_hash,
                                         SearchType::FindSource { file_size: *file_size },
                                         closest,
@@ -15629,7 +15748,9 @@ pub async fn start_network(
                         let kad_hash = md4_bytes_to_kad_id(&hash_bytes);
                         let closest = state.routing_table.find_closest_prefer_verified(&kad_hash, SEARCH_INITIAL_CONTACTS);
                         if !closest.is_empty() {
-                            let sid = state.search_manager.start_search(
+                            let sid = start_kad_search(
+                                &mut state,
+                                &app_handle,
                                 kad_hash,
                                 SearchType::FindSource { file_size },
                                 closest,
@@ -15775,7 +15896,9 @@ pub async fn start_network(
                         let kad_hash = md4_bytes_to_kad_id(&fh);
                         let closest = state.routing_table.find_closest_prefer_verified(&kad_hash, SEARCH_INITIAL_CONTACTS);
                         if !closest.is_empty() {
-                            let sid = state.search_manager.start_search(
+                            let sid = start_kad_search(
+                                &mut state,
+                                &app_handle,
                                 kad_hash,
                                 SearchType::FindSource { file_size },
                                 closest,
@@ -21350,7 +21473,11 @@ fn update_publish_manager_state(state: &mut NetworkState) {
 /// small `m_liPossibleTestClients` list; we allow a few more for reliability.
 const UDP_FW_CANDIDATE_POOL_MAX: usize = 64;
 
-fn dispatch_udp_firewall_probe_requests(state: &mut NetworkState, settings: &AppSettings) {
+fn dispatch_udp_firewall_probe_requests(
+    state: &mut NetworkState,
+    app_handle: &tauri::AppHandle,
+    settings: &AppSettings,
+) {
     if !state.firewall_checker.needs_udp_firewall_probes() {
         // Test finished/inactive: drop leftover fresh candidates and forget the
         // scratch lookup so the next cycle starts clean (eMule
@@ -21383,9 +21510,7 @@ fn dispatch_udp_firewall_probe_requests(state: &mut NetworkState, settings: &App
                 .routing_table
                 .find_closest_prefer_verified(&target, SEARCH_INITIAL_CONTACTS);
             if !closest.is_empty() {
-                let sid = state
-                    .search_manager
-                    .start_search(target, SearchType::FindNode, closest);
+                let sid = start_kad_search(state, app_handle, target, SearchType::FindNode, closest);
                 if sid != SearchId(0) {
                     if let Some(s) = state.search_manager.get_mut(&sid) {
                         s.is_udp_fw_probe_search = true;
@@ -22657,8 +22782,11 @@ async fn handle_udp_packet_inner(
                     .routing_table
                     .find_closest(&state.local_id, SEARCH_INITIAL_CONTACTS);
                 if !closest.is_empty() {
-                    let sid = state.search_manager.start_search(
-                        state.local_id,
+                    let self_id = state.local_id;
+                    let sid = start_kad_search(
+                        state,
+                        app_handle,
+                        self_id,
                         SearchType::FindNode,
                         closest,
                     );
@@ -23053,41 +23181,8 @@ async fn handle_udp_packet_inner(
             }
 
             // eMule Process_KADEMLIA2_RES: verify we have an active search for this target.
-            let expected = state.search_manager.get_expected_response_count(&target);
-            if expected == 0 {
+            if !state.search_manager.has_active_search_for_target(&target) {
                 debug!("  No active search for target {target}, ignoring response");
-                return;
-            }
-
-            // Resolve responder id (for FIND_VALUE_MORE allowance) from tried set.
-            let responder_id = match from.ip() {
-                std::net::IpAddr::V4(v4) => state
-                    .search_manager
-                    .active
-                    .values()
-                    .find(|s| {
-                        s.target == target
-                            && !s.completed
-                            && s.tried.contains_key(&(v4, from.port()))
-                    })
-                    .and_then(|s| s.tried.get(&(v4, from.port())).copied()),
-                _ => None,
-            };
-
-            // eMule drops the entire response when contact count exceeds what
-            // we requested (ProcessResponse / GetRequestContactCount), except
-            // FIND_VALUE_MORE from the re-ask contact (≤ KADEMLIA_FIND_NODE).
-            // Never truncate-and-use — that lets a malicious peer inject up to
-            // 11 contacts after a FIND_VALUE(2) / STORE(4) query.
-            let max_accepted = state
-                .search_manager
-                .max_accepted_response_count(&target, responder_id.as_ref());
-            if contacts.len() > max_accepted as usize {
-                debug!(
-                    "KadRes from {from}: contact count {} exceeds max {}, dropping response",
-                    contacts.len(),
-                    max_accepted
-                );
                 return;
             }
 
@@ -23103,6 +23198,8 @@ async fn handle_udp_packet_inner(
             // delivering the same validated contacts to several searches is
             // harmless. We still never route to a search that did NOT query
             // this sender (eMule's IsOnOutTrackList anti-injection rule).
+            // Contact-count acceptance is per matched search (not max across
+            // same-target searches) — see the check inside the loop below.
             let sender_ip_port: Option<(Ipv4Addr, u16)> = match from.ip() {
                 std::net::IpAddr::V4(v4) => Some((v4, from.port())),
                 _ => None,
@@ -23175,6 +23272,23 @@ async fn handle_udp_packet_inner(
                         })
                     });
 
+                // eMule drops the response for a search when contact count
+                // exceeds what *that* search requested (GetRequestContactCount),
+                // except FIND_VALUE_MORE from that search's re-ask contact
+                // (≤ KADEMLIA_FIND_NODE). Never borrow a higher expected count
+                // from a different same-target search, and never truncate.
+                let max_accepted = state
+                    .search_manager
+                    .max_accepted_response_count_for(&sid, sender_id.as_ref());
+                if contacts.len() > max_accepted as usize {
+                    debug!(
+                        "KadRes from {from}: contact count {} exceeds max {} for search {}, skipping",
+                        contacts.len(),
+                        max_accepted,
+                        sid.0
+                    );
+                    continue;
+                }
                 // Buffer for eMule's immediate `SendFindValue` dispatch. Filled
                 // while `search` (a &mut borrow of state.search_manager) is held,
                 // then flushed after the block releases it — `send_kad_packet`
@@ -23316,7 +23430,7 @@ async fn handle_udp_packet_inner(
                         // click Recheck" symptom (the manual recheck merely gets
                         // lucky with an unrelated Pong arriving in time).
                         if gained_candidate {
-                            dispatch_udp_firewall_probe_requests(state, settings);
+                            dispatch_udp_firewall_probe_requests(state, app_handle, settings);
                         }
                     } else {
                         for c in &safe_contacts {
@@ -23675,7 +23789,7 @@ async fn handle_udp_packet_inner(
                     if let Some(ext_port) = state.firewall_checker.external_udp_port() {
                         state.external_udp_port = Some(ext_port);
                     }
-                    dispatch_udp_firewall_probe_requests(state, settings);
+                    dispatch_udp_firewall_probe_requests(state, app_handle, settings);
                 }
             }
             // eMule Process_KADEMLIA2_PONG: legacy Ping challenge verifies
@@ -24953,7 +25067,9 @@ async fn handle_command_inner(
                     crate::storage::statistics::OverheadDirection::Upload,
                     64,
                 );
-                let sid = state.search_manager.start_search(
+                let sid = start_kad_search(
+                    state,
+                    app_handle,
                     keyword_hash,
                     SearchType::FindKeyword,
                     closest,
@@ -25128,6 +25244,7 @@ async fn handle_command_inner(
             if let Some(handle) = state.download_handles.remove(&transfer_id) {
                 save_registered_part_tracker(&state, &transfer_id, "pause").await;
                 handle.abort();
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
             }
             // Drop KAD-callback placeholder timestamps: the manager
             // clears `source_details` for this transfer on pause
@@ -25288,7 +25405,9 @@ async fn handle_command_inner(
                         .find_closest_prefer_verified(&kad_hash, SEARCH_INITIAL_CONTACTS);
                     let kad_search_started = if kad_available && !closest.is_empty() {
                         closest.sort_by_key(|c| c.is_tcp_firewalled() as u8);
-                        let sid = state.search_manager.start_search(
+                        let sid = start_kad_search(
+                            state,
+                            app_handle,
                             kad_hash,
                             SearchType::FindSource { file_size },
                             closest,
@@ -25522,6 +25641,10 @@ async fn handle_command_inner(
                 if let Some(old_handle) = state.download_handles.remove(&tid2) {
                     debug!("Aborting existing download task for {tid2} before starting new one");
                     old_handle.abort();
+                    // Match CancelDownload: wait for the old worker (and its
+                    // spawn_blocking children) to release the .part before the
+                    // new multi-source task opens it.
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), old_handle).await;
                 }
                 let handle = tokio::spawn(async move {
                     if let Err(e) = ms_download.run(tx).await {
@@ -25563,7 +25686,9 @@ async fn handle_command_inner(
                         .find_closest_prefer_verified(&kad_hash, SEARCH_INITIAL_CONTACTS);
                     if !closest.is_empty() {
                         closest.sort_by_key(|c| c.is_tcp_firewalled() as u8);
-                        let sid = state.search_manager.start_search(
+                        let sid = start_kad_search(
+                            state,
+                            app_handle,
                             kad_hash,
                             SearchType::FindSource { file_size },
                             closest,
@@ -25737,7 +25862,9 @@ async fn handle_command_inner(
 
                 let kad_search_started = if kad_ready_for_sources(state) && !closest.is_empty() {
                     closest.sort_by_key(|c| c.is_tcp_firewalled() as u8);
-                    let sid = state.search_manager.start_search(
+                    let sid = start_kad_search(
+                        state,
+                        app_handle,
                         kad_hash,
                         SearchType::FindSource { file_size },
                         closest,
@@ -25942,9 +26069,7 @@ async fn handle_command_inner(
                 return;
             }
 
-            let sid = state
-                .search_manager
-                .start_search(file_hash, SearchType::StoreNotes, closest);
+            let sid = start_kad_search(state, app_handle, file_hash, SearchType::StoreNotes, closest);
             if sid == SearchId(0) {
                 debug!("Failed to start StoreNotes search: too many active searches");
                 let _ = tx.send(Err(
@@ -26426,7 +26551,9 @@ async fn handle_command_inner(
                 return;
             }
 
-            let sid = state.search_manager.start_search(
+            let sid = start_kad_search(
+                state,
+                app_handle,
                 file_hash,
                 SearchType::FindNotes { file_size },
                 closest,
@@ -26453,7 +26580,9 @@ async fn handle_command_inner(
                 return;
             }
 
-            let sid = state.search_manager.start_search(
+            let sid = start_kad_search(
+                state,
+                app_handle,
                 file_hash,
                 SearchType::FindSource { file_size },
                 closest,
@@ -27354,7 +27483,7 @@ async fn handle_command_inner(
 
             // Eagerly dispatch UDP firewall probes (uses previous external port
             // or falls back to settings.udp_port). Pong handler will also retry.
-            dispatch_udp_firewall_probe_requests(state, &settings);
+            dispatch_udp_firewall_probe_requests(state, app_handle, &settings);
 
             info!(
                 "Sent {} firewall checks and {} ping probes",
@@ -29244,7 +29373,11 @@ async fn handle_download_event(
             };
             if matches!(
                 current_status,
-                Some(TransferStatus::Paused | TransferStatus::Stopped)
+                Some(
+                    TransferStatus::Paused
+                        | TransferStatus::Stopped
+                        | TransferStatus::Insufficient
+                )
             ) {
                 return;
             }
@@ -29522,7 +29655,7 @@ async fn handle_upload_event(
             promoted_out.extend(promoted);
             let _ = app_handle.emit(
                 "transfer-failed",
-                serde_json::json!({ "id": event.transfer_id, "error": error, "direction": "upload" }),
+                serde_json::json!({ "id": event.transfer_id, "error": upload_failure_summary, "direction": "upload" }),
             );
         }
         UploadEventKind::EmberSources { .. }

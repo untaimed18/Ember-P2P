@@ -95,26 +95,35 @@ impl LocalIndex {
     }
 
     pub fn search(&self, query: &str) -> Vec<SearchResult> {
-        let query_lower = query.to_lowercase();
-        let query_tokens = tokenize(&query_lower);
-
-        if query_tokens.is_empty() {
+        // Same boolean grammar as KAD/server (`AND`/`OR`/`NOT`/`-`/quotes).
+        // Token-OR against name_tokens disagreed with network filtering for
+        // the same typed query (e.g. `foo OR bar`, `foo -bar`).
+        let Some(expr) = crate::search::query::parse(query) else {
             return Vec::new();
-        }
+        };
+        let positive = expr.positive_terms();
 
-        let mut score_map: HashMap<usize, u32> = HashMap::new();
-
-        for token in &query_tokens {
-            for (indexed_token, indices) in &self.name_tokens {
-                if indexed_token.contains(token.as_str()) {
-                    for &idx in indices {
-                        *score_map.entry(idx).or_insert(0) += 1;
-                    }
+        let mut results: Vec<(usize, u32)> = self
+            .files
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, file)| {
+                let name_lower = file.name.to_lowercase();
+                if !expr.matches(&name_lower) {
+                    return None;
                 }
-            }
-        }
-
-        let mut results: Vec<(usize, u32)> = score_map.into_iter().collect();
+                let score = if positive.is_empty() {
+                    1u32
+                } else {
+                    positive
+                        .iter()
+                        .filter(|t| name_lower.contains(t.as_str()))
+                        .count()
+                        .max(1) as u32
+                };
+                Some((idx, score))
+            })
+            .collect();
         results.sort_by(|a, b| b.1.cmp(&a.1));
 
         results

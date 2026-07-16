@@ -602,6 +602,7 @@
       })
       .catch(() => {});
     let unlistenHistory: (() => void) | undefined;
+    let historyListenMounted = true;
     listen('download-history-cleared', () => {
       downloadHistoryMap = {};
       historyFetchedHashes.clear();
@@ -612,9 +613,10 @@
       const hashes = searchResultsList.map((r) => r.file.hash);
       if (hashes.length > 0) queueHistoryFetch(hashes);
     }).then((u) => {
-      unlistenHistory = u;
+      if (historyListenMounted) unlistenHistory = u; else u();
     }).catch(() => {});
     return () => {
+      historyListenMounted = false;
       unlistenHistory?.();
     };
   });

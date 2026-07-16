@@ -327,7 +327,7 @@ impl TransferManager {
         self.controls.get(id).cloned()
     }
 
-    fn active_download_count(&self) -> usize {
+    pub(crate) fn active_download_count(&self) -> usize {
         self.active
             .values()
             .filter(|transfer| {
@@ -586,23 +586,30 @@ impl TransferManager {
         failure_kind: Option<String>,
         failure_stage: Option<String>,
     ) -> Option<Vec<Transfer>> {
-        if let Some(mut transfer) = self.active.remove(id) {
-            transfer.status = TransferStatus::Failed;
-            transfer.speed = 0;
-            transfer.failure_reason = Some(reason.to_string());
-            transfer.failure_kind = failure_kind;
-            transfer.failure_stage = failure_stage;
-            Self::clear_runtime_health(&mut transfer);
-            self.completed.push(transfer);
-            if self.completed.len() > 1000 {
-                self.completed.drain(..self.completed.len() - 1000);
+        let mut transfer = match self.active.remove(id) {
+            Some(t) => t,
+            None => {
+                // Stopped/queued rows live in `queue`; still move them into
+                // completed so Stop/cancel races don't leave a Failed queue
+                // entry without the normal Failed lifecycle.
+                let pos = self.queue.iter().position(|t| t.id == id)?;
+                self.queue.remove(pos).unwrap()
             }
-            self.speed_history.remove(id);
-            self.controls.remove(id);
-            self.source_details.remove(id);
-            return Some(self.promote_next());
+        };
+        transfer.status = TransferStatus::Failed;
+        transfer.speed = 0;
+        transfer.failure_reason = Some(reason.to_string());
+        transfer.failure_kind = failure_kind;
+        transfer.failure_stage = failure_stage;
+        Self::clear_runtime_health(&mut transfer);
+        self.completed.push(transfer);
+        if self.completed.len() > 1000 {
+            self.completed.drain(..self.completed.len() - 1000);
         }
-        None
+        self.speed_history.remove(id);
+        self.controls.remove(id);
+        self.source_details.remove(id);
+        Some(self.promote_next())
     }
 
     pub fn update_status(&mut self, id: &str, status: TransferStatus) {

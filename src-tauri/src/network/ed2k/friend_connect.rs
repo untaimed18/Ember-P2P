@@ -912,7 +912,7 @@ use super::multi_source::parse_browse_response;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::Signer;
+    use crate::network::ed2k::ember_auth::sign_auth_nonce;
 
     /// With an empty `rendezvous_url`, `connect_friend_with_fallback` must
     /// behave exactly like the old TCP-only `open_and_run_friend_session`
@@ -1075,7 +1075,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let sig = peer_sk.sign(&our_nonce);
+            let sig = sign_auth_nonce(&peer_sk, &our_nonce);
             let mut resp = Vec::with_capacity(96);
             resp.extend_from_slice(&peer_pk_bytes);
             resp.extend_from_slice(&sig.to_bytes());
@@ -1237,7 +1237,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let sig = peer_sk.sign(&our_nonce);
+            let sig = sign_auth_nonce(&peer_sk, &our_nonce);
             let mut resp = Vec::with_capacity(96);
             resp.extend_from_slice(&peer_pk_bytes);
             resp.extend_from_slice(&sig.to_bytes());

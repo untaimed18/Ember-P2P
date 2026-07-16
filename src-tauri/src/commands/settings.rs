@@ -127,6 +127,129 @@ const MAX_URL_LEN: usize = 2 * 1024;
 const MAX_FILENAME_CLEANUPS_LEN: usize = 16 * 1024;
 const MAX_CONFIGURED_SPEED_BPS: u64 = 100 * 1024 * 1024 * 1024;
 
+fn clamp_assign<T: Ord + Copy>(value: &mut T, min: T, max: T) -> bool {
+    let clamped = (*value).clamp(min, max);
+    if clamped != *value {
+        *value = clamped;
+        true
+    } else {
+        false
+    }
+}
+
+/// Clamp out-of-range numerics and reset invalid enum strings so a hand-edited
+/// or downgraded `config.json` can load without wiping every setting. Returns
+/// whether any field was changed. Call before [`validate_settings`] on load;
+/// remaining failures (paths, nickname, etc.) still trigger backup+defaults.
+pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
+    use crate::network::kad::types::{DEFAULT_TCP_PORT, DEFAULT_UDP_PORT};
+
+    let mut changed = false;
+
+    let profile = settings.spam_filter_profile.trim().to_ascii_lowercase();
+    if profile != "relaxed" && profile != "balanced" && profile != "aggressive" {
+        settings.spam_filter_profile = "balanced".to_string();
+        changed = true;
+    } else if profile != settings.spam_filter_profile {
+        settings.spam_filter_profile = profile;
+        changed = true;
+    }
+
+    let close_behavior = settings.close_to_tray_behavior.trim().to_ascii_lowercase();
+    if close_behavior != "ask" && close_behavior != "tray" && close_behavior != "exit" {
+        settings.close_to_tray_behavior = "ask".to_string();
+        changed = true;
+    } else if close_behavior != settings.close_to_tray_behavior {
+        settings.close_to_tray_behavior = close_behavior;
+        changed = true;
+    }
+
+    let freq = settings.update_check_frequency.trim().to_ascii_lowercase();
+    if freq != "daily" && freq != "weekly" && freq != "monthly" {
+        settings.update_check_frequency = "daily".to_string();
+        changed = true;
+    } else if freq != settings.update_check_frequency {
+        settings.update_check_frequency = freq;
+        changed = true;
+    }
+
+    if settings.tcp_port == 0 {
+        settings.tcp_port = DEFAULT_TCP_PORT;
+        changed = true;
+    }
+    if settings.udp_port == 0 {
+        settings.udp_port = DEFAULT_UDP_PORT;
+        changed = true;
+    }
+
+    changed |= clamp_assign(&mut settings.max_concurrent_downloads, 1, 50);
+    changed |= clamp_assign(&mut settings.max_concurrent_uploads, 1, 50);
+    if settings.max_upload_speed > MAX_CONFIGURED_SPEED_BPS {
+        settings.max_upload_speed = MAX_CONFIGURED_SPEED_BPS;
+        changed = true;
+    }
+    if settings.max_download_speed > MAX_CONFIGURED_SPEED_BPS {
+        settings.max_download_speed = MAX_CONFIGURED_SPEED_BPS;
+        changed = true;
+    }
+    // Soft-disable USS when upload is unlimited (validate rejects that combo).
+    if settings.uss_enabled && settings.max_upload_speed == 0 {
+        settings.uss_enabled = false;
+        changed = true;
+    }
+    changed |= clamp_assign(&mut settings.download_queue_wait_secs, 60, 14400);
+    changed |= clamp_assign(&mut settings.max_sources_per_file, 1, 2000);
+    changed |= clamp_assign(&mut settings.max_connections, 1, 2000);
+    changed |= clamp_assign(&mut settings.multisource_retry_rounds, 1, 20);
+    changed |= clamp_assign(&mut settings.download_part_retry_rounds, 1, 20);
+    changed |= clamp_assign(&mut settings.max_download_file_size_gib, 1, 16_384);
+    changed |= clamp_assign(&mut settings.search_timeout_secs, 30, 600);
+    changed |= clamp_assign(&mut settings.max_friends, 1, 500);
+
+    // Drop shared folders that would fail validate (sensitive segments) or that
+    // contain / are the Ember data directory. Older builds allowed some AppData
+    // paths; rejecting them in validate alone would wipe the entire config.
+    let data_dir = crate::storage::paths::resolve_data_dir();
+    let data_canon = data_dir.canonicalize().unwrap_or(data_dir);
+    let before_len = settings.shared_folders.len();
+    settings.shared_folders.retain(|folder| {
+        let path = std::path::Path::new(folder);
+        let folder_canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if folder_canon == data_canon
+            || data_canon.starts_with(&folder_canon)
+            || crate::security::path_matches_dir(
+                &data_canon.to_string_lossy(),
+                &folder_canon.to_string_lossy(),
+            )
+        {
+            tracing::warn!(
+                "Removing shared folder that covers Ember data directory on load: {folder}"
+            );
+            return false;
+        }
+        let canonical = path.canonicalize().ok();
+        let scan_paths = std::iter::once(path.to_path_buf()).chain(canonical);
+        for scan_path in scan_paths {
+            for component in scan_path.components() {
+                if let std::path::Component::Normal(seg) = component {
+                    if crate::sharing::is_sensitive_dir_name(&seg.to_string_lossy()) {
+                        tracing::warn!(
+                            "Removing shared folder with sensitive path segment on load: {folder}"
+                        );
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    });
+    if settings.shared_folders.len() != before_len {
+        changed = true;
+    }
+
+    changed
+}
+
 pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
     if settings.spam_filter_profile != "relaxed"
         && settings.spam_filter_profile != "balanced"
@@ -338,25 +461,6 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
             "Nickname must be 128 bytes or fewer",
         ));
     }
-    let blocked_segments: &[&str] = &[
-        "windows",
-        "program files",
-        "program files (x86)",
-        "programdata",
-        ".ssh",
-        ".gnupg",
-        "etc",
-        "usr",
-        "bin",
-        "sbin",
-        "var",
-        "root",
-        "tmp",
-        "temp",
-        "proc",
-        "sys",
-        "dev",
-    ];
     let is_filesystem_root = |path: &std::path::Path| {
         path.has_root()
             && !path
@@ -397,8 +501,7 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
         for scan_path in scan_paths {
             for component in scan_path.components() {
                 if let std::path::Component::Normal(seg) = component {
-                    let seg_lower = seg.to_string_lossy().to_lowercase();
-                    if blocked_segments.contains(&seg_lower.as_str()) {
+                    if crate::sharing::is_sensitive_dir_name(&seg.to_string_lossy()) {
                         return Err(coded_ctx(
                             "settings_download_folder_system_dir",
                             "Cannot use system directory as download folder",
@@ -468,35 +571,12 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
         for scan_path in scan_paths {
             for component in scan_path.components() {
                 if let std::path::Component::Normal(seg) = component {
-                    let seg_lower = seg.to_string_lossy().to_lowercase();
-                    if blocked_segments.contains(&seg_lower.as_str()) {
+                    if crate::sharing::is_sensitive_dir_name(&seg.to_string_lossy()) {
                         return Err(coded_ctx(
                             "settings_shared_folder_system_dir",
                             "Cannot share system directory",
                             folder,
                         ));
-                    }
-                    if seg_lower == "appdata" {
-                        let rest: String = scan_path
-                            .components()
-                            .skip_while(|c| {
-                                if let std::path::Component::Normal(s) = c {
-                                    s.to_string_lossy().to_lowercase() != "appdata"
-                                } else {
-                                    true
-                                }
-                            })
-                            .skip(1)
-                            .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
-                            .collect::<Vec<_>>()
-                            .join("/");
-                        if rest.starts_with("local/temp") || rest.starts_with("local\\temp") {
-                            return Err(coded_ctx(
-                                "settings_shared_folder_system_dir",
-                                "Cannot share system directory",
-                                folder,
-                            ));
-                        }
                     }
                 }
             }
@@ -1038,6 +1118,22 @@ mod tests {
         if let Err(e) = validate_settings(&AppSettings::default()) {
             panic!("AppSettings::default() must satisfy validate_settings, got: {e}");
         }
+    }
+
+    #[test]
+    fn soft_repair_clamps_ranges_and_enums() {
+        let mut settings = AppSettings::default();
+        settings.tcp_port = 0;
+        settings.max_concurrent_downloads = 999;
+        settings.spam_filter_profile = "nope".to_string();
+        settings.uss_enabled = true;
+        settings.max_upload_speed = 0;
+        assert!(soft_repair_settings(&mut settings));
+        assert_ne!(settings.tcp_port, 0);
+        assert_eq!(settings.max_concurrent_downloads, 50);
+        assert_eq!(settings.spam_filter_profile, "balanced");
+        assert!(!settings.uss_enabled);
+        assert!(validate_settings(&settings).is_ok());
     }
 
     #[test]

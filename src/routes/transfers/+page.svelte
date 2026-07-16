@@ -2,7 +2,7 @@
   import ProgressBar from '$lib/components/ProgressBar.svelte';
   import PartsBar from '$lib/components/PartsBar.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
-  import { transfers } from '$lib/stores/transfers';
+  import { transfers, markDownloadRemoved, clearDownloadRemoved } from '$lib/stores/transfers';
   import { networkStats } from '$lib/stores/network';
   import {
     pauseTransfer, stopTransfer, resumeTransfer, cancelTransfer, removeTransfer,
@@ -3931,11 +3931,13 @@
     const id = confirmCancel.id;
     // Drop the row immediately so a racing transfer-failed event can't
     // paint the progress bar red before cancel finishes.
+    markDownloadRemoved(id);
     speedHistory.delete(id);
     transfers.update((list) => list.filter((x) => x.id !== id));
     try {
       await cancelTransfer(id);
     } catch (e: unknown) {
+      clearDownloadRemoved(id);
       transferError = toErrorMsg(e);
     }
   }}
@@ -3999,7 +4001,10 @@
   onconfirm={async () => {
     const ids = confirmBatchCancel.ids; const idSet = new Set(ids);
     // Optimistic remove — same rationale as single cancel above.
-    for (const id of idSet) speedHistory.delete(id);
+    for (const id of idSet) {
+      markDownloadRemoved(id);
+      speedHistory.delete(id);
+    }
     transfers.update((list) => list.filter((x) => !idSet.has(x.id)));
     selectedDownloadIds = [];
     lastClickedDlId = null;
@@ -4008,7 +4013,10 @@
       requestAnimationFrame(() => {
         (document.querySelector('.filter-input') as HTMLInputElement | null)?.focus();
       });
-    } catch (e: unknown) { transferError = toErrorMsg(e); }
+    } catch (e: unknown) {
+      for (const id of idSet) clearDownloadRemoved(id);
+      transferError = toErrorMsg(e);
+    }
   }}
 />
 

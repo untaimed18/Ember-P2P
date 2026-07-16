@@ -198,6 +198,12 @@ let flushTimeout: ReturnType<typeof setTimeout> | null = null;
 const recentlyRemovedUploads = new Map<string, number>();
 const REMOVED_UPLOAD_TTL_MS = 10_000;
 
+/** Download IDs the UI optimistically removed on cancel. Same TTL race as
+ *  `recentlyRemovedUploads`: a poll whose snapshot predated the cancel must
+ *  not resurrect the row for a cycle. */
+const recentlyRemovedDownloads = new Map<string, number>();
+const REMOVED_DOWNLOAD_TTL_MS = 10_000;
+
 /**
  * Wall-clock time each row most recently entered a reversible side state
  * (paused/stopped/insufficient) via a `transfer-status` event. `isMoreAdvancedStatus`
@@ -210,6 +216,13 @@ const REMOVED_UPLOAD_TTL_MS = 10_000;
  * the row as `active` for the ~3s until the next poll/event corrects it.
  */
 const reversibleStateEnteredAt = new Map<string, number>();
+/**
+ * Symmetric to `reversibleStateEnteredAt`: when a `transfer-status` event
+ * leaves paused/stopped/insufficient for a non-reversible status (resume),
+ * record when that happened so a poll already in flight can't flip the row
+ * back to the stale reversible API status.
+ */
+const reversibleStateLeftAt = new Map<string, number>();
 const sourceCountsUpdatedAt = new Map<string, number>();
 const LIVE_SOURCE_EVENT_GRACE_MS = 6_000;
 function markUploadRemoved(id: string) {
@@ -225,6 +238,34 @@ function wasRecentlyRemoved(id: string, now: number): boolean {
   if (expiry === undefined) return false;
   if (expiry <= now) {
     recentlyRemovedUploads.delete(id);
+    return false;
+  }
+  return true;
+}
+
+/** Tombstone a download id so the next poll can't resurrect it after an
+ *  optimistic cancel. Exported for the transfers page cancel handlers. */
+export function markDownloadRemoved(id: string) {
+  recentlyRemovedDownloads.set(id, Date.now() + REMOVED_DOWNLOAD_TTL_MS);
+}
+
+/** Drop a download tombstone (e.g. cancel IPC failed) so a later poll can
+ *  restore the row from the API snapshot. */
+export function clearDownloadRemoved(id: string) {
+  recentlyRemovedDownloads.delete(id);
+}
+
+function pruneRemovedDownloads(now: number) {
+  for (const [id, expiry] of recentlyRemovedDownloads) {
+    if (expiry <= now) recentlyRemovedDownloads.delete(id);
+  }
+}
+
+export function wasRecentlyRemovedDownload(id: string, now: number = Date.now()): boolean {
+  const expiry = recentlyRemovedDownloads.get(id);
+  if (expiry === undefined) return false;
+  if (expiry <= now) {
+    recentlyRemovedDownloads.delete(id);
     return false;
   }
   return true;
@@ -370,6 +411,7 @@ export async function initTransferStore() {
       // applies (a stale entry wouldn't cause wrong merges, since a terminal
       // event status already wins on its own, but there's no reason to keep it).
       reversibleStateEnteredAt.delete(id);
+      reversibleStateLeftAt.delete(id);
       transfers.update((list) => {
         // Find the row (if any) so we can decide whether to drop it
         // outright (uploads) or simply mark it completed (downloads).
@@ -411,6 +453,7 @@ export async function initTransferStore() {
       markEventUpdate();
       const { id, error, failure_kind, failure_stage, direction } = event.payload;
       reversibleStateEnteredAt.delete(id);
+      reversibleStateLeftAt.delete(id);
       transfers.update((list) => {
         const existing = list.find((t) => t.id === id);
         const isUpload = direction === 'upload' || existing?.direction === 'upload';
@@ -481,7 +524,13 @@ export async function initTransferStore() {
                 updated.status = narrowed;
                 if (narrowed === 'paused' || narrowed === 'stopped' || narrowed === 'insufficient') {
                   reversibleStateEnteredAt.set(id, Date.now());
+                  reversibleStateLeftAt.delete(id);
                 } else {
+                  const wasReversible =
+                    t.status === 'paused' || t.status === 'stopped' || t.status === 'insufficient';
+                  if (wasReversible) {
+                    reversibleStateLeftAt.set(id, Date.now());
+                  }
                   reversibleStateEnteredAt.delete(id);
                 }
               }
@@ -650,9 +699,11 @@ export async function initTransferStore() {
             progress: Math.max(apiItem.progress, eventItem.progress),
             transferred: Math.max(apiItem.transferred, eventItem.transferred),
             completed_size: Math.max(apiItem.completed_size || 0, eventItem.completed_size || 0),
-            health: eventItem.health ?? apiItem.health,
-            health_reason: eventItem.health_reason ?? apiItem.health_reason,
-            stalled_since: eventItem.stalled_since ?? apiItem.stalled_since,
+            // Prefer API health: events often omit/stale-carry `health`, and a
+            // prior `degraded` on the event row would otherwise stick forever.
+            health: apiItem.health ?? eventItem.health,
+            health_reason: apiItem.health_reason ?? eventItem.health_reason,
+            stalled_since: apiItem.stalled_since ?? eventItem.stalled_since,
             failure_reason: eventItem.failure_reason ?? apiItem.failure_reason,
             failure_kind: eventItem.failure_kind ?? apiItem.failure_kind,
             failure_stage: eventItem.failure_stage ?? apiItem.failure_stage,
@@ -728,8 +779,10 @@ export function cleanupTransferStore() {
   pollConsumers = 0;
   pendingProgress.clear();
   recentlyRemovedUploads.clear();
+  recentlyRemovedDownloads.clear();
   missingFromApiSince.clear();
   reversibleStateEnteredAt.clear();
+  reversibleStateLeftAt.clear();
   sourceCountsUpdatedAt.clear();
   // Cancel any flush queued for the next frame/tick so it can't run against a
   // store we've just reset (or a subsequently re-initialised one).
@@ -839,15 +892,19 @@ export function startTransferPoll() {
       transfers.update((current) => {
         const now = Date.now();
         pruneRemovedUploads(now);
+        pruneRemovedDownloads(now);
         const currentById = new Map(current.map((t) => [t.id, t]));
         const apiIds = new Set(all.map((t) => t.id));
         const merged = all
-          // Skip API items for upload rows we removed within the last
-          // ~10 s. Without this, a poll that fetched its snapshot just
-          // before a `transfer-complete` event would resurrect the
-          // just-vanished row for a single poll cycle, defeating the
-          // eMule-style auto-remove UX.
-          .filter((apiItem) => !wasRecentlyRemoved(apiItem.id, now))
+          // Skip API items for upload/download rows we removed within the
+          // last ~10 s. Without this, a poll that fetched its snapshot just
+          // before a `transfer-complete` / optimistic cancel would resurrect
+          // the just-vanished row for a single poll cycle.
+          .filter(
+            (apiItem) =>
+              !wasRecentlyRemoved(apiItem.id, now) &&
+              !wasRecentlyRemovedDownload(apiItem.id, now),
+          )
           .map((apiItem) => {
             const eventItem = currentById.get(apiItem.id);
             if (!eventItem) return apiItem;
@@ -862,8 +919,22 @@ export function startTransferPoll() {
             const enteredReversibleAt = reversibleStateEnteredAt.get(apiItem.id);
             const snapshotPredatesReversibleEntry =
               enteredReversibleAt != null && enteredReversibleAt > pollStartedAt;
+            // Symmetric leave protection: a resume event that landed after
+            // this poll started must win over an API snapshot still showing
+            // paused/stopped/insufficient.
+            const leftReversibleAt = reversibleStateLeftAt.get(apiItem.id);
+            const apiStillReversible =
+              apiItem.status === 'paused' ||
+              apiItem.status === 'stopped' ||
+              apiItem.status === 'insufficient';
+            const snapshotPredatesReversibleLeave =
+              leftReversibleAt != null &&
+              leftReversibleAt > pollStartedAt &&
+              apiStillReversible;
             const preferEvent =
-              snapshotPredatesReversibleEntry || isMoreAdvancedStatus(eventItem.status, apiItem.status);
+              snapshotPredatesReversibleEntry ||
+              snapshotPredatesReversibleLeave ||
+              isMoreAdvancedStatus(eventItem.status, apiItem.status);
             const status = preferEvent ? eventItem.status : apiItem.status;
             const apiActive = apiItem.active_sources ?? 0;
             const apiQueued = apiItem.queued_sources ?? 0;
@@ -886,9 +957,10 @@ export function startTransferPoll() {
               speed: mergeSpeed(status, apiItem.speed, eventItem.speed),
               transferred: Math.max(apiItem.transferred, eventItem.transferred),
               completed_size: Math.max(apiItem.completed_size || 0, eventItem.completed_size || 0),
-              health: eventItem.health ?? apiItem.health,
-              health_reason: eventItem.health_reason ?? apiItem.health_reason,
-              stalled_since: eventItem.stalled_since ?? apiItem.stalled_since,
+              // Prefer API health over a possibly-stale event value.
+              health: apiItem.health ?? eventItem.health,
+              health_reason: apiItem.health_reason ?? eventItem.health_reason,
+              stalled_since: apiItem.stalled_since ?? eventItem.stalled_since,
               failure_reason: eventItem.failure_reason ?? apiItem.failure_reason,
               failure_kind: eventItem.failure_kind ?? apiItem.failure_kind,
               failure_stage: eventItem.failure_stage ?? apiItem.failure_stage,
