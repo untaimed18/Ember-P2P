@@ -1940,6 +1940,7 @@
   "error_settings_too_many_shared_folders": "Demasiadas carpetas compartidas (máx. {detail})",
   "error_settings_udp_port_invalid": "El puerto UDP debe estar entre 1 y 65535",
   "error_settings_url_validation_failed": "Falló la validación de la URL: {detail}",
+  "error_settings_uss_requires_upload_limit": "Upload Speed Sense requiere un límite de velocidad de subida",
   "error_settings_validation_task_failed": "Falló la tarea de validación: {detail}",
   "error_sharing_cannot_share_system_dir": "No se puede compartir un directorio del sistema: {detail}",
   "error_sharing_config_save_error": "Error al guardar la configuración: {detail}",

@@ -131,6 +131,17 @@ impl AppConfig {
                         );
                         config_changed = true;
                     }
+                    // Soft-fix legacy configs that had USS on with unlimited
+                    // upload. validate_settings rejects that combo on save; if
+                    // we didn't clear here, load would treat the file as
+                    // corrupt and reset the whole settings file.
+                    if s.uss_enabled && s.max_upload_speed == 0 {
+                        tracing::warn!(
+                            "Disabled Upload Speed Sense because no upload speed limit is set"
+                        );
+                        s.uss_enabled = false;
+                        config_changed = true;
+                    }
                     match crate::commands::settings::validate_settings(&s) {
                         Ok(()) => s,
                         Err(e) => {

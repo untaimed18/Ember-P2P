@@ -1900,6 +1900,7 @@
   "error_settings_too_many_shared_folders": "Trop de dossiers partagés ({detail} max.)",
   "error_settings_udp_port_invalid": "Le port UDP doit être compris entre 1 et 65535",
   "error_settings_url_validation_failed": "Échec de la validation de l'URL : {detail}",
+  "error_settings_uss_requires_upload_limit": "Upload Speed Sense nécessite une limite de vitesse d'envoi",
   "error_settings_validation_task_failed": "Échec de la tâche de validation : {detail}",
   "error_sharing_cannot_share_system_dir": "Impossible de partager un répertoire système : {detail}",
   "error_sharing_config_save_error": "Erreur d'enregistrement de la configuration : {detail}",

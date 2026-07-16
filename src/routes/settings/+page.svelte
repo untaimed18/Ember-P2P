@@ -986,6 +986,14 @@
       if (pageContentEl) pageContentEl.scrollTop = 0;
     });
   });
+
+  // USS needs a non-zero upload cap. Clear the flag when the user switches
+  // to Unlimited so save can't persist an inert/invalid combo.
+  $effect(() => {
+    if (settings && settings.max_upload_speed === 0 && settings.uss_enabled) {
+      settings.uss_enabled = false;
+    }
+  });
 </script>
 
 <div class="page-header sticky-header">
@@ -1569,7 +1577,11 @@
               <span class="toggle-title">{m.settings_uss_label()}</span>
               <span class="hint">{m.settings_uss_hint()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.uss_enabled} ariaLabel={m.settings_uss_label()} />
+            <ToggleSwitch
+              bind:checked={settings.uss_enabled}
+              disabled={settings.max_upload_speed === 0}
+              ariaLabel={m.settings_uss_label()}
+            />
           </div>
           <div class="field speed-test-section">
             <div class="speed-test-header">

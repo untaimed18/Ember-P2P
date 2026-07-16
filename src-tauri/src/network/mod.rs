@@ -4067,11 +4067,14 @@ struct NetworkState {
     server_reconnect_failures: u32,
     /// Instant when the last server connect attempt was started
     server_last_connect_attempt: Option<std::time::Instant>,
-    /// Pending USS ping timestamps for RTT measurement
+    /// Pending USS ping timestamps for RTT measurement (at most one in flight).
     pending_uss_pings: HashMap<SocketAddr, std::time::Instant>,
     /// Currently selected USS ping target
     uss_host: Option<(SocketAddr, KadId)>,
-    /// Consecutive missed USS pongs (rotate host after 3)
+    /// Last USS host — excluded on the next selection so rotation cannot
+    /// immediately re-pick the same unresponsive contact.
+    uss_prev_host: Option<SocketAddr>,
+    /// Consecutive *timed-out* USS pings (rotate host after 3)
     uss_missed_pongs: u32,
     /// When the current USS host was selected
     uss_host_selected_at: i64,
@@ -6301,8 +6304,11 @@ fn apply_network_settings(
     ed2k::multi_source::set_global_download_conn_limit(new_settings.max_connections as usize);
     crate::sharing::manager::set_global_preview_priority(new_settings.preview_priority_all);
     if !new_settings.uss_enabled {
-        state.uss_host = None;
+        if let Some((addr, _)) = state.uss_host.take() {
+            state.uss_prev_host = Some(addr);
+        }
         state.pending_uss_pings.clear();
+        state.uss_missed_pongs = 0;
     }
     if state.ip_filter.is_enabled() != new_settings.ip_filter_enabled {
         state.ip_filter.set_enabled(new_settings.ip_filter_enabled);
@@ -6913,6 +6919,7 @@ pub async fn start_network(
         server_last_connect_attempt: None,
         pending_uss_pings: HashMap::new(),
         uss_host: None,
+        uss_prev_host: None,
         uss_missed_pongs: 0,
         uss_host_selected_at: 0,
         uss_rtt_queue,
@@ -21537,30 +21544,77 @@ pub async fn start_network(
                 let __panic_result = std::panic::AssertUnwindSafe(async {
                 if state.stats.status == NetworkStatus::Disconnected { return; }
                 if !state.uss_enabled_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                    state.uss_host = None;
+                    if let Some((addr, _)) = state.uss_host.take() {
+                        state.uss_prev_host = Some(addr);
+                    }
+                    state.pending_uss_pings.clear();
+                    state.uss_missed_pongs = 0;
                     return;
                 }
                 let now_ts = chrono::Utc::now().timestamp();
+                const USS_PING_TIMEOUT_SECS: u64 = 3;
 
-                // Expire old pending pings (> 10s without response)
-                state.pending_uss_pings.retain(|_, sent| sent.elapsed().as_secs() < 10);
+                // Count timed-out in-flight pings as misses, then drop them.
+                // Do NOT increment on send — that falsely rotates hosts when
+                // RTT is merely slower than the 2s timer interval.
+                let timed_out: Vec<SocketAddr> = state
+                    .pending_uss_pings
+                    .iter()
+                    .filter(|(_, sent)| sent.elapsed().as_secs() >= USS_PING_TIMEOUT_SECS)
+                    .map(|(addr, _)| *addr)
+                    .collect();
+                for addr in timed_out {
+                    state.pending_uss_pings.remove(&addr);
+                    state.uss_missed_pongs = state.uss_missed_pongs.saturating_add(1);
+                }
 
-                // Rotate host every 5 minutes or after 3 consecutive missed pongs
+                // Rotate host every 5 minutes or after 3 consecutive timed-out pings
                 let should_rotate = state.uss_host.is_some()
                     && (state.uss_missed_pongs >= 3 || now_ts.saturating_sub(state.uss_host_selected_at) > 300);
                 if should_rotate {
-                    debug!("USS: rotating ping host (missed={}, age={}s)", state.uss_missed_pongs, now_ts - state.uss_host_selected_at);
-                    state.uss_host = None;
+                    debug!(
+                        "USS: rotating ping host (missed={}, age={}s)",
+                        state.uss_missed_pongs,
+                        now_ts.saturating_sub(state.uss_host_selected_at)
+                    );
+                    if let Some((addr, _)) = state.uss_host.take() {
+                        state.uss_prev_host = Some(addr);
+                        state.pending_uss_pings.remove(&addr);
+                    }
                 }
 
-                // Select a host if needed
+                // Select a host if needed (prefer not re-picking the just-rotated
+                // one, but fall back to it when it is the only eligible contact —
+                // otherwise a single-peer KAD table leaves USS stuck with no host
+                // and the Preparing min upload forever).
                 if state.uss_host.is_none() {
-                    let candidate = state.routing_table.all_contacts()
+                    let exclude = state.uss_prev_host;
+                    let all_eligible: Vec<_> = state
+                        .routing_table
+                        .all_contacts()
                         .filter(|c| c.verified && !c.is_dead() && !c.is_udp_firewalled())
-                        .find(|c| {
+                        .cloned()
+                        .collect();
+                    let mut candidates: Vec<_> = all_eligible
+                        .iter()
+                        .filter(|c| {
                             let addr = SocketAddr::new(c.ip.into(), c.udp_port);
-                            state.uss_host.as_ref().map(|(a, _)| *a) != Some(addr)
-                        });
+                            exclude != Some(addr)
+                        })
+                        .cloned()
+                        .collect();
+                    if candidates.is_empty() {
+                        candidates = all_eligible;
+                    }
+                    // Prefer a stable pick among eligible contacts rather than
+                    // always the first table entry (which caused sticky reselect
+                    // of the same dead peer after rotation when alternatives exist).
+                    let candidate = if candidates.is_empty() {
+                        None
+                    } else {
+                        let idx = (now_ts.unsigned_abs() as usize) % candidates.len();
+                        Some(candidates[idx].clone())
+                    };
                     if let Some(contact) = candidate {
                         let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                         state.uss_host = Some((addr, contact.id));
@@ -21570,13 +21624,21 @@ pub async fn start_network(
                     }
                 }
 
-                // Send Ping to the USS host (via obfuscation layer)
+                // Send at most one in-flight Ping per host so a late pong cannot
+                // measure against a newer overwrite of the send timestamp.
                 if let Some((addr, ref contact_id)) = state.uss_host {
-                    let msg = KadMessage::Ping;
-                    if let Ok(packet) = messages::encode_packet(&msg) {
-                        let _ = send_kad_packet(&udp_socket, &packet, addr, &state, contact_id).await;
-                        state.pending_uss_pings.insert(addr, std::time::Instant::now());
-                        state.uss_missed_pongs += 1;
+                    if !state.pending_uss_pings.contains_key(&addr) {
+                        let msg = KadMessage::Ping;
+                        if let Ok(packet) = messages::encode_packet(&msg) {
+                            match send_kad_packet(&udp_socket, &packet, addr, &state, contact_id).await {
+                                Ok(_) => {
+                                    state.pending_uss_pings.insert(addr, std::time::Instant::now());
+                                }
+                                Err(e) => {
+                                    debug!("USS: failed to send ping to {addr}: {e}");
+                                }
+                            }
+                        }
                     }
                 }
                 }).catch_unwind().await;
@@ -26066,16 +26128,33 @@ async fn handle_udp_packet_inner(
                     }
                 }
             }
-            // USS RTT measurement: if this Pong is from our USS ping target, compute RTT
-            if let Some(sent_at) = state.pending_uss_pings.remove(&from) {
-                let rtt_ms = sent_at.elapsed().as_secs_f64() * 1000.0;
-                state
-                    .uss_rtt_queue
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .push_back(rtt_ms);
-                state.uss_missed_pongs = 0;
-                debug!("USS RTT from {from}: {rtt_ms:.1}ms");
+            // USS RTT measurement: only accept a Pong from the *current* USS
+            // host while USS is enabled. Unrelated KAD Ping/Pong traffic
+            // (firewall checks, legacy challenges) must not clear pending or
+            // feed the RTT queue, and a late pong from a rotated host must
+            // not reset the new host's miss counter.
+            if state.uss_enabled_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                let is_current_uss_host = state
+                    .uss_host
+                    .as_ref()
+                    .is_some_and(|(addr, _)| *addr == from);
+                if is_current_uss_host {
+                    if let Some(sent_at) = state.pending_uss_pings.remove(&from) {
+                        let rtt_ms = sent_at.elapsed().as_secs_f64() * 1000.0;
+                        let mut queue = state
+                            .uss_rtt_queue
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if queue.len() >= 128 {
+                            queue.pop_front();
+                        }
+                        queue.push_back(rtt_ms);
+                        state.uss_missed_pongs = 0;
+                        debug!("USS RTT from {from}: {rtt_ms:.1}ms");
+                    }
+                }
+            } else {
+                state.pending_uss_pings.remove(&from);
             }
         }
 

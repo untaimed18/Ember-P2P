@@ -261,6 +261,16 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
             MAX_CONFIGURED_SPEED_BPS,
         ));
     }
+    // USS throttles under the configured upload cap; with unlimited upload
+    // (0) there is no ceiling to sense against. Reject rather than silently
+    // leaving uss_enabled true but inert — config load soft-fixes legacy
+    // configs before this check runs.
+    if settings.uss_enabled && settings.max_upload_speed == 0 {
+        return Err(coded(
+            "settings_uss_requires_upload_limit",
+            "Upload Speed Sense requires an upload speed limit to be set",
+        ));
+    }
     if settings.max_download_speed > MAX_CONFIGURED_SPEED_BPS {
         return Err(coded_ctx(
             "settings_max_download_speed_invalid",
@@ -1048,6 +1058,25 @@ mod tests {
         if let Err(e) = validate_settings(&AppSettings::default()) {
             panic!("AppSettings::default() must satisfy validate_settings, got: {e}");
         }
+    }
+
+    #[test]
+    fn uss_requires_nonzero_upload_limit() {
+        let mut settings = AppSettings::default();
+        settings.uss_enabled = true;
+        settings.max_upload_speed = 0;
+        let err = validate_settings(&settings).expect_err("USS + unlimited must fail");
+        assert!(
+            err.contains("settings_uss_requires_upload_limit"),
+            "unexpected error: {err}"
+        );
+
+        settings.max_upload_speed = 512 * 1024;
+        assert!(validate_settings(&settings).is_ok());
+
+        settings.uss_enabled = false;
+        settings.max_upload_speed = 0;
+        assert!(validate_settings(&settings).is_ok());
     }
 
     #[test]
