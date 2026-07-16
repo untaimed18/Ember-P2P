@@ -9013,6 +9013,13 @@ pub async fn start_network(
                             continue;
                         }
                     }
+                    if is_user_cancel {
+                        // cancel_transfer / CancelDownload already removed the
+                        // row and recorded history as "cancelled". Falling
+                        // through would emit transfer-failed and paint the
+                        // download bar red for a moment before the UI drops it.
+                        continue;
+                    }
                     } // end else (!is_disk_full)
                 }
                 // Inject source-exchange-discovered sources into the active download
@@ -32063,6 +32070,14 @@ async fn handle_download_event(
             let failure_stage = ed2k::transfer::infer_stage_from_error(&error).to_string();
             let failure_kind_name = ed2k::transfer::failure_kind_name(&failure_kind);
             let failure_summary = ed2k::transfer::summarize_error(&error, &failure_kind);
+            // User cancel is handled by cancel_transfer (history + row removal).
+            // Emitting transfer-failed here would briefly turn the progress bar
+            // red before the frontend drops the row.
+            if ed2k::transfer::is_user_cancel_error(&error)
+                || failure_summary.eq_ignore_ascii_case("cancelled")
+            {
+                return;
+            }
             let current_status = {
                 let mgr = transfer_manager.read().await;
                 mgr.get_transfer(&transfer_id).map(|t| t.status.clone())
