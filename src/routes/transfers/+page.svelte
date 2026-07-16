@@ -1618,6 +1618,12 @@
     closeCtx();
     closeKnownCtx();
     closeColumnMenu();
+    // Match ctx/column menus: native <details> stays open on outside click.
+    document
+      .querySelectorAll<HTMLDetailsElement>('.toolbar-more[open]')
+      .forEach((d) => {
+        d.open = false;
+      });
   }
 
   async function knownCtxAction(action: string) {
