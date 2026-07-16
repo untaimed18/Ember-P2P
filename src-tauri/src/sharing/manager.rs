@@ -1042,6 +1042,10 @@ impl TransferManager {
         }
         self.active.remove(id);
         self.queue.retain(|t| t.id != id);
+        // Also drop any completed/failed copy so a Failed event that raced
+        // ahead of cancel can't leave a sticky red "failed" row in memory
+        // (and therefore in get_transfers) after the user cancelled.
+        self.completed.retain(|t| t.id != id);
         self.controls.remove(id);
         self.speed_history.remove(id);
         self.source_details.remove(id);

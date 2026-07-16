@@ -423,6 +423,13 @@ export async function initTransferStore() {
           pendingProgress.delete(id);
           return list.filter((t) => t.id !== id);
         }
+        // User cancel must not paint the row red in Completed/Failed —
+        // cancel already removes the download; treat the event as removal.
+        const errText = typeof error === 'string' ? error : '';
+        if (/cancel/i.test(errText)) {
+          pendingProgress.delete(id);
+          return list.filter((t) => t.id !== id);
+        }
         return list.map((t) => {
           if (t.id !== id) return t;
           // D30: don't downgrade a completed row to failed if a stray

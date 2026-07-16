@@ -3927,7 +3927,18 @@
   message={m.transfers_confirm_cancel_message({ name: confirmCancel.name })}
   confirmLabel={m.transfers_confirm_cancel_label()}
   danger={true}
-  onconfirm={async () => { try { await cancelTransfer(confirmCancel.id); speedHistory.delete(confirmCancel.id); transfers.update((list) => list.filter((x) => x.id !== confirmCancel.id)); } catch (e: unknown) { transferError = toErrorMsg(e); } }}
+  onconfirm={async () => {
+    const id = confirmCancel.id;
+    // Drop the row immediately so a racing transfer-failed event can't
+    // paint the progress bar red before cancel finishes.
+    speedHistory.delete(id);
+    transfers.update((list) => list.filter((x) => x.id !== id));
+    try {
+      await cancelTransfer(id);
+    } catch (e: unknown) {
+      transferError = toErrorMsg(e);
+    }
+  }}
 />
 <ConfirmDialog
   bind:open={confirmBan.open}
@@ -3987,14 +3998,13 @@
   danger={true}
   onconfirm={async () => {
     const ids = confirmBatchCancel.ids; const idSet = new Set(ids);
+    // Optimistic remove — same rationale as single cancel above.
+    for (const id of idSet) speedHistory.delete(id);
+    transfers.update((list) => list.filter((x) => !idSet.has(x.id)));
+    selectedDownloadIds = [];
+    lastClickedDlId = null;
     try {
       await cancelTransfersBatch(ids);
-      for (const id of idSet) speedHistory.delete(id);
-      transfers.update((list) => list.filter((x) => !idSet.has(x.id)));
-      selectedDownloadIds = [];
-      lastClickedDlId = null;
-      // L13: move focus back to the page toolbar after destructive
-      // actions so keyboard users don't land on a detached element.
       requestAnimationFrame(() => {
         (document.querySelector('.filter-input') as HTMLInputElement | null)?.focus();
       });
