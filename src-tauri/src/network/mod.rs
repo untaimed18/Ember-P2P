@@ -904,6 +904,17 @@ fn stop_ed2k_udp_search_if_capped(state: &mut NetworkState, app_handle: &tauri::
 /// reach.
 const KAD_MIN_VERIFIED_FOR_CONNECTED: usize = 1;
 
+/// True when we have decoded a KAD packet recently enough to claim Connected.
+/// Prevents bootstrap from promoting on stale `nodes.dat` verified rows after
+/// KADEMLIADISCONNECTDELAY cleared `last_kad_contact`.
+fn kad_has_fresh_contact(state: &NetworkState) -> bool {
+    const KAD_DISCONNECT_DELAY_SECS: i64 = 1200;
+    match state.last_kad_contact {
+        Some(ts) => chrono::Utc::now().timestamp().saturating_sub(ts) <= KAD_DISCONNECT_DELAY_SECS,
+        None => false,
+    }
+}
+
 fn enqueue_overflow_source(
     state: &mut NetworkState,
     transfer_id: &str,
@@ -8184,7 +8195,17 @@ pub async fn start_network(
                             }
                         }
                     }
-                    Err(e) => warn!("Deferred disk load task panicked: {e}"),
+                    Err(e) => {
+                        warn!("Deferred disk load task panicked: {e}");
+                        // Clear fail-closed gate so KAD/peer paths are not
+                        // permanently blackholed for the session.
+                        if state.ip_filter.is_enabled() {
+                            state.ip_filter.mark_ranges_ready();
+                            state
+                                .ip_filter
+                                .update_shared_snapshot(&state.shared_ip_filter);
+                        }
+                    }
                 }
             }
         }
@@ -13615,6 +13636,7 @@ pub async fn start_network(
                 info!("Routing table: {count} contacts");
                 if state.stats.status != NetworkStatus::Connected
                     && state.routing_table.verified_len() >= KAD_MIN_VERIFIED_FOR_CONNECTED
+                    && kad_has_fresh_contact(&state)
                 {
                     state.stats.status = NetworkStatus::Connected;
                     let _ = app_handle.emit("network-status", NetworkStatus::Connected);
@@ -15722,7 +15744,9 @@ pub async fn start_network(
                 if state.stats.status == NetworkStatus::Disconnected { return; }
 
                 // eMule KADEMLIADISCONNECTDELAY: if no valid KAD contact for 20 minutes,
-                // transition back to Connecting so bootstrap re-engages.
+                // transition back to Connecting so bootstrap re-engages. Do NOT tear
+                // down eD2K here — temporary KAD quiet must not yank a working server
+                // (and would flap Connected↔Connecting against stale verified rows).
                 const KAD_DISCONNECT_DELAY_SECS: i64 = 1200;
                 if state.stats.status == NetworkStatus::Connected {
                     if let Some(last_contact) = state.last_kad_contact {
@@ -15735,24 +15759,11 @@ pub async fn start_network(
                             state.stats.status = NetworkStatus::Connecting;
                             state.self_lookup_done = false;
                             state.last_self_lookup = 0;
+                            // Clear so bootstrap cannot promote back to Connected
+                            // until a fresh decoded packet updates last_kad_contact.
+                            state.last_kad_contact = None;
                             state.routing_table.reset_big_timer_global(now_dc);
                             let _ = app_handle.emit("network-status", NetworkStatus::Connecting);
-
-                            // Tear down eD2K server — it should only be up while KAD is connected
-                            if let Some(handle) = state.pending_server_connect.take() {
-                                handle.abort();
-                            }
-                            if state.server_connected || state.server_connection.is_some() {
-                                if let Some(conn) = state.server_connection.take() {
-                                    conn.disconnect().await;
-                                }
-                                handle_server_disconnect(
-                                    &mut state,
-                                    &shared_server_addr,
-                                    &app_handle,
-                                    "KAD lost connection",
-                                ).await;
-                            }
                         }
                     }
                 }
@@ -23598,7 +23609,7 @@ fn dispatch_udp_firewall_probe_requests(
                 .firewall_checker
                 .is_udp_firewall_check_ip(candidate.ip)
             || state.routing_table.get_contact(&candidate.id).is_some()
-            || state.ip_filter.is_blocked(candidate.ip)
+            || state.ip_filter.is_blocked_readonly_for_kad(candidate.ip)
             || state.banned_ips.contains(&candidate.ip)
         {
             continue;
@@ -25203,7 +25214,7 @@ async fn handle_udp_packet_inner(
             }
         },
     };
-    if state.ip_filter.is_blocked_readonly(from_ipv4) {
+    if state.ip_filter.is_blocked_readonly_for_kad(from_ipv4) {
         debug!("Dropping UDP packet from blocked IP {from}");
         return;
     }
@@ -25566,7 +25577,7 @@ async fn handle_udp_packet_inner(
 
     // Security: IP filter and ban check
     if let std::net::IpAddr::V4(ipv4) = from.ip() {
-        if state.ip_filter.is_blocked_readonly(ipv4) {
+        if state.ip_filter.is_blocked_readonly_for_kad(ipv4) {
             debug!("Dropping packet from blocked IP {from}");
             return;
         }
@@ -25898,6 +25909,7 @@ async fn handle_udp_packet_inner(
             state.stats.connected_peers = table_size as u32;
             if state.stats.status != NetworkStatus::Connected
                 && state.routing_table.verified_len() >= KAD_MIN_VERIFIED_FOR_CONNECTED
+                && kad_has_fresh_contact(state)
             {
                 state.stats.status = NetworkStatus::Connected;
                 let _ = app_handle.emit("network-status", NetworkStatus::Connected);
@@ -26460,7 +26472,11 @@ async fn handle_udp_packet_inner(
                             if c.udp_port == 53 && c.version <= KADEMLIA_VERSION5_48A {
                                 return false;
                             }
-                            if state.ip_filter.is_blocked(c.ip) || state.banned_ips.contains(&c.ip)
+                            // Use KAD admission (not fail-closed peer gate) so
+                            // bootstrap KadRes contacts aren't wiped while
+                            // ipfilter.dat is still loading — matches RT insert.
+                            if state.ip_filter.is_blocked_readonly_for_kad(c.ip)
+                                || state.banned_ips.contains(&c.ip)
                             {
                                 return false;
                             }

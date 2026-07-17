@@ -189,9 +189,25 @@ export async function initNetworkStore() {
       if (!status) return;
       lastEventUpdate = Date.now();
       lastNetworkUpdate = lastEventUpdate;
-      networkStats.update((s) =>
-        withDerivedNetworkState({ ...s, status })
-      );
+      networkStats.update((s) => {
+        if (status === 'disconnected') {
+          // Backend KadDisconnect resets buddy/peers/IP but only emits
+          // status — clear the stale tiles here so the UI doesn't keep
+          // showing Connected buddy / Open firewall until the next poll.
+          return withDerivedNetworkState({
+            ...s,
+            status,
+            connected_peers: 0,
+            external_ip: '',
+            firewalled: true,
+            buddy_status: 'none',
+            tcp_status: 'Unknown',
+            udp_status: 'Unknown',
+            stores_acknowledged: 0,
+          });
+        }
+        return withDerivedNetworkState({ ...s, status });
+      });
     }));
     registered.push(await listen<{ firewalled: boolean; external_ip: string; tcp_status?: string; udp_status?: string }>('firewall-status', (event) => {
       const p = event.payload;

@@ -352,6 +352,9 @@
 
     listen<{ transfer_id: string; source: string; kind: string }>('transfer:source-failed', (event) => {
       const d = event.payload;
+      // Don't overwrite a prior KAD/server "found" summary with a single
+      // peer timeout — failures still appear in the expanded source list.
+      if (searchFoundIds.has(d.transfer_id)) return;
       const label = d.kind === 'permanent' ? m.transfers_src_rejected() : d.kind === 'timeout' ? m.transfers_src_timed_out() : m.transfers_src_failed();
       searchStatus.set(d.transfer_id, `${d.source} ${label}`);
       searchStatus = new Map(searchStatus);
@@ -1673,7 +1676,14 @@
         case 'open': await openFile(t.id); break;
         case 'open_location': await openTransferFileLocation(t.id); break;
         case 'priority': if (extra) await setTransferPriority(t.id, extra as 'verylow' | 'low' | 'normal' | 'high' | 'release' | 'auto'); break;
-        case 'find_sources': await findSources(t.file_hash, t.total_size); break;
+        case 'find_sources': {
+          try {
+            await runFindSourcesWithStatus(t);
+          } catch (e: unknown) {
+            transferError = toErrorMsg(e);
+          }
+          break;
+        }
         case 'preview': await previewFile(t.id); break;
         case 'toggle_preview_prio': { const live = $transfers.find(x => x.id === t.id); await setPreviewPriority(t.id, !(live ?? t).preview_priority); break; }
         case 'recover_archive': {
@@ -1772,13 +1782,31 @@
     }
   }
 
+  async function runFindSourcesWithStatus(t: Transfer): Promise<void> {
+    searchStatus.set(t.id, m.transfers_src_kad_search());
+    searchStatus = new Map(searchStatus);
+    const found = await findSources(t.file_hash, t.total_size);
+    if (found.length > 0) {
+      searchFoundIds.add(t.id);
+      searchStatus.set(
+        t.id,
+        found.length === 1
+          ? m.transfers_src_kad_found_one()
+          : m.transfers_src_kad_found_other({ count: found.length }),
+      );
+    } else if (!searchFoundIds.has(t.id)) {
+      searchStatus.set(t.id, m.transfers_src_kad_empty());
+    }
+    searchStatus = new Map(searchStatus);
+  }
+
   async function runSelectedAction(action: 'pause' | 'resume' | 'stop' | 'sources' | 'preview') {
     if (!selectedTransfer) return;
     try {
       if (action === 'pause' && canPause(selectedTransfer)) await pauseTransfer(selectedTransfer.id);
       if (action === 'resume' && canResume(selectedTransfer)) await resumeTransfer(selectedTransfer.id);
       if (action === 'stop' && canStop(selectedTransfer)) await stopTransfer(selectedTransfer.id);
-      if (action === 'sources') await findSources(selectedTransfer.file_hash, selectedTransfer.total_size);
+      if (action === 'sources') await runFindSourcesWithStatus(selectedTransfer);
       if (action === 'preview') await previewFile(selectedTransfer.id);
     } catch (e: unknown) {
       transferError = toErrorMsg(e);
@@ -1787,7 +1815,7 @@
 
   async function findSourcesInline(t: Transfer) {
     try {
-      await findSources(t.file_hash, t.total_size);
+      await runFindSourcesWithStatus(t);
     } catch (e: unknown) {
       transferError = toErrorMsg(e);
     }

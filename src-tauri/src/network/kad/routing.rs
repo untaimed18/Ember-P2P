@@ -1190,7 +1190,7 @@ impl RoutingTable {
         if let Some(ref filter) = self.range_ip_filter {
             match filter.read() {
                 Ok(snap) => {
-                    if snap.is_blocked(contact.ip) {
+                    if snap.is_blocked_for_kad(contact.ip) {
                         tracing::debug!(
                             "RT reject {}: IP {} blocked by range filter",
                             contact.id,
