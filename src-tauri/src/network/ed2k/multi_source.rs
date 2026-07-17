@@ -3473,7 +3473,9 @@ impl MultiSourceDownload {
                         transfer_id: self.transfer_id.clone(),
                         error: "Final hash verification failed — .part preserved for retry"
                             .to_string(),
-                        failure_kind: super::transfer::SourceFailureKind::Permanent,
+                        // Transient: parts were reopened and .part.met saved;
+                        // the network loop re-queues Searching so recovery continues.
+                        failure_kind: super::transfer::SourceFailureKind::Transient,
                     })
                     .await;
             }

@@ -543,6 +543,27 @@ export async function initTransferStore() {
             if ((narrowed === 'paused' || narrowed === 'stopped') && updated.status === narrowed) {
               updated.speed = 0;
             }
+            // Clear stale failure_* once the transfer leaves Failed / resumes
+            // into a live or reversible state without new failure fields.
+            if (
+              narrowed &&
+              (narrowed === 'searching' ||
+                narrowed === 'queued' ||
+                narrowed === 'active' ||
+                narrowed === 'paused' ||
+                narrowed === 'stopped' ||
+                narrowed === 'hashing' ||
+                narrowed === 'verifying' ||
+                narrowed === 'completing') &&
+              failure_reason === undefined &&
+              failure_kind === undefined &&
+              failure_stage === undefined &&
+              error === undefined
+            ) {
+              delete updated.failure_reason;
+              delete updated.failure_kind;
+              delete updated.failure_stage;
+            }
             if (peer_id) {
               updated.peer_id = peer_id;
             }

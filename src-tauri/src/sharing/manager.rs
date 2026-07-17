@@ -939,14 +939,17 @@ impl TransferManager {
         if let Some(control) = self.controls.get(id) {
             control.pause();
         }
-        // Pause tears down all peer connections for this transfer, so
-        // the per-source detail rows (status=Connecting / Queued /
-        // Transferring) no longer reflect live state — keeping them
-        // would show the user "31 sources, 6 transferring" for a
-        // transfer that has zero live peers. Clear the backend list
-        // so the next pull (or resume) rebuilds it from reality. This
-        // matches what `stop()` and `cancel()` already do below.
-        self.source_details.remove(id);
+        // Pause tears down peer connections, but keep last-known source rows
+        // so the UI still shows who was known — mark them offline (Failed)
+        // with zero speed rather than wiping the list (network still holds
+        // per_file_sources for redial on resume).
+        if let Some(rows) = self.source_details.get_mut(id) {
+            for s in rows.iter_mut() {
+                s.status = crate::types::SourceStatus::Failed;
+                s.speed = 0;
+                s.queue_rank = None;
+            }
+        }
     }
 
     /// Pause a transfer and, if this frees an active download slot, promote
@@ -993,19 +996,19 @@ impl TransferManager {
     pub fn resume(&mut self, id: &str) -> Vec<Transfer> {
         if let Some(transfer) = self.active.get_mut(id) {
             if transfer.status == TransferStatus::Paused {
-                transfer.status = TransferStatus::Active;
+                // Match Insufficient: do not jump straight to Active before a
+                // worker is up — Searching/Queued until SourcesUpdate promotes.
+                transfer.status = Self::queued_wait_status(transfer);
                 Self::clear_failure_context(transfer);
                 Self::clear_runtime_health(transfer);
             } else if transfer.status == TransferStatus::Insufficient {
                 // eMule ResumeFileInsufficient: clear the insufficient-disk
                 // state and let the download re-drive from discovery. Unlike a
-                // Paused resume we do NOT jump straight to Active — the worker
-                // never started (it was blocked for lack of space), so fall
-                // back to the normal waiting status and let the caller restart
-                // it. Without this, Resume on an "Insufficient disk space" row
-                // was a silent no-op: the row had already been dropped from
-                // pending_downloads when it went Insufficient, so nothing ever
-                // restarted it.
+                // prior Paused→Active bug, fall back to the normal waiting
+                // status and let the caller restart it. Without this, Resume
+                // on an "Insufficient disk space" row was a silent no-op: the
+                // row had already been dropped from pending_downloads when it
+                // went Insufficient, so nothing ever restarted it.
                 let next = Self::queued_wait_status(transfer);
                 transfer.status = next;
                 Self::clear_failure_context(transfer);
