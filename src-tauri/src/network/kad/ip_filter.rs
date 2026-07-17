@@ -29,6 +29,11 @@ pub struct IpFilterSnapshot {
     pub ranges: Vec<(u32, u32)>,
     pub enabled: bool,
     pub block_private: bool,
+    /// False while a deferred/on-enable load of `ipfilter.dat` is still in
+    /// flight. When `enabled && !ranges_ready`, [`Self::is_blocked`] fail-closes
+    /// (treats every non-special IP as blocked) so peers cannot slip through
+    /// an empty range list at startup.
+    pub ranges_ready: bool,
     /// Hits from range-based (ipfilter.dat) matches.
     pub hit_counter: AtomicU64,
     /// Hits from always-blocked bogus IPs and (when `block_private`) LAN/CGNAT
@@ -57,6 +62,13 @@ impl IpFilterSnapshot {
         // RFC1918 / link-local / CGNAT only when the user opted in.
         if self.block_private && crate::security::is_lan_or_cgnat_v4(ip) {
             self.special_hit_counter.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        if self.enabled && !self.ranges_ready {
+            // Fail closed until ipfilter.dat has been applied (or confirmed
+            // absent). Avoids a startup window where enabled+empty ranges
+            // admit peers that the list would block.
+            self.hit_counter.fetch_add(1, Ordering::Relaxed);
             return true;
         }
         if self.enabled {
@@ -95,6 +107,8 @@ pub struct IpFilter {
     blocked_ranges: Vec<IpRange>,
     enabled: bool,
     block_private: bool,
+    /// See [`IpFilterSnapshot::ranges_ready`].
+    ranges_ready: bool,
     /// Total range-based filter hits (atomic so readonly checks can also count)
     total_range_hits: AtomicU64,
     /// Hits from blocking private/reserved/special IPs (not in any range)
@@ -107,9 +121,22 @@ impl IpFilter {
             blocked_ranges: Vec::new(),
             enabled,
             block_private,
+            // Disabled ⇒ nothing to load. Enabled ⇒ fail closed until the
+            // first load pass finishes (or confirms there is no file).
+            ranges_ready: !enabled,
             total_range_hits: AtomicU64::new(0),
             total_special_hits: AtomicU64::new(0),
         }
+    }
+
+    /// Mark the range list as applied (or confirmed empty/absent). Clears the
+    /// startup fail-closed gate.
+    pub fn mark_ranges_ready(&mut self) {
+        self.ranges_ready = true;
+    }
+
+    pub fn ranges_ready(&self) -> bool {
+        self.ranges_ready
     }
 
     /// Replace `self.blocked_ranges` with `new_ranges` after sorting,
@@ -142,6 +169,9 @@ impl IpFilter {
                 }
             }
         }
+        // A successful commit means the range list is intentional — clear the
+        // fail-closed gate (also covers empty files that parse cleanly).
+        self.ranges_ready = true;
         self.blocked_ranges.len()
     }
 
@@ -282,6 +312,10 @@ impl IpFilter {
             self.total_special_hits.fetch_add(1, Ordering::Relaxed);
             return true;
         }
+        if self.enabled && !self.ranges_ready {
+            self.total_range_hits.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
         if self.enabled {
             let ip_u32 = u32::from(ip);
             if let Ok(idx) = self.blocked_ranges.binary_search_by(|range| {
@@ -310,6 +344,10 @@ impl IpFilter {
         }
         if self.block_private && crate::security::is_lan_or_cgnat_v4(ip) {
             self.total_special_hits.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        if self.enabled && !self.ranges_ready {
+            self.total_range_hits.fetch_add(1, Ordering::Relaxed);
             return true;
         }
         if self.enabled {
@@ -348,6 +386,13 @@ impl IpFilter {
 
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
+        if !enabled {
+            // Nothing to await — clear fail-closed gate.
+            self.ranges_ready = true;
+        } else {
+            // Caller must load (or confirm absence) then `mark_ranges_ready`.
+            self.ranges_ready = false;
+        }
     }
 
     pub fn set_block_private(&mut self, block_private: bool) {
@@ -364,6 +409,7 @@ impl IpFilter {
                 .collect(),
             enabled: self.enabled,
             block_private: self.block_private,
+            ranges_ready: self.ranges_ready,
             hit_counter: AtomicU64::new(0),
             special_hit_counter: AtomicU64::new(0),
         }))
@@ -381,6 +427,7 @@ impl IpFilter {
                 .collect();
             snap.enabled = self.enabled;
             snap.block_private = self.block_private;
+            snap.ranges_ready = self.ranges_ready;
         }
     }
 
@@ -838,6 +885,7 @@ mod tests {
     #[test]
     fn test_ip_filter_with_ranges() {
         let mut filter = IpFilter::new(true, false);
+        filter.mark_ranges_ready();
         filter.add_range(
             Ipv4Addr::new(1, 0, 0, 0),
             Ipv4Addr::new(1, 0, 0, 255),
@@ -923,6 +971,7 @@ mod tests {
     #[test]
     fn test_hit_counting() {
         let mut filter = IpFilter::new(true, false);
+        filter.mark_ranges_ready();
         filter.add_range(
             Ipv4Addr::new(1, 0, 0, 0),
             Ipv4Addr::new(1, 0, 0, 255),
@@ -1013,6 +1062,7 @@ mod tests {
         // Range hits and special/bogus hits must land in separate buckets so
         // the stats UI doesn't report private/bogus blocks as range matches.
         let mut filter = IpFilter::new(true, true);
+        filter.mark_ranges_ready();
         filter.add_range(
             Ipv4Addr::new(5, 0, 0, 0),
             Ipv4Addr::new(5, 0, 0, 255),
@@ -1032,6 +1082,37 @@ mod tests {
         let stats = filter.get_stats();
         // 1 range hit + 2 special hits, none double-counted.
         assert_eq!(stats.total_hits, 3);
+    }
+
+    #[test]
+    fn test_enabled_fail_closed_until_ranges_ready() {
+        let mut filter = IpFilter::new(true, false);
+        assert!(!filter.ranges_ready());
+        // Public IP must be blocked while the deferred load has not finished.
+        assert!(filter.is_blocked(Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(filter.is_blocked_readonly(Ipv4Addr::new(1, 1, 1, 1)));
+
+        filter.mark_ranges_ready();
+        assert!(filter.ranges_ready());
+        assert!(!filter.is_blocked(Ipv4Addr::new(8, 8, 8, 8)));
+
+        let snap = filter.create_shared_snapshot();
+        let snap = snap.read().unwrap();
+        assert!(snap.ranges_ready);
+        assert!(!snap.is_blocked(Ipv4Addr::new(8, 8, 8, 8)));
+    }
+
+    #[test]
+    fn test_set_enabled_reopens_fail_closed_gate() {
+        let mut filter = IpFilter::new(false, false);
+        assert!(filter.ranges_ready());
+        filter.set_enabled(true);
+        assert!(!filter.ranges_ready());
+        assert!(filter.is_blocked(Ipv4Addr::new(8, 8, 8, 8)));
+        filter.mark_ranges_ready();
+        assert!(!filter.is_blocked(Ipv4Addr::new(8, 8, 8, 8)));
+        filter.set_enabled(false);
+        assert!(filter.ranges_ready());
     }
 
     fn unique_temp_path(name: &str) -> std::path::PathBuf {

@@ -6520,6 +6520,10 @@ fn apply_network_settings(
                 }
             }
         }
+        // Clear fail-closed gate after enable/load (or confirm empty/absent).
+        if new_settings.ip_filter_enabled {
+            state.ip_filter.mark_ranges_ready();
+        }
         state
             .ip_filter
             .update_shared_snapshot(&state.shared_ip_filter);
@@ -7876,6 +7880,9 @@ pub async fn start_network(
             if ipf_enabled && ipfilter_path.exists() {
                 let _ = filter.load_from_file(&ipfilter_path);
             }
+            // Always clear the fail-closed gate after the load attempt — an
+            // absent or unreadable file still means "empty list is intentional".
+            filter.mark_ranges_ready();
             info!(
                 "Loaded IP filter: enabled={}, block_private={}, ranges={}",
                 filter.is_enabled(),
@@ -8100,6 +8107,7 @@ pub async fn start_network(
                 match deferred_disk_loads.take().unwrap().await {
                     Ok(loads) => {
                         state.ip_filter = loads.ip_filter;
+                        state.ip_filter.mark_ranges_ready();
                         state
                             .ip_filter
                             .update_shared_snapshot(&state.shared_ip_filter);
@@ -8641,6 +8649,8 @@ pub async fn start_network(
             }));
         } else if server_met_bootstrap_task.is_none()
             && pending_auto_connect_server
+            && deferred_disk_loads.is_none()
+            && state.ip_filter.ranges_ready()
             && state.pending_server_connect.is_none()
             && !state.server_connected
             && state.server_connection.is_none()
@@ -30144,6 +30154,7 @@ async fn handle_command_inner(
             match loaded {
                 Ok(Some(fresh)) => {
                     state.ip_filter = fresh;
+                    state.ip_filter.mark_ranges_ready();
                     state
                         .ip_filter
                         .update_shared_snapshot(&state.shared_ip_filter);
@@ -30266,6 +30277,10 @@ async fn handle_command_inner(
                         }
                     }
                 }
+            }
+            // Clear fail-closed gate after enable/load (or confirm empty/absent).
+            if enabled {
+                state.ip_filter.mark_ranges_ready();
             }
             state
                 .ip_filter
