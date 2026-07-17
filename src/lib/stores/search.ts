@@ -239,6 +239,12 @@ let flushScheduled = false;
 let flushRaf: number | null = null;
 let flushTimeout: ReturnType<typeof setTimeout> | null = null;
 
+/** Drop any coalesced `search-results` buffer for a request so a Clear
+ * Results / discard cannot be refilled by a late flush (SF9). */
+export function clearPendingSearchResults(requestId: number) {
+  pendingByRequest.delete(requestId);
+}
+
 function validRequestId(raw: unknown): number | null {
   return typeof raw === 'number' && Number.isSafeInteger(raw) && raw > 0 ? raw : null;
 }

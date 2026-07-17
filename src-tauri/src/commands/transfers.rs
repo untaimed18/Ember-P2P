@@ -652,6 +652,9 @@ pub async fn pause_transfer(
         let mut manager = state.transfer_manager.write().await;
         if let Some(control) = manager.get_control(&transfer_id) {
             control.pause();
+            // Also cancel so detached per-source tasks exit (pause alone used
+            // to leave orphans until hard abort). Resume replaces the control.
+            control.cancel();
         }
         let promoted = manager.pause_and_promote(&transfer_id);
         let status = manager.get_transfer(&transfer_id).map(|t| t.status.clone());
@@ -1263,6 +1266,7 @@ pub async fn pause_all_transfers(
         for id in &active_ids {
             if let Some(control) = manager.get_control(id) {
                 control.pause();
+                control.cancel();
             }
             manager.pause(id);
         }

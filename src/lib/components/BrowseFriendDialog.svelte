@@ -33,6 +33,9 @@
   // we're currently tracking land in the UI, so a real failure
   // never gets silently swallowed.
   let currentBrowseGen = 0;
+  // Generation the listeners currently accept. requestBrowse assigns this
+  // to myGen so a late result from a prior open can't land after reopen.
+  let expectedBrowseGen = 0;
 
   $effect(() => {
     if (open && friendHash) {
@@ -53,6 +56,9 @@
     }
     return () => {
       listenerGen++;
+      currentBrowseGen = 0;
+      expectedBrowseGen = 0;
+      loading = false;
       clearTimeout(browseTimeout);
       if (unlisten) { unlisten(); unlisten = null; }
       if (unlistenError) { unlistenError(); unlistenError = null; }
@@ -75,12 +81,10 @@
     try {
       fn = await listen<{ user_hash: string; files: BrowseFileEntry[] }>('ember:browse-result', (event) => {
         if (event.payload.user_hash !== hash) return;
-        // Only accept results while a browse is in flight. If
-        // `currentBrowseGen` is 0 the event belongs to a previous
-        // browse the user already dismissed; ignoring it stops a
-        // stale result from overwriting the dialog after the user
-        // navigated past it.
-        if (currentBrowseGen === 0) return;
+        // Only accept results for the in-flight browse generation.
+        // `currentBrowseGen === 0` means dismissed; mismatch vs
+        // `expectedBrowseGen` means a stale result from a prior open.
+        if (currentBrowseGen === 0 || currentBrowseGen !== expectedBrowseGen) return;
         clearTimeout(browseTimeout);
         // Defensive: treat missing/invalid `files` as empty rather than
         // crashing the dialog if the backend ever emits a malformed payload.
@@ -107,15 +111,10 @@
     try {
       errFn = await listen<{ user_hash: string; reason: string }>('ember:browse-error', (event) => {
         if (event.payload.user_hash !== hash) return;
-        // M4: previously this guard required `loading`, which meant
-        // an error that arrived shortly after a result was silently
-        // dropped — including the common case where the backend
-        // emits a partial result then a transport failure for the
-        // same browse. We now key on `currentBrowseGen`: as long as
-        // this dialog still has an open browse generation, surface
-        // the error. After a successful result clears the gen, late
-        // errors for that browse are discarded as expected.
-        if (currentBrowseGen === 0) return;
+        // M4: key on browse generation so a late error after a
+        // successful result (gen cleared) is discarded, and a stale
+        // error from a prior open can't land after reopen.
+        if (currentBrowseGen === 0 || currentBrowseGen !== expectedBrowseGen) return;
         clearTimeout(browseTimeout);
         // Run the backend reason through `translateError` so a coded error is
         // localized; a plain string falls through unchanged, and an empty
@@ -154,6 +153,7 @@
     // error race each other on the wire.
     currentBrowseGen++;
     const myGen = currentBrowseGen;
+    expectedBrowseGen = myGen;
     try {
       await browseFriend(hash);
       browseTimeout = setTimeout(() => {

@@ -423,6 +423,9 @@
   let loadingSources = $state(false);
   let sourceLoadError: string | null = $state(null);
   let sourceDetailRequestId = $state(0);
+  // Separate counter for opportunistic refreshes so they never invalidate
+  // toggleSourceDetail's requestId (which would leave loadingSources stuck).
+  let sourceRefreshRequestId = 0;
 
   async function toggleSourceDetail(t: Transfer) {
     if (expandedTransferId === t.id) {
@@ -491,12 +494,13 @@
   }
 
   async function refreshExpandedSourceDetails(transferId: string) {
-    // Bump per call so overlapping refreshes ignore older empty responses.
-    const requestId = ++sourceDetailRequestId;
+    // Do NOT bump sourceDetailRequestId — that would invalidate the open
+    // toggle's loading clear and leave the source drawer stuck spinning.
+    const refreshGen = ++sourceRefreshRequestId;
     const preFetchSources = expandedSources;
     try {
       const sources = await getTransferSources(transferId);
-      if (expandedTransferId !== transferId || requestId !== sourceDetailRequestId) return;
+      if (expandedTransferId !== transferId || refreshGen !== sourceRefreshRequestId) return;
       if (expandedSources === preFetchSources) {
         // Prefer non-empty snapshots: an empty API race must not wipe
         // live push-fed rows while discovery is still writing.
@@ -508,9 +512,13 @@
         for (const s of expandedSources) liveByKey.set(`${s.ip}:${s.port}`, s);
         if (sources.length === 0) {
           // Keep push-fed rows when the snapshot is still empty.
+          if (expandedTransferId === transferId) loadingSources = false;
           return;
         }
         expandedSources = sources.map((s) => liveByKey.get(`${s.ip}:${s.port}`) ?? s);
+      }
+      if (expandedTransferId === transferId) {
+        loadingSources = false;
       }
     } catch {
       // Keep the live event-fed rows if this opportunistic refresh fails.
@@ -3960,15 +3968,25 @@
   danger={true}
   onconfirm={async () => {
     const id = confirmCancel.id;
+    let snapshot: Transfer | undefined;
+    transfers.update((list) => {
+      snapshot = list.find((x) => x.id === id);
+      return list.filter((x) => x.id !== id);
+    });
     // Drop the row immediately so a racing transfer-failed event can't
     // paint the progress bar red before cancel finishes.
     markDownloadRemoved(id);
     speedHistory.delete(id);
-    transfers.update((list) => list.filter((x) => x.id !== id));
     try {
       await cancelTransfer(id);
     } catch (e: unknown) {
       clearDownloadRemoved(id);
+      if (snapshot) {
+        const restore = snapshot;
+        transfers.update((list) =>
+          list.some((x) => x.id === id) ? list : [...list, restore],
+        );
+      }
       transferError = toErrorMsg(e);
     }
   }}
@@ -4031,12 +4049,16 @@
   danger={true}
   onconfirm={async () => {
     const ids = confirmBatchCancel.ids; const idSet = new Set(ids);
+    let snapshots: Transfer[] = [];
     // Optimistic remove — same rationale as single cancel above.
+    transfers.update((list) => {
+      snapshots = list.filter((x) => idSet.has(x.id));
+      return list.filter((x) => !idSet.has(x.id));
+    });
     for (const id of idSet) {
       markDownloadRemoved(id);
       speedHistory.delete(id);
     }
-    transfers.update((list) => list.filter((x) => !idSet.has(x.id)));
     selectedDownloadIds = [];
     lastClickedDlId = null;
     try {
@@ -4046,6 +4068,11 @@
       });
     } catch (e: unknown) {
       for (const id of idSet) clearDownloadRemoved(id);
+      transfers.update((list) => {
+        const existing = new Set(list.map((x) => x.id));
+        const toRestore = snapshots.filter((s) => !existing.has(s.id));
+        return toRestore.length ? [...list, ...toRestore] : list;
+      });
       transferError = toErrorMsg(e);
     }
   }}

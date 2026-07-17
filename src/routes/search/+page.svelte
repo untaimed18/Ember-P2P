@@ -10,8 +10,10 @@
   import { appSettings } from '$lib/stores/settings';
   import {
     activeSearchTabId,
+    clearPendingSearchResults,
     closeSearchTab,
     mergeSearchResults,
+    newSearchNonce,
     openSearchTab,
     patchSearchTabByRequestId,
     patchSpamFlagByHash,
@@ -160,7 +162,12 @@
       if (t.direction !== 'download' || !t.file_hash) continue;
       present.add(t.file_hash);
       seenDownloadHashes.add(t.file_hash);
-      if (t.status !== 'completed' && t.status !== 'failed') continue;
+      // Non-terminal download for this hash means a retry is in flight —
+      // allow a later completed/failed to refresh history again (SF10).
+      if (t.status !== 'completed' && t.status !== 'failed') {
+        completedHandled.delete(t.file_hash);
+        continue;
+      }
       if (completedHandled.has(t.file_hash)) continue;
       completedHandled.add(t.file_hash);
       if (completedHandled.size > COMPLETED_HANDLED_CAP) {
@@ -410,6 +417,29 @@
 
     const tokens = filterText.trim().split(/\s+/).filter(t => t !== '' && t !== '-');
     if (tokens.length === 0) return false;
+
+    // Sources column: numeric equality (and optional >= with leading `>`),
+    // not substring-on-number which made "1" match 10/12/21 (SF11).
+    if (filterColumn === 'sources') {
+      for (const token of tokens) {
+        const isNot = token.startsWith('-');
+        const raw = (isNot ? token.slice(1) : token).trim();
+        if (!raw) continue;
+        let found = false;
+        if (raw.startsWith('>=')) {
+          const n = Number.parseInt(raw.slice(2), 10);
+          found = Number.isFinite(n) && result.availability >= n;
+        } else if (raw.startsWith('>')) {
+          const n = Number.parseInt(raw.slice(1), 10);
+          found = Number.isFinite(n) && result.availability > n;
+        } else {
+          const n = Number.parseInt(raw, 10);
+          found = Number.isFinite(n) && result.availability === n;
+        }
+        if (isNot === found) return true;
+      }
+      return false;
+    }
 
     const target = getColumnText(result, filterColumn).toLowerCase();
 
@@ -1539,15 +1569,31 @@
     const tabId = get(activeSearchTabId);
     if (!tabId) return;
     const tab = get(searchTabs).find((t) => t.id === tabId);
-    if (tab?.isSearching) {
-      clearSearchTimeoutForRequest(tab.requestId);
-      searchInvokeSettled.add(tab.requestId);
-      void cancelSearch(tab.requestId).catch(() => { /* best effort */ });
+    const oldRequestId = tab?.requestId;
+    if (tab?.isSearching && oldRequestId != null) {
+      clearSearchTimeoutForRequest(oldRequestId);
+      searchInvokeSettled.add(oldRequestId);
+      void cancelSearch(oldRequestId).catch(() => { /* best effort */ });
+    }
+    // Rotate requestId and drop buffered stream merges so late oneshot /
+    // search-results / flush cannot refill the cleared tab (SF9).
+    const discardedId = oldRequestId;
+    const freshId = newSearchNonce();
+    if (discardedId != null) {
+      clearPendingSearchResults(discardedId);
+      searchInvokeSettled.add(discardedId);
     }
     searchTabs.update((tabs) =>
       tabs.map((t) =>
         t.id === tabId
-          ? { ...t, results: [], error: null, isSearching: false, progress: null }
+          ? {
+              ...t,
+              requestId: freshId,
+              results: [],
+              error: null,
+              isSearching: false,
+              progress: null,
+            }
           : t,
       ),
     );

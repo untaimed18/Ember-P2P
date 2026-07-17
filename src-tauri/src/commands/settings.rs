@@ -567,7 +567,7 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
         // above and the canonicalize-first check in `add_shared_folder`). A
         // not-yet-created folder won't canonicalize — fall back to literal.
         let canonical = path.canonicalize().ok();
-        let scan_paths = std::iter::once(path.to_path_buf()).chain(canonical);
+        let scan_paths = std::iter::once(path.to_path_buf()).chain(canonical.clone());
         for scan_path in scan_paths {
             for component in scan_path.components() {
                 if let std::path::Component::Normal(seg) = component {
@@ -580,6 +580,25 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
                     }
                 }
             }
+        }
+        // Refuse Ember's own data directory (or a parent that covers it).
+        // Mirrors soft_repair / add_shared_folder so a settings save can't
+        // reintroduce a folder that covers config, identity, known.met, …
+        let data_dir = crate::storage::paths::resolve_data_dir();
+        let data_canon = data_dir.canonicalize().unwrap_or(data_dir);
+        let folder_canon = canonical.unwrap_or_else(|| path.to_path_buf());
+        if folder_canon == data_canon
+            || data_canon.starts_with(&folder_canon)
+            || crate::security::path_matches_dir(
+                &data_canon.to_string_lossy(),
+                &folder_canon.to_string_lossy(),
+            )
+        {
+            return Err(coded_ctx(
+                "settings_cannot_share_data_dir",
+                "Cannot share Ember data directory or a parent of it",
+                folder,
+            ));
         }
     }
     for (index, folder) in settings.shared_folders.iter().enumerate() {

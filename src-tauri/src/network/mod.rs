@@ -3211,8 +3211,8 @@ async fn mark_download_insufficient(
     app_handle: &tauri::AppHandle,
     transfer_id: &str,
     file_name: &str,
-) {
-    {
+) -> Vec<Transfer> {
+    let promoted = {
         let mut mgr = transfer_manager.write().await;
         // Stop any still-running workers so they do not keep retrying
         // writes against a full volume.
@@ -3226,7 +3226,9 @@ async fn mark_download_insufficient(
             Some("insufficient_disk".to_string()),
             Some("disk_space".to_string()),
         );
-    }
+        // Free the concurrent slot and promote the next queued download (T2).
+        mgr.promote_available()
+    };
     if let Err(e) = db.update_transfer_status(transfer_id, "insufficient") {
         warn!("DB update_transfer_status('insufficient') failed for {transfer_id}: {e}");
     }
@@ -3241,6 +3243,7 @@ async fn mark_download_insufficient(
             "file_name": file_name,
         }),
     );
+    promoted
 }
 
 struct PendingKeywordSearch {
@@ -4347,14 +4350,14 @@ fn finalize_removed_searches(
 }
 
 /// Like [`finalize_removed_searches`], but when capacity eviction already
-/// extracted `FindKeyword` result entries, deliver those via the oneshot
-/// instead of dropping them with the removed `SearchState`.
+/// extracted FindKeyword / FindSource / FindNotes result entries, deliver or
+/// inject those instead of dropping them with the removed `SearchState`.
 fn finalize_removed_searches_with_keyword_results(
     state: &mut NetworkState,
     app_handle: &tauri::AppHandle,
     removed_sids: &[SearchId],
     released_in_use: &[KadId],
-    keyword_results: &HashMap<SearchId, Vec<kad::messages::SearchResultEntry>>,
+    preserved_results: &HashMap<SearchId, Vec<kad::messages::SearchResultEntry>>,
 ) {
     if !released_in_use.is_empty() {
         state.routing_table.release_contacts_in_use(released_in_use);
@@ -4368,7 +4371,7 @@ fn finalize_removed_searches_with_keyword_results(
             ..
         }) = state.pending_keyword_searches.remove(sid)
         {
-            if let Some(entries) = keyword_results.get(sid) {
+            if let Some(entries) = preserved_results.get(sid) {
                 if !entries.is_empty() {
                     let mut network_results = convert_search_results(entries, |ip| {
                         is_search_source_safe(state, ip)
@@ -4396,12 +4399,127 @@ fn finalize_removed_searches_with_keyword_results(
             maybe_finish_active_search(state, app_handle, request_id);
         }
         if let Some((_, tx)) = state.pending_source_searches.remove(sid) {
-            let _ = tx.send(Ok(Vec::new()));
+            // Prefer delivering collected sources; otherwise signal busy so
+            // callers do not treat capacity eviction as an empty success (S8).
+            if let Some(entries) = preserved_results.get(sid) {
+                let all = extract_kad_sources(entries);
+                for s in &all {
+                    if !s.ip.is_unspecified() && s.tcp_port != 0 {
+                        if s.is_ember_capable
+                            && state.ember_capable_peers.len() < MAX_EMBER_CAPABLE_PEERS
+                        {
+                            state.ember_capable_peers.insert((s.ip, s.tcp_port));
+                        }
+                        if let Some(npub) = s.ember_noise_pub {
+                            let _ = record_ember_noise_key(
+                                &mut state.ember_noise_keys,
+                                s.ip,
+                                s.tcp_port,
+                                npub,
+                            );
+                        }
+                    }
+                }
+                let sources: Vec<(String, u16)> = all
+                    .into_iter()
+                    .filter(|s| !is_self_source(s, state))
+                    .map(|s| (s.ip.to_string(), s.tcp_port))
+                    .collect();
+                let _ = tx.send(Ok(sources));
+            } else {
+                let _ = tx.send(Err(
+                    "Source search busy: KAD search capacity reached".to_string(),
+                ));
+            }
         }
         if let Some((_, tx)) = state.pending_notes_searches.remove(sid) {
-            let _ = tx.send(Ok(Vec::new()));
+            if let Some(entries) = preserved_results.get(sid) {
+                // Notes conversion forces the searched file hash onto results;
+                // use the first entry id (Kad key) or zeros if empty after filter.
+                let target = entries
+                    .first()
+                    .map(|e| e.id)
+                    .unwrap_or(KadId([0u8; 16]));
+                let notes = convert_note_search_results(entries, &target);
+                let _ = tx.send(Ok(notes));
+            } else {
+                let _ = tx.send(Err(
+                    "Notes search busy: KAD search capacity reached".to_string(),
+                ));
+            }
         }
-        state.download_source_searches.remove(sid);
+        // Download-backed FindSource: inject any collected sources before
+        // dropping the mapping so capacity eviction does not discard them (S9).
+        if let Some((transfer_id, file_hash)) = state.download_source_searches.remove(sid) {
+            if let Some(entries) = preserved_results.get(sid) {
+                let all = extract_kad_sources(entries);
+                for s in &all {
+                    if !s.ip.is_unspecified() && s.tcp_port != 0 {
+                        if s.is_ember_capable
+                            && state.ember_capable_peers.len() < MAX_EMBER_CAPABLE_PEERS
+                        {
+                            state.ember_capable_peers.insert((s.ip, s.tcp_port));
+                        }
+                        if let Some(npub) = s.ember_noise_pub {
+                            let _ = record_ember_noise_key(
+                                &mut state.ember_noise_keys,
+                                s.ip,
+                                s.tcp_port,
+                                npub,
+                            );
+                        }
+                    }
+                }
+                let kad_sources: Vec<KadSource> = all
+                    .into_iter()
+                    .filter(|s| !is_self_source(s, state))
+                    .collect();
+                let direct: Vec<&KadSource> = kad_sources
+                    .iter()
+                    .filter(|s| {
+                        s.buddy_ip.is_none()
+                            && s.tcp_port != 0
+                            && !s.ip.is_unspecified()
+                            && s.lowid == 0
+                    })
+                    .collect();
+                if !direct.is_empty() {
+                    let matching = [transfer_id.clone()];
+                    let mut injected = 0usize;
+                    for ds in &direct {
+                        let source = DownloadSource {
+                            peer_ip: ds.ip.to_string(),
+                            peer_port: ds.tcp_port,
+                            available_parts: Vec::new(),
+                            peer_user_hash: ds.source_user_hash,
+                            peer_connect_options: Some(ds.connect_options),
+                        };
+                        let stats = inject_source_into_active_transfers(
+                            state,
+                            file_hash,
+                            &matching,
+                            &source,
+                            ds.udp_port,
+                        );
+                        injected += stats.injected + stats.persisted;
+                    }
+                    if let Some(pd) = state.pending_downloads.get_mut(&transfer_id) {
+                        pd.last_search_at = 0;
+                    }
+                    if injected > 0 {
+                        info!(
+                            "Evicted download source search {}: preserved {} source(s) for {}",
+                            sid.0, injected, transfer_id
+                        );
+                        let _ = app_handle.emit(
+                            "transfer:sources-updated",
+                            serde_json::json!({ "transfer_id": transfer_id }),
+                        );
+                    }
+                }
+            }
+            state.source_search_stream_cursor.remove(sid);
+        }
         state.store_keyword_searches.remove(sid);
         state.store_source_searches.remove(sid);
         state.pending_note_publishes.remove(sid);
@@ -4419,7 +4537,7 @@ fn start_kad_search(
     search_type: SearchType,
     initial_contacts: Vec<KadContact>,
 ) -> SearchId {
-    let (sid, evicted, released, keyword_results) =
+    let (sid, evicted, released, preserved_results) =
         state
             .search_manager
             .start_search(target, search_type, initial_contacts);
@@ -4429,7 +4547,7 @@ fn start_kad_search(
             app_handle,
             &evicted,
             &released,
-            &keyword_results,
+            &preserved_results,
         );
     }
     sid
@@ -5005,21 +5123,21 @@ async fn try_start_pending_download_from_known_sources(
     }
 
     // Only start transfers that are actively waiting for sources / slots.
-    // Queued rows discover sources but must wait for promotion. Paused /
-    // Stopped / Insufficient / terminal must never dial from a stale pending.
+    // Must be in the active map (promoted). Queued-in-queue waits for
+    // promote_next; Paused / Stopped / Insufficient / terminal must never
+    // dial from a stale pending. Queued-in-active is a promoted row that
+    // still needs a worker (T2 promote-after-insufficient).
     {
         let mgr = transfer_manager.read().await;
-        let allowed = mgr
-            .get_transfer(transfer_id)
-            .map(|t| {
-                matches!(
-                    t.status,
-                    TransferStatus::Searching
-                        | TransferStatus::Active
-                        | TransferStatus::Hashing
-                )
-            })
-            .unwrap_or(false);
+        let allowed = mgr.active.get(transfer_id).is_some_and(|t| {
+            matches!(
+                t.status,
+                TransferStatus::Searching
+                    | TransferStatus::Active
+                    | TransferStatus::Hashing
+                    | TransferStatus::Queued
+            )
+        });
         if !allowed {
             return false;
         }
@@ -8793,7 +8911,7 @@ pub async fn start_network(
                                 .unwrap_or_default()
                         };
                         state.pending_downloads.remove(transfer_id);
-                        mark_download_insufficient(
+                        let freed_slots = mark_download_insufficient(
                             &transfer_manager,
                             &db,
                             &app_handle,
@@ -8801,6 +8919,72 @@ pub async fn start_network(
                             &file_name,
                         )
                         .await;
+                        // Start any downloads promoted into the freed concurrent
+                        // slots before continuing (T2).
+                        for t in freed_slots {
+                            crate::commands::transfers::emit_transfer_status(
+                                &app_handle,
+                                &t.id,
+                                &t.status,
+                            );
+                            let control = TransferControl::new();
+                            {
+                                let mut mgr = transfer_manager.write().await;
+                                mgr.register_control(&t.id, control.clone());
+                            }
+                            handle_command(
+                                &udp_socket,
+                                NetworkCommand::StartDownload {
+                                    file_hash: t.file_hash.clone(),
+                                    file_name: t.file_name.clone(),
+                                    file_size: t.total_size,
+                                    peer_ip: t
+                                        .peer_id
+                                        .split(':')
+                                        .next()
+                                        .unwrap_or("")
+                                        .to_string(),
+                                    peer_port: t
+                                        .peer_id
+                                        .split(':')
+                                        .nth(1)
+                                        .and_then(|p| p.parse().ok())
+                                        .unwrap_or(0),
+                                    extra_sources: Vec::new(),
+                                    transfer_id: t.id.clone(),
+                                    control,
+                                    discovery_only: false,
+                                },
+                                &mut state,
+                                &local_index,
+                                &fresh_part_hashes,
+                                &settings,
+                                &dl_event_tx,
+                                &bandwidth_limiter,
+                                &db,
+                                &app_handle,
+                                &transfer_manager,
+                                &source_manager,
+                                &credit_manager,
+                                &mut stats_manager,
+                                &mut known_files,
+                                &server_udp,
+                                &firewall_probe_ips,
+                                &shared_banned_ips,
+                                &shared_banned_hashes,
+                                &shared_server_addr,
+                                &shared_ember_payload,
+                                &ember_payload_generation,
+                                &geoip,
+                                &friend_hashes,
+                                ember_hash,
+                                &ul_event_tx,
+                                ed25519_pubkey,
+                                ed25519_secret_key,
+                                &upload_queue_handle,
+                            )
+                            .await;
+                        }
                         // Must not fall through to handle_download_event →
                         // fail()/transfer-failed, which would overwrite the
                         // resumable Insufficient state as Failed.
@@ -8814,27 +8998,57 @@ pub async fn start_network(
                             mgr.get_transfer(transfer_id).cloned()
                         };
                         if let Some(t) = transfer_info {
+                            // Pause/Stop/Insufficient must not be undone by a
+                            // late Failed requeue (T1/T3).
+                            if matches!(
+                                t.status,
+                                TransferStatus::Paused
+                                    | TransferStatus::Stopped
+                                    | TransferStatus::Insufficient
+                            ) {
+                                continue;
+                            }
                             let control = TransferControl::new();
                             let health_update = {
                                 let mut mgr = transfer_manager.write().await;
-                                if let Some(active_t) = mgr.active.get_mut(transfer_id) {
-                                    active_t.status = TransferStatus::Searching;
-                                    active_t.speed = 0;
+                                // Re-check under write lock — status can flip
+                                // between the read above and here.
+                                let blocked = mgr.get_transfer(transfer_id).is_some_and(|row| {
+                                    matches!(
+                                        row.status,
+                                        TransferStatus::Paused
+                                            | TransferStatus::Stopped
+                                            | TransferStatus::Insufficient
+                                    )
+                                });
+                                if blocked {
+                                    None
+                                } else {
+                                    if let Some(active_t) = mgr.active.get_mut(transfer_id) {
+                                        active_t.status = TransferStatus::Searching;
+                                        active_t.speed = 0;
+                                    }
+                                    mgr.set_failure_context(
+                                        transfer_id,
+                                        Some(failure_summary.clone()),
+                                        Some(failure_kind_name.clone()),
+                                        Some(failure_stage.clone()),
+                                    );
+                                    let update = mgr.set_health_state(
+                                        transfer_id,
+                                        TransferHealth::Degraded,
+                                        Some(format!(
+                                            "Retrying after {}",
+                                            failure_summary.to_lowercase()
+                                        )),
+                                        chrono::Utc::now().timestamp(),
+                                    );
+                                    mgr.register_control(transfer_id, control.clone());
+                                    Some(update)
                                 }
-                                mgr.set_failure_context(
-                                    transfer_id,
-                                    Some(failure_summary.clone()),
-                                    Some(failure_kind_name.clone()),
-                                    Some(failure_stage.clone()),
-                                );
-                                let update = mgr.set_health_state(
-                                    transfer_id,
-                                    TransferHealth::Degraded,
-                                    Some(format!("Retrying after {}", failure_summary.to_lowercase())),
-                                    chrono::Utc::now().timestamp(),
-                                );
-                                mgr.register_control(transfer_id, control.clone());
-                                update
+                            };
+                            let Some(health_update) = health_update else {
+                                continue;
                             };
                             {
                                 if let Some(update) = health_update.as_ref() {
@@ -10503,7 +10717,9 @@ pub async fn start_network(
 
                         let new_results = search.results.len();
                         let stream_threshold = if pending.last_streamed_count == 0 { 1 } else { 20 };
-                        if new_results > pending.last_streamed_count + stream_threshold {
+                        // `>=` so the first batch streams at 1 result and later
+                        // batches every 20 new results (strict `>` was off-by-one).
+                        if new_results >= pending.last_streamed_count + stream_threshold {
                             let new_entries = &search.results[pending.last_streamed_count..];
                             let mut batch = convert_search_results(new_entries, |ip| {
                                 is_search_source_safe(&state, ip)
@@ -15657,7 +15873,7 @@ pub async fn start_network(
                 }
                 for (tid, file_name) in insufficient_downloads {
                     state.pending_downloads.remove(&tid);
-                    mark_download_insufficient(
+                    let freed = mark_download_insufficient(
                         &transfer_manager,
                         &db,
                         &app_handle,
@@ -15665,6 +15881,52 @@ pub async fn start_network(
                         &file_name,
                     )
                     .await;
+                    for t in freed {
+                        crate::commands::transfers::emit_transfer_status(
+                            &app_handle,
+                            &t.id,
+                            &t.status,
+                        );
+                        let control = TransferControl::new();
+                        {
+                            let mut mgr = transfer_manager.write().await;
+                            mgr.register_control(&t.id, control.clone());
+                        }
+                        state.pending_downloads.insert(
+                            t.id.clone(),
+                            PendingDownload {
+                                transfer_id: t.id.clone(),
+                                file_hash: t.file_hash.clone(),
+                                file_name: t.file_name.clone(),
+                                file_size: t.total_size,
+                                control,
+                                search_count: 0,
+                                last_search_at: 0,
+                                priority: priority_str_to_u32(&t.priority),
+                            },
+                        );
+                        let _ = try_start_pending_download_from_known_sources(
+                            &mut state,
+                            &t.id,
+                            &transfer_manager,
+                            &source_manager,
+                            &credit_manager,
+                            &bandwidth_limiter,
+                            &dl_event_tx,
+                            &app_handle,
+                            &settings,
+                            &shared_ember_payload,
+                            &ember_payload_generation,
+                            &shared_banned_ips,
+                            &geoip,
+                            &friend_hashes,
+                            ember_hash,
+                            ed25519_pubkey,
+                            ed25519_secret_key,
+                            &stats_manager.sx_counters,
+                        )
+                        .await;
+                    }
                 }
 
                 // High-priority downloads get processed first
@@ -15792,7 +16054,7 @@ pub async fn start_network(
                         let needed = remaining_download_bytes(pending.file_size, completed);
                         if !check_disk_space(&dl_dir, needed) {
                             warn!("Skipping download {} ({}): insufficient disk space", tid, pending.file_name);
-                            mark_download_insufficient(
+                            let freed = mark_download_insufficient(
                                 &transfer_manager,
                                 &db,
                                 &app_handle,
@@ -15800,6 +16062,31 @@ pub async fn start_network(
                                 &pending.file_name,
                             )
                             .await;
+                            for t in freed {
+                                crate::commands::transfers::emit_transfer_status(
+                                    &app_handle,
+                                    &t.id,
+                                    &t.status,
+                                );
+                                let control = TransferControl::new();
+                                {
+                                    let mut mgr = transfer_manager.write().await;
+                                    mgr.register_control(&t.id, control.clone());
+                                }
+                                state.pending_downloads.insert(
+                                    t.id.clone(),
+                                    PendingDownload {
+                                        transfer_id: t.id.clone(),
+                                        file_hash: t.file_hash.clone(),
+                                        file_name: t.file_name.clone(),
+                                        file_size: t.total_size,
+                                        control,
+                                        search_count: 0,
+                                        last_search_at: 0,
+                                        priority: priority_str_to_u32(&t.priority),
+                                    },
+                                );
+                            }
                             continue;
                         }
                         let source_count = ready_sources.len() as u32;
@@ -15959,7 +16246,7 @@ pub async fn start_network(
                         let needed = remaining_download_bytes(pending.file_size, completed);
                         if !check_disk_space(&dl_dir, needed) {
                             warn!("Skipping download {} ({}): insufficient disk space", tid, pending.file_name);
-                            mark_download_insufficient(
+                            let freed = mark_download_insufficient(
                                 &transfer_manager,
                                 &db,
                                 &app_handle,
@@ -15967,6 +16254,31 @@ pub async fn start_network(
                                 &pending.file_name,
                             )
                             .await;
+                            for t in freed {
+                                crate::commands::transfers::emit_transfer_status(
+                                    &app_handle,
+                                    &t.id,
+                                    &t.status,
+                                );
+                                let control = TransferControl::new();
+                                {
+                                    let mut mgr = transfer_manager.write().await;
+                                    mgr.register_control(&t.id, control.clone());
+                                }
+                                state.pending_downloads.insert(
+                                    t.id.clone(),
+                                    PendingDownload {
+                                        transfer_id: t.id.clone(),
+                                        file_hash: t.file_hash.clone(),
+                                        file_name: t.file_name.clone(),
+                                        file_size: t.total_size,
+                                        control,
+                                        search_count: 0,
+                                        last_search_at: 0,
+                                        priority: priority_str_to_u32(&t.priority),
+                                    },
+                                );
+                            }
                             continue;
                         }
                         let source_count = live_sources.len() as u32;
@@ -18032,7 +18344,7 @@ pub async fn start_network(
                         let user_hash = state.user_hash;
                         let nickname = settings.nickname.clone();
                         let tcp_port = state.tcp_port;
-                        let force_plain = state.server_reconnect_failures >= 3;
+                        let force_plain = state.server_reconnect_failures >= 2;
                         let obfuscation_enabled = state.obfuscation_enabled;
                         state.server_last_connect_attempt = Some(std::time::Instant::now());
                         // Pre-set server addr so upload handler can detect HighID port test callbacks
@@ -25922,6 +26234,15 @@ async fn handle_command_inner(
             // Remove from pending_downloads so no new searches are started
             let removed_pending = state.pending_downloads.remove(&transfer_id);
 
+            // Cancel control first so detached per-source tasks bail before
+            // we ACK cleanup / delete .part files (N1).
+            {
+                let mgr = transfer_manager.read().await;
+                if let Some(control) = mgr.get_control(&transfer_id) {
+                    control.cancel();
+                }
+            }
+
             // Find and stop all active KAD source searches for this transfer
             let search_ids: Vec<SearchId> = state
                 .download_source_searches
@@ -26022,6 +26343,14 @@ async fn handle_command_inner(
         NetworkCommand::PauseDownload { transfer_id } => {
             // eMule PauseFile: tear down active network state but keep source
             // knowledge so the download can be resumed quickly.
+            // Cancel the shared control BEFORE aborting the worker so detached
+            // per-source tasks observe teardown cooperatively (N1 / KadDisconnect).
+            {
+                let mgr = transfer_manager.read().await;
+                if let Some(control) = mgr.get_control(&transfer_id) {
+                    control.cancel();
+                }
+            }
             if let Some(handle) = state.download_handles.remove(&transfer_id) {
                 save_registered_part_tracker(&state, &transfer_id, "pause").await;
                 handle.abort();
@@ -29138,17 +29467,16 @@ async fn handle_command_inner(
                                                 db_for_clear.clear_friend_address(&hash_hex_clear)
                                             })
                                             .await;
-                                            // EmberFriendSearchFailed not
-                                            // EmberFriendDisconnected: we never
-                                            // had a session and emitting offline
-                                            // / browse-error / scheduling a
-                                            // reconnect would just dogpile.
-                                            let _ = ul_tx2.send(upload_server::UploadEvent {
-                                            transfer_id: String::new(),
-                                            kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
-                                        }).await;
                                         }
                                     }
+                                    // Always release the outbound-task slot
+                                    // (success or failure). On Ok the live
+                                    // session lives in ember_sessions; the
+                                    // slot only gated this connect attempt.
+                                    let _ = ul_tx2.send(upload_server::UploadEvent {
+                                        transfer_id: String::new(),
+                                        kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
+                                    }).await;
                                 });
                             } else {
                                 // Stored IP wasn't a parseable v4 address —
@@ -29193,7 +29521,6 @@ async fn handle_command_inner(
                                 hex::encode(friend_eh)
                             );
                             tokio::spawn(async move {
-                                let mut session_alive = false;
                                 match crate::network::rendezvous::lookup(&rv_url, &friend_eh).await
                                 {
                                     Ok(Some((ip, port))) => {
@@ -29219,7 +29546,6 @@ async fn handle_command_inner(
                                         .await
                                         {
                                             Ok(handle) => {
-                                                session_alive = true;
                                                 let msg_bytes = msg.as_bytes();
                                                 let mut packet =
                                                     Vec::with_capacity(6 + msg_bytes.len());
@@ -29272,23 +29598,16 @@ async fn handle_command_inner(
                                         let _ = tx.send(Err("Friend is offline".into()));
                                     }
                                 }
-                                if !session_alive {
-                                    // No live session was opened for
-                                    // `friend_eh`; release the outbound
-                                    // task slot so the next chat / browse
-                                    // / auto-retry can proceed without
-                                    // waiting for the 10-min TTL sweep.
-                                    // EmberFriendSearchFailed (not
-                                    // EmberFriendDisconnected) avoids the
-                                    // misleading offline UI events and
-                                    // the automatic reconnect cycle that
-                                    // would just hammer the same
-                                    // unreachable peer.
-                                    let _ = ultx2.send(upload_server::UploadEvent {
+                                // Always release the outbound-task slot
+                                // (success or failure) so the next chat /
+                                // browse / auto-retry isn't blocked for
+                                // the 10-min TTL. EmberFriendSearchFailed
+                                // (not EmberFriendDisconnected) avoids
+                                // misleading offline UI events.
+                                let _ = ultx2.send(upload_server::UploadEvent {
                                     transfer_id: String::new(),
                                     kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
                                 }).await;
-                                }
                             });
                         }
                     }
@@ -29302,6 +29621,8 @@ async fn handle_command_inner(
         } => {
             if settings.friend_browse_disabled {
                 let _ = tx.send(Err("Browse is disabled in Friends settings".into()));
+            } else if !friend_hashes.read().await.contains(&friend_eh) {
+                let _ = tx.send(Err("Can only browse friends".into()));
             } else {
                 let sessions = state.ember_sessions.read().await;
                 // See the identical `filter(|h| h.is_fresh())` in
@@ -29429,12 +29750,16 @@ async fn handle_command_inner(
                                                 db3.clear_friend_address(&hash_hex_clear)
                                             })
                                             .await;
-                                            let _ = ul_tx2.send(upload_server::UploadEvent {
-                                                transfer_id: String::new(),
-                                                kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
-                                            }).await;
                                         }
                                     }
+                                    // Always release the outbound-task slot
+                                    // (success or failure). On Ok the live
+                                    // session lives in ember_sessions; the
+                                    // slot only gated this connect attempt.
+                                    let _ = ul_tx2.send(upload_server::UploadEvent {
+                                        transfer_id: String::new(),
+                                        kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
+                                    }).await;
                                 });
                             } else {
                                 // Stored IP isn't a parseable v4 address; wipe
@@ -29475,7 +29800,6 @@ async fn handle_command_inner(
                                 hex::encode(friend_eh)
                             );
                             tokio::spawn(async move {
-                                let mut session_alive = false;
                                 match crate::network::rendezvous::lookup(&rv_url, &friend_eh).await
                                 {
                                     Ok(Some((ip, port))) => {
@@ -29501,7 +29825,6 @@ async fn handle_command_inner(
                                         .await
                                         {
                                             Ok(handle) => {
-                                                session_alive = true;
                                                 let mut packet = Vec::with_capacity(6);
                                                 packet.push(OP_EMULEPROT);
                                                 let size: u32 = 1;
@@ -29538,18 +29861,13 @@ async fn handle_command_inner(
                                         let _ = tx.send(Err("Friend is offline".into()));
                                     }
                                 }
-                                if !session_alive {
-                                    // No session opened; release the
-                                    // outbound-task slot so subsequent
-                                    // commands or auto-retry can proceed.
-                                    // EmberFriendSearchFailed not
-                                    // EmberFriendDisconnected — see chat
-                                    // path for rationale.
-                                    let _ = ultx2.send(upload_server::UploadEvent {
-                                        transfer_id: String::new(),
-                                        kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
-                                    }).await;
-                                }
+                                // Always release the outbound-task slot
+                                // (success or failure). EmberFriendSearchFailed
+                                // not EmberFriendDisconnected — see chat path.
+                                let _ = ultx2.send(upload_server::UploadEvent {
+                                    transfer_id: String::new(),
+                                    kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
+                                }).await;
                             });
                         }
                     }
@@ -29621,6 +29939,11 @@ async fn handle_command_inner(
             tx,
         } => {
             let hash_hex = hex::encode(target_hash);
+
+            if !friend_hashes.read().await.contains(&target_hash) {
+                let _ = tx.send(Err("Can only retry search for friends".into()));
+                return;
+            }
 
             if state.online_friends.contains_key(&target_hash)
                 || state

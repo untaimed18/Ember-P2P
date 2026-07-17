@@ -462,7 +462,10 @@ pub(crate) fn is_queue_detached_error(error: &str) -> bool {
 /// would otherwise steadily degrade and eventually evict a transfer's best
 /// peers. eMule treats a user pause/stop as a clean teardown.
 pub(crate) fn is_user_cancel_error(error: &str) -> bool {
-    error.contains("cancelled by user") || error.contains("cancelled while paused")
+    let lower = error.to_ascii_lowercase();
+    lower.contains("cancelled by user")
+        || lower.contains("cancelled while paused")
+        || lower.contains("download cancelled")
 }
 
 #[cfg(test)]
