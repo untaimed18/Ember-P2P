@@ -72,6 +72,10 @@ impl SxOverheadCounters {
 
 pub type SharedSxOverheadCounters = Arc<SxOverheadCounters>;
 
+/// Lock-free KAD upload wire-byte counter. Populated by `send_kad_packet`;
+/// drained into `OverheadCategory::Kad` on the 1s stats tick.
+pub type SharedKadUploadOverhead = Arc<AtomicU64>;
+
 pub struct StatsManager {
     pub stats: TransferStats,
     down_rate_history: VecDeque<(i64, u64)>,
@@ -81,6 +85,7 @@ pub struct StatsManager {
     pub session_down_counter: Arc<AtomicU64>,
     pub session_up_counter: Arc<AtomicU64>,
     pub sx_counters: SharedSxOverheadCounters,
+    pub kad_upload_bytes: SharedKadUploadOverhead,
     /// Monotonic session-start marker for connection-time accounting.
     /// `session_start_time` is a wall-clock timestamp kept for "session
     /// started at" display; elapsed connection time must use this Instant
@@ -105,6 +110,7 @@ impl StatsManager {
             session_down_counter: Arc::new(AtomicU64::new(0)),
             session_up_counter: Arc::new(AtomicU64::new(0)),
             sx_counters: Arc::new(SxOverheadCounters::default()),
+            kad_upload_bytes: Arc::new(AtomicU64::new(0)),
             session_start_instant: std::time::Instant::now(),
         }
     }
@@ -130,6 +136,10 @@ impl StatsManager {
                 OverheadDirection::Download,
                 down,
             );
+        }
+        let kad_up = self.kad_upload_bytes.swap(0, Ordering::Relaxed);
+        if kad_up > 0 {
+            self.add_overhead(OverheadCategory::Kad, OverheadDirection::Upload, kad_up);
         }
     }
 
@@ -330,6 +340,10 @@ impl StatsManager {
 #[derive(Debug, Clone, Copy)]
 pub enum OverheadCategory {
     Kad,
+    /// Reserved for peer TCP file-request / handshake protocol bytes.
+    /// Formerly mis-attributed KAD source-search initiation estimates;
+    /// those now flow through `send_kad_packet` → Kad upload.
+    #[allow(dead_code)]
     FileRequest,
     Server,
     SourceExchange,

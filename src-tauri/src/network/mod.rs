@@ -3774,6 +3774,8 @@ struct NetworkState {
     shared_buddy_info: upload_server::SharedBuddyInfo,
     /// Shared IP filter snapshot for the upload handler
     shared_ip_filter: kad::ip_filter::SharedIpFilter,
+    /// Lock-free KAD upload wire bytes (drained into StatsManager each second)
+    kad_upload_overhead: crate::storage::statistics::SharedKadUploadOverhead,
     /// Event receiver for our buddy connection (we are firewalled)
     buddy_event_rx: Option<mpsc::Receiver<BuddyEvent>>,
     /// Event receiver for the client we're serving as buddy for
@@ -6296,6 +6298,9 @@ pub async fn start_network(
 
     let shared_ip_filter = ip_filter.create_shared_snapshot();
     routing_table.set_ip_filter(shared_ip_filter.clone());
+    // Shared with StatsManager below so send_kad_packet can record wire
+    // bytes without holding the manager.
+    let kad_upload_overhead = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     let mut dht_store = DhtStore::new();
     dht_store.set_local_id(local_id);
@@ -6530,6 +6535,7 @@ pub async fn start_network(
         pending_buddy_hashes: pending_buddy_hashes.clone(),
         shared_buddy_info: shared_buddy_info.clone(),
         shared_ip_filter: shared_ip_filter.clone(),
+        kad_upload_overhead: kad_upload_overhead.clone(),
         buddy_event_rx: None,
         serving_event_rx: None,
         pending_outgoing_buddy: None,
@@ -6630,6 +6636,7 @@ pub async fn start_network(
     // Initialize statistics manager
     let mut stats_manager = StatsManager::new();
     stats_manager.load_cumulative(&db);
+    stats_manager.kad_upload_bytes = kad_upload_overhead;
 
     // Rate-limit DB persistence of download progress. DownloadEvent::Progress
     // fires many times per second per active download (one per block landing
@@ -18483,14 +18490,21 @@ pub async fn start_network(
                     let idx = server_udp_ping_idx % server_count;
                     server_udp_ping_idx = server_udp_ping_idx.wrapping_add(1);
                     let server = state.server_list.servers()[idx].clone();
-                    if let Err(e) = server_udp.send_status_ping(&server).await {
-                        debug!("Server UDP ping to {}:{} failed: {e}", server.ip, server.port);
-                    } else {
-                        stats_manager.add_overhead(
-                            crate::storage::statistics::OverheadCategory::Server,
-                            crate::storage::statistics::OverheadDirection::Upload,
-                            32,
-                        );
+                    match server_udp.send_status_ping(&server).await {
+                        Ok(bytes) if bytes > 0 => {
+                            stats_manager.add_overhead(
+                                crate::storage::statistics::OverheadCategory::Server,
+                                crate::storage::statistics::OverheadDirection::Upload,
+                                bytes as u64,
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            debug!(
+                                "Server UDP ping to {}:{} failed: {e}",
+                                server.ip, server.port
+                            );
+                        }
                     }
                 }
                 while let Some((recv_len, resp)) = {
@@ -22294,8 +22308,17 @@ async fn send_kad_packet(
     } else {
         socket.send_to(packet, addr).await
     };
-    if let Err(e) = &result {
-        debug!("UDP send to {addr} failed: {e}");
+    match &result {
+        Ok(n) => {
+            if *n > 0 {
+                state
+                    .kad_upload_overhead
+                    .fetch_add(*n as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        Err(e) => {
+            debug!("UDP send to {addr} failed: {e}");
+        }
     }
     result
 }
@@ -26198,11 +26221,6 @@ async fn handle_command_inner(
                     break 'kad false;
                 }
 
-                stats_manager.add_overhead(
-                    crate::storage::statistics::OverheadCategory::Kad,
-                    crate::storage::statistics::OverheadDirection::Upload,
-                    64,
-                );
                 let sid = start_kad_search(
                     state,
                     app_handle,
@@ -26572,11 +26590,6 @@ async fn handle_command_inner(
                             state
                                 .download_source_searches
                                 .insert(sid, (transfer_id.clone(), hash_bytes));
-                            stats_manager.add_overhead(
-                                crate::storage::statistics::OverheadCategory::FileRequest,
-                                crate::storage::statistics::OverheadDirection::Upload,
-                                48,
-                            );
                             info!(
                                 "Started KAD source search {} for queued/paused download {}",
                                 sid.0, transfer_id
@@ -26899,11 +26912,6 @@ async fn handle_command_inner(
                             state
                                 .download_source_searches
                                 .insert(sid, (transfer_id.clone(), hash_bytes));
-                            stats_manager.add_overhead(
-                                crate::storage::statistics::OverheadCategory::FileRequest,
-                                crate::storage::statistics::OverheadDirection::Upload,
-                                48,
-                            );
                             info!(
                                 "Started KAD source search {} for new active download {}",
                                 sid.0, transfer_id
@@ -27085,11 +27093,6 @@ async fn handle_command_inner(
                         state
                             .download_source_searches
                             .insert(sid, (transfer_id.clone(), fh));
-                        stats_manager.add_overhead(
-                            crate::storage::statistics::OverheadCategory::FileRequest,
-                            crate::storage::statistics::OverheadDirection::Upload,
-                            48,
-                        );
                         info!(
                             "Started source search {} for download {}",
                             sid.0, transfer_id
@@ -27969,6 +27972,9 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::GetIpFilterStats { tx } => {
+            state
+                .ip_filter
+                .collect_shared_hits(&state.shared_ip_filter);
             let _ = tx.send(state.ip_filter.get_stats());
         }
 

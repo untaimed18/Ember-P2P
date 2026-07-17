@@ -144,7 +144,18 @@
   let unmounted = false;
 
   onMount(() => {
-    loadStats();
+    void (async () => {
+      await loadStats();
+      // Startup deferred ipfilter load may still be in flight — re-poll
+      // briefly while enabled && !ranges_ready so we don't stick on empty.
+      for (const delay of [500, 1000, 2000, 3000]) {
+        if (unmounted) return;
+        if (!stats?.enabled || stats.ranges_ready) return;
+        await new Promise((r) => setTimeout(r, delay));
+        if (unmounted) return;
+        await loadStats();
+      }
+    })();
     return () => { unmounted = true; clearTimeout(flashTimer); };
   });
 
@@ -212,13 +223,12 @@
     flashTimer = setTimeout(() => (successMsg = null), 4000);
   }
 
-  async function syncIpFilterSettingsCache(patch: {
-    ip_filter_enabled?: boolean;
-    block_private_ips?: boolean;
-  }) {
+  async function syncIpFilterSettingsCache() {
     try {
+      // Backend already persisted the toggled value; do not patch a
+      // possibly-stale getSettings snapshot (rapid on/off races).
       const current = await getSettings();
-      setAppSettings({ ...current, ...patch });
+      setAppSettings(current);
     } catch {
       // Settings page will reload from disk on next visit.
     }
@@ -230,7 +240,23 @@
     togglesInFlight++;
     try {
       await setIpFilterEnabled(next);
-      await syncIpFilterSettingsCache({ ip_filter_enabled: next });
+      await syncIpFilterSettingsCache();
+      // Enable may lazily load ipfilter.dat — refresh so range_count /
+      // ranges_ready / entries match the live filter (SEC-01).
+      await loadStats();
+      // While deferred/lazy load is still in flight, keep polling briefly
+      // so the empty list does not stick (SEC-02).
+      if (next) {
+        for (const delay of [400, 800, 1600]) {
+          if (unmounted) return;
+          if (stats?.ranges_ready && (stats.range_count > 0 || !stats.enabled)) break;
+          if (stats && !stats.enabled) break;
+          await new Promise((r) => setTimeout(r, delay));
+          if (unmounted) return;
+          await loadStats();
+          if (stats?.ranges_ready) break;
+        }
+      }
     } catch (e: unknown) {
       stats.enabled = prev;
       error = toErrorMsg(e);
@@ -245,7 +271,7 @@
     togglesInFlight++;
     try {
       await setBlockPrivateIps(next);
-      await syncIpFilterSettingsCache({ block_private_ips: next });
+      await syncIpFilterSettingsCache();
     } catch (e: unknown) {
       stats.block_private = prev;
       error = toErrorMsg(e);
@@ -261,6 +287,7 @@
       const msg = await downloadAndLoadIpfilter();
       if (unmounted) return;
       flash(msg);
+      await syncIpFilterSettingsCache();
       await loadStats();
     } catch (e: unknown) {
       if (unmounted) return;
@@ -283,6 +310,7 @@
         const msg = await importIpfilterFile(selected as string);
         if (unmounted) return;
         flash(msg);
+        await syncIpFilterSettingsCache();
         await loadStats();
       }
     } catch (e: unknown) {
@@ -314,6 +342,7 @@
       const msg = await updateIpfilterFromUrl(trimmed);
       if (unmounted) return;
       flash(msg);
+      await syncIpFilterSettingsCache();
       await loadStats();
       // Collapse the form on success — saves a click and signals
       // completion. The URL is preserved so users who want to refetch
@@ -349,6 +378,7 @@
     error = null;
     try {
       await addIpFilterRange(startIp, endIp, desc);
+      if (unmounted) return;
       flash(m.security_added_range({ start: startIp, end: endIp }));
       newStartIp = '';
       newEndIp = '';
@@ -356,6 +386,7 @@
       showAddForm = false;
       await loadStats();
     } catch (e: unknown) {
+      if (unmounted) return;
       error = toErrorMsg(e);
     }
   }
@@ -372,10 +403,13 @@
     error = null;
     try {
       await removeIpFilterRange(entry.start_ip, entry.end_ip);
+      if (unmounted) return;
       flash(m.security_removed_range({ start: entry.start_ip, end: entry.end_ip }));
-      await loadStats();
     } catch (e: unknown) {
+      if (unmounted) return;
       error = toErrorMsg(e);
+    } finally {
+      if (!unmounted) await loadStats();
     }
   }
 
@@ -493,6 +527,12 @@
         <span class="inline-stat hits-stat">{m.security_hits_count({ count: stats.total_hits.toLocaleString() })}</span>
       </div>
     </div>
+
+    {#if stats.enabled && !stats.ranges_ready}
+      <div class="banner error-banner" role="alert">
+        <span>{m.security_filter_fail_closed_banner()}</span>
+      </div>
+    {/if}
 
     {#if showAddForm}
       <div class="add-form">

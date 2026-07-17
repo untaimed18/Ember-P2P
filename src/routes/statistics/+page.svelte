@@ -24,6 +24,9 @@
   // UI can render a "—" placeholder instead of zeros (zeros are
   // misleading when the backend is briefly unreachable).
   let repStats = $state<ReputationStatsInfo | null>(null);
+  // True after at least one reputation fetch failed while we still have
+  // no snapshot — drives the unavailable hint under Peer Reputation.
+  let repUnavailable = $state(false);
 
   async function loadStats(opts: { force?: boolean } = {}) {
     if (unmounted) return;
@@ -65,7 +68,15 @@
         ]),
       ]);
       if (unmounted) return;
-      if (repResult.status === 'fulfilled') repStats = repResult.value;
+      if (repResult.status === 'fulfilled') {
+        repStats = repResult.value;
+        repUnavailable = false;
+      } else if (!repStats) {
+        // First successful stats paint with a failed reputation fetch:
+        // keep the section visible with an unavailable hint instead of
+        // hiding Peer Reputation entirely for the session.
+        repUnavailable = true;
+      }
       if (statsResult.status === 'fulfilled') {
         stats = statsResult.value;
         elapsedAtFetch = statsResult.value.session_elapsed_secs ?? 0;
@@ -120,17 +131,21 @@
   // Hero ratio is session-scoped (matches neighbouring session rate/time cards).
   // All-time ratio lives in the cumulative section below.
   let sessionRatio = $derived.by(() => {
-    if (!stats || !stats.session_downloaded) return null;
-    return stats.session_uploaded / stats.session_downloaded;
+    if (!stats) return null;
+    if (stats.session_downloaded > 0) return stats.session_uploaded / stats.session_downloaded;
+    if (stats.session_uploaded > 0) return Number.POSITIVE_INFINITY;
+    return null;
   });
 
   let allTimeRatio = $derived.by(() => {
-    if (!totalDown) return null;
-    return totalUp / totalDown;
+    if (totalDown > 0) return totalUp / totalDown;
+    if (totalUp > 0) return Number.POSITIVE_INFINITY;
+    return null;
   });
 
   function formatRatio(ratio: number | null): string {
     if (ratio === null) return '\u2014';
+    if (!Number.isFinite(ratio)) return '\u221E';
     if (ratio >= 100) return ratio.toFixed(0);
     if (ratio >= 10) return ratio.toFixed(1);
     return ratio.toFixed(2);
@@ -288,7 +303,7 @@
             <span class="big-sub">{m.stats_transferred()}</span>
           </div>
           <div class="big-stat">
-            <span class="big-value">{stats.session_completed_down}</span>
+            <span class="big-value">{stats.session_completed_down.toLocaleString()}</span>
             <span class="big-sub">{m.stats_completed()}</span>
           </div>
         </div>
@@ -311,7 +326,7 @@
             <span class="big-sub">{m.stats_transferred()}</span>
           </div>
           <div class="big-stat">
-            <span class="big-value">{stats.session_completed_up}</span>
+            <span class="big-value">{stats.session_completed_up.toLocaleString()}</span>
             <span class="big-sub">{m.stats_completed()}</span>
           </div>
         </div>
@@ -344,17 +359,17 @@
           <span class="cum-value up-color">{formatBytes(totalUp)}</span>
         </div>
         <div class="cum-item">
-          <span class="cum-label">{m.stats_total_connection_time()}</span>
+          <span class="cum-label">{m.stats_total_uptime()}</span>
           <span class="cum-value">{formatDuration(cumConnTime)}</span>
         </div>
         <div class="cum-item">
           <span class="cum-label">{m.stats_completed_downloads()}</span>
           <!-- cum_ excludes current session (DB snapshot at startup), so addition is intentional -->
-          <span class="cum-value">{stats.cum_completed_down + stats.session_completed_down}</span>
+          <span class="cum-value">{(stats.cum_completed_down + stats.session_completed_down).toLocaleString()}</span>
         </div>
         <div class="cum-item">
           <span class="cum-label">{m.stats_completed_uploads()}</span>
-          <span class="cum-value">{stats.cum_completed_up + stats.session_completed_up}</span>
+          <span class="cum-value">{(stats.cum_completed_up + stats.session_completed_up).toLocaleString()}</span>
         </div>
         <div class="cum-item">
           <span class="cum-label">{m.stats_upload_download_ratio()}</span>
@@ -412,7 +427,9 @@
       attention — a non-zero value means we're actively filtering out
       misbehaving peers. Rendered only when we've had at least one
       successful fetch (`repStats != null`) so a transient backend
-      hiccup doesn't make the row flash zeros and scare the user.
+      hiccup doesn't make the row flash zeros and scare the user. When
+      the fetch keeps failing, show an unavailable hint instead of
+      hiding the section forever.
     -->
     {#if repStats}
       <section class="card">
@@ -424,7 +441,7 @@
             </svg>
           </span>
           <h3>{m.stats_peer_reputation()}</h3>
-          <span class="head-aside">{m.stats_session_tracker()}</span>
+          <span class="head-aside">{m.stats_live_counters()}</span>
         </div>
         <div class="reputation-row">
           <div class="rep-stat">
@@ -444,6 +461,20 @@
             </span>
           </div>
         </div>
+      </section>
+    {:else if stats && repUnavailable}
+      <section class="card">
+        <div class="card-head">
+          <span class="section-icon" aria-hidden="true">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M8 1.5 L2 4 V8 Q2 12.5 8 14.5 Q14 12.5 14 8 V4 Z"/>
+              <polyline points="5.5,8 7.5,10 10.5,6"/>
+            </svg>
+          </span>
+          <h3>{m.stats_peer_reputation()}</h3>
+          <span class="head-aside">{m.stats_live_counters()}</span>
+        </div>
+        <p class="rep-unavailable">{m.stats_reputation_unavailable()}</p>
       </section>
     {/if}
 
@@ -701,5 +732,11 @@
   }
   .rep-value.rep-danger {
     color: var(--danger);
+  }
+  .rep-unavailable {
+    margin: 0;
+    padding: 4px 2px 2px;
+    font-size: 0.85rem;
+    color: var(--text-muted);
   }
 </style>

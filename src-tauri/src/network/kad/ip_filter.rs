@@ -5,12 +5,46 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::Serialize;
 use tracing::{info, warn};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct IpRange {
     start: u32,
     end: u32,
     description: String,
-    hits: u64,
+    /// Atomic so [`IpFilter::is_blocked_readonly`] (and shared-snapshot
+    /// collection) can attribute hits without `&mut self`.
+    hits: AtomicU64,
+}
+
+impl Clone for IpRange {
+    fn clone(&self) -> Self {
+        Self {
+            start: self.start,
+            end: self.end,
+            description: self.description.clone(),
+            hits: AtomicU64::new(self.hits.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+impl IpRange {
+    fn new(start: u32, end: u32, description: String) -> Self {
+        Self {
+            start,
+            end,
+            description,
+            hits: AtomicU64::new(0),
+        }
+    }
+
+    fn hit_count(&self) -> u64 {
+        self.hits.load(Ordering::Relaxed)
+    }
+
+    fn add_hits(&self, n: u64) {
+        if n > 0 {
+            self.hits.fetch_add(n, Ordering::Relaxed);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -27,6 +61,10 @@ pub type SharedIpFilter = std::sync::Arc<std::sync::RwLock<IpFilterSnapshot>>;
 
 pub struct IpFilterSnapshot {
     pub ranges: Vec<(u32, u32)>,
+    /// Per-range hit counters parallel to [`Self::ranges`]. Hot-path blocks
+    /// (upload / KAD / multi-source) only see this snapshot; without these,
+    /// the Security page Hits column stayed at 0 while the header total grew.
+    pub range_hits: Vec<AtomicU64>,
     pub enabled: bool,
     pub block_private: bool,
     /// False while a deferred/on-enable load of `ipfilter.dat` is still in
@@ -34,7 +72,8 @@ pub struct IpFilterSnapshot {
     /// (treats every non-special IP as blocked) so peers cannot slip through
     /// an empty range list at startup.
     pub ranges_ready: bool,
-    /// Hits from range-based (ipfilter.dat) matches.
+    /// Hits from range-based (ipfilter.dat) matches (and fail-closed blocks
+    /// while ranges are still loading).
     pub hit_counter: AtomicU64,
     /// Hits from always-blocked bogus IPs and (when `block_private`) LAN/CGNAT
     /// space. Kept separate from `hit_counter` so [`IpFilter::collect_shared_hits`]
@@ -53,6 +92,13 @@ impl std::fmt::Debug for IpFilterSnapshot {
 }
 
 impl IpFilterSnapshot {
+    fn record_range_hit(&self, idx: usize) {
+        if let Some(counter) = self.range_hits.get(idx) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        self.hit_counter.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn is_blocked(&self, ip: Ipv4Addr) -> bool {
         // Always-unroutable space is rejected regardless of any toggle.
         if crate::security::is_bogus_v4(ip) {
@@ -73,20 +119,16 @@ impl IpFilterSnapshot {
         }
         if self.enabled {
             let ip_u32 = u32::from(ip);
-            if self
-                .ranges
-                .binary_search_by(|&(start, end)| {
-                    if ip_u32 < start {
-                        std::cmp::Ordering::Greater
-                    } else if ip_u32 > end {
-                        std::cmp::Ordering::Less
-                    } else {
-                        std::cmp::Ordering::Equal
-                    }
-                })
-                .is_ok()
-            {
-                self.hit_counter.fetch_add(1, Ordering::Relaxed);
+            if let Ok(idx) = self.ranges.binary_search_by(|&(start, end)| {
+                if ip_u32 < start {
+                    std::cmp::Ordering::Greater
+                } else if ip_u32 > end {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            }) {
+                self.record_range_hit(idx);
                 return true;
             }
         }
@@ -110,20 +152,16 @@ impl IpFilterSnapshot {
         }
         if self.enabled && self.ranges_ready {
             let ip_u32 = u32::from(ip);
-            if self
-                .ranges
-                .binary_search_by(|&(start, end)| {
-                    if ip_u32 < start {
-                        std::cmp::Ordering::Greater
-                    } else if ip_u32 > end {
-                        std::cmp::Ordering::Less
-                    } else {
-                        std::cmp::Ordering::Equal
-                    }
-                })
-                .is_ok()
-            {
-                self.hit_counter.fetch_add(1, Ordering::Relaxed);
+            if let Ok(idx) = self.ranges.binary_search_by(|&(start, end)| {
+                if ip_u32 < start {
+                    std::cmp::Ordering::Greater
+                } else if ip_u32 > end {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            }) {
+                self.record_range_hit(idx);
                 return true;
             }
         }
@@ -135,6 +173,9 @@ impl IpFilterSnapshot {
 pub struct IpFilterStats {
     pub enabled: bool,
     pub block_private: bool,
+    /// False while an enabled filter has not finished (or failed) loading
+    /// ranges — peer paths fail-closed in that window.
+    pub ranges_ready: bool,
     pub range_count: usize,
     pub total_hits: u64,
     pub entries: Vec<IpFilterEntry>,
@@ -191,8 +232,8 @@ impl IpFilter {
         let saved_hits: std::collections::HashMap<(u32, u32), u64> = self
             .blocked_ranges
             .iter()
-            .filter(|r| r.hits > 0)
-            .map(|r| ((r.start, r.end), r.hits))
+            .filter(|r| r.hit_count() > 0)
+            .map(|r| ((r.start, r.end), r.hit_count()))
             .collect();
 
         new_ranges.sort_by_key(|r| r.start);
@@ -200,9 +241,9 @@ impl IpFilter {
         self.merge_overlapping();
 
         if !saved_hits.is_empty() {
-            for r in &mut self.blocked_ranges {
+            for r in &self.blocked_ranges {
                 if let Some(&hits) = saved_hits.get(&(r.start, r.end)) {
-                    r.hits = hits;
+                    r.hits.store(hits, Ordering::Relaxed);
                 }
             }
         }
@@ -339,7 +380,7 @@ impl IpFilter {
                 if last.description.is_empty() && !range.description.is_empty() {
                     last.description = range.description.clone();
                 }
-                last.hits += range.hits;
+                last.add_hits(range.hit_count());
             } else {
                 merged.push(range.clone());
             }
@@ -371,7 +412,7 @@ impl IpFilter {
                     std::cmp::Ordering::Equal
                 }
             }) {
-                self.blocked_ranges[idx].hits += 1;
+                self.blocked_ranges[idx].add_hits(1);
                 self.total_range_hits.fetch_add(1, Ordering::Relaxed);
                 return true;
             }
@@ -380,7 +421,7 @@ impl IpFilter {
     }
 
     /// Check if an IP is blocked without requiring &mut self.
-    /// Increments the atomic total hit counter but not per-range counters.
+    /// Increments both the atomic total and the matching per-range counter.
     pub fn is_blocked_readonly(&self, ip: Ipv4Addr) -> bool {
         if crate::security::is_bogus_v4(ip) {
             self.total_special_hits.fetch_add(1, Ordering::Relaxed);
@@ -396,19 +437,16 @@ impl IpFilter {
         }
         if self.enabled {
             let ip_u32 = u32::from(ip);
-            if self
-                .blocked_ranges
-                .binary_search_by(|range| {
-                    if ip_u32 < range.start {
-                        std::cmp::Ordering::Greater
-                    } else if ip_u32 > range.end {
-                        std::cmp::Ordering::Less
-                    } else {
-                        std::cmp::Ordering::Equal
-                    }
-                })
-                .is_ok()
-            {
+            if let Ok(idx) = self.blocked_ranges.binary_search_by(|range| {
+                if ip_u32 < range.start {
+                    std::cmp::Ordering::Greater
+                } else if ip_u32 > range.end {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            }) {
+                self.blocked_ranges[idx].add_hits(1);
                 self.total_range_hits.fetch_add(1, Ordering::Relaxed);
                 return true;
             }
@@ -429,19 +467,16 @@ impl IpFilter {
         }
         if self.enabled && self.ranges_ready {
             let ip_u32 = u32::from(ip);
-            if self
-                .blocked_ranges
-                .binary_search_by(|range| {
-                    if ip_u32 < range.start {
-                        std::cmp::Ordering::Greater
-                    } else if ip_u32 > range.end {
-                        std::cmp::Ordering::Less
-                    } else {
-                        std::cmp::Ordering::Equal
-                    }
-                })
-                .is_ok()
-            {
+            if let Ok(idx) = self.blocked_ranges.binary_search_by(|range| {
+                if ip_u32 < range.start {
+                    std::cmp::Ordering::Greater
+                } else if ip_u32 > range.end {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            }) {
+                self.blocked_ranges[idx].add_hits(1);
                 self.total_range_hits.fetch_add(1, Ordering::Relaxed);
                 return true;
             }
@@ -491,12 +526,15 @@ impl IpFilter {
 
     /// Create a shared snapshot for use by the upload handler.
     pub fn create_shared_snapshot(&self) -> SharedIpFilter {
+        let ranges: Vec<(u32, u32)> = self
+            .blocked_ranges
+            .iter()
+            .map(|r| (r.start, r.end))
+            .collect();
+        let range_hits = (0..ranges.len()).map(|_| AtomicU64::new(0)).collect();
         std::sync::Arc::new(std::sync::RwLock::new(IpFilterSnapshot {
-            ranges: self
-                .blocked_ranges
-                .iter()
-                .map(|r| (r.start, r.end))
-                .collect(),
+            ranges,
+            range_hits,
             enabled: self.enabled,
             block_private: self.block_private,
             ranges_ready: self.ranges_ready,
@@ -510,10 +548,27 @@ impl IpFilter {
     /// change or reload doesn't drop pending upload-path hits.
     pub fn update_shared_snapshot(&self, shared: &SharedIpFilter) {
         if let Ok(mut snap) = shared.write() {
+            let pending: std::collections::HashMap<(u32, u32), u64> = snap
+                .ranges
+                .iter()
+                .zip(snap.range_hits.iter())
+                .filter_map(|(&(start, end), counter)| {
+                    let n = counter.load(Ordering::Relaxed);
+                    (n > 0).then_some(((start, end), n))
+                })
+                .collect();
+
             snap.ranges = self
                 .blocked_ranges
                 .iter()
                 .map(|r| (r.start, r.end))
+                .collect();
+            snap.range_hits = snap
+                .ranges
+                .iter()
+                .map(|&(start, end)| {
+                    AtomicU64::new(pending.get(&(start, end)).copied().unwrap_or(0))
+                })
                 .collect();
             snap.enabled = self.enabled;
             snap.block_private = self.block_private;
@@ -522,8 +577,8 @@ impl IpFilter {
     }
 
     /// Collect hits from the shared snapshot into the totals, preserving the
-    /// range-vs-special split (the upload handler is the only writer of the
-    /// snapshot counters).
+    /// range-vs-special split and attributing range hits to matching entries
+    /// so the Security page Hits column stays in sync with the header total.
     pub fn collect_shared_hits(&self, shared: &SharedIpFilter) {
         if let Ok(snap) = shared.read() {
             let range_hits = snap.hit_counter.swap(0, Ordering::Relaxed);
@@ -536,11 +591,28 @@ impl IpFilter {
                 self.total_special_hits
                     .fetch_add(special_hits, Ordering::Relaxed);
             }
+
+            for (i, counter) in snap.range_hits.iter().enumerate() {
+                let n = counter.swap(0, Ordering::Relaxed);
+                if n == 0 {
+                    continue;
+                }
+                let Some(&(start, end)) = snap.ranges.get(i) else {
+                    continue;
+                };
+                if let Some(range) = self
+                    .blocked_ranges
+                    .iter()
+                    .find(|r| r.start == start && r.end == end)
+                {
+                    range.add_hits(n);
+                }
+            }
         }
     }
 
     pub fn get_stats(&self) -> IpFilterStats {
-        let per_range_hits: u64 = self.blocked_ranges.iter().map(|r| r.hits).sum();
+        let per_range_hits: u64 = self.blocked_ranges.iter().map(|r| r.hit_count()).sum();
         let atomic_range_hits = self.total_range_hits.load(Ordering::Relaxed);
         let special_hits = self.total_special_hits.load(Ordering::Relaxed);
         let total_hits = atomic_range_hits.max(per_range_hits) + special_hits;
@@ -552,13 +624,14 @@ impl IpFilter {
                 start_ip: Ipv4Addr::from(r.start).to_string(),
                 end_ip: Ipv4Addr::from(r.end).to_string(),
                 description: r.description.clone(),
-                hits: r.hits,
+                hits: r.hit_count(),
             })
             .collect();
 
         IpFilterStats {
             enabled: self.enabled,
             block_private: self.block_private,
+            ranges_ready: self.ranges_ready,
             range_count: self.blocked_ranges.len(),
             total_hits,
             entries,
@@ -571,12 +644,8 @@ impl IpFilter {
         if s > e {
             return false;
         }
-        self.blocked_ranges.push(IpRange {
-            start: s,
-            end: e,
-            description,
-            hits: 0,
-        });
+        self.blocked_ranges
+            .push(IpRange::new(s, e, description));
         self.blocked_ranges.sort_by_key(|r| r.start);
         self.merge_overlapping();
         true
@@ -731,12 +800,7 @@ impl IpFilter {
             pos += 4;
 
             if start <= end {
-                new_ranges.push(IpRange {
-                    start,
-                    end,
-                    description: desc,
-                    hits: 0,
-                });
+                new_ranges.push(IpRange::new(start, end, desc));
                 count += 1;
             }
         }
@@ -794,12 +858,7 @@ fn parse_p2p_line(line: &str) -> Option<IpRange> {
     if start > end {
         return None;
     }
-    Some(IpRange {
-        start,
-        end,
-        description,
-        hits: 0,
-    })
+    Some(IpRange::new(start, end, description))
 }
 
 /// Parse an IP address string, handling leading zeros (e.g., "003.000.000.000")
@@ -865,12 +924,7 @@ fn parse_ipfilter_line(line: &str) -> Option<IpRange> {
         return None;
     }
 
-    Some(IpRange {
-        start,
-        end,
-        description,
-        hits: 0,
-    })
+    Some(IpRange::new(start, end, description))
 }
 
 /// Count how many valid IP-filter entries `data` contains, without
@@ -1177,6 +1231,23 @@ mod tests {
         let stats = filter.get_stats();
         // 1 range hit + 2 special hits, none double-counted.
         assert_eq!(stats.total_hits, 3);
+        assert_eq!(stats.entries[0].hits, 1, "shared range hits must show in the Hits column");
+    }
+
+    #[test]
+    fn test_readonly_hit_counting_attributes_per_range() {
+        let mut filter = IpFilter::new(true, false);
+        filter.mark_ranges_ready();
+        filter.add_range(
+            Ipv4Addr::new(1, 0, 0, 0),
+            Ipv4Addr::new(1, 0, 0, 255),
+            "test range".to_string(),
+        );
+        assert!(filter.is_blocked_readonly(Ipv4Addr::new(1, 0, 0, 1)));
+        assert!(filter.is_blocked_readonly(Ipv4Addr::new(1, 0, 0, 2)));
+        let stats = filter.get_stats();
+        assert_eq!(stats.total_hits, 2);
+        assert_eq!(stats.entries[0].hits, 2);
     }
 
     #[test]

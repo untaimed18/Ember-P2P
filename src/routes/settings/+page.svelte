@@ -120,7 +120,21 @@
     }
   }
 
-  async function handleClearHistory(status: string) {
+  // History clear uses ConfirmDialog (same pattern as spam reset) so a
+  // misclick cannot wipe completed/cancelled rows without an explicit OK.
+  let historyClearConfirmOpen = $state(false);
+  let pendingHistoryClear: 'completed' | 'cancelled' | 'all' | null = $state(null);
+
+  function requestClearHistory(status: 'completed' | 'cancelled' | 'all') {
+    pendingHistoryClear = status;
+    historyClearConfirmOpen = true;
+  }
+
+  async function confirmClearHistory() {
+    const status = pendingHistoryClear;
+    if (!status) return;
+    // Leave `pendingHistoryClear` set so the ConfirmDialog outro keeps the
+    // correct title/message; the next `requestClearHistory` overwrites it.
     try {
       await clearDownloadHistory(status);
       historyClearMsg = status === 'all'
@@ -134,6 +148,19 @@
       historyClearMsg = m.settings_history_clear_failed({ error: translateError(e) });
     }
   }
+
+  let historyClearDialogTitle = $derived(
+    pendingHistoryClear === 'all' ? m.settings_history_clear_all_dialog_title()
+      : pendingHistoryClear === 'completed' ? m.settings_history_clear_completed_dialog_title()
+        : pendingHistoryClear === 'cancelled' ? m.settings_history_clear_cancelled_dialog_title()
+          : ''
+  );
+  let historyClearDialogMessage = $derived(
+    pendingHistoryClear === 'all' ? m.settings_history_clear_all_dialog_message()
+      : pendingHistoryClear === 'completed' ? m.settings_history_clear_completed_dialog_message()
+        : pendingHistoryClear === 'cancelled' ? m.settings_history_clear_cancelled_dialog_message()
+          : ''
+  );
 
   let speedTesting = $state(false);
   let speedResult: { download_speed: number; upload_speed: number; recommended_upload_limit: number; recommended_download_limit: number } | null = $state(null);
@@ -403,11 +430,13 @@
   }
 
   /** Friend toggles apply immediately (frontend store + persist) so Chat /
-   * online toasts / browse gate don't wait for the page Save button. */
+   * online toasts / browse gate don't wait for the page Save button.
+   * Session encryption is always kept on from this UI path. */
   let friendTogglePersistInFlight = false;
   let friendTogglePersistPending = false;
   async function applyFriendTogglesLive() {
     if (!settings) return;
+    settings.friend_session_encryption = true;
     // Optimistic: push only friend fields so unsaved draft edits on other
     // settings keys are not leaked into the process-wide store.
     const cached = get(appSettings);
@@ -418,7 +447,7 @@
         friend_online_notifications: settings.friend_online_notifications,
         friend_chat_disabled: settings.friend_chat_disabled,
         friend_browse_disabled: settings.friend_browse_disabled,
-        friend_session_encryption: settings.friend_session_encryption,
+        friend_session_encryption: true,
       });
     }
     if (friendTogglePersistInFlight) {
@@ -439,7 +468,7 @@
             friend_online_notifications: settings.friend_online_notifications,
             friend_chat_disabled: settings.friend_chat_disabled,
             friend_browse_disabled: settings.friend_browse_disabled,
-            friend_session_encryption: settings.friend_session_encryption,
+            friend_session_encryption: true,
           };
           try {
             // updateSettings returns a status string, not AppSettings.
@@ -452,7 +481,7 @@
               baseline.friend_online_notifications = candidate.friend_online_notifications;
               baseline.friend_chat_disabled = candidate.friend_chat_disabled;
               baseline.friend_browse_disabled = candidate.friend_browse_disabled;
-              baseline.friend_session_encryption = candidate.friend_session_encryption;
+              baseline.friend_session_encryption = true;
               baseline.settings_revision = candidate.settings_revision;
               originalSettings = JSON.stringify(baseline);
             }
@@ -509,6 +538,9 @@
     // the await resolves, not what this save actually persisted.
     const snapshot = JSON.stringify(settings);
     const draft = JSON.parse(snapshot) as AppSettings;
+    // Friend session encryption is not user-toggleable in Settings; keep it on.
+    draft.friend_session_encryption = true;
+    settings.friend_session_encryption = true;
     try {
       let result = '';
       let saved: AppSettings | null = null;
@@ -523,6 +555,7 @@
         setAppSettings(latest);
         if (settings) settings.settings_revision = latest.settings_revision;
         const candidate = mergeDraftOntoLatest(draft, latest);
+        candidate.friend_session_encryption = true;
         try {
           result = await updateSettings(candidate);
           saved = candidate;
@@ -877,7 +910,13 @@
     }
   }
 
-  async function handleResetAntileech() {
+  let antileechResetConfirmOpen = $state(false);
+
+  function handleResetAntileech() {
+    antileechResetConfirmOpen = true;
+  }
+
+  async function confirmResetAntileech() {
     antileechSaving = true;
     antileechMessage = null;
     antileechCompileErrors = [];
@@ -1395,35 +1434,9 @@
             <span class="hint">{m.settings_max_file_size_hint()}</span>
           </div>
 
-          <div class="field-row">
-            <div class="field half">
-              <label for="max-sources-per-file">{m.settings_max_sources_per_file_label()}</label>
-              <input id="max-sources-per-file" type="number" min="1" max="2000" bind:value={settings.max_sources_per_file} />
-              <span class="hint">{m.settings_max_sources_per_file_hint()}</span>
-            </div>
-            <div class="field half">
-              <label for="max-connections">{m.settings_max_connections_label()}</label>
-              <input id="max-connections" type="number" min="1" max="2000" bind:value={settings.max_connections} />
-              <span class="hint">{m.settings_max_connections_hint()}</span>
-            </div>
-          </div>
-          <div class="field">
-            <label for="download-queue-wait">{m.settings_download_queue_wait_label()}</label>
-            <input id="download-queue-wait" type="number" min="60" max="14400" bind:value={settings.download_queue_wait_secs} />
-            <span class="hint">{m.settings_download_queue_wait_hint()}</span>
-          </div>
-          <div class="field-row">
-            <div class="field half">
-              <label for="multisource-retries">{m.settings_multisource_retries_label()}</label>
-              <input id="multisource-retries" type="number" min="1" max="20" bind:value={settings.multisource_retry_rounds} />
-              <span class="hint">{m.settings_multisource_retries_hint()}</span>
-            </div>
-            <div class="field half">
-              <label for="download-part-retries">{m.settings_download_part_retries_label()}</label>
-              <input id="download-part-retries" type="number" min="1" max="20" bind:value={settings.download_part_retry_rounds} />
-              <span class="hint">{m.settings_download_part_retries_hint()}</span>
-            </div>
-          </div>
+          <!-- Protocol budget / retry knobs (max_sources, max_connections,
+               queue wait, retry rounds) stay in AppSettings for config.json
+               and backend clamps, but are intentionally not exposed here. -->
 
           <div class="field toggle-row">
             <div class="toggle-info">
@@ -1467,7 +1480,7 @@
                     {historyStatsLoading ? m.settings_history_stats_loading() : historyStatsError ? '—' : historyStats?.completed ?? 0}
                   </strong>
                 </div>
-                <button class="history-clear-btn" onclick={() => handleClearHistory('completed')}>{m.settings_clear_completed()}</button>
+                <button class="history-clear-btn" onclick={() => requestClearHistory('completed')}>{m.settings_clear_completed()}</button>
               </div>
               <div class="history-card">
                 <div class="history-stat-body">
@@ -1476,7 +1489,7 @@
                     {historyStatsLoading ? m.settings_history_stats_loading() : historyStatsError ? '—' : historyStats?.cancelled ?? 0}
                   </strong>
                 </div>
-                <button class="history-clear-btn" onclick={() => handleClearHistory('cancelled')}>{m.settings_clear_cancelled()}</button>
+                <button class="history-clear-btn" onclick={() => requestClearHistory('cancelled')}>{m.settings_clear_cancelled()}</button>
               </div>
               <div class="history-card history-card-total">
                 <div class="history-stat-body">
@@ -1485,7 +1498,7 @@
                     {historyStatsLoading ? m.settings_history_stats_loading() : historyStatsError ? '—' : historyStats?.total ?? 0}
                   </strong>
                 </div>
-                <button class="history-clear-btn" onclick={() => handleClearHistory('all')}>{m.settings_clear_all_history()}</button>
+                <button class="history-clear-btn" onclick={() => requestClearHistory('all')}>{m.settings_clear_all_history()}</button>
               </div>
             </div>
             {#if historyStatsError}
@@ -1748,7 +1761,7 @@
         <div class="card-body">
           <div class="field toggle-row">
             <div class="toggle-info">
-              <span class="toggle-title">{m.settings_obfuscation_label()} <span class="restart-badge">{m.settings_restart_badge()}</span></span>
+              <span class="toggle-title">{m.settings_obfuscation_label()}</span>
               <span class="hint">{m.settings_obfuscation_hint()}</span>
             </div>
             <ToggleSwitch bind:checked={settings.obfuscation_enabled} ariaLabel={m.settings_obfuscation_label()} />
@@ -1908,31 +1921,9 @@
             <ToggleSwitch bind:checked={settings.friend_browse_disabled} ariaLabel={m.settings_friend_browse_disabled()} onchange={() => void applyFriendTogglesLive()} />
           </div>
 
-          <div class="field toggle-row">
-            <div>
-              <span class="toggle-title">{m.settings_friend_session_encryption()}</span>
-              <span class="hint">{m.settings_friend_session_encryption_hint()}</span>
-            </div>
-            <ToggleSwitch bind:checked={settings.friend_session_encryption} ariaLabel={m.settings_friend_session_encryption()} onchange={() => void applyFriendTogglesLive()} />
-          </div>
-
-          <div class="field">
-            <label for="max-friends">{m.settings_max_friends_label()}</label>
-            <input id="max-friends" type="number" min="1" max="500" bind:value={settings.max_friends} />
-            <span class="hint">{m.settings_max_friends_hint()}</span>
-          </div>
-          <div class="field">
-            <label for="rendezvous-url">{m.settings_rendezvous_url_label()}</label>
-            <input
-              id="rendezvous-url"
-              type="url"
-              maxlength="2048"
-              bind:value={settings.rendezvous_url}
-              placeholder={m.settings_rendezvous_url_placeholder()}
-              spellcheck="false"
-            />
-            <span class="hint">{m.settings_rendezvous_url_hint()}</span>
-          </div>
+          <!-- Friend session encryption stays forced on (see handleSave /
+               applyFriendTogglesLive). Max friends + rendezvous URL remain
+               in AppSettings for config.json only — not everyday controls. -->
 
         </div>
       </section>
@@ -2059,6 +2050,25 @@
   confirmLabel={m.settings_spam_reset_confirm()}
   danger={true}
   onconfirm={confirmResetSpamData}
+/>
+
+<ConfirmDialog
+  bind:open={historyClearConfirmOpen}
+  title={historyClearDialogTitle}
+  message={historyClearDialogMessage}
+  confirmLabel={m.settings_history_clear_confirm()}
+  danger={true}
+  onconfirm={confirmClearHistory}
+  oncancel={() => { pendingHistoryClear = null; }}
+/>
+
+<ConfirmDialog
+  bind:open={antileechResetConfirmOpen}
+  title={m.settings_antileech_restore_dialog_title()}
+  message={m.settings_antileech_restore_dialog_message()}
+  confirmLabel={m.settings_antileech_restore_confirm()}
+  danger={true}
+  onconfirm={confirmResetAntileech}
 />
 
 <!--
