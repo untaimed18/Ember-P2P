@@ -757,9 +757,13 @@ pub fn run() {
                             idx.remove_file_by_id(&file_temp_id);
                         }
                         Err(_) => {
-                            tracing::warn!("Startup hash timed out for {} (file may be on cloud storage or locked), skipping", file.name);
-                            let mut idx = index_clone.write().await;
-                            idx.remove_file_by_id(&file_temp_id);
+                            // Leave the pending entry so a later reload/retry can
+                            // finish hashing; dropping it made slow/cloud files
+                            // disappear from the share list after one timeout.
+                            tracing::warn!(
+                                "Startup hash timed out for {} (file may be on cloud storage or locked); leaving pending for retry",
+                                file.name
+                            );
                         }
                     }
                 }

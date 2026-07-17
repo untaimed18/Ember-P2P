@@ -3475,13 +3475,24 @@ fn check_disk_space(download_dir: &std::path::Path, needed_bytes: u64) -> bool {
             }
         }
         Err(e) => {
-            // Fail closed: an unreadable download volume must not silently
-            // admit starts that then ENOSPC mid-write.
-            warn!(
-                "Could not check disk space on {}: {e}; treating as insufficient",
-                download_dir.display()
-            );
-            false
+            // Fail closed only when the download folder is missing/unusable.
+            // Some cloud/mapped volumes reject available_space while still
+            // accepting writes — treating those as Insufficient blocked all
+            // downloads (R1). Admit with a warning when the path exists;
+            // ENOSPC on write still fails the transfer safely.
+            if download_dir.exists() {
+                warn!(
+                    "Could not check disk space on {}: {e}; allowing start (volume exists)",
+                    download_dir.display()
+                );
+                true
+            } else {
+                warn!(
+                    "Could not check disk space on {}: {e}; treating as insufficient (path missing)",
+                    download_dir.display()
+                );
+                false
+            }
         }
     }
 }
@@ -6722,6 +6733,7 @@ fn apply_network_settings(
     }
     if state.ip_filter.is_enabled() != new_settings.ip_filter_enabled {
         state.ip_filter.set_enabled(new_settings.ip_filter_enabled);
+        let mut load_ready = true;
         if new_settings.ip_filter_enabled && state.ip_filter.range_count() == 0 {
             let default_path = state.data_dir.join("ipfilter.dat");
             if default_path.exists() {
@@ -6730,14 +6742,17 @@ fn apply_network_settings(
                         "Loaded {n} IP filter entries on enable ({} ranges after merge)",
                         state.ip_filter.range_count()
                     ),
-                    None => warn!(
-                        "Failed to read ipfilter.dat on enable; filter stays empty until a valid file is available"
-                    ),
+                    None => {
+                        warn!(
+                            "Failed to read ipfilter.dat on enable; leaving fail-closed until a successful reload"
+                        );
+                        load_ready = false;
+                    }
                 }
             }
         }
-        // Clear fail-closed gate after enable/load (or confirm empty/absent).
-        if new_settings.ip_filter_enabled {
+        // Clear fail-closed only after a successful load or intentional empty/absent.
+        if new_settings.ip_filter_enabled && load_ready {
             state.ip_filter.mark_ranges_ready();
         }
         state
@@ -8093,18 +8108,41 @@ pub async fn start_network(
         let geoip_dir = geoip_resource_dir.clone();
         Some(tokio::task::spawn_blocking(move || {
             let mut filter = IpFilter::new(ipf_enabled, ipf_block_private);
-            if ipf_enabled && ipfilter_path.exists() {
-                let _ = filter.load_from_file(&ipfilter_path);
+            // Only clear the fail-closed gate when the load succeeded or the
+            // file is absent (intentional empty). Mid-file I/O failure returns
+            // None and must leave ranges_ready=false so we do not silently
+            // run with enabled+empty blacklist (R3).
+            let ranges_ready = if ipf_enabled && ipfilter_path.exists() {
+                match filter.load_from_file(&ipfilter_path) {
+                    Some(n) => {
+                        info!(
+                            "Loaded IP filter: enabled={}, block_private={}, ranges={}",
+                            filter.is_enabled(),
+                            filter.blocks_private(),
+                            n,
+                        );
+                        true
+                    }
+                    None => {
+                        warn!(
+                            "IP filter load failed for {}; leaving fail-closed until a successful reload",
+                            ipfilter_path.display()
+                        );
+                        false
+                    }
+                }
+            } else {
+                info!(
+                    "Loaded IP filter: enabled={}, block_private={}, ranges={}",
+                    filter.is_enabled(),
+                    filter.blocks_private(),
+                    filter.range_count(),
+                );
+                true
+            };
+            if ranges_ready {
+                filter.mark_ranges_ready();
             }
-            // Always clear the fail-closed gate after the load attempt — an
-            // absent or unreadable file still means "empty list is intentional".
-            filter.mark_ranges_ready();
-            info!(
-                "Loaded IP filter: enabled={}, block_private={}, ranges={}",
-                filter.is_enabled(),
-                filter.blocks_private(),
-                filter.range_count(),
-            );
             let known_files = KnownFileList::load(&known_met_path);
             info!("Loaded {} known files", known_files.file_count());
 
@@ -8327,11 +8365,19 @@ pub async fn start_network(
                         let live_enabled = state.ip_filter.is_enabled();
                         let live_block_private = state.ip_filter.blocks_private();
                         let mut loaded = loads.ip_filter;
+                        // Capture before set_enabled(true), which clears ranges_ready.
+                        let deferred_load_ready = loaded.ranges_ready();
                         loaded.merge_ranges_from(&state.ip_filter);
                         loaded.set_enabled(live_enabled);
                         loaded.set_block_private(live_block_private);
                         if live_enabled {
-                            loaded.mark_ranges_ready();
+                            if deferred_load_ready {
+                                loaded.mark_ranges_ready();
+                            } else {
+                                warn!(
+                                    "Deferred IP filter load failed; leaving fail-closed until a successful reload"
+                                );
+                            }
                         }
                         state.ip_filter = loaded;
                         state
@@ -30821,6 +30867,7 @@ async fn handle_command_inner(
             //
             // Keep the live filter in place during the await so UDP/TCP
             // arms don't see an empty placeholder if the load task panics.
+            let mut load_ready = true;
             if enabled && state.ip_filter.range_count() == 0 {
                 let default_path = state.data_dir.join("ipfilter.dat");
                 if default_path.exists() {
@@ -30836,7 +30883,7 @@ async fn handle_command_inner(
                             }
                             None => {
                                 warn!(
-                                    "Failed to read ipfilter.dat while enabling the filter; ranges stay empty until a valid file is available"
+                                    "Failed to read ipfilter.dat while enabling the filter; leaving fail-closed until a successful reload"
                                 );
                                 None
                             }
@@ -30851,17 +30898,20 @@ async fn handle_command_inner(
                                 state.ip_filter.range_count()
                             );
                         }
-                        Ok(None) => {}
+                        Ok(None) => {
+                            load_ready = false;
+                        }
                         Err(e) => {
                             error!(
                                 "SetIpFilterEnabled load task panicked: {e}; keeping previous filter"
                             );
+                            load_ready = false;
                         }
                     }
                 }
             }
-            // Clear fail-closed gate after enable/load (or confirm empty/absent).
-            if enabled {
+            // Clear fail-closed only after a successful load or intentional empty/absent.
+            if enabled && load_ready {
                 state.ip_filter.mark_ranges_ready();
             }
             state

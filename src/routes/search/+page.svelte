@@ -205,6 +205,18 @@
   // Shown when the user tries to search with no usable network connected.
   let networkAlertOpen = $state(false);
 
+  function searchNetworkHint(method: SearchMethod): string {
+    if (method === 'kad') return m.search_network_need_kad_hint();
+    if (method === 'server') return m.search_network_need_server_hint();
+    return m.search_network_disconnected_hint();
+  }
+
+  function searchNetworkAlertMessage(method: SearchMethod): string {
+    if (method === 'kad') return m.search_no_network_kad_message();
+    if (method === 'server') return m.search_no_network_server_message();
+    return m.search_no_network_message();
+  }
+
   let selectedResultKey = $state<string | null>(null);
   let checkedKeys = $state(new Set<string>());
   let lastCheckedKey = $state<string | null>(null);
@@ -2090,7 +2102,7 @@
     || (searchMethod === 'server' && $serverStatus !== 'connected')
     || (searchMethod === 'global' && $networkStats.status !== 'connected' && $serverStatus !== 'connected')}
     <div class="search-readiness-hint" role="status">
-      {m.search_network_disconnected_hint()}
+      {searchNetworkHint(searchMethod)}
     </div>
   {:else if $networkStats.degraded && $networkStats.degraded_reason}
     <div class="search-readiness-hint search-readiness-muted" role="status">
@@ -2598,7 +2610,7 @@
   bind:open={networkAlertOpen}
   alert
   title={m.search_no_network_title()}
-  message={m.search_no_network_message()}
+  message={searchNetworkAlertMessage(searchMethod)}
   confirmLabel={m.common_ok()}
 />
 
