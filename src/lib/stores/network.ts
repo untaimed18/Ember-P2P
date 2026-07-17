@@ -232,6 +232,9 @@ export async function initNetworkStore() {
       // particular drives both the store and the toast branches below, so a
       // missing/non-boolean payload must bail before either runs.
       if (!p || typeof p.mapped !== 'boolean') return;
+      // Ignore provisional "still setting up" events so a deferred UPnP
+      // `setup()` cannot sticky-toast a false failure before the real result.
+      if ((p as { pending?: boolean }).pending === true) return;
       lastEventUpdate = Date.now();
       lastNetworkUpdate = lastEventUpdate;
       const mapped = p.mapped;
@@ -318,6 +321,9 @@ export async function initNetworkStore() {
     registered.push(await listen<{ status: ServerStatus }>('server-status-changed', (event) => {
       const status = narrowServerStatus(event.payload?.status);
       if (status) serverStatus.set(status);
+    }));
+    registered.push(await listen('server-auto-connect-failed', () => {
+      toastWarning(m.toast_server_auto_connect_failed());
     }));
   } catch (e) {
     for (const u of registered) u();

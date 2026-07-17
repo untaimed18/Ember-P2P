@@ -3780,6 +3780,11 @@ struct NetworkState {
     /// Serializes every known.met writer, including shutdown, so a timed-out
     /// periodic snapshot cannot rename over a newer authoritative save.
     known_met_save_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Monotonic generation for async `server.met` writes (latest wins).
+    server_met_save_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Serializes async `server.met` writers so a superseded snapshot cannot
+    /// finish after a newer one and clobber it (generation check under lock).
+    server_met_save_lock: Arc<std::sync::Mutex<()>>,
     /// Same ownership rule for periodic/disconnect/shutdown nodes.dat writes.
     nodes_save_lock: Arc<tokio::sync::Mutex<()>>,
     external_ip: Option<Ipv4Addr>,
@@ -3949,6 +3954,8 @@ struct NetworkState {
     /// until the first send this session, so the first `SharedFilesChanged`
     /// after connecting always sends unconditionally.
     last_offer_files_signature: Option<(usize, u64)>,
+    /// Set by SharedFilesChangedAck; main loop builds/queues chunked OP_OFFERFILES.
+    request_offer_files: bool,
     /// Hashes successfully included in an `OP_OFFERFILES` this server session.
     /// Drives the Library eD2K "published" badge (connection alone is not enough).
     offered_ed2k_hashes: HashSet<[u8; 16]>,
@@ -4061,10 +4068,15 @@ struct NetworkState {
         >,
     >,
     /// Whether the server auto-reconnect loop is allowed to run.
-    /// Starts from settings; enabled on manual connect, disabled on manual disconnect.
+    /// Starts from settings; enabled on manual connect, disabled on manual disconnect
+    /// or after auto-connect gives up on the preferred server.
     server_auto_reconnect: bool,
-    /// Consecutive server connection failures for exponential backoff (reset on success)
+    /// Consecutive preferred-server connection failures for exponential backoff
+    /// (reset on success). After [`AUTO_CONNECT_MAX_FAILURES`], auto-reconnect stops.
     server_reconnect_failures: u32,
+    /// Only server auto-reconnect / auto-connect may dial. Set on connect and
+    /// persisted as last successful server on login.
+    preferred_ed2k_server: Option<(String, u16)>,
     /// Instant when the last server connect attempt was started
     server_last_connect_attempt: Option<std::time::Instant>,
     /// Pending USS ping timestamps for RTT measurement (at most one in flight).
@@ -5098,12 +5110,37 @@ async fn handle_server_disconnect(
     );
 }
 
+/// Max preferred-server connect failures before auto-reconnect stops and the
+/// UI is told to connect manually. Covers boot auto-connect and mid-session
+/// drop recovery for the same host only.
+const AUTO_CONNECT_MAX_FAILURES: u32 = 3;
+
+fn emit_server_auto_connect_failed(app_handle: &tauri::AppHandle, detail: &str) {
+    warn!("eD2K auto-connect abandoned: {detail}");
+    emit_server_log(
+        app_handle,
+        &format!("Auto-connect failed ({detail}). Please connect to a server manually."),
+    );
+    let _ = app_handle.emit(
+        "server-auto-connect-failed",
+        serde_json::json!({ "detail": detail }),
+    );
+}
+
+fn abandon_server_auto_reconnect(state: &mut NetworkState, app_handle: &tauri::AppHandle, detail: &str) {
+    state.server_auto_reconnect = false;
+    emit_server_auto_connect_failed(app_handle, detail);
+}
+
 /// Establish a new eD2K server connection to `ip`:`port`, tearing down any
 /// existing connection/pending attempt first. Shared by
 /// `NetworkCommand::ConnectToServer` (Servers page) and
 /// `start_network`'s boot path when `settings.auto_connect_server` is set.
 /// KAD Connect does **not** call this — eD2K is opt-in via the Servers page
 /// (or the startup auto-connect setting).
+///
+/// Auto-reconnect (after drop / failed attempt) retries **only** this same
+/// preferred server — it never walks the rest of the server list.
 async fn initiate_server_connect(
     state: &mut NetworkState,
     settings: &AppSettings,
@@ -5114,7 +5151,15 @@ async fn initiate_server_connect(
 ) {
     state.server_auto_reconnect = true;
     state.server_reconnect_failures = 0;
-    // Explicit Connect should be allowed to retry servers that recently
+    state.preferred_ed2k_server = Some((ip.clone(), port));
+    // Connecting to an eD2K server counts as being online for the upload
+    // listener: allow peer uploads and (critically) the server's HighID
+    // TCP port-test. Without this, server-first sessions with KAD auto-
+    // connect off always rejected the port-test and got stuck on LowID.
+    state
+        .upload_disconnected
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    // Explicit Connect should be allowed to retry a server that recently
     // failed auto-reconnect — keep fail counts for sort preference.
     state.server_list.clear_connect_cooldowns();
     if let Some(handle) = state.pending_server_connect.take() {
@@ -5161,10 +5206,9 @@ async fn initiate_server_connect(
         serde_json::json!({ "status": "connecting" }),
     );
     state.pending_server_connect = Some(tokio::spawn(async move {
-        // One crypt→plain cycle per server. Retrying the same host 3× used to
-        // burn ~90s on a dead High-priority entry (e.g. eMule Security) before
-        // auto-reconnect could move on; fail once and let `record_failure` +
-        // cooldown hand off to the next server.
+        // One crypt→plain cycle per server. Prefer failing fast on a dead
+        // preferred host so auto-reconnect can retry with backoff, then stop
+        // after AUTO_CONNECT_MAX_FAILURES instead of walking the server list.
         let result = async {
             let (mut conn, resolved_addr) = try_connect_server(
                 &ip_clone,
@@ -5352,6 +5396,49 @@ fn spawn_credit_flush(
         )
         .await;
     })
+}
+
+/// Serialize `server.met` on the network task, write it on the blocking pool
+/// so select-arm saves don't stall UDP/timers/IPC on disk sync.
+///
+/// Each call bumps `generation`; a writer only commits if it is still the
+/// latest generation when it reaches disk, so overlapping saves cannot
+/// clobber newer metadata with an older snapshot.
+fn spawn_save_server_met(
+    list: &ed2k::server_list::ServerList,
+    path: PathBuf,
+    generation: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    save_lock: &std::sync::Arc<std::sync::Mutex<()>>,
+) {
+    let gen = generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    match list.to_server_met_bytes() {
+        Ok(buf) => {
+            let generation = generation.clone();
+            let save_lock = save_lock.clone();
+            tokio::task::spawn_blocking(move || {
+                let _guard = match save_lock.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                if generation.load(std::sync::atomic::Ordering::Relaxed) != gen {
+                    return;
+                }
+                if let Err(e) =
+                    ed2k::server_list::ServerList::write_server_met_bytes(&path, &buf)
+                {
+                    warn!("Failed to save server.met: {e}");
+                }
+            });
+        }
+        Err(e) => warn!("Failed to serialize server.met: {e}"),
+    }
+}
+
+struct DeferredDiskLoads {
+    ip_filter: IpFilter,
+    known_files: KnownFileList,
+    aich_hash_sets: Vec<ed2k::aich::AICHRecoveryHashSet>,
+    aich_root_map: HashMap<[u8; 16], [u8; 20]>,
 }
 
 fn server_entry_to_info(server: &ServerEntry) -> ServerInfo {
@@ -5789,6 +5876,92 @@ fn apply_persistent_ip_ban(
     if let Err(e) = db.ban_ip(ip, reason, expires_at) {
         warn!("Failed to persist auto-ban for {ip}: {e}");
     }
+}
+
+/// Rebuild the in-memory enforced ban set from durable sources plus
+/// still-active reputation bans. This is what makes:
+/// - DB auto-ban TTLs actually expire in a long-running session (H2)
+/// - reputation 24h bans leave `banned_ips` after `lift_expired_bans` (H1)
+///
+/// Fail-closed on DB errors: keep the current set rather than wiping bans.
+fn sync_enforced_banned_ips(
+    state: &mut NetworkState,
+    shared_banned_ips: &ed2k::upload::SharedBannedIps,
+    db: &Arc<Database>,
+    source_manager: &SourceManager,
+) {
+    let (peers, auto_bans) = match (db.get_peers(), db.get_banned_ips()) {
+        (Ok(peers), Ok(auto_bans)) => (peers, auto_bans),
+        _ => {
+            warn!("banned_ips sync skipped: DB read failed; keeping in-memory set");
+            return;
+        }
+    };
+
+    let mut rebuilt: HashSet<Ipv4Addr> = peers
+        .iter()
+        .filter(|p| p.banned)
+        .flat_map(|p| p.addresses.iter())
+        .filter_map(|a| a.rsplit_once(':').and_then(|(ip, _)| ip.parse().ok()))
+        .collect();
+    rebuilt.extend(auto_bans);
+
+    for ip in state.reputation.currently_banned_ips() {
+        rebuilt.insert(ip);
+    }
+    for uh in state.reputation.currently_banned_node_ids() {
+        for ip in source_manager.find_ips_by_user_hash(&uh) {
+            rebuilt.insert(ip);
+        }
+        if let Some(contact) = state.routing_table.get_contact(&KadId(uh)) {
+            rebuilt.insert(contact.ip);
+        }
+    }
+
+    state.banned_ips = rebuilt;
+    if let Ok(mut shared) = shared_banned_ips.write() {
+        *shared = state.banned_ips.clone();
+    }
+}
+
+/// Soften/fail-closed helper used whenever a reputation event newly bans a
+/// peer: mirror each observed IP into IP-reputation (so periodic
+/// `sync_enforced_banned_ips` rebuilds keep them) and into `banned_ips`.
+fn apply_reputation_ban_ips(
+    state: &mut NetworkState,
+    shared_banned_ips: &ed2k::upload::SharedBannedIps,
+    ips: impl IntoIterator<Item = Ipv4Addr>,
+    user_hash: &[u8; 16],
+) {
+    let mut any = false;
+    for ip in ips {
+        state.reputation.mirror_node_ban_to_ip(ip);
+        if state.banned_ips.insert(ip) {
+            warn!(
+                "Reputation ban: banning IP {} (user_hash {})",
+                ip,
+                hex::encode(user_hash)
+            );
+        }
+        any = true;
+    }
+    if any {
+        if let Ok(mut shared) = shared_banned_ips.write() {
+            *shared = state.banned_ips.clone();
+        }
+    }
+}
+
+/// Upload `Failed` endings that are session/queue mechanics rather than
+/// evidence the peer sent bad data — must not feed `FailedChunk`.
+fn is_neutral_upload_failure(error: &str) -> bool {
+    let lower = error.to_lowercase();
+    lower.contains("before any data")
+        || lower.contains("slot rotated")
+        || lower.contains("peer banned")
+        || lower.contains("network disconnected")
+        || lower.contains("cancelled")
+        || lower.contains("auto-banned")
 }
 
 fn routing_peers_snapshot(state: &NetworkState) -> Vec<PeerInfo> {
@@ -6413,13 +6586,11 @@ pub async fn start_network(
 ) -> anyhow::Result<()> {
     let data_dir = crate::storage::paths::ensure_data_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-    let geoip = {
-        let resource_dir = app_handle
-            .path()
-            .resource_dir()
-            .unwrap_or_else(|_| PathBuf::from("."));
-        crate::geoip::load(&resource_dir)
-    };
+    let geoip = crate::geoip::empty();
+    let geoip_resource_dir = app_handle
+        .path()
+        .resource_dir()
+        .unwrap_or_else(|_| PathBuf::from("."));
 
     let local_id = identity.kad_id();
     let user_hash = identity.user_hash;
@@ -6614,80 +6785,18 @@ pub async fn start_network(
     // retries, the QUIC port mapping, and the shutdown teardown.
     let upnp_enabled = settings.upnp_enabled;
 
-    // Run UPnP setup and IP filter load concurrently since they're
-    // independent. Gateway discovery is bounded to ~5s inside `setup()`, so a
-    // UPnP-less network can't stall startup for the full SSDP default (10s);
-    // a missed gateway is retried by the periodic `maintain` tick.
+    // Defer UPnP gateway discovery/mapping and heavy disk loads until after
+    // the event loop is running so splash IPC / GetNetworkStats are not
+    // stalled behind SSDP (~5s) or large known.met / ipfilter parses.
+    // Start firewalled until the background setup reports a mapping.
+    // Do **not** emit `upnp-status` here with `mapped: false` — the UI treats
+    // the first event as the session baseline and would sticky-toast a
+    // false "UPnP failed" before deferred `setup()` finishes.
     let mut upnp_mappings = upnp::UpnpMappings::new(tcp_port, udp_port);
-    let ipfilter_path = data_dir.join("ipfilter.dat");
+    let upnp_success = false;
     let ipf_enabled = settings.ip_filter_enabled;
     let ipf_block_private = settings.block_private_ips;
-    let ipf_path = ipfilter_path.clone();
-
-    let (upnp_success, ip_filter) = tokio::join!(
-        async {
-            if upnp_enabled {
-                upnp_mappings.setup().await;
-                let mapped = upnp_mappings.is_mapped();
-                if mapped {
-                    info!("UPnP port mapping succeeded -- not firewalled");
-                }
-                mapped
-            } else {
-                info!("UPnP disabled by user -- skipping port mapping");
-                false
-            }
-        },
-        async {
-            let mut filter = IpFilter::new(ipf_enabled, ipf_block_private);
-            if ipf_enabled && ipf_path.exists() {
-                let _ = filter.load_from_file(&ipf_path);
-            }
-            filter
-        },
-    );
-
-    // Tell the UI the outcome of the initial UPnP attempt so it can warn the
-    // user (with actionable advice) when automatic port forwarding didn't
-    // work. Only emitted when UPnP is enabled — there's nothing to report
-    // when the user opted out. `gateway_found` lets the frontend distinguish
-    // "no UPnP router" from "router rejected the mapping".
-    //
-    // A failed *startup* mapping is treated the same as a mid-session loss: we
-    // do NOT disable UPnP. A slow or briefly-unavailable IGD at launch (SSDP
-    // not answered within the 5s discovery window, the network stack not fully
-    // up yet) is usually transient, and the periodic `maintain` tick already
-    // retries discovery + mapping with backoff and clears the firewalled flag
-    // on recovery. The old behaviour disabled the loop-owned flag here (killing
-    // those retries for the session) AND told the frontend to persist
-    // `upnp_enabled = false`, so a transient launch hiccup left the client
-    // permanently firewalled/LowID across restarts until the user manually
-    // re-enabled UPnP. We still surface the failure to the UI — the frontend
-    // toasts on a `!mapped` startup event regardless of `auto_disabled` — so
-    // the user can set up manual forwarding if the background retries don't
-    // succeed.
-    if upnp_enabled {
-        if !upnp_success {
-            debug!(
-                "UPnP initial port mapping failed; keeping UPnP enabled and \
-                 retrying in the background (set up manual port forwarding if \
-                 peers can't reach you)"
-            );
-        }
-        let _ = app_handle.emit(
-            "upnp-status",
-            serde_json::json!({
-                "mapped": upnp_success,
-                "gateway_found": upnp_mappings.has_gateway(),
-                // Never auto-disable on a startup failure anymore — the
-                // `maintain` tick keeps retrying — so this stays false and the
-                // setting is never persisted off behind the user's back.
-                "auto_disabled": false,
-                "tcp_port": tcp_port,
-                "udp_port": udp_port,
-            }),
-        );
-    }
+    let ip_filter = IpFilter::new(ipf_enabled, ipf_block_private);
 
     let shared_ip_filter = ip_filter.create_shared_snapshot();
     routing_table.set_ip_filter(shared_ip_filter.clone());
@@ -6709,10 +6818,9 @@ pub async fn start_network(
     let shared_buddy_info: upload_server::SharedBuddyInfo =
         std::sync::Arc::new(tokio::sync::RwLock::new(None));
     info!(
-        "IP filter: enabled={}, block_private={}, ranges={}",
+        "IP filter: enabled={}, block_private={} (ranges load deferred)",
         ip_filter.is_enabled(),
         ip_filter.blocks_private(),
-        ip_filter.range_count(),
     );
 
     // Extract banned peer IPs from the already-loaded peer list, then
@@ -6784,40 +6892,33 @@ pub async fn start_network(
 
     // Load the persisted server list from `<data_dir>/server.met` so
     // servers discovered via OP_SERVERLIST, manually added, or merged
-    // from a downloaded server.met survive across restarts. If the
-    // file is missing (first launch) or fails to parse (corruption /
-    // older format), fall back to the hardcoded seed list so the user
-    // still has a working set of bootstrap servers. The seed is also
-    // overlaid into the loaded list below so the well-known seeds
-    // remain available even if a previous version saved a list that
-    // didn't include them.
+    // from a downloaded server.met survive across restarts. An empty /
+    // missing list is bootstrapped *after* the event loop starts so the
+    // UI is not blocked on the HTTPS download during splash/init.
     let server_list = {
         let met_path = data_dir.join("server.met");
-        let mut list = match ServerList::load_server_met(&met_path) {
+        match ServerList::load_server_met(&met_path) {
             Ok(loaded) => loaded,
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     info!(
-                        "No persisted server.met at {:?} — seeding hardcoded list",
+                        "No persisted server.met at {:?} — will download community list after event loop starts",
                         met_path
                     );
                 } else {
-                    warn!("Failed to load persisted server.met from {:?}: {} — seeding hardcoded list", met_path, e);
+                    warn!(
+                        "Failed to load persisted server.met from {:?}: {} — will download community list after event loop starts if empty",
+                        met_path, e
+                    );
                 }
-                ServerList::hardcoded()
+                ServerList::new()
             }
-        };
-        // Overlay the hardcoded seeds (idempotent: `add` skips
-        // duplicates by ip/port). Without this, a user whose
-        // server.met was saved before a seed was added would never
-        // see the new seed. The hardcoded list is only 4 entries so
-        // the clone cost is negligible.
-        let seeds = ServerList::hardcoded();
-        for seed in seeds.servers().iter().cloned() {
-            list.add(seed);
         }
-        list
     };
+    let mut pending_server_met_bootstrap = server_list.is_empty();
+    let mut server_met_bootstrap_task: Option<
+        tokio::task::JoinHandle<Result<Vec<u8>, String>>,
+    > = None;
 
     let mut state = NetworkState {
         local_id,
@@ -6849,6 +6950,8 @@ pub async fn start_network(
         pending_downloads: HashMap::new(),
         data_dir: data_dir.clone(),
         known_met_save_lock: Arc::new(tokio::sync::Mutex::new(())),
+        server_met_save_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        server_met_save_lock: Arc::new(std::sync::Mutex::new(())),
         nodes_save_lock: Arc::new(tokio::sync::Mutex::new(())),
         external_ip: None,
         external_udp_port: None,
@@ -6902,6 +7005,7 @@ pub async fn start_network(
         server_udp_source_reask_at: HashMap::new(),
         pending_udp_reasks: HashMap::new(),
         last_offer_files_signature: None,
+        request_offer_files: false,
         offered_ed2k_hashes: HashSet::new(),
         server_tcp_getsources_cursor: 0,
         server_connected_at: 0,
@@ -6937,6 +7041,7 @@ pub async fn start_network(
         // `initiate_server_connect`, which flips this on for drop recovery.
         server_auto_reconnect: false,
         server_reconnect_failures: 0,
+        preferred_ed2k_server: None,
         server_last_connect_attempt: None,
         pending_uss_pings: HashMap::new(),
         uss_host: None,
@@ -6981,11 +7086,12 @@ pub async fn start_network(
         // ("uploads allowed") left a fresh launch — or any session with
         // auto-connect disabled — silently servable by any peer that
         // already knows our IP:port from a prior session, even while the
-        // UI still read "Disconnected". Only `NetworkCommand::KadConnect`
-        // clears this flag, so it must start set unless we're already
-        // auto-connecting.
+        // UI still read "Disconnected". Cleared by `KadConnect` or
+        // `initiate_server_connect` (eD2K Connect / auto-connect server).
+        // The eD2K server's HighID port-test is also exempted in the upload
+        // accept loop so server-first connect cannot get stuck on LowID.
         upload_disconnected: Arc::new(std::sync::atomic::AtomicBool::new(
-            !settings.auto_connect_kad,
+            !settings.auto_connect_kad && !settings.auto_connect_server,
         )),
         rendezvous_registered: false,
         rendezvous_register_generation: 0,
@@ -7066,100 +7172,21 @@ pub async fn start_network(
     let (ember_boot_tx, mut ember_boot_rx) = mpsc::channel::<Vec<ember::dht::EmberContact>>(1);
     maybe_spawn_ember_cold_bootstrap(&settings, &state, &ember_boot_tx, "startup");
 
-    // Load known files for hash cache
-    let known_met_path = data_dir.join("known.met");
-    let mut known_files = KnownFileList::load(&known_met_path);
-    info!("Loaded {} known files", known_files.file_count());
-
-    // Load AICH hash sets from known2_64.met (eMule SHAHashSet.cpp).
-    // Truncate at the same `MAX_AICH_HASH_SETS` cap that the periodic
-    // save timer enforces — otherwise an existing on-disk file with
-    // implausibly many entries (corrupted, attacker-supplied, or
-    // legacy build with no cap) would blow past the runtime limit
-    // immediately on startup. Excess entries are dropped with a
-    // visible warning so the operator can investigate.
-    let known2_met_path = data_dir.join("known2_64.met");
-    match ed2k::aich::load_known2_met(&known2_met_path) {
-        Ok(sets) => {
-            let total = sets.len();
-            let kept: Vec<_> = sets
-                .into_iter()
-                .take(MAX_AICH_HASH_SETS)
-                .map(|(root, leaves)| {
-                    // known2_64.met (eMule's own format) doesn't store the
-                    // file size, only the master root + leaf hashes, so it
-                    // can't be recovered exactly here. That's fine: sets
-                    // loaded from this cache are only ever used to check
-                    // `root_hash` against already-verified roots and to be
-                    // re-persisted — never to build new
-                    // OP_AICHANSWER recovery data (that always goes through
-                    // `build_from_file` on the live file, which sets the
-                    // real size). Approximate for the `file_size` field so
-                    // it's never left as a misleading `0`.
-                    let file_size = leaves.len() as u64 * ed2k::aich::AICH_BLOCK_SIZE as u64;
-                    ed2k::aich::AICHRecoveryHashSet {
-                        root_hash: root,
-                        leaf_hashes: leaves,
-                        file_size,
-                    }
-                })
-                .collect();
-            if total > MAX_AICH_HASH_SETS {
-                warn!(
-                    "known2_64.met has {} sets (cap {}); dropping {} oldest on load",
-                    total,
-                    MAX_AICH_HASH_SETS,
-                    total - MAX_AICH_HASH_SETS,
-                );
-            }
-            info!("Loaded {} AICH hash sets from known2_64.met", kept.len());
-            state.aich_hash_sets = kept;
-        }
-        Err(e) => {
-            if known2_met_path.exists() {
-                warn!("Failed to load known2_64.met: {e}");
-            }
-        }
-    };
-
-    // Load ed2k hash → AICH root mapping from cache. Same logic as
-    // above — refuse new mappings past `MAX_AICH_ROOT_MAP_SOFT_CAP`
-    // even on startup so a tampered cache can't trick us into
-    // exceeding the documented soft cap before the warn-only sweep
-    // would even catch it.
-    let aich_cache_path = data_dir.join("aich_cache.dat");
-    if let Ok(contents) = std::fs::read_to_string(&aich_cache_path) {
-        let mut skipped_at_cap = 0usize;
-        for line in contents.lines() {
-            if let Some((ed2k_hex, aich_hex)) = line.split_once('=') {
-                if let (Ok(ed2k_bytes), Ok(aich_bytes)) =
-                    (hex::decode(ed2k_hex.trim()), hex::decode(aich_hex.trim()))
-                {
-                    if ed2k_bytes.len() == 16 && aich_bytes.len() == 20 {
-                        if state.aich_root_map.len() >= MAX_AICH_ROOT_MAP_SOFT_CAP {
-                            skipped_at_cap = skipped_at_cap.saturating_add(1);
-                            continue;
-                        }
-                        let mut fh = [0u8; 16];
-                        let mut ah = [0u8; 20];
-                        fh.copy_from_slice(&ed2k_bytes);
-                        ah.copy_from_slice(&aich_bytes);
-                        state.aich_root_map.insert(fh, ah);
-                    }
-                }
-            }
-        }
-        if skipped_at_cap > 0 {
-            warn!(
-                "aich_cache.dat had {} entries past soft cap {}; ignored on load",
-                skipped_at_cap, MAX_AICH_ROOT_MAP_SOFT_CAP,
-            );
-        }
-        info!(
-            "Loaded {} AICH root mappings from cache",
-            state.aich_root_map.len()
-        );
+    // Seed active IP-reputation bans into the enforced set so a restart
+    // does not leave a still-banned IP connectable until the first
+    // reputation-timer sync (user-hash gates alone miss IP-correlation bans).
+    for ip in state.reputation.currently_banned_ips() {
+        state.banned_ips.insert(ip);
     }
+    if let Ok(mut shared) = shared_banned_ips.write() {
+        *shared = state.banned_ips.clone();
+    }
+
+    // Load known files / AICH / ipfilter on a blocking thread after the event
+    // loop starts (see `deferred_disk_loads`). Start empty so splash IPC is not
+    // stalled behind large known.met / ipfilter.dat parses.
+    let mut known_files = KnownFileList::new();
+    info!("Known files / AICH / ipfilter load deferred until event loop");
 
     // Initialize statistics manager
     let mut stats_manager = StatsManager::new();
@@ -7298,6 +7325,16 @@ pub async fn start_network(
             }
             Err(_) => {}
         }
+        // Map still-banned reputation identities onto cached source IPs so
+        // enforcement matches a live session after restart.
+        for uh in state.reputation.currently_banned_node_ids() {
+            for ip in sm.find_ips_by_user_hash(&uh) {
+                state.banned_ips.insert(ip);
+            }
+        }
+        if let Ok(mut shared) = shared_banned_ips.write() {
+            *shared = state.banned_ips.clone();
+        }
         Arc::new(RwLock::new(sm))
     };
 
@@ -7401,11 +7438,16 @@ pub async fn start_network(
         // a crash inside the first 60-s save tick can't reload the
         // pre-prune rows from the DB on next start. Skip the flush
         // when nothing was pruned to avoid paying for a full-table
-        // rewrite on every cold boot. The flush itself is
-        // already-transactional (DELETE + INSERT inside a single
-        // SQLite tx in `save_all_credits`).
+        // rewrite on every cold boot. Fire-and-forget on the credit
+        // flush path so we don't stall event-loop entry on SQLite I/O.
         if any_pruned {
-            flush_credit_state(&arc, &db, &data_dir, false, &credit_save_ownership).await;
+            let _ = spawn_credit_flush(
+                arc.clone(),
+                db.clone(),
+                data_dir.clone(),
+                false,
+                credit_save_ownership.clone(),
+            );
         }
         arc
     };
@@ -7416,28 +7458,13 @@ pub async fn start_network(
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let shared_server_addr: Arc<RwLock<Option<SocketAddr>>> = Arc::new(RwLock::new(None));
 
-    // Mirrors the `auto_connect_kad` boot check above, but for the eD2K
-    // server — independent of it, since a user may want one without the
-    // other. Defaults to off: connecting to a server is opt-in via this
-    // setting or an explicit Connect on the Servers page. KAD Connect
-    // never starts an eD2K session on its own.
-    if settings.auto_connect_server {
-        let next = state
-            .server_list
-            .get_next_server()
-            .map(|s| (s.ip.clone(), s.port));
-        if let Some((server_ip, server_port)) = next {
-            initiate_server_connect(
-                &mut state,
-                &settings,
-                &app_handle,
-                &shared_server_addr,
-                server_ip,
-                server_port,
-            )
-            .await;
-        }
-    }
+    // Defer auto-connect until the event loop is running (and, when needed,
+    // until server.met bootstrap finishes). Starting the TCP login before the
+    // upload listener / command loop are up made splash IPC wait and raced
+    // the server's HighID port-test against a not-yet-listening socket.
+    let mut pending_auto_connect_server = settings.auto_connect_server;
+    // After a successful login, OP_OFFERFILES is queued into pending_offer_files
+    // (declared with other deferred startup state) and drained one chunk/turn.
 
     let shared_ember_payload: ember::SharedEmberPayload =
         Arc::new(RwLock::new(Arc::new(Vec::new())));
@@ -7814,10 +7841,342 @@ pub async fn start_network(
     let mut last_kad_activity_at = chrono::Utc::now().timestamp();
     let mut last_cache_refresh_started_at = 0i64;
 
-    // Resume incomplete downloads from previous session
-    if let Ok(incomplete) = db.get_incomplete_downloads() {
-        let count = incomplete.len();
-        if count > 0 {
+    // Defer transfer resume, orphan sweep, firewall rules, and heavy disk
+    // loads until the event loop can service splash IPC. UPnP setup is also
+    // kicked here (non-blocking) via the maintain-result channel.
+    let mut pending_incomplete_downloads = match db.get_incomplete_downloads() {
+        Ok(v) if !v.is_empty() => {
+            info!(
+                "Will resume {} incomplete downloads after event loop starts",
+                v.len()
+            );
+            Some(v)
+        }
+        Ok(_) => None,
+        Err(e) => {
+            warn!("Failed to load incomplete downloads for resume: {e}");
+            None
+        }
+    };
+    let mut part_progress_task: Option<
+        tokio::task::JoinHandle<std::collections::HashMap<String, (u64, bool, bool)>>,
+    > = None;
+    let mut part_progress_map: Option<std::collections::HashMap<String, (u64, bool, bool)>> = None;
+    let mut pending_startup_cleanup = true;
+    let mut pending_upnp_setup = upnp_enabled;
+    let mut deferred_disk_loads: Option<tokio::task::JoinHandle<DeferredDiskLoads>> = {
+        let ipfilter_path = data_dir.join("ipfilter.dat");
+        let known_met_path = data_dir.join("known.met");
+        let known2_met_path = data_dir.join("known2_64.met");
+        let aich_cache_path = data_dir.join("aich_cache.dat");
+        let geoip_for_load = geoip.clone();
+        let geoip_dir = geoip_resource_dir.clone();
+        Some(tokio::task::spawn_blocking(move || {
+            let mut filter = IpFilter::new(ipf_enabled, ipf_block_private);
+            if ipf_enabled && ipfilter_path.exists() {
+                let _ = filter.load_from_file(&ipfilter_path);
+            }
+            info!(
+                "Loaded IP filter: enabled={}, block_private={}, ranges={}",
+                filter.is_enabled(),
+                filter.blocks_private(),
+                filter.range_count(),
+            );
+            let known_files = KnownFileList::load(&known_met_path);
+            info!("Loaded {} known files", known_files.file_count());
+
+            let mut aich_hash_sets = Vec::new();
+            match ed2k::aich::load_known2_met(&known2_met_path) {
+                Ok(sets) => {
+                    let total = sets.len();
+                    aich_hash_sets = sets
+                        .into_iter()
+                        .take(MAX_AICH_HASH_SETS)
+                        .map(|(root, leaves)| {
+                            let file_size =
+                                leaves.len() as u64 * ed2k::aich::AICH_BLOCK_SIZE as u64;
+                            ed2k::aich::AICHRecoveryHashSet {
+                                root_hash: root,
+                                leaf_hashes: leaves,
+                                file_size,
+                            }
+                        })
+                        .collect();
+                    if total > MAX_AICH_HASH_SETS {
+                        warn!(
+                            "known2_64.met has {} sets (cap {}); dropping {} oldest on load",
+                            total,
+                            MAX_AICH_HASH_SETS,
+                            total - MAX_AICH_HASH_SETS,
+                        );
+                    }
+                    info!(
+                        "Loaded {} AICH hash sets from known2_64.met",
+                        aich_hash_sets.len()
+                    );
+                }
+                Err(e) => {
+                    if known2_met_path.exists() {
+                        warn!("Failed to load known2_64.met: {e}");
+                    }
+                }
+            }
+
+            let mut aich_root_map = HashMap::new();
+            if let Ok(contents) = std::fs::read_to_string(&aich_cache_path) {
+                let mut skipped_at_cap = 0usize;
+                for line in contents.lines() {
+                    if let Some((ed2k_hex, aich_hex)) = line.split_once('=') {
+                        if let (Ok(ed2k_bytes), Ok(aich_bytes)) =
+                            (hex::decode(ed2k_hex.trim()), hex::decode(aich_hex.trim()))
+                        {
+                            if ed2k_bytes.len() == 16 && aich_bytes.len() == 20 {
+                                if aich_root_map.len() >= MAX_AICH_ROOT_MAP_SOFT_CAP {
+                                    skipped_at_cap = skipped_at_cap.saturating_add(1);
+                                    continue;
+                                }
+                                let mut fh = [0u8; 16];
+                                let mut ah = [0u8; 20];
+                                fh.copy_from_slice(&ed2k_bytes);
+                                ah.copy_from_slice(&aich_bytes);
+                                aich_root_map.insert(fh, ah);
+                            }
+                        }
+                    }
+                }
+                if skipped_at_cap > 0 {
+                    warn!(
+                        "aich_cache.dat had {} entries past soft cap {}; ignored on load",
+                        skipped_at_cap, MAX_AICH_ROOT_MAP_SOFT_CAP,
+                    );
+                }
+                info!(
+                    "Loaded {} AICH root mappings from cache",
+                    aich_root_map.len()
+                );
+            }
+
+            crate::geoip::fill(&geoip_for_load, &geoip_dir);
+
+            DeferredDiskLoads {
+                ip_filter: filter,
+                known_files,
+                aich_hash_sets,
+                aich_root_map,
+            }
+        }))
+    };
+
+    // Rate-limited LowID callback flush after login (avoid monopolizing the loop).
+    let mut pending_lowid_callback_queue: std::collections::VecDeque<([u8; 16], u32)> =
+        std::collections::VecDeque::new();
+    // Chunked OP_OFFERFILES across loop turns (post-login + shared-files changes).
+    let mut pending_offer_files: Option<Vec<ed2k::server::OfferFile>> = None;
+    let mut pending_offer_signature: Option<(usize, u64)> = None;
+
+    let (aich_set_tx, mut aich_set_rx) =
+        tokio::sync::mpsc::channel::<ed2k::aich::AICHRecoveryHashSet>(128);
+
+    info!("Network event loop starting");
+
+    let loop_panic = std::panic::AssertUnwindSafe(async {
+    loop {
+        // Give frontend commands priority, but cap each batch so a full IPC
+        // channel cannot starve UDP, timers, and transfer events indefinitely.
+        const MAX_COMMANDS_PER_ITERATION: usize = 128;
+        let mut shutting_down = false;
+        for _ in 0..MAX_COMMANDS_PER_ITERATION {
+            let Ok(cmd) = cmd_rx.try_recv() else {
+                break;
+            };
+            match cmd {
+                NetworkCommand::Shutdown => {
+                    shutting_down = true;
+                    break;
+                }
+                NetworkCommand::UpdateSettings { settings: new_settings } => {
+                    let prev_filter_servers = settings.filter_servers_by_ip;
+                    apply_network_settings(
+                        &mut state,
+                        &mut settings,
+                        new_settings,
+                        &ember_boot_tx,
+                    );
+                    {
+                        let mut nick = shared_nickname.write().await;
+                        *nick = settings.nickname.clone();
+                    }
+                    source_manager
+                        .write()
+                        .await
+                        .set_max_per_file(settings.max_sources_per_file);
+                    if settings.filter_servers_by_ip && !prev_filter_servers {
+                        let removed = state.server_list.remove_filtered(&mut state.ip_filter);
+                        if removed > 0 {
+                            let met_path = state.data_dir.join("server.met");
+                            spawn_save_server_met(&state.server_list, met_path, &state.server_met_save_generation, &state.server_met_save_lock);
+                            info!(
+                                "Removed {removed} servers blocked by IP filter (toggle enabled)"
+                            );
+                        }
+                    }
+                }
+                cmd => {
+                    handle_command(
+                        &udp_socket,
+                        cmd,
+                        &mut state,
+                        &local_index,
+                        &fresh_part_hashes,
+                        &settings,
+                        &dl_event_tx,
+                        &bandwidth_limiter,
+                        &db,
+                        &app_handle,
+                        &transfer_manager,
+                        &source_manager,
+                        &credit_manager,
+                        &mut stats_manager,
+                        &mut known_files,
+                        &server_udp,
+                        &firewall_probe_ips,
+                        &shared_banned_ips,
+                        &shared_banned_hashes,
+                        &shared_server_addr,
+                        &shared_ember_payload,
+                        &ember_payload_generation,
+                        &geoip,
+                        &friend_hashes,
+                        ember_hash,
+                        &ul_event_tx,
+                        ed25519_pubkey,
+                        ed25519_secret_key,
+                        &upload_queue_handle,
+                    ).await;
+                }
+            }
+        }
+        if shutting_down {
+            info!("Network shutting down");
+            // Stop the upload listener from accepting new connections (and let it
+            // terminate active sessions) during the multi-second shutdown save
+            // sequence, so it can't spawn work against state being torn down.
+            state.upload_disconnected.store(true, std::sync::atomic::Ordering::Relaxed);
+            break;
+        }
+
+        // --- Deferred startup: disk loads, UPnP, transfer resume, offers ------
+        if pending_upnp_setup {
+            pending_upnp_setup = false;
+            if upnp_enabled {
+                let revision = upnp_mappings.revision();
+                let mut mappings = upnp_mappings.clone();
+                let tx = upnp_maintain_result_tx.clone();
+                upnp_maintain_in_flight = true;
+                upnp_maintain_started_at = Some(tokio::time::Instant::now());
+                tokio::spawn(async move {
+                    mappings.setup().await;
+                    let mapped = mappings.is_mapped();
+                    if mapped {
+                        info!("UPnP port mapping succeeded -- not firewalled");
+                    } else {
+                        debug!(
+                            "UPnP initial port mapping failed; keeping UPnP enabled and retrying in the background"
+                        );
+                    }
+                    let _ = tx.send(UpnpMaintainResult {
+                        revision,
+                        mappings,
+                        mapped,
+                    });
+                });
+            } else {
+                info!("UPnP disabled by user -- skipping port mapping");
+            }
+        }
+
+        if let Some(handle) = deferred_disk_loads.as_mut() {
+            if handle.is_finished() {
+                match deferred_disk_loads.take().unwrap().await {
+                    Ok(loads) => {
+                        state.ip_filter = loads.ip_filter;
+                        state
+                            .ip_filter
+                            .update_shared_snapshot(&state.shared_ip_filter);
+                        known_files.absorb_missing_from(loads.known_files);
+                        state.aich_hash_sets = loads.aich_hash_sets;
+                        for (k, v) in loads.aich_root_map {
+                            if state.aich_root_map.len() >= MAX_AICH_ROOT_MAP_SOFT_CAP {
+                                break;
+                            }
+                            state.aich_root_map.entry(k).or_insert(v);
+                        }
+                        if settings.filter_servers_by_ip {
+                            let removed =
+                                state.server_list.remove_filtered(&mut state.ip_filter);
+                            if removed > 0 {
+                                let met_path = state.data_dir.join("server.met");
+                                spawn_save_server_met(&state.server_list, met_path, &state.server_met_save_generation, &state.server_met_save_lock);
+                                info!(
+                                    "Removed {removed} IP-filtered servers from server list"
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => warn!("Deferred disk load task panicked: {e}"),
+                }
+            }
+        }
+
+        if part_progress_task.is_none()
+            && part_progress_map.is_none()
+            && pending_incomplete_downloads.is_some()
+        {
+            let dl_folder = settings.download_folder.clone();
+            let jobs: Vec<(String, u64, String)> = pending_incomplete_downloads
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|t| (t.id.clone(), t.total_size, t.file_name.clone()))
+                .collect();
+            part_progress_task = Some(tokio::task::spawn_blocking(move || {
+                let mut map = std::collections::HashMap::new();
+                for (id, total, name) in jobs {
+                    let part_path = PathBuf::from(&dl_folder)
+                        .join("Temp")
+                        .join(format!("{id}.part"));
+                    if part_path.exists() && total > 0 {
+                        let tracker =
+                            crate::network::ed2k::part_tracker::PartTracker::new(total, &part_path);
+                        map.insert(
+                            id,
+                            (
+                                tracker.completed_bytes(),
+                                tracker.is_preview_ready(&name, total),
+                                tracker.all_complete(),
+                            ),
+                        );
+                    }
+                }
+                map
+            }));
+        }
+        if let Some(handle) = part_progress_task.as_mut() {
+            if handle.is_finished() {
+                match part_progress_task.take().unwrap().await {
+                    Ok(map) => part_progress_map = Some(map),
+                    Err(e) => {
+                        warn!("Part progress restore task panicked: {e}");
+                        part_progress_map = Some(std::collections::HashMap::new());
+                    }
+                }
+            }
+        }
+
+        if pending_incomplete_downloads.is_some() && part_progress_map.is_some() {
+            let incomplete = pending_incomplete_downloads.take().unwrap();
+            let progress_map = part_progress_map.take().unwrap();
+            let count = incomplete.len();
             info!("Resuming {count} incomplete downloads from previous session");
             let dl_folder = settings.download_folder.clone();
             for mut transfer in incomplete {
@@ -7846,25 +8205,16 @@ pub async fn start_network(
                     .join("Temp")
                     .join(format!("{}.part", transfer.id));
                 if part_path.exists() && transfer.total_size > 0 {
-                    let tracker = crate::network::ed2k::part_tracker::PartTracker::new(
-                        transfer.total_size,
-                        &part_path,
-                    );
-                    let completed_bytes = tracker.completed_bytes();
-                    transfer.transferred = completed_bytes;
-                    transfer.completed_size = transfer.transferred;
-                    transfer.progress =
-                        ((transfer.transferred as f64 / transfer.total_size as f64) * 100.0)
-                            .min(100.0);
-                    // Publish preview-readiness from the resumed on-disk state.
-                    // Paused/stopped/queued downloads have no running worker to
-                    // compute this, so without it the UI's Preview action would
-                    // be greyed out after a restart even when the first part is
-                    // already verified and a preview would succeed. Active
-                    // downloads get this refreshed by their worker once it spawns.
-                    control.set_preview_ready(
-                        tracker.is_preview_ready(&transfer.file_name, transfer.total_size),
-                    );
+                    if let Some((completed_bytes, preview_ready, _)) =
+                        progress_map.get(&transfer.id).copied()
+                    {
+                        transfer.transferred = completed_bytes;
+                        transfer.completed_size = transfer.transferred;
+                        transfer.progress =
+                            ((transfer.transferred as f64 / transfer.total_size as f64) * 100.0)
+                                .min(100.0);
+                        control.set_preview_ready(preview_ready);
+                    }
                 }
 
                 // If the app crashed during Verifying/Completing, handle locally
@@ -7886,54 +8236,72 @@ pub async fn start_network(
                         // transfer's ed2k hash before recording success —
                         // otherwise we'd mark a download complete against the
                         // wrong content (and Open/Reveal would point at it).
+                        // Verify off the network task — do not await a full-file
+                        // hash before the event loop can drain IPC.
                         let expected = transfer.file_hash.clone();
                         let verify_path = final_path.clone();
-                        let hash_matches = tokio::task::spawn_blocking(move || {
-                            ed2k::hash::ed2k_hash_file(&verify_path).ok()
-                        })
-                        .await
-                        .ok()
-                        .flatten()
-                        .map(|h| h.eq_ignore_ascii_case(&expected))
-                        .unwrap_or(false);
-
-                        if hash_matches {
-                            info!(
-                                "Restored download {} was Verifying; final file verified against expected hash — marking completed",
+                        let tid = transfer.id.clone();
+                        let tid_handle = tid.clone();
+                        let tx = dl_event_tx.clone();
+                        transfer.status = TransferStatus::Verifying;
+                        transfer.speed = 0;
+                        if let Err(e) = db.save_transfer(&transfer) {
+                            warn!(
+                                "DB save_transfer failed for verifying transfer {}: {e}",
                                 transfer.id
                             );
-                            transfer.status = TransferStatus::Completed;
-                            transfer.progress = 100.0;
-                            transfer.speed = 0;
-                            transfer.completed_path =
-                                Some(final_path.to_string_lossy().into_owned());
-                            if let Err(e) = db.save_transfer(&transfer) {
-                                warn!(
-                                    "DB save_transfer failed for completed transfer {}: {e}",
-                                    transfer.id
-                                );
-                            }
-                            let mut mgr = transfer_manager.write().await;
-                            mgr.completed.push(transfer);
-                            continue;
                         }
-
-                        warn!(
-                            "Restored download {} has no .part and the file at {} does not match the expected hash; \
-                             not marking complete — will re-acquire sources",
-                            transfer.id,
-                            final_path.display()
-                        );
-                        // Fall through to the normal restore path below so the
-                        // download is re-attempted rather than silently claimed.
+                        {
+                            let mut mgr = transfer_manager.write().await;
+                            mgr.active.insert(tid.clone(), transfer);
+                            mgr.register_control(&tid, control);
+                        }
+                        let handle = tokio::spawn(async move {
+                            let hash_matches = tokio::task::spawn_blocking(move || {
+                                ed2k::hash::ed2k_hash_file(&verify_path).ok()
+                            })
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|h| h.eq_ignore_ascii_case(&expected))
+                            .unwrap_or(false);
+                            if hash_matches {
+                                let _ = tx
+                                    .send(DownloadEvent::Completed {
+                                        transfer_id: tid,
+                                        final_path: Some(
+                                            final_path.to_string_lossy().into_owned(),
+                                        ),
+                                        part_hashes: Vec::new(),
+                                    })
+                                    .await;
+                            } else {
+                                warn!(
+                                    "Restored download {} final file hash mismatch; marking failed for retry",
+                                    tid
+                                );
+                                let _ = tx
+                                    .send(DownloadEvent::Failed {
+                                        transfer_id: tid,
+                                        error: "Restored final file hash mismatch".into(),
+                                        failure_kind: ed2k::transfer::classify_error(
+                                            "hash mismatch",
+                                        ),
+                                    })
+                                    .await;
+                            }
+                        });
+                        state.download_handles.insert(tid_handle, handle);
+                        continue;
                     }
 
+
                     if part_path.exists() && transfer.total_size > 0 {
-                        let tracker = crate::network::ed2k::part_tracker::PartTracker::new(
-                            transfer.total_size,
-                            &part_path,
-                        );
-                        if tracker.all_complete() {
+                        let all_complete = progress_map
+                            .get(&transfer.id)
+                            .map(|(_, _, ac)| *ac)
+                            .unwrap_or(false);
+                        if all_complete {
                             info!(
                                 "Restored download {} was Verifying with complete .part — re-verifying locally",
                                 transfer.id
@@ -8077,131 +8445,229 @@ pub async fn start_network(
                 }
             }
         }
-    }
 
-    // Reap orphan `.part` / `.part.met` files in `<download_folder>/Temp/`
-    // whose UUID basename doesn't match any transfer the manager just
-    // restored from the DB. Idempotent — workers that own a known
-    // .part are skipped because their UUID is in `known_ids`. Catches
-    // crashes that bypassed `cleanup_partial_files`, Windows-locked
-    // file deletions that ran out of retries, cross-device move
-    // fallbacks where the source remove failed after the copy
-    // succeeded, and Temp folders left behind by a wiped DB.
-    {
-        let known_ids: std::collections::HashSet<String> = {
-            let mgr = transfer_manager.read().await;
-            mgr.get_all().into_iter().map(|t| t.id).collect()
-        };
-        crate::commands::transfers::sweep_orphan_part_files(&settings.download_folder, &known_ids)
-            .await;
-    }
+        if pending_startup_cleanup
+            && pending_incomplete_downloads.is_none()
+            && part_progress_task.is_none()
+            && part_progress_map.is_none()
+        {
+            pending_startup_cleanup = false;
+            {
+                let known_ids: std::collections::HashSet<String> = {
+                    let mgr = transfer_manager.read().await;
+                    mgr.get_all().into_iter().map(|t| t.id).collect()
+                };
+                crate::commands::transfers::sweep_orphan_part_files(
+                    &settings.download_folder,
+                    &known_ids,
+                )
+                .await;
+            }
 
-    #[cfg(target_os = "windows")]
-    {
-        crate::security::firewall::ensure_firewall_rules(tcp_port, udp_port);
-    }
+            #[cfg(target_os = "windows")]
+            {
+                let fw_tcp = tcp_port;
+                let fw_udp = udp_port;
+                tokio::task::spawn_blocking(move || {
+                    crate::security::firewall::ensure_firewall_rules(fw_tcp, fw_udp);
+                });
+            }
 
-    ed2k::preview::cleanup_previews();
-
-    // Remove servers blocked by IP filter (eMule: FilterServerByIP on startup)
-    if settings.filter_servers_by_ip {
-        let removed = state.server_list.remove_filtered(&mut state.ip_filter);
-        if removed > 0 {
-            let met_path = state.data_dir.join("server.met");
-            let _ = state.server_list.save_server_met(&met_path);
-            info!("Removed {removed} IP-filtered servers from server list");
+            ed2k::preview::cleanup_previews();
         }
-    }
 
-    let (aich_set_tx, mut aich_set_rx) =
-        tokio::sync::mpsc::channel::<ed2k::aich::AICHRecoveryHashSet>(128);
-
-    info!("Network event loop starting");
-
-    let loop_panic = std::panic::AssertUnwindSafe(async {
-    loop {
-        // Give frontend commands priority, but cap each batch so a full IPC
-        // channel cannot starve UDP, timers, and transfer events indefinitely.
-        const MAX_COMMANDS_PER_ITERATION: usize = 128;
-        let mut shutting_down = false;
-        for _ in 0..MAX_COMMANDS_PER_ITERATION {
-            let Ok(cmd) = cmd_rx.try_recv() else {
-                break;
-            };
-            match cmd {
-                NetworkCommand::Shutdown => {
-                    shutting_down = true;
-                    break;
-                }
-                NetworkCommand::UpdateSettings { settings: new_settings } => {
-                    let prev_filter_servers = settings.filter_servers_by_ip;
-                    apply_network_settings(
-                        &mut state,
-                        &mut settings,
-                        new_settings,
-                        &ember_boot_tx,
-                    );
-                    {
-                        let mut nick = shared_nickname.write().await;
-                        *nick = settings.nickname.clone();
-                    }
-                    source_manager
-                        .write()
-                        .await
-                        .set_max_per_file(settings.max_sources_per_file);
-                    if settings.filter_servers_by_ip && !prev_filter_servers {
-                        let removed = state.server_list.remove_filtered(&mut state.ip_filter);
-                        if removed > 0 {
-                            let met_path = state.data_dir.join("server.met");
-                            let _ = state.server_list.save_server_met(&met_path);
-                            info!(
-                                "Removed {removed} servers blocked by IP filter (toggle enabled)"
-                            );
+        // Drain at most one OP_OFFERFILES chunk per loop turn so large libraries
+        // cannot monopolize the network task (IPC/UDP/timers keep running).
+        if state.request_offer_files && pending_offer_files.is_none() {
+            state.request_offer_files = false;
+            if state.server_connected {
+                let mut seen_offer_hashes = std::collections::HashSet::new();
+                let mut offer_files: Vec<ed2k::server::OfferFile> = {
+                    let index = local_index.read().await;
+                    index
+                        .all_files()
+                        .iter()
+                        .filter(|f| f.shared)
+                        .filter_map(|f| {
+                            let hash_bytes = hex::decode(&f.hash).ok()?;
+                            if hash_bytes.len() < 16 {
+                                return None;
+                            }
+                            if !seen_offer_hashes.insert(f.hash.clone()) {
+                                return None;
+                            }
+                            let mut h = [0u8; 16];
+                            h.copy_from_slice(&hash_bytes[..16]);
+                            Some(ed2k::server::OfferFile {
+                                hash: h,
+                                name: f.name.clone(),
+                                size: f.size,
+                                is_complete: true,
+                                file_type: String::new(),
+                            })
+                        })
+                        .collect()
+                };
+                let temp_dir = PathBuf::from(&settings.download_folder).join("Temp");
+                {
+                    let mgr = transfer_manager.read().await;
+                    for transfer in mgr.active.values().chain(mgr.queue.iter()) {
+                        if transfer.direction != TransferDirection::Download {
+                            continue;
                         }
+                        if matches!(
+                            transfer.status,
+                            TransferStatus::Completed | TransferStatus::Failed
+                        ) {
+                            continue;
+                        }
+                        if transfer.file_hash.is_empty()
+                            || !seen_offer_hashes.insert(transfer.file_hash.clone())
+                        {
+                            continue;
+                        }
+                        let hash_bytes = match hex::decode(&transfer.file_hash) {
+                            Ok(bytes) if bytes.len() >= 16 => bytes,
+                            _ => continue,
+                        };
+                        let part_path = temp_dir.join(format!("{}.part", transfer.id));
+                        if !part_path.exists() {
+                            continue;
+                        }
+                        let mut h = [0u8; 16];
+                        h.copy_from_slice(&hash_bytes[..16]);
+                        offer_files.push(ed2k::server::OfferFile {
+                            hash: h,
+                            name: transfer.file_name.clone(),
+                            size: transfer.total_size,
+                            is_complete: false,
+                            file_type: String::new(),
+                        });
                     }
                 }
-                cmd => {
-                    handle_command(
-                        &udp_socket,
-                        cmd,
-                        &mut state,
-                        &local_index,
-                        &fresh_part_hashes,
-                        &settings,
-                        &dl_event_tx,
-                        &bandwidth_limiter,
-                        &db,
-                        &app_handle,
-                        &transfer_manager,
-                        &source_manager,
-                        &credit_manager,
-                        &mut stats_manager,
-                        &mut known_files,
-                        &server_udp,
-                        &firewall_probe_ips,
-                        &shared_banned_ips,
-                        &shared_banned_hashes,
-                        &shared_server_addr,
-                        &shared_ember_payload,
-                        &ember_payload_generation,
-                        &geoip,
-                        &friend_hashes,
-                        ember_hash,
-                        &ul_event_tx,
-                        ed25519_pubkey,
-                        ed25519_secret_key,
-                        &upload_queue_handle,
-                    ).await;
+                if !offer_files.is_empty() {
+                    pending_offer_signature = Some(offer_files_signature(&offer_files));
+                    pending_offer_files = Some(offer_files);
                 }
             }
         }
-        if shutting_down {
-            info!("Network shutting down");
-            // Stop the upload listener from accepting new connections (and let it
-            // terminate active sessions) during the multi-second shutdown save
-            // sequence, so it can't spawn work against state being torn down.
-            state.upload_disconnected.store(true, std::sync::atomic::Ordering::Relaxed);
-            break;
+        if let Some(files) = pending_offer_files.as_mut() {
+            if state.server_connection.is_some() {
+                let limit = state
+                    .server_connection
+                    .as_ref()
+                    .map(|c| c.offer_files_chunk_limit())
+                    .unwrap_or(200);
+                let end = limit.min(files.len());
+                let chunk: Vec<_> = files.drain(..end).collect();
+                if let Some(conn) = state.server_connection.as_mut() {
+                    if !chunk.is_empty() {
+                        match conn.offer_files_chunk(&chunk, settings.tcp_port).await {
+                            Ok(()) => {
+                                replace_offered_ed2k_hashes(&mut state, &chunk);
+                                if files.is_empty() {
+                                    pending_offer_files = None;
+                                    if let Some(sig) = pending_offer_signature.take() {
+                                        state.last_offer_files_signature = Some(sig);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                debug!("Failed to send OP_OFFERFILES chunk: {e}");
+                                // Put the failed chunk back at the front so it is
+                                // retried on a later turn instead of being dropped.
+                                let mut rest = std::mem::take(files);
+                                let mut retry = chunk;
+                                retry.append(&mut rest);
+                                *files = retry;
+                            }
+                        }
+                    } else if files.is_empty() {
+                        pending_offer_files = None;
+                    }
+                }
+            } else {
+                pending_offer_files = None;
+                pending_offer_signature = None;
+            }
+        }
+
+        // Rate-limit LowID callback requests after login / poll bursts.
+        const MAX_LOWID_CALLBACKS_PER_TURN: usize = 32;
+        if !pending_lowid_callback_queue.is_empty()
+            && state.server_connected
+            && !state.low_id
+        {
+            if let Some(conn) = state.server_connection.as_mut() {
+                let mut succeeded = Vec::new();
+                for _ in 0..MAX_LOWID_CALLBACKS_PER_TURN {
+                    let Some((file_hash, client_id)) = pending_lowid_callback_queue.pop_front()
+                    else {
+                        break;
+                    };
+                    if conn.request_callback(client_id).await.is_ok() {
+                        succeeded.push((file_hash, client_id));
+                    } else {
+                        // Keep the entry and stop this turn — further attempts
+                        // against a failing TCP session would just burn the quota.
+                        pending_lowid_callback_queue.push_front((file_hash, client_id));
+                        break;
+                    }
+                }
+                if !succeeded.is_empty() {
+                    let mut sm = source_manager.write().await;
+                    for (file_hash, client_id) in &succeeded {
+                        sm.mark_callback_sent(file_hash, *client_id);
+                    }
+                    debug!(
+                        "Sent {} LowID callbacks ({} still queued)",
+                        succeeded.len(),
+                        pending_lowid_callback_queue.len()
+                    );
+                }
+            }
+        }
+
+
+        // --- Deferred startup: server.met bootstrap + auto-connect ------------
+        // Kept out of pre-loop init so splash/GetNetworkStats can complete while
+        // the upload listener is already accepting the server's HighID port-test.
+        if pending_server_met_bootstrap && server_met_bootstrap_task.is_none() {
+            pending_server_met_bootstrap = false;
+            let url = crate::commands::server::DEFAULT_SERVER_MET_URL;
+            info!("Empty server list — downloading server.met from {url} (background)");
+            server_met_bootstrap_task = Some(tokio::spawn(async move {
+                crate::commands::server::fetch_server_met_bytes(url).await
+            }));
+        } else if server_met_bootstrap_task.is_none()
+            && pending_auto_connect_server
+            && state.pending_server_connect.is_none()
+            && !state.server_connected
+            && state.server_connection.is_none()
+        {
+            pending_auto_connect_server = false;
+            match ed2k::server_list::ServerList::resolve_auto_connect_target(
+                &state.data_dir,
+                &state.server_list,
+            ) {
+                Some((server_ip, server_port)) => {
+                    initiate_server_connect(
+                        &mut state,
+                        &settings,
+                        &app_handle,
+                        &shared_server_addr,
+                        server_ip,
+                        server_port,
+                    )
+                    .await;
+                }
+                None => {
+                    emit_server_auto_connect_failed(
+                        &app_handle,
+                        "no last server and eMule Sunrise not in list",
+                    );
+                }
+            }
         }
 
         if state.stats.status == NetworkStatus::Disconnected {
@@ -8231,6 +8697,67 @@ pub async fn start_network(
         }
 
         tokio::select! {
+            // Background first-launch server.met download (must not block splash).
+            result = async {
+                match server_met_bootstrap_task.as_mut() {
+                    Some(handle) => handle.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                server_met_bootstrap_task = None;
+                match result {
+                    Ok(Ok(data)) => {
+                        match state.server_list.merge_from_bytes_filtered(
+                            &data,
+                            settings.filter_servers_by_ip,
+                            Some(&mut state.ip_filter),
+                        ) {
+                            Ok(stats) => {
+                                info!(
+                                    "First-launch server.met: {} added, {} updated, {} filtered, {} dropped at capacity",
+                                    stats.added, stats.updated, stats.filtered, stats.at_capacity
+                                );
+                                let met_path = state.data_dir.join("server.met");
+                                spawn_save_server_met(&state.server_list, met_path.clone(), &state.server_met_save_generation, &state.server_met_save_lock);
+                            }
+                            Err(e) => {
+                                warn!("Failed to parse downloaded server.met: {e}");
+                                if pending_auto_connect_server {
+                                    pending_auto_connect_server = false;
+                                    emit_server_auto_connect_failed(
+                                        &app_handle,
+                                        "downloaded server.met could not be parsed",
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        warn!(
+                            "Failed to download server.met: {e} — server list remains empty \
+                             (use Servers page to add servers or retry download)"
+                        );
+                        if pending_auto_connect_server {
+                            pending_auto_connect_server = false;
+                            emit_server_auto_connect_failed(
+                                &app_handle,
+                                "server.met download failed",
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!("server.met bootstrap task failed: {e}");
+                        if pending_auto_connect_server {
+                            pending_auto_connect_server = false;
+                            emit_server_auto_connect_failed(
+                                &app_handle,
+                                "server.met download task failed",
+                            );
+                        }
+                    }
+                }
+            }
+
             // Incoming UDP packets: batch up to 20 per iteration so we re-check
             // commands and timers between batches
             result = udp_socket.recv_from(&mut udp_buf) => {
@@ -8387,7 +8914,7 @@ pub async fn start_network(
                             let removed = state.server_list.remove_filtered(&mut state.ip_filter);
                             if removed > 0 {
                                 let met_path = state.data_dir.join("server.met");
-                                let _ = state.server_list.save_server_met(&met_path);
+                                spawn_save_server_met(&state.server_list, met_path, &state.server_met_save_generation, &state.server_met_save_lock);
                                 info!(
                                     "Removed {removed} servers blocked by IP filter (toggle enabled)"
                                 );
@@ -9407,33 +9934,52 @@ pub async fn start_network(
                             }
                         }
                     }
-                    // Reputation: record handshake success or failure
-                    if status == "transferring" || status == "failed" {
+                    // Reputation: record handshake success; only score real
+                    // download timeouts as Timeout (not our disk-full, permanent
+                    // "no file", or other non-timeout failures).
+                    if status == "transferring" {
                         if let Ok(v4) = ip.parse::<Ipv4Addr>() {
                             let sm = source_manager.read().await;
                             let maybe_uh = sm.find_user_hash_by_addr(v4, port);
                             drop(sm);
                             if let Some(uh) = maybe_uh {
-                                let rep_event = if status == "transferring" {
-                                    ember::reputation::ReputationEvent::SuccessfulHandshake
-                                } else {
-                                    ember::reputation::ReputationEvent::Timeout
-                                };
                                 let (node_banned, ip_banned) =
-                                    state.reputation.record_event_with_ip(&uh, v4, rep_event);
+                                    state.reputation.record_event_with_ip(
+                                        &uh,
+                                        v4,
+                                        ember::reputation::ReputationEvent::SuccessfulHandshake,
+                                    );
                                 if node_banned || ip_banned {
-                                    if state.banned_ips.insert(v4) {
-                                        warn!(
-                                            "Reputation ban: banning IP {} (user_hash {}, node_ban={}, ip_ban={})",
-                                            v4,
-                                            hex::encode(&uh),
-                                            node_banned,
-                                            ip_banned,
-                                        );
-                                    }
-                                    if let Ok(mut shared) = shared_banned_ips.write() {
-                                        *shared = state.banned_ips.clone();
-                                    }
+                                    apply_reputation_ban_ips(
+                                        &mut state,
+                                        &shared_banned_ips,
+                                        std::iter::once(v4),
+                                        &uh,
+                                    );
+                                }
+                            }
+                        }
+                    } else if status == "failed"
+                        && matches!(failure_kind, Some(SourceFailureKind::DownloadTimeout))
+                    {
+                        if let Ok(v4) = ip.parse::<Ipv4Addr>() {
+                            let sm = source_manager.read().await;
+                            let maybe_uh = sm.find_user_hash_by_addr(v4, port);
+                            drop(sm);
+                            if let Some(uh) = maybe_uh {
+                                let (node_banned, ip_banned) =
+                                    state.reputation.record_event_with_ip(
+                                        &uh,
+                                        v4,
+                                        ember::reputation::ReputationEvent::Timeout,
+                                    );
+                                if node_banned || ip_banned {
+                                    apply_reputation_ban_ips(
+                                        &mut state,
+                                        &shared_banned_ips,
+                                        std::iter::once(v4),
+                                        &uh,
+                                    );
                                 }
                             }
                         }
@@ -9509,14 +10055,12 @@ pub async fn start_network(
                                         ips.push(ip);
                                     }
                                 }
-                                for ip in ips {
-                                    if state.banned_ips.insert(ip) {
-                                        warn!("Reputation ban: banning IP {} (user_hash {})", ip, hex::encode(uh));
-                                    }
-                                }
-                                if let Ok(mut shared) = shared_banned_ips.write() {
-                                    *shared = state.banned_ips.clone();
-                                }
+                                apply_reputation_ban_ips(
+                                    &mut state,
+                                    &shared_banned_ips,
+                                    ips,
+                                    uh,
+                                );
                             }
                         }
                     }
@@ -9536,26 +10080,31 @@ pub async fn start_network(
                                 ember::reputation::ReputationEvent::ProtocolViolation,
                             );
                         if node_banned || ip_banned {
-                            if state.banned_ips.insert(sender_ip) {
-                                warn!("Reputation ban: banning IP {} (protocol violation, user_hash {})", sender_ip, hex::encode(uh));
-                            }
                             let sm = source_manager.read().await;
-                            let ips = sm.find_ips_by_user_hash(uh);
+                            let mut ips = sm.find_ips_by_user_hash(uh);
                             drop(sm);
-                            for ip in ips {
-                                state.banned_ips.insert(ip);
+                            if !ips.contains(&sender_ip) {
+                                ips.push(sender_ip);
                             }
-                            if let Ok(mut shared) = shared_banned_ips.write() {
-                                *shared = state.banned_ips.clone();
-                            }
+                            apply_reputation_ban_ips(
+                                &mut state,
+                                &shared_banned_ips,
+                                ips,
+                                uh,
+                            );
                         }
-                    } else if state.banned_ips.insert(sender_ip) {
+                    } else {
                         // No user hash to score against — fall back to a
-                        // direct IP ban for the offending source.
-                        warn!("Banning IP {} (protocol violation, no user hash)", sender_ip);
-                        if let Ok(mut shared) = shared_banned_ips.write() {
-                            *shared = state.banned_ips.clone();
-                        }
+                        // durable IP ban so the offender cannot reconnect
+                        // for the auto-ban TTL (and so over-cap rebuilds
+                        // do not silently drop the entry).
+                        apply_persistent_ip_ban(
+                            &mut state.banned_ips,
+                            &shared_banned_ips,
+                            &db,
+                            sender_ip,
+                            "protocol violation (no user hash)",
+                        );
                     }
                 }
                 if let DownloadEvent::AichRecoveryFailed { ref file_hash, part_index, failed_ip, .. } = event {
@@ -10201,10 +10750,14 @@ pub async fn start_network(
                         }
                         drop(mgr);
                     }
-                    UploadEventKind::Failed { .. } => {
+                    UploadEventKind::Failed { ref error } => {
                         // Pull the peer identity out first, then drop the
                         // transfer-manager lock before touching the source
-                        // manager / reputation state.
+                        // manager / reputation state. Skip queue/session
+                        // mechanics that are not evidence of bad peer data.
+                        if is_neutral_upload_failure(error) {
+                            // no reputation strike
+                        } else {
                         let peer_info: Option<([u8; 16], Option<Ipv4Addr>)> = {
                             let mgr = transfer_manager.read().await;
                             mgr.get_transfer(&event.transfer_id).and_then(|t| {
@@ -10249,38 +10802,45 @@ pub async fn start_network(
                                         ips.push(ip);
                                     }
                                 }
-                                for ip in ips {
-                                    if state.banned_ips.insert(ip) {
-                                        warn!("Reputation ban: banning IP {} (user_hash {})", ip, hex::encode(uh));
-                                    }
-                                }
-                                if let Ok(mut shared) = shared_banned_ips.write() {
-                                    *shared = state.banned_ips.clone();
-                                }
+                                apply_reputation_ban_ips(
+                                    &mut state,
+                                    &shared_banned_ips,
+                                    ips,
+                                    &uh,
+                                );
                             }
+                        }
                         }
                     }
                     UploadEventKind::PeerAutoBanned { ip, reason, user_hash } => {
-                        // The upload listener already added this to the
-                        // shared upload set for immediate effect; make it
-                        // canonical (UDP + download enforcement) and durable.
-                        apply_persistent_ip_ban(
-                            &mut state.banned_ips,
-                            &shared_banned_ips,
-                            &db,
-                            *ip,
-                            reason,
-                        );
-                        // If this IP was captured from a live session whose
-                        // peer was manually banned by user-hash, record it
-                        // against that peer so unban_peer (which reverses a
-                        // ban by walking the peer's known addresses) clears
-                        // this IP too — keeping ban/unban symmetric.
-                        if let Some(uh) = user_hash {
-                            let peer_id_hex = hex::encode(uh);
-                            if let Err(e) = db.add_banned_peer_address(&peer_id_hex, *ip) {
-                                warn!("Failed to record captured ban IP {ip} for peer {peer_id_hex}: {e}");
+                        // Manual live-session capture (hash-banned peer caught
+                        // mid-upload): persist against the peer row only — not
+                        // the 7-day auto-ban table — so unban_peer remains the
+                        // sole lifetime authority.
+                        let is_manual_capture = user_hash.is_some()
+                            && reason.starts_with("manual peer ban");
+                        if is_manual_capture {
+                            if state.banned_ips.insert(*ip) {
+                                warn!("Manual ban capture: banning IP {ip} ({reason})");
                             }
+                            if let Ok(mut shared) = shared_banned_ips.write() {
+                                *shared = state.banned_ips.clone();
+                            }
+                            if let Some(uh) = user_hash {
+                                let peer_id_hex = hex::encode(uh);
+                                if let Err(e) = db.add_banned_peer_address(&peer_id_hex, *ip) {
+                                    warn!("Failed to record captured ban IP {ip} for peer {peer_id_hex}: {e}");
+                                }
+                            }
+                        } else {
+                            // Abuse / AddRequestCount: canonical + durable auto-ban.
+                            apply_persistent_ip_ban(
+                                &mut state.banned_ips,
+                                &shared_banned_ips,
+                                &db,
+                                *ip,
+                                reason,
+                            );
                         }
                     }
                     _ => {}
@@ -12959,7 +13519,8 @@ pub async fn start_network(
                     }
                     if !state.firewalled {
                         state.firewalled = true;
-                        state.firewall_checker.note_tcp_firewalled();
+                        // Re-assert LowID aggregate firewalled, but do not erase
+                        // KAD/server TCP Open proof via note_tcp_firewalled.
                         update_publish_manager_state(&mut state);
                         state.stats.firewalled = true;
                         state.stats.tcp_status = format!("{:?}", state.firewall_checker.tcp_status());
@@ -15502,38 +16063,20 @@ pub async fn start_network(
                     }
                 }
 
-                // Cap banned_ips to prevent unbounded growth: keep only IPs
-                // still in the database. The full ban persists in the DB.
+                // Cap banned_ips to prevent unbounded growth: rebuild from
+                // durable sources + active reputation bans (same path as the
+                // periodic reputation-timer sync).
                 const MAX_BANNED_IPS: usize = 10_000;
                 if state.banned_ips.len() > MAX_BANNED_IPS {
-                    // Rebuild the enforced set from the two durable sources
-                    // (manually-banned peer rows + the auto-ban table), but
-                    // ONLY if both DB reads succeed. On a transient DB error
-                    // we keep the current (oversized) in-memory set for this
-                    // cycle instead of replacing it with an empty/partial set
-                    // — dropping every live ban would be a fail-open. We also
-                    // union ALL addresses of each banned peer row (BanPeer
-                    // inserts all of them), not just the first.
-                    match (db.get_peers(), db.get_banned_ips()) {
-                        (Ok(peers), Ok(auto_bans)) => {
-                            let mut db_banned: HashSet<Ipv4Addr> = peers
-                                .iter()
-                                .filter(|p| p.banned)
-                                .flat_map(|p| p.addresses.iter())
-                                .filter_map(|a| a.rsplit_once(':').and_then(|(ip, _)| ip.parse().ok()))
-                                .collect();
-                            db_banned.extend(auto_bans);
-                            state.banned_ips = db_banned;
-                            if let Ok(mut shared) = shared_banned_ips.write() {
-                                *shared = state.banned_ips.clone();
-                            }
-                        }
-                        _ => {
-                            warn!(
-                                "banned_ips over cap ({}) but a DB read failed; keeping in-memory set this cycle",
-                                state.banned_ips.len()
-                            );
-                        }
+                    let sm = source_manager.read().await;
+                    let before = state.banned_ips.len();
+                    sync_enforced_banned_ips(&mut state, &shared_banned_ips, &db, &sm);
+                    if state.banned_ips.len() > MAX_BANNED_IPS {
+                        warn!(
+                            "banned_ips still over cap after sync ({} → {}); durable sources exceed MAX_BANNED_IPS",
+                            before,
+                            state.banned_ips.len()
+                        );
                     }
                 }
 
@@ -17366,9 +17909,7 @@ pub async fn start_network(
                                         if added > 0 {
                                             emit_server_log(&app_handle, &format!("Added {added} servers from server list update"));
                                             let met_path = state.data_dir.join("server.met");
-                                            if let Err(e) = state.server_list.save_server_met(&met_path) {
-                                                warn!("Failed to save server.met after server list update: {e}");
-                                            }
+                                            spawn_save_server_met(&state.server_list, met_path.clone(), &state.server_met_save_generation, &state.server_met_save_lock);
                                         }
                                     }
                                 }
@@ -17394,7 +17935,7 @@ pub async fn start_network(
                                             &name,
                                         ) {
                                             let met_path = state.data_dir.join("server.met");
-                                            let _ = state.server_list.save_server_met(&met_path);
+                                            spawn_save_server_met(&state.server_list, met_path, &state.server_met_save_generation, &state.server_met_save_lock);
                                         }
                                     }
                                 }
@@ -18258,13 +18799,21 @@ pub async fn start_network(
                 if state.server_auto_reconnect
                     && !state.server_connected
                     && state.pending_server_connect.is_none()
-                    && !state.server_list.is_empty()
                     && state.server_connection.is_none()
+                    && state.preferred_ed2k_server.is_some()
                     && matches!(
                         state.stats.status,
                         NetworkStatus::Connected | NetworkStatus::Connecting
                     )
                 {
+                    if state.server_reconnect_failures >= AUTO_CONNECT_MAX_FAILURES {
+                        let (ip, port) = state.preferred_ed2k_server.clone().unwrap_or_default();
+                        abandon_server_auto_reconnect(
+                            &mut state,
+                            &app_handle,
+                            &format!("could not reach preferred server {ip}:{port}"),
+                        );
+                    } else {
                     let backoff_secs = match state.server_reconnect_failures {
                         0 => 0,
                         1 => 3,
@@ -18277,11 +18826,14 @@ pub async fn start_network(
                         .map(|t| t.elapsed().as_secs() >= backoff_secs)
                         .unwrap_or(true);
                     if elapsed_ok {
-                    // Only connect when a cooldown-eligible server exists.
-                    // Never wipe per-server cooldowns here — that defeated the
-                    // High-priority failure window and hammered dead servers.
-                    let picked = state.server_list.get_next_server().map(|s| {
-                        (s.ip.clone(), s.port, s.obfuscation_port_tcp)
+                    // Retry only the preferred server — never rotate through the list.
+                    let picked = state.preferred_ed2k_server.clone().map(|(ip, port)| {
+                        let obf_port = state
+                            .server_list
+                            .find_by_addr(&ip, port)
+                            .map(|s| s.obfuscation_port_tcp)
+                            .unwrap_or(0);
+                        (ip, port, obf_port)
                     });
                     if let Some((ip, port, obf_port)) = picked {
                         let addr_str = format!("{ip}:{port}");
@@ -18302,8 +18854,8 @@ pub async fn start_network(
                         let _ = app_handle.emit("server-status-changed", serde_json::json!({ "status": "connecting" }));
                         let app_for_auto = app_handle.clone();
                         state.pending_server_connect = Some(tokio::spawn(async move {
-                            // One crypt→plain cycle; outer auto-reconnect + cooldown
-                            // rotates to the next server on failure (see initiate_server_connect).
+                            // One crypt→plain cycle; outer auto-reconnect retries
+                            // the same preferred server only (see initiate_server_connect).
                             let result = async {
                                 let (mut conn, resolved_addr) = try_connect_server(
                                     &ip,
@@ -18365,6 +18917,7 @@ pub async fn start_network(
                         }));
                     }
                     } // elapsed_ok
+                    } // else: failures < MAX
                 }
                 }).catch_unwind().await;
                 if let Err(__p) = __panic_result {
@@ -18961,11 +19514,21 @@ pub async fn start_network(
                                     conn.disconnect().await;
                                     state.server_list.record_failure(&ip, port);
                                     let met_path = state.data_dir.join("server.met");
-                                    let _ = state.server_list.save_server_met(&met_path);
+                                    spawn_save_server_met(&state.server_list, met_path, &state.server_met_save_generation, &state.server_met_save_lock);
                                     *shared_server_addr.write().await = None;
-                                    state.server_reconnect_failures = state.server_reconnect_failures.saturating_add(1);
+                                    state.server_reconnect_failures =
+                                        state.server_reconnect_failures.saturating_add(1);
                                     state.stats.server_status = "disconnected".to_string();
                                     let _ = app_handle.emit("server-status-changed", serde_json::json!({ "status": "disconnected" }));
+                                    if state.server_auto_reconnect
+                                        && state.server_reconnect_failures >= AUTO_CONNECT_MAX_FAILURES
+                                    {
+                                        abandon_server_auto_reconnect(
+                                            &mut state,
+                                            &app_handle,
+                                            &format!("preferred server {ip}:{port} blocked by IP filter"),
+                                        );
+                                    }
                                     continue;
                                 }
                             }
@@ -18991,6 +19554,18 @@ pub async fn start_network(
                         state.server_list.record_success(&ip, port);
                         state.server_connected = true;
                         state.server_reconnect_failures = 0;
+                        state.preferred_ed2k_server = Some((ip.clone(), port));
+                        {
+                            let last = ed2k::server_list::LastEd2kServer {
+                                ip: ip.clone(),
+                                port,
+                                name: session.server_name.clone(),
+                            };
+                            let last_path = state.data_dir.join("last_ed2k_server.json");
+                            if let Err(e) = last.save(&last_path) {
+                                warn!("Failed to persist last eD2K server: {e}");
+                            }
+                        }
                         last_server_activity_at = chrono::Utc::now().timestamp();
                         state.server_connected_at = last_server_activity_at;
                         state.server_addr = Some(addr);
@@ -19130,9 +19705,7 @@ pub async fn start_network(
                                 if added > 0 {
                                     emit_server_log(&app_handle, &format!("Added {added} servers from connected server"));
                                     let met_path = state.data_dir.join("server.met");
-                                    if let Err(e) = state.server_list.save_server_met(&met_path) {
-                                        warn!("Failed to save server.met after login server list: {e}");
-                                    }
+                                    spawn_save_server_met(&state.server_list, met_path, &state.server_met_save_generation, &state.server_met_save_lock);
                                 }
                             }
                             // Explicitly request the server list. eMule's "Update
@@ -19146,8 +19719,9 @@ pub async fn start_network(
                             }
                         }
 
-                        // eMule: send OP_OFFERFILES after login to announce shared files.
-                        // Include incomplete .part downloads as partial offers (0xFCFC on newer servers).
+                        // Queue OP_OFFERFILES for chunked drain on later turns so
+                        // firewall/server status events and GetNetworkStats can
+                        // flush to the UI before a potentially large offer.
                         {
                             let mut seen_offer_hashes = std::collections::HashSet::new();
                             let mut offer_files: Vec<ed2k::server::OfferFile> = {
@@ -19176,7 +19750,6 @@ pub async fn start_network(
                                     })
                                     .collect()
                             };
-
                             let temp_dir = PathBuf::from(&settings.download_folder).join("Temp");
                             {
                                 let mgr = transfer_manager.read().await;
@@ -19184,10 +19757,15 @@ pub async fn start_network(
                                     if transfer.direction != TransferDirection::Download {
                                         continue;
                                     }
-                                    if matches!(transfer.status, TransferStatus::Completed | TransferStatus::Failed) {
+                                    if matches!(
+                                        transfer.status,
+                                        TransferStatus::Completed | TransferStatus::Failed
+                                    ) {
                                         continue;
                                     }
-                                    if transfer.file_hash.is_empty() || !seen_offer_hashes.insert(transfer.file_hash.clone()) {
+                                    if transfer.file_hash.is_empty()
+                                        || !seen_offer_hashes.insert(transfer.file_hash.clone())
+                                    {
                                         continue;
                                     }
                                     let hash_bytes = match hex::decode(&transfer.file_hash) {
@@ -19209,20 +19787,17 @@ pub async fn start_network(
                                     });
                                 }
                             }
-
-                            let complete_count = offer_files.iter().filter(|f| f.is_complete).count();
-                            let partial_count = offer_files.len() - complete_count;
-                            if !offer_files.is_empty() {
-                                info!("Offering {} files to server ({} complete, {} partial)", offer_files.len(), complete_count, partial_count);
-                                if let Err(e) = conn.offer_files(&offer_files, settings.tcp_port).await {
-                                    debug!("Failed to send OP_OFFERFILES: {e}");
-                                } else {
-                                    replace_offered_ed2k_hashes(&mut state, &offer_files);
-                                    state.last_offer_files_signature =
-                                        Some(offer_files_signature(&offer_files));
-                                }
-                            } else {
+                            if offer_files.is_empty() {
                                 warn!("No files to offer to server after login — check shared folders");
+                                pending_offer_files = None;
+                                pending_offer_signature = None;
+                            } else {
+                                info!(
+                                    "Queuing {} files to offer to server (chunked)",
+                                    offer_files.len()
+                                );
+                                pending_offer_signature = Some(offer_files_signature(&offer_files));
+                                pending_offer_files = Some(offer_files);
                             }
                         }
 
@@ -19273,74 +19848,74 @@ pub async fn start_network(
                                     )
                                 };
                                 if !pending.is_empty() {
-                                    if let Some(conn) = &mut state.server_connection {
-                                        // Send callbacks WITHOUT
-                                        // holding the source_manager
-                                        // write lock — each
-                                        // `request_callback` is an
-                                        // async TCP write (potentially
-                                        // tens of ms when slow), and
-                                        // holding `source_manager`
-                                        // exclusively blocks every
-                                        // other task that needs to
-                                        // register / look up a source
-                                        // (KAD source-search results,
-                                        // EPX source-receive, server
-                                        // OP_FOUNDSOURCES handler,
-                                        // upload listener IP-banlist
-                                        // queries). Collect successes,
-                                        // then re-acquire the lock
-                                        // briefly to batch-mark.
-                                        let mut succeeded: Vec<([u8; 16], u32)> =
-                                            Vec::with_capacity(pending.len());
-                                        for (file_hash, client_id) in &pending {
-                                            if conn.request_callback(*client_id).await.is_ok() {
-                                                succeeded.push((*file_hash, *client_id));
-                                            }
-                                        }
-                                        let sent = succeeded.len();
-                                        if sent > 0 {
-                                            let mut sm = source_manager.write().await;
-                                            for (file_hash, client_id) in &succeeded {
-                                                sm.mark_callback_sent(file_hash, *client_id);
-                                            }
-                                        }
-                                        if sent > 0 {
-                                            info!(
-                                                "L-2 flush: requested {sent}/{} LowID callbacks via newly-connected server {}:{}",
-                                                pending.len(), addr.ip(), server_port_u16,
-                                            );
-                                        }
-                                    }
+                                    // Queue for rate-limited drain (MAX_LOWID_CALLBACKS_PER_TURN)
+                                    // so login cannot monopolize the loop with N sequential awaits.
+                                    let n = pending.len();
+                                    pending_lowid_callback_queue.extend(pending);
+                                    info!(
+                                        "L-2 flush: queued {n} LowID callbacks via newly-connected server {}:{}",
+                                        addr.ip(), server_port_u16,
+                                    );
                                 }
                             }
                         }
                     }
                     Ok(ServerConnectResult { ip, port, result: Err(e), .. }) => {
-                        info!("Failed to connect to server {ip}:{port}: {e} — will try another server");
-                        emit_server_log(
-                            &app_handle,
-                            &format!("Connection failed ({e}); trying next server..."),
-                        );
-                        state.server_reconnect_failures = state.server_reconnect_failures.saturating_add(1);
+                        info!("Failed to connect to server {ip}:{port}: {e}");
+                        let attempt = state.server_reconnect_failures.saturating_add(1);
+                        let will_retry = state.server_auto_reconnect
+                            && state.preferred_ed2k_server.as_ref().is_some_and(|(pip, pport)| {
+                                pip == &ip && *pport == port
+                            })
+                            && attempt < AUTO_CONNECT_MAX_FAILURES;
+                        if will_retry {
+                            emit_server_log(
+                                &app_handle,
+                                &format!(
+                                    "Connection failed ({e}); retrying preferred server ({attempt}/{AUTO_CONNECT_MAX_FAILURES})..."
+                                ),
+                            );
+                        } else {
+                            emit_server_log(
+                                &app_handle,
+                                &format!("Connection failed ({e})."),
+                            );
+                        }
+                        state.server_reconnect_failures = attempt;
                         *shared_server_addr.write().await = None;
                         state.server_list.record_failure(&ip, port);
                         let met_path = state.data_dir.join("server.met");
-                        let _ = state.server_list.save_server_met(&met_path);
+                        spawn_save_server_met(&state.server_list, met_path, &state.server_met_save_generation, &state.server_met_save_lock);
                         state.stats.server_status = "disconnected".to_string();
                         let _ = app_handle.emit("server-status-changed", serde_json::json!({ "status": "disconnected" }));
-                        // Keep `server_last_connect_attempt` so the reconnect
-                        // backoff below still applies. Per-server cooldown already
-                        // excludes this host, so the next eligible server is tried
-                        // after backoff_secs — not on the very next 1s tick.
+                        if state.server_auto_reconnect && attempt >= AUTO_CONNECT_MAX_FAILURES {
+                            abandon_server_auto_reconnect(
+                                &mut state,
+                                &app_handle,
+                                &format!("could not reach preferred server {ip}:{port}"),
+                            );
+                        }
+                        // Keep `server_last_connect_attempt` so reconnect backoff
+                        // still applies when retrying the same preferred host.
                     }
                     Err(e) => {
                         warn!("Server connection task panicked: {e}");
                         emit_server_log(&app_handle, &format!("Connection error: {e}"));
-                        state.server_reconnect_failures = state.server_reconnect_failures.saturating_add(1);
+                        state.server_reconnect_failures =
+                            state.server_reconnect_failures.saturating_add(1);
                         *shared_server_addr.write().await = None;
                         state.stats.server_status = "disconnected".to_string();
                         let _ = app_handle.emit("server-status-changed", serde_json::json!({ "status": "disconnected" }));
+                        if state.server_auto_reconnect
+                            && state.server_reconnect_failures >= AUTO_CONNECT_MAX_FAILURES
+                        {
+                            let detail = state
+                                .preferred_ed2k_server
+                                .as_ref()
+                                .map(|(ip, port)| format!("could not reach preferred server {ip}:{port}"))
+                                .unwrap_or_else(|| "server connection task failed".to_string());
+                            abandon_server_auto_reconnect(&mut state, &app_handle, &detail);
+                        }
                     }
                 }
             }
@@ -20251,41 +20826,36 @@ pub async fn start_network(
                     let was_mapped = state.upnp_mapped;
                     upnp_mappings = result.mappings;
                     let mapped = result.mapped;
-                    if mapped != was_mapped {
-                        state.upnp_mapped = mapped;
-                        state.stats.upnp_mapped = mapped;
-                        if mapped {
-                            // Same semantics as startup (`firewalled:
-                            // !upnp_success`): a fresh mapping means inbound
-                            // TCP should now reach us. The shared atomic is
-                            // only ever allowed to clear the firewalled flag
-                            // (see the sweep that consumes it), never assert
-                            // it, so this can't override a FirewallChecker
-                            // determination in the other direction.
-                            // Do not clear while the ed2k server has us on
-                            // LowID — that assignment is authoritative until
-                            // the server gives HighID.
-                            if !state.low_id {
-                                state.firewalled_shared.store(false, std::sync::atomic::Ordering::Relaxed);
-                            }
+                    state.upnp_mapped = mapped;
+                    state.stats.upnp_mapped = mapped;
+                    if mapped && !was_mapped {
+                        // Same semantics as startup (`firewalled:
+                        // !upnp_success`): a fresh mapping means inbound
+                        // TCP should now reach us. The shared atomic is
+                        // only ever allowed to clear the firewalled flag
+                        // (see the sweep that consumes it), never assert
+                        // it, so this can't override a FirewallChecker
+                        // determination in the other direction.
+                        // Do not clear while the ed2k server has us on
+                        // LowID — that assignment is authoritative until
+                        // the server gives HighID.
+                        if !state.low_id {
+                            state.firewalled_shared.store(false, std::sync::atomic::Ordering::Relaxed);
                         }
-                        // Mirror the startup emission so the UI can toast a
-                        // recovery ("forwarding restored") or a loss ("mapping
-                        // lost, peers may not reach you") without waiting for
-                        // the next stats poll. `auto_disabled` is always false
-                        // here: a mid-session change keeps UPnP enabled so
-                        // `maintain` can recover it (router reboots usually do).
-                        let _ = app_handle.emit(
-                            "upnp-status",
-                            serde_json::json!({
-                                "mapped": mapped,
-                                "gateway_found": upnp_mappings.has_gateway(),
-                                "auto_disabled": false,
-                                "tcp_port": state.tcp_port,
-                                "udp_port": state.udp_port,
-                            }),
-                        );
                     }
+                    // Always emit so deferred startup's first result (and
+                    // mid-session maintain) update the UI, including the
+                    // `gateway_found` bit when mapping stayed false.
+                    let _ = app_handle.emit(
+                        "upnp-status",
+                        serde_json::json!({
+                            "mapped": mapped,
+                            "gateway_found": upnp_mappings.has_gateway(),
+                            "auto_disabled": false,
+                            "tcp_port": state.tcp_port,
+                            "udp_port": state.udp_port,
+                        }),
+                    );
                 } else {
                     debug!("Discarding stale UPnP maintenance result after mapping state changed");
                 }
@@ -20561,12 +21131,16 @@ pub async fn start_network(
             // bans and apply the hourly score decay). `maybe_decay`
             // self-gates on DECAY_INTERVAL (1h), so calling it each minute
             // is cheap and is what actually drives decay in production —
-            // nothing on the hot path calls `get_score` (the only other
-            // decay trigger), so without this scores never decayed.
+            // this timer is the only decay trigger, so without it scores
+            // would never decay. After lift, rebuild `banned_ips` from
+            // durable sources + still-active reputation bans so 24h
+            // reputation IPs and expired 7d auto-bans leave the enforced set.
             _ = reputation_timer.tick() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
                 state.reputation.lift_expired_bans();
                 state.reputation.maybe_decay();
+                let sm = source_manager.read().await;
+                sync_enforced_banned_ips(&mut state, &shared_banned_ips, &db, &sm);
                 }).catch_unwind().await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'reputation_timer' panicked: {}", describe_panic(&*__p));
@@ -21250,6 +21824,10 @@ pub async fn start_network(
                                 request_id,
                                 results,
                                 &file_type_filter,
+                                None,
+                                None,
+                                None,
+                                None,
                                 &keywords,
                                 None,
                             )
@@ -21835,8 +22413,9 @@ pub async fn start_network(
                         state.firewalled_shared.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                     if !state.firewalled {
+                        // Sticky LowID keeps the aggregate badge; do not wipe
+                        // tcp_status Open via note_tcp_firewalled.
                         state.firewalled = true;
-                        state.firewall_checker.note_tcp_firewalled();
                     }
                 } else if state.firewalled && !fw_shared {
                     // UPnP optimism only — do not mark tcp_status Open.
@@ -22448,7 +23027,7 @@ pub async fn start_network(
     }
 
     let server_met_path = state.data_dir.join("server.met");
-    let _ = state.server_list.save_server_met(&server_met_path);
+    spawn_save_server_met(&state.server_list, server_met_path.clone(), &state.server_met_save_generation, &state.server_met_save_lock);
 
     // Unregister from the rendezvous server LAST and with a short bound.
     // This is a best-effort courtesy call to a remote host that may be slow
@@ -28716,6 +29295,9 @@ async fn handle_command_inner(
                                     state.banned_ips.remove(&ip);
                                     // Also clear any persistent auto-ban for this IP.
                                     let _ = db.unban_ip(ip);
+                                    // Soften IP-reputation so the next scored
+                                    // event cannot immediately re-arm an IP ban.
+                                    let _ = state.reputation.clear_ip_ban(ip);
                                 }
                             }
                         }
@@ -28735,6 +29317,24 @@ async fn handle_command_inner(
                 }
                 if state.reputation.clear_ban(&kad_id.0) {
                     debug!("Cleared reputation ban for {peer_id_hex}");
+                }
+                // Routing-table contact IP may not be on the peer row.
+                if let Some(contact) = state.routing_table.get_contact(&kad_id) {
+                    let _ = state.reputation.clear_ip_ban(contact.ip);
+                    state.banned_ips.remove(&contact.ip);
+                }
+                // Reputation bans mirror onto every SourceManager IP for the
+                // user hash; clear those too or the next sync_enforced_banned_ips
+                // tick would re-inject them from currently_banned_ips().
+                {
+                    let sm = source_manager.read().await;
+                    for ip in sm.find_ips_by_user_hash(&kad_id.0) {
+                        let _ = state.reputation.clear_ip_ban(ip);
+                        state.banned_ips.remove(&ip);
+                    }
+                }
+                if let Ok(mut shared) = shared_banned_ips.write() {
+                    *shared = state.banned_ips.clone();
                 }
             }
             info!("Unbanned peer {peer_id_hex}");
@@ -29556,7 +30156,7 @@ async fn handle_command_inner(
                         let removed = state.server_list.remove_filtered(&mut state.ip_filter);
                         if removed > 0 {
                             let met_path = state.data_dir.join("server.met");
-                            let _ = state.server_list.save_server_met(&met_path);
+                            spawn_save_server_met(&state.server_list, met_path, &state.server_met_save_generation, &state.server_met_save_lock);
                             info!("Removed {removed} servers blocked by updated IP filter");
                         }
                     }
@@ -30360,6 +30960,13 @@ async fn handle_command_inner(
             }
             handle_server_disconnect(state, shared_server_addr, app_handle, "User disconnected")
                 .await;
+            // If KAD is also down, re-arm the upload gate so a disconnected
+            // session is not silently uploadable again.
+            if state.stats.status == NetworkStatus::Disconnected {
+                state
+                    .upload_disconnected
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
         }
 
         NetworkCommand::AddServer { ip, port, name, tx } => {
@@ -30380,9 +30987,7 @@ async fn handle_command_inner(
                     ) {
                         AddServerOutcome::Added => {
                             let met_path = state.data_dir.join("server.met");
-                            if let Err(e) = state.server_list.save_server_met(&met_path) {
-                                warn!("Failed to save server.met after adding server: {e}");
-                            }
+                            spawn_save_server_met(&state.server_list, met_path.clone(), &state.server_met_save_generation, &state.server_met_save_lock);
                             Ok(format!("Added server {ip}:{port}"))
                         }
                         AddServerOutcome::Duplicate => {
@@ -30403,9 +31008,7 @@ async fn handle_command_inner(
         NetworkCommand::RemoveServer { ip, port, tx } => {
             let result = if state.server_list.remove(&ip, port) {
                 let met_path = state.data_dir.join("server.met");
-                if let Err(e) = state.server_list.save_server_met(&met_path) {
-                    warn!("Failed to save server.met after removing server: {e}");
-                }
+                spawn_save_server_met(&state.server_list, met_path.clone(), &state.server_met_save_generation, &state.server_met_save_lock);
                 Ok(format!("Removed server {ip}:{port}"))
             } else {
                 Err(format!("Server {ip}:{port} not found in the list"))
@@ -30591,19 +31194,15 @@ async fn handle_command_inner(
                                 if let Some(cached) = fresh_part_hashes.write().await.remove(&fh) {
                                     part_hashes = cached;
                                 } else {
-                                    // Fallback for files whose part hashes
-                                    // weren't produced by our own hash pass
-                                    // (e.g. resolved from an older known.met /
-                                    // version-skew edge case). Rare, so an
-                                    // occasional blocking re-read here is
-                                    // acceptable.
-                                    let hash_path = std::path::PathBuf::from(&f.path);
-                                    part_hashes = tokio::task::spawn_blocking(move || {
-                                        ed2k::hash::ed2k_part_hashes_file(&hash_path)
-                                            .unwrap_or_default()
-                                    })
-                                    .await
-                                    .unwrap_or_default();
+                                    // Do not await a full-file re-hash on the
+                                    // network task — that starved KAD/IPC for
+                                    // large libraries. Empty part hashes here
+                                    // are filled on the next combined hash pass.
+                                    debug!(
+                                        "Deferring part-hash re-read for {}; using empty until next hash pass",
+                                        f.path
+                                    );
+                                    part_hashes = Vec::new();
                                 }
                             }
                             known_files.add_or_update(KnownFileRecord {
@@ -30806,24 +31405,11 @@ async fn handle_command_inner(
                         "Skipping OP_OFFERFILES resend: offer set unchanged ({} files)",
                         offer_files.len()
                     );
-                    // Still refresh the badge set — e.g. after reconnect bookkeeping
-                    // or a process where the signature survived but the set was cleared.
                     replace_offered_ed2k_hashes(state, &offer_files);
                 } else {
-                    let send_ok = match state.server_connection.as_mut() {
-                        Some(conn) => match conn.offer_files(&offer_files, settings.tcp_port).await {
-                            Ok(()) => true,
-                            Err(e) => {
-                                debug!("Failed to re-send OP_OFFERFILES: {e}");
-                                false
-                            }
-                        },
-                        None => false,
-                    };
-                    if send_ok {
-                        state.last_offer_files_signature = Some(signature);
-                        replace_offered_ed2k_hashes(state, &offer_files);
-                    }
+                    // Defer the actual send to the main loop's chunked drain so
+                    // this Ack returns immediately and does not block IPC.
+                    state.request_offer_files = true;
                 }
             }
             let _ = reconcile_ack.send(Ok(()));
@@ -30867,98 +31453,91 @@ async fn handle_command_inner(
             );
             if result.is_ok() {
                 let met_path = state.data_dir.join("server.met");
-                let _ = state.server_list.save_server_met(&met_path);
+                spawn_save_server_met(&state.server_list, met_path, &state.server_met_save_generation, &state.server_met_save_lock);
             }
             let _ = tx.send(result);
         }
 
         NetworkCommand::PreviewFile { transfer_id, tx } => {
-            let result = async {
-                let mgr_guard = transfer_manager.read().await;
-                let transfer = mgr_guard.get_transfer(&transfer_id)
-                    .ok_or_else(|| "Transfer not found".to_string())?;
+            let download_folder = settings.download_folder.clone();
+            let tm = transfer_manager.clone();
+            tokio::spawn(async move {
+                let result = async {
+                    let mgr_guard = tm.read().await;
+                    let transfer = mgr_guard
+                        .get_transfer(&transfer_id)
+                        .ok_or_else(|| "Transfer not found".to_string())?;
 
-                let file_name = transfer.file_name.clone();
-                let file_size = transfer.total_size;
-                let tid = transfer.id.clone();
-                drop(mgr_guard);
+                    let file_name = transfer.file_name.clone();
+                    let file_size = transfer.total_size;
+                    let tid = transfer.id.clone();
+                    drop(mgr_guard);
 
-                let temp_dir = PathBuf::from(&settings.download_folder).join("Temp");
-                let part_path = temp_dir.join(format!("{tid}.part"));
+                    let temp_dir = PathBuf::from(&download_folder).join("Temp");
+                    let part_path = temp_dir.join(format!("{tid}.part"));
 
-                if !part_path.exists() {
-                    return Err("Part file not found — download may not have started".to_string());
+                    if !part_path.exists() {
+                        return Err(
+                            "Part file not found — download may not have started".to_string(),
+                        );
+                    }
+
+                    let canonical_part = part_path
+                        .canonicalize()
+                        .map_err(|e| format!("Invalid part-file path: {e}"))?;
+                    let canonical_temp_dir = temp_dir
+                        .canonicalize()
+                        .map_err(|e| format!("Invalid temp directory: {e}"))?;
+                    if !canonical_part.starts_with(&canonical_temp_dir) {
+                        return Err("Preview path escapes the temp directory".to_string());
+                    }
+                    let part_path = canonical_part;
+                    let file_name_for_preview = file_name.clone();
+
+                    tokio::task::spawn_blocking(move || {
+                        let tracker =
+                            ed2k::part_tracker::PartTracker::new(file_size, &part_path);
+                        let filled_ranges: Vec<ed2k::preview::FilledRange> = tracker
+                            .filled_ranges()
+                            .into_iter()
+                            .map(|(start, end)| ed2k::preview::FilledRange { start, end })
+                            .collect();
+                        let completed_bytes = tracker.completed_bytes();
+                        let has_part_hashes = !tracker.part_hashes().is_empty();
+                        let verified_complete_parts = tracker.verified_parts();
+                        let part_size = ed2k::hash::PARTSIZE;
+
+                        if !ed2k::preview::can_preview(
+                            &file_name_for_preview,
+                            file_size,
+                            completed_bytes,
+                            has_part_hashes,
+                            &verified_complete_parts,
+                            part_size,
+                        ) {
+                            return Err(
+                                "File is not ready for preview (need the first 256KB downloaded and MD4-verified, and a previewable file type)".to_string(),
+                            );
+                        }
+
+                        let preview_path = ed2k::preview::create_preview_file(
+                            &part_path,
+                            &filled_ranges,
+                            &file_name_for_preview,
+                        )
+                        .map_err(|e| format!("Failed to create preview file: {e}"))?;
+
+                        ed2k::preview::launch_preview(&preview_path)
+                            .map_err(|e| format!("Failed to launch preview: {e}"))?;
+
+                        Ok(format!("Preview launched: {}", preview_path.display()))
+                    })
+                    .await
+                    .map_err(|e| format!("Preview task panicked: {e}"))?
                 }
-
-                // Defense in depth: verify the resolved part-file path is
-                // actually contained within the Temp directory before
-                // reading it, matching the canonicalize + `starts_with`
-                // containment check every other transfer-file-access path
-                // in this codebase applies (see
-                // `commands/transfers.rs::resolve_transfer_reveal_path` /
-                // `open_file`). `tid` is the transfer's own internal id
-                // rather than raw user input, so this should already be
-                // inert, but a filesystem path built from a
-                // transfer-derived value shouldn't get a free pass from
-                // the containment check every sibling code path enforces.
-                let canonical_part = part_path
-                    .canonicalize()
-                    .map_err(|e| format!("Invalid part-file path: {e}"))?;
-                let canonical_temp_dir = temp_dir
-                    .canonicalize()
-                    .map_err(|e| format!("Invalid temp directory: {e}"))?;
-                if !canonical_part.starts_with(&canonical_temp_dir) {
-                    return Err("Preview path escapes the temp directory".to_string());
-                }
-                let part_path = canonical_part;
-
-                // `PartTracker::new` reads and parses the `.part.met` file
-                // from disk; run it on the blocking pool so the main network
-                // loop isn't stalled on sync file IO while the user opens a
-                // preview.
-                let pp_owned = part_path.clone();
-                let tracker_bundle = tokio::task::spawn_blocking(move || {
-                    let tracker = ed2k::part_tracker::PartTracker::new(file_size, &pp_owned);
-                    let filled_ranges: Vec<ed2k::preview::FilledRange> = tracker
-                        .filled_ranges()
-                        .into_iter()
-                        .map(|(start, end)| ed2k::preview::FilledRange { start, end })
-                        .collect();
-                    let completed_bytes = tracker.completed_bytes();
-                    let has_part_hashes = !tracker.part_hashes().is_empty();
-                    // `can_preview` requires MD4-VERIFIED parts (not merely
-                    // gap-complete ones) so we never open a media player on
-                    // bytes that haven't been hash-checked against the
-                    // publisher's part hashes. `verified_parts()` is persisted
-                    // in `.part.met` and restored on load.
-                    let verified_complete_parts = tracker.verified_parts();
-                    (filled_ranges, completed_bytes, has_part_hashes, verified_complete_parts)
-                })
-                .await
-                .map_err(|e| format!("Preview task panicked: {e}"))?;
-                let (filled_ranges, completed_bytes, has_part_hashes, verified_complete_parts) = tracker_bundle;
-                let part_size = ed2k::hash::PARTSIZE;
-
-                if !ed2k::preview::can_preview(
-                    &file_name,
-                    file_size,
-                    completed_bytes,
-                    has_part_hashes,
-                    &verified_complete_parts,
-                    part_size,
-                ) {
-                    return Err("File is not ready for preview (need the first 256KB downloaded and MD4-verified, and a previewable file type)".to_string());
-                }
-
-                let preview_path = ed2k::preview::create_preview_file(&part_path, &filled_ranges, &file_name)
-                    .map_err(|e| format!("Failed to create preview file: {e}"))?;
-
-                ed2k::preview::launch_preview(&preview_path)
-                    .map_err(|e| format!("Failed to launch preview: {e}"))?;
-
-                Ok::<String, String>(format!("Preview launched: {}", preview_path.display()))
-            }.await;
-            let _ = tx.send(result);
+                .await;
+                let _ = tx.send(result);
+            });
         }
 
         // UpdateIpFilterFromUrl removed — download now happens directly in the command handler with DNS-pinned client

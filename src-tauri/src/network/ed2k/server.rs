@@ -744,11 +744,7 @@ impl Ed2kServerConnection {
     /// we chunk the offer into ≤`limit`-file `OP_OFFERFILES` packets rather
     /// than blasting all shares at once.
     pub async fn offer_files(&mut self, files: &[OfferFile], tcp_port: u16) -> anyhow::Result<()> {
-        let limit = if self.soft_files == 0 || self.soft_files > 200 {
-            200
-        } else {
-            self.soft_files as usize
-        };
+        let limit = self.offer_files_chunk_limit();
         if files.is_empty() {
             // Preserve the empty (count=0) offer some callers may rely on.
             return self.offer_files_chunk(files, tcp_port).await;
@@ -762,14 +758,25 @@ impl Ed2kServerConnection {
         }
         for chunk in files.chunks(limit) {
             self.offer_files_chunk(chunk, tcp_port).await?;
+            // Let the network task service UI IPC between large offer batches.
+            tokio::task::yield_now().await;
         }
         Ok(())
+    }
+
+    /// Soft per-packet file cap used by `offer_files` / deferred chunk sends.
+    pub fn offer_files_chunk_limit(&self) -> usize {
+        if self.soft_files == 0 || self.soft_files > 200 {
+            200
+        } else {
+            self.soft_files as usize
+        }
     }
 
     /// Send a single OP_OFFERFILES packet (one chunk). Matches eMule
     /// SharedFileList.cpp's per-file encoding; uses magic client ID/port
     /// values when the server supports SRV_TCPFLG_COMPRESSION.
-    async fn offer_files_chunk(
+    pub async fn offer_files_chunk(
         &mut self,
         files: &[OfferFile],
         tcp_port: u16,

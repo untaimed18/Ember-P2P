@@ -1314,6 +1314,10 @@ struct AbuseEntry {
     request_count: u32,
     window_start: std::time::Instant,
     file_not_found_count: u32,
+    /// Independent window for hash-probe (file-not-found) counting so
+    /// occasional missing-file asks over hours do not accumulate forever
+    /// while `record_request` keeps `window_start` fresh.
+    fnf_window_start: std::time::Instant,
     banned_until: Option<std::time::Instant>,
 }
 
@@ -1383,6 +1387,7 @@ impl AbuseTracker {
             request_count: 0,
             window_start: now,
             file_not_found_count: 0,
+            fnf_window_start: now,
             banned_until: None,
         });
 
@@ -1420,8 +1425,20 @@ impl AbuseTracker {
             request_count: 0,
             window_start: now,
             file_not_found_count: 0,
+            fnf_window_start: now,
             banned_until: None,
         });
+
+        if let Some(until) = entry.banned_until {
+            return now < until;
+        }
+
+        // Window FNF the same way as request-rate so rare missing-file
+        // asks over a long session cannot trip the probe ban.
+        if now.duration_since(entry.fnf_window_start).as_secs() > ABUSE_WINDOW_SECS {
+            entry.file_not_found_count = 0;
+            entry.fnf_window_start = now;
+        }
 
         entry.file_not_found_count += 1;
 
@@ -2091,9 +2108,24 @@ pub async fn start_upload_server(
                             }
                         }
 
+                        // eD2K server HighID port-test: the connected/pending
+                        // server dials our TCP port during login. Must be
+                        // accepted even when `network_disconnected` is set
+                        // (KAD not connected yet) — otherwise we always get
+                        // LowID on server-first connect. Match by peer IP
+                        // against `shared_server_addr` (preset at connect).
+                        let is_server_port_test_ip = {
+                            let server_addr = server.shared_server_addr.read().await;
+                            server_addr
+                                .map(|a| a.ip() == peer_addr.ip())
+                                .unwrap_or(false)
+                        };
+
                         // eMule: reject new upload connections while network is disconnected.
-                        // Firewall probes (handled above) still pass through.
-                        if server.network_disconnected.load(std::sync::atomic::Ordering::Relaxed) {
+                        // Firewall probes and the eD2K server's HighID port-test still pass.
+                        if server.network_disconnected.load(std::sync::atomic::Ordering::Relaxed)
+                            && !is_server_port_test_ip
+                        {
                             debug!("Rejecting connection from {peer_addr}: network disconnected");
                             drop(stream);
                             continue;
@@ -3640,6 +3672,12 @@ impl UploadHandler {
 
                                 if is_server_port_test {
                                     info!("Server port test from {peer_addr}: replied to Hello+EmuleInfo, port verified");
+                                    // Same proof as a KAD TCP connect-back: inbound
+                                    // reachability from a trusted endpoint.
+                                    self.tcp_connect_back_shared
+                                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                                    self.firewalled_shared
+                                        .store(false, std::sync::atomic::Ordering::Relaxed);
                                     let mut discard = [0u8; 4096];
                                     let _ = tokio::time::timeout(
                                         std::time::Duration::from_secs(5),
@@ -3831,6 +3869,16 @@ impl UploadHandler {
                             &emule_payload,
                         )
                         .await?;
+
+                        if is_server_port_test {
+                            info!("Server port test from {peer_addr}: replied to Hello+EmuleInfo, port verified");
+                            self.tcp_connect_back_shared
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                            self.firewalled_shared
+                                .store(false, std::sync::atomic::Ordering::Relaxed);
+                            return Ok(());
+                        }
+
                         (rd, wr, hd, puh)
                     }
                 };
@@ -5588,7 +5636,11 @@ impl UploadHandler {
 
                     // eMule AddRequestCount: check per-file request frequency before admitting
                     if let Some(h) = current_file_hash {
-                        if let std::net::IpAddr::V4(peer_v4) = peer_addr.ip() {
+                        let peer_v4 = match peer_addr.ip() {
+                            std::net::IpAddr::V4(v4) => Some(v4),
+                            std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+                        };
+                        if let Some(peer_v4) = peer_v4 {
                             let should_ban = {
                                 let mut tracker = self.file_request_tracker.lock().await;
                                 tracker.cleanup_stale();

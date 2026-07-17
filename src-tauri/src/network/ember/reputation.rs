@@ -316,6 +316,61 @@ impl ReputationManager {
         }
     }
 
+    /// Clear an active IP-correlation ban (and soften the IP score) so a
+    /// manual unban that removes the IP from `banned_ips` is not
+    /// immediately re-armed by the next scored event against a still-
+    /// banned `IpReputation` row.
+    pub fn clear_ip_ban(&mut self, ip: std::net::Ipv4Addr) -> bool {
+        let key = ip.octets();
+        if let Some(entry) = self.ips.get_mut(&key) {
+            entry.banned_until = None;
+            if entry.score <= IP_BAN_THRESHOLD {
+                entry.score = IP_BAN_THRESHOLD + 1;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Mirror a node-identity ban onto an observed IPv4 so periodic
+    /// `banned_ips` rebuilds (which re-seed from
+    /// `currently_banned_ips`) keep enforcing that address for the
+    /// reputation TTL even when the IP is not yet in SourceManager.
+    pub fn mirror_node_ban_to_ip(&mut self, ip: std::net::Ipv4Addr) {
+        let now = now_secs();
+        let key = ip.octets();
+        let entry = self
+            .ips
+            .entry(key)
+            .or_insert_with(|| IpReputation::new(key, now));
+        entry.last_interaction = now;
+        entry.banned_until = Some(now + BAN_DURATION.as_secs());
+        if self.ips.len() > MAX_TRACKED_IPS {
+            self.evict_stale_ips();
+        }
+    }
+
+    /// Node identities whose reputation ban has not yet expired.
+    pub fn currently_banned_node_ids(&self) -> Vec<[u8; 16]> {
+        let now = now_secs();
+        self.peers
+            .iter()
+            .filter(|(_, p)| p.is_banned(now))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// IPv4 addresses whose IP-reputation ban has not yet expired.
+    pub fn currently_banned_ips(&self) -> Vec<std::net::Ipv4Addr> {
+        let now = now_secs();
+        self.ips
+            .iter()
+            .filter(|(_, p)| p.is_banned(now))
+            .map(|(octets, _)| std::net::Ipv4Addr::from(*octets))
+            .collect()
+    }
+
     /// Apply a manual UI ban so reputation-gated paths and the Trust
     /// badge agree with the persistent ban list. Creates a tracker
     /// entry if needed. Duration matches automatic score bans.
@@ -780,6 +835,9 @@ mod tests {
             ip_banned,
             "rotating free identities must not reset address-level abuse history"
         );
+        assert!(manager.currently_banned_ips().contains(&ip));
+        assert!(manager.clear_ip_ban(ip));
+        assert!(!manager.currently_banned_ips().contains(&ip));
     }
 
     #[test]

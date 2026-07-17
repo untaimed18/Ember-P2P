@@ -3,7 +3,40 @@ use std::net::Ipv4Addr;
 use std::path::Path;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use tracing::{debug, info};
+use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
+
+/// Historical eMule Sunrise endpoint used as the never-connected auto-connect
+/// fallback when present in the downloaded server.met.
+pub const EMULE_SUNRISE_IP: &str = "176.123.5.89";
+pub const EMULE_SUNRISE_PORT: u16 = 4725;
+pub const EMULE_SUNRISE_NAME: &str = "eMule Sunrise";
+
+/// Persisted last successfully connected eD2K server (`last_ed2k_server.json`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LastEd2kServer {
+    pub ip: String,
+    pub port: u16,
+    #[serde(default)]
+    pub name: String,
+}
+
+impl LastEd2kServer {
+    pub fn load(path: &Path) -> Option<Self> {
+        let data = std::fs::read_to_string(path).ok()?;
+        let parsed: Self = serde_json::from_str(&data).ok()?;
+        if parsed.ip.is_empty() || parsed.port == 0 {
+            return None;
+        }
+        Some(parsed)
+    }
+
+    pub fn save(&self, path: &Path) -> io::Result<()> {
+        let data = serde_json::to_string_pretty(self)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        crate::security::atomic_write(path, data.as_bytes(), true)
+    }
+}
 
 /// Upper bounds on server.met tag field lengths. Each `vec![0u8; len]` is
 /// sized from an unchecked on-disk `u16` and allocated before the read can
@@ -176,7 +209,7 @@ fn apply_server_int_tag(entry: &mut ServerEntry, name_id: u8, v: u32) {
         ST_UDPKEYIP => entry.server_udp_key_ip = v,
         ST_TCPPORTOBFUSCATION | 0xF1 => entry.obfuscation_port_tcp = v as u16,
         ST_UDPPORTOBFUSCATION => entry.obfuscation_port_udp = v as u16,
-        // Ember-private tags persisted by `save_server_met` for UDP
+        // Ember-private tags persisted by `to_server_met_bytes` for UDP
         // obfuscation state. Fresh server.met files from eMule won't
         // carry these (so the fields stay 0 until the first status
         // ping); our own saves preserve them across restarts.
@@ -197,6 +230,7 @@ fn apply_server_int_tag(entry: &mut ServerEntry, name_id: u8, v: u32) {
 
 pub struct ServerList {
     servers: Vec<ServerEntry>,
+    #[allow(dead_code)] // round-robin cursor for get_next_server
     current_index: usize,
     needs_sort: bool,
 }
@@ -210,52 +244,12 @@ impl ServerList {
         }
     }
 
-    /// Built-in server list used for source discovery.
-    /// eMule Security is prioritized (High) so it is tried first.
-    pub fn hardcoded() -> Self {
-        let servers = vec![
-            ServerEntry {
-                ip: "45.82.80.155".to_string(),
-                port: 5687,
-                name: "eMule Security".to_string(),
-                priority: ServerPriority::High,
-                is_static: true,
-                ..ServerEntry::new(String::new(), 0)
-            },
-            ServerEntry {
-                ip: "176.123.5.89".to_string(),
-                port: 4725,
-                name: "eMule Sunrise".to_string(),
-                is_static: true,
-                ..ServerEntry::new(String::new(), 0)
-            },
-            ServerEntry {
-                ip: "176.123.2.239".to_string(),
-                port: 4232,
-                name: "!! Sharing-Devils No.1 !!".to_string(),
-                is_static: true,
-                ..ServerEntry::new(String::new(), 0)
-            },
-            ServerEntry {
-                ip: "145.239.2.134".to_string(),
-                port: 4661,
-                name: "GrupoTS Server".to_string(),
-                is_static: true,
-                ..ServerEntry::new(String::new(), 0)
-            },
-        ];
-        Self {
-            servers,
-            current_index: 0,
-            needs_sort: true,
-        }
-    }
-
+    #[allow(dead_code)] // used by get_next_server
     fn connect_cooldown_secs(entry: &ServerEntry) -> i64 {
-        // High priority (e.g. eMule Security) still gets first pick when
-        // healthy, but after a failed login we want a long enough window
-        // for auto-reconnect to try Normal servers (Sunrise, etc.) instead
-        // of hammering the same dead High entry. First failure → 2 minutes.
+        // High priority still gets first pick when healthy, but after a
+        // failed login we want a long enough window for auto-reconnect to
+        // try Normal servers instead of hammering the same dead High entry.
+        // First failure → 2 minutes.
         let base: i64 = match entry.priority {
             ServerPriority::High => 60,
             ServerPriority::Normal => 30,
@@ -417,6 +411,10 @@ impl ServerList {
         self.servers.len() != before
     }
 
+    /// Round-robin pick among cooldown-eligible servers. Currently unused by
+    /// production auto-connect (preferred-server only), but kept for unit tests
+    /// covering failure cooldown and for any future list-walk reconnect mode.
+    #[allow(dead_code)]
     pub fn get_next_server(&mut self) -> Option<&ServerEntry> {
         if self.servers.is_empty() {
             return None;
@@ -581,6 +579,49 @@ impl ServerList {
 
     pub fn servers(&self) -> &[ServerEntry] {
         &self.servers
+    }
+
+    pub fn find_by_addr(&self, ip: &str, port: u16) -> Option<&ServerEntry> {
+        self.servers.iter().find(|s| s.ip == ip && s.port == port)
+    }
+
+    /// Prefer the well-known Sunrise IP/port when present in the list; otherwise
+    /// match the canonical display name (case-insensitive).
+    pub fn find_emule_sunrise(&self) -> Option<&ServerEntry> {
+        if let Some(entry) = self.find_by_addr(EMULE_SUNRISE_IP, EMULE_SUNRISE_PORT) {
+            return Some(entry);
+        }
+        self.servers
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case(EMULE_SUNRISE_NAME))
+    }
+
+    /// Resolve auto-connect target: last successful server, else eMule Sunrise
+    /// from the current list.
+    pub fn resolve_auto_connect_target(data_dir: &Path, list: &Self) -> Option<(String, u16)> {
+        let last_path = data_dir.join("last_ed2k_server.json");
+        if let Some(last) = LastEd2kServer::load(&last_path) {
+            info!(
+                "Auto-connect target from last server: {}:{} ({})",
+                last.ip,
+                last.port,
+                if last.name.is_empty() {
+                    "unnamed"
+                } else {
+                    last.name.as_str()
+                }
+            );
+            return Some((last.ip, last.port));
+        }
+        if let Some(sunrise) = list.find_emule_sunrise() {
+            info!(
+                "Auto-connect target fallback: {} {}:{}",
+                sunrise.name, sunrise.ip, sunrise.port
+            );
+            return Some((sunrise.ip.clone(), sunrise.port));
+        }
+        warn!("No last eD2K server and eMule Sunrise not found in server list");
+        None
     }
 
     pub fn len(&self) -> usize {
@@ -1184,8 +1225,8 @@ impl ServerList {
         false
     }
 
-    /// Save server list in server.met format (eMule-compatible, persists all metadata).
-    pub fn save_server_met(&self, path: &Path) -> io::Result<()> {
+    /// Serialize the server list to server.met bytes (no disk I/O).
+    pub fn to_server_met_bytes(&self) -> io::Result<Vec<u8>> {
         let mut buf = Vec::new();
         buf.write_u8(0x0E)?; // MET_HEADER
         buf.write_u32::<LittleEndian>(self.servers.len() as u32)?;
@@ -1337,10 +1378,17 @@ impl ServerList {
             buf.write_all(&tag_buf)?;
         }
 
+        Ok(buf)
+    }
+
+    /// Persist server.met bytes atomically. Prefer
+    /// `network::spawn_save_server_met` from the event loop so disk I/O
+    /// stays off the network task.
+    pub fn write_server_met_bytes(path: &Path, buf: &[u8]) -> io::Result<()> {
         // Use atomic_write so a crash mid-save can't truncate or
         // zero-out server.met. Without this, the next start could
         // load 0 servers and silently lose the persisted list.
-        crate::security::atomic_write(path, &buf, false)
+        crate::security::atomic_write(path, buf, false)
     }
 }
 
@@ -1372,13 +1420,35 @@ fn write_met_uint16_tag(buf: &mut Vec<u8>, tag_id: u8, value: u16) {
 mod tests {
     use super::*;
 
+    /// Two-server fixture: one High-priority entry and one Normal, used by
+    /// cooldown tests that previously depended on `ServerList::hardcoded()`.
+    fn high_then_normal_list() -> ServerList {
+        let mut list = ServerList::new();
+        list.add(ServerEntry {
+            ip: "1.1.1.1".to_string(),
+            port: 1000,
+            name: "High Priority".to_string(),
+            priority: ServerPriority::High,
+            is_static: true,
+            ..ServerEntry::new(String::new(), 0)
+        });
+        list.add(ServerEntry {
+            ip: "2.2.2.2".to_string(),
+            port: 2000,
+            name: "Normal Priority".to_string(),
+            is_static: true,
+            ..ServerEntry::new(String::new(), 0)
+        });
+        list
+    }
+
     #[test]
     fn get_next_server_skips_failed_high_for_healthy_normal() {
-        let mut list = ServerList::hardcoded();
+        let mut list = high_then_normal_list();
         let security = list
             .get_next_server()
-            .expect("hardcoded list has servers");
-        assert_eq!(security.name, "eMule Security");
+            .expect("fixture list has servers");
+        assert_eq!(security.name, "High Priority");
         let sec_ip = security.ip.clone();
         let sec_port = security.port;
 
@@ -1395,14 +1465,37 @@ mod tests {
     }
 
     #[test]
+    fn find_emule_sunrise_prefers_known_addr_then_name() {
+        let mut list = ServerList::new();
+        list.add(ServerEntry {
+            ip: "9.9.9.9".to_string(),
+            port: 1234,
+            name: "eMule Sunrise".to_string(),
+            ..ServerEntry::new(String::new(), 0)
+        });
+        let by_name = list.find_emule_sunrise().expect("name match");
+        assert_eq!(by_name.ip, "9.9.9.9");
+
+        list.add(ServerEntry {
+            ip: EMULE_SUNRISE_IP.to_string(),
+            port: EMULE_SUNRISE_PORT,
+            name: "Other Label".to_string(),
+            ..ServerEntry::new(String::new(), 0)
+        });
+        let by_ip = list.find_emule_sunrise().expect("ip match");
+        assert_eq!(by_ip.ip, EMULE_SUNRISE_IP);
+        assert_eq!(by_ip.port, EMULE_SUNRISE_PORT);
+    }
+
+    #[test]
     fn clear_connect_cooldowns_allows_retrying_high_again() {
-        let mut list = ServerList::hardcoded();
+        let mut list = high_then_normal_list();
         let security = list.get_next_server().unwrap();
         let sec_ip = security.ip.clone();
         let sec_port = security.port;
         list.record_failure(&sec_ip, sec_port);
 
-        // While cooling down, Security must not be returned.
+        // While cooling down, High must not be returned.
         let during = list.get_next_server().unwrap();
         assert_ne!((during.ip.as_str(), during.port), (sec_ip.as_str(), sec_port));
 
