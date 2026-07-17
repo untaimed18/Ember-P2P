@@ -554,6 +554,12 @@ async fn handle_epx_sources(
                 udp_port,
             );
             total_injected += stats.injected;
+            // Persist EPX accepts into SourceManager so pause→resume can
+            // reseed from SM (PFS-only peers were previously lost).
+            if stats.injected > 0 || stats.persisted > 0 {
+                let mut sm = source_manager.write().await;
+                sm.register_source_full(*file_hash, ip, port, udp_port, [0u8; 16]);
+            }
             // Only count sources that were actually new injections
             // against the per-event ceiling. The earlier behaviour
             // counted every source the EPX packet listed even when
@@ -1365,14 +1371,18 @@ fn inject_source_into_active_transfers(
                 .or_insert_with(|| ed2k::sources::PerFileSourceList::new(file_hash));
             let already_known = pfs.has_source(v4, source.peer_port);
             if already_known {
-                false
+                // Worker may have soft-dropped this peer (no free parts).
+                // Re-inject only when PFS says another attempt is due.
+                pfs.is_eligible_for_reinject(v4, source.peer_port)
             } else {
                 let added = pfs.add_source_full(v4, source.peer_port, udp_port);
                 if added {
                     stats.persisted += 1;
                     state.ember_payload_dirty = true;
                 }
-                true
+                // At capacity, do not inject peers we could not store —
+                // otherwise every rediscovery re-spams the same address.
+                added
             }
         } else {
             // Non-IPv4 source: use sender channel state as a proxy for dedup.
@@ -1388,7 +1398,16 @@ fn inject_source_into_active_transfers(
         }
 
         match try_inject_source(state.active_source_senders.get(transfer_id), source) {
-            SourceInjectionResult::Injected => stats.injected += 1,
+            SourceInjectionResult::Injected => {
+                stats.injected += 1;
+                // Claim the PFS slot so rediscovery does not re-spam until
+                // the worker adopts or soft-drops the peer.
+                if let Some(v4) = parsed_ip {
+                    if let Some(pfs) = state.per_file_sources.get_mut(transfer_id) {
+                        pfs.set_connecting(v4, source.peer_port, None);
+                    }
+                }
+            }
             SourceInjectionResult::Full => {
                 stats.dropped_full += 1;
                 if enqueue_overflow_source(state, transfer_id, source) {
@@ -9887,6 +9906,7 @@ pub async fn start_network(
                                     }
                                 }
                                 "no_needed_parts" => pfs.set_none_needed_parts(v4, port, None),
+                                "parts_busy" => pfs.set_parts_busy(v4, port, None),
                                 "duplicate" => pfs.clear_duplicate_route(v4, port, None),
                                 "wait_callback" => pfs.set_wait_callback(v4, port, None),
                                 "wait_callback_kad" => pfs.set_wait_callback_kad(v4, port, None),
@@ -9938,6 +9958,11 @@ pub async fn start_network(
                                 _ => {}
                             }
                         }
+                    }
+
+                    // Soft defer only — do not push a Failed row into the UI.
+                    if status == "parts_busy" {
+                        continue;
                     }
 
                     if status == "failed" {
@@ -11446,26 +11471,31 @@ pub async fn start_network(
                         let mut injected = 0usize;
                         if is_active {
                             let matching = [transfer_id.clone()];
-                            let dsources: Vec<DownloadSource> = {
+                            let dsources: Vec<(DownloadSource, u16)> = {
                                 let sm = source_manager.read().await;
                                 direct_sources
                                     .iter()
-                                    .map(|ds| DownloadSource {
-                                        peer_ip: ds.ip.to_string(),
-                                        peer_port: ds.tcp_port,
-                                        available_parts: Vec::new(),
-                                        peer_user_hash: sm
-                                            .get_user_hash(&fh, ds.ip, ds.tcp_port)
-                                            .or(ds.source_user_hash),
-                                        peer_connect_options: sm
-                                            .get_connect_options(&fh, ds.ip, ds.tcp_port)
-                                            .or(Some(ds.connect_options)),
+                                    .map(|ds| {
+                                        (
+                                            DownloadSource {
+                                                peer_ip: ds.ip.to_string(),
+                                                peer_port: ds.tcp_port,
+                                                available_parts: Vec::new(),
+                                                peer_user_hash: sm
+                                                    .get_user_hash(&fh, ds.ip, ds.tcp_port)
+                                                    .or(ds.source_user_hash),
+                                                peer_connect_options: sm
+                                                    .get_connect_options(&fh, ds.ip, ds.tcp_port)
+                                                    .or(Some(ds.connect_options)),
+                                            },
+                                            ds.udp_port,
+                                        )
                                     })
                                     .collect()
                             };
-                            for ds in &dsources {
+                            for (ds, udp_port) in &dsources {
                                 let stats = inject_source_into_active_transfers(
-                                    &mut state, fh, &matching, ds, 0,
+                                    &mut state, fh, &matching, ds, *udp_port,
                                 );
                                 injected += stats.injected;
                             }
@@ -12130,9 +12160,27 @@ pub async fn start_network(
                                     );
                                 }
                                 info!(
-                                    "Registered {} Type-2 LowID sources for {}, server callbacks will be sent on next poll",
+                                    "Registered {} Type-2 LowID sources for {}, queuing server callbacks",
                                     lowid_sources.len(), transfer_id
                                 );
+                                // Enqueue callbacks immediately when HighID on the
+                                // matching server — do not wait for FoundSources.
+                                if !state.low_id {
+                                    if let Some(addr) = state.server_addr {
+                                        if let std::net::IpAddr::V4(v4) = addr.ip() {
+                                            let srv_ip = u32::from_le_bytes(v4.octets());
+                                            let srv_port = addr.port();
+                                            for ls in &lowid_sources {
+                                                if ls.ed2k_server_ip == srv_ip
+                                                    && ls.ed2k_server_port == srv_port
+                                                {
+                                                    pending_lowid_callback_queue
+                                                        .push_back((fh, ls.lowid));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             lowid_sources.len()
                         } else {
@@ -12668,12 +12716,20 @@ pub async fn start_network(
                             if !sources.is_empty() {
                                 let matching_ids = vec![transfer_id.clone()];
                                 let sm = source_manager.read().await;
+                                let udp_sources = sm.get_udp_sources(&fh);
                                 let mut injected = 0usize;
                                 for (ip_s, port) in &sources {
-                                    let uh = ip_s.parse::<Ipv4Addr>().ok()
-                                        .and_then(|v4| sm.get_user_hash(&fh, v4, *port));
-                                    let co = ip_s.parse::<Ipv4Addr>().ok()
-                                        .and_then(|v4| sm.get_connect_options(&fh, v4, *port));
+                                    let v4 = ip_s.parse::<Ipv4Addr>().ok();
+                                    let uh = v4.and_then(|v4| sm.get_user_hash(&fh, v4, *port));
+                                    let co = v4.and_then(|v4| sm.get_connect_options(&fh, v4, *port));
+                                    let udp = v4
+                                        .and_then(|v4| {
+                                            udp_sources
+                                                .iter()
+                                                .find(|(ip, tcp, _)| *ip == v4 && *tcp == *port)
+                                                .map(|(_, _, u)| *u)
+                                        })
+                                        .unwrap_or(0);
                                     let ds = DownloadSource {
                                         peer_ip: ip_s.clone(),
                                         peer_port: *port,
@@ -12682,7 +12738,7 @@ pub async fn start_network(
                                         peer_connect_options: co,
                                     };
                                     let stats = inject_source_into_active_transfers(
-                                        &mut state, fh, &matching_ids, &ds, 0,
+                                        &mut state, fh, &matching_ids, &ds, udp,
                                     );
                                     injected += stats.injected;
                                 }
@@ -17312,6 +17368,61 @@ pub async fn start_network(
                     state.kad_source_search_cursor = state.kad_source_search_cursor.wrapping_add(MAX_KAD_SEARCHES_PER_TICK);
                 }
 
+                // Active-download LowID callback flush: SX / KAD Type-2 peers
+                // are registered without waiting for FoundSources. Without this,
+                // busy files (source_count ≥ MAX_SOURCES_FOR_UDP) never request
+                // OP_CALLBACKREQUEST for those LowIDs.
+                if !state.low_id && state.server_connected && state.server_connection.is_some() {
+                    let current_server = state.server_addr.and_then(|addr| match addr.ip() {
+                        std::net::IpAddr::V4(v4) => {
+                            Some((u32::from_le_bytes(v4.octets()), addr.port()))
+                        }
+                        _ => None,
+                    });
+                    if let Some((srv_ip, srv_port)) = current_server {
+                        let active_hashes: Vec<[u8; 16]> = {
+                            let mgr = transfer_manager.read().await;
+                            state
+                                .active_source_senders
+                                .keys()
+                                .filter_map(|tid| {
+                                    mgr.get_transfer(tid).and_then(|t| {
+                                        let raw = hex::decode(&t.file_hash).ok()?;
+                                        if raw.len() == 16 {
+                                            let mut fh = [0u8; 16];
+                                            fh.copy_from_slice(&raw);
+                                            Some(fh)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                })
+                                .collect()
+                        };
+                        let mut to_queue: Vec<([u8; 16], u32)> = Vec::new();
+                        {
+                            let sm = source_manager.read().await;
+                            for fh in &active_hashes {
+                                for cid in sm.get_lowid_sources_needing_callback(
+                                    fh,
+                                    srv_ip,
+                                    srv_port,
+                                    ed2k::dead_sources::FILEREASKTIME_SECS,
+                                ) {
+                                    to_queue.push((*fh, cid));
+                                }
+                            }
+                        }
+                        if !to_queue.is_empty() {
+                            let n = to_queue.len();
+                            pending_lowid_callback_queue.extend(to_queue);
+                            debug!(
+                                "Queued {n} LowID callbacks for active downloads via {srv_ip}:{srv_port}"
+                            );
+                        }
+                    }
+                }
+
                 // eMule: every downloading file periodically searches KAD for
                 // additional sources, not just files waiting for their first
                 // source.  Use remaining budget from MAX_KAD_SEARCHES_PER_TICK.
@@ -18400,6 +18511,10 @@ pub async fn start_network(
                                                         },
                                                     );
                                                 }
+                                                let _ = app_handle.emit(
+                                                    "transfer:sources-updated",
+                                                    serde_json::json!({ "transfer_id": tid }),
+                                                );
                                             }
                                         }
                                         for pd in state.pending_downloads.values_mut() {
@@ -19286,6 +19401,12 @@ pub async fn start_network(
                                                     );
                                                 }
                                             }
+                                        }
+                                        for tid in &matching_transfer_ids {
+                                            let _ = app_handle.emit(
+                                                "transfer:sources-updated",
+                                                serde_json::json!({ "transfer_id": tid }),
+                                            );
                                         }
                                     }
                                 }
@@ -28576,6 +28697,30 @@ async fn handle_command_inner(
                         validated_extras.push((ip, port, ip.to_string()));
                     }
                 }
+                // Also seed from per_file_sources (EPX / soft-kept peers that
+                // may not be in SourceManager). Register into SM so later
+                // rediscovery and pause→resume stay consistent.
+                let pfs_dialable = state
+                    .per_file_sources
+                    .get(&transfer_id)
+                    .map(|pfs| pfs.dialable_sources())
+                    .unwrap_or_default();
+                if !pfs_dialable.is_empty() {
+                    let mut sm = source_manager.write().await;
+                    for (ip, port, udp_port) in pfs_dialable {
+                        if validated_extras.len() >= MAX_SEED_EXTRA_SOURCES {
+                            break;
+                        }
+                        if !is_source_admissible(&state, ip, port, None) {
+                            continue;
+                        }
+                        if !seen_addrs.insert((ip, port)) {
+                            continue;
+                        }
+                        sm.register_source_full(hash_bytes, ip, port, udp_port, [0u8; 16]);
+                        validated_extras.push((ip, port, ip.to_string()));
+                    }
+                }
 
                 let download_sources = {
                     let sm = source_manager.read().await;
@@ -28806,6 +28951,14 @@ async fn handle_command_inner(
                     transfer_id.clone(),
                     (now_ts, if initial_kad_search_started { 1 } else { 0 }),
                 );
+                // Empty-seed pending was inserted with search_count=0; stamp the
+                // fan-out so the 5s retry timer does not start a duplicate FindSource.
+                if initial_kad_search_started {
+                    if let Some(pd) = state.pending_downloads.get_mut(&transfer_id) {
+                        pd.search_count = pd.search_count.max(1);
+                        pd.last_search_at = now_ts;
+                    }
+                }
 
                 // Ember DHT source discovery for the new download (slice 9):
                 // independent of KAD, so it fires even on a KAD-less network.

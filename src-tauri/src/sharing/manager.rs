@@ -931,9 +931,14 @@ impl TransferManager {
         if let Some(transfer) = self.active.get_mut(id) {
             transfer.status = TransferStatus::Paused;
             transfer.speed = 0;
+            transfer.active_sources = 0;
+            transfer.queued_sources = 0;
             Self::clear_runtime_health(transfer);
         } else if let Some(transfer) = self.queue.iter_mut().find(|t| t.id == id) {
             transfer.status = TransferStatus::Paused;
+            transfer.speed = 0;
+            transfer.active_sources = 0;
+            transfer.queued_sources = 0;
             Self::clear_runtime_health(transfer);
         }
         if let Some(control) = self.controls.get(id) {
@@ -980,6 +985,8 @@ impl TransferManager {
         if let Some(mut transfer) = self.active.remove(id) {
             transfer.status = TransferStatus::Stopped;
             transfer.speed = 0;
+            transfer.active_sources = 0;
+            transfer.queued_sources = 0;
             Self::clear_runtime_health(&mut transfer);
             self.speed_history.remove(id);
             self.source_details.remove(id);
@@ -988,6 +995,9 @@ impl TransferManager {
         }
         if let Some(transfer) = self.queue.iter_mut().find(|t| t.id == id) {
             transfer.status = TransferStatus::Stopped;
+            transfer.speed = 0;
+            transfer.active_sources = 0;
+            transfer.queued_sources = 0;
             Self::clear_runtime_health(transfer);
         }
         Vec::new()
