@@ -519,6 +519,17 @@ impl AICHRecoveryHashSet {
         })
     }
 
+    /// Per-part subtree hashes for `OP_HASHSETANSWER2` — eMule hierarchical
+    /// part roots (not flat `compute_aich_part` with always-left splits).
+    pub fn part_hashes(&self) -> Vec<[u8; 20]> {
+        if self.file_size == 0 {
+            return Vec::new();
+        }
+        let num_parts =
+            (((self.file_size + PARTSIZE as u64 - 1) / PARTSIZE as u64) as usize).max(1);
+        compute_all_part_hashes(&self.leaf_hashes, self.file_size, num_parts)
+    }
+
     /// Build from raw data (e.g., a part or buffer). The buffer is treated
     /// as the whole "file" for tree-position purposes (`file_size =
     /// data.len()`).

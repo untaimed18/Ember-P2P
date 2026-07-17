@@ -227,6 +227,7 @@ impl IpFilter {
         let mut new_ranges = Vec::new();
         let mut count = 0usize;
         let mut overlong_drops = 0usize;
+        let mut io_failed = false;
         let mut raw_line = Vec::new();
         for lineno in 0..MAX_LINES {
             raw_line.clear();
@@ -245,6 +246,7 @@ impl IpFilter {
                         "Stopping ipfilter.dat parse after I/O error at line {}: {e}",
                         lineno + 1
                     );
+                    io_failed = true;
                     break;
                 }
             };
@@ -272,6 +274,11 @@ impl IpFilter {
             warn!(
                 "ipfilter.dat: dropped {overlong_drops} lines longer than {MAX_LINE_BYTES} bytes"
             );
+        }
+        // Mid-file I/O failure: keep the previous range list rather than
+        // committing a truncated parse as if it were a successful load.
+        if io_failed {
+            return None;
         }
 
         let final_count = self.commit_ranges(new_ranges);
@@ -397,6 +404,19 @@ impl IpFilter {
 
     pub fn set_block_private(&mut self, block_private: bool) {
         self.block_private = block_private;
+    }
+
+    /// Merge ranges from `other` into this filter. Used when a deferred
+    /// ipfilter.dat load finishes and the live filter may already hold
+    /// user-added ranges from AddIpRange during the load window.
+    pub fn merge_ranges_from(&mut self, other: &IpFilter) {
+        if other.blocked_ranges.is_empty() {
+            return;
+        }
+        self.blocked_ranges
+            .extend(other.blocked_ranges.iter().cloned());
+        self.blocked_ranges.sort_by_key(|r| r.start);
+        self.merge_overlapping();
     }
 
     /// Create a shared snapshot for use by the upload handler.
@@ -528,6 +548,7 @@ impl IpFilter {
         let mut new_ranges = Vec::new();
         let mut count = 0;
         let mut overlong_drops = 0usize;
+        let mut io_failed = false;
         let mut raw_line = Vec::new();
         for lineno in 0..MAX_LINES {
             raw_line.clear();
@@ -541,6 +562,7 @@ impl IpFilter {
                         "Stopping .p2p parse after I/O error at line {}: {e}",
                         lineno + 1
                     );
+                    io_failed = true;
                     break;
                 }
             };
@@ -563,6 +585,9 @@ impl IpFilter {
         }
         if overlong_drops > 0 {
             warn!(".p2p file: dropped {overlong_drops} lines longer than {MAX_LINE_BYTES} bytes");
+        }
+        if io_failed {
+            return None;
         }
 
         let final_count = self.commit_ranges(new_ranges);

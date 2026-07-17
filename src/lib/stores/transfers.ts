@@ -546,7 +546,7 @@ export async function initTransferStore() {
             if (peer_id) {
               updated.peer_id = peer_id;
             }
-            if (sources !== undefined) updated.sources = Math.max(sources, t.sources);
+            if (sources !== undefined) updated.sources = sources;
             if (active_sources !== undefined || queued_sources !== undefined) {
               const nextActive = active_sources ?? t.active_sources ?? 0;
               const nextQueued = queued_sources ?? t.queued_sources ?? 0;
@@ -648,7 +648,7 @@ export async function initTransferStore() {
             else if (!preserveLive) sourceCountsUpdatedAt.delete(id);
             return {
               ...t,
-              sources: Math.max(sources, t.sources),
+              sources,
               active_sources: preserveLive ? t.active_sources : active_sources,
               queued_sources: preserveLive ? t.queued_sources : queued_sources,
             };
@@ -707,7 +707,7 @@ export async function initTransferStore() {
             failure_reason: eventItem.failure_reason ?? apiItem.failure_reason,
             failure_kind: eventItem.failure_kind ?? apiItem.failure_kind,
             failure_stage: eventItem.failure_stage ?? apiItem.failure_stage,
-            sources: Math.max(apiItem.sources ?? 0, eventItem.sources ?? 0),
+            sources: apiItem.sources ?? eventItem.sources ?? 0,
             active_sources: Math.max(apiItem.active_sources ?? 0, eventItem.active_sources ?? 0),
             queued_sources: Math.max(apiItem.queued_sources ?? 0, eventItem.queued_sources ?? 0),
           });
@@ -964,7 +964,7 @@ export function startTransferPoll() {
               failure_reason: eventItem.failure_reason ?? apiItem.failure_reason,
               failure_kind: eventItem.failure_kind ?? apiItem.failure_kind,
               failure_stage: eventItem.failure_stage ?? apiItem.failure_stage,
-              sources: Math.max(apiItem.sources ?? 0, eventItem.sources ?? 0),
+              sources: apiItem.sources ?? eventItem.sources ?? 0,
               active_sources: preserveFreshEventCounts ? eventActive : apiActive,
               queued_sources: preserveFreshEventCounts ? eventQueued : apiQueued,
             };

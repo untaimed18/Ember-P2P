@@ -1,6 +1,7 @@
 <script lang="ts">
   import { getSettings, updateSettings, downloadNodesDat, downloadIpfilter, openEmberWebsite } from '$lib/api/settings';
-  import { setAppSettings } from '$lib/stores/settings';
+  import { setAppSettings, appSettings } from '$lib/stores/settings';
+  import { get } from 'svelte/store';
   import { getSpamStats, resetSpamFilter, clearDownloadHistory, getDownloadHistoryStats } from '$lib/api/search';
   import {
     getAntileechPatterns,
@@ -409,7 +410,19 @@
   let friendTogglePersistPending = false;
   async function applyFriendTogglesLive() {
     if (!settings) return;
-    setAppSettings({ ...settings });
+    // Optimistic: push only friend fields so unsaved draft edits on other
+    // settings keys are not leaked into the process-wide store.
+    const cached = get(appSettings);
+    if (cached) {
+      setAppSettings({
+        ...cached,
+        friend_require_approval: settings.friend_require_approval,
+        friend_online_notifications: settings.friend_online_notifications,
+        friend_chat_disabled: settings.friend_chat_disabled,
+        friend_browse_disabled: settings.friend_browse_disabled,
+        friend_session_encryption: settings.friend_session_encryption,
+      });
+    }
     if (friendTogglePersistInFlight) {
       // A later toggle flipped while we were writing — coalesce and re-run
       // with the latest values once the in-flight persist finishes.
@@ -431,17 +444,18 @@
             friend_session_encryption: settings.friend_session_encryption,
           };
           try {
-            const saved = await updateSettings(candidate);
-            setAppSettings(saved);
-            settings.settings_revision = saved.settings_revision;
+            // updateSettings returns a status string, not AppSettings.
+            await updateSettings(candidate);
+            setAppSettings(candidate);
+            settings.settings_revision = candidate.settings_revision;
             if (originalSettings) {
               const baseline = JSON.parse(originalSettings) as AppSettings;
-              baseline.friend_require_approval = saved.friend_require_approval;
-              baseline.friend_online_notifications = saved.friend_online_notifications;
-              baseline.friend_chat_disabled = saved.friend_chat_disabled;
-              baseline.friend_browse_disabled = saved.friend_browse_disabled;
-              baseline.friend_session_encryption = saved.friend_session_encryption;
-              baseline.settings_revision = saved.settings_revision;
+              baseline.friend_require_approval = candidate.friend_require_approval;
+              baseline.friend_online_notifications = candidate.friend_online_notifications;
+              baseline.friend_chat_disabled = candidate.friend_chat_disabled;
+              baseline.friend_browse_disabled = candidate.friend_browse_disabled;
+              baseline.friend_session_encryption = candidate.friend_session_encryption;
+              baseline.settings_revision = candidate.settings_revision;
               originalSettings = JSON.stringify(baseline);
             }
             break;

@@ -8602,23 +8602,8 @@ fn parse_aich_root_hash(hex_str: &str) -> Option<[u8; 20]> {
 }
 
 fn compute_aich_part_hashes(path: &std::path::Path) -> anyhow::Result<Vec<[u8; 20]>> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(path)?;
-    let file_size = file.metadata()?.len();
-    if file_size == 0 {
-        return Ok(Vec::new());
-    }
-    let mut hashes = Vec::new();
-    let mut remaining = file_size;
-    let mut buf = vec![0u8; PARTSIZE as usize];
-    while remaining > 0 {
-        let part_len = remaining.min(PARTSIZE) as usize;
-        let part_buf = &mut buf[..part_len];
-        file.read_exact(part_buf)?;
-        hashes.push(crate::network::ed2k::aich::compute_aich_part(part_buf));
-        remaining -= part_len as u64;
-    }
-    Ok(hashes)
+    let hs = crate::network::ed2k::aich::AICHRecoveryHashSet::build_from_file(path)?;
+    Ok(hs.part_hashes())
 }
 
 fn parse_request_parts_32(payload: &[u8]) -> anyhow::Result<Vec<(u64, u64)>> {
