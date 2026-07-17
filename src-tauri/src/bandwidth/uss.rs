@@ -126,12 +126,31 @@ impl UploadSpeedSense {
             );
         } else if self.state == UssState::Monitoring
             && self.initial_ping_ms > 0.0
-            && latency_ms < self.initial_ping_ms
+            && self.ping_history.len() >= BASELINE_SAMPLES
         {
-            // Ratchet the baseline down when we observe a quieter path so the
-            // target does not stay permanently inflated after a noisy start.
-            self.initial_ping_ms = latency_ms;
-            debug!("USS: New lowest baseline RTT: {:.1}ms", self.initial_ping_ms);
+            // Only lower the baseline when the entire recent window is quieter
+            // than the current floor — a single lucky sample must not ratchet.
+            // Use the window median (not min) so one older quiet spike still
+            // sitting in the window cannot drag the floor unrealistically low.
+            let mut window: Vec<f64> = self
+                .ping_history
+                .iter()
+                .rev()
+                .take(BASELINE_SAMPLES)
+                .copied()
+                .collect();
+            if window.iter().all(|&p| p < self.initial_ping_ms) {
+                window.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let mid = window.len() / 2;
+                let recent = if window.len() % 2 == 0 {
+                    (window[mid - 1] + window[mid]) / 2.0
+                } else {
+                    window[mid]
+                }
+                .max(1.0);
+                self.initial_ping_ms = recent;
+                debug!("USS: New lowest baseline RTT: {:.1}ms", self.initial_ping_ms);
+            }
         }
     }
 
@@ -303,6 +322,30 @@ mod tests {
         uss.record_ping(90.0);
         assert_eq!(uss.state(), UssState::Monitoring);
         assert!((uss.initial_ping_ms - 50.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn single_quiet_sample_does_not_ratchet_baseline() {
+        let mut uss = UploadSpeedSense::new(0, 100_000);
+        uss.enable();
+        for _ in 0..BASELINE_SAMPLES {
+            uss.record_ping(50.0);
+        }
+        assert!((uss.initial_ping_ms - 50.0).abs() < f64::EPSILON);
+
+        // One quieter spike must not permanently lower the baseline.
+        uss.record_ping(10.0);
+        assert!(
+            (uss.initial_ping_ms - 50.0).abs() < f64::EPSILON,
+            "baseline moved to {} after a single quiet sample",
+            uss.initial_ping_ms
+        );
+
+        // A sustained quieter window (last BASELINE_SAMPLES all lower) may.
+        for _ in 0..BASELINE_SAMPLES {
+            uss.record_ping(30.0);
+        }
+        assert!((uss.initial_ping_ms - 30.0).abs() < f64::EPSILON);
     }
 
     #[test]

@@ -2041,21 +2041,37 @@ pub async fn start_upload_server(
                             continue;
                         }
 
+                        // eD2K server HighID port-test: the connected/pending
+                        // server dials our TCP port during login. Identified
+                        // before the IP filter so a fail-closed empty-range
+                        // window at startup cannot reject Sunrise and force
+                        // LowID. Match by peer IP against `shared_server_addr`
+                        // (preset at connect).
+                        let is_server_port_test_ip = {
+                            let server_addr = server.shared_server_addr.read().await;
+                            server_addr
+                                .map(|a| a.ip() == peer_addr.ip())
+                                .unwrap_or(false)
+                        };
+
                         if server.filter_incoming_connections.load(std::sync::atomic::Ordering::Relaxed) {
                             // Fail closed on poisoned lock: if we can't read
                             // the filter snapshot we refuse the connection
                             // rather than silently letting potentially-blocked
                             // peers through.
-                            let blocked = match server.shared_ip_filter.read() {
-                                Ok(snap) => snap.is_blocked(peer_ipv4),
+                            let (blocked, ranges_ready) = match server.shared_ip_filter.read() {
+                                Ok(snap) => (snap.is_blocked(peer_ipv4), snap.ranges_ready),
                                 Err(_poisoned) => {
                                     tracing::warn!(
                                         "IP filter lock poisoned while checking {peer_addr}; rejecting connection"
                                     );
-                                    true
+                                    (true, true)
                                 }
                             };
-                            if blocked {
+                            // While ranges are still loading, fail-closed
+                            // blocks every public IP — including the eD2K
+                            // server's HighID port-test. Exempt that peer.
+                            if blocked && !(is_server_port_test_ip && !ranges_ready) {
                                 info!("IP filter blocked incoming TCP from {peer_addr}");
                                 drop(stream);
                                 continue;
@@ -2107,19 +2123,6 @@ pub async fn start_upload_server(
                                 continue;
                             }
                         }
-
-                        // eD2K server HighID port-test: the connected/pending
-                        // server dials our TCP port during login. Must be
-                        // accepted even when `network_disconnected` is set
-                        // (KAD not connected yet) — otherwise we always get
-                        // LowID on server-first connect. Match by peer IP
-                        // against `shared_server_addr` (preset at connect).
-                        let is_server_port_test_ip = {
-                            let server_addr = server.shared_server_addr.read().await;
-                            server_addr
-                                .map(|a| a.ip() == peer_addr.ip())
-                                .unwrap_or(false)
-                        };
 
                         // eMule: reject new upload connections while network is disconnected.
                         // Firewall probes and the eD2K server's HighID port-test still pass.
