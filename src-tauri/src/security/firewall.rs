@@ -122,7 +122,7 @@ fn add_firewall_rule(rule_name: &str, protocol: &str, port: u16) -> AddRuleOutco
         format!("localport={port}"),
         "enable=yes".to_string(),
         "profile=any".to_string(),
-        format!("program=\"{exe_path}\""),
+        format!("program={exe_path}"),
     ];
     let result = Command::new("netsh")
         .args(&args)

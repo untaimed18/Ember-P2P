@@ -389,6 +389,31 @@ fn global_dl_conn_contended() -> bool {
 /// small reserve; `low`/`verylow` leave a larger one. A bounded max-wait keeps
 /// low-priority downloads from being starved forever when pressure persists —
 /// they still make progress, just yield slots to higher-priority files first.
+/// Decrements `in_use` on drop unless disarmed after a successful acquire.
+/// Prevents a permanent budget leak when cancel drops the future between the
+/// `in_use` bump and `sem.acquire_owned()` completing (N2).
+struct InUseAcquireGuard {
+    limiter: &'static GlobalConnLimiter,
+    armed: bool,
+}
+
+impl Drop for InUseAcquireGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.limiter
+                .in_use
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            self.limiter.notify.notify_waiters();
+        }
+    }
+}
+
+impl InUseAcquireGuard {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
 async fn acquire_global_dl_conn(priority_ord: u8) -> Option<GlobalConnPermit> {
     use std::sync::atomic::Ordering;
     let l = GLOBAL_DL_CONN_LIMITER.get()?;
@@ -424,15 +449,21 @@ async fn acquire_global_dl_conn(priority_ord: u8) -> Option<GlobalConnPermit> {
                 .compare_exchange(active, active + 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
+                // Guard covers cancel-drop and Closed; GlobalConnPermit takes
+                // over the decrement once ownership is fully established.
+                let guard = InUseAcquireGuard {
+                    limiter: l,
+                    armed: true,
+                };
                 match l.sem.clone().acquire_owned().await {
                     Ok(permit) => {
+                        guard.disarm();
                         return Some(GlobalConnPermit {
                             _permit: permit,
                             limiter: l,
-                        })
+                        });
                     }
                     Err(_) => {
-                        l.in_use.fetch_sub(1, Ordering::AcqRel);
                         return None;
                     }
                 }
@@ -845,11 +876,11 @@ async fn check_control(control: &TransferControl) -> anyhow::Result<()> {
     if control.is_cancelled() {
         anyhow::bail!("cancelled by user");
     }
-    while control.is_paused() {
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        if control.is_cancelled() {
-            anyhow::bail!("cancelled while paused");
-        }
+    // Pause tears the worker down (PauseDownload aborts the parent). Do not
+    // busy-wait here — that parked the parent forever and left children
+    // holding sockets until a hard JoinHandle abort (N3).
+    if control.is_paused() {
+        anyhow::bail!("cancelled while paused");
     }
     Ok(())
 }
@@ -871,8 +902,26 @@ async fn check_control(control: &TransferControl) -> anyhow::Result<()> {
 /// anyway), the function will not return on its own and this still force-drops
 /// it within the grace window, keeping Stop/Cancel near-immediate.
 async fn cancel_with_grace(control: &TransferControl) {
-    control.wait_cancelled().await;
+    // Pause and cancel both tear down the wire transfer; wait for either so
+    // per-source tasks exit cooperatively instead of only on hard abort (N1/N3).
+    control.wait_cancel_or_pause().await;
     tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+}
+
+/// Acquire a per-file source permit, aborting immediately on cancel/pause so
+/// waiters do not park forever behind pause holders (N4).
+async fn acquire_source_permit<'a>(
+    sem: &'a tokio::sync::Semaphore,
+    control: &TransferControl,
+) -> anyhow::Result<tokio::sync::SemaphorePermit<'a>> {
+    tokio::select! {
+        result = sem.acquire() => {
+            result.map_err(|_| anyhow::anyhow!("download cancelled"))
+        }
+        _ = control.wait_cancel_or_pause() => {
+            Err(anyhow::anyhow!("cancelled by user"))
+        }
+    }
 }
 
 /// Outcome of an in-session re-queue attempt after `OP_OUTOFPARTREQS`.
@@ -1668,9 +1717,9 @@ impl MultiSourceDownload {
                         })
                         .await;
                 }
-                let _permit = match sem_clone.acquire().await {
+                let _permit = match acquire_source_permit(&sem_clone, &ctrl_clone).await {
                     Ok(p) => p,
-                    Err(_) => return (src_idx, parts, Err(anyhow::anyhow!("download cancelled"))),
+                    Err(e) => return (src_idx, parts, Err(e)),
                 };
                 let freq_avail = src_avail.clone();
                 let cancel_ctrl = ctrl_clone.clone();
@@ -1841,6 +1890,14 @@ impl MultiSourceDownload {
             let mut injection_channel_open = true;
             loop {
                 if let Err(e) = check_control(&self.control).await {
+                    // Abort detached per-source tasks before draining so cancel/
+                    // pause does not leave writers live after the parent exits (N1).
+                    for ah in &abort_handles {
+                        ah.abort();
+                    }
+                    for ah in &injected_abort_handles {
+                        ah.abort();
+                    }
                     while pending_futs.next().await.is_some() {}
                     return Err(e);
                 }
@@ -2068,9 +2125,9 @@ impl MultiSourceDownload {
                             let inj_sx_oh = self.sx_overhead.clone();
                             let inj_missing_parts = peers_missing_parts.clone();
                             let handle = tokio::spawn(async move {
-                                let _permit = match sem.acquire().await {
+                                let _permit = match acquire_source_permit(&sem, &ctrl).await {
                                     Ok(p) => p,
-                                    Err(_) => return (src_idx, Vec::new(), Err(anyhow::anyhow!("download cancelled"))),
+                                    Err(e) => return (src_idx, Vec::new(), Err(e)),
                                 };
                                 let freq_avail = avail.clone();
                                 let cancel_ctrl = ctrl.clone();
@@ -2307,9 +2364,9 @@ impl MultiSourceDownload {
                             let inj_sx_oh = self.sx_overhead.clone();
                             let inj_missing_parts = peers_missing_parts.clone();
                             let handle = tokio::spawn(async move {
-                                let _permit = match sem.acquire().await {
+                                let _permit = match acquire_source_permit(&sem, &ctrl).await {
                                     Ok(p) => p,
-                                    Err(_) => return (src_idx, Vec::new(), Err(anyhow::anyhow!("download cancelled"))),
+                                    Err(e) => return (src_idx, Vec::new(), Err(e)),
                                 };
                                 let freq_avail = avail.clone();
                                 let cancel_ctrl = ctrl.clone();
@@ -2377,18 +2434,13 @@ impl MultiSourceDownload {
                     }
                 }
             }
-            // Drain remaining handles
-            let all_parts_done = {
-                let t = tracker.read().await;
-                t.all_complete()
-            };
-            if all_parts_done {
-                for ah in &abort_handles {
-                    ah.abort();
-                }
-                for ah in &injected_abort_handles {
-                    ah.abort();
-                }
+            // Drain remaining handles. Always abort first so pause/cancel
+            // teardown cannot leave orphan writers on the .part file (N1).
+            for ah in &abort_handles {
+                ah.abort();
+            }
+            for ah in &injected_abort_handles {
+                ah.abort();
             }
             while let Some(joined) = pending_futs.next().await {
                 match joined {
@@ -2795,7 +2847,7 @@ impl MultiSourceDownload {
                 let a_sx_oh = self.sx_overhead.clone();
                 let a_missing_parts = peers_missing_parts.clone();
                 adopted_handles.push(tokio::spawn(async move {
-                    let _permit = match sem.acquire().await {
+                    let _permit = match acquire_source_permit(&sem, &ctrl).await {
                         Ok(p) => p,
                         Err(_) => return,
                     };
@@ -3226,7 +3278,7 @@ impl MultiSourceDownload {
                 let r_src_ip = source.peer_ip.clone();
                 let r_src_port = source.peer_port;
                 retry_handles.push(tokio::spawn(async move {
-                    let _permit = match r_sem.acquire().await {
+                    let _permit = match acquire_source_permit(&r_sem, &rctrl).await {
                         Ok(p) => p,
                         Err(_) => return,
                     };
@@ -7981,12 +8033,6 @@ async fn download_parts_from_source(
                 }
             }
 
-            // No pre-verification fsync: the writer thread reads from the same
-            // open file handle it wrote with, so the OS page cache is
-            // self-consistent. Skipping fsync here removes a per-part disk
-            // round-trip (tens of ms on HDDs / network shares) without
-            // affecting correctness — the final fsync still runs at completion.
-
             // DIAG: log every receive-loop exit with the reason and the
             // counters so we can correlate "peer disappears after 1 chunk"
             // with the underlying cause (gap-list says complete, peer
@@ -8234,6 +8280,24 @@ async fn download_parts_from_source(
                     continue;
                 }
                 PartHashOutcome::Verified => {
+                    // Durability before persisting verified bits: otherwise a
+                    // crash can leave .part.met claiming verified while .part
+                    // data is still only in the page cache, and uploads would
+                    // serve that range (T5).
+                    if let Err(e) = output.sync_data().await {
+                        warn!(
+                            "pre-verification fsync failed for part {part_idx} (source {_src_idx}): {e}"
+                        );
+                        let snap = {
+                            let mut t = tracker.write().await;
+                            t.set_in_progress(part_idx, false);
+                            t.snapshot_for_save()
+                        };
+                        save_snapshot_now(snap, "fsync failed before verify persist").await;
+                        ip_guard.unmark(part_idx);
+                        per_part_credit.remove(&part_idx);
+                        continue;
+                    }
                     let (ps, pe, snap) = {
                         let mut t = tracker.write().await;
                         let (ps, pe) = t.part_range(part_idx);

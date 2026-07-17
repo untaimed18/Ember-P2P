@@ -1196,7 +1196,7 @@ impl SearchManager {
         }
     }
 
-    /// Start a search. Returns `(new_id, evicted_ids, released_in_use, keyword_results)`.
+    /// Start a search. Returns `(new_id, evicted_ids, released_in_use, preserved_results)`.
     ///
     /// `new_id` is `SearchId(0)` when the request is rejected (capacity /
     /// priority). `evicted_ids` are searches removed by the capacity reap or
@@ -1204,10 +1204,10 @@ impl SearchManager {
     /// `CancelKadSearch` (`finalize_removed_searches`) so pending-result maps
     /// keyed by those ids are cleared. `released_in_use` are the evicted
     /// searches' routing-table in-use marks (pass them to finalize together
-    /// with the ids). `keyword_results` carries any `FindKeyword` result
-    /// entries collected before eviction so finalize can deliver them instead
-    /// of answering the oneshot with an empty local-only list. When nothing
-    /// is evicted the vecs/map are empty.
+    /// with the ids). `preserved_results` carries any FindKeyword / FindSource /
+    /// FindNotes entries collected before eviction so finalize can deliver or
+    /// inject them instead of answering with empty success. When nothing is
+    /// evicted the vecs/map are empty.
     pub fn start_search(
         &mut self,
         target: KadId,
@@ -1238,7 +1238,7 @@ impl SearchManager {
         const MAX_ACTIVE_SEARCHES: usize = 20;
         let mut evicted_ids: Vec<SearchId> = Vec::new();
         let mut released_in_use: Vec<KadId> = Vec::new();
-        let mut keyword_results: HashMap<SearchId, Vec<SearchResultEntry>> = HashMap::new();
+        let mut preserved_results: HashMap<SearchId, Vec<SearchResultEntry>> = HashMap::new();
         let active = self.active_count();
         if active >= MAX_ACTIVE_SEARCHES {
             let completed: Vec<SearchId> = self
@@ -1256,8 +1256,8 @@ impl SearchManager {
                     // Caller finalizes pending maps for these ids; in-use
                     // marks go back via `released_in_use` (not pending_release)
                     // so finalize can release them immediately.
-                    if matches!(s.search_type, SearchType::FindKeyword) && !s.results.is_empty() {
-                        keyword_results.insert(s.id, std::mem::take(&mut s.results));
+                    if s.search_type.accepts_search_results() && !s.results.is_empty() {
+                        preserved_results.insert(s.id, std::mem::take(&mut s.results));
                     }
                     released_in_use.extend(s.in_use_ids);
                     evicted_ids.push(id);
@@ -1287,10 +1287,10 @@ impl SearchManager {
                         if self.target_map.get(&old_key) == Some(&id) {
                             self.target_map.remove(&old_key);
                         }
-                        if matches!(state.search_type, SearchType::FindKeyword)
-                            && !state.results.is_empty()
+                        if state.search_type.accepts_search_results() && !state.results.is_empty()
                         {
-                            keyword_results.insert(state.id, std::mem::take(&mut state.results));
+                            preserved_results
+                                .insert(state.id, std::mem::take(&mut state.results));
                         }
                         released_in_use.extend(state.in_use_ids);
                         evicted_ids.push(id);
@@ -1306,7 +1306,7 @@ impl SearchManager {
                     );
                     // Still return any completed rows we reaped above so the
                     // caller can finalize their pending maps.
-                    return (SearchId(0), evicted_ids, released_in_use, keyword_results);
+                    return (SearchId(0), evicted_ids, released_in_use, preserved_results);
                 }
             }
         }
@@ -1321,7 +1321,7 @@ impl SearchManager {
         self.active.insert(id, state);
         self.pending_in_use.extend(in_use);
         debug!("Started search {}: target={}", id.0, target);
-        (id, evicted_ids, released_in_use, keyword_results)
+        (id, evicted_ids, released_in_use, preserved_results)
     }
 
     pub fn get_mut(&mut self, id: &SearchId) -> Option<&mut SearchState> {

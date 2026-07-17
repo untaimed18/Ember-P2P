@@ -670,6 +670,12 @@ pub async fn retry_friend_search(
 ) -> Result<(), String> {
     let canonical = user_hash_hex.to_lowercase();
     let hash = parse_user_hash(&canonical)?;
+    if !state.friend_hashes.read().await.contains(&hash) {
+        return Err(coded(
+            "peers_not_friend",
+            "Can only retry search for friends",
+        ));
+    }
     let (tx, rx) = tokio::sync::oneshot::channel();
     bounded_send(
         &state.network_tx,
@@ -689,6 +695,12 @@ pub async fn browse_friend(
 ) -> Result<(), String> {
     let canonical = user_hash_hex.to_lowercase();
     let hash = parse_user_hash(&canonical)?;
+    if !state.friend_hashes.read().await.contains(&hash) {
+        return Err(coded(
+            "peers_not_friend",
+            "Can only browse friends",
+        ));
+    }
     let (tx, rx) = tokio::sync::oneshot::channel();
     bounded_send(
         &state.network_tx,

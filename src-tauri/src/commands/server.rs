@@ -45,13 +45,21 @@ pub async fn fetch_server_met_bytes(url: &str) -> Result<Vec<u8>, String> {
 
     if bytes.starts_with(&[0x1f, 0x8b]) {
         use std::io::Read;
+        // Bound decompressed output; `take(MAX + 1)` so we can distinguish
+        // "exactly the limit" from overflow (same pattern as ipfilter .gz).
         const MAX_DECOMPRESSED: u64 = 50 * 1024 * 1024;
         let decoder = flate2::read::GzDecoder::new(&bytes[..]);
-        let mut limited = decoder.take(MAX_DECOMPRESSED);
+        let mut limited = decoder.take(MAX_DECOMPRESSED + 1);
         let mut decompressed = Vec::new();
         limited
             .read_to_end(&mut decompressed)
             .map_err(|e| coded_ctx("gzip_decompress_failed", "Failed to decompress gzip", e))?;
+        if decompressed.len() as u64 > MAX_DECOMPRESSED {
+            return Err(coded(
+                "gzip_decompressed_too_large",
+                "Decompressed server.met is too large",
+            ));
+        }
         Ok(decompressed)
     } else {
         Ok(bytes)

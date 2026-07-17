@@ -334,10 +334,19 @@ impl TransferManager {
                 transfer.direction == TransferDirection::Download
                     && !matches!(
                         transfer.status,
-                        TransferStatus::Paused | TransferStatus::Stopped
+                        TransferStatus::Paused
+                            | TransferStatus::Stopped
+                            // Disk-full rows stay visible but must not block the
+                            // concurrent slot budget (T2).
+                            | TransferStatus::Insufficient
                     )
             })
             .count()
+    }
+
+    /// Promote queued downloads into free concurrent slots.
+    pub fn promote_available(&mut self) -> Vec<Transfer> {
+        self.promote_next()
     }
 
     fn can_auto_run(transfer: &Transfer) -> bool {
@@ -965,7 +974,9 @@ impl TransferManager {
             freed_active_download_slot = transfer.direction == TransferDirection::Download
                 && !matches!(
                     transfer.status,
-                    TransferStatus::Paused | TransferStatus::Stopped
+                    TransferStatus::Paused
+                        | TransferStatus::Stopped
+                        | TransferStatus::Insufficient
                 );
         }
         self.pause(id);

@@ -104,6 +104,7 @@
     const hash = friendHash;
     if (hash) {
       sendError = null;
+      sending = false;
       // Restore any draft the user had typed for THIS conversation
       // before they switched tabs / closed the dock. New drafts
       // are saved in the cleanup below. Empty string is a valid

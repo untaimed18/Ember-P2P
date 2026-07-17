@@ -682,9 +682,10 @@ pub async fn add_shared_folder(
                     index.remove_file_by_id(&file_temp_id);
                 }
                 Err(_) => {
-                    warn!("Hash timed out after 5 min for {} (file may be on cloud storage or locked), skipping", file.name);
-                    let mut index = local_index.write().await;
-                    index.remove_file_by_id(&file_temp_id);
+                    // Leave the pending entry so a later reload/retry can
+                    // finish hashing; dropping it here made slow/cloud files
+                    // disappear from the share list after one timeout.
+                    warn!("Hash timed out after 5 min for {} (file may be on cloud storage or locked); leaving pending for retry", file.name);
                 }
             }
         }
@@ -1539,9 +1540,10 @@ pub async fn reload_shared_files(
                     index.remove_file_by_id(&file_temp_id);
                 }
                 Err(_) => {
-                    warn!("Hash timed out after 5 min for {} (file may be on cloud storage or locked), skipping", file.name);
-                    let mut index = local_index.write().await;
-                    index.remove_file_by_id(&file_temp_id);
+                    // Leave the pending entry so a later reload/retry can
+                    // finish hashing; dropping it here made slow/cloud files
+                    // disappear from the share list after one timeout.
+                    warn!("Hash timed out after 5 min for {} (file may be on cloud storage or locked); leaving pending for retry", file.name);
                 }
             }
         }
