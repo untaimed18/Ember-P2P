@@ -1968,11 +1968,26 @@ impl MultiSourceDownload {
                             };
                             if parts.is_empty() {
                                 // Source not usable right now (e.g. all
-                                // parts already in progress); drop it
-                                // silently so we don't pollute counters
-                                // or UI totals. The peer can be
-                                // re-injected via KAD/server SX if it
-                                // becomes useful later.
+                                // parts already in progress). Soft-release
+                                // PFS so rediscovery can re-inject later
+                                // (~60s), matching the inject-path comment.
+                                let _ = event_tx
+                                    .send(DownloadEvent::SourceDetail {
+                                        transfer_id: self.transfer_id.clone(),
+                                        ip: source.peer_ip.clone(),
+                                        port: source.peer_port,
+                                        status: "parts_busy".to_string(),
+                                        queue_rank: None,
+                                        speed: 0,
+                                        transferred: 0,
+                                        client_software: String::new(),
+                                        peer_name: String::new(),
+                                        failure_kind: None,
+                                        available_parts: None,
+                                        total_parts: None,
+                                        country_code: None,
+                                    })
+                                    .await;
                                 continue;
                             }
 
@@ -2192,6 +2207,23 @@ impl MultiSourceDownload {
                                     "Pre-established source {}:{} has no assignable parts; dropping stream",
                                     source.peer_ip, source.peer_port,
                                 );
+                                let _ = event_tx
+                                    .send(DownloadEvent::SourceDetail {
+                                        transfer_id: self.transfer_id.clone(),
+                                        ip: source.peer_ip.clone(),
+                                        port: source.peer_port,
+                                        status: "parts_busy".to_string(),
+                                        queue_rank: None,
+                                        speed: 0,
+                                        transferred: 0,
+                                        client_software: String::new(),
+                                        peer_name: String::new(),
+                                        failure_kind: None,
+                                        available_parts: None,
+                                        total_parts: None,
+                                        country_code: None,
+                                    })
+                                    .await;
                                 drop(stream);
                                 continue;
                             }
@@ -2667,6 +2699,23 @@ impl MultiSourceDownload {
                         "Adopted callback {}:{} has no assignable parts; dropping stream",
                         source.peer_ip, source.peer_port,
                     );
+                    let _ = event_tx
+                        .send(DownloadEvent::SourceDetail {
+                            transfer_id: self.transfer_id.clone(),
+                            ip: source.peer_ip.clone(),
+                            port: source.peer_port,
+                            status: "parts_busy".to_string(),
+                            queue_rank: None,
+                            speed: 0,
+                            transferred: 0,
+                            client_software: String::new(),
+                            peer_name: String::new(),
+                            failure_kind: None,
+                            available_parts: None,
+                            total_parts: None,
+                            country_code: None,
+                        })
+                        .await;
                     drop(stream);
                     continue;
                 }

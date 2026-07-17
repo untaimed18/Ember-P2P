@@ -404,6 +404,42 @@ impl PerFileSourceList {
         }
     }
 
+    /// Soft-drop when the multi-source worker could not assign a part yet
+    /// (all parts in-progress/done). Keeps the peer in the list but makes it
+    /// eligible for re-inject after ~60s — not a peer fault, so no fail_count.
+    pub fn set_parts_busy(&mut self, ip: Ipv4Addr, port: u16, user_hash: Option<[u8; 16]>) {
+        const PARTS_BUSY_REASK_SECS: u64 = 60;
+        if let Some(s) = self.find_mut(ip, port, user_hash) {
+            s.state = DownloadSourceState::Failed;
+            s.state_changed = Instant::now();
+            // Arm so `time_until_reask` returns ~PARTS_BUSY_REASK_SECS, not
+            // a full FILEREASKTIME wait from a stale `last_asked`.
+            s.last_asked = Instant::now()
+                .checked_sub(Duration::from_secs(
+                    (FILEREASKTIME_SECS as u64).saturating_sub(PARTS_BUSY_REASK_SECS),
+                ))
+                .unwrap_or_else(Instant::now);
+        }
+    }
+
+    /// True when a rediscovered peer should be re-injected into the active
+    /// worker (PFS already knows it, but the worker may have soft-dropped it).
+    pub fn is_eligible_for_reinject(&self, ip: Ipv4Addr, tcp_port: u16) -> bool {
+        self.sources
+            .iter()
+            .find(|s| s.ip == ip && s.tcp_port == tcp_port)
+            .is_some_and(|s| s.time_until_reask() == 0)
+    }
+
+    /// Snapshot of dialable HighID sources for seeding a new worker (pause→resume).
+    pub fn dialable_sources(&self) -> Vec<(Ipv4Addr, u16, u16)> {
+        self.sources
+            .iter()
+            .filter(|s| !s.ip.is_unspecified() && s.tcp_port != 0)
+            .map(|s| (s.ip, s.tcp_port, s.udp_port))
+            .collect()
+    }
+
     /// Mark a source as waiting for Low-ID callback via server.
     pub fn set_wait_callback(&mut self, ip: Ipv4Addr, port: u16, user_hash: Option<[u8; 16]>) {
         if let Some(s) = self.find_mut(ip, port, user_hash) {

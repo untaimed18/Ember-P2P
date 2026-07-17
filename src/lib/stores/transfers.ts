@@ -542,6 +542,8 @@ export async function initTransferStore() {
             // nothing else would clear it).
             if ((narrowed === 'paused' || narrowed === 'stopped') && updated.status === narrowed) {
               updated.speed = 0;
+              updated.active_sources = 0;
+              updated.queued_sources = 0;
             }
             // Clear stale failure_* once the transfer leaves Failed / resumes
             // into a live or reversible state without new failure fields.
@@ -674,17 +676,6 @@ export async function initTransferStore() {
               queued_sources: preserveLive ? t.queued_sources : queued_sources,
             };
           })
-        );
-      },
-    );
-    await safeListen<{ transfer_id: string; queue_rank?: number }>(
-      'transfer-source-detail',
-      (event) => {
-        const { transfer_id, queue_rank } = event.payload;
-        if (queue_rank === undefined || queue_rank === null) return;
-        // Sub-row update (per-source queue rank) — must not defer the poll.
-        transfers.update((list) =>
-          list.map((t) => (t.id === transfer_id ? { ...t, queue_rank } : t))
         );
       },
     );
@@ -986,8 +977,18 @@ export function startTransferPoll() {
               failure_kind: eventItem.failure_kind ?? apiItem.failure_kind,
               failure_stage: eventItem.failure_stage ?? apiItem.failure_stage,
               sources: apiItem.sources ?? eventItem.sources ?? 0,
-              active_sources: preserveFreshEventCounts ? eventActive : apiActive,
-              queued_sources: preserveFreshEventCounts ? eventQueued : apiQueued,
+              active_sources:
+                status === 'paused' || status === 'stopped'
+                  ? 0
+                  : preserveFreshEventCounts
+                    ? eventActive
+                    : apiActive,
+              queued_sources:
+                status === 'paused' || status === 'stopped'
+                  ? 0
+                  : preserveFreshEventCounts
+                    ? eventQueued
+                    : apiQueued,
             };
           })
           .map(snapCompletedDownload);

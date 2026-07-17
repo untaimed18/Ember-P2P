@@ -260,12 +260,15 @@
       const d = event.payload;
       if (d.transfer_id !== expandedTransferId) return;
       const idx = expandedSources.findIndex((s) => s.ip === d.ip && s.port === d.port);
-      // D28: if the backend now reports a terminal status for this source,
-      // drop it from the visible list rather than accumulating dead rows
-      // that stay until the user collapses and re-opens the drawer.
-      // `duplicate` is a transient wire status not modeled on SourceInfo.
-      const isDead = d.status === 'failed' || d.status === 'duplicate';
-      const status = d.status as SourceInfo['status'];
+      // Permanent rejects / duplicates are dropped. Pause-offline `failed`
+      // rows are kept so the drawer still shows who was known.
+      const isDuplicate = d.status === 'duplicate';
+      const rawStatus = d.status === 'wait_callback_kad' ? 'wait_callback' : d.status;
+      const status = rawStatus as SourceInfo['status'];
+      const transferPaused =
+        activeDownloads.find((t) => t.id === d.transfer_id)?.status === 'paused';
+      const isDead =
+        isDuplicate || (d.status === 'failed' && !transferPaused);
       if (idx >= 0) {
         if (isDead) {
           expandedSources = expandedSources.filter((_, i) => i !== idx);
@@ -330,13 +333,9 @@
         searchStatus.set(d.transfer_id, msg);
         searchStatus = new Map(searchStatus);
       }
-      if (
-        d.transfer_id === expandedTransferId &&
-        count > 0 &&
-        (d.kind === 'server_found' || d.kind === 'udp_found' || d.kind === 'kad_found' || d.kind === 'kad_indirect')
-      ) {
-        refreshExpandedSourceDetails(d.transfer_id);
-      }
+      // Do not refresh the drawer on early found events — TCP/UDP paths
+      // emit `transfer:sources-updated` after rows are written; refreshing
+      // here races and can wipe the list with an empty snapshot.
     }).then((u) => { if (mounted) searchUnsubs.push(u); else u(); }).catch((e) => { console.error('Failed to subscribe to transfer:source-search:', e); });
 
     // Reliable post-write refresh: the backend emits this AFTER it has
@@ -489,34 +488,25 @@
   }
 
   async function refreshExpandedSourceDetails(transferId: string) {
-    const requestId = sourceDetailRequestId;
-    // Same "did a push event land during the await" detection as
-    // `toggleSourceDetail` above, and for the same reason: `expandedSources`
-    // is reassigned on every mutating update from the `transfer-source-detail`
-    // handler, so identity inequality after the await reliably means a push
-    // arrived mid-fetch.
+    // Bump per call so overlapping refreshes ignore older empty responses.
+    const requestId = ++sourceDetailRequestId;
     const preFetchSources = expandedSources;
     try {
       const sources = await getTransferSources(transferId);
       if (expandedTransferId !== transferId || requestId !== sourceDetailRequestId) return;
       if (expandedSources === preFetchSources) {
-        // Nothing changed during the fetch — the backend just finished
-        // writing this transfer's source list (that's what triggers this
-        // refresh), so the snapshot is authoritative for both membership
-        // and fields. Replace outright. The previous union-by-key merge
-        // here never dropped peers the backend removed (zombie rows lingered
-        // in the drawer indefinitely) and let a stale existing row shadow
-        // the fresh snapshot's value on any key collision.
-        expandedSources = sources;
+        // Prefer non-empty snapshots: an empty API race must not wipe
+        // live push-fed rows while discovery is still writing.
+        if (sources.length > 0 || preFetchSources.length === 0) {
+          expandedSources = sources;
+        }
       } else {
-        // A push landed mid-fetch and is strictly newer than the snapshot
-        // for whichever row(s) it touched. Same precedence as
-        // `toggleSourceDetail`: push rows win on collision. The snapshot
-        // still governs membership, so a peer the backend has since
-        // dropped is not resurrected just because a push happened to touch
-        // it moments earlier.
         const liveByKey = new Map<string, SourceInfo>();
         for (const s of expandedSources) liveByKey.set(`${s.ip}:${s.port}`, s);
+        if (sources.length === 0) {
+          // Keep push-fed rows when the snapshot is still empty.
+          return;
+        }
         expandedSources = sources.map((s) => liveByKey.get(`${s.ip}:${s.port}`) ?? s);
       }
     } catch {
@@ -2461,11 +2451,14 @@
   }
 
   function sourcesTooltip(t: Transfer): string {
-    if (!t.sources) return m.transfers_sources_tooltip_none();
+    const active = t.active_sources || 0;
+    const queued = t.queued_sources || 0;
+    const current = active + queued;
+    if (!t.sources && current === 0) return m.transfers_sources_tooltip_none();
     const parts: string[] = [];
-    parts.push(m.transfers_sources_tooltip_active({ count: t.active_sources || 0 }));
-    parts.push(m.transfers_sources_tooltip_queued({ count: t.queued_sources || 0 }));
-    parts.push(m.transfers_sources_tooltip_total({ count: t.sources }));
+    parts.push(m.transfers_sources_tooltip_active({ count: active }));
+    parts.push(m.transfers_sources_tooltip_queued({ count: queued }));
+    parts.push(m.transfers_sources_tooltip_total({ count: t.sources || current }));
     if (t.ember_sources > 0) parts.push(m.transfers_sources_tooltip_ember({ count: t.ember_sources }));
     if (t.a4af_sources > 0) parts.push(m.transfers_sources_tooltip_a4af({ count: t.a4af_sources }));
     if (t.max_sources > 0) parts.push(m.transfers_sources_tooltip_max({ count: t.max_sources }));
@@ -2493,31 +2486,34 @@
     }
   });
 
-  // When the currently-expanded transfer is paused or stopped, the
-  // backend has torn down every peer connection for it — the
-  // accumulated `expandedSources` list no longer reflects live state
-  // (the rows that show Queued / Transferring would falsely imply
-  // live peers on a paused download). Clear the panel so it matches
-  // backend reality; on resume it will repopulate naturally from
-  // the next `transfer-source-detail` push events.
+  // When the currently-expanded transfer is stopped, clear the panel
+  // (backend removes source_details). On pause, refresh once from the API so
+  // offline (Failed) rows kept by the backend remain visible.
+  let pauseSourceRefreshKey = '';
   $effect(() => {
-    if (!expandedTransferId) return;
+    if (!expandedTransferId) {
+      pauseSourceRefreshKey = '';
+      return;
+    }
     const t = activeDownloads.find((x) => x.id === expandedTransferId);
     if (!t) return;
-    if (t.status === 'paused' || t.status === 'stopped') {
-      // Mutate inside `untrack`. `sourceDetailRequestId += 1` *reads* the
-      // counter, and a tracked read of state this effect also writes would
-      // subscribe the effect to its own write — so it re-runs itself. Because
-      // the guard above (status still paused/stopped) never flips, it re-ran
-      // forever, freezing the UI the instant the source panel of a stopped/
-      // paused download was opened (e.g. stop a download, then double-click
-      // it). The bump still invalidates any in-flight getTransferSources fetch
-      // so a late response can't repopulate the list we just cleared.
+    if (t.status === 'stopped') {
+      pauseSourceRefreshKey = '';
       untrack(() => {
         expandedSources = [];
         sourceDetailRequestId += 1;
         loadingSources = false;
       });
+    } else if (t.status === 'paused') {
+      const key = `${expandedTransferId}:paused`;
+      if (pauseSourceRefreshKey === key) return;
+      pauseSourceRefreshKey = key;
+      const tid = expandedTransferId;
+      untrack(() => {
+        void refreshExpandedSourceDetails(tid);
+      });
+    } else {
+      pauseSourceRefreshKey = '';
     }
   });
 
@@ -2891,7 +2887,10 @@
                   </td>
                 </tr>
               {:else}
-                {@const visibleSources = sortSourcesByPriority(expandedSources.filter(s => s.status !== 'failed'))}
+                {@const transferPaused = t.status === 'paused'}
+                {@const visibleSources = sortSourcesByPriority(
+                  expandedSources.filter((s) => transferPaused || s.status !== 'failed'),
+                )}
                 {@const failedCount = expandedSources.length - visibleSources.length}
                 {@const xferCount = visibleSources.filter(s => s.status === 'transferring').length}
                 {@const queuedCount = visibleSources.filter(s => s.status === 'queued').length}
@@ -3695,7 +3694,11 @@
           </thead>
           <tbody>
             {#if expandedSources.length > 0 && expandedTransferId}
-              {@const clientSources = sortSourcesByPriority(expandedSources.filter(s => s.status !== 'failed'))}
+              {@const clientParent = allDownloads.find((d) => d.id === expandedTransferId)}
+              {@const clientPaused = clientParent?.status === 'paused'}
+              {@const clientSources = sortSourcesByPriority(
+                expandedSources.filter((s) => clientPaused || s.status !== 'failed'),
+              )}
               {#each clientSources as src (src.ip + ':' + src.port)}
                 <tr class="client-row">
                   {#each visibleClientColumns as column (column.key)}
