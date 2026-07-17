@@ -3423,6 +3423,11 @@ fn priority_str_to_u32(s: &str) -> u32 {
 
 const DISK_SPACE_BUFFER: u64 = 50 * 1024 * 1024; // 50 MB safety margin
 
+/// Bytes still needed on disk for a download (full size minus already written).
+fn remaining_download_bytes(file_size: u64, completed: u64) -> u64 {
+    file_size.saturating_sub(completed)
+}
+
 fn check_disk_space(download_dir: &std::path::Path, needed_bytes: u64) -> bool {
     match fs2::available_space(download_dir) {
         Ok(available) => {
@@ -3440,11 +3445,13 @@ fn check_disk_space(download_dir: &std::path::Path, needed_bytes: u64) -> bool {
             }
         }
         Err(e) => {
-            debug!(
-                "Could not check disk space on {}: {e}",
+            // Fail closed: an unreadable download volume must not silently
+            // admit starts that then ENOSPC mid-write.
+            warn!(
+                "Could not check disk space on {}: {e}; treating as insufficient",
                 download_dir.display()
             );
-            true
+            false
         }
     }
 }
@@ -5515,16 +5522,23 @@ async fn try_start_pending_download_from_known_sources(
         }
     }
 
-    // Only start transfers that are in the active set. Downloads still in
-    // the queue participate in source discovery (they live in
-    // pending_downloads) but must wait for promotion before connecting.
+    // Only start transfers that are actively waiting for sources / slots.
+    // Queued rows discover sources but must wait for promotion. Paused /
+    // Stopped / Insufficient / terminal must never dial from a stale pending.
     {
         let mgr = transfer_manager.read().await;
-        let is_active = mgr
+        let allowed = mgr
             .get_transfer(transfer_id)
-            .map(|t| !matches!(t.status, TransferStatus::Queued))
+            .map(|t| {
+                matches!(
+                    t.status,
+                    TransferStatus::Searching
+                        | TransferStatus::Active
+                        | TransferStatus::Hashing
+                )
+            })
             .unwrap_or(false);
-        if !is_active {
+        if !allowed {
             return false;
         }
     }
@@ -8574,6 +8588,9 @@ pub async fn start_network(
                     }
                 }
                 if !offer_files.is_empty() {
+                    // Fresh offer drain replaces the offered-hash set so
+                    // removed shares do not keep a stale "offered" badge.
+                    state.offered_ed2k_hashes.clear();
                     pending_offer_signature = Some(offer_files_signature(&offer_files));
                     pending_offer_files = Some(offer_files);
                 }
@@ -9507,9 +9524,9 @@ pub async fn start_network(
                         // resumable Insufficient state as Failed.
                         continue;
                     } else {
-                    let is_terminal_final_hash_failure = *failure_kind == SourceFailureKind::Permanent
-                        && error.to_lowercase().contains("final hash verification failed");
-                    if !is_user_cancel && !is_terminal_final_hash_failure {
+                    // Re-queue all non-cancel failures (including final-hash
+                    // mismatch after part reopen) so recovery can continue.
+                    if !is_user_cancel {
                         let transfer_info = {
                             let mgr = transfer_manager.read().await;
                             mgr.get_transfer(transfer_id).cloned()
@@ -16325,6 +16342,22 @@ pub async fn start_network(
                             }
                             continue;
                         }
+                        // Stop/Pause/Insufficient already cancelled the control
+                        // and removed it from the manager. Prefer those statuses
+                        // over rewriting the row as Failed ("Cancelled").
+                        let skip_fail = {
+                            let mgr = transfer_manager.read().await;
+                            mgr.get_transfer(tid)
+                                .map(|t| {
+                                    matches!(
+                                        t.status,
+                                        TransferStatus::Stopped
+                                            | TransferStatus::Paused
+                                            | TransferStatus::Insufficient
+                                    )
+                                })
+                                .unwrap_or(false)
+                        };
                         if let Some(_pending) = state.pending_downloads.remove(tid) {
                             let stale_sids: Vec<SearchId> = state.download_source_searches.iter()
                                 .filter(|(_, (t, _))| t == tid)
@@ -16335,6 +16368,10 @@ pub async fn start_network(
                                 if let Some(removed) = state.search_manager.remove(sid) {
                                     state.routing_table.release_contacts_in_use(&removed.in_use_ids);
                                 }
+                            }
+
+                            if skip_fail {
+                                continue;
                             }
 
                             {
@@ -16384,7 +16421,14 @@ pub async fn start_network(
                     if pd.control.is_cancelled() || pd.control.is_paused() {
                         continue;
                     }
-                    if !check_disk_space(&dl_dir, pd.file_size) {
+                    let completed = {
+                        let mgr = transfer_manager.read().await;
+                        mgr.get_transfer(tid)
+                            .map(|t| t.transferred.max(t.completed_size))
+                            .unwrap_or(0)
+                    };
+                    let needed = remaining_download_bytes(pd.file_size, completed);
+                    if !check_disk_space(&dl_dir, needed) {
                         debug!("Skipping source retry for {} ({}): insufficient disk space", tid, pd.file_name);
                         insufficient_downloads.push((tid.clone(), pd.file_name.clone()));
                         continue;
@@ -16522,7 +16566,14 @@ pub async fn start_network(
                             continue;
                         }
                         let dl_dir = PathBuf::from(&settings.download_folder);
-                        if !check_disk_space(&dl_dir, pending.file_size) {
+                        let completed = {
+                            let mgr = transfer_manager.read().await;
+                            mgr.get_transfer(tid)
+                                .map(|t| t.transferred.max(t.completed_size))
+                                .unwrap_or(0)
+                        };
+                        let needed = remaining_download_bytes(pending.file_size, completed);
+                        if !check_disk_space(&dl_dir, needed) {
                             warn!("Skipping download {} ({}): insufficient disk space", tid, pending.file_name);
                             mark_download_insufficient(
                                 &transfer_manager,
@@ -16682,7 +16733,14 @@ pub async fn start_network(
                             continue;
                         }
                         let dl_dir = PathBuf::from(&settings.download_folder);
-                        if !check_disk_space(&dl_dir, pending.file_size) {
+                        let completed = {
+                            let mgr = transfer_manager.read().await;
+                            mgr.get_transfer(tid)
+                                .map(|t| t.transferred.max(t.completed_size))
+                                .unwrap_or(0)
+                        };
+                        let needed = remaining_download_bytes(pending.file_size, completed);
+                        if !check_disk_space(&dl_dir, needed) {
                             warn!("Skipping download {} ({}): insufficient disk space", tid, pending.file_name);
                             mark_download_insufficient(
                                 &transfer_manager,
@@ -19742,6 +19800,9 @@ pub async fn start_network(
                                     "Queuing {} files to offer to server (chunked)",
                                     offer_files.len()
                                 );
+                                // Fresh login offer replaces prior offered
+                                // hashes so badges match the current share set.
+                                state.offered_ed2k_hashes.clear();
                                 pending_offer_signature = Some(offer_files_signature(&offer_files));
                                 pending_offer_files = Some(offer_files);
                             }
@@ -28555,13 +28616,34 @@ async fn handle_command_inner(
                 };
                 if download_sources.is_empty() {
                     warn!(
-                        "StartDownload {transfer_id}: no admissible sources after filter/ban checks"
+                        "StartDownload {transfer_id}: no admissible sources after filter/ban checks — \
+                         queueing pending discovery without spawning a worker"
                     );
-                    // Keep going through the no-source / searching path
-                    // below by treating this as has_source=false would —
-                    // fall through is awkward inside this branch, so
-                    // queue as pending discovery instead.
-                }
+                    let pending_priority = {
+                        let mgr = transfer_manager.read().await;
+                        mgr.get_transfer(&transfer_id)
+                            .map(|t| priority_str_to_u32(&t.priority))
+                            .unwrap_or(1)
+                    };
+                    {
+                        let mut mgr = transfer_manager.write().await;
+                        mgr.update_status(&transfer_id, TransferStatus::Searching);
+                        mgr.register_control(&transfer_id, control.clone());
+                    }
+                    state.pending_downloads.insert(
+                        transfer_id.clone(),
+                        PendingDownload {
+                            transfer_id: transfer_id.clone(),
+                            file_hash: file_hash.clone(),
+                            file_name: file_name.clone(),
+                            file_size,
+                            control,
+                            search_count: 0,
+                            last_search_at: 0,
+                            priority: pending_priority,
+                        },
+                    );
+                } else {
                 if !validated_extras.is_empty() {
                     info!(
                         "Seeded multi-source download {} with primary {}:{} + {} extra source(s)",
@@ -28648,6 +28730,7 @@ async fn handle_command_inner(
                     }
                 });
                 state.download_handles.insert(tid2, handle);
+                } // end non-empty sources spawn
 
                 // ─── Source-discovery fan-out for new downloads ──────────────
                 //

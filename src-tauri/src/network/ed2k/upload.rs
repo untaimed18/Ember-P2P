@@ -922,12 +922,31 @@ pub struct UploadEvent {
     pub kind: UploadEventKind,
 }
 
+/// Unique bytes delivered this session from the per-part served tally
+/// (re-requests do not inflate past each part's size).
+fn unique_served_bytes(served: &[u64], total_size: u64) -> u64 {
+    if total_size == 0 || served.is_empty() {
+        return 0;
+    }
+    let part_count = total_size.div_ceil(PARTSIZE).max(1) as usize;
+    let mut sum = 0u64;
+    for (i, &s) in served.iter().take(part_count).enumerate() {
+        let part_size = if i + 1 < part_count {
+            PARTSIZE
+        } else {
+            total_size.saturating_sub((part_count as u64 - 1) * PARTSIZE)
+        };
+        sum = sum.saturating_add(s.min(part_size));
+    }
+    sum
+}
+
 /// Terminal upload kind for a session that moved at least one byte.
-/// Statistics "Completed Uploads" only increments when the peer received
-/// the entire file (`uploaded >= total_size`).
-fn upload_session_completed(uploaded: u64, total_size: u64) -> UploadEventKind {
+/// Statistics "Completed Uploads" only increments when unique coverage
+/// reached the full file (not cumulative wire bytes, which re-requests inflate).
+fn upload_session_completed(unique_uploaded: u64, total_size: u64) -> UploadEventKind {
     UploadEventKind::Completed {
-        full_file: total_size > 0 && uploaded >= total_size,
+        full_file: total_size > 0 && unique_uploaded >= total_size,
     }
 }
 
@@ -2391,6 +2410,15 @@ pub async fn start_upload_server(
                 let peer_addr = req.peer_addr;
                 let peer_ip = peer_addr.ip();
 
+                // Same gate as inbound TCP accept: reject new upload sessions
+                // while the network is disconnected (eMule behavior).
+                if server.network_disconnected.load(std::sync::atomic::Ordering::Relaxed) {
+                    debug!(
+                        "Rejecting punch/relay-adopted stream from {peer_addr}: network disconnected"
+                    );
+                    continue;
+                }
+
                 if let std::net::IpAddr::V4(peer_ipv4) = peer_ip {
                     // Unspecified (0.0.0.0) is the relay-placeholder case —
                     // skip filter/ban because the true peer IP is hidden.
@@ -3206,8 +3234,8 @@ impl UploadHandler {
         self.push_grant_in_flight.lock().await.remove(&identity);
 
         let accepted = grant_accepted.load(std::sync::atomic::Ordering::Relaxed);
-        if accepted || result.is_ok() {
-            // Granted (or session completed cleanly): drop waiting-list seniority.
+        if accepted {
+            // Granted: drop waiting-list seniority.
             let mut queue = self.upload_queue.lock().await;
             queue.retain(|e| e.identity != identity);
         } else if let Err(e) = result {
@@ -3219,6 +3247,7 @@ impl UploadHandler {
                     + std::time::Duration::from_secs(PUSH_GRANT_BACKOFF_SECS),
             );
         }
+        // Soft Ok(()) before grant (ban / AntiLeech / etc.) keeps seniority.
     }
 
     /// Dial `peer_addr` and serve it as an upload peer — the LowID callback
@@ -5109,6 +5138,7 @@ impl UploadHandler {
                                         // Slot already reserved atomically above.
                                         queued_identity = None;
                                         uploaded = 0;
+                                        served_bytes_per_part.clear();
                                         queue_wait_at_grant = queue_join_time.elapsed().as_secs();
                                         session_start = Some(std::time::Instant::now());
                                         rate_tracker = SessionRateTracker::new();
@@ -5410,7 +5440,10 @@ impl UploadHandler {
                             if prev != hash {
                                 if let Some(tid) = transfer_id.take() {
                                     let kind = if uploaded > 0 {
-                                        upload_session_completed(uploaded, total_size)
+                                        upload_session_completed(
+                                            unique_served_bytes(&served_bytes_per_part, total_size),
+                                            total_size,
+                                        )
                                     } else {
                                         UploadEventKind::Failed {
                                             error: "Peer switched files before any data was sent".to_string(),
@@ -5421,6 +5454,7 @@ impl UploadHandler {
                                         kind,
                                     }).await;
                                     uploaded = 0;
+                                    served_bytes_per_part.clear();
                                 }
                             }
                         }
@@ -6090,6 +6124,7 @@ impl UploadHandler {
                     // Slot already reserved atomically via `try_activate` above.
                     queued_identity = None;
                     uploaded = 0;
+                    served_bytes_per_part.clear();
                     queue_wait_at_grant = queue_join_time.elapsed().as_secs();
                     session_start = Some(std::time::Instant::now());
                     rate_tracker = SessionRateTracker::new();
@@ -6151,7 +6186,10 @@ impl UploadHandler {
                                 if prev != requested {
                                     if let Some(tid) = transfer_id.take() {
                                         let kind = if uploaded > 0 {
-                                            upload_session_completed(uploaded, total_size)
+                                            upload_session_completed(
+                                                unique_served_bytes(&served_bytes_per_part, total_size),
+                                                total_size,
+                                            )
                                         } else {
                                             UploadEventKind::Failed {
                                                 error: "Peer switched files before any data was sent".to_string(),
@@ -6162,6 +6200,7 @@ impl UploadHandler {
                                             kind,
                                         }).await;
                                         uploaded = 0;
+                                        served_bytes_per_part.clear();
                                     }
                                 }
                             }
@@ -6694,7 +6733,7 @@ impl UploadHandler {
                                 part_payload.extend_from_slice(&newsize.to_le_bytes());
                                 part_payload.extend_from_slice(chunk);
 
-                                self.acquire_upload_bandwidth(chunk_len as u64).await;
+                                self.acquire_upload_bandwidth(chunk_len as u64).await?;
                                 let write_start = std::time::Instant::now();
                                 write_packet_async(
                                     &mut writer,
@@ -6830,7 +6869,7 @@ impl UploadHandler {
                             }
                             part_payload.extend_from_slice(chunk);
 
-                            self.acquire_upload_bandwidth(chunk_len as u64).await;
+                            self.acquire_upload_bandwidth(chunk_len as u64).await?;
                             let write_start = std::time::Instant::now();
                             write_packet_async(&mut writer, proto, op, &part_payload).await?;
                             let write_elapsed = write_start.elapsed();
@@ -6997,11 +7036,17 @@ impl UploadHandler {
                     // dropping the per-session row loses no history; a peer
                     // that wants another file just reconnects (cheap, and
                     // exactly how eMule clients pipeline multiple files).
-                    if total_size > 0 && uploaded >= total_size {
+                    // Use unique per-part coverage — cumulative `uploaded`
+                    // counts re-requests after hash/AICH and would end the
+                    // session early while the peer still needs bytes.
+                    let unique_uploaded =
+                        unique_served_bytes(&served_bytes_per_part, total_size);
+                    if total_size > 0 && unique_uploaded >= total_size {
                         info!(
                             target: "ember::upload_diag",
                             "session_end {peer_addr} reason=file_complete \
-                             uploaded={uploaded}B total={total_size}B \
+                             uploaded={uploaded}B unique={unique_uploaded}B \
+                             total={total_size}B \
                              session_age={}s iters={outer_loop_iterations} — \
                              dropping completed upload row",
                             session_open_at.elapsed().as_secs(),
@@ -7144,7 +7189,10 @@ impl UploadHandler {
                             // the UI row is distinguishable from a real transfer.
                             // Statistics only count full-file serves as completed.
                             let kind = if uploaded > 0 {
-                                upload_session_completed(uploaded, total_size)
+                                upload_session_completed(
+                                    unique_served_bytes(&served_bytes_per_part, total_size),
+                                    total_size,
+                                )
                             } else {
                                 UploadEventKind::Failed {
                                     error: "Slot rotated before any data was sent".to_string(),
@@ -7347,7 +7395,10 @@ impl UploadHandler {
                         // the zero-byte row is visibly distinguishable from
                         // a real upload.
                         let kind = if uploaded > 0 {
-                            upload_session_completed(uploaded, total_size)
+                            upload_session_completed(
+                                unique_served_bytes(&served_bytes_per_part, total_size),
+                                total_size,
+                            )
                         } else {
                             UploadEventKind::Failed {
                                 error: "Peer ended transfer before any data was sent".to_string(),
@@ -7361,6 +7412,7 @@ impl UploadHandler {
                     slot_guard.deactivate();
                     transfer_id = None;
                     uploaded = 0;
+                    served_bytes_per_part.clear();
                     session_start = None;
                     self.slot_rates.lock().remove(&peer_addr);
                     rate_tracker = SessionRateTracker::new();
@@ -7508,29 +7560,38 @@ impl UploadHandler {
 
                                 let mut resp = Vec::new();
                                 local_ident.write_identifier(&mut resp);
+                                let md4_section = md4_hashes
+                                    .as_ref()
+                                    .filter(|h| !h.is_empty());
+                                let aich_section = match (aich_root, aich_hashes.as_ref()) {
+                                    (Some(root), Some(hashes)) if !hashes.is_empty() => {
+                                        Some((root, hashes))
+                                    }
+                                    _ => None,
+                                };
                                 let mut resp_options = 0u8;
-                                if let Some(ref hashes) = md4_hashes {
-                                    if !hashes.is_empty() {
-                                        resp_options |= 0x01;
-                                    }
+                                if md4_section.is_some() {
+                                    resp_options |= 0x01;
                                 }
-                                if let (Some(_root), Some(ref hashes)) = (aich_root, aich_hashes.as_ref()) {
-                                    if !hashes.is_empty() {
-                                        resp_options |= 0x02;
-                                    }
+                                if aich_section.is_some() {
+                                    resp_options |= 0x02;
                                 }
                                 resp.push(resp_options);
-                                if let Some(hashes) = md4_hashes {
+                                // Emit body sections iff the matching option bits
+                                // are set — peers parse by options, so an empty
+                                // Some([]) must not write a zero-count MD4 block
+                                // that shifts the AICH section.
+                                if let Some(hashes) = md4_section {
                                     resp.extend_from_slice(&file_ident.md4_hash);
                                     resp.extend_from_slice(&(hashes.len() as u16).to_le_bytes());
-                                    for h in &hashes {
+                                    for h in hashes {
                                         resp.extend_from_slice(h);
                                     }
                                 }
-                                if let (Some(root), Some(hashes)) = (aich_root, aich_hashes) {
+                                if let Some((root, hashes)) = aich_section {
                                     resp.extend_from_slice(&root);
                                     resp.extend_from_slice(&(hashes.len() as u16).to_le_bytes());
-                                    for h in &hashes {
+                                    for h in hashes {
                                         resp.extend_from_slice(h);
                                     }
                                 }
@@ -7591,7 +7652,10 @@ impl UploadHandler {
                                 if prev != mpreq.file_hash {
                                     if let Some(tid) = transfer_id.take() {
                                         let kind = if uploaded > 0 {
-                                            upload_session_completed(uploaded, total_size)
+                                            upload_session_completed(
+                                                unique_served_bytes(&served_bytes_per_part, total_size),
+                                                total_size,
+                                            )
                                         } else {
                                             UploadEventKind::Failed {
                                                 error: "Peer switched files before any data was sent".to_string(),
@@ -7602,6 +7666,7 @@ impl UploadHandler {
                                             kind,
                                         }).await;
                                         uploaded = 0;
+                                        served_bytes_per_part.clear();
                                     }
                                 }
                             }
@@ -8530,7 +8595,10 @@ impl UploadHandler {
                 last_part_request.elapsed().as_secs(),
             );
             let kind = if uploaded > 0 {
-                upload_session_completed(uploaded, total_size)
+                upload_session_completed(
+                    unique_served_bytes(&served_bytes_per_part, total_size),
+                    total_size,
+                )
             } else if let Err(e) = &session_result {
                 UploadEventKind::Failed {
                     error: format!("Session ended: {e}"),
@@ -8564,8 +8632,26 @@ impl UploadHandler {
         session_result
     }
 
-    async fn acquire_upload_bandwidth(&self, bytes: u64) {
-        self.bandwidth_limiter.acquire_upload(bytes).await;
+    /// Acquire upload tokens, aborting promptly if the network disconnects
+    /// while parked in the token bucket (tight limits can otherwise stall
+    /// teardown for many seconds after Disconnect).
+    async fn acquire_upload_bandwidth(&self, bytes: u64) -> anyhow::Result<()> {
+        if self.network_disconnected.load(std::sync::atomic::Ordering::Relaxed) {
+            anyhow::bail!("network disconnected");
+        }
+        tokio::select! {
+            _ = self.bandwidth_limiter.acquire_upload(bytes) => Ok(()),
+            _ = async {
+                loop {
+                    if self.network_disconnected.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            } => {
+                anyhow::bail!("network disconnected");
+            }
+        }
     }
 }
 
