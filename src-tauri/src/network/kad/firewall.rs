@@ -247,7 +247,19 @@ impl FirewallChecker {
 
     /// Record that an ed2k server assigned us LowID — inbound TCP to our
     /// advertised port failed from the server's perspective.
+    ///
+    /// Does **not** overwrite a stronger TCP Open proof from a real
+    /// connect-back (KAD probe or successful server port-test). Callers may
+    /// still set aggregate `firewalled` for LowID; this only protects
+    /// `tcp_status` from being wiped back to Firewalled.
     pub fn note_tcp_firewalled(&mut self) {
+        if self.tcp_status == FirewallStatus::Open && self.tcp_responses_received > 0 {
+            debug!(
+                "TCP firewall: keeping Open despite LowID note ({} connect-back(s) already proved reachability)",
+                self.tcp_responses_received
+            );
+            return;
+        }
         self.tcp_status = FirewallStatus::Firewalled;
         debug!("TCP firewall check: firewalled (server LowID)");
     }
@@ -404,5 +416,31 @@ impl FirewallChecker {
 
     pub fn checks_to_send(&self) -> u32 {
         FIREWALL_CHECK_COUNT
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn note_tcp_firewalled_does_not_wipe_connect_back_open() {
+        let mut fw = FirewallChecker::new();
+        fw.handle_tcp_connect_back();
+        assert_eq!(fw.tcp_status(), FirewallStatus::Open);
+        fw.note_tcp_firewalled();
+        assert_eq!(
+            fw.tcp_status(),
+            FirewallStatus::Open,
+            "LowID sticky must not erase proven TCP Open"
+        );
+    }
+
+    #[test]
+    fn note_tcp_firewalled_sets_firewalled_without_prior_proof() {
+        let mut fw = FirewallChecker::new();
+        assert_eq!(fw.tcp_status(), FirewallStatus::Unknown);
+        fw.note_tcp_firewalled();
+        assert_eq!(fw.tcp_status(), FirewallStatus::Firewalled);
     }
 }

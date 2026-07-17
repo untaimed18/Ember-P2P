@@ -245,12 +245,24 @@ impl CorruptionBlackBox {
 
     /// Evaluates corruption within [part_start, part_end). Returns a list of IPs
     /// that should be banned based on their corruption ratio across the entire file.
+    ///
+    /// When more than one IP contributed unverified bytes to the failed part,
+    /// this is a no-op: we cannot attribute which contributor's bytes were bad
+    /// from part-level MD4 alone, so marking every overlapping block corrupt
+    /// would poison honest multi-source peers toward a false ban. AICH
+    /// narrowing (or a later single-contributor failure) is required before
+    /// corrupt bytes count toward the ban ratio.
     pub fn corrupted_part(
         &mut self,
         file_hash: &[u8; 16],
         part_start: u64,
         part_end: u64,
     ) -> Vec<Ipv4Addr> {
+        let contributors = self.corrupted_part_contributors(file_hash, part_start, part_end);
+        if contributors.len() != 1 {
+            return Vec::new();
+        }
+
         if let Some(blocks) = self.records.get_mut(file_hash) {
             for block in blocks.iter_mut() {
                 if !block.verified && block.start < part_end && block.end > part_start {
@@ -475,6 +487,27 @@ mod tests {
         let contributors = bb.corrupted_part_contributors(&h, 0, 1000);
         assert_eq!(contributors.len(), 1);
         assert!(contributors.contains(&solo));
+    }
+
+    #[test]
+    fn multi_source_corrupt_part_does_not_ban_or_mark() {
+        // Ambiguous multi-contributor part failures must not poison every
+        // overlapping IP toward the corruption-ratio ban.
+        let mut bb = CorruptionBlackBox::new();
+        let h = hash(12);
+        let a = ip(10, 0, 0, 1);
+        let b = ip(10, 0, 0, 2);
+        bb.record_data(h, 0, MIN_BYTES_FOR_BAN_DECISION, a);
+        bb.record_data(
+            h,
+            MIN_BYTES_FOR_BAN_DECISION,
+            MIN_BYTES_FOR_BAN_DECISION * 2,
+            b,
+        );
+        let banned = bb.corrupted_part(&h, 0, MIN_BYTES_FOR_BAN_DECISION * 2);
+        assert!(banned.is_empty());
+        let blocks = bb.records.get(&h).unwrap();
+        assert!(blocks.iter().all(|blk| !blk.corrupt));
     }
 
     #[test]

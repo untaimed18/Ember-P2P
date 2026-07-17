@@ -6908,6 +6908,16 @@ async fn download_parts_from_source(
                             consecutive_bad_blocks += 1;
                             tracing::debug!("Invalid block offsets from source {_src_idx}: start={start}, end={end}, data={} (bad streak: {consecutive_bad_blocks})", data.len());
                             if consecutive_bad_blocks >= MAX_CONSECUTIVE_BAD_BLOCKS {
+                                if let (Some(etx), std::net::IpAddr::V4(v4)) =
+                                    (event_tx.as_ref(), addr.ip())
+                                {
+                                    let _ = etx
+                                        .send(DownloadEvent::ProtocolViolation {
+                                            sender_ip: v4,
+                                            sender_user_hash: Some(peer_user_hash),
+                                        })
+                                        .await;
+                                }
                                 anyhow::bail!("source {_src_idx} sent {consecutive_bad_blocks} consecutive invalid blocks, disconnecting");
                             }
                             continue;
@@ -6926,6 +6936,16 @@ async fn download_parts_from_source(
                             "source {_src_idx} sent undersized block ({piece_len} bytes); treating as abusive"
                         );
                             if consecutive_bad_blocks >= MAX_CONSECUTIVE_BAD_BLOCKS {
+                                if let (Some(etx), std::net::IpAddr::V4(v4)) =
+                                    (event_tx.as_ref(), addr.ip())
+                                {
+                                    let _ = etx
+                                        .send(DownloadEvent::ProtocolViolation {
+                                            sender_ip: v4,
+                                            sender_user_hash: Some(peer_user_hash),
+                                        })
+                                        .await;
+                                }
                                 anyhow::bail!("source {_src_idx} sent {consecutive_bad_blocks} consecutive invalid blocks, disconnecting");
                             }
                             continue;
@@ -7109,6 +7129,16 @@ async fn download_parts_from_source(
                             consecutive_bad_blocks += 1;
                             tracing::debug!("Compressed block exceeds file size from source {_src_idx} (bad streak: {consecutive_bad_blocks})");
                             if consecutive_bad_blocks >= MAX_CONSECUTIVE_BAD_BLOCKS {
+                                if let (Some(etx), std::net::IpAddr::V4(v4)) =
+                                    (event_tx.as_ref(), addr.ip())
+                                {
+                                    let _ = etx
+                                        .send(DownloadEvent::ProtocolViolation {
+                                            sender_ip: v4,
+                                            sender_user_hash: Some(peer_user_hash),
+                                        })
+                                        .await;
+                                }
                                 anyhow::bail!("source {_src_idx} sent {consecutive_bad_blocks} consecutive invalid blocks, disconnecting");
                             }
                             continue;

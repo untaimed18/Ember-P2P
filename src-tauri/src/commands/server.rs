@@ -6,6 +6,58 @@ use tracing::info;
 
 const MAX_SERVER_NAME_LEN: usize = 256;
 
+/// Default community server.met used on first launch and as the Servers-page
+/// suggested URL. Same host as nodes.dat / ipfilter bootstrap assets.
+pub const DEFAULT_SERVER_MET_URL: &str = "https://upd.emule-security.org/server.met";
+
+/// Download and optionally gunzip a server.met from `url` (HTTPS + DNS-pinned).
+/// Shared by the Tauri command and network-task first-launch bootstrap.
+pub async fn fetch_server_met_bytes(url: &str) -> Result<Vec<u8>, String> {
+    const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+    let response = crate::security::fetch_pinned_get(url)
+        .await
+        .map_err(|e| coded_ctx("http_request_failed", "HTTP request failed", e))?
+        .error_for_status()
+        .map_err(|e| coded_ctx("http_error", "HTTP error", e))?;
+    if let Some(cl) = response.content_length() {
+        if cl > MAX_RESPONSE_BYTES as u64 {
+            return Err(coded(
+                "response_too_large",
+                "Response too large (Content-Length exceeds limit)",
+            ));
+        }
+    }
+
+    let bytes = {
+        use futures::StreamExt;
+        let mut body = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk =
+                chunk.map_err(|e| coded_ctx("response_read_failed", "Failed to read response", e))?;
+            body.extend_from_slice(&chunk);
+            if body.len() > MAX_RESPONSE_BYTES {
+                return Err(coded("response_too_large", "Response too large"));
+            }
+        }
+        body
+    };
+
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        use std::io::Read;
+        const MAX_DECOMPRESSED: u64 = 50 * 1024 * 1024;
+        let decoder = flate2::read::GzDecoder::new(&bytes[..]);
+        let mut limited = decoder.take(MAX_DECOMPRESSED);
+        let mut decompressed = Vec::new();
+        limited
+            .read_to_end(&mut decompressed)
+            .map_err(|e| coded_ctx("gzip_decompress_failed", "Failed to decompress gzip", e))?;
+        Ok(decompressed)
+    } else {
+        Ok(bytes)
+    }
+}
+
 async fn resolve_server_host(input: &str, port: u16) -> Result<String, String> {
     if let Ok(ip) = input.parse::<std::net::Ipv4Addr>() {
         if crate::security::is_special_use_v4(ip) {
@@ -170,49 +222,7 @@ pub async fn download_server_met(
 ) -> Result<String, String> {
     info!("Downloading server.met");
 
-    const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
-    let response = crate::security::fetch_pinned_get(&url)
-        .await
-        .map_err(|e| coded_ctx("http_request_failed", "HTTP request failed", e))?
-        .error_for_status()
-        .map_err(|e| coded_ctx("http_error", "HTTP error", e))?;
-    if let Some(cl) = response.content_length() {
-        if cl > MAX_RESPONSE_BYTES as u64 {
-            return Err(coded(
-                "response_too_large",
-                "Response too large (Content-Length exceeds limit)",
-            ));
-        }
-    }
-
-    let bytes = {
-        use futures::StreamExt;
-        let mut body = Vec::new();
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk
-                .map_err(|e| coded_ctx("response_read_failed", "Failed to read response", e))?;
-            body.extend_from_slice(&chunk);
-            if body.len() > MAX_RESPONSE_BYTES {
-                return Err(coded("response_too_large", "Response too large"));
-            }
-        }
-        body
-    };
-
-    let data = if bytes.starts_with(&[0x1f, 0x8b]) {
-        use std::io::Read;
-        const MAX_DECOMPRESSED: u64 = 50 * 1024 * 1024;
-        let decoder = flate2::read::GzDecoder::new(&bytes[..]);
-        let mut limited = decoder.take(MAX_DECOMPRESSED);
-        let mut decompressed = Vec::new();
-        limited
-            .read_to_end(&mut decompressed)
-            .map_err(|e| coded_ctx("gzip_decompress_failed", "Failed to decompress gzip", e))?;
-        decompressed
-    } else {
-        bytes.to_vec()
-    };
+    let data = fetch_server_met_bytes(&url).await?;
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     state

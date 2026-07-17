@@ -90,6 +90,28 @@ impl KnownFileList {
         }
     }
 
+    /// Merge records from a freshly loaded catalog. Existing in-memory
+    /// entries win on hash collision so a concurrent share-scan that ran
+    /// before disk load finished is not clobbered by stale known.met data.
+    pub fn absorb_missing_from(&mut self, other: Self) {
+        for (hash, record) in other.files {
+            if let std::collections::hash_map::Entry::Vacant(e) = self.files.entry(hash) {
+                if !record.file_path.is_empty() {
+                    self.path_index
+                        .insert(normalize_path_key(&record.file_path), hash);
+                }
+                e.insert(record);
+            }
+        }
+        // Path index entries for hashes we already had stay as-is; disk-only
+        // path mappings for absorbed hashes are already inserted above.
+        for (path_key, hash) in other.path_index {
+            if self.files.contains_key(&hash) && !self.path_index.contains_key(&path_key) {
+                self.path_index.insert(path_key, hash);
+            }
+        }
+    }
+
     pub fn load(path: &Path) -> Self {
         let mut list = Self::new();
         if !path.exists() {
