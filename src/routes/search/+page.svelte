@@ -1006,10 +1006,15 @@
       minAvailability: parsedMinAvail !== undefined && Number.isFinite(parsedMinAvail) && parsedMinAvail >= 0 ? parsedMinAvail : undefined,
     };
     if (!q && !hasSearchFilters(searchFilterSnapshot, searchFileType || undefined)) return;
-    // An eD2k search needs either the KAD DHT or a connected server. With
-    // neither, the request would only time out, so prompt the user to connect
-    // first instead of opening a doomed search tab.
-    if ($networkStats.status !== 'connected' && $serverStatus !== 'connected') {
+    // Gate by the selected search method — KAD-only needs KAD, server-only
+    // needs the eD2K server, global needs either.
+    const kadUp = $networkStats.status === 'connected';
+    const serverUp = $serverStatus === 'connected';
+    const methodAllowed =
+      method === 'kad' ? kadUp :
+      method === 'server' ? serverUp :
+      kadUp || serverUp;
+    if (!methodAllowed) {
       networkAlertOpen = true;
       return;
     }
@@ -1966,7 +1971,9 @@
 </div>
 
 <div class="page-content">
-  {#if $networkStats.status === 'disconnected'}
+  {#if (searchMethod === 'kad' && $networkStats.status === 'disconnected')
+    || (searchMethod === 'server' && $serverStatus === 'disconnected')
+    || (searchMethod === 'global' && $networkStats.status === 'disconnected' && $serverStatus === 'disconnected')}
     <div class="search-readiness-hint" role="status">
       {m.search_network_disconnected_hint()}
     </div>

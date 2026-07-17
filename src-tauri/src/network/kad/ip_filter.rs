@@ -92,6 +92,43 @@ impl IpFilterSnapshot {
         }
         false
     }
+
+    /// KAD UDP / routing-table admission while `ipfilter.dat` may still be
+    /// loading. Unlike [`Self::is_blocked`], does **not** fail-closed when
+    /// `!ranges_ready` — that window would blackhole bootstrap replies and
+    /// reject every RT insert. Bogus/private rules still apply; once ranges
+    /// are ready, range matches apply. After load, `evict_filtered_contacts`
+    /// removes any contacts that should have been blocked.
+    pub fn is_blocked_for_kad(&self, ip: Ipv4Addr) -> bool {
+        if crate::security::is_bogus_v4(ip) {
+            self.special_hit_counter.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        if self.block_private && crate::security::is_lan_or_cgnat_v4(ip) {
+            self.special_hit_counter.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        if self.enabled && self.ranges_ready {
+            let ip_u32 = u32::from(ip);
+            if self
+                .ranges
+                .binary_search_by(|&(start, end)| {
+                    if ip_u32 < start {
+                        std::cmp::Ordering::Greater
+                    } else if ip_u32 > end {
+                        std::cmp::Ordering::Less
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
+                .is_ok()
+            {
+                self.hit_counter.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
+        false
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -358,6 +395,39 @@ impl IpFilter {
             return true;
         }
         if self.enabled {
+            let ip_u32 = u32::from(ip);
+            if self
+                .blocked_ranges
+                .binary_search_by(|range| {
+                    if ip_u32 < range.start {
+                        std::cmp::Ordering::Greater
+                    } else if ip_u32 > range.end {
+                        std::cmp::Ordering::Less
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
+                .is_ok()
+            {
+                self.total_range_hits.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// KAD UDP ingress while ranges may still be loading — see
+    /// [`IpFilterSnapshot::is_blocked_for_kad`].
+    pub fn is_blocked_readonly_for_kad(&self, ip: Ipv4Addr) -> bool {
+        if crate::security::is_bogus_v4(ip) {
+            self.total_special_hits.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        if self.block_private && crate::security::is_lan_or_cgnat_v4(ip) {
+            self.total_special_hits.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        if self.enabled && self.ranges_ready {
             let ip_u32 = u32::from(ip);
             if self
                 .blocked_ranges
@@ -1125,6 +1195,25 @@ mod tests {
         let snap = snap.read().unwrap();
         assert!(snap.ranges_ready);
         assert!(!snap.is_blocked(Ipv4Addr::new(8, 8, 8, 8)));
+    }
+
+    #[test]
+    fn test_kad_admission_skips_fail_closed_until_ranges_ready() {
+        let mut filter = IpFilter::new(true, false);
+        assert!(!filter.ranges_ready());
+        // Peer gates still fail-closed…
+        assert!(filter.is_blocked_readonly(Ipv4Addr::new(8, 8, 8, 8)));
+        // …but KAD UDP / RT insert must admit so bootstrap can proceed.
+        assert!(!filter.is_blocked_readonly_for_kad(Ipv4Addr::new(8, 8, 8, 8)));
+        let snap = filter.create_shared_snapshot();
+        let snap = snap.read().unwrap();
+        assert!(snap.is_blocked(Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(!snap.is_blocked_for_kad(Ipv4Addr::new(8, 8, 8, 8)));
+        drop(snap);
+
+        filter.mark_ranges_ready();
+        // With an empty intentional list, KAD path still admits public IPs.
+        assert!(!filter.is_blocked_readonly_for_kad(Ipv4Addr::new(8, 8, 8, 8)));
     }
 
     #[test]
