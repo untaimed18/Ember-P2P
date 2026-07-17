@@ -106,7 +106,7 @@
   // new column set.
   const QUEUE_COLUMNS: TransferColumn[] = [
     { key: 'country', label: '', width: 48, minWidth: 40, className: 'col-q-flag' },
-    { key: 'user_name', get label() { return m.transfers_col_user_name(); }, width: 150, minWidth: 120, className: 'col-q-client' },
+    { key: 'user_name', get label() { return m.transfers_col_user_id(); }, width: 150, minWidth: 120, className: 'col-q-client' },
     { key: 'file_name', get label() { return m.transfers_col_file(); }, width: 260, minWidth: 160, className: 'col-q-file' },
     { key: 'wait_time', get label() { return m.transfers_col_wait_time(); }, width: 90, minWidth: 72, className: 'col-q-wait' },
     { key: 'queue_rank', get label() { return m.transfers_col_rank(); }, width: 60, minWidth: 50, className: 'col-q-rank' },
@@ -4989,11 +4989,6 @@
   .ctx-item:disabled { opacity: 0.5; cursor: default; }
   .ctx-item.danger { color: var(--danger); }
   .ctx-item.has-sub { display: flex; justify-content: space-between; }
-  .ctx-shortcut {
-    font-size: 10px;
-    color: var(--text-muted);
-    margin-left: auto;
-  }
   .ctx-active { font-weight: 700; }
   .ctx-sep {
     height: 1px;

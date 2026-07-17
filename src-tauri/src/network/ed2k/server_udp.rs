@@ -267,7 +267,7 @@ impl ServerUdpSocket {
         Some((wire_packet, wire_addr))
     }
 
-    pub async fn send_status_ping(&mut self, server: &ServerEntry) -> anyhow::Result<()> {
+    pub async fn send_status_ping(&mut self, server: &ServerEntry) -> anyhow::Result<usize> {
         let udp_port = server.port.checked_add(4).ok_or_else(|| {
             anyhow::anyhow!("Server port {} too high for UDP offset", server.port)
         })?;
@@ -304,7 +304,7 @@ impl ServerUdpSocket {
         // cooldown by switching to a "different" key.
         if let Some(&last) = self.last_ping_times.get(&plain_addr) {
             if now - last < MIN_PING_INTERVAL_SECS {
-                return Ok(());
+                return Ok(0);
             }
         }
 
@@ -322,7 +322,7 @@ impl ServerUdpSocket {
             packet
         };
 
-        self.socket.send_to(&wire_packet, wire_addr).await?;
+        let sent = self.socket.send_to(&wire_packet, wire_addr).await?;
         // Tracking keyed by canonical addr — see comment above.
         self.last_ping_times.insert(plain_addr, now);
         self.pending_challenges.insert(plain_addr, challenge);
@@ -337,7 +337,7 @@ impl ServerUdpSocket {
             "Sent status ping to {}:{} (challenge=0x{challenge:08X})",
             server.ip, server.port
         );
-        Ok(())
+        Ok(sent)
     }
 
     /// Receive and process one UDP packet. Returns the parsed result

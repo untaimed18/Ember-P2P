@@ -105,6 +105,15 @@
         { keys: ['PgUp / PgDn'], label: () => m.shortcuts_library_page() },
       ],
     },
+    {
+      title: () => m.shortcuts_section_chat(),
+      shortcuts: [
+        { keys: ['Ctrl', '/'], label: () => m.shortcuts_toggle_chat() },
+        { keys: ['Ctrl', 'Tab'], label: () => m.shortcuts_chat_cycle_tabs() },
+        { keys: ['Ctrl', 'W'], label: () => m.shortcuts_chat_close_tab() },
+        { keys: ['Esc'], label: () => m.shortcuts_chat_close_dock() },
+      ],
+    },
   ];
 
   function onKeydown(e: KeyboardEvent) {

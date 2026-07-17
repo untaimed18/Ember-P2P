@@ -1380,7 +1380,10 @@
     // active transfer — harmless server-side (`already_queued: true`), but
     // it's an extra IPC round-trip and toast the disabled button exists
     // specifically to prevent.
-    if (getBlockingDownloadTransfer(result)) return;
+    if (getBlockingDownloadTransfer(result)) {
+      addToast('info', m.search_action_already_downloading_title());
+      return;
+    }
 
     const networkAddresses = (result.source_addresses ?? []).filter(
       (a) => a && a !== 'local'
@@ -2279,7 +2282,7 @@
             class:history-completed-row={!result.result_origin?.includes('Local') && downloadHistoryMap[result.file.hash] === 'completed'}
             class:history-cancelled-row={!result.result_origin?.includes('Local') && downloadHistoryMap[result.file.hash] === 'cancelled'}
             oncontextmenu={(e) => showContextMenu(e, result)}
-            ondblclick={() => download(result)}
+            ondblclick={() => { if (!blockingDl) download(result); }}
             in:fade={{ duration: 140 }}
           >
             <td class="col-check">
@@ -2450,7 +2453,12 @@
         {:else}
           <button role="menuitem" onclick={() => { if (contextMenu) handleMarkSpam(contextMenu.result); }}>{m.search_mark_spam()}</button>
         {/if}
-        <button role="menuitem" onclick={() => { if (contextMenu) download(contextMenu.result); closeContextMenu(); }}>{m.search_ctx_download()}</button>
+        <button
+          role="menuitem"
+          disabled={!!getBlockingDownloadTransfer(contextMenu.result)}
+          title={getBlockingDownloadTransfer(contextMenu.result) ? m.search_action_already_downloading_title() : undefined}
+          onclick={() => { if (contextMenu) download(contextMenu.result); closeContextMenu(); }}
+        >{m.search_ctx_download()}</button>
         {#if checkedCount > 1}
           <button role="menuitem" onclick={() => { downloadChecked(); closeContextMenu(); }}>{m.search_ctx_download_selected({ count: checkedCount })}</button>
         {/if}
@@ -3822,6 +3830,13 @@
   }
   .context-menu button:hover {
     background: var(--bg-hover);
+  }
+  .context-menu button:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .context-menu button:disabled:hover {
+    background: none;
   }
 
   @media (max-width: 980px) {

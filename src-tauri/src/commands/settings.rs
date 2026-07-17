@@ -206,6 +206,13 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
     changed |= clamp_assign(&mut settings.search_timeout_secs, 30, 600);
     changed |= clamp_assign(&mut settings.max_friends, 1, 500);
 
+    // Friend session encryption is not a user-facing toggle; keep it on even
+    // if an older config.json or hand edit turned it off.
+    if !settings.friend_session_encryption {
+        settings.friend_session_encryption = true;
+        changed = true;
+    }
+
     // Drop shared folders that would fail validate (sensitive segments) or that
     // contain / are the Ember data directory. Older builds allowed some AppData
     // paths; rejecting them in validate alone would wipe the entire config.
@@ -625,6 +632,8 @@ pub async fn update_settings(
     settings.spam_filter_profile = settings.spam_filter_profile.trim().to_ascii_lowercase();
     settings.close_to_tray_behavior = settings.close_to_tray_behavior.trim().to_ascii_lowercase();
     settings.update_check_frequency = settings.update_check_frequency.trim().to_ascii_lowercase();
+    // Not exposed in Settings UI — always keep friend sessions encrypted.
+    settings.friend_session_encryption = true;
     // L20: strip bidi/zero-width/control formatters from the
     // local user's own nickname before it's stored or sent on the
     // wire (Hello/EmuleInfo/HelloAnswer all carry it). Without
@@ -1173,6 +1182,14 @@ mod tests {
         assert_eq!(settings.spam_filter_profile, "balanced");
         assert!(!settings.uss_enabled);
         assert!(validate_settings(&settings).is_ok());
+    }
+
+    #[test]
+    fn soft_repair_forces_friend_session_encryption_on() {
+        let mut settings = AppSettings::default();
+        settings.friend_session_encryption = false;
+        assert!(soft_repair_settings(&mut settings));
+        assert!(settings.friend_session_encryption);
     }
 
     #[test]

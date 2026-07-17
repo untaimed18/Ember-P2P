@@ -1,5 +1,6 @@
 <script lang="ts">
   import * as m from '$lib/paraglide/messages';
+  import ConfirmDialog from './ConfirmDialog.svelte';
 
   let {
     value = $bindable(''),
@@ -38,6 +39,7 @@
   let showRecent = $state(false);
   let activeIndex = $state(-1);
   let wrapEl: HTMLDivElement | undefined = $state(undefined);
+  let clearRecentConfirmOpen = $state(false);
   let inputEl: HTMLInputElement | undefined = $state(undefined);
 
   function loadRecent() {
@@ -83,6 +85,10 @@
       if (activeIndex >= recent.length) activeIndex = recent.length - 1;
     }
     saveRecent();
+  }
+
+  function requestClearRecent() {
+    clearRecentConfirmOpen = true;
   }
 
   function clearRecent() {
@@ -220,7 +226,7 @@
     <div id="search-recent-list" class="recent-dropdown" role="listbox" aria-label={m.search_bar_recent_searches()}>
       <div class="recent-header">
         <span>{m.search_bar_recent_searches()}</span>
-        <button type="button" class="recent-clear" onclick={clearRecent}>{m.search_bar_clear_all()}</button>
+        <button type="button" class="recent-clear" onclick={requestClearRecent}>{m.search_bar_clear_all()}</button>
       </div>
       {#each recent as q, i (q)}
         <div
@@ -257,6 +263,15 @@
     </div>
   {/if}
 </div>
+
+<ConfirmDialog
+  bind:open={clearRecentConfirmOpen}
+  title={m.search_bar_clear_recent_dialog_title()}
+  message={m.search_bar_clear_recent_dialog_message()}
+  confirmLabel={m.search_bar_clear_all()}
+  danger={true}
+  onconfirm={clearRecent}
+/>
 
 <style>
   .search-bar-wrap {

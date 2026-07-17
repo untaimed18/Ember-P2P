@@ -64,11 +64,14 @@ impl Database {
         }
 
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL;\
+            // auto_vacuum must be set before journal_mode writes the DB
+            // header. After WAL is enabled (or any table exists), changing
+            // auto_vacuum requires an explicit VACUUM — see v21 migration.
+            "PRAGMA auto_vacuum=INCREMENTAL;\
+             PRAGMA journal_mode=WAL;\
              PRAGMA synchronous=FULL;\
              PRAGMA foreign_keys=ON;\
              PRAGMA secure_delete=ON;\
-             PRAGMA auto_vacuum=INCREMENTAL;\
              PRAGMA busy_timeout=5000;",
         )?;
 
@@ -171,7 +174,7 @@ impl Database {
         // Ember build. Silently running would invite subtle data corruption
         // (missing columns, renamed tables, semantic changes). Bump this
         // when introducing a new migration.
-        const MAX_SUPPORTED_VERSION: i64 = 20;
+        const MAX_SUPPORTED_VERSION: i64 = 21;
         if version > MAX_SUPPORTED_VERSION {
             anyhow::bail!(
                 "Database schema version {version} is newer than this Ember build supports \
@@ -590,6 +593,34 @@ impl Database {
             let tx = conn.unchecked_transaction()?;
             Self::add_column_if_missing(&tx, "credits", "ember_hash", "BLOB")?;
             set_version(&tx, 20)?;
+            tx.commit()?;
+        }
+
+        if version < 21 {
+            // Existing installs were created with `journal_mode=WAL` before
+            // `auto_vacuum=INCREMENTAL`, which left auto_vacuum stuck at NONE
+            // forever — `PRAGMA incremental_vacuum` then silently no-ops and
+            // freed pages never return to the OS. Enable incremental vacuum
+            // and drop unused legacy migration backup tables.
+            //
+            // VACUUM cannot run inside a transaction, so we set the version
+            // after the maintenance steps (same pattern as other one-shot
+            // maintenance migrations).
+            let auto_vacuum: i64 = conn
+                .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
+                .unwrap_or(0);
+            if auto_vacuum == 0 {
+                // Must set the pragma, then VACUUM, for the file header to change.
+                conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;")?;
+                info!("Enabled incremental auto_vacuum on existing database (v21)");
+            }
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS transfers_v5_backup;
+                 DROP TABLE IF EXISTS shared_files_v7_backup;
+                 DROP TABLE IF EXISTS settings_v7_backup;",
+            )?;
+            let tx = conn.unchecked_transaction()?;
+            set_version(&tx, 21)?;
             tx.commit()?;
         }
 
@@ -1997,11 +2028,20 @@ impl Database {
     /// Reclaim unused pages freed by DELETE operations.
     /// Should be called periodically (e.g. alongside credit flush).
     pub fn incremental_vacuum(&self) {
-        {
-            let conn = self.conn.lock();
-            if let Err(e) = conn.execute_batch("PRAGMA incremental_vacuum(64);") {
-                tracing::debug!("incremental_vacuum failed: {e}");
-            }
+        let conn = self.conn.lock();
+        let auto_vacuum: i64 = conn
+            .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
+            .unwrap_or(0);
+        if auto_vacuum == 0 {
+            // Should be impossible after v21, but keep the signal if a
+            // future regression re-introduces the pragma-order bug.
+            tracing::warn!(
+                "incremental_vacuum skipped: auto_vacuum is NONE (expected INCREMENTAL)"
+            );
+            return;
+        }
+        if let Err(e) = conn.execute_batch("PRAGMA incremental_vacuum(64);") {
+            tracing::debug!("incremental_vacuum failed: {e}");
         }
     }
 
@@ -2268,5 +2308,90 @@ mod tests {
         db.ban_ip(ip, "finite", 100).expect("finite");
         // Still permanent (present despite the finite re-ban being in the past).
         assert_eq!(db.get_banned_ips().expect("load"), vec![ip]);
+    }
+
+    #[test]
+    fn fresh_database_uses_incremental_auto_vacuum() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-av-fresh-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open fresh db");
+        let auto_vacuum: i64 = db
+            .conn
+            .lock()
+            .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
+            .expect("auto_vacuum");
+        assert_eq!(auto_vacuum, 2, "INCREMENTAL auto_vacuum expected on fresh DB");
+        let version: i64 = db
+            .conn
+            .lock()
+            .query_row("SELECT COALESCE(MAX(version), 0) FROM schema_version", [], |r| {
+                r.get(0)
+            })
+            .expect("version");
+        assert_eq!(version, 21);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn v21_enables_auto_vacuum_on_legacy_none_db() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-av-legacy-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            // Build a minimal pre-v21 DB with auto_vacuum stuck at NONE
+            // (the historical pragma-order bug + existing tables).
+            let conn = Connection::open(&path).expect("create legacy");
+            conn.execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE schema_version (version INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO schema_version (version) VALUES (20);
+                 CREATE TABLE statistics (key TEXT PRIMARY KEY, value INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE transfers_v5_backup (id TEXT);
+                 CREATE TABLE shared_files_v7_backup (id TEXT);
+                 CREATE TABLE settings_v7_backup (key TEXT);",
+            )
+            .expect("seed legacy schema");
+            let av: i64 = conn
+                .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(av, 0, "fixture must start with auto_vacuum=NONE");
+        }
+        let db = Database::open_at(&path).expect("migrate legacy");
+        let auto_vacuum: i64 = db
+            .conn
+            .lock()
+            .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
+            .expect("auto_vacuum");
+        assert_eq!(auto_vacuum, 2, "v21 must enable INCREMENTAL auto_vacuum");
+        let backups: i64 = db
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name LIKE '%_backup'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("backup count");
+        assert_eq!(backups, 0, "v21 must drop legacy backup tables");
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 }

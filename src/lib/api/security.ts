@@ -11,6 +11,8 @@ export interface IpFilterEntry {
 export interface IpFilterStats {
   enabled: boolean;
   block_private: boolean;
+  /** False while an enabled filter has not finished (or failed) loading ranges. */
+  ranges_ready: boolean;
   range_count: number;
   total_hits: number;
   entries: IpFilterEntry[];
