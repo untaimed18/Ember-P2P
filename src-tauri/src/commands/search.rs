@@ -399,7 +399,13 @@ pub async fn find_notes(
     };
     let mut results =
         match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
-            Ok(Ok(results)) => results,
+            Ok(Ok(Ok(results))) => results,
+            Ok(Ok(Err(e))) => {
+                return Err(coded(
+                    "search_notes_busy",
+                    e,
+                ))
+            }
             Ok(Err(e)) => {
                 return Err(coded_ctx(
                     "search_notes_search_failed",

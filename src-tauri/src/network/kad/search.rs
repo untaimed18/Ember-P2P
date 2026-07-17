@@ -1196,7 +1196,7 @@ impl SearchManager {
         }
     }
 
-    /// Start a search. Returns `(new_id, evicted_ids, released_in_use)`.
+    /// Start a search. Returns `(new_id, evicted_ids, released_in_use, keyword_results)`.
     ///
     /// `new_id` is `SearchId(0)` when the request is rejected (capacity /
     /// priority). `evicted_ids` are searches removed by the capacity reap or
@@ -1204,19 +1204,27 @@ impl SearchManager {
     /// `CancelKadSearch` (`finalize_removed_searches`) so pending-result maps
     /// keyed by those ids are cleared. `released_in_use` are the evicted
     /// searches' routing-table in-use marks (pass them to finalize together
-    /// with the ids). When nothing is evicted both vecs are empty.
+    /// with the ids). `keyword_results` carries any `FindKeyword` result
+    /// entries collected before eviction so finalize can deliver them instead
+    /// of answering the oneshot with an empty local-only list. When nothing
+    /// is evicted the vecs/map are empty.
     pub fn start_search(
         &mut self,
         target: KadId,
         search_type: SearchType,
         initial_contacts: Vec<KadContact>,
-    ) -> (SearchId, Vec<SearchId>, Vec<KadId>) {
+    ) -> (
+        SearchId,
+        Vec<SearchId>,
+        Vec<KadId>,
+        HashMap<SearchId, Vec<SearchResultEntry>>,
+    ) {
         let key = (target, search_type);
         if Self::reuses_existing_search(search_type) {
             if let Some(existing_id) = self.target_map.get(&key) {
                 if let Some(state) = self.active.get(existing_id) {
                     if !state.completed && state.search_type == search_type {
-                        return (*existing_id, Vec::new(), Vec::new());
+                        return (*existing_id, Vec::new(), Vec::new(), HashMap::new());
                     }
                 }
             }
@@ -1230,6 +1238,7 @@ impl SearchManager {
         const MAX_ACTIVE_SEARCHES: usize = 20;
         let mut evicted_ids: Vec<SearchId> = Vec::new();
         let mut released_in_use: Vec<KadId> = Vec::new();
+        let mut keyword_results: HashMap<SearchId, Vec<SearchResultEntry>> = HashMap::new();
         let active = self.active_count();
         if active >= MAX_ACTIVE_SEARCHES {
             let completed: Vec<SearchId> = self
@@ -1239,7 +1248,7 @@ impl SearchManager {
                 .map(|(id, _)| *id)
                 .collect();
             for id in completed {
-                if let Some(s) = self.active.remove(&id) {
+                if let Some(mut s) = self.active.remove(&id) {
                     let k = (s.target, s.search_type);
                     if self.target_map.get(&k) == Some(&id) {
                         self.target_map.remove(&k);
@@ -1247,6 +1256,9 @@ impl SearchManager {
                     // Caller finalizes pending maps for these ids; in-use
                     // marks go back via `released_in_use` (not pending_release)
                     // so finalize can release them immediately.
+                    if matches!(s.search_type, SearchType::FindKeyword) && !s.results.is_empty() {
+                        keyword_results.insert(s.id, std::mem::take(&mut s.results));
+                    }
                     released_in_use.extend(s.in_use_ids);
                     evicted_ids.push(id);
                 }
@@ -1270,10 +1282,15 @@ impl SearchManager {
                     .map(|(id, _)| *id);
 
                 if let Some(id) = eviction {
-                    if let Some(state) = self.active.remove(&id) {
+                    if let Some(mut state) = self.active.remove(&id) {
                         let old_key = (state.target, state.search_type);
                         if self.target_map.get(&old_key) == Some(&id) {
                             self.target_map.remove(&old_key);
+                        }
+                        if matches!(state.search_type, SearchType::FindKeyword)
+                            && !state.results.is_empty()
+                        {
+                            keyword_results.insert(state.id, std::mem::take(&mut state.results));
                         }
                         released_in_use.extend(state.in_use_ids);
                         evicted_ids.push(id);
@@ -1289,7 +1306,7 @@ impl SearchManager {
                     );
                     // Still return any completed rows we reaped above so the
                     // caller can finalize their pending maps.
-                    return (SearchId(0), evicted_ids, released_in_use);
+                    return (SearchId(0), evicted_ids, released_in_use, keyword_results);
                 }
             }
         }
@@ -1304,7 +1321,7 @@ impl SearchManager {
         self.active.insert(id, state);
         self.pending_in_use.extend(in_use);
         debug!("Started search {}: target={}", id.0, target);
-        (id, evicted_ids, released_in_use)
+        (id, evicted_ids, released_in_use, keyword_results)
     }
 
     pub fn get_mut(&mut self, id: &SearchId) -> Option<&mut SearchState> {

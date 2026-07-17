@@ -2629,7 +2629,7 @@ mod tests {
             ],
         }];
 
-        let results = convert_search_results(&entries);
+        let results = convert_search_results(&entries, |_| true);
         assert_eq!(results.len(), 1);
         let media = results[0].media.as_ref().expect("media present");
         assert_eq!(media.artist.as_deref(), Some("Some Artist"));
@@ -2655,7 +2655,7 @@ mod tests {
                 },
             ],
         }];
-        let results = convert_search_results(&entries);
+        let results = convert_search_results(&entries, |_| true);
         assert_eq!(results.len(), 1);
         assert!(results[0].media.is_none());
     }
@@ -2818,7 +2818,7 @@ pub enum NetworkCommand {
         file_hash: KadId,
         file_size: u64,
         request_id: u64,
-        tx: oneshot::Sender<Vec<SearchResult>>,
+        tx: oneshot::Sender<Result<Vec<SearchResult>, String>>,
     },
     PublishNote {
         file_hash: KadId,
@@ -3556,7 +3556,7 @@ struct NetworkState {
     store_source_searches: HashMap<SearchId, (KadId, KadMessage)>,
     /// Pending notes searches: search_id -> (request_id, response sender).
     /// See `pending_source_searches` for why `request_id` is carried here.
-    pending_notes_searches: HashMap<SearchId, PendingHelperSearchTx<Vec<SearchResult>>>,
+    pending_notes_searches: HashMap<SearchId, PendingHelperSearchTx<Result<Vec<SearchResult>, String>>>,
     /// Pending note publishes, including the exact StorePacket payload used by
     /// both eager lookup sends and completion mop-up.
     pending_note_publishes: HashMap<SearchId, PendingNotePublish>,
@@ -4337,17 +4337,56 @@ fn finalize_removed_searches(
     removed_sids: &[SearchId],
     released_in_use: &[KadId],
 ) {
+    finalize_removed_searches_with_keyword_results(
+        state,
+        app_handle,
+        removed_sids,
+        released_in_use,
+        &HashMap::new(),
+    );
+}
+
+/// Like [`finalize_removed_searches`], but when capacity eviction already
+/// extracted `FindKeyword` result entries, deliver those via the oneshot
+/// instead of dropping them with the removed `SearchState`.
+fn finalize_removed_searches_with_keyword_results(
+    state: &mut NetworkState,
+    app_handle: &tauri::AppHandle,
+    removed_sids: &[SearchId],
+    released_in_use: &[KadId],
+    keyword_results: &HashMap<SearchId, Vec<kad::messages::SearchResultEntry>>,
+) {
     if !released_in_use.is_empty() {
         state.routing_table.release_contacts_in_use(released_in_use);
     }
     for sid in removed_sids {
         if let Some(PendingKeywordSearch {
             tx,
-            local_results,
+            mut local_results,
+            query_expr,
             request_id,
             ..
         }) = state.pending_keyword_searches.remove(sid)
         {
+            if let Some(entries) = keyword_results.get(sid) {
+                if !entries.is_empty() {
+                    let mut network_results = convert_search_results(entries, |ip| {
+                        is_search_source_safe(state, ip)
+                    });
+                    if !query_expr.is_trivial() {
+                        network_results.retain(|r| {
+                            query_expr.matches(&r.file.name.to_lowercase())
+                        });
+                    }
+                    if let Some(active) = state.active_search_request.as_ref() {
+                        if active.request_id == request_id {
+                            network_results =
+                                filter_results_by_client_constraints(network_results, active);
+                        }
+                    }
+                    local_results.extend(network_results);
+                }
+            }
             let _ = tx.send(local_results);
             if let Some(active) = state.active_search_request.as_mut() {
                 if active.request_id == request_id {
@@ -4360,7 +4399,7 @@ fn finalize_removed_searches(
             let _ = tx.send(Ok(Vec::new()));
         }
         if let Some((_, tx)) = state.pending_notes_searches.remove(sid) {
-            let _ = tx.send(Vec::new());
+            let _ = tx.send(Ok(Vec::new()));
         }
         state.download_source_searches.remove(sid);
         state.store_keyword_searches.remove(sid);
@@ -4380,12 +4419,18 @@ fn start_kad_search(
     search_type: SearchType,
     initial_contacts: Vec<KadContact>,
 ) -> SearchId {
-    let (sid, evicted, released) =
+    let (sid, evicted, released, keyword_results) =
         state
             .search_manager
             .start_search(target, search_type, initial_contacts);
     if !evicted.is_empty() {
-        finalize_removed_searches(state, app_handle, &evicted, &released);
+        finalize_removed_searches_with_keyword_results(
+            state,
+            app_handle,
+            &evicted,
+            &released,
+            &keyword_results,
+        );
     }
     sid
 }
@@ -4444,7 +4489,7 @@ fn cancel_search_request(state: &mut NetworkState, app_handle: &tauri::AppHandle
             let _ = tx.send(Ok(Vec::new()));
         }
         if let Some((_, tx)) = state.pending_notes_searches.remove(sid) {
-            let _ = tx.send(Vec::new());
+            let _ = tx.send(Ok(Vec::new()));
         }
         state.download_source_searches.remove(sid);
         state.store_keyword_searches.remove(sid);
@@ -10460,7 +10505,9 @@ pub async fn start_network(
                         let stream_threshold = if pending.last_streamed_count == 0 { 1 } else { 20 };
                         if new_results > pending.last_streamed_count + stream_threshold {
                             let new_entries = &search.results[pending.last_streamed_count..];
-                            let mut batch = convert_search_results(new_entries);
+                            let mut batch = convert_search_results(new_entries, |ip| {
+                                is_search_source_safe(&state, ip)
+                            });
                             // Pull the per-pending data out by value so we
                             // don't hold an immutable borrow of
                             // `state.pending_keyword_searches` across the
@@ -10797,7 +10844,9 @@ pub async fn start_network(
                                 "Keyword search {} completed: {} unique files ({} raw entries from KAD), {} local results",
                                 sid.0, unique.len(), search.results.len(), local_results.len()
                             );
-                            let all_results = convert_search_results(&search.results);
+                            let all_results = convert_search_results(&search.results, |ip| {
+                                is_search_source_safe(&state, ip)
+                            });
                             if !query_expr.is_trivial() {
                                 let before = all_results.len();
                                 let filtered: Vec<SearchResult> = all_results
@@ -12088,7 +12137,7 @@ pub async fn start_network(
                         } else {
                             Vec::new()
                         };
-                        let _ = tx.send(results);
+                        let _ = tx.send(Ok(results));
                     } else if let Some(batch) = state.store_keyword_searches.remove(&sid) {
                         // StoreKeyword search completed - send publish messages to the closest nodes found.
                         // eMule publishes by keyword, carrying all complete files
@@ -17124,7 +17173,9 @@ pub async fn start_network(
                                             },
                                         peer_id: String::new(),
                                         peer_name: String::new(),
-                                        availability: sr.source_count,
+                                        // Mirror UDP/KAD: missing/0 sources still
+                                        // mean the publishing peer is present.
+                                        availability: sr.source_count.max(1),
                                         file_type: crate::search::index::infer_file_type(&extension),
                                         source_addresses,
                                         rating: sr.rating,
@@ -25589,11 +25640,17 @@ async fn handle_command_inner(
             tx,
             search_filters,
         } => {
-            if let Some(active) = state.active_search_request.take() {
+            // Cancel the prior request while it is still `active_search_request`
+            // so cancel can clear the UDP queue and emit `search-complete`.
+            // Taking first used to skip both, leaving the old tab spinning and
+            // leftover UDP packets tagged under the new request.
+            if let Some(active) = state.active_search_request.as_ref() {
                 if active.request_id != request_id {
-                    cancel_search_request(state, app_handle, active.request_id);
+                    let prior_id = active.request_id;
+                    cancel_search_request(state, app_handle, prior_id);
                 }
             }
+            state.active_search_request = None;
 
             let mut tx = Some(tx);
             let mut local_results: Option<Vec<SearchResult>> = Some(Vec::new());
@@ -25637,14 +25694,16 @@ async fn handle_command_inner(
                 .as_ref()
                 .map(|e| e.positive_terms())
                 .unwrap_or_default();
-            let has_filter_expression = search_filters.as_ref().is_some_and(|f| {
-                f.file_type.is_some()
-                    || f.file_extension.is_some()
-                    || f.min_size.is_some()
-                    || f.max_size.is_some()
-                    || f.min_availability.is_some()
-            });
-            if keywords.is_empty() && !has_filter_expression {
+            // Match wire encoding: zero numerics and empty type/ext are dropped
+            // by `build_search_expression_with_node`, so treat them as absent.
+            let has_usable_filters = search_filters.as_ref().is_some_and(|f| {
+                f.file_type.as_ref().is_some_and(|t| !t.is_empty())
+                    || f.file_extension.as_ref().is_some_and(|e| !e.is_empty())
+                    || f.min_size.is_some_and(|v| v > 0)
+                    || f.max_size.is_some_and(|v| v > 0)
+                    || f.min_availability.is_some_and(|v| v > 0)
+            }) || wire_file_type.as_ref().is_some_and(|t| !t.is_empty());
+            if keywords.is_empty() && !has_usable_filters {
                 if let Some(tx) = tx.take() {
                     let _ = tx.send(local_results.take().unwrap_or_default());
                 }
@@ -27344,7 +27403,7 @@ async fn handle_command_inner(
                 .find_closest_prefer_verified(&file_hash, SEARCH_INITIAL_CONTACTS);
 
             if closest.is_empty() {
-                let _ = tx.send(Vec::new());
+                let _ = tx.send(Ok(Vec::new()));
                 return;
             }
 
@@ -27356,7 +27415,10 @@ async fn handle_command_inner(
                 closest,
             );
             if sid == SearchId(0) {
-                let _ = tx.send(Vec::new());
+                warn!("FindNotes rejected: active search cap reached");
+                let _ = tx.send(Err(
+                    "Notes search busy: too many active KAD searches".to_string(),
+                ));
                 return;
             }
             state.pending_notes_searches.insert(sid, (request_id, tx));
@@ -27765,7 +27827,7 @@ async fn handle_command_inner(
                 let _ = tx.send(Ok(Vec::new()));
             }
             for (_, (_, tx)) in state.pending_notes_searches.drain() {
-                let _ = tx.send(Vec::new());
+                let _ = tx.send(Ok(Vec::new()));
             }
             state.active_search_request = None;
             state.download_source_searches.clear();
@@ -30469,7 +30531,10 @@ fn name_spam_penalty(name: &str) -> usize {
     score
 }
 
-fn convert_search_results(entries: &[kad::messages::SearchResultEntry]) -> Vec<SearchResult> {
+fn convert_search_results(
+    entries: &[kad::messages::SearchResultEntry],
+    is_source_safe: impl Fn(Ipv4Addr) -> bool,
+) -> Vec<SearchResult> {
     use crate::search::index::infer_file_type;
 
     const MAX_KAD_SOURCE_ADDRS: usize = 500;
@@ -30706,7 +30771,11 @@ fn convert_search_results(entries: &[kad::messages::SearchResultEntry]) -> Vec<S
 
             let source_addr = if source_ip != 0 {
                 let ip = Ipv4Addr::from(source_ip.to_be_bytes());
-                format!("{}:{}", ip, source_port)
+                if is_source_safe(ip) {
+                    format!("{}:{}", ip, source_port)
+                } else {
+                    String::new()
+                }
             } else {
                 String::new()
             };

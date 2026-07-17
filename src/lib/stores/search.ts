@@ -58,6 +58,10 @@ function combineOrigin(a: string, b: string): string {
   return [...new Set(parts)].sort().join(' · ');
 }
 
+/** Per-hash user spam overrides. Honored by mergeResult so stream merges
+ * cannot undo an explicit Mark spam / Mark not spam. Cleared on store cleanup. */
+const spamUserOverrides = new Map<string, { isSpam: boolean; spamRating: number }>();
+
 function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResult {
   const mergedAddresses = Array.from(new Set([...(existing.source_addresses || []), ...(incoming.source_addresses || [])]));
   // Backend ed2k resights emit absolute noted availability; take max so we do
@@ -83,6 +87,18 @@ function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResu
   const incomingName = incoming.file.name || '';
   const preferredName =
     incomingName.length > existingName.length ? incomingName : existingName || incomingName;
+  const hash = incoming.file.hash || existing.file.hash || '';
+  const override = hash ? spamUserOverrides.get(hash) : undefined;
+  const spam_rating = override
+    ? override.spamRating
+    : Math.max(existing.spam_rating ?? 0, incoming.spam_rating ?? 0);
+  const is_spam = override
+    ? override.isSpam
+    // Search channels can disagree or report partial spam evaluation. Treat a
+    // positive classification and the highest observed score conservatively;
+    // a later unflagged hit must not erase an earlier warning for the same file
+    // unless the user explicitly unmarked it (override above).
+    : existing.is_spam || incoming.is_spam;
   return {
     ...existing,
     ...incoming,
@@ -104,11 +120,8 @@ function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResu
     rating: incoming.rating ?? existing.rating,
     comment: incoming.comment ?? existing.comment,
     media: hasMedia ? media : existing.media || incoming.media,
-    // Search channels can disagree or report partial spam evaluation. Treat a
-    // positive classification and the highest observed score conservatively;
-    // a later unflagged hit must not erase an earlier warning for the same file.
-    spam_rating: Math.max(existing.spam_rating ?? 0, incoming.spam_rating ?? 0),
-    is_spam: existing.is_spam || incoming.is_spam,
+    spam_rating,
+    is_spam,
     clean_name: incoming.clean_name || existing.clean_name,
     result_origin: combineOrigin(existing.result_origin || '', incoming.result_origin || ''),
   };
@@ -147,9 +160,11 @@ export function patchSearchTabByRequestId(requestId: number, fn: (tab: SearchTab
 /**
  * Patch `is_spam` / `spam_rating` for a file hash across all tabs.
  * Only reallocates tabs/results that actually contain a match.
+ * Records a user override so later stream merges cannot undo the choice.
  */
 export function patchSpamFlagByHash(fileHash: string, isSpam: boolean, spamRating: number) {
   if (!fileHash) return;
+  spamUserOverrides.set(fileHash, { isSpam, spamRating });
   searchTabs.update((tabs) => {
     let anyChanged = false;
     const next = tabs.map((tab) => {
@@ -372,6 +387,7 @@ export function cleanupSearchStore() {
   flushTimeout = null;
   flushScheduled = false;
   pendingByRequest.clear();
+  spamUserOverrides.clear();
   searchTabs.set([]);
   activeSearchTabId.set(null);
 }
