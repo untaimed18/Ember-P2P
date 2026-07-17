@@ -30,6 +30,10 @@
   import { translateError, degradedReasonText } from '$lib/i18n';
 
   const searchTimeouts = new Map<number, ReturnType<typeof setTimeout>>();
+  /** Request ids whose invoke has settled (success or error). Prevents a late
+   * getSettings() from re-arming the cancel watchdog after completion grace
+   * is already in `searchTimeouts`. */
+  const searchInvokeSettled = new Set<number>();
 
   /// Upper bound on a search query length sent over IPC. ed2k keywords are
   /// short; this just guards against pathologically long pasted input.
@@ -137,20 +141,26 @@
     historyHashGen.delete(hash);
   }
 
-  // React to downloads finishing while results are on screen: drop the stale
-  // "already fetched" mark for the completed file and re-queue, so its
-  // completed/cancelled badge appears without a reload. A `completedHandled`
-  // guard keeps this from re-firing on every transfers-store tick.
+  // React to downloads finishing or being cancelled while results are on
+  // screen: drop the stale "already fetched" mark for the file and re-queue,
+  // so its completed/cancelled badge appears without a reload. A
+  // `completedHandled` guard keeps this from re-firing on every transfers-store
+  // tick for hashes that stay terminal in the list.
   const completedHandled = new Set<string>();
   // Bound the dedupe set so a very long session with thousands of completed
   // downloads can't grow it without limit. Sets preserve insertion order, so
   // dropping the oldest entry evicts the least-recently-completed hash.
   const COMPLETED_HANDLED_CAP = 2000;
+  const seenDownloadHashes = new Set<string>();
   $effect(() => {
     const list = $transfers;
     if (destroyed) return;
+    const present = new Set<string>();
     for (const t of list) {
-      if (t.direction !== 'download' || t.status !== 'completed' || !t.file_hash) continue;
+      if (t.direction !== 'download' || !t.file_hash) continue;
+      present.add(t.file_hash);
+      seenDownloadHashes.add(t.file_hash);
+      if (t.status !== 'completed' && t.status !== 'failed') continue;
       if (completedHandled.has(t.file_hash)) continue;
       completedHandled.add(t.file_hash);
       if (completedHandled.size > COMPLETED_HANDLED_CAP) {
@@ -159,6 +169,19 @@
       }
       invalidateHistory(t.file_hash);
       queueHistoryFetch([t.file_hash]);
+    }
+    // Hash left the transfer list (cancel/remove) — refresh history badge.
+    for (const hash of [...seenDownloadHashes]) {
+      if (present.has(hash)) continue;
+      seenDownloadHashes.delete(hash);
+      if (completedHandled.has(hash)) continue;
+      completedHandled.add(hash);
+      if (completedHandled.size > COMPLETED_HANDLED_CAP) {
+        const oldest = completedHandled.values().next().value;
+        if (oldest !== undefined) completedHandled.delete(oldest);
+      }
+      invalidateHistory(hash);
+      queueHistoryFetch([hash]);
     }
   });
 
@@ -331,8 +354,9 @@
     destroyed = true;
     if (filterDebounceTimer) { clearTimeout(filterDebounceTimer); filterDebounceTimer = null; }
     if (historyFetchTimer) { clearTimeout(historyFetchTimer); historyFetchTimer = null; }
-    for (const t of searchTimeouts.values()) clearTimeout(t);
-    searchTimeouts.clear();
+    // Leave searchTimeouts alone: tabs/`isSearching` persist in the layout-
+    // scoped store, and grace/watchdog callbacks only patch that store. Clearing
+    // them here used to strand spinners when search-complete was missed.
     for (const id of miscTimers) clearTimeout(id);
   });
 
@@ -689,6 +713,19 @@
 
   function getDownloadTransfer(result: SearchResult): Transfer | undefined {
     return downloadsByHash.get(result.file.hash);
+  }
+
+  /** Statuses that mean a download is still in flight and should block a new
+   * start_download from Search. Terminal failed/completed do not block retry. */
+  const BLOCKING_DOWNLOAD_STATUSES = new Set([
+    'searching', 'queued', 'active', 'paused', 'stopped',
+    'verifying', 'completing', 'hashing', 'insufficient', 'noneneeded',
+  ]);
+
+  function getBlockingDownloadTransfer(result: SearchResult): Transfer | undefined {
+    const t = getDownloadTransfer(result);
+    if (!t) return undefined;
+    return BLOCKING_DOWNLOAD_STATUSES.has(t.status) ? t : undefined;
   }
 
   function dlBadgeLabel(t: Transfer): string {
@@ -1056,6 +1093,7 @@
 
     getSettings()
       .then((s) => {
+        if (searchInvokeSettled.has(requestId)) return;
         if (!searchTimeouts.has(requestId)) return; // search already finished
         if (s.search_timeout_secs !== timeoutSec) {
           timeoutSec = s.search_timeout_secs;
@@ -1074,6 +1112,7 @@
       // fire later and call cancelSearch() against a request the backend has
       // already closed, then arm a short completion fallback so a dropped
       // `search-complete` event can't leave the spinner stuck forever.
+      searchInvokeSettled.add(requestId);
       clearSearchTimeoutForRequest(requestId);
       if (!get(searchTabs).some((t) => t.requestId === requestId)) {
         return;
@@ -1086,6 +1125,7 @@
       }
       armSearchCompletionFallback(requestId, method);
     } catch (e: unknown) {
+      searchInvokeSettled.add(requestId);
       clearSearchTimeoutForRequest(requestId);
       if (!get(searchTabs).some((t) => t.requestId === requestId)) return;
       const msg = translateError(e, m.search_failed());
@@ -1298,7 +1338,7 @@
     // active transfer — harmless server-side (`already_queued: true`), but
     // it's an extra IPC round-trip and toast the disabled button exists
     // specifically to prevent.
-    if (getDownloadTransfer(result)) return;
+    if (getBlockingDownloadTransfer(result)) return;
 
     const networkAddresses = (result.source_addresses ?? []).filter(
       (a) => a && a !== 'local'
@@ -1500,7 +1540,19 @@
   function performClearResults() {
     const tabId = get(activeSearchTabId);
     if (!tabId) return;
-    searchTabs.update((tabs) => tabs.map((t) => (t.id === tabId ? { ...t, results: [], error: null } : t)));
+    const tab = get(searchTabs).find((t) => t.id === tabId);
+    if (tab?.isSearching) {
+      clearSearchTimeoutForRequest(tab.requestId);
+      searchInvokeSettled.add(tab.requestId);
+      void cancelSearch(tab.requestId).catch(() => { /* best effort */ });
+    }
+    searchTabs.update((tabs) =>
+      tabs.map((t) =>
+        t.id === tabId
+          ? { ...t, results: [], error: null, isSearching: false, progress: null }
+          : t,
+      ),
+    );
     selectedResultKey = null;
     notes = [];
     spamExplainLoading = false;
@@ -1580,6 +1632,7 @@
     let queued = 0;
     let failed = 0;
     let skippedLocal = 0;
+    let alreadyQueued = 0;
     const failures: string[] = [];
 
     // Fan out with bounded concurrency so the backend doesn't get hammered
@@ -1601,6 +1654,10 @@
           skippedLocal++;
           continue;
         }
+        if (getBlockingDownloadTransfer(result)) {
+          alreadyQueued++;
+          continue;
+        }
         // Same as single-row download: a hash without embedded addresses
         // still queues; the backend discovers sources.
         try {
@@ -1612,7 +1669,7 @@
           const extraSources = primaryAddr
             ? networkAddrs.filter((addr) => addr !== primaryAddr)
             : networkAddrs.slice();
-          await startDownload(
+          const res = await startDownload(
             result.file.hash,
             result.file.name,
             result.file.size,
@@ -1620,7 +1677,11 @@
             peerPort,
             extraSources
           );
-          queued++;
+          if (res.already_queued) {
+            alreadyQueued++;
+          } else {
+            queued++;
+          }
         } catch (e) {
           failed++;
           const msg = translateError(e, m.search_bulk_download_failed());
@@ -1641,6 +1702,7 @@
 
     const parts: string[] = [];
     if (queued > 0) parts.push(m.search_bulk_queued({ count: queued }));
+    if (alreadyQueued > 0) parts.push(`${alreadyQueued}× ${m.search_already_in_queue()}`);
     if (skippedLocal > 0) parts.push(m.search_bulk_already_in_library({ count: skippedLocal }));
     if (failed > 0) parts.push(m.search_bulk_failed({ count: failed }));
     bulkDownloadMessage = parts.join(', ');
@@ -1653,6 +1715,8 @@
     if (queued > 0 && failed === 0) {
       const base = queued === 1 ? m.search_bulk_queued_one() : m.search_bulk_queued_other({ count: queued });
       addToast('success', skippedLocal > 0 ? m.search_bulk_queued_with_local({ base, local: skippedLocal }) : base);
+    } else if (queued === 0 && alreadyQueued > 0 && failed === 0) {
+      addToast('info', m.search_already_in_queue());
     } else if (failed > 0) {
       const head = failures.slice(0, 3).join(' · ');
       const more = failures.length > 3 ? m.search_bulk_more({ count: failures.length - 3 }) : '';
@@ -1976,9 +2040,9 @@
 </div>
 
 <div class="page-content">
-  {#if (searchMethod === 'kad' && $networkStats.status === 'disconnected')
-    || (searchMethod === 'server' && $serverStatus === 'disconnected')
-    || (searchMethod === 'global' && $networkStats.status === 'disconnected' && $serverStatus === 'disconnected')}
+  {#if (searchMethod === 'kad' && $networkStats.status !== 'connected')
+    || (searchMethod === 'server' && $serverStatus !== 'connected')
+    || (searchMethod === 'global' && $networkStats.status !== 'connected' && $serverStatus !== 'connected')}
     <div class="search-readiness-hint" role="status">
       {m.search_network_disconnected_hint()}
     </div>
@@ -2148,6 +2212,7 @@
         {#each filteredResults as result, idx (resultKey(result))}
           {@const rKey = resultKey(result)}
           {@const dlTransfer = getDownloadTransfer(result)}
+          {@const blockingDl = getBlockingDownloadTransfer(result)}
           <tr
             class="{dlRowClass(dlTransfer)}"
             class:spam-row={result.is_spam}
@@ -2267,7 +2332,7 @@
                     <polyline points="3,8 7,12 13,4"/>
                   </svg>
                 </button>
-              {:else if dlTransfer}
+              {:else if blockingDl}
                 <button
                   class="row-dl-btn"
                   type="button"
