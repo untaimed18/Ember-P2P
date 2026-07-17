@@ -284,6 +284,12 @@ impl ServerList {
         &mut self,
         ip_filter: &mut crate::network::kad::ip_filter::IpFilter,
     ) -> usize {
+        // While an enabled filter is still loading ranges, `is_blocked` fail-closes
+        // for every public IP. Running retain in that window would wipe server.met.
+        // Callers re-run after `mark_ranges_ready` (deferred load / enable).
+        if ip_filter.is_enabled() && !ip_filter.ranges_ready() {
+            return 0;
+        }
         let before = self.servers.len();
         self.servers.retain(|s| {
             if let Ok(addr) = s.ip.parse::<Ipv4Addr>() {

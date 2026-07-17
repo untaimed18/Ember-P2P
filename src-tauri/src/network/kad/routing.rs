@@ -1123,7 +1123,14 @@ impl RoutingTable {
         }
         if let Some(ref filter) = self.range_ip_filter {
             match filter.read() {
-                Ok(snap) => snap.is_blocked(ip),
+                Ok(snap) => {
+                    // Fail-closed while ranges load is for inbound peer gates only.
+                    // Evicting against that window would wipe the whole routing table.
+                    if snap.enabled && !snap.ranges_ready {
+                        return false;
+                    }
+                    snap.is_blocked(ip)
+                }
                 // Don't mass-evict on a poisoned lock — insert path already
                 // fails closed for new contacts.
                 Err(_) => false,

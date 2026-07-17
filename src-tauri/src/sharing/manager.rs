@@ -651,7 +651,9 @@ impl TransferManager {
     /// is actively maintaining.
     pub fn update_source_total(&mut self, id: &str, total: u32) {
         if let Some(transfer) = self.get_transfer_mut(id) {
-            transfer.sources = transfer.sources.max(total);
+            // Replace, don't ratchet upward forever — discovery can shrink
+            // when sources expire or a file loses availability.
+            transfer.sources = total;
         }
     }
 

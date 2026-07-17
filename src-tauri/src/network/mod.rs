@@ -3199,6 +3199,8 @@ async fn mark_download_insufficient(
             "id": transfer_id,
             "status": "insufficient",
             "error": "Insufficient disk space",
+            "failure_kind": "insufficient_disk",
+            "failure_stage": "disk_space",
             "file_name": file_name,
         }),
     );
@@ -4515,6 +4517,13 @@ async fn handle_server_disconnect(
         "server-status-changed",
         serde_json::json!({ "status": "disconnected" }),
     );
+    // eD2K-only sessions (KAD never connected) must re-arm the upload gate
+    // on server drop; otherwise peers keep uploading after we go offline.
+    if state.stats.status == NetworkStatus::Disconnected {
+        state
+            .upload_disconnected
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Max preferred-server connect failures before auto-reconnect stops and the
@@ -7294,11 +7303,22 @@ pub async fn start_network(
             if handle.is_finished() {
                 match deferred_disk_loads.take().unwrap().await {
                     Ok(loads) => {
-                        state.ip_filter = loads.ip_filter;
-                        state.ip_filter.mark_ranges_ready();
+                        // Preserve enable/private flags and any ranges the
+                        // user added while the deferred load was in flight.
+                        let live_enabled = state.ip_filter.is_enabled();
+                        let live_block_private = state.ip_filter.blocks_private();
+                        let mut loaded = loads.ip_filter;
+                        loaded.merge_ranges_from(&state.ip_filter);
+                        loaded.set_enabled(live_enabled);
+                        loaded.set_block_private(live_block_private);
+                        if live_enabled {
+                            loaded.mark_ranges_ready();
+                        }
+                        state.ip_filter = loaded;
                         state
                             .ip_filter
                             .update_shared_snapshot(&state.shared_ip_filter);
+                        state.routing_table.evict_filtered_contacts();
                         known_files.absorb_missing_from(loads.known_files);
                         state.aich_hash_sets = loads.aich_hash_sets;
                         for (k, v) in loads.aich_root_map {
@@ -7760,7 +7780,7 @@ pub async fn start_network(
                     if !chunk.is_empty() {
                         match conn.offer_files_chunk(&chunk, settings.tcp_port).await {
                             Ok(()) => {
-                                replace_offered_ed2k_hashes(&mut state, &chunk);
+                                record_offered_ed2k_hashes(&mut state, &chunk);
                                 if files.is_empty() {
                                     pending_offer_files = None;
                                     if let Some(sig) = pending_offer_signature.take() {
@@ -9378,7 +9398,6 @@ pub async fn start_network(
                 } else {
                     None
                 };
-                let was_completed = completed_file_hash.is_some();
                 let mut promoted = Vec::new();
                 // Isolate per-event panics so one malformed/unexpected download
                 // event can't unwind the whole network loop (→ outer catch →
@@ -9450,88 +9469,9 @@ pub async fn start_network(
                     ).await;
                 }
 
-                // M10: auto-resume the highest-priority paused download when a
-                // free concurrent slot exists (complete→promote already filled
-                // active slots up to the cap).
-                if was_completed {
-                    let resume_candidate = {
-                        let mgr = transfer_manager.read().await;
-                        if mgr.active_download_count() >= mgr.max_concurrent as usize {
-                            None
-                        } else {
-                            let mut paused: Vec<_> = mgr
-                                .active
-                                .values()
-                                .chain(mgr.queue.iter())
-                                .filter(|t| {
-                                    t.direction == TransferDirection::Download
-                                        && t.status == TransferStatus::Paused
-                                })
-                                .collect();
-                            paused.sort_by(|a, b| {
-                                priority_str_to_u32(&b.priority)
-                                    .cmp(&priority_str_to_u32(&a.priority))
-                            });
-                            paused.first().map(|t| {
-                                (
-                                    t.id.clone(),
-                                    t.file_hash.clone(),
-                                    t.file_name.clone(),
-                                    t.total_size,
-                                    t.priority.clone(),
-                                )
-                            })
-                        }
-                    };
-                    if let Some((rid, fhash, fname, fsize, prio)) = resume_candidate {
-                        let control = TransferControl::new();
-                        let mut started = false;
-                        {
-                            let mut mgr = transfer_manager.write().await;
-                            // Re-check under write lock — another promotion may
-                            // have filled the last slot since the read above.
-                            if mgr.active_download_count() < mgr.max_concurrent as usize {
-                                mgr.update_status(&rid, TransferStatus::Searching);
-                                mgr.register_control(&rid, control.clone());
-                                started = true;
-                            }
-                        }
-                        if started {
-                            state.pending_downloads.insert(
-                                rid.clone(),
-                                PendingDownload {
-                                    transfer_id: rid.clone(),
-                                    file_hash: fhash.clone(),
-                                    file_name: fname.clone(),
-                                    file_size: fsize,
-                                    control,
-                                    search_count: 0,
-                                    last_search_at: 0,
-                                    priority: priority_str_to_u32(&prio),
-                                },
-                            );
-                            {
-                                let db = db.clone();
-                                let rid = rid.clone();
-                                tokio::task::spawn_blocking(move || {
-                                    if let Err(e) = db.update_transfer_status(&rid, "searching") {
-                                        warn!(
-                                            "DB update_transfer_status('searching') failed for {rid}: {e}"
-                                        );
-                                    }
-                                });
-                            }
-                            let _ = app_handle.emit(
-                                "transfer-status",
-                                serde_json::json!({ "id": rid, "status": "searching" }),
-                            );
-                            info!(
-                                "Auto-resumed paused download {} ({}) after completion",
-                                rid, fname
-                            );
-                        }
-                    }
-                }
+                // Do not auto-resume user-paused downloads when a transfer
+                // completes — Pausing is an explicit user action. Concurrent
+                // slot refill for queued (not paused) work is handled elsewhere.
             }
 
             // Upload events from the peer-to-peer upload listener
@@ -17822,10 +17762,6 @@ pub async fn start_network(
                     && state.pending_server_connect.is_none()
                     && state.server_connection.is_none()
                     && state.preferred_ed2k_server.is_some()
-                    && matches!(
-                        state.stats.status,
-                        NetworkStatus::Connected | NetworkStatus::Connecting
-                    )
                 {
                     if state.server_reconnect_failures >= AUTO_CONNECT_MAX_FAILURES {
                         let (ip, port) = state.preferred_ed2k_server.clone().unwrap_or_default();
@@ -25754,7 +25690,10 @@ async fn handle_command_inner(
             state.active_established_senders.remove(&transfer_id);
             state.active_source_overflow.remove(&transfer_id);
             state.active_kad_search_state.remove(&transfer_id);
-            state.per_file_sources.remove(&transfer_id);
+            // Cancel (delete) clears known sources; Stop preserves them for resume.
+            if cleanup_ack.is_some() {
+                state.per_file_sources.remove(&transfer_id);
+            }
             if let Some(handle) = state.download_handles.remove(&transfer_id) {
                 if cleanup_ack.is_none() {
                     // Stop path: preserve .part.met for resume
@@ -28131,13 +28070,6 @@ async fn handle_command_inner(
             }
             handle_server_disconnect(state, shared_server_addr, app_handle, "User disconnected")
                 .await;
-            // If KAD is also down, re-arm the upload gate so a disconnected
-            // session is not silently uploadable again.
-            if state.stats.status == NetworkStatus::Disconnected {
-                state
-                    .upload_disconnected
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-            }
         }
 
         NetworkCommand::AddServer { ip, port, name, tx } => {
