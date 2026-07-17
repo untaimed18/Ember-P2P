@@ -346,7 +346,9 @@
     listen<{ transfer_id: string }>('transfer:sources-updated', (event) => {
       const d = event.payload;
       if (d.transfer_id === expandedTransferId) {
-        refreshExpandedSourceDetails(d.transfer_id);
+        // Post-write refresh: an empty snapshot is authoritative once the
+        // backend finished writing placeholder rows for this search.
+        refreshExpandedSourceDetails(d.transfer_id, true);
       }
     }).then((u) => { if (mounted) searchUnsubs.push(u); else u(); }).catch((e) => { console.error('Failed to subscribe to transfer:sources-updated:', e); });
 
@@ -426,11 +428,16 @@
   // Separate counter for opportunistic refreshes so they never invalidate
   // toggleSourceDetail's requestId (which would leave loadingSources stuck).
   let sourceRefreshRequestId = 0;
+  // Consecutive empty API snapshots while the drawer still shows rows.
+  // One empty read can race discovery writes; two in a row (or a
+  // post-write `sources-updated` empty) is treated as authoritative.
+  let emptySourceSnapshotStreak = 0;
 
   async function toggleSourceDetail(t: Transfer) {
     if (expandedTransferId === t.id) {
       expandedTransferId = null;
       expandedSources = [];
+      emptySourceSnapshotStreak = 0;
       sourceLoadError = null;
       sourceDetailRequestId += 1;
       return;
@@ -439,6 +446,7 @@
     expandedTransferId = t.id;
     loadingSources = true;
     sourceLoadError = null;
+    emptySourceSnapshotStreak = 0;
     // Switching to a different download: clear the previous file's rows up
     // front so the table shows the loading spinner instead of rendering the
     // old peers under the NEW file's name (the file_name column reads from
@@ -493,7 +501,10 @@
     }
   }
 
-  async function refreshExpandedSourceDetails(transferId: string) {
+  // Consecutive empty API snapshots are tracked via emptySourceSnapshotStreak
+  // (declared with the source-drawer state above).
+
+  async function refreshExpandedSourceDetails(transferId: string, authoritativeEmpty = false) {
     // Do NOT bump sourceDetailRequestId — that would invalidate the open
     // toggle's loading clear and leave the source drawer stuck spinning.
     const refreshGen = ++sourceRefreshRequestId;
@@ -502,19 +513,34 @@
       const sources = await getTransferSources(transferId);
       if (expandedTransferId !== transferId || refreshGen !== sourceRefreshRequestId) return;
       if (expandedSources === preFetchSources) {
-        // Prefer non-empty snapshots: an empty API race must not wipe
-        // live push-fed rows while discovery is still writing.
-        if (sources.length > 0 || preFetchSources.length === 0) {
+        if (sources.length > 0) {
+          emptySourceSnapshotStreak = 0;
           expandedSources = sources;
+        } else if (preFetchSources.length === 0) {
+          emptySourceSnapshotStreak = 0;
+          expandedSources = sources;
+        } else {
+          // Soft-drop a single empty race, but apply empty after a second
+          // consecutive empty (or when the backend says writes finished).
+          emptySourceSnapshotStreak += 1;
+          if (authoritativeEmpty || emptySourceSnapshotStreak >= 2) {
+            emptySourceSnapshotStreak = 0;
+            expandedSources = [];
+          }
         }
       } else {
         const liveByKey = new Map<string, SourceInfo>();
         for (const s of expandedSources) liveByKey.set(`${s.ip}:${s.port}`, s);
         if (sources.length === 0) {
-          // Keep push-fed rows when the snapshot is still empty.
+          emptySourceSnapshotStreak += 1;
+          if (authoritativeEmpty || emptySourceSnapshotStreak >= 2) {
+            emptySourceSnapshotStreak = 0;
+            expandedSources = [];
+          }
           if (expandedTransferId === transferId) loadingSources = false;
           return;
         }
+        emptySourceSnapshotStreak = 0;
         expandedSources = sources.map((s) => liveByKey.get(`${s.ip}:${s.port}`) ?? s);
       }
       if (expandedTransferId === transferId) {
@@ -1445,7 +1471,8 @@
       }
       case 'queued':
         if (t.sources === 0) return m.transfers_dl_status_searching();
-        if (t.queue_rank != null && t.queue_rank > 0) return m.transfers_dl_status_queued_rank({ rank: t.queue_rank });
+        // Transfer-level queue_rank is never populated by the backend; per-source
+        // ranks still show in the source drawer via SourceInfo.queue_rank.
         return m.transfer_status_queued();
       case 'paused': return m.transfer_status_paused();
       case 'stopped': return m.transfer_status_stopped();
