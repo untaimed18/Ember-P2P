@@ -293,6 +293,28 @@ export interface EmberDiagnostics {
   ember_dht_buddy_publishes: number;
   /** PROXY_STORE requests accepted and fanned out as a buddy. */
   ember_dht_buddy_forwards: number;
+  /** Outbound FIND_VALUE frames sent this session. */
+  ember_dht_find_values_sent: number;
+  /** Completed FIND_VALUE searches that gathered ≥1 record. */
+  ember_dht_search_hits: number;
+  /** Completed FIND_VALUE searches that returned no records. */
+  ember_dht_search_misses: number;
+  /** Iterative search rounds that dispatched ≥1 query. */
+  ember_dht_search_rounds: number;
+  /** Inbound FIND_VALUE answered with FOUND_VALUE. */
+  ember_dht_find_value_hits: number;
+  /** Inbound FIND_VALUE answered with FOUND_NODE. */
+  ember_dht_find_value_misses: number;
+  /** Outbound STORE_ACK receipts this session. */
+  ember_dht_stores_acked: number;
+  /** Outbound STORE targets that failed/timed out. */
+  ember_dht_stores_failed: number;
+  /** Sum of acked counts across finished publishes. */
+  ember_dht_replication_sum: number;
+  /** Finished publish operations this session. */
+  ember_dht_publishes_completed: number;
+  /** Average STORE replication depth (acks per finished publish). */
+  ember_dht_avg_replication: number;
 }
 
 /** Result of an `ember_ping_peer` harness round-trip. `rtt_ms` is set
@@ -314,6 +336,31 @@ export interface EmberDhtContact {
   ed25519_pub: string;
   last_seen: number;
   failed_queries: number;
+  /** XOR distance from our node ID, hex (slice 16). */
+  distance?: string;
+}
+
+/** One in-flight Ember DHT iterative search (slice 16). */
+export interface EmberDhtSearchEntry {
+  id: number;
+  type: string;
+  target: string;
+  keyword_count: number;
+  results: number;
+  queried: number;
+  in_flight: number;
+  responded: number;
+  pending: number;
+  complete: boolean;
+  age_secs: number;
+}
+
+/** One live key in the local Ember DHT store (slice 16). */
+export interface EmberDhtStoreEntry {
+  key: string;
+  record_count: number;
+  keyword_records: number;
+  source_records: number;
 }
 
 /** Result of a single-hop `ember_dht_find_node`: the contacts a peer

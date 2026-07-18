@@ -15,6 +15,23 @@ const SEARCH_TIMEOUT_SECS: u64 = 60;
 /// Maximum results returned from a single search.
 const MAX_SEARCH_RESULTS: usize = 300;
 
+/// Diagnostic row for one in-flight Ember DHT search (slice 16).
+#[derive(Debug, Clone)]
+pub struct SearchSnapshot {
+    pub id: u32,
+    pub search_type: String,
+    pub target: String,
+    pub keyword_count: u32,
+    pub results: u32,
+    pub queried: u32,
+    pub in_flight: u32,
+    pub responded: u32,
+    pub pending: u32,
+    pub complete: bool,
+    /// Seconds since the search started (wall-clock relative).
+    pub started_at_secs: u64,
+}
+
 /// State of a node in the search shortlist.
 #[derive(Debug, Clone, PartialEq)]
 enum NodeState {
@@ -417,6 +434,47 @@ impl SearchManager {
         self.searches.len()
     }
 
+    /// Diagnostic snapshot of every in-flight iterative search (slice 16).
+    pub fn snapshot(&self) -> Vec<SearchSnapshot> {
+        self.searches
+            .values()
+            .map(|s| {
+                let in_flight = s
+                    .shortlist
+                    .iter()
+                    .filter(|e| e.state == NodeState::InFlight)
+                    .count() as u32;
+                let responded = s
+                    .shortlist
+                    .iter()
+                    .filter(|e| e.state == NodeState::Responded)
+                    .count() as u32;
+                let pending = s
+                    .shortlist
+                    .iter()
+                    .filter(|e| e.state == NodeState::Pending)
+                    .count() as u32;
+                SearchSnapshot {
+                    id: s.id,
+                    search_type: match s.search_type {
+                        SearchType::FindNode => "Node",
+                        SearchType::FindValue => "Value",
+                    }
+                    .to_string(),
+                    target: s.target.to_hex(),
+                    keyword_count: 1 + s.keyword_hashes.len() as u32,
+                    results: s.results.len() as u32,
+                    queried: s.queried.len() as u32,
+                    in_flight,
+                    responded,
+                    pending,
+                    complete: s.complete,
+                    started_at_secs: s.started_at.elapsed().as_secs(),
+                }
+            })
+            .collect()
+    }
+
     fn alloc_id(&mut self) -> Option<u32> {
         if self.searches.len() >= MAX_ACTIVE_SEARCHES {
             warn!(
@@ -441,9 +499,6 @@ impl SearchManager {
 }
 
 /// Compute the BLAKE3-based keyword hash used as a DHT key.
-/// Multi-keyword search hashes each keyword individually and searches
-/// for the primary (longest) keyword, then intersects results client-side
-/// for secondary keywords.
 pub fn keyword_hash(keyword: &str) -> [u8; 16] {
     let normalized = keyword.to_lowercase();
     let hash = blake3::hash(normalized.as_bytes());
@@ -452,9 +507,10 @@ pub fn keyword_hash(keyword: &str) -> [u8; 16] {
     key
 }
 
-/// Compute keyword hashes for a multi-word query. Returns a list of
-/// (keyword_hash, keyword_text) pairs, sorted by keyword length descending
-/// (so the first entry is the primary keyword used for DHT lookup).
+/// Compute keyword hashes for a multi-word query. Returns `(hash, text)` pairs
+/// sorted by keyword length descending (longest / most selective first). The
+/// first entry is the primary DHT walk key; the rest ride on FIND_VALUE for
+/// peer-side `file_hash` intersection.
 pub fn compute_keyword_hashes(query: &str) -> Vec<([u8; 16], String)> {
     let mut keywords: Vec<String> = query
         .split_whitespace()

@@ -4,8 +4,8 @@ use crate::app_state::AppState;
 use crate::commands::errors::{await_reply, bounded_send, coded, coded_ctx};
 use crate::network::ember::dht::publish::SignedRecord;
 use crate::network::{
-    EmberDhtContactInfo, EmberMaintenanceResult, EmberPublishResult, NetworkCommand,
-    PeerReputationInfo, ReputationStatsInfo,
+    EmberDhtContactInfo, EmberDhtSearchInfo, EmberDhtStoreInfo, EmberMaintenanceResult,
+    EmberPublishResult, NetworkCommand, PeerReputationInfo, ReputationStatsInfo,
 };
 use crate::types::EmberDiagnostics;
 use crate::types::*;
@@ -1340,6 +1340,32 @@ pub async fn get_ember_dht_contacts(
     state
         .network_tx
         .try_send(NetworkCommand::GetEmberDhtContacts { tx })
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+    await_reply(rx, "peers_no_response", "No response").await
+}
+
+/// Snapshot in-flight Ember DHT iterative searches (slice 16).
+#[tauri::command]
+pub async fn get_ember_dht_searches(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<EmberDhtSearchInfo>, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state
+        .network_tx
+        .try_send(NetworkCommand::GetEmberDhtSearches { tx })
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+    await_reply(rx, "peers_no_response", "No response").await
+}
+
+/// Snapshot live Ember DHT store keys (slice 16).
+#[tauri::command]
+pub async fn get_ember_dht_store(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<EmberDhtStoreInfo>, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state
+        .network_tx
+        .try_send(NetworkCommand::GetEmberDhtStore { tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
     await_reply(rx, "peers_no_response", "No response").await
 }

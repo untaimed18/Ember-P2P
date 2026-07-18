@@ -18,6 +18,15 @@ const DEFAULT_RECORD_TTL: Duration = Duration::from_secs(24 * 3600);
 /// we treat it as bogus (clock-skew tolerance between peers).
 const CLOCK_SKEW_TOLERANCE_SECS: i64 = 3600;
 
+/// One live key in the local store, for the diagnostic UI (slice 16).
+#[derive(Debug, Clone)]
+pub struct DhtStoreEntry {
+    pub key: [u8; 16],
+    pub record_count: u32,
+    pub keyword_records: u32,
+    pub source_records: u32,
+}
+
 /// A signed record stored in the DHT.
 #[derive(Debug, Clone)]
 pub struct DhtRecord {
@@ -230,6 +239,43 @@ impl DhtStore {
     /// Number of distinct keys.
     pub fn key_count(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Snapshot of live keys for the diagnostic UI. Sorted by record count
+    /// descending, capped at `max`.
+    pub fn snapshot(&self, max: usize) -> Vec<DhtStoreEntry> {
+        let now = Instant::now();
+        let mut out: Vec<DhtStoreEntry> = self
+            .entries
+            .iter()
+            .filter_map(|(key, records)| {
+                let live: Vec<_> = records.iter().filter(|r| r.expires_at > now).collect();
+                if live.is_empty() {
+                    return None;
+                }
+                let mut keyword_records = 0u32;
+                let mut source_records = 0u32;
+                for r in &live {
+                    match r.data.first() {
+                        Some(&RECORD_TYPE_SOURCE) => {
+                            source_records = source_records.saturating_add(1);
+                        }
+                        _ => {
+                            keyword_records = keyword_records.saturating_add(1);
+                        }
+                    }
+                }
+                Some(DhtStoreEntry {
+                    key: *key,
+                    record_count: live.len() as u32,
+                    keyword_records,
+                    source_records,
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| b.record_count.cmp(&a.record_count));
+        out.truncate(max);
+        out
     }
 
     /// Check if we are responsible for storing a key based on proximity.

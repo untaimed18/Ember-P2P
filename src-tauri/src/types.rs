@@ -578,6 +578,39 @@ pub struct EmberDiagnostics {
     /// PROXY_STORE requests we accepted and fanned out as a HighID buddy.
     #[serde(default)]
     pub ember_dht_buddy_forwards: u32,
+    /// Outbound `FIND_VALUE` frames sent this session (slice 17).
+    #[serde(default)]
+    pub ember_dht_find_values_sent: u32,
+    /// Completed FIND_VALUE searches that gathered at least one record.
+    #[serde(default)]
+    pub ember_dht_search_hits: u32,
+    /// Completed FIND_VALUE searches that returned no records.
+    #[serde(default)]
+    pub ember_dht_search_misses: u32,
+    /// Iterative search rounds that dispatched at least one query.
+    #[serde(default)]
+    pub ember_dht_search_rounds: u32,
+    /// Inbound FIND_VALUE answered with FOUND_VALUE (we held matching records).
+    #[serde(default)]
+    pub ember_dht_find_value_hits: u32,
+    /// Inbound FIND_VALUE answered with FOUND_NODE (miss / continue walk).
+    #[serde(default)]
+    pub ember_dht_find_value_misses: u32,
+    /// Outbound STORE_ACK receipts (successful remote stores) this session.
+    #[serde(default)]
+    pub ember_dht_stores_acked: u32,
+    /// Outbound STORE targets that failed or timed out this session.
+    #[serde(default)]
+    pub ember_dht_stores_failed: u32,
+    /// Sum of `acked` counts across finished publishes (for avg replication).
+    #[serde(default)]
+    pub ember_dht_replication_sum: u64,
+    /// Finished publish operations this session (denominator for avg replication).
+    #[serde(default)]
+    pub ember_dht_publishes_completed: u32,
+    /// Average STORE replication depth this session (`replication_sum / publishes`).
+    #[serde(default)]
+    pub ember_dht_avg_replication: u32,
 }
 
 /// Serializable KAD contact info for the frontend (mirrors eMule KadContactListCtrl columns)

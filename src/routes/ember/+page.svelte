@@ -11,15 +11,30 @@
   import { onMount, untrack } from 'svelte';
   import { goto } from '$app/navigation';
   import { getSettings, updateSettings } from '$lib/api/settings';
-  import { getEmberDiagnostics } from '$lib/api/ember';
+  import {
+    getEmberDiagnostics,
+    getEmberDhtContacts,
+    getEmberDhtSearches,
+    getEmberDhtStore,
+  } from '$lib/api/ember';
   import { emberDevToolsEnabled } from '$lib/stores/devTools';
-  import type { AppSettings, EmberDiagnostics } from '$lib/types';
+  import type {
+    AppSettings,
+    EmberDiagnostics,
+    EmberDhtContact,
+    EmberDhtSearchEntry,
+    EmberDhtStoreEntry,
+  } from '$lib/types';
   import { translateError } from '$lib/i18n';
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
   import * as m from '$lib/paraglide/messages';
 
   let settings = $state<AppSettings | null>(null);
   let diag = $state<EmberDiagnostics | null>(null);
+  let contacts = $state<EmberDhtContact[]>([]);
+  let searches = $state<EmberDhtSearchEntry[]>([]);
+  let storeEntries = $state<EmberDhtStoreEntry[]>([]);
+  let contactFilter = $state('');
   let loadError = $state<string | null>(null);
   let toggleError = $state<string | null>(null);
 
@@ -54,6 +69,22 @@
     inFlightDiag = true;
     try {
       diag = await getEmberDiagnostics();
+      if (diag.ember_native_enabled) {
+        const [c, s, st] = await Promise.all([
+          getEmberDhtContacts().catch(() => contacts),
+          getEmberDhtSearches().catch(() => searches),
+          getEmberDhtStore().catch(() => storeEntries),
+        ]);
+        if (!unmounted) {
+          contacts = c;
+          searches = s;
+          storeEntries = st;
+        }
+      } else if (!unmounted) {
+        contacts = [];
+        searches = [];
+        storeEntries = [];
+      }
       diagFailures = 0;
       diagStale = false;
       reconcileToggle();
@@ -67,6 +98,22 @@
     } finally {
       inFlightDiag = false;
     }
+  }
+
+  let filteredContacts = $derived.by(() => {
+    const q = contactFilter.trim().toLowerCase();
+    if (!q) return contacts;
+    return contacts.filter(
+      (c) =>
+        c.node_id.toLowerCase().includes(q) ||
+        c.addr.toLowerCase().includes(q) ||
+        (c.distance ?? '').toLowerCase().includes(q),
+    );
+  });
+
+  function shortHex(hex: string, head = 8, tail = 4): string {
+    if (hex.length <= head + tail + 1) return hex || '—';
+    return `${hex.slice(0, head)}…${hex.slice(-tail)}`;
   }
 
   // Keep the switch honest with the backend's *actual* state. Ember can
@@ -254,6 +301,151 @@
     </div>
   </section>
 
+  {#if isActive}
+    <section class="stat-grid secondary" class:dimmed={!isActive}>
+      <div class="stat">
+        <div class="stat-value">{diag?.ember_dht_search_hits ?? 0}/{diag?.ember_dht_search_misses ?? 0}</div>
+        <div class="stat-label">{m.ember_stat_search_hit_miss()}</div>
+      </div>
+      <div class="stat">
+        <div class="stat-value">{diag?.ember_dht_stores_acked ?? 0}/{diag?.ember_dht_stores_failed ?? 0}</div>
+        <div class="stat-label">{m.ember_stat_store_ack_fail()}</div>
+      </div>
+      <div class="stat">
+        <div class="stat-value">{diag?.ember_dht_avg_replication ?? 0}</div>
+        <div class="stat-label">{m.ember_stat_avg_replication()}</div>
+      </div>
+      <div class="stat">
+        <div class="stat-value">{diag?.ember_dht_active_searches ?? 0}</div>
+        <div class="stat-label">{m.ember_stat_active_searches()}</div>
+      </div>
+    </section>
+
+    <div class="dht-layout">
+      <section class="card dht-panel">
+        <div class="panel-head">
+          <h2>{m.ember_dht_contacts_title()}</h2>
+          <input
+            class="filter-input"
+            type="search"
+            bind:value={contactFilter}
+            placeholder={m.ember_dht_contacts_filter()}
+            aria-label={m.ember_dht_contacts_filter()}
+          />
+        </div>
+        <div class="table-wrap">
+          <table class="dht-table">
+            <thead>
+              <tr>
+                <th>{m.ember_dht_col_node_id()}</th>
+                <th>{m.ember_dht_col_addr()}</th>
+                <th>{m.ember_dht_col_distance()}</th>
+                <th>{m.ember_dht_col_fails()}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {#each filteredContacts as c (c.node_id + c.addr)}
+                <tr>
+                  <td title={c.node_id}><code>{shortHex(c.node_id)}</code></td>
+                  <td><code>{c.addr}</code></td>
+                  <td title={c.distance ?? ''}><code>{shortHex(c.distance ?? '', 6, 4)}</code></td>
+                  <td>{c.failed_queries}</td>
+                </tr>
+              {:else}
+                <tr><td colspan="4" class="empty">{m.ember_dht_contacts_empty()}</td></tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card dht-panel">
+        <h2>{m.ember_dht_status_title()}</h2>
+        <div class="kv compact">
+          <div class="k">{m.ember_stat_stored_keys()}</div>
+          <div class="v">{diag?.ember_dht_stored_keys ?? 0}</div>
+        </div>
+        <div class="kv compact">
+          <div class="k">{m.ember_stat_active_publishes()}</div>
+          <div class="v">{diag?.ember_dht_active_publishes ?? 0}</div>
+        </div>
+        <div class="kv compact">
+          <div class="k">{m.ember_stat_search_rounds()}</div>
+          <div class="v">{diag?.ember_dht_search_rounds ?? 0}</div>
+        </div>
+        <div class="kv compact">
+          <div class="k">{m.ember_stat_find_values_sent()}</div>
+          <div class="v">{diag?.ember_dht_find_values_sent ?? 0}</div>
+        </div>
+        <div class="kv compact">
+          <div class="k">{m.ember_stat_serve_hit_miss()}</div>
+          <div class="v">{diag?.ember_dht_find_value_hits ?? 0}/{diag?.ember_dht_find_value_misses ?? 0}</div>
+        </div>
+      </section>
+    </div>
+
+    <section class="card">
+      <h2>{m.ember_dht_searches_title()}</h2>
+      <div class="table-wrap">
+        <table class="dht-table">
+          <thead>
+            <tr>
+              <th>{m.ember_dht_search_col_id()}</th>
+              <th>{m.ember_dht_search_col_type()}</th>
+              <th>{m.ember_dht_search_col_target()}</th>
+              <th>{m.ember_dht_search_col_results()}</th>
+              <th>{m.ember_dht_search_col_progress()}</th>
+              <th>{m.ember_dht_search_col_age()}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each searches as s (s.id)}
+              <tr>
+                <td>{s.id}</td>
+                <td>{s.type}{#if s.keyword_count > 1} ({s.keyword_count}){/if}</td>
+                <td title={s.target}><code>{shortHex(s.target)}</code></td>
+                <td>{s.results}</td>
+                <td>{s.responded}/{s.queried} · {s.in_flight}↑ · {s.pending}…</td>
+                <td>{s.age_secs}s</td>
+              </tr>
+            {:else}
+              <tr><td colspan="6" class="empty">{m.ember_dht_searches_empty()}</td></tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>{m.ember_dht_store_title()}</h2>
+      <p class="hint">{m.ember_dht_store_hint()}</p>
+      <div class="table-wrap">
+        <table class="dht-table">
+          <thead>
+            <tr>
+              <th>{m.ember_dht_store_col_key()}</th>
+              <th>{m.ember_dht_store_col_records()}</th>
+              <th>{m.ember_dht_store_col_keyword()}</th>
+              <th>{m.ember_dht_store_col_source()}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each storeEntries as e (e.key)}
+              <tr>
+                <td title={e.key}><code>{shortHex(e.key)}</code></td>
+                <td>{e.record_count}</td>
+                <td>{e.keyword_records}</td>
+                <td>{e.source_records}</td>
+              </tr>
+            {:else}
+              <tr><td colspan="4" class="empty">{m.ember_dht_store_empty()}</td></tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  {/if}
+
   <!-- Local identity -->
   <section class="card">
     <h2>{m.ember_identity_title()}</h2>
@@ -308,7 +500,7 @@
    */
   .ember-inner {
     padding: 24px;
-    max-width: 880px;
+    max-width: 1100px;
     margin: 0 auto;
     display: flex;
     flex-direction: column;
@@ -439,6 +631,94 @@
     color: var(--text-muted);
   }
 
+  .stat-grid.secondary .stat-value {
+    font-size: 18px;
+  }
+
+  .dht-layout {
+    display: grid;
+    grid-template-columns: 1.6fr 1fr;
+    gap: 16px;
+  }
+
+  .dht-panel {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .panel-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  .panel-head h2 {
+    margin: 0;
+  }
+
+  .filter-input {
+    flex: 1;
+    min-width: 140px;
+    max-width: 260px;
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-size: 13px;
+  }
+
+  .table-wrap {
+    overflow: auto;
+    max-height: 280px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+  }
+
+  .dht-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+
+  .dht-table th,
+  .dht-table td {
+    padding: 6px 10px;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+
+  .dht-table th {
+    position: sticky;
+    top: 0;
+    background: var(--bg-secondary);
+    color: var(--text-muted);
+    font-weight: 600;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+  }
+
+  .dht-table code {
+    font-size: 11px;
+  }
+
+  .dht-table .empty {
+    color: var(--text-muted);
+    text-align: center;
+    padding: 16px;
+  }
+
+  .kv.compact {
+    margin: 0;
+    padding: 4px 0;
+  }
+
   .kv {
     display: grid;
     grid-template-columns: 160px 1fr;
@@ -561,6 +841,9 @@
   @media (max-width: 640px) {
     .stat-grid {
       grid-template-columns: repeat(2, 1fr);
+    }
+    .dht-layout {
+      grid-template-columns: 1fr;
     }
     .kv {
       grid-template-columns: 1fr;

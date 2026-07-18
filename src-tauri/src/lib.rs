@@ -975,6 +975,8 @@ pub fn run() {
             commands::peers::get_ember_diagnostics,
             commands::peers::ember_ping_peer,
             commands::peers::get_ember_dht_contacts,
+            commands::peers::get_ember_dht_searches,
+            commands::peers::get_ember_dht_store,
             commands::peers::add_ember_dht_contact,
             commands::peers::ember_dht_ping_peer,
             commands::peers::ember_dht_find_node,

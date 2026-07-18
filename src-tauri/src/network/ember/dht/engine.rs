@@ -14,7 +14,7 @@
 //! That keeps the protocol logic unit-testable without a live socket or
 //! a `NetworkState`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -24,7 +24,7 @@ use tracing::trace;
 use super::messages::{self, DhtPayload};
 use super::publish::{SignedRecord, SourceContact, RECORD_TYPE_SOURCE};
 use super::routing::{AddResult, RoutingTable};
-use super::store::DhtStore;
+use super::store::{DhtStore, DhtStoreEntry};
 use super::{EmberContact, EmberNodeId, ID_BITS, K_BUCKET_SIZE, MAX_CONTACTS_PER_RESPONSE};
 use crate::network::ember::crypto;
 use crate::network::ember::SOURCE_FLAG_FIREWALLED;
@@ -66,6 +66,8 @@ pub struct DhtInbound {
     /// The frame was a `FIND_VALUE` we answered (with `FOUND_VALUE` if we
     /// held a record, else `FOUND_NODE` with the closest contacts).
     pub find_value_received: bool,
+    /// True when that `FIND_VALUE` was answered with `FOUND_VALUE` (hit).
+    pub find_value_hit: bool,
     /// The frame was a `STORE_ACK`; the `request_id` it answered (so the
     /// caller can resolve the matching publish query).
     pub store_ack_request_id: Option<u32>,
@@ -296,6 +298,11 @@ impl EmberDht {
     /// Local store stats `(distinct_keys, total_records)` for diagnostics.
     pub fn store_stats(&self) -> (usize, usize) {
         (self.store.key_count(), self.store.total_records())
+    }
+
+    /// Snapshot of live store keys for the diagnostic UI (capped).
+    pub fn store_entries(&self, max: usize) -> Vec<DhtStoreEntry> {
+        self.store.snapshot(max)
     }
 
     /// Drop expired records from the local store. Returns how many went.
@@ -586,38 +593,23 @@ impl EmberDht {
             }
             DhtPayload::FindValue { keys } => {
                 out.find_value_received = true;
-                // Answer with the records for the first requested key we
-                // hold; otherwise fall back to the closest contacts so the
-                // searcher can keep walking toward a node that has it.
-                let mut answered = false;
-                for key in &keys {
-                    // Serve only live records — an expired record that the
-                    // periodic sweep hasn't reaped yet must never satisfy a
-                    // lookup.
-                    let records = self.store.get_live(key);
-                    if !records.is_empty() {
-                        // Each FOUND_VALUE blob is `record_data ||
-                        // 64-byte publisher signature` so the searcher
-                        // can re-verify it end-to-end (the wire frame's
-                        // own signature only proves *we* relayed it).
-                        let blobs: Vec<Vec<u8>> = records
-                            .iter()
-                            .map(|r| {
-                                let mut b = Vec::with_capacity(r.data.len() + 64);
-                                b.extend_from_slice(&r.data);
-                                b.extend_from_slice(&r.signature);
-                                b
-                            })
-                            .collect();
-                        let fv =
-                            messages::build_found_value(self.local_id, msg.request_id, *key, blobs);
-                        out.responses
-                            .push(messages::encode_message(&fv, &self.signing_key, true));
-                        answered = true;
-                        break;
-                    }
-                }
-                if !answered {
+                // Multi-keyword wire intersection (when `keys.len() > 1`):
+                // serve primary-key (`keys[0]`) records whose `file_hash`
+                // appears under every secondary key we *also* hold. Keys we
+                // do not hold are skipped (sparse DHT — secondary keywords
+                // live near different IDs). If we hold no primary records,
+                // fall back to FOUND_NODE toward keys[0].
+                if let Some((primary, blobs)) = intersect_find_value_records(&self.store, &keys) {
+                    out.find_value_hit = true;
+                    let fv = messages::build_found_value(
+                        self.local_id,
+                        msg.request_id,
+                        primary,
+                        blobs,
+                    );
+                    out.responses
+                        .push(messages::encode_message(&fv, &self.signing_key, true));
+                } else {
                     let target = keys
                         .first()
                         .map(|k| EmberNodeId(*k))
@@ -649,6 +641,76 @@ impl EmberDht {
 
         out
     }
+}
+
+/// Extract `file_hash` from a packed Ember DHT record (`type || keyword_hash || file_hash || …`).
+fn file_hash_from_record_data(data: &[u8]) -> Option<[u8; 16]> {
+    if data.len() < 33 {
+        return None;
+    }
+    let mut h = [0u8; 16];
+    h.copy_from_slice(&data[17..33]);
+    Some(h)
+}
+
+/// Multi-keyword FIND_VALUE answer: primary-key blobs whose `file_hash`
+/// appears under every secondary key this node also holds. Secondary keys
+/// we do not hold are ignored (those records live elsewhere in the DHT).
+/// Returns `None` when we have no live primary records (caller sends FOUND_NODE).
+fn intersect_find_value_records(
+    store: &DhtStore,
+    keys: &[[u8; 16]],
+) -> Option<([u8; 16], Vec<Vec<u8>>)> {
+    let primary = *keys.first()?;
+    let primary_recs = store.get_live(&primary);
+    if primary_recs.is_empty() {
+        return None;
+    }
+
+    let mut allowed: Option<HashSet<[u8; 16]>> = None;
+    for key in keys.iter().skip(1) {
+        let secondary = store.get_live(key);
+        if secondary.is_empty() {
+            continue;
+        }
+        let hashes: HashSet<[u8; 16]> = secondary
+            .iter()
+            .filter_map(|r| file_hash_from_record_data(&r.data))
+            .collect();
+        allowed = Some(match allowed {
+            None => hashes,
+            Some(prev) => prev.intersection(&hashes).copied().collect(),
+        });
+    }
+
+    let filtered: Vec<&_> = match &allowed {
+        None => primary_recs,
+        Some(set) => primary_recs
+            .into_iter()
+            .filter(|r| {
+                file_hash_from_record_data(&r.data)
+                    .map(|h| set.contains(&h))
+                    .unwrap_or(false)
+            })
+            .collect(),
+    };
+
+    // Applied an AND and nothing survived → FOUND_NODE so the searcher
+    // keeps walking (we are not a useful value peer for this query).
+    if filtered.is_empty() {
+        return None;
+    }
+
+    let blobs: Vec<Vec<u8>> = filtered
+        .iter()
+        .map(|r| {
+            let mut b = Vec::with_capacity(r.data.len() + 64);
+            b.extend_from_slice(&r.data);
+            b.extend_from_slice(&r.signature);
+            b
+        })
+        .collect();
+    Some((primary, blobs))
 }
 
 #[cfg(test)]
@@ -795,6 +857,52 @@ mod tests {
         assert_eq!(parsed.file_name, "ubuntu.iso");
         assert_eq!(parsed.file_size, 4096);
         assert_eq!(parsed.keyword_hash, key);
+    }
+
+    #[test]
+    fn find_value_intersects_multi_keyword_by_file_hash() {
+        let mut a = dht(30);
+        let mut b = dht(31);
+        let mut c = dht(32); // second publisher (store dedupes by publisher key)
+        let a_noise = [0xAA; 32];
+        let c_noise = [0xCC; 32];
+        let b_noise = [0xBB; 32];
+        let a_addr = addr(30, 4672);
+        let c_addr = addr(32, 4672);
+        let b_addr = addr(31, 4672);
+
+        let both = [1u8; 16];
+        let only_ubuntu = [2u8; 16];
+        let r_both_u = a.build_keyword_record("ubuntu", both, [0u8; 32], 100, "ubuntu-server.iso");
+        let r_both_s = a.build_keyword_record("server", both, [0u8; 32], 100, "ubuntu-server.iso");
+        let r_only = c.build_keyword_record("ubuntu", only_ubuntu, [0u8; 32], 50, "ubuntu.iso");
+
+        for rec in [&r_both_u, &r_both_s] {
+            let (_rid, bytes) = a.build_store(rec.keyword_hash, rec.data.clone(), rec.signature);
+            assert!(
+                b.handle_message(&bytes, a_addr, a_noise, 1000)
+                    .stored_record
+            );
+        }
+        {
+            let (_rid, bytes) =
+                c.build_store(r_only.keyword_hash, r_only.data.clone(), r_only.signature);
+            assert!(
+                b.handle_message(&bytes, c_addr, c_noise, 1000)
+                    .stored_record
+            );
+        }
+
+        let (_frid, find_bytes) =
+            a.build_find_value(vec![r_both_u.keyword_hash, r_both_s.keyword_hash]);
+        let on_b = b.handle_message(&find_bytes, a_addr, a_noise, 1001);
+        assert!(on_b.find_value_hit, "peer holds primary+secondary keys");
+        let on_a = a.handle_message(&on_b.responses[0], b_addr, b_noise, 1002);
+        let (_rid, blobs) = on_a.found_value.expect("FOUND_VALUE");
+        assert_eq!(blobs.len(), 1, "only file_hash present under both keys");
+        let parsed = SignedRecord::from_value_blob(&blobs[0]).unwrap();
+        assert_eq!(parsed.file_hash, both);
+        assert_eq!(parsed.file_name, "ubuntu-server.iso");
     }
 
     fn source_contact_at(last: u8) -> SourceContact {

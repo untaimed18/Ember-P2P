@@ -3236,6 +3236,14 @@ pub enum NetworkCommand {
     GetEmberDhtContacts {
         tx: oneshot::Sender<Vec<EmberDhtContactInfo>>,
     },
+    /// Snapshot of in-flight Ember DHT searches (slice 16).
+    GetEmberDhtSearches {
+        tx: oneshot::Sender<Vec<EmberDhtSearchInfo>>,
+    },
+    /// Snapshot of live local store keys (slice 16).
+    GetEmberDhtStore {
+        tx: oneshot::Sender<Vec<EmberDhtStoreInfo>>,
+    },
     /// Send an Ember DHT `PING` over the Noise transport. Like
     /// [`NetworkCommand::SendEmberPing`] but exercises the DHT
     /// PING/PONG path (and so populates the routing table on both
@@ -3394,12 +3402,44 @@ pub struct EmberDhtContactInfo {
     pub last_seen: i64,
     /// Consecutive unanswered queries.
     pub failed_queries: u8,
+    /// XOR distance from our local node ID, hex-encoded (slice 16).
+    #[serde(default)]
+    pub distance: String,
+}
+
+/// One in-flight Ember DHT search for the diagnostic UI (slice 16).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EmberDhtSearchInfo {
+    pub id: u32,
+    #[serde(rename = "type")]
+    pub search_type: String,
+    pub target: String,
+    pub keyword_count: u32,
+    pub results: u32,
+    pub queried: u32,
+    pub in_flight: u32,
+    pub responded: u32,
+    pub pending: u32,
+    pub complete: bool,
+    pub age_secs: u64,
+}
+
+/// One live store key for the diagnostic UI (slice 16).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EmberDhtStoreInfo {
+    pub key: String,
+    pub record_count: u32,
+    pub keyword_records: u32,
+    pub source_records: u32,
 }
 
 /// Flatten a routing-table contact into its IPC representation. Shared
 /// by the `get_ember_dht_contacts` snapshot and the `FIND_NODE` reply
 /// path so the two never drift.
-fn ember_dht_contact_info(c: &ember::dht::EmberContact) -> EmberDhtContactInfo {
+fn ember_dht_contact_info(
+    c: &ember::dht::EmberContact,
+    local_id: ember::dht::EmberNodeId,
+) -> EmberDhtContactInfo {
     EmberDhtContactInfo {
         node_id: c.node_id.to_hex(),
         addr: c.addr.to_string(),
@@ -3407,6 +3447,7 @@ fn ember_dht_contact_info(c: &ember::dht::EmberContact) -> EmberDhtContactInfo {
         ed25519_pub: hex::encode(c.ed25519_pub),
         last_seen: c.last_seen,
         failed_queries: c.failed_queries,
+        distance: local_id.distance(&c.node_id).to_hex(),
     }
 }
 
@@ -24660,6 +24701,7 @@ async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkState, search
         None => return,
     };
 
+    let mut batch_sent = 0u32;
     for (contact, per_search_req_id) in batch {
         let (wire_req_id, frame) = match search_type {
             ember::dht::search::SearchType::FindNode => state.ember_dht.build_find_node(target),
@@ -24715,7 +24757,13 @@ async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkState, search
                 .ember_diagnostics
                 .ember_dht_find_nodes_sent
                 .saturating_add(1);
+        } else {
+            state.ember_diagnostics.ember_dht_find_values_sent = state
+                .ember_diagnostics
+                .ember_dht_find_values_sent
+                .saturating_add(1);
         }
+        batch_sent = batch_sent.saturating_add(1);
         state.ember_dht_search_requests.insert(
             wire_req_id,
             EmberSearchRequest {
@@ -24724,6 +24772,13 @@ async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkState, search
                 sent_at: std::time::Instant::now(),
             },
         );
+    }
+
+    if batch_sent > 0 {
+        state.ember_diagnostics.ember_dht_search_rounds = state
+            .ember_diagnostics
+            .ember_dht_search_rounds
+            .saturating_add(1);
     }
 
     maybe_finish_ember_search(state, search_id);
@@ -24753,7 +24808,11 @@ fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32) {
                 .map(|s| s.closest_responded())
                 .unwrap_or_default();
             if let Some(tx) = state.ember_dht_pending_lookups.remove(&search_id) {
-                let infos = contacts.iter().map(ember_dht_contact_info).collect();
+                let local_id = state.ember_dht.local_id();
+                let infos = contacts
+                    .iter()
+                    .map(|c| ember_dht_contact_info(c, local_id))
+                    .collect();
                 let _ = tx.send(infos);
             }
         }
@@ -24763,6 +24822,17 @@ fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32) {
                 .get(search_id)
                 .map(|s| s.results.iter().map(|r| r.data.clone()).collect::<Vec<_>>())
                 .unwrap_or_default();
+            if records.is_empty() {
+                state.ember_diagnostics.ember_dht_search_misses = state
+                    .ember_diagnostics
+                    .ember_dht_search_misses
+                    .saturating_add(1);
+            } else {
+                state.ember_diagnostics.ember_dht_search_hits = state
+                    .ember_diagnostics
+                    .ember_dht_search_hits
+                    .saturating_add(1);
+            }
             if let Some(tx) = state.ember_dht_pending_value_lookups.remove(&search_id) {
                 // Dev/command value lookup: hand the raw blobs to the waiter.
                 let _ = tx.send(records);
@@ -24874,6 +24944,10 @@ fn parse_ember_source_records(
 /// publishers seen for that file. Sources are intentionally empty: a
 /// keyword hit identifies the file, and source discovery runs separately
 /// via the slice-9 source lookup when a download starts.
+/// User keyword search (slice 10): build SearchResults from gathered
+/// keyword records. Multi-keyword queries already ask peers to intersect
+/// by `file_hash` on the wire; this still applies a filename substring AND
+/// as defense-in-depth (and for peers that only held the primary key).
 fn build_ember_keyword_results(blobs: &[Vec<u8>], keywords: &[String]) -> Vec<SearchResult> {
     use crate::search::index::infer_file_type;
 
@@ -25054,6 +25128,24 @@ fn maybe_finish_ember_publish(state: &mut NetworkState, publish_id: u32) {
             if !op.poll_complete() {
                 return;
             }
+            let acked = op.acked.len() as u32;
+            let failed = (op.targets.len().saturating_sub(op.acked.len())) as u32;
+            state.ember_diagnostics.ember_dht_stores_acked = state
+                .ember_diagnostics
+                .ember_dht_stores_acked
+                .saturating_add(acked);
+            state.ember_diagnostics.ember_dht_stores_failed = state
+                .ember_diagnostics
+                .ember_dht_stores_failed
+                .saturating_add(failed);
+            state.ember_diagnostics.ember_dht_replication_sum = state
+                .ember_diagnostics
+                .ember_dht_replication_sum
+                .saturating_add(acked as u64);
+            state.ember_diagnostics.ember_dht_publishes_completed = state
+                .ember_diagnostics
+                .ember_dht_publishes_completed
+                .saturating_add(1);
             EmberPublishResult {
                 stored_on: op.acked.len(),
                 targets: op.targets.len(),
@@ -25651,6 +25743,17 @@ async fn handle_ember_dht_message(
             .ember_diagnostics
             .ember_dht_find_values_received
             .saturating_add(1);
+        if inbound.find_value_hit {
+            state.ember_diagnostics.ember_dht_find_value_hits = state
+                .ember_diagnostics
+                .ember_dht_find_value_hits
+                .saturating_add(1);
+        } else {
+            state.ember_diagnostics.ember_dht_find_value_misses = state
+                .ember_diagnostics
+                .ember_dht_find_value_misses
+                .saturating_add(1);
+        }
     }
 
     // Buddy accepted a PROXY_STORE: fan the publisher-signed firewalled
@@ -25771,7 +25874,11 @@ async fn handle_ember_dht_message(
     // unsolicited and ignored.
     if let Some((rid, contacts)) = inbound.found_node {
         if let Some((_sent_at, tx)) = state.ember_dht_pending_finds.remove(&rid) {
-            let infos = contacts.iter().map(ember_dht_contact_info).collect();
+            let local_id = state.ember_dht.local_id();
+            let infos = contacts
+                .iter()
+                .map(|c| ember_dht_contact_info(c, local_id))
+                .collect();
             let _ = tx.send(infos);
         } else if let Some(req) = state.ember_dht_search_requests.remove(&rid) {
             // `process_response` gates on `(per_search_req_id, from_id)`,
@@ -28968,20 +29075,22 @@ async fn handle_command_inner(
                 true
             };
 
-            // --- Ember DHT keyword search (slice 10) ---
+            // --- Ember DHT keyword search (slice 10 + multi-keyword wire) ---
             // Streaming-only: it never touches the invoke oneshot (`tx`); its
             // hits arrive via `search-results` events and it gates
             // `search-complete` through `ember_pending`. Uses the longest
-            // (most selective) keyword as the DHT key, mirroring KAD; the
-            // remaining words are AND-filtered locally at emit time.
+            // (most selective) keyword as the DHT walk key; remaining
+            // keyword hashes ride on FIND_VALUE for peer-side file_hash
+            // intersection. Filename AND remains a defense-in-depth filter.
             if run_ember && settings.ember_native_enabled && state.ember_dht.contact_count() > 0 {
-                if let Some(primary_keyword) =
-                    active_request.keywords.iter().max_by_key(|k| k.len())
-                {
-                    let kw_hash = ember::dht::search::keyword_hash(primary_keyword);
+                let query = active_request.keywords.join(" ");
+                let hashed = ember::dht::search::compute_keyword_hashes(&query);
+                if let Some((primary_hash, _)) = hashed.first() {
+                    let extras: Vec<[u8; 16]> =
+                        hashed.iter().skip(1).map(|(h, _)| *h).collect();
                     if let Some(search_id) = state.ember_search.start_find_value(
-                        ember::dht::EmberNodeId(kw_hash),
-                        Vec::new(),
+                        ember::dht::EmberNodeId(*primary_hash),
+                        extras,
                         state.ember_dht.routing(),
                     ) {
                         state.ember_keyword_searches.insert(
@@ -30286,6 +30395,11 @@ async fn handle_command_inner(
             diag.ember_dht_stored_keys = store_keys as u32;
             diag.ember_dht_stored_records = store_records as u32;
             diag.ember_dht_active_publishes = state.ember_publish.active_count() as u32;
+            diag.ember_dht_avg_replication = if diag.ember_dht_publishes_completed > 0 {
+                (diag.ember_dht_replication_sum / diag.ember_dht_publishes_completed as u64) as u32
+            } else {
+                0
+            };
             if let Some(ref broker) = state.connection_broker {
                 let bs = broker.stats();
                 diag.broker_punch_attempts = bs.punch_attempts;
@@ -30440,13 +30554,52 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::GetEmberDhtContacts { tx } => {
+            let local_id = state.ember_dht.local_id();
             let contacts = state
                 .ember_dht
                 .contacts()
                 .iter()
-                .map(ember_dht_contact_info)
+                .map(|c| ember_dht_contact_info(c, local_id))
                 .collect();
             let _ = tx.send(contacts);
+        }
+
+        NetworkCommand::GetEmberDhtSearches { tx } => {
+            let searches = state
+                .ember_search
+                .snapshot()
+                .into_iter()
+                .map(|s| EmberDhtSearchInfo {
+                    id: s.id,
+                    search_type: s.search_type,
+                    target: s.target,
+                    keyword_count: s.keyword_count,
+                    results: s.results,
+                    queried: s.queried,
+                    in_flight: s.in_flight,
+                    responded: s.responded,
+                    pending: s.pending,
+                    complete: s.complete,
+                    age_secs: s.started_at_secs,
+                })
+                .collect();
+            let _ = tx.send(searches);
+        }
+
+        NetworkCommand::GetEmberDhtStore { tx } => {
+            const MAX_STORE_ROWS: usize = 500;
+            let entries = state
+                .ember_dht
+                .store_entries(MAX_STORE_ROWS)
+                .into_iter()
+                .map(|e| EmberDhtStoreInfo {
+                    key: hex::encode(e.key),
+                    record_count: e.record_count,
+                    keyword_records: e.keyword_records,
+                    source_records: e.source_records,
+                })
+                .collect();
+            let _ = tx.send(entries);
         }
 
         NetworkCommand::SendEmberExchangeRequest {
@@ -30770,11 +30923,16 @@ async fn handle_command_inner(
                 return;
             }
 
-            let kw_hash = ember::dht::search::keyword_hash(&keyword);
-            let primary = ember::dht::EmberNodeId(kw_hash);
+            let hashed = ember::dht::search::compute_keyword_hashes(&keyword);
+            let Some((primary_hash, _)) = hashed.first() else {
+                let _ = tx.send(Err("Keyword is empty".to_string()));
+                return;
+            };
+            let extras: Vec<[u8; 16]> = hashed.iter().skip(1).map(|(h, _)| *h).collect();
+            let primary = ember::dht::EmberNodeId(*primary_hash);
             let search_id = match state.ember_search.start_find_value(
                 primary,
-                Vec::new(),
+                extras,
                 state.ember_dht.routing(),
             ) {
                 Some(id) => id,

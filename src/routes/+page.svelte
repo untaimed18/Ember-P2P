@@ -807,7 +807,7 @@
             <span class="stat-value">
               {!$networkStats.buddy_status || $networkStats.buddy_status === 'none' ? m.kad_buddy_none() :
                $networkStats.buddy_status.startsWith('connected') ? m.kad_buddy_connected() :
-               $networkStats.buddy_status === 'searching' || $networkStats.buddy_status.startsWith('connecting') ? m.kad_buddy_connecting() :
+               $networkStats.buddy_status.startsWith('connecting') ? m.kad_buddy_connecting() :
                $networkStats.buddy_status.startsWith('serving') ? m.kad_buddy_serving() :
                $networkStats.buddy_status}
             </span>

@@ -6,6 +6,8 @@ import type {
   EmberDhtFindValueResult,
   EmberDhtMaintenanceResult,
   EmberDhtPublishResult,
+  EmberDhtSearchEntry,
+  EmberDhtStoreEntry,
   EmberPingResult,
 } from '$lib/types';
 
@@ -81,6 +83,16 @@ export async function emberRequestSources(args: {
  */
 export async function getEmberDhtContacts(): Promise<EmberDhtContact[]> {
   return invoke<EmberDhtContact[]>('get_ember_dht_contacts');
+}
+
+/** Snapshot in-flight Ember DHT iterative searches (slice 16). */
+export async function getEmberDhtSearches(): Promise<EmberDhtSearchEntry[]> {
+  return invoke<EmberDhtSearchEntry[]>('get_ember_dht_searches');
+}
+
+/** Snapshot live Ember DHT store keys (slice 16). */
+export async function getEmberDhtStore(): Promise<EmberDhtStoreEntry[]> {
+  return invoke<EmberDhtStoreEntry[]>('get_ember_dht_store');
 }
 
 /**
