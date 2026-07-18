@@ -184,8 +184,25 @@ impl IterativeSearch {
             }
         }
 
-        // Collect value results
+        // Collect value results. Bind each FOUND_VALUE blob to the queried
+        // DHT key: blobs are `record_data || 64-byte sig` with keyword_hash
+        // at bytes [1..17]. Without this check a malicious LOOKUP peer can
+        // return any publisher-signed keyword records as hits for the query.
         for data in value_records {
+            if self.search_type == SearchType::FindValue {
+                if data.len() < 17 + 64 {
+                    continue;
+                }
+                let mut kh = [0u8; 16];
+                kh.copy_from_slice(&data[1..17]);
+                if kh != self.target.0 {
+                    debug!(
+                        "Search {}: dropping FOUND_VALUE blob whose keyword_hash does not match target",
+                        self.id
+                    );
+                    continue;
+                }
+            }
             if self.results.len() < MAX_SEARCH_RESULTS {
                 self.results.push(SearchResultRecord {
                     data,
@@ -602,20 +619,27 @@ mod tests {
         let mut rt = RoutingTable::new(local);
         rt.add_contact(make_contact(0x80));
 
+        let target = make_id(0xFF);
         let mut sm = SearchManager::new();
         let search_id = sm
-            .start_find_value(make_id(0xFF), vec![], &rt)
+            .start_find_value(target, vec![], &rt)
             .expect("search slot");
 
         let search = sm.get_mut(search_id).unwrap();
         let batch = search.next_to_query();
         let (_, req_id) = &batch[0];
 
+        // Blobs are `record_data || 64-byte sig` with keyword_hash at [1..17].
+        let mut matching = vec![0u8; 17 + 64];
+        matching[1..17].copy_from_slice(&target.0);
+        let mut mismatched = matching.clone();
+        mismatched[1] ^= 0xFF;
+
         search.process_response(
             *req_id,
             &make_id(0x80),
             vec![],
-            vec![b"record1".to_vec(), b"record2".to_vec()],
+            vec![matching.clone(), mismatched, matching],
         );
 
         assert_eq!(search.results.len(), 2);

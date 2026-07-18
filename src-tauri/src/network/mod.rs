@@ -2319,14 +2319,15 @@ mod tests {
         let sk = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
         let hash_a = [0x11u8; 16];
         let hash_b = [0x22u8; 16];
-        // Both stored under the primary keyword "ubuntu", but only file A's
-        // name also contains "server"; the multi-word AND-filter drops B.
+        // DHT lookup key is the longest query term (`max_by_key` length; ties
+        // take the last). "ubuntuiso" is primary; records are stored under it.
+        // Only file A's name also contains "server".
         let blobs = vec![
-            ember_kw_blob(&sk, "ubuntu", hash_a, 1, "ubuntu server amd64"),
-            ember_kw_blob(&sk, "ubuntu", hash_b, 1, "ubuntu desktop amd64"),
+            ember_kw_blob(&sk, "ubuntuiso", hash_a, 1, "ubuntuiso server amd64"),
+            ember_kw_blob(&sk, "ubuntuiso", hash_b, 1, "ubuntuiso desktop amd64"),
         ];
         let results =
-            build_ember_keyword_results(&blobs, &["ubuntu".to_string(), "server".to_string()]);
+            build_ember_keyword_results(&blobs, &["ubuntuiso".to_string(), "server".to_string()]);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].file.hash, hex::encode(hash_a));
     }
@@ -5005,12 +5006,16 @@ fn finalize_removed_searches_with_keyword_results(
                             state.ember_capable_peers.insert((s.ip, s.tcp_port));
                         }
                         if let Some(npub) = s.ember_noise_pub {
-                            let _ = record_ember_noise_key(
-                                &mut state.ember_noise_keys,
-                                s.ip,
-                                s.tcp_port,
-                                npub,
-                            );
+                            // Cache under UDP port: Ember Noise runs on the
+                            // shared KAD UDP socket, not eMule TCP.
+                            if s.udp_port != 0 {
+                                let _ = record_ember_noise_key(
+                                    &mut state.ember_noise_keys,
+                                    s.ip,
+                                    s.udp_port,
+                                    npub,
+                                );
+                            }
                         }
                     }
                 }
@@ -5055,12 +5060,16 @@ fn finalize_removed_searches_with_keyword_results(
                             state.ember_capable_peers.insert((s.ip, s.tcp_port));
                         }
                         if let Some(npub) = s.ember_noise_pub {
-                            let _ = record_ember_noise_key(
-                                &mut state.ember_noise_keys,
-                                s.ip,
-                                s.tcp_port,
-                                npub,
-                            );
+                            // Cache under UDP port: Ember Noise runs on the
+                            // shared KAD UDP socket, not eMule TCP.
+                            if s.udp_port != 0 {
+                                let _ = record_ember_noise_key(
+                                    &mut state.ember_noise_keys,
+                                    s.ip,
+                                    s.udp_port,
+                                    npub,
+                                );
+                            }
                         }
                     }
                 }
@@ -6564,7 +6573,10 @@ fn antileech_reset_defaults(
 /// instantly without a cold bootstrap, and it's re-persisted to
 /// `nodes_ember.dat` on shutdown regardless. Only the volatile session and
 /// discovery state tied to a live transport is cleared here.
-fn ember_disable_cleanup(state: &mut NetworkState) {
+///
+/// Returns the active search `request_id` if an in-flight Ember search leg
+/// was cancelled so the caller can emit `search-complete`.
+fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     // Encrypted sessions + their control-ping waiters.
     state.ember_transport.cleanup_all();
     state.ember_pending_pings.clear();
@@ -6602,7 +6614,19 @@ fn ember_disable_cleanup(state: &mut NetworkState) {
     // contact count, etc. — are recomputed from state on each read.
     state.ember_diagnostics = EmberDiagnostics::default();
 
+    // Cancel any in-flight Ember search leg so Global/Ember searches don't
+    // hang waiting on `ember_pending` after the transport is gone.
+    let finish_request_id = state.active_search_request.as_mut().and_then(|active| {
+        if active.ember_pending {
+            active.ember_pending = false;
+            Some(active.request_id)
+        } else {
+            None
+        }
+    });
+
     info!("Ember-native transport disabled — cleared sessions, caches, and in-flight DHT state");
+    finish_request_id
 }
 
 /// Kick a cold-start Ember DHT bootstrap if (and only if) it's warranted:
@@ -6698,6 +6722,7 @@ fn apply_network_settings(
     settings: &mut AppSettings,
     new_settings: AppSettings,
     ember_boot_tx: &mpsc::Sender<Vec<ember::dht::EmberContact>>,
+    app_handle: &tauri::AppHandle,
 ) {
     state.obfuscation_enabled = new_settings.obfuscation_enabled;
     state.obfuscation_enabled_shared.store(
@@ -6779,7 +6804,9 @@ fn apply_network_settings(
     }
     let ember_turned_on = !settings.ember_native_enabled && new_settings.ember_native_enabled;
     if settings.ember_native_enabled && !new_settings.ember_native_enabled {
-        ember_disable_cleanup(state);
+        if let Some(request_id) = ember_disable_cleanup(state) {
+            maybe_finish_active_search(state, app_handle, request_id);
+        }
     }
     info!(
         "Network settings updated: obfuscation={}, uss={}, nickname={}, max_uploads={}, ip_filter={}, block_private={}, ember_native={}",
@@ -8269,6 +8296,7 @@ pub async fn start_network(
                         &mut settings,
                         new_settings,
                         &ember_boot_tx,
+                        &app_handle,
                     );
                     {
                         let mut nick = shared_nickname.write().await;
@@ -9204,6 +9232,7 @@ pub async fn start_network(
                             &mut settings,
                             new_settings,
                             &ember_boot_tx,
+                            &app_handle,
                         );
                         {
                             let mut nick = shared_nickname.write().await;
@@ -22144,6 +22173,7 @@ pub async fn start_network(
                     && state.ember_publish.active_count() == 0
                     && state.ember_dht_maint_pings.is_empty()
                     && state.ember_pending_source_injections.is_empty()
+                    && state.ember_pending_keyword_results.is_empty()
                 {
                     return;
                 }
@@ -22289,6 +22319,10 @@ pub async fn start_network(
                         let mut sm = source_manager.write().await;
                         for (fh, sources) in &entries {
                             for &(ip, tcp_port, udp_port, flags) in sources {
+                                if state.ip_filter.is_blocked(ip) || state.banned_ips.contains(&ip)
+                                {
+                                    continue;
+                                }
                                 let connect_options =
                                     if flags & ember::SOURCE_FLAG_OBFUSCATION != 0 {
                                         0x02
@@ -24724,8 +24758,10 @@ fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32) {
 /// Each blob is re-verified (`from_value_blob` checks the publisher
 /// signature), filtered to source records whose embedded file hash matches
 /// the download we asked about, self-filtered against our own external IP,
-/// and counted for diagnostics. Dedup / ipfilter / ban / cap handling is
-/// left to `handle_epx_sources` downstream.
+/// and counted for diagnostics. Dedup / ban / cap handling is left to
+/// `handle_epx_sources` downstream; this path applies the same
+/// `ip_filter` / banlist gates before writing SourceManager so blocked
+/// IPs never inflate SM counts.
 fn parse_ember_source_records(
     blobs: &[Vec<u8>],
     file_hash: [u8; 16],
@@ -24762,7 +24798,9 @@ fn parse_ember_source_records(
 /// `FIND_VALUE` (slice 10).
 ///
 /// Each blob is re-verified (`from_value_blob` checks the publisher
-/// signature), kept only if it is a keyword record, and -- for multi-word
+/// signature), kept only if it is a keyword record whose embedded
+/// `keyword_hash` matches the primary query keyword (defense in depth vs
+/// a LOOKUP peer returning unrelated signed records), and -- for multi-word
 /// queries -- AND-filtered so every query keyword appears in the file name
 /// (the DHT key only matched the primary keyword). Records are deduped by
 /// eD2K file hash, with `availability` reflecting the number of distinct
@@ -24773,6 +24811,11 @@ fn build_ember_keyword_results(blobs: &[Vec<u8>], keywords: &[String]) -> Vec<Se
     use crate::search::index::infer_file_type;
 
     let kw_lower: Vec<String> = keywords.iter().map(|k| k.to_lowercase()).collect();
+    // Must match the DHT lookup key: longest (most selective) keyword.
+    let primary_hash = keywords
+        .iter()
+        .max_by_key(|k| k.len())
+        .map(|k| ember::dht::search::keyword_hash(k));
     // file_hash -> (result, set of distinct publisher keys)
     let mut dedup: HashMap<[u8; 16], (SearchResult, HashSet<[u8; 32]>)> = HashMap::new();
 
@@ -24782,6 +24825,11 @@ fn build_ember_keyword_results(blobs: &[Vec<u8>], keywords: &[String]) -> Vec<Se
         };
         if rec.record_type != ember::dht::publish::RECORD_TYPE_KEYWORD {
             continue;
+        }
+        if let Some(expected) = primary_hash {
+            if rec.keyword_hash != expected {
+                continue;
+            }
         }
         // Multi-word AND-filter, mirroring the KAD keyword path.
         if kw_lower.len() > 1 {

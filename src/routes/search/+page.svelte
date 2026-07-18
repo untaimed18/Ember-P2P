@@ -477,7 +477,7 @@
   // Stored under a versioned key so a future shape change can be migrated or
   // discarded safely by bumping the suffix.
   const PREFS_KEY = 'search-prefs-v1';
-  const VALID_SEARCH_METHODS = new Set<SearchMethod>(['global', 'kad', 'server']);
+  const VALID_SEARCH_METHODS = new Set<SearchMethod>(['global', 'kad', 'server', 'ember']);
   const VALID_FILTER_COLUMNS = new Set<FilterColumn>([
     'name', 'size', 'type', 'sources', 'origin', 'hash', 'all',
   ]);

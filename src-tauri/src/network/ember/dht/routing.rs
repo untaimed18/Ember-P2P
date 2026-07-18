@@ -115,10 +115,42 @@ impl RoutingTable {
         let subnet = contact.subnet_key();
         let bucket = &mut self.buckets[bucket_idx];
 
-        // If already in the bucket, update it and move to back (most recent)
+        // If already in the bucket: only mutate from a verified observation
+        // (`last_seen > 0`, e.g. a direct signed frame). Unverified gossip
+        // (FOUND_NODE / bootstrap entries use `last_seen == 0`) must not
+        // rewrite addr/keys or reset freshness — that bypassed subnet caps
+        // (eclipse) and could clobber a live contact with `last_seen = 0`.
         if let Some(pos) = bucket.find(&contact.node_id) {
             let mut existing = bucket.contacts.remove(pos).unwrap();
-            existing.addr = contact.addr;
+            if contact.last_seen <= 0 {
+                bucket.contacts.insert(pos, existing);
+                return AddResult::Added;
+            }
+
+            let old_subnet = existing.subnet_key();
+            if contact.addr != existing.addr {
+                if subnet != old_subnet {
+                    if bucket.subnet_count(subnet) >= MAX_PER_SUBNET_PER_BUCKET {
+                        bucket.contacts.insert(pos, existing);
+                        return AddResult::Rejected;
+                    }
+                    let global_count =
+                        self.global_subnet_count.get(&subnet).copied().unwrap_or(0);
+                    if global_count >= MAX_PER_SUBNET_GLOBAL {
+                        bucket.contacts.insert(pos, existing);
+                        return AddResult::Rejected;
+                    }
+                    if let Some(count) = self.global_subnet_count.get_mut(&old_subnet) {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            self.global_subnet_count.remove(&old_subnet);
+                        }
+                    }
+                    *self.global_subnet_count.entry(subnet).or_insert(0) += 1;
+                }
+                existing.addr = contact.addr;
+            }
+
             existing.noise_pub = contact.noise_pub;
             existing.ed25519_pub = contact.ed25519_pub;
             existing.last_seen = contact.last_seen;
@@ -627,6 +659,37 @@ mod tests {
         assert!(matches!(rt.add_contact(c2), AddResult::Added));
         assert_eq!(rt.total_contacts(), 1);
         assert_eq!(rt.get_contact(&make_id(1)).unwrap().addr.port(), 9999);
+    }
+
+    #[test]
+    fn unverified_gossip_does_not_clobber_existing_contact() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local);
+
+        let verified = EmberContact {
+            node_id: make_id(1),
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(80, 1, 1, 1)), 4662),
+            noise_pub: [1; 32],
+            ed25519_pub: [1; 32],
+            last_seen: 1_700_000_000,
+            failed_queries: 0,
+        };
+        assert!(matches!(rt.add_contact(verified), AddResult::Added));
+
+        // FOUND_NODE-style gossip (last_seen == 0) must not rewrite addr/keys.
+        let gossip = EmberContact {
+            node_id: make_id(1),
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)), 9999),
+            noise_pub: [9; 32],
+            ed25519_pub: [9; 32],
+            last_seen: 0,
+            failed_queries: 0,
+        };
+        assert!(matches!(rt.add_contact(gossip), AddResult::Added));
+        let kept = rt.get_contact(&make_id(1)).unwrap();
+        assert_eq!(kept.addr.port(), 4662);
+        assert_eq!(kept.noise_pub, [1; 32]);
+        assert_eq!(kept.last_seen, 1_700_000_000);
     }
 
     #[test]

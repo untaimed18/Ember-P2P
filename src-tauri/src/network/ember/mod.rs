@@ -4,11 +4,13 @@ pub mod nat;
 pub mod quic;
 pub mod relay;
 
-// `dht` and `transfer` are still dormant. `reputation` is persisted and
-// consulted by the live eD2K/EPX paths in network/mod.rs (ban/credit
-// events); `transport` backs the Ember UDP control-message dispatch
-// (Ping/ExchangeRequest, is_ember_packet routing) used by those same paths.
-#[allow(dead_code)]
+// `dht` is live on the Noise path when `ember_native_enabled` (routing,
+// STORE/FIND_VALUE, bootstrap, auto-publish). `transfer` is still dormant.
+// `reputation` is persisted and consulted by the live eD2K/EPX paths in
+// network/mod.rs (ban/credit events); `transport` backs the Ember UDP
+// control-message dispatch (Ping/ExchangeRequest, is_ember_packet routing)
+// used by those same paths.
+#[allow(dead_code)] // stubs / helpers inside until ANNOUNCE_PEER etc. land
 pub mod dht;
 pub mod reputation;
 #[allow(dead_code)]

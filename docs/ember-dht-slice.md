@@ -352,18 +352,20 @@ fed `ember_ping_peer`; slice 13 folds it into the DHT.
 
 ## Out of scope for these slices
 
-Multi-keyword search (intersecting several keyword hashes, Phase 2
-slice 8) — a `FIND_VALUE` carries the wire support for multiple keys, but
-the dev `find_value` queries a single keyword. Proximity-gated storage
-(`DhtStore::should_store`, a maturity concern) is not yet enforced: in the
-early/small network every directed `STORE` is accepted, bounded only by
-signature + key-binding + capacity caps. The native **rendezvous
-bootstrap** is now wired end-to-end (server pool + client cold-start fetch
-+ self-lookup, above), so both warm and cold starts are KAD-free; what
-remains deferred there is a **signed, load-weighted** bootstrap pool (the
-current pool is unsigned and best-effort, leaning on PING-time
-verification). Also deferred: wiring publishes to real shared files
-(today's publish command signs a dev record). Inbound `ANNOUNCE_PEER` /
+Multi-keyword DHT intersection (intersecting several keyword hashes on
+the wire) — a `FIND_VALUE` carries the wire support for multiple keys, but
+lookups query a single primary keyword and the UI AND-filters remaining
+terms locally after results arrive. Proximity-gated storage
+(`DhtStore::should_store`) **is** enforced once the routing table has at
+least `K_BUCKET_SIZE` contacts (accept the close half of the ID space;
+sparse tables still accept every directed `STORE`, bounded by signature +
+key-binding + capacity caps). The native **rendezvous bootstrap** is wired
+end-to-end (server pool + client cold-start fetch + self-lookup), so both
+warm and cold starts are KAD-free; what remains deferred there is a
+**signed, load-weighted** bootstrap pool (the current pool is unsigned and
+best-effort, leaning on PING-time verification). Auto keyword/source
+publish against real shared files (slices 8–9) and search UI Ember method
+(slice 10) are live behind `ember_native_enabled`. Inbound `ANNOUNCE_PEER` /
 `PEER_LIST` are decoded and the sender is learned, but their handlers are
 deferred.
 
@@ -471,4 +473,5 @@ and `ember_native_enabled: true` in each `config.json`:
 4. A **signed, load-weighted** rendezvous `/bootstrap` pool (the current
    pool is unsigned + best-effort, leaning on the DHT's PING-time
    verification as the trust anchor).
-5. Multi-keyword search + real shared-file publishing (Phase 2).
+5. Multi-keyword DHT intersection on the wire (UI already AND-filters
+   locally after a primary-keyword `FIND_VALUE`).

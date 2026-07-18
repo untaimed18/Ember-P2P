@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use tracing::debug;
+
+use crate::network::ember::crypto;
 
 use super::publish::RECORD_TYPE_SOURCE;
 use super::EmberNodeId;
@@ -236,23 +237,27 @@ impl DhtStore {
     pub fn should_store(local_id: &EmberNodeId, key: &[u8; 16]) -> bool {
         let key_id = EmberNodeId(*key);
         let dist = local_id.distance(&key_id);
-        // Accept if the distance's leading bit is within the close half of the ID space
+        // Accept keys in the close half of the ID space (XOR MSB clear →
+        // `leading_bit_index < 127`). The previous `bit < 120` threshold
+        // required eight leading zero bits (~1/256 of keys) and rejected
+        // almost all legitimate STOREs once the table was large enough to
+        // enable proximity gating.
         match dist.leading_bit_index() {
             None => true,
-            Some(bit) => bit < 120, // tolerant threshold for early network
+            Some(bit) => bit < 127,
         }
     }
 }
 
 /// Verify an Ed25519 signature over `data` with `publisher_key`.
 /// Returns false on any failure (malformed key, malformed sig, or
-/// signature mismatch).
+/// signature mismatch). Uses the same strict verify as frame / record
+/// parse paths so weak-key forgeries cannot sneak in via `store` alone.
 fn verify_record_signature(data: &[u8], signature: &[u8; 64], publisher_key: &[u8; 32]) -> bool {
-    let Ok(vk) = VerifyingKey::from_bytes(publisher_key) else {
+    let Some(vk) = crypto::verifying_key_from_bytes(publisher_key) else {
         return false;
     };
-    let sig = Signature::from_bytes(signature);
-    vk.verify(data, &sig).is_ok()
+    crypto::verify(&vk, data, signature)
 }
 
 #[cfg(test)]
@@ -478,5 +483,20 @@ mod tests {
         assert_eq!(removed, 1);
         assert_eq!(store.total_records(), 0);
         assert_eq!(store.key_count(), 0);
+    }
+
+    #[test]
+    fn should_store_accepts_close_half_of_id_space() {
+        let local = EmberNodeId([0u8; 16]);
+        // MSB of XOR clear → close half → accept.
+        let mut close_key = [0u8; 16];
+        close_key[0] = 0x7F;
+        assert!(DhtStore::should_store(&local, &close_key));
+        // MSB of XOR set → far half → reject.
+        let mut far_key = [0u8; 16];
+        far_key[0] = 0x80;
+        assert!(!DhtStore::should_store(&local, &far_key));
+        // Identical key → distance zero → accept.
+        assert!(DhtStore::should_store(&local, &[0u8; 16]));
     }
 }
