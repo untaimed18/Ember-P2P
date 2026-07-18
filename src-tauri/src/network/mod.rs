@@ -4461,6 +4461,10 @@ struct EmberKeywordSearch {
     keywords: Vec<String>,
     /// Optional file-type filter applied at emit time.
     file_type_filter: Option<String>,
+    min_size: Option<u64>,
+    max_size: Option<u64>,
+    file_extension: Option<String>,
+    min_availability: Option<u32>,
 }
 
 /// A batch of Ember DHT keyword results ready to emit (slice 10).
@@ -4468,6 +4472,10 @@ struct EmberKeywordResultBatch {
     request_id: u64,
     keywords: Vec<String>,
     file_type_filter: Option<String>,
+    min_size: Option<u64>,
+    max_size: Option<u64>,
+    file_extension: Option<String>,
+    min_availability: Option<u32>,
     results: Vec<SearchResult>,
 }
 
@@ -9002,28 +9010,43 @@ pub async fn start_network(
         }
 
         if state.stats.status == NetworkStatus::Disconnected {
-            nat_probe_in_flight = false;
-            nat_probe_started_at = None;
-            nat_probe_packet_tx = None;
+            // Ember-only nodes remain KAD-Disconnected permanently. Do not
+            // cancel an in-flight STUN probe that discovers `external_ip` for
+            // slice-9 source publish — clearing here every loop iteration
+            // would respawn forever and ignore every STUN reply as stale.
+            if !settings.ember_native_enabled {
+                nat_probe_in_flight = false;
+                nat_probe_started_at = None;
+                nat_probe_packet_tx = None;
+            }
             rendezvous_register_in_flight = false;
             rendezvous_register_started_at = None;
         }
 
-        if state.external_ip.is_some()
+        // Probe NAT when we already know an external IP (refine type), or when
+        // Ember is on and we still lack one (STUN discovers the mapped address
+        // so KAD-less HighID source publish can advertise a real IP).
+        let want_nat_probe = (state.external_ip.is_some()
+            || (settings.ember_native_enabled && state.external_ip.is_none()))
             && state.nat_info.nat_type == ember::nat::NatType::Unknown
             && !nat_probe_in_flight
             && nat_probe_backoff_until.map_or(true, |deadline| {
                 tokio::time::Instant::now() >= deadline
-            })
-        {
+            });
+        if want_nat_probe {
             nat_probe_in_flight = true;
             nat_probe_started_at = Some(tokio::time::Instant::now());
             state.nat_probe_generation = state.nat_probe_generation.saturating_add(1);
+            let reason = if state.external_ip.is_some() {
+                "external IP available"
+            } else {
+                "ember needs STUN external IP"
+            };
             nat_probe_packet_tx = Some(spawn_nat_probe(
                 udp_socket.clone(),
                 nat_probe_result_tx.clone(),
                 state.nat_probe_generation,
-                "external IP available",
+                reason,
             ));
         }
 
@@ -21476,6 +21499,21 @@ pub async fn start_network(
                 } else {
                     nat_probe_backoff_until = None;
                 }
+                // Adopt STUN-mapped IPv4 when we have no other confirmed public
+                // IP yet (Ember-only HighID path before KAD/eD2K learn one).
+                if state.external_ip.is_none() {
+                    if let Some(addr) = state.nat_info.external_addr {
+                        if let std::net::IpAddr::V4(ip) = addr.ip() {
+                            set_external_ip(&mut state, Some(ip));
+                            state.stats.external_ip = ip.to_string();
+                            state.routing_table.set_external_ip(ip);
+                            info!(
+                                "NAT probe ({}): learned external IP {} via STUN",
+                                result.reason, ip
+                            );
+                        }
+                    }
+                }
                 if let Some(ext_ip) = state.external_ip {
                     if state.nat_info.apply_highid_fallback(
                         std::net::IpAddr::V4(ext_ip),
@@ -22409,6 +22447,10 @@ pub async fn start_network(
                             request_id,
                             keywords,
                             file_type_filter,
+                            min_size,
+                            max_size,
+                            file_extension,
+                            min_availability,
                             results,
                         } = batch;
                         if !results.is_empty() {
@@ -22420,10 +22462,10 @@ pub async fn start_network(
                                 request_id,
                                 results,
                                 &file_type_filter,
-                                None,
-                                None,
-                                None,
-                                None,
+                                min_size,
+                                max_size,
+                                file_extension.as_deref(),
+                                min_availability,
                                 &keywords,
                                 None,
                             )
@@ -24721,6 +24763,7 @@ fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32) {
                     file_hash,
                     self_ip,
                     &mut state.ember_diagnostics,
+                    &mut state.ember_noise_keys,
                 );
                 if !sources.is_empty() {
                     state
@@ -24740,6 +24783,10 @@ fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32) {
                         request_id: kw.request_id,
                         keywords: kw.keywords,
                         file_type_filter: kw.file_type_filter,
+                        min_size: kw.min_size,
+                        max_size: kw.max_size,
+                        file_extension: kw.file_extension,
+                        min_availability: kw.min_availability,
                         results,
                     });
             }
@@ -24758,15 +24805,17 @@ fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32) {
 /// Each blob is re-verified (`from_value_blob` checks the publisher
 /// signature), filtered to source records whose embedded file hash matches
 /// the download we asked about, self-filtered against our own external IP,
-/// and counted for diagnostics. Dedup / ban / cap handling is left to
-/// `handle_epx_sources` downstream; this path applies the same
-/// `ip_filter` / banlist gates before writing SourceManager so blocked
-/// IPs never inflate SM counts.
+/// and counted for diagnostics. When a record carries a Noise pubkey and
+/// UDP port, it is cached under that UDP endpoint so later Ember dials
+/// (bridge / native) can find it. Dedup / ban / cap handling is left to
+/// `handle_epx_sources` downstream; the drain path applies the same
+/// `ip_filter` / banlist gates before writing SourceManager.
 fn parse_ember_source_records(
     blobs: &[Vec<u8>],
     file_hash: [u8; 16],
     self_ip: Option<Ipv4Addr>,
     diag: &mut crate::types::EmberDiagnostics,
+    noise_keys: &mut HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)>,
 ) -> Vec<(Ipv4Addr, u16, u16, u8)> {
     let mut out = Vec::new();
     for blob in blobs {
@@ -24788,6 +24837,9 @@ fn parse_ember_source_records(
         // Never inject ourselves, and drop unusable contacts.
         if Some(sc.ip) == self_ip || sc.tcp_port == 0 {
             continue;
+        }
+        if sc.udp_port != 0 && sc.noise_pub != [0u8; 32] {
+            let _ = record_ember_noise_key(noise_keys, sc.ip, sc.udp_port, sc.noise_pub);
         }
         out.push((sc.ip, sc.tcp_port, sc.udp_port, sc.flags));
     }
@@ -25031,8 +25083,23 @@ async fn maybe_publish_ember_sources(
     {
         return;
     }
-    let Some(external_ip) = state.external_ip else {
-        return;
+    // Prefer the confirmed external IP (eD2K HighID / KAD firewall vote).
+    // Fall back to the STUN-mapped address so a KAD-less Ember HighID seeder
+    // can still advertise sources after a NAT probe.
+    let external_ip = match state.external_ip {
+        Some(ip) => ip,
+        None => match state.nat_info.external_addr {
+            Some(addr) => match addr.ip() {
+                std::net::IpAddr::V4(ip) => {
+                    set_external_ip(state, Some(ip));
+                    state.stats.external_ip = ip.to_string();
+                    state.routing_table.set_external_ip(ip);
+                    ip
+                }
+                std::net::IpAddr::V6(_) => return,
+            },
+            None => return,
+        },
     };
 
     // Select shared files whose source record is missing or past its
@@ -25201,6 +25268,10 @@ async fn maybe_publish_ember_keywords(
                 .ember_publish
                 .start_publish(record, state.ember_dht.routing())
             {
+                state.ember_diagnostics.ember_dht_keywords_published = state
+                    .ember_diagnostics
+                    .ember_dht_keywords_published
+                    .saturating_add(1);
                 drive_ember_publish(socket, state, publish_id).await;
             }
         }
@@ -28792,6 +28863,10 @@ async fn handle_command_inner(
                                 request_id,
                                 keywords: active_request.keywords.clone(),
                                 file_type_filter: active_request.file_type_filter.clone(),
+                                min_size: active_request.min_size,
+                                max_size: active_request.max_size,
+                                file_extension: active_request.file_extension.clone(),
+                                min_availability: active_request.min_availability,
                             },
                         );
                         active_request.ember_pending = true;

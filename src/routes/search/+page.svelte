@@ -3,6 +3,7 @@
   import { searchFiles, cancelSearch, findNotes, publishNote, markSpam, markNotSpam, explainSpamResult, getDownloadHistory, removeDownloadHistoryEntry, type SearchMethod } from '$lib/api/search';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import { getSettings } from '$lib/api/settings';
+  import { getEmberDiagnostics } from '$lib/api/ember';
   import { startDownload } from '$lib/api/transfers';
   import { transfers } from '$lib/stores/transfers';
   import type { Transfer } from '$lib/types';
@@ -208,14 +209,32 @@
   function searchNetworkHint(method: SearchMethod): string {
     if (method === 'kad') return m.search_network_need_kad_hint();
     if (method === 'server') return m.search_network_need_server_hint();
+    if (method === 'ember') {
+      if (!emberEnabled) return m.search_network_need_ember_hint();
+      if (emberContacts === 0 && !emberJoinTimedOut) {
+        return m.search_network_ember_joining_hint();
+      }
+      return m.search_network_need_ember_hint();
+    }
+    // Global with neither eMule net up: Ember may still be usable.
+    if (emberEnabled && !kadUpLive && !serverUpLive) {
+      return emberContacts === 0 && !emberJoinTimedOut
+        ? m.search_network_ember_joining_hint()
+        : m.search_network_global_ember_only_hint();
+    }
     return m.search_network_disconnected_hint();
   }
 
   function searchNetworkAlertMessage(method: SearchMethod): string {
     if (method === 'kad') return m.search_no_network_kad_message();
     if (method === 'server') return m.search_no_network_server_message();
+    if (method === 'ember') return m.search_no_network_ember_message();
     return m.search_no_network_message();
   }
+
+  // Live network readiness used by hints (must stay reactive).
+  let kadUpLive = $derived($networkStats.status === 'connected');
+  let serverUpLive = $derived($serverStatus === 'connected');
 
   let selectedResultKey = $state<string | null>(null);
   let checkedKeys = $state(new Set<string>());
@@ -658,7 +677,38 @@
   }
 
   let searchTimeoutSecs = $state(120);
-  let emberEnabled = $state(false);
+  let emberEnabled = $derived(!!$appSettings?.ember_native_enabled);
+  let emberContacts = $state(0);
+  let emberJoinTimedOut = $state(false);
+  let emberJoinActiveSince = $state<number | null>(null);
+  const EMBER_JOIN_TIMEOUT_MS = 30_000;
+
+  function recomputeEmberJoinState() {
+    if (!emberEnabled) {
+      emberJoinActiveSince = null;
+      emberJoinTimedOut = false;
+      emberContacts = 0;
+      return;
+    }
+    if (emberContacts > 0) {
+      emberJoinActiveSince = null;
+      emberJoinTimedOut = false;
+      return;
+    }
+    if (emberJoinActiveSince === null) {
+      emberJoinActiveSince = Date.now();
+      emberJoinTimedOut = false;
+    } else if (Date.now() - emberJoinActiveSince >= EMBER_JOIN_TIMEOUT_MS) {
+      emberJoinTimedOut = true;
+    }
+  }
+
+  $effect(() => {
+    // Re-arm joining UX when Ember is toggled on (mirrors /ember).
+    void emberEnabled;
+    void emberContacts;
+    recomputeEmberJoinState();
+  });
 
   onMount(() => {
     loadPersistedPrefs();
@@ -666,9 +716,28 @@
     getSettings()
       .then((s) => {
         searchTimeoutSecs = s.search_timeout_secs;
-        emberEnabled = !!s.ember_native_enabled;
       })
       .catch(() => {});
+
+    // Poll Ember DHT contact count while Ember is enabled so the readiness
+    // strip can show "joining" vs "ready" without navigating to /ember.
+    let emberPoll: ReturnType<typeof setInterval> | undefined;
+    let joinPoll: ReturnType<typeof setInterval> | undefined;
+    const refreshEmber = () => {
+      if (!$appSettings?.ember_native_enabled) {
+        emberContacts = 0;
+        return;
+      }
+      getEmberDiagnostics()
+        .then((d) => {
+          emberContacts = d.ember_dht_contacts ?? 0;
+        })
+        .catch(() => {});
+    };
+    refreshEmber();
+    emberPoll = setInterval(refreshEmber, 3000);
+    joinPoll = setInterval(() => recomputeEmberJoinState(), 1000);
+
     let unlistenHistory: (() => void) | undefined;
     let historyListenMounted = true;
     listen('download-history-cleared', () => {
@@ -686,6 +755,8 @@
     return () => {
       historyListenMounted = false;
       unlistenHistory?.();
+      if (emberPoll) clearInterval(emberPoll);
+      if (joinPoll) clearInterval(joinPoll);
     };
   });
   let spamHiddenCount = $derived(searchResultsList.filter(r => r.is_spam).length);
@@ -1088,13 +1159,15 @@
     };
     if (!q && !hasSearchFilters(searchFilterSnapshot, searchFileType || undefined)) return;
     // Gate by the selected search method — KAD-only needs KAD, server-only
-    // needs the eD2K server, global needs either.
+    // needs the eD2K server, Ember-only needs Ember enabled, global needs
+    // any of KAD / server / Ember.
     const kadUp = $networkStats.status === 'connected';
     const serverUp = $serverStatus === 'connected';
     const methodAllowed =
       method === 'kad' ? kadUp :
       method === 'server' ? serverUp :
-      kadUp || serverUp;
+      method === 'ember' ? emberEnabled :
+      kadUp || serverUp || emberEnabled;
     if (!methodAllowed) {
       networkAlertOpen = true;
       return;
@@ -2103,9 +2176,26 @@
 <div class="page-content">
   {#if (searchMethod === 'kad' && $networkStats.status !== 'connected')
     || (searchMethod === 'server' && $serverStatus !== 'connected')
-    || (searchMethod === 'global' && $networkStats.status !== 'connected' && $serverStatus !== 'connected')}
+    || (searchMethod === 'ember' && (!emberEnabled || (emberContacts === 0 && !emberJoinTimedOut)))
+    || (searchMethod === 'global'
+      && $networkStats.status !== 'connected'
+      && $serverStatus !== 'connected'
+      && emberEnabled
+      && (emberContacts === 0 ? !emberJoinTimedOut : true))}
     <div class="search-readiness-hint" role="status">
       {searchNetworkHint(searchMethod)}
+    </div>
+  {:else if (searchMethod === 'ember' || (searchMethod === 'global' && !kadUpLive && !serverUpLive))
+    && emberEnabled && emberContacts === 0 && emberJoinTimedOut}
+    <div class="search-readiness-hint search-readiness-muted" role="status">
+      {m.search_network_ember_no_peers_hint()}
+    </div>
+  {:else if searchMethod === 'global'
+    && $networkStats.status !== 'connected'
+    && $serverStatus !== 'connected'
+    && !emberEnabled}
+    <div class="search-readiness-hint" role="status">
+      {m.search_network_disconnected_hint()}
     </div>
   {:else if $networkStats.degraded && $networkStats.degraded_reason}
     <div class="search-readiness-hint search-readiness-muted" role="status">

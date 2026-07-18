@@ -553,6 +553,11 @@ pub struct EmberDiagnostics {
     /// downloads this session (slice 9), before dedup/injection filtering.
     #[serde(default)]
     pub ember_dht_source_records_found: u32,
+    /// Ember DHT *keyword* records (re)published for our shared files this
+    /// session (slice 8): incremented once per keyword STORE attempt fanned
+    /// out by the publish tick.
+    #[serde(default)]
+    pub ember_dht_keywords_published: u32,
 }
 
 /// Serializable KAD contact info for the frontend (mirrors eMule KadContactListCtrl columns)

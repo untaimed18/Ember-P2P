@@ -279,6 +279,8 @@ export interface EmberDiagnostics {
   ember_dht_source_searches: number;
   /** Verified source records discovered via FIND_VALUE for downloads (slice 9). */
   ember_dht_source_records_found: number;
+  /** Keyword records (re)published for our shared files this session (slice 8). */
+  ember_dht_keywords_published: number;
 }
 
 /** Result of an `ember_ping_peer` harness round-trip. `rtt_ms` is set
