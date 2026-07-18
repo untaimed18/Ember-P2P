@@ -26,12 +26,12 @@
     getFileMediaMetadata,
   } from '$lib/api/sharing';
   import { getFileComments, setFileComment, type FileCommentInfo } from '$lib/api/comments';
-  import { formatEd2kLink, buildEd2kLink } from '$lib/api/search';
+  import { formatEd2kLink, formatEd2kLinks, buildEd2kLink } from '$lib/api/search';
   import { loadCollection, createCollection, downloadCollectionFiles, type Collection, type CollectionFile } from '$lib/api/collections';
   import { incomingCollection } from '$lib/stores/collection';
   import { toastSuccess, toastError, toastWarning } from '$lib/stores/toast';
   import { networkStats } from '$lib/stores/network';
-  import { formatSize } from '$lib/utils';
+  import { formatSize, copyToClipboard as writeClipboard } from '$lib/utils';
   import type { FileInfo, MediaMetadata } from '$lib/types';
   import { onMount, tick } from 'svelte';
   import { fly } from 'svelte/transition';
@@ -157,11 +157,25 @@
     if (!loadedCollection || copyingCollectionLinks) return;
     copyingCollectionLinks = true;
     try {
-      const links = await Promise.all(
-        loadedCollection.files.map((f) => formatEd2kLink(f.name, f.size, f.hash))
-      );
-      await navigator.clipboard.writeText(links.join('\n'));
-      toastSuccess(links.length === 1 ? m.library_copied_link_one() : m.library_copied_links_other({ count: links.length }));
+      // De-dupe by hash: two collection rows can share one ed2k hash.
+      const seen = new Set<string>();
+      const files: Array<{ name: string; size: number; hash: string }> = [];
+      for (const f of loadedCollection.files) {
+        const h = f.hash?.trim();
+        if (!h || seen.has(h)) continue;
+        seen.add(h);
+        files.push({ name: f.name, size: f.size, hash: h });
+      }
+      if (files.length === 0) {
+        toastWarning(m.library_copy_all_none());
+        return;
+      }
+      const text = await formatEd2kLinks(files);
+      if (!(await writeClipboard(text))) {
+        toastError(m.library_copy_failed());
+        return;
+      }
+      toastSuccess(files.length === 1 ? m.library_copied_link_one() : m.library_copied_links_other({ count: files.length }));
     } catch (e: unknown) {
       toastError(toErr(e));
     } finally {
@@ -632,11 +646,62 @@
   }
 
   async function copyToClipboard(text: string, label: string) {
-    try {
-      await navigator.clipboard.writeText(text);
+    if (await writeClipboard(text)) {
       toastSuccess(label);
-    } catch {
+    } else {
       toastError(m.library_copy_failed());
+    }
+  }
+
+  /** Soft confirm when copying a very large link list to the clipboard. */
+  const COPY_ALL_LINKS_CONFIRM_AT = 5_000;
+
+  let copyingAllLibraryLinks = $state(false);
+
+  let filteredHashedFiles = $derived.by(() => {
+    const seen = new Set<string>();
+    const out: FileInfo[] = [];
+    for (const f of filteredFiles) {
+      const h = f.hash?.trim();
+      if (!h || seen.has(h)) continue;
+      seen.add(h);
+      out.push(f);
+    }
+    return out;
+  });
+
+  async function copyAllLibraryLinks() {
+    if (copyingAllLibraryLinks) return;
+    const targets = filteredHashedFiles;
+    if (targets.length === 0) {
+      toastWarning(m.library_copy_all_none());
+      return;
+    }
+    if (targets.length >= COPY_ALL_LINKS_CONFIRM_AT) {
+      const confirmed = await askConfirm(
+        m.library_copy_all_confirm({ count: targets.length.toLocaleString() }),
+        m.library_copy_all_confirm_title(),
+      );
+      if (!confirmed) return;
+    }
+    copyingAllLibraryLinks = true;
+    try {
+      const text = await formatEd2kLinks(
+        targets.map((f) => ({ name: f.name, size: f.size, hash: f.hash }))
+      );
+      if (!(await writeClipboard(text))) {
+        toastError(m.library_copy_failed());
+        return;
+      }
+      toastSuccess(
+        targets.length === 1
+          ? m.library_copied_link_one()
+          : m.library_copied_links_other({ count: targets.length })
+      );
+    } catch (e: unknown) {
+      toastError(toErr(e));
+    } finally {
+      copyingAllLibraryLinks = false;
     }
   }
 
@@ -1020,18 +1085,28 @@
       return;
     }
     try {
-      const links = await Promise.all(targets.map(f => formatEd2kLink(f.name, f.size, f.hash)));
-      await navigator.clipboard.writeText(links.join('\n'));
+      const seen = new Set<string>();
+      const files: Array<{ name: string; size: number; hash: string }> = [];
+      for (const f of targets) {
+        if (seen.has(f.hash)) continue;
+        seen.add(f.hash);
+        files.push({ name: f.name, size: f.size, hash: f.hash });
+      }
+      const text = await formatEd2kLinks(files);
+      if (!(await writeClipboard(text))) {
+        toastError(m.library_copy_failed());
+        return;
+      }
       const unsharedCount = targets.filter(f => !f.shared).length;
       if (unsharedCount > 0) {
         toastWarning(m.library_copied_with_unshared({
-          links: links.length,
-          link_label: links.length === 1 ? m.library_link_singular() : m.library_link_plural(),
+          links: files.length,
+          link_label: files.length === 1 ? m.library_link_singular() : m.library_link_plural(),
           unshared: unsharedCount,
           unshared_label: unsharedCount === 1 ? m.library_file_is_unshared() : m.library_files_are_unshared(),
         }));
       } else {
-        toastSuccess(links.length === 1 ? m.library_copied_link_one() : m.library_copied_links_other({ count: links.length }));
+        toastSuccess(files.length === 1 ? m.library_copied_link_one() : m.library_copied_links_other({ count: files.length }));
       }
     } catch (e: unknown) { error = toErr(e); }
   }
@@ -1471,18 +1546,28 @@
         return;
       }
       try {
-        const links = await Promise.all(targets.map(f => formatEd2kLink(f.name, f.size, f.hash)));
-        await navigator.clipboard.writeText(links.join('\n'));
+        const seen = new Set<string>();
+        const files: Array<{ name: string; size: number; hash: string }> = [];
+        for (const f of targets) {
+          if (seen.has(f.hash)) continue;
+          seen.add(f.hash);
+          files.push({ name: f.name, size: f.size, hash: f.hash });
+        }
+        const text = await formatEd2kLinks(files);
+        if (!(await writeClipboard(text))) {
+          toastError(m.library_copy_failed());
+          return;
+        }
         const unsharedCount = targets.filter(f => !f.shared).length;
         if (unsharedCount > 0) {
           toastWarning(m.library_copied_with_unshared({
-            links: links.length,
-            link_label: links.length === 1 ? m.library_link_singular() : m.library_link_plural(),
+            links: files.length,
+            link_label: files.length === 1 ? m.library_link_singular() : m.library_link_plural(),
             unshared: unsharedCount,
             unshared_label: unsharedCount === 1 ? m.library_file_is_unshared() : m.library_files_are_unshared(),
           }));
         } else {
-          toastSuccess(links.length === 1 ? m.library_copied_link_one() : m.library_copied_links_other({ count: links.length }));
+          toastSuccess(files.length === 1 ? m.library_copied_link_one() : m.library_copied_links_other({ count: files.length }));
         }
       } catch (e: unknown) { error = toErr(e); }
       return;
@@ -1493,8 +1578,11 @@
     }
     if (!selectedFile?.hash) return;
     try {
-      const links = [await formatEd2kLink(selectedFile.name, selectedFile.size, selectedFile.hash)];
-      await navigator.clipboard.writeText(links[0]);
+      const link = await formatEd2kLink(selectedFile.name, selectedFile.size, selectedFile.hash);
+      if (!(await writeClipboard(link))) {
+        toastError(m.library_copy_failed());
+        return;
+      }
       if (!selectedFile.shared) {
         toastWarning(m.library_copied_link_unshared_single());
       } else {
@@ -1678,7 +1766,10 @@
           } else {
             link = await formatEd2kLink(f.name, f.size, f.hash);
           }
-          await navigator.clipboard.writeText(link);
+          if (!(await writeClipboard(link))) {
+            toastError(m.library_copy_failed());
+            break;
+          }
           if (!f.shared) {
             toastWarning(m.library_copied_link_unshared_single());
           } else if (extra === 'aich') {
@@ -2146,20 +2237,13 @@
     <button
       class="dupes-toggle missing-toggle"
       class:active={showMissingOnly}
-      disabled={missingScanInFlight}
-      onclick={() => {
-        if (missingScanInFlight) return;
-        if (missingTotalCount > 0 || missingPathSet.size > 0) {
-          showMissingOnly = !showMissingOnly;
-          return;
-        }
-        void refreshMissingSet(true);
-      }}
+      disabled={missingScanInFlight || (missingTotalCount === 0 && missingPathSet.size === 0)}
+      onclick={() => (showMissingOnly = !showMissingOnly)}
       title={
         missingScanInFlight
           ? m.library_missing_scanning()
-          : missingTotalCount === 0
-            ? (missingScanDone ? m.library_no_missing() : m.library_missing_scan_now())
+          : missingTotalCount === 0 && missingPathSet.size === 0
+            ? m.library_no_missing()
             : missingScanTruncated
               ? m.library_missing_truncated({
                   shown: missingPathSet.size,
@@ -2186,6 +2270,24 @@
     {#if hasActiveLibraryFilters}
       <button class="ghost clear-library-filters" onclick={clearLibraryFilters}>{m.library_clear_filters()}</button>
     {/if}
+    <button
+      class="dupes-toggle"
+      disabled={copyingAllLibraryLinks || filteredHashedFiles.length === 0}
+      onclick={() => void copyAllLibraryLinks()}
+      title={
+        filteredHashedFiles.length === 0
+          ? m.library_copy_all_none()
+          : hasActiveLibraryFilters
+            ? m.library_copy_all_filtered_title({ count: filteredHashedFiles.length })
+            : m.library_copy_all_links_title()
+      }
+    >
+      {#if copyingAllLibraryLinks}
+        {m.library_copying()}
+      {:else}
+        {m.library_copy_all_links()}{filteredHashedFiles.length > 0 ? ` (${filteredHashedFiles.length.toLocaleString()})` : ''}
+      {/if}
+    </button>
     <button
       class="dupes-toggle columns-btn"
       onclick={(e) => libraryTableRef?.openColumnMenu(e)}

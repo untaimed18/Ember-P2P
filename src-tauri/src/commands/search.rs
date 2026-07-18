@@ -601,6 +601,51 @@ pub fn format_ed2k_link(name: String, size: u64, file_hash: String) -> Result<St
     Ok(hash::format_ed2k_link(&name, size, &file_hash))
 }
 
+/// One file entry for [`format_ed2k_links`] (bulk clipboard / export).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Ed2kLinkFileInput {
+    pub name: String,
+    pub size: u64,
+    pub hash: String,
+}
+
+/// Soft cap for a single clipboard batch. Larger libraries should export a
+/// collection / text file instead of stuffing the OS clipboard.
+const MAX_ED2K_LINK_BATCH: usize = 50_000;
+
+/// Format many standard eD2K links in one IPC round-trip (newline-separated).
+#[tauri::command]
+pub fn format_ed2k_links(files: Vec<Ed2kLinkFileInput>) -> Result<String, String> {
+    if files.len() > MAX_ED2K_LINK_BATCH {
+        return Err(coded_ctx(
+            "search_ed2k_link_batch_too_large",
+            format!("Too many links in one batch (max {MAX_ED2K_LINK_BATCH})"),
+            MAX_ED2K_LINK_BATCH,
+        ));
+    }
+    let mut out = String::new();
+    for (i, f) in files.into_iter().enumerate() {
+        if f.name.is_empty() || f.name.len() > 4096 {
+            return Err(coded(
+                "search_file_name_invalid",
+                "File name is empty or too long",
+            ));
+        }
+        if f.hash.len() != 32 || !f.hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(coded(
+                "search_link_invalid_hash",
+                "Invalid file hash (expected 32 hex characters)",
+            ));
+        }
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(&hash::format_ed2k_link(&f.name, f.size, &f.hash));
+    }
+    Ok(out)
+}
+
 #[derive(serde::Serialize)]
 pub struct Ed2kLinkInfo {
     pub name: String,

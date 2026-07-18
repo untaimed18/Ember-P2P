@@ -32,6 +32,13 @@ export async function formatEd2kLink(name: string, size: number, fileHash: strin
   return invoke('format_ed2k_link', { name, size, fileHash });
 }
 
+/** Format many standard eD2K links in one IPC call (newline-separated). */
+export async function formatEd2kLinks(
+  files: Array<{ name: string; size: number; hash: string }>
+): Promise<string> {
+  return invoke('format_ed2k_links', { files });
+}
+
 /**
  * Build an ed2k link variant. When `aichHash` (40-char hex) is supplied it is
  * embedded as a base32 `h=` segment; when `withSources` is true our reachable
