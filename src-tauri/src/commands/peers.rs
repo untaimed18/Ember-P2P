@@ -993,9 +993,8 @@ pub async fn get_ember_diagnostics(
 }
 
 /// Send an Ember-native `Ping` to a peer over the Noise transport and
-/// wait up to `timeout_ms` for the matching `Pong`. Used by the local
-/// harness (`scripts\harness.ps1`) to verify the feature-flagged
-/// integration end-to-end.
+/// wait up to `timeout_ms` for the matching `Pong`. Used to verify the
+/// feature-flagged native transport end-to-end.
 ///
 /// `peer_pubkey_hex` is **optional**. When provided, it must be the
 /// 64-char hex encoding of the peer's `local_noise_public_key` (also

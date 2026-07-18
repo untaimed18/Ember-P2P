@@ -4,9 +4,8 @@ import type { EmberDiagnostics, EmberPingResult } from '$lib/types';
 /**
  * Fetch a snapshot of the Ember mesh diagnostic counters: EPX events,
  * LowID broker outcomes, native-transport ping counters, session
- * count, and the local Noise X25519 public key. Backs the dev panel
- * at `/dev/ember` and is also useful from devtools when debugging
- * harness flows.
+ * count, and the local Noise X25519 public key. Useful from
+ * devtools when debugging Ember mesh flows.
  */
 export async function getEmberDiagnostics(): Promise<EmberDiagnostics> {
   return invoke<EmberDiagnostics>('get_ember_diagnostics');
