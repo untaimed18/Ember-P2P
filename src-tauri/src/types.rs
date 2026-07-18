@@ -572,6 +572,12 @@ pub struct EmberDiagnostics {
     /// in source records (STUN / HighID / KAD have not produced one yet).
     #[serde(default)]
     pub ember_dht_udp_unreachable: bool,
+    /// Buddy PROXY_STORE requests we sent this session (firewalled publisher).
+    #[serde(default)]
+    pub ember_dht_buddy_publishes: u32,
+    /// PROXY_STORE requests we accepted and fanned out as a HighID buddy.
+    #[serde(default)]
+    pub ember_dht_buddy_forwards: u32,
 }
 
 /// Serializable KAD contact info for the frontend (mirrors eMule KadContactListCtrl columns)

@@ -27,6 +27,7 @@ use super::routing::{AddResult, RoutingTable};
 use super::store::DhtStore;
 use super::{EmberContact, EmberNodeId, ID_BITS, K_BUCKET_SIZE, MAX_CONTACTS_PER_RESPONSE};
 use crate::network::ember::crypto;
+use crate::network::ember::SOURCE_FLAG_FIREWALLED;
 
 /// Collapse identical STORE frames for this long (slice 14). Hourly
 /// keyword republish still gets through.
@@ -85,6 +86,9 @@ pub struct DhtInbound {
     pub error: Option<String>,
     /// Slice 14: identical STORE signature rejected as a replay.
     pub store_replay_rejected: bool,
+    /// A verified `PROXY_STORE` the caller should fan out via the normal
+    /// publish driver (buddy-assisted firewalled source publish).
+    pub proxy_store_forward: Option<SignedRecord>,
 }
 
 /// Owns our DHT identity, routing table, and local record store, and
@@ -218,6 +222,21 @@ impl EmberDht {
         let request_id = self.next_request_id();
         let msg =
             messages::build_store_record(self.local_id, request_id, key, record, record_signature);
+        let bytes = messages::encode_message(&msg, &self.signing_key, true);
+        (request_id, bytes)
+    }
+
+    /// Ask a HighID buddy to fan out our publisher-signed firewalled source
+    /// record (`PROXY_STORE`). Same payload shape as `STORE_RECORD`.
+    pub fn build_proxy_store(
+        &mut self,
+        key: [u8; 16],
+        record: Vec<u8>,
+        record_signature: [u8; 64],
+    ) -> (u32, Vec<u8>) {
+        let request_id = self.next_request_id();
+        let msg =
+            messages::build_proxy_store(self.local_id, request_id, key, record, record_signature);
         let bytes = messages::encode_message(&msg, &self.signing_key, true);
         (request_id, bytes)
     }
@@ -477,16 +496,17 @@ impl EmberDht {
                 // verifies the Ed25519 signature; `DhtStore::store` checks
                 // it again (defence in depth) and enforces capacity.
                 if let Some(parsed) = SignedRecord::from_wire(&record, record_signature) {
-                    // Anti-reflection for source records: the publisher's
-                    // self-reported IP must match the observed Noise sender IP,
-                    // so a peer cannot publish a record that points downloaders
-                    // at a third-party victim. Honest publishers store their own
-                    // source record from their own address, and source records
-                    // are deliberately not relayed by other nodes (see
-                    // `DhtStore::take_republish_batch`), so this binding always
-                    // holds for legitimate stores. Non-source records carry no
-                    // address and are unaffected.
+                    // Anti-reflection for source records: HighID / direct
+                    // sources must claim the observed Noise sender IP so a
+                    // peer cannot point downloaders at a third-party victim.
+                    // Firewalled sources (`SOURCE_FLAG_FIREWALLED`) are exempt:
+                    // they may be STORED by a HighID buddy (proxy path) or from
+                    // a NAT mapping that differs from the STUN hint. Authorship
+                    // is still bound by the publisher Ed25519 signature; the
+                    // record is not republished by storers (see
+                    // `DhtStore::take_republish_batch`).
                     let source_ip_ok = match parsed.source_contact {
+                        Some(sc) if sc.flags & SOURCE_FLAG_FIREWALLED != 0 => true,
                         Some(sc) => from.ip() == std::net::IpAddr::V4(sc.ip),
                         None => parsed.record_type != RECORD_TYPE_SOURCE,
                     };
@@ -531,9 +551,38 @@ impl EmberDht {
                     }
                 }
                 // A record that fails to parse/verify, whose key does not
-                // match its content, or (for a source record) whose claimed
-                // IP doesn't match the sender, is dropped with no ACK so the
-                // publisher's success count reflects only real storage.
+                // match its content, or (for a non-firewalled source) whose
+                // claimed IP doesn't match the sender, is dropped with no ACK.
+            }
+            DhtPayload::ProxyStore {
+                key,
+                record,
+                record_signature,
+            } => {
+                // Buddy-assisted publish: a firewalled peer asks us to fan
+                // out their already-signed source record. We verify it, ack
+                // the request, and hand the record to the caller to publish
+                // via the normal STORE driver (storers accept FIREWALLED
+                // without IP anti-reflection).
+                if let Some(parsed) = SignedRecord::from_wire(&record, record_signature) {
+                    let is_fw_source = parsed.record_type == RECORD_TYPE_SOURCE
+                        && parsed
+                            .source_contact
+                            .map(|sc| sc.flags & SOURCE_FLAG_FIREWALLED != 0)
+                            .unwrap_or(false);
+                    if is_fw_source && key == parsed.keyword_hash {
+                        out.proxy_store_forward = Some(parsed);
+                        let ack =
+                            messages::build_proxy_store_ack(self.local_id, msg.request_id, key);
+                        out.responses
+                            .push(messages::encode_message(&ack, &self.signing_key, true));
+                    }
+                }
+            }
+            DhtPayload::ProxyStoreAck { key: _ } => {
+                // Publisher-side: buddy accepted the proxy request. No
+                // further engine work — diagnostics are updated by the
+                // network loop if desired.
             }
             DhtPayload::FindValue { keys } => {
                 out.find_value_received = true;
@@ -816,6 +865,71 @@ mod tests {
             "no STORE_ACK on reflection rejection"
         );
         assert_eq!(b.store_stats(), (0, 0));
+    }
+
+    #[test]
+    fn firewalled_source_store_allows_ip_mismatch() {
+        let mut a = dht(70);
+        let mut b = dht(71);
+        let a_noise = [0xAA; 32];
+        // Observed sender IP differs from claimed contact IP (buddy path /
+        // symmetric NAT). FIREWALLED exempts anti-reflection.
+        let a_addr = addr(30, 4672);
+        let mut contact = source_contact_at(99);
+        contact.flags = crate::network::ember::SOURCE_FLAG_FIREWALLED;
+        let record = a.build_source_record([9u8; 16], [0u8; 32], 10, "fw.mkv", contact);
+        let key = record.keyword_hash;
+        let (_rid, store_bytes) = a.build_store(key, record.data.clone(), record.signature);
+        let on_b = b.handle_message(&store_bytes, a_addr, a_noise, 1000);
+        assert!(
+            on_b.stored_record,
+            "FIREWALLED source must store despite IP mismatch"
+        );
+        assert_eq!(on_b.responses.len(), 1);
+    }
+
+    #[test]
+    fn proxy_store_forwards_firewalled_source() {
+        let mut publisher = dht(80);
+        let mut buddy = dht(81);
+        let pub_noise = [0xAA; 32];
+        let pub_addr = addr(80, 4672);
+
+        let mut contact = source_contact_at(80);
+        contact.flags = crate::network::ember::SOURCE_FLAG_FIREWALLED
+            | crate::network::ember::SOURCE_FLAG_RELAY_CAPABLE;
+        let record =
+            publisher.build_source_record([3u8; 16], [0u8; 32], 42, "buddy.mkv", contact);
+        let key = record.keyword_hash;
+        let (_rid, frame) =
+            publisher.build_proxy_store(key, record.data.clone(), record.signature);
+        let on_buddy = buddy.handle_message(&frame, pub_addr, pub_noise, 2000);
+        assert!(
+            on_buddy.proxy_store_forward.is_some(),
+            "buddy should accept PROXY_STORE"
+        );
+        assert_eq!(on_buddy.responses.len(), 1, "PROXY_STORE_ACK");
+        let fwd = on_buddy.proxy_store_forward.unwrap();
+        assert_eq!(fwd.file_name, "buddy.mkv");
+        assert_eq!(fwd.keyword_hash, key);
+    }
+
+    #[test]
+    fn proxy_store_rejects_non_firewalled_source() {
+        let mut publisher = dht(82);
+        let mut buddy = dht(83);
+        let pub_noise = [0xAA; 32];
+        let pub_addr = addr(82, 4672);
+
+        // HighID source must not ride PROXY_STORE (would bypass anti-reflection).
+        let contact = source_contact_at(82);
+        let record =
+            publisher.build_source_record([4u8; 16], [0u8; 32], 1, "direct.mkv", contact);
+        let (_rid, frame) =
+            publisher.build_proxy_store(record.keyword_hash, record.data.clone(), record.signature);
+        let on_buddy = buddy.handle_message(&frame, pub_addr, pub_noise, 2000);
+        assert!(on_buddy.proxy_store_forward.is_none());
+        assert!(on_buddy.responses.is_empty());
     }
 
     #[test]

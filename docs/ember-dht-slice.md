@@ -441,8 +441,9 @@ and `ember_native_enabled: true` in each `config.json`:
    bootstrap" above. KAD-learned Ember peers are DHT-pinged into the table
    while it's sparse. Primary discovery path for the first public DHT
    release (alongside rendezvous `/bootstrap` for KAD-off clients).
-2. **DNS seed list** (slice 12, deferred) — `_ember._udp.<domain>` SRV/TXT
-   records so a seed set can rotate without a client release. Deferred
-   until a seed domain actually exists (needs a DNS-resolver dependency).
+2. ~~Buddy / dual-UDP publish (`PROXY_STORE`, slice 15).~~ **Done** —
+   firewalled publishers ask up to 3 fresh DHT contacts to fan out their
+   signed `FIREWALLED` source records; storers exempt those sources from
+   IP anti-reflection. DNS seed list (slice 12) remains deferred.
 3. Multi-keyword DHT intersection on the wire (UI already AND-filters
    locally after a primary-keyword `FIND_VALUE`).

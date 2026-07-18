@@ -2,13 +2,13 @@
 //!
 //! Transport-layer AEAD already rejects verbatim UDP replays; STORE
 //! signature replay collapse lives in [super::engine::EmberDht]. This
-//! module caps per-IP frame and STORE rates once a Noise session is up.
+//! module caps per-IP frame and STORE/PROXY_STORE rates once a Noise session is up.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
-use super::messages::MSG_STORE_RECORD;
+use super::messages::{MSG_PROXY_STORE, MSG_STORE_RECORD};
 
 /// Sliding window for per-IP message counts.
 const MSG_WINDOW: Duration = Duration::from_secs(1);
@@ -16,7 +16,7 @@ const MSG_WINDOW: Duration = Duration::from_secs(1);
 const MAX_MSGS_PER_WINDOW: u32 = 40;
 /// Sliding window for STORE floods.
 const STORE_WINDOW: Duration = Duration::from_secs(60);
-/// Max STORE_RECORD frames accepted from one IP per [STORE_WINDOW].
+/// Max STORE_RECORD / PROXY_STORE frames accepted from one IP per [STORE_WINDOW].
 const MAX_STORES_PER_WINDOW: u32 = 30;
 const MAX_IP_ENTRIES: usize = 10_000;
 
@@ -91,7 +91,7 @@ impl DhtProtection {
             return false;
         }
 
-        if msg_type == MSG_STORE_RECORD {
+        if msg_type == MSG_STORE_RECORD || msg_type == MSG_PROXY_STORE {
             if self.store_counters.len() >= MAX_IP_ENTRIES && !self.store_counters.contains_key(&ip)
             {
                 self.dropped_rate = self.dropped_rate.saturating_add(1);

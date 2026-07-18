@@ -25095,6 +25095,7 @@ async fn maybe_publish_ember_sources(
     // Refresh firewall-awareness gauges every tick (slice 15), even when
     // we skip publishing (empty table / no IP yet).
     let firewalled_like = state.firewalled || state.low_id;
+    let needs_buddy = firewalled_like || state.udp_firewalled;
     state.ember_diagnostics.ember_dht_firewalled_publishing = false;
     state.ember_diagnostics.ember_dht_udp_unreachable = false;
 
@@ -25129,7 +25130,7 @@ async fn maybe_publish_ember_sources(
         },
     };
 
-    if firewalled_like {
+    if needs_buddy {
         state.ember_diagnostics.ember_dht_firewalled_publishing = true;
     }
 
@@ -25190,7 +25191,9 @@ async fn maybe_publish_ember_sources(
     if settings.obfuscation_enabled {
         flags |= ember::SOURCE_FLAG_OBFUSCATION;
     }
-    if firewalled_like {
+    // TCP LowID *or* UDP-firewalled: advertise firewalled+relay so downloaders
+    // use the broker, and so storers accept buddy-forwarded STORES.
+    if needs_buddy {
         flags |= ember::SOURCE_FLAG_FIREWALLED | ember::SOURCE_FLAG_RELAY_CAPABLE;
     }
     let contact = ember::dht::publish::SourceContact {
@@ -25199,6 +25202,17 @@ async fn maybe_publish_ember_sources(
         udp_port,
         flags,
         noise_pub: *state.ember_transport.local_noise_public_key(),
+    };
+
+    // HighID buddies that can fan out PROXY_STORE for us (freshest first).
+    let buddies: Vec<ember::dht::EmberContact> = if needs_buddy {
+        let mut c = state.ember_dht.contacts();
+        c.retain(|x| x.node_id != state.ember_dht.local_id() && x.failed_queries == 0);
+        c.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+        c.truncate(EMBER_SOURCE_BUDDY_MAX);
+        c
+    } else {
+        Vec::new()
     };
 
     for (file_hash, file_size, file_name) in due {
@@ -25210,7 +25224,7 @@ async fn maybe_publish_ember_sources(
             .build_source_record(file_hash, [0u8; 32], file_size, &file_name, contact);
         if let Some(publish_id) = state
             .ember_publish
-            .start_publish(record, state.ember_dht.routing())
+            .start_publish(record.clone(), state.ember_dht.routing())
         {
             state.ember_source_publish_at.insert(file_hash, now);
             state.ember_diagnostics.ember_dht_sources_published = state
@@ -25218,6 +25232,49 @@ async fn maybe_publish_ember_sources(
                 .ember_dht_sources_published
                 .saturating_add(1);
             drive_ember_publish(socket, state, publish_id).await;
+        }
+        // Buddy path: also ask HighID contacts to STORE on our behalf when
+        // we are TCP/UDP firewalled (symmetric NAT / dual-FW). Buddies that
+        // accept reply with PROXY_STORE_ACK and fan out normal STORE_RECORDs.
+        if !buddies.is_empty() {
+            ask_ember_source_buddies(socket, state, &record, &buddies).await;
+        }
+    }
+}
+
+/// Cap on HighID buddies asked to PROXY_STORE per source publish tick.
+const EMBER_SOURCE_BUDDY_MAX: usize = 3;
+
+/// Send `PROXY_STORE` to each buddy for a firewalled source record.
+async fn ask_ember_source_buddies(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    record: &ember::dht::publish::SignedRecord,
+    buddies: &[ember::dht::EmberContact],
+) {
+    let key = record.keyword_hash;
+    for buddy in buddies {
+        let (_rid, frame) =
+            state
+                .ember_dht
+                .build_proxy_store(key, record.data.clone(), record.signature);
+        let sent = match state.ember_transport.prepare_outgoing(
+            buddy.addr,
+            Some(&buddy.noise_pub),
+            &frame,
+        ) {
+            ember::transport::OutgoingResult::Ready { packet }
+            | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+                socket.send_to(&packet, buddy.addr).await.is_ok()
+            }
+            ember::transport::OutgoingResult::Queued => true,
+            ember::transport::OutgoingResult::Error(_) => false,
+        };
+        if sent {
+            state.ember_diagnostics.ember_dht_buddy_publishes = state
+                .ember_diagnostics
+                .ember_dht_buddy_publishes
+                .saturating_add(1);
         }
     }
 }
@@ -25594,6 +25651,21 @@ async fn handle_ember_dht_message(
             .ember_diagnostics
             .ember_dht_find_values_received
             .saturating_add(1);
+    }
+
+    // Buddy accepted a PROXY_STORE: fan the publisher-signed firewalled
+    // source record out via our normal publish driver.
+    if let Some(forward) = inbound.proxy_store_forward {
+        state.ember_diagnostics.ember_dht_buddy_forwards = state
+            .ember_diagnostics
+            .ember_dht_buddy_forwards
+            .saturating_add(1);
+        if let Some(publish_id) = state
+            .ember_publish
+            .start_publish(forward, state.ember_dht.routing())
+        {
+            drive_ember_publish(socket, state, publish_id).await;
+        }
     }
 
     // Encrypt and send any signed DHT replies (e.g. the PONG answering

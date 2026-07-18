@@ -18,6 +18,11 @@ pub const MSG_FIND_VALUE: u8 = 0x07;
 pub const MSG_FOUND_VALUE: u8 = 0x08;
 pub const MSG_ANNOUNCE_PEER: u8 = 0x09;
 pub const MSG_PEER_LIST: u8 = 0x0A;
+/// Firewalled peer → HighID buddy: please fan out this publisher-signed
+/// source `STORE_RECORD` payload on our behalf.
+pub const MSG_PROXY_STORE: u8 = 0x0B;
+/// Buddy → firewalled peer: accepted the proxy request (not a DHT STORE_ACK).
+pub const MSG_PROXY_STORE_ACK: u8 = 0x0C;
 
 // Address type flags
 const ADDR_IPV4: u8 = 0x04;
@@ -58,6 +63,16 @@ pub enum DhtPayload {
         record_signature: [u8; 64],
     },
     StoreAck {
+        key: [u8; 16],
+    },
+    /// Same body as [`DhtPayload::StoreRecord`]; asks the receiver to
+    /// re-`STORE` a firewalled source record on the publisher's behalf.
+    ProxyStore {
+        key: [u8; 16],
+        record: Vec<u8>,
+        record_signature: [u8; 64],
+    },
+    ProxyStoreAck {
         key: [u8; 16],
     },
     FindValue {
@@ -288,6 +303,46 @@ pub fn build_store_ack(sender_id: EmberNodeId, request_id: u32, key: [u8; 16]) -
     }
 }
 
+/// Build a PROXY_STORE (buddy fan-out request); body matches STORE_RECORD.
+pub fn build_proxy_store(
+    sender_id: EmberNodeId,
+    request_id: u32,
+    key: [u8; 16],
+    record: Vec<u8>,
+    record_signature: [u8; 64],
+) -> DhtMessage {
+    DhtMessage {
+        version: EMBER_DHT_VERSION,
+        msg_type: MSG_PROXY_STORE,
+        request_id,
+        sender_id,
+        sender_pub_key: None,
+        payload: DhtPayload::ProxyStore {
+            key,
+            record,
+            record_signature,
+        },
+        signature: [0u8; 64],
+    }
+}
+
+/// Build a PROXY_STORE_ACK (buddy accepted the proxy request).
+pub fn build_proxy_store_ack(
+    sender_id: EmberNodeId,
+    request_id: u32,
+    key: [u8; 16],
+) -> DhtMessage {
+    DhtMessage {
+        version: EMBER_DHT_VERSION,
+        msg_type: MSG_PROXY_STORE_ACK,
+        request_id,
+        sender_id,
+        sender_pub_key: None,
+        payload: DhtPayload::ProxyStoreAck { key },
+        signature: [0u8; 64],
+    }
+}
+
 /// Build a FIND_VALUE request for one or more keys.
 pub fn build_find_value(
     sender_id: EmberNodeId,
@@ -336,6 +391,11 @@ fn encode_payload(payload: &DhtPayload) -> Vec<u8> {
             key,
             record,
             record_signature,
+        }
+        | DhtPayload::ProxyStore {
+            key,
+            record,
+            record_signature,
         } => {
             let mut buf = Vec::with_capacity(16 + 2 + record.len() + 64);
             buf.extend_from_slice(key);
@@ -344,7 +404,7 @@ fn encode_payload(payload: &DhtPayload) -> Vec<u8> {
             buf.extend_from_slice(record_signature);
             buf
         }
-        DhtPayload::StoreAck { key } => key.to_vec(),
+        DhtPayload::StoreAck { key } | DhtPayload::ProxyStoreAck { key } => key.to_vec(),
         DhtPayload::FindValue { keys } => {
             let mut buf = Vec::with_capacity(1 + keys.len() * 16);
             buf.write_u8(keys.len() as u8).unwrap();
@@ -419,9 +479,9 @@ fn decode_payload(msg_type: u8, data: &[u8]) -> anyhow::Result<DhtPayload> {
                 _ => Ok(DhtPayload::PeerList { contacts }),
             }
         }
-        MSG_STORE_RECORD => {
+        MSG_STORE_RECORD | MSG_PROXY_STORE => {
             if data.len() < 16 + 2 + 64 {
-                anyhow::bail!("STORE_RECORD too short");
+                anyhow::bail!("STORE/PROXY_STORE too short");
             }
             let mut key = [0u8; 16];
             key.copy_from_slice(&data[..16]);
@@ -429,24 +489,36 @@ fn decode_payload(msg_type: u8, data: &[u8]) -> anyhow::Result<DhtPayload> {
             let record_len = cursor.read_u16::<LittleEndian>()? as usize;
             let offset = 18;
             if offset + record_len + 64 > data.len() {
-                anyhow::bail!("STORE_RECORD truncated");
+                anyhow::bail!("STORE/PROXY_STORE truncated");
             }
             let record = data[offset..offset + record_len].to_vec();
             let mut record_signature = [0u8; 64];
             record_signature.copy_from_slice(&data[offset + record_len..offset + record_len + 64]);
-            Ok(DhtPayload::StoreRecord {
-                key,
-                record,
-                record_signature,
-            })
+            if msg_type == MSG_PROXY_STORE {
+                Ok(DhtPayload::ProxyStore {
+                    key,
+                    record,
+                    record_signature,
+                })
+            } else {
+                Ok(DhtPayload::StoreRecord {
+                    key,
+                    record,
+                    record_signature,
+                })
+            }
         }
-        MSG_STORE_ACK => {
+        MSG_STORE_ACK | MSG_PROXY_STORE_ACK => {
             if data.len() < 16 {
-                anyhow::bail!("STORE_ACK too short");
+                anyhow::bail!("STORE/PROXY_STORE_ACK too short");
             }
             let mut key = [0u8; 16];
             key.copy_from_slice(&data[..16]);
-            Ok(DhtPayload::StoreAck { key })
+            if msg_type == MSG_PROXY_STORE_ACK {
+                Ok(DhtPayload::ProxyStoreAck { key })
+            } else {
+                Ok(DhtPayload::StoreAck { key })
+            }
         }
         MSG_FIND_VALUE => {
             if data.is_empty() {

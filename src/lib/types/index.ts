@@ -289,6 +289,10 @@ export interface EmberDiagnostics {
   ember_dht_firewalled_publishing: boolean;
   /** Slice 15: Ember on but no external IPv4 available for source records. */
   ember_dht_udp_unreachable: boolean;
+  /** PROXY_STORE requests sent (firewalled publisher → HighID buddies). */
+  ember_dht_buddy_publishes: number;
+  /** PROXY_STORE requests accepted and fanned out as a buddy. */
+  ember_dht_buddy_forwards: number;
 }
 
 /** Result of an `ember_ping_peer` harness round-trip. `rtt_ms` is set
