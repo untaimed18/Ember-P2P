@@ -22470,8 +22470,11 @@ pub async fn start_network(
                 if hashes.is_empty() {
                     return;
                 }
-                let sm = source_manager.read().await;
-                let mut updates: Vec<(String, [u8; 16], u32)> = Vec::new();
+                // Library "Peers" = known complete copies (active download PFS)
+                // and/or KAD peers that ACK'd our source publish. Do NOT use
+                // SourceManager::source_count — that counts every known peer
+                // including incomplete ones and inflated the column.
+                let mut computed: Vec<(String, [u8; 16], u32)> = Vec::new();
                 for hash_hex in &hashes {
                     let hash_bytes: [u8; 16] = match hex::decode(hash_hex) {
                         Ok(b) if b.len() == 16 => {
@@ -22481,77 +22484,94 @@ pub async fn start_network(
                         }
                         _ => continue,
                     };
-                    let mut count = sm.source_count(&hash_bytes) as u32;
+                    let mut count = 0u32;
                     for pfs in state.per_file_sources.values() {
                         if pfs.file_hash == hash_bytes {
-                            let pfs_count = pfs.complete_source_count() as u32;
-                            if pfs_count > count {
-                                count = pfs_count;
-                            }
+                            count = count.max(u32::from(pfs.complete_source_count()));
                             break;
                         }
                     }
-                    // Fallback for purely-shared files (never searched/downloaded):
-                    // use the number of KAD peers that accepted our most recent
-                    // source publish. This represents *other* peers who know
-                    // about us as a source; the local copy is not counted so
-                    // the UI label ("Peers") stays honest.
+                    // Purely-shared files (never searched/downloaded) have no
+                    // PFS entry; fall back to KAD publish ACKs — peers that
+                    // stored our source record. Local copy is not counted.
                     let kad_hash = md4_bytes_to_kad_id(&hash_bytes);
                     if let Some(&ack_count) = state.source_publish_acks.get(&kad_hash) {
-                        if ack_count > count {
-                            count = ack_count;
+                        count = count.max(ack_count);
+                    }
+                    computed.push((hash_hex.clone(), hash_bytes, count));
+                }
+
+                let mut updates: Vec<(String, [u8; 16], u32)> = Vec::new();
+                {
+                    let index = local_index.read().await;
+                    for (hash_hex, hash_bytes, count) in &computed {
+                        let current = index
+                            .get_by_hash(hash_hex)
+                            .map(|f| f.complete_sources)
+                            .unwrap_or(0);
+                        if current != *count {
+                            updates.push((hash_hex.clone(), *hash_bytes, *count));
                         }
                     }
-                    if count > 0 {
-                        updates.push((hash_hex.clone(), hash_bytes, count));
-                    }
                 }
-                drop(sm);
-                if !updates.is_empty() {
+
+                if updates.is_empty() {
+                    return;
+                }
+
+                {
                     let mut index = local_index.write().await;
                     for (hash_hex, _, count) in &updates {
                         index.update_complete_sources(hash_hex, *count);
                     }
-                    drop(index);
-                    // Persist the freshly-synced counts too, so the Library
-                    // shows the last-known Peers figure immediately at the
-                    // next startup instead of resetting to 0 until this sync
-                    // runs again (it's a point-in-time gauge, so a fresh
-                    // count always simply overwrites the stored one).
-                    let mut known_dirty = false;
-                    for (_, hash_bytes, count) in &updates {
-                        if let Some(record) = known_files.find_by_hash_mut(hash_bytes) {
-                            if record.complete_sources != *count {
-                                record.complete_sources = *count;
-                                known_dirty = true;
-                            }
+                }
+                // Persist so Library shows last-known Peers at next startup
+                // (including clearing to 0 when the gauge drops).
+                let mut known_dirty = false;
+                for (_, hash_bytes, count) in &updates {
+                    if let Some(record) = known_files.find_by_hash_mut(hash_bytes) {
+                        if record.complete_sources != *count {
+                            record.complete_sources = *count;
+                            known_dirty = true;
                         }
                     }
-                    if known_dirty {
-                        known_files.mark_dirty();
-                    }
-                    let li_ref = local_index.clone();
-                    let s_files = shared_files.clone();
-                    let kad_connected = state.stats.status == NetworkStatus::Connected;
-                    let srv_connected = state.server_connected;
-                    let kad_published = state.publish_manager.source_published_md4_hashes();
-                    let ed2k_offered = state.offered_ed2k_hashes.clone();
-                    tokio::spawn(async move {
-                        let file_snap = {
-                            let index = li_ref.read().await;
-                            let mut snap = index.all_files().to_vec();
-                            apply_publish_badges(
-                                &mut snap,
-                                kad_connected,
-                                srv_connected,
-                                &kad_published,
-                                &ed2k_offered,
-                            );
-                            snap
-                        };
-                        *s_files.write().await = file_snap;
-                    });
                 }
+                if known_dirty {
+                    known_files.mark_dirty();
+                }
+                let li_ref = local_index.clone();
+                let s_files = shared_files.clone();
+                let app_for_peers = app_handle.clone();
+                let changed_count = updates.len();
+                let kad_connected = state.stats.status == NetworkStatus::Connected;
+                let srv_connected = state.server_connected;
+                let kad_published = state.publish_manager.source_published_md4_hashes();
+                let ed2k_offered = state.offered_ed2k_hashes.clone();
+                tokio::spawn(async move {
+                    let file_snap = {
+                        let index = li_ref.read().await;
+                        let mut snap = index.all_files().to_vec();
+                        apply_publish_badges(
+                            &mut snap,
+                            kad_connected,
+                            srv_connected,
+                            &kad_published,
+                            &ed2k_offered,
+                        );
+                        snap
+                    };
+                    *s_files.write().await = file_snap;
+                    // Library only refreshes on this event (or scan done) —
+                    // without it the Peers column stayed stale for the
+                    // whole session after the initial load.
+                    let _ = app_for_peers.emit(
+                        "shared-files-changed",
+                        serde_json::json!({
+                            "phase": "peer-counts",
+                            "count": changed_count,
+                        }),
+                    );
+                });
                 }).catch_unwind().await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'source_count_sync_timer' panicked: {}", describe_panic(&*__p));
