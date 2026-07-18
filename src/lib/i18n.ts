@@ -83,11 +83,17 @@ export function systemLocale(): Locale {
   if (!nav) return baseLocale;
   const lang = nav.split('-')[0];
   const compiled = locales as readonly Locale[];
-  // exact match first, then language-only prefix match.
+  // exact match first (e.g. zh-CN), then language-only (e.g. es),
+  // then primary-subtag match for regional locales (zh → zh-CN).
   const exact = compiled.find((l) => l.toLowerCase() === nav);
   if (exact) return exact;
   const prefix = compiled.find((l) => l.toLowerCase() === lang);
-  return prefix ?? baseLocale;
+  if (prefix) return prefix;
+  const regional = compiled.find((l) => {
+    const lower = l.toLowerCase();
+    return lower.startsWith(`${lang}-`) || lower.startsWith(`${lang}_`);
+  });
+  return regional ?? baseLocale;
 }
 
 /**
@@ -121,6 +127,8 @@ export function languageLabel(locale: Locale): string {
       return m.language_name_pt_BR({}, { locale });
     case 'de':
       return m.language_name_de({}, { locale });
+    case 'zh-CN':
+      return m.language_name_zh_CN({}, { locale });
     default:
       return locale;
   }
@@ -145,6 +153,8 @@ export function localeFlagSrc(locale: Locale): string | null {
         return 'br';
       case 'de':
         return 'de';
+      case 'zh-CN':
+        return 'cn';
       default:
         return null;
     }
