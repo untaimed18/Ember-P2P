@@ -241,9 +241,11 @@ probe and the rendezvous server we already run for friend presence.
   standard Kademlia self-lookup that fills the neighbourhood. Warm starts
   skip the whole path.
 
-The trust anchor throughout is the DHT's own PING-time verification, so the
-pool stays unsigned and best-effort; a signed, load-weighted pool can come
-later without changing the client.
+The trust anchor throughout is the DHT's own PING-time verification.
+The rendezvous `/bootstrap` pool is additionally **signed** by the
+server's long-term Ed25519 key and **load-weighted** so cold-start
+traffic spreads across the pool; clients verify the envelope (and may
+pin `rendezvous_bootstrap_pubkey`).
 
 ### KAD-bridge bootstrap (slice 13)
 
@@ -337,9 +339,7 @@ least `K_BUCKET_SIZE` contacts (accept the close half of the ID space;
 sparse tables still accept every directed `STORE`, bounded by signature +
 key-binding + capacity caps). The native **rendezvous bootstrap** is wired
 end-to-end (server pool + client cold-start fetch + self-lookup), so both
-warm and cold starts are KAD-free; what remains deferred there is a
-**signed, load-weighted** bootstrap pool (the current pool is unsigned and
-best-effort, leaning on PING-time verification). Auto keyword/source
+warm and cold starts are KAD-free. Auto keyword/source
 publish against real shared files (slices 8–9) and search UI Ember method
 (slice 10) are live behind `ember_native_enabled`. Inbound `ANNOUNCE_PEER` /
 `PEER_LIST` are decoded and the sender is learned, but their handlers are
@@ -444,8 +444,5 @@ and `ember_native_enabled: true` in each `config.json`:
 2. **DNS seed list** (slice 12, deferred) — `_ember._udp.<domain>` SRV/TXT
    records so a seed set can rotate without a client release. Deferred
    until a seed domain actually exists (needs a DNS-resolver dependency).
-3. A **signed, load-weighted** rendezvous `/bootstrap` pool (the current
-   pool is unsigned + best-effort, leaning on the DHT's PING-time
-   verification as the trust anchor).
-4. Multi-keyword DHT intersection on the wire (UI already AND-filters
+3. Multi-keyword DHT intersection on the wire (UI already AND-filters
    locally after a primary-keyword `FIND_VALUE`).

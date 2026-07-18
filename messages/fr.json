@@ -1916,6 +1916,7 @@
   "error_settings_rendezvous_url_no_host": "L'URL rendezvous doit contenir un hôte valide",
   "error_settings_rendezvous_url_not_https": "L'URL rendezvous doit utiliser HTTPS",
   "error_settings_rendezvous_url_too_long": "L'URL rendezvous dépasse {detail} octets",
+  "error_settings_rendezvous_bootstrap_pubkey_invalid": "Rendezvous bootstrap pubkey must be 64 hex characters",
   "error_settings_response_read_failed": "Échec de la lecture du corps de la réponse : {detail}",
   "error_settings_response_too_large": "Réponse trop volumineuse (Content-Length dépasse la limite)",
   "error_settings_save_failed": "Échec de l'enregistrement : {detail}",

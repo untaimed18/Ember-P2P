@@ -14,7 +14,9 @@
 //! That keeps the protocol logic unit-testable without a live socket or
 //! a `NetworkState`.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
 use tracing::trace;
@@ -25,6 +27,11 @@ use super::routing::{AddResult, RoutingTable};
 use super::store::DhtStore;
 use super::{EmberContact, EmberNodeId, ID_BITS, K_BUCKET_SIZE, MAX_CONTACTS_PER_RESPONSE};
 use crate::network::ember::crypto;
+
+/// Collapse identical STORE frames for this long (slice 14). Hourly
+/// keyword republish still gets through.
+const STORE_SIG_REPLAY_TTL: Duration = Duration::from_secs(60);
+const MAX_STORE_SIG_CACHE: usize = 50_000;
 
 /// What the engine produced from one inbound DHT frame.
 #[derive(Default)]
@@ -76,6 +83,8 @@ pub struct DhtInbound {
     /// Decode / signature / identity-binding failure. The caller should
     /// drop the frame; the string is for debug logging only.
     pub error: Option<String>,
+    /// Slice 14: identical STORE signature rejected as a replay.
+    pub store_replay_rejected: bool,
 }
 
 /// Owns our DHT identity, routing table, and local record store, and
@@ -90,6 +99,9 @@ pub struct EmberDht {
     /// Monotonic request-id source for outbound requests. Wraps,
     /// skipping 0 so a live waiter can never key on the sentinel.
     next_request_id: u32,
+    /// Recently-seen STORE signatures (`blake3(publisher||sig)` → time)
+    /// for slice-14 replay collapse.
+    store_sig_seen: HashMap<[u8; 32], Instant>,
 }
 
 impl EmberDht {
@@ -108,6 +120,7 @@ impl EmberDht {
             signing_key,
             local_id,
             next_request_id: 1,
+            store_sig_seen: HashMap::new(),
         }
     }
 
@@ -477,7 +490,27 @@ impl EmberDht {
                         Some(sc) => from.ip() == std::net::IpAddr::V4(sc.ip),
                         None => parsed.record_type != RECORD_TYPE_SOURCE,
                     };
-                    if key == parsed.keyword_hash
+                    // Slice 14: collapse identical STORE frames (same publisher
+                    // signature) for a short window so a retransmit storm can't
+                    // re-verify the same blob forever. Hourly republish still
+                    // lands after the TTL.
+                    let mut hasher = blake3::Hasher::new();
+                    hasher.update(&parsed.publisher_key);
+                    hasher.update(&record_signature);
+                    let sig_key = *hasher.finalize().as_bytes();
+                    let now_inst = Instant::now();
+                    if self.store_sig_seen.len() > MAX_STORE_SIG_CACHE / 2 {
+                        self.store_sig_seen
+                            .retain(|_, t| now_inst.duration_since(*t) < STORE_SIG_REPLAY_TTL);
+                    }
+                    let is_replay = self
+                        .store_sig_seen
+                        .get(&sig_key)
+                        .map(|t| now_inst.duration_since(*t) < STORE_SIG_REPLAY_TTL)
+                        .unwrap_or(false);
+                    if is_replay {
+                        out.store_replay_rejected = true;
+                    } else if key == parsed.keyword_hash
                         && source_ip_ok
                         && self.store_proximity_ok(&key)
                         && self.store.store(
@@ -488,6 +521,9 @@ impl EmberDht {
                             parsed.timestamp,
                         )
                     {
+                        if self.store_sig_seen.len() < MAX_STORE_SIG_CACHE {
+                            self.store_sig_seen.insert(sig_key, now_inst);
+                        }
                         out.stored_record = true;
                         let ack = messages::build_store_ack(self.local_id, msg.request_id, key);
                         out.responses

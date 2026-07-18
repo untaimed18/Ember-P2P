@@ -228,6 +228,12 @@
     <div class="banner banner-muted" role="status">{m.ember_no_contacts_hint()}</div>
   {/if}
 
+  {#if isActive && diag?.ember_dht_udp_unreachable}
+    <div class="banner banner-info" role="status">{m.ember_dht_udp_unreachable_hint()}</div>
+  {:else if isActive && diag?.ember_dht_firewalled_publishing}
+    <div class="banner banner-muted" role="status">{m.ember_dht_firewalled_publishing_hint()}</div>
+  {/if}
+
   <!-- Live stats -->
   <section class="stat-grid" class:dimmed={!isActive}>
     <div class="stat">

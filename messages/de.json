@@ -1916,6 +1916,7 @@
   "error_settings_rendezvous_url_no_host": "Rendezvous-URL muss einen gültigen Host enthalten",
   "error_settings_rendezvous_url_not_https": "Rendezvous-URL muss HTTPS verwenden",
   "error_settings_rendezvous_url_too_long": "Rendezvous-URL überschreitet {detail} Byte",
+  "error_settings_rendezvous_bootstrap_pubkey_invalid": "Rendezvous bootstrap pubkey must be 64 hex characters",
   "error_settings_response_read_failed": "Antworttext konnte nicht gelesen werden: {detail}",
   "error_settings_response_too_large": "Antwort zu groß (Content-Length überschreitet das Limit)",
   "error_settings_save_failed": "Speichern fehlgeschlagen: {detail}",

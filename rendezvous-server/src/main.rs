@@ -18,8 +18,9 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use futures_util::FutureExt;
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
@@ -47,6 +48,8 @@ const OP_UNREGISTER: u8 = 0x02;
 // endpoints once those IDs are migrated from synthetic (ip, port)
 // strings to presence-map ember-hash ids. Until then those endpoints
 // rely on per-IP rate-limiting and per-target caps for abuse control.
+/// Server-signed DHT `/bootstrap` pool responses.
+const OP_BOOTSTRAP: u8 = 0x07;
 
 /// Maximum allowed clock skew between the client and server timestamps
 /// in a signed request. 5 minutes covers normal NTP-skewed clients
@@ -142,6 +145,44 @@ fn build_unregister_msg(id_raw: &[u8; 32], ts: i64) -> Vec<u8> {
     m.extend_from_slice(id_raw);
     m.extend_from_slice(&ts.to_le_bytes());
     m
+}
+
+/// Load or generate the long-term Ed25519 key used to sign `/bootstrap`
+/// responses. Prefer `EMBER_BOOTSTRAP_SIGNING_KEY` (64 hex chars = 32-byte
+/// seed). Otherwise read/write `EMBER_BOOTSTRAP_KEY_FILE` (default
+/// `bootstrap_signing.key` hex seed) so restarts keep the same identity
+/// clients may pin.
+fn load_bootstrap_signing_key() -> SigningKey {
+    if let Ok(hex_seed) = std::env::var("EMBER_BOOTSTRAP_SIGNING_KEY") {
+        let mut seed = [0u8; 32];
+        if hex::decode_to_slice(hex_seed.trim(), &mut seed).is_ok() {
+            info!("Loaded bootstrap signing key from EMBER_BOOTSTRAP_SIGNING_KEY");
+            return SigningKey::from_bytes(&seed);
+        }
+        warn!("EMBER_BOOTSTRAP_SIGNING_KEY is set but not valid 64-hex; falling back to key file");
+    }
+
+    let path = std::env::var("EMBER_BOOTSTRAP_KEY_FILE")
+        .unwrap_or_else(|_| "bootstrap_signing.key".to_string());
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let mut seed = [0u8; 32];
+        if hex::decode_to_slice(existing.trim(), &mut seed).is_ok() {
+            info!("Loaded bootstrap signing key from {path}");
+            return SigningKey::from_bytes(&seed);
+        }
+        warn!("Bootstrap key file {path} is corrupt; generating a new key");
+    }
+
+    let key = SigningKey::generate(&mut OsRng);
+    if let Err(e) = std::fs::write(&path, hex::encode(key.to_bytes())) {
+        warn!("Failed to persist bootstrap signing key to {path}: {e}");
+    } else {
+        info!(
+            "Generated new bootstrap signing key (pubkey {}); persisted to {path}",
+            hex::encode(key.verifying_key().to_bytes())
+        );
+    }
+    key
 }
 
 fn signed_request_replay_key(message: &[u8], sig: &[u8; 64]) -> [u8; 32] {
@@ -286,9 +327,9 @@ struct PresenceEntry {
     /// responses: this is what lets a looker-upper cryptographically
     /// confirm the (ip, port, pubkey, ts) tuple was produced by
     /// whoever holds the private key for this id, and was not
-    /// substituted or fabricated by the rendezvous server itself. The
-    /// server has no long-term signing key of its own for this
-    /// purpose — it only ever relays the registrant's own proof.
+    /// substituted or fabricated by the rendezvous server itself.
+    /// (The server *does* hold a separate long-term key for signing
+    /// `/bootstrap` pool responses — see `bootstrap_signing_key`.)
     sig: [u8; 64],
 }
 
@@ -371,6 +412,12 @@ struct AppState {
     /// fresh; this cache prevents replaying a captured fresh register or
     /// unregister within that allowed skew window.
     replay_cache: Arc<RwLock<HashMap<[u8; 32], Instant>>>,
+    /// How many times each DHT node's Ed25519 pubkey has been handed out
+    /// via `/bootstrap`. Used as the load score for weighted sampling so
+    /// cold-start traffic doesn't concentrate on a few popular entries.
+    bootstrap_load: Arc<RwLock<HashMap<[u8; 32], u32>>>,
+    /// Long-term Ed25519 key that signs every `/bootstrap` response.
+    bootstrap_signing_key: Arc<SigningKey>,
     started_at: Instant,
 }
 
@@ -1707,7 +1754,7 @@ async fn health() -> &'static str {
 /// One node in the `/bootstrap` pool. The client derives the 128-bit DHT
 /// node id itself from `ed25519_pub` (`BLAKE3(ed25519_pub)[..16]`) — it
 /// never trusts a server-supplied id — so we don't send one.
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct BootstrapNodeResponse {
     /// "ip:port" the peer is reachable at for the Ember Noise transport.
     addr: String,
@@ -1715,6 +1762,24 @@ struct BootstrapNodeResponse {
     noise_pub: String,
     /// Ed25519 public key (64 hex chars).
     ed25519_pub: String,
+    /// How many times this node has been served from `/bootstrap` so far
+    /// (including this response once the client accepts it). Lower is
+    /// better — clients prefer these when seeding.
+    load: u32,
+}
+
+/// Signed `/bootstrap` envelope. Replaces the earlier bare JSON array so
+/// clients can authenticate the pool against the rendezvous operator's
+/// long-term key (and optionally pin that key).
+#[derive(Serialize)]
+struct BootstrapResponse {
+    /// Unix seconds when this response was signed.
+    ts: i64,
+    /// Server bootstrap Ed25519 public key (64 hex chars).
+    pubkey: String,
+    /// Hex Ed25519 signature over [`build_bootstrap_msg`].
+    sig: String,
+    nodes: Vec<BootstrapNodeResponse>,
 }
 
 /// Max nodes returned per `/bootstrap` GET. The client caps its own
@@ -1722,54 +1787,162 @@ struct BootstrapNodeResponse {
 /// response size and the per-node bootstrap load.
 const MAX_BOOTSTRAP_RESPONSE: usize = 50;
 
-/// DHT bootstrap pool (replaces the earlier empty stub now that the Ember
-/// DHT is live).
+/// Canonical bytes the server signs for a `/bootstrap` response.
 ///
-/// Returns a rotating sample of currently-registered nodes that published
-/// a Noise key (i.e. run the Ember-native DHT). The client
-/// (`ember/dht/bootstrap.rs::fetch_bootstrap_nodes`) seeds its routing
-/// table from this on a cold start — no warm `nodes_ember.dat` — so a
-/// brand-new install joins the DHT without any KAD involvement.
-///
-/// Trust model: the pool is unsigned and best-effort. It can at worst
-/// hand out unreachable/stale contacts — it cannot poison a routing table,
-/// because the DHT verifies each contact's Ed25519 signature and the
-/// `node_id == BLAKE3(ed25519_pub)` binding on the first PING, and a wrong
-/// Noise key just fails the handshake.
-async fn bootstrap(State(state): State<AppState>) -> Json<Vec<BootstrapNodeResponse>> {
-    let now = Instant::now();
-    let store = state.store.read().await;
-    let eligible: Vec<&PresenceEntry> = store
-        .values()
-        .filter(|e| e.expires_at > now && e.noise_pub.is_some() && e.ember_port.is_some())
-        .collect();
+/// Layout: `RDV_DOMAIN || OP_BOOTSTRAP || ts_le || count_u16_le ||`
+/// for each node in the returned order:
+/// `addr_len_u16_le || addr_utf8 || noise_pub(32) || ed25519_pub(32) || load_u32_le`.
+fn build_bootstrap_msg(ts: i64, nodes: &[BootstrapNodeResponse]) -> Vec<u8> {
+    let mut m = Vec::with_capacity(RDV_DOMAIN.len() + 1 + 8 + 2 + nodes.len() * 80);
+    m.extend_from_slice(RDV_DOMAIN);
+    m.push(OP_BOOTSTRAP);
+    m.extend_from_slice(&ts.to_le_bytes());
+    m.extend_from_slice(&(nodes.len() as u16).to_le_bytes());
+    for n in nodes {
+        let addr = n.addr.as_bytes();
+        let addr_len = (addr.len().min(u16::MAX as usize)) as u16;
+        m.extend_from_slice(&addr_len.to_le_bytes());
+        m.extend_from_slice(&addr[..addr_len as usize]);
+        let mut noise = [0u8; 32];
+        let mut ed = [0u8; 32];
+        let _ = hex::decode_to_slice(&n.noise_pub, &mut noise);
+        let _ = hex::decode_to_slice(&n.ed25519_pub, &mut ed);
+        m.extend_from_slice(&noise);
+        m.extend_from_slice(&ed);
+        m.extend_from_slice(&n.load.to_le_bytes());
+    }
+    m
+}
 
-    let total = eligible.len();
-    if total == 0 {
-        return Json(Vec::new());
+/// Weighted sample of eligible bootstrap nodes: prefer low `bootstrap_load`
+/// so successive cold-starts spread across the pool. Deterministic LCG
+/// mixing (seeded by uptime) keeps us dependency-free while still rotating
+/// among equally-loaded peers.
+fn sample_bootstrap_nodes(
+    eligible: &[(&PresenceEntry, u32)],
+    max: usize,
+    mix: u64,
+) -> Vec<BootstrapNodeResponse> {
+    if eligible.is_empty() || max == 0 {
+        return Vec::new();
     }
 
-    // Rotate the window by server uptime so successive callers don't all
-    // get the same head-of-map slice (which would concentrate bootstrap
-    // traffic on a few nodes). Dependency-free; good enough until a
-    // signed, load-weighted pool lands.
-    let offset = (state.started_at.elapsed().as_secs() as usize) % total;
-    let out: Vec<BootstrapNodeResponse> = eligible
+    // Score = 1/(1+load); sample without replacement via weighted picks.
+    let mut remaining: Vec<(usize, f64)> = eligible
         .iter()
-        .cycle()
-        .skip(offset)
-        .take(total.min(MAX_BOOTSTRAP_RESPONSE))
-        .map(|e| BootstrapNodeResponse {
-            // `ember_port` is guaranteed `Some` by the eligibility filter
-            // above; advertise the UDP port (not the TCP `e.port`) so the
-            // peer dials the Ember Noise transport on the right socket.
-            addr: SocketAddr::new(e.ip, e.ember_port.unwrap_or_default()).to_string(),
-            noise_pub: hex::encode(e.noise_pub.unwrap_or_default()),
-            ed25519_pub: hex::encode(e.pubkey),
-        })
+        .enumerate()
+        .map(|(i, (_, load))| (i, 1.0 / (1.0 + f64::from(*load))))
         .collect();
 
-    Json(out)
+    let mut rng = mix ^ 0xA5A5_5A5A_C3C3_3C3C;
+    let mut picked = Vec::with_capacity(max.min(remaining.len()));
+    while picked.len() < max && !remaining.is_empty() {
+        let total: f64 = remaining.iter().map(|(_, w)| *w).sum();
+        if total <= 0.0 {
+            break;
+        }
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1);
+        let mut target = ((rng >> 33) as f64 / ((1u64 << 31) as f64)) * total;
+        let mut chosen = 0usize;
+        for (idx, (_, w)) in remaining.iter().enumerate() {
+            if target < *w {
+                chosen = idx;
+                break;
+            }
+            target -= *w;
+            chosen = idx;
+        }
+        let (ei, _) = remaining.swap_remove(chosen);
+        let (entry, load) = eligible[ei];
+        picked.push(BootstrapNodeResponse {
+            addr: SocketAddr::new(entry.ip, entry.ember_port.unwrap_or_default()).to_string(),
+            noise_pub: hex::encode(entry.noise_pub.unwrap_or_default()),
+            ed25519_pub: hex::encode(entry.pubkey),
+            // Advertise post-increment load so clients see the cost of
+            // this hand-out (matches what we persist below).
+            load: load.saturating_add(1),
+        });
+    }
+    picked
+}
+
+/// DHT bootstrap pool: signed, load-weighted sample of currently-registered
+/// Ember-DHT nodes. Cold-start clients
+/// (`ember/dht/bootstrap.rs::fetch_bootstrap_nodes`) verify the signature,
+/// optionally pin the server pubkey, then seed their routing table — no
+/// warm `nodes_ember.dat`, no KAD required.
+///
+/// Trust model: the signature authenticates the *list* as coming from this
+/// rendezvous operator. Individual contacts still cannot poison a routing
+/// table — the DHT re-verifies each contact's Ed25519 signature and the
+/// `node_id == BLAKE3(ed25519_pub)` binding on the first PING.
+async fn bootstrap(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Result<Json<BootstrapResponse>, StatusCode> {
+    if !check_rate_limit(&state, addr.ip()).await {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    let now = Instant::now();
+    let store = state.store.read().await;
+    let loads = state.bootstrap_load.read().await;
+
+    let mut eligible: Vec<(&PresenceEntry, u32)> = store
+        .values()
+        .filter(|e| e.expires_at > now && e.noise_pub.is_some() && e.ember_port.is_some())
+        .map(|e| (e, *loads.get(&e.pubkey).unwrap_or(&0)))
+        .collect();
+    drop(loads);
+
+    if eligible.is_empty() {
+        let ts = now_unix_secs();
+        let nodes: Vec<BootstrapNodeResponse> = Vec::new();
+        let msg = build_bootstrap_msg(ts, &nodes);
+        let sig = state.bootstrap_signing_key.sign(&msg);
+        return Ok(Json(BootstrapResponse {
+            ts,
+            pubkey: hex::encode(state.bootstrap_signing_key.verifying_key().to_bytes()),
+            sig: hex::encode(sig.to_bytes()),
+            nodes,
+        }));
+    }
+
+    // Prefer lower load; stable secondary key so equal-load peers don't
+    // always lose to HashMap iteration order.
+    eligible.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.pubkey.cmp(&b.0.pubkey)));
+
+    let mix = state.started_at.elapsed().as_nanos() as u64;
+    let nodes = sample_bootstrap_nodes(&eligible, MAX_BOOTSTRAP_RESPONSE, mix);
+    drop(store);
+
+    // Persist the load increments for the nodes we actually returned.
+    {
+        let mut loads = state.bootstrap_load.write().await;
+        for n in &nodes {
+            let mut pk = [0u8; 32];
+            if hex::decode_to_slice(&n.ed25519_pub, &mut pk).is_ok() {
+                let entry = loads.entry(pk).or_insert(0);
+                *entry = entry.saturating_add(1);
+            }
+        }
+        // Bound the map so a long-lived server with churn doesn't grow forever.
+        if loads.len() > MAX_STORE_ENTRIES {
+            loads.clear();
+        }
+    }
+
+    let ts = now_unix_secs();
+    let msg = build_bootstrap_msg(ts, &nodes);
+    let sig = state.bootstrap_signing_key.sign(&msg);
+    Ok(Json(BootstrapResponse {
+        ts,
+        pubkey: hex::encode(state.bootstrap_signing_key.verifying_key().to_bytes()),
+        sig: hex::encode(sig.to_bytes()),
+        nodes,
+    }))
 }
 
 async fn sweep_expired(state: AppState) {
@@ -1879,6 +2052,12 @@ async fn main() {
         )
         .init();
 
+    let bootstrap_signing_key = Arc::new(load_bootstrap_signing_key());
+    info!(
+        "Bootstrap pool signing pubkey={}",
+        hex::encode(bootstrap_signing_key.verifying_key().to_bytes())
+    );
+
     let state = AppState {
         store: Arc::new(RwLock::new(HashMap::new())),
         rate_limits: Arc::new(RwLock::new(HashMap::new())),
@@ -1888,6 +2067,8 @@ async fn main() {
         relay_ip_counts: Arc::new(RwLock::new(HashMap::new())),
         relay_invites: Arc::new(RwLock::new(HashMap::new())),
         replay_cache: Arc::new(RwLock::new(HashMap::new())),
+        bootstrap_load: Arc::new(RwLock::new(HashMap::new())),
+        bootstrap_signing_key,
         started_at: Instant::now(),
     };
 
@@ -1902,10 +2083,8 @@ async fn main() {
         .route("/relay/{session_id}", get(relay_ws))
         .route("/relay-invite", post(relay_invite_post))
         .route("/relay-invites/{id}", get(relay_invite_poll))
-        // DHT bootstrap pool. Now that the Ember DHT is live, this serves
-        // a rotating sample of registered nodes that published a Noise key
-        // so a cold-start client (no warm `nodes_ember.dat`) can join the
-        // DHT without KAD. See `bootstrap()` for the trust model.
+        // DHT bootstrap pool: signed + load-weighted sample of Ember DHT
+        // nodes so a cold-start client can join without KAD. See `bootstrap()`.
         .route("/bootstrap", get(bootstrap))
         .route("/health", get(health))
         .route("/stats", get(stats_handler))

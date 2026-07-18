@@ -213,6 +213,18 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
         changed = true;
     }
 
+    // Pin the official rendezvous bootstrap signing key when using the
+    // default Fly URL and the field is still empty (upgrades / early builds
+    // that saved `""`). Self-hosted URLs are left alone.
+    let official_url = crate::types::default_rendezvous_url();
+    if settings.rendezvous_bootstrap_pubkey.trim().is_empty()
+        && settings.rendezvous_url.trim().eq_ignore_ascii_case(official_url.trim())
+    {
+        settings.rendezvous_bootstrap_pubkey =
+            crate::types::default_rendezvous_bootstrap_pubkey();
+        changed = true;
+    }
+
     // Drop shared folders that would fail validate (sensitive segments) or that
     // contain / are the Ember data directory. Older builds allowed some AppData
     // paths; rejecting them in validate alone would wipe the entire config.
@@ -540,6 +552,15 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
                 "Rendezvous URL must not contain credentials",
             ));
         }
+    }
+    let boot_pk = settings.rendezvous_bootstrap_pubkey.trim();
+    if !boot_pk.is_empty()
+        && (boot_pk.len() != 64 || !boot_pk.chars().all(|c| c.is_ascii_hexdigit()))
+    {
+        return Err(coded(
+            "settings_rendezvous_bootstrap_pubkey_invalid",
+            "Rendezvous bootstrap pubkey must be 64 hex characters",
+        ));
     }
 
     for folder in &settings.shared_folders {

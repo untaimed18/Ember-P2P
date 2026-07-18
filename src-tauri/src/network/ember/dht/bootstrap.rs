@@ -189,7 +189,15 @@ pub fn load_nodes(path: &Path) -> anyhow::Result<Vec<EmberContact>> {
 }
 
 /// Fetch bootstrap nodes from the rendezvous server.
-pub async fn fetch_bootstrap_nodes(rendezvous_url: &str) -> Result<Vec<BootstrapNode>, String> {
+///
+/// Expects the signed envelope `{ ts, pubkey, sig, nodes }` (slice: signed /
+/// load-weighted pool). When `expected_pubkey_hex` is `Some`, the response
+/// pubkey must match (pinning). Signature freshness uses the same ±5 min
+/// skew as rendezvous register.
+pub async fn fetch_bootstrap_nodes(
+    rendezvous_url: &str,
+    expected_pubkey_hex: Option<&str>,
+) -> Result<Vec<BootstrapNode>, String> {
     let url = format!("{}/bootstrap", rendezvous_url.trim_end_matches('/'));
     // https_only mirrors the rendezvous client: refuse to send the bootstrap
     // request in cleartext (or follow an http redirect), so a tampered/mistyped
@@ -211,14 +219,97 @@ pub async fn fetch_bootstrap_nodes(rendezvous_url: &str) -> Result<Vec<Bootstrap
         return Err(format!("Bootstrap endpoint returned {}", resp.status()));
     }
 
-    let nodes: Vec<BootstrapNode> = resp
+    let envelope: BootstrapResponse = resp
         .json()
         .await
         .map_err(|e| format!("Bootstrap parse error: {e}"))?;
 
+    verify_bootstrap_envelope(&envelope, expected_pubkey_hex)?;
+
+    // Prefer lower-load nodes when seeding so cold-starts don't all dial
+    // the same popular peers the server already tried to deprioritize.
+    let mut nodes = envelope.nodes;
+    nodes.sort_by(|a, b| a.load.cmp(&b.load).then_with(|| a.addr.cmp(&b.addr)));
     let count = nodes.len().min(MAX_BOOTSTRAP_NODES);
-    debug!("Fetched {count} bootstrap nodes from rendezvous server");
+    debug!("Fetched {count} signed bootstrap nodes from rendezvous server");
     Ok(nodes.into_iter().take(MAX_BOOTSTRAP_NODES).collect())
+}
+
+/// Signed `/bootstrap` envelope from the rendezvous server.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct BootstrapResponse {
+    ts: i64,
+    pubkey: String,
+    sig: String,
+    nodes: Vec<BootstrapNode>,
+}
+
+const BOOTSTRAP_MAX_TIMESTAMP_SKEW_SECS: i64 = 300;
+const RDV_DOMAIN: &[u8] = b"ember-rdv-v1";
+const OP_BOOTSTRAP: u8 = 0x07;
+
+fn verify_bootstrap_envelope(
+    envelope: &BootstrapResponse,
+    expected_pubkey_hex: Option<&str>,
+) -> Result<(), String> {
+    let now = chrono::Utc::now().timestamp();
+    if (now - envelope.ts).abs() > BOOTSTRAP_MAX_TIMESTAMP_SKEW_SECS {
+        return Err(format!(
+            "Bootstrap response timestamp skew too large (ts={}, now={now})",
+            envelope.ts
+        ));
+    }
+
+    if let Some(expected) = expected_pubkey_hex {
+        let expected = expected.trim();
+        if !expected.is_empty() && !expected.eq_ignore_ascii_case(envelope.pubkey.trim()) {
+            return Err("Bootstrap response pubkey does not match pinned rendezvous key".into());
+        }
+    }
+
+    let pk_bytes = hex::decode(envelope.pubkey.trim()).map_err(|_| "Invalid bootstrap pubkey hex")?;
+    if pk_bytes.len() != 32 {
+        return Err("Bootstrap pubkey must be 32 bytes".into());
+    }
+    let mut pk = [0u8; 32];
+    pk.copy_from_slice(&pk_bytes);
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&pk)
+        .map_err(|_| "Invalid bootstrap Ed25519 pubkey")?;
+
+    let sig_bytes = hex::decode(envelope.sig.trim()).map_err(|_| "Invalid bootstrap sig hex")?;
+    if sig_bytes.len() != 64 {
+        return Err("Bootstrap signature must be 64 bytes".into());
+    }
+    let mut sig_arr = [0u8; 64];
+    sig_arr.copy_from_slice(&sig_bytes);
+    let signature = ed25519_dalek::Signature::from_bytes(&sig_arr);
+
+    let msg = build_bootstrap_verify_msg(envelope.ts, &envelope.nodes);
+    vk.verify_strict(&msg, &signature)
+        .map_err(|_| "Bootstrap response signature verification failed".to_string())?;
+    Ok(())
+}
+
+fn build_bootstrap_verify_msg(ts: i64, nodes: &[BootstrapNode]) -> Vec<u8> {
+    let mut m = Vec::with_capacity(RDV_DOMAIN.len() + 1 + 8 + 2 + nodes.len() * 80);
+    m.extend_from_slice(RDV_DOMAIN);
+    m.push(OP_BOOTSTRAP);
+    m.extend_from_slice(&ts.to_le_bytes());
+    m.extend_from_slice(&(nodes.len() as u16).to_le_bytes());
+    for n in nodes {
+        let addr = n.addr.as_bytes();
+        let addr_len = (addr.len().min(u16::MAX as usize)) as u16;
+        m.extend_from_slice(&addr_len.to_le_bytes());
+        m.extend_from_slice(&addr[..addr_len as usize]);
+        let mut noise = [0u8; 32];
+        let mut ed = [0u8; 32];
+        let _ = hex::decode_to_slice(&n.noise_pub, &mut noise);
+        let _ = hex::decode_to_slice(&n.ed25519_pub, &mut ed);
+        m.extend_from_slice(&noise);
+        m.extend_from_slice(&ed);
+        m.extend_from_slice(&n.load.to_le_bytes());
+    }
+    m
 }
 
 /// A bootstrap node returned by the rendezvous server. The node id is
@@ -229,6 +320,9 @@ pub struct BootstrapNode {
     pub addr: String,
     pub noise_pub: String,
     pub ed25519_pub: String,
+    /// Server-side hand-out count (lower is preferred when seeding).
+    #[serde(default)]
+    pub load: u32,
 }
 
 impl BootstrapNode {
@@ -362,6 +456,7 @@ mod tests {
             addr: "1.2.3.4:4662".to_string(),
             noise_pub: hex::encode([2u8; 32]),
             ed25519_pub: hex::encode(ed_pub),
+            load: 0,
         };
         let c = bn.to_contact().unwrap();
         // node_id is derived from ed25519_pub, never trusted from the wire.
@@ -378,6 +473,7 @@ mod tests {
             addr: "not-an-addr".to_string(),
             noise_pub: hex::encode([0u8; 32]),
             ed25519_pub: hex::encode([0u8; 32]),
+            load: 0,
         };
         assert!(bn.to_contact().is_none());
 
@@ -387,7 +483,36 @@ mod tests {
             addr: "1.2.3.4:4662".to_string(),
             noise_pub: hex::encode([0u8; 16]),
             ed25519_pub: hex::encode(sk.verifying_key().to_bytes()),
+            load: 0,
         };
         assert!(bn.to_contact().is_none());
+    }
+
+    #[test]
+    fn bootstrap_envelope_signature_round_trip() {
+        use ed25519_dalek::Signer;
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+        let nodes = vec![BootstrapNode {
+            addr: "10.0.0.1:4672".to_string(),
+            noise_pub: hex::encode([3u8; 32]),
+            ed25519_pub: hex::encode(sk.verifying_key().to_bytes()),
+            load: 2,
+        }];
+        let ts = chrono::Utc::now().timestamp();
+        let msg = build_bootstrap_verify_msg(ts, &nodes);
+        let sig = sk.sign(&msg);
+        let envelope = BootstrapResponse {
+            ts,
+            pubkey: hex::encode(sk.verifying_key().to_bytes()),
+            sig: hex::encode(sig.to_bytes()),
+            nodes,
+        };
+        assert!(verify_bootstrap_envelope(&envelope, None).is_ok());
+        assert!(verify_bootstrap_envelope(
+            &envelope,
+            Some(&hex::encode(sk.verifying_key().to_bytes()))
+        )
+        .is_ok());
+        assert!(verify_bootstrap_envelope(&envelope, Some(&hex::encode([0u8; 32]))).is_err());
     }
 }

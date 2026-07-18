@@ -507,8 +507,18 @@ async fn handle_epx_sources(
                 debug!(
                     "EPX source {ip}:{port} advertised relay-capable; not treating flag as relay admission (attestation trailer required)"
                 );
+                if state.ember_capable_peers.len() < MAX_EMBER_CAPABLE_PEERS {
+                    state.ember_capable_peers.insert((ip, port));
+                }
             }
-            if flags & ember::SOURCE_FLAG_FIREWALLED != 0 && (state.firewalled || state.low_id) {
+            // Skip LowID↔LowID for plain firewalled sources (no Ember relay
+            // path). When `SOURCE_FLAG_RELAY_CAPABLE` is set (Ember DHT / EPX
+            // slice 15), keep the source so PFS can hit `low_to_low` and the
+            // broker can punch/relay.
+            if flags & ember::SOURCE_FLAG_FIREWALLED != 0
+                && (state.firewalled || state.low_id)
+                && flags & ember::SOURCE_FLAG_RELAY_CAPABLE == 0
+            {
                 continue;
             }
             if state
@@ -4322,6 +4332,8 @@ struct NetworkState {
     /// from any validly-signed inbound frame and seeded manually via
     /// the harness `add_ember_dht_contact` command.
     ember_dht: ember::dht::engine::EmberDht,
+    /// Slice 14: per-IP Ember DHT rate limits.
+    ember_dht_protection: ember::dht::protection::DhtProtection,
     /// Pending Ember DHT `PING` requests awaiting a `PONG`, keyed by the
     /// wire `request_id`. Mirrors `ember_pending_pings` (the control
     /// ping map) and is bounded by `MAX_EMBER_PENDING_PINGS`.
@@ -6664,6 +6676,7 @@ fn maybe_spawn_ember_cold_bootstrap(
     if rv_url.is_empty() {
         return;
     }
+    let pinned_pubkey = settings.rendezvous_bootstrap_pubkey.trim().to_string();
 
     // In-flight guard, taken only after the cheap no-op checks above so an
     // early return can never strand the flag set. `swap` is the atomic
@@ -6690,7 +6703,12 @@ fn maybe_spawn_ember_cold_bootstrap(
         }
         let _guard = InFlightGuard(in_flight);
 
-        match ember::dht::bootstrap::fetch_bootstrap_nodes(&rv_url).await {
+        let expected = if pinned_pubkey.is_empty() {
+            None
+        } else {
+            Some(pinned_pubkey.as_str())
+        };
+        match ember::dht::bootstrap::fetch_bootstrap_nodes(&rv_url, expected).await {
             Ok(nodes) => {
                 let contacts: Vec<ember::dht::EmberContact> =
                     nodes.iter().filter_map(|n| n.to_contact()).collect();
@@ -7375,6 +7393,7 @@ pub async fn start_network(
         ),
         ember_pending_pings: HashMap::new(),
         ember_dht: ember::dht::engine::EmberDht::new(identity.ed25519_secret_key),
+        ember_dht_protection: ember::dht::protection::DhtProtection::new(),
         ember_dht_pending_pings: HashMap::new(),
         ember_dht_pending_finds: HashMap::new(),
         ember_search: ember::dht::search::SearchManager::new(),
@@ -10297,7 +10316,8 @@ pub async fn start_network(
                                     let broker_started = if !ember_capable {
                                         debug!(
                                             "Skipping LowID-to-LowID broker for {}:{} — \
-                                             peer has not advertised Ember capability via KAD",
+                                             peer has not advertised Ember capability \
+                                             (KAD ember tag or DHT RELAY_CAPABLE)",
                                             v4, port,
                                         );
                                         false
@@ -22345,6 +22365,17 @@ pub async fn start_network(
                                 {
                                     continue;
                                 }
+                                // Slice 15: Ember DHT firewalled/relay-capable
+                                // sources must gate the LowID broker the same
+                                // way KAD `"ember"` tags do.
+                                if flags
+                                    & (ember::SOURCE_FLAG_RELAY_CAPABLE
+                                        | ember::SOURCE_FLAG_FIREWALLED)
+                                    != 0
+                                    && state.ember_capable_peers.len() < MAX_EMBER_CAPABLE_PEERS
+                                {
+                                    state.ember_capable_peers.insert((ip, tcp_port));
+                                }
                                 let connect_options =
                                     if flags & ember::SOURCE_FLAG_OBFUSCATION != 0 {
                                         0x02
@@ -25041,16 +25072,18 @@ fn maybe_finish_ember_publish(state: &mut NetworkState, publish_id: u32) {
         .retain(|_, r| r.publish_id != publish_id);
 }
 
-/// Auto-publish Ember DHT source records for our shared files (slice 9).
+/// Auto-publish Ember DHT source records for our shared files (slice 9 + 15).
 ///
-/// Runs on the 60-second publish tick, gated only on `ember_native_enabled`
+/// Runs on the 60-second publish tick, gated on `ember_native_enabled`
 /// plus a non-empty Ember routing table (NOT on KAD connectivity), so the
-/// DHT advertises us as a source even on a KAD-less network. Only HighID /
-/// reachable nodes self-publish — mirroring KAD's `build_source_publish`
-/// returning `None` when firewalled — because the record's claimed IP is
-/// bound to the observed sender IP at the storer (anti-reflection). The
-/// record format already carries firewalled/relay flags, so LowID
-/// self-publish + broker-dial is a clean follow-on with no wire change.
+/// DHT advertises us as a source even on a KAD-less network.
+///
+/// HighID / open peers publish a direct contact. LowID / TCP-firewalled
+/// peers (slice 15) also self-publish when we have an observed external
+/// IPv4 (eD2K/KAD/STUN) — the Noise UDP path still reaches DHT storers,
+/// satisfying the anti-reflection IP bind — and set
+/// `SOURCE_FLAG_FIREWALLED | SOURCE_FLAG_RELAY_CAPABLE` so downloaders
+/// route LowID↔LowID via the Ember broker instead of a doomed TCP dial.
 async fn maybe_publish_ember_sources(
     socket: &UdpSocket,
     state: &mut NetworkState,
@@ -25059,17 +25092,18 @@ async fn maybe_publish_ember_sources(
     tcp_port: u16,
     udp_port: u16,
 ) {
-    if !settings.ember_native_enabled
-        || state.firewalled
-        || state.low_id
-        || tcp_port == 0
-        || state.ember_dht.contact_count() == 0
-    {
+    // Refresh firewall-awareness gauges every tick (slice 15), even when
+    // we skip publishing (empty table / no IP yet).
+    let firewalled_like = state.firewalled || state.low_id;
+    state.ember_diagnostics.ember_dht_firewalled_publishing = false;
+    state.ember_diagnostics.ember_dht_udp_unreachable = false;
+
+    if !settings.ember_native_enabled || tcp_port == 0 || state.ember_dht.contact_count() == 0 {
         return;
     }
     // Prefer the confirmed external IP (eD2K HighID / KAD firewall vote).
-    // Fall back to the STUN-mapped address so a KAD-less Ember HighID seeder
-    // can still advertise sources after a NAT probe.
+    // Fall back to the STUN-mapped address so a KAD-less Ember seeder
+    // (HighID or LowID) can still advertise sources after a NAT probe.
     let external_ip = match state.external_ip {
         Some(ip) => ip,
         None => match state.nat_info.external_addr {
@@ -25080,11 +25114,24 @@ async fn maybe_publish_ember_sources(
                     state.routing_table.set_external_ip(ip);
                     ip
                 }
-                std::net::IpAddr::V6(_) => return,
+                std::net::IpAddr::V6(_) => {
+                    state.ember_diagnostics.ember_dht_udp_unreachable = true;
+                    return;
+                }
             },
-            None => return,
+            None => {
+                // No routable IPv4 yet — firewalled seeders can't satisfy
+                // anti-reflection, and HighID seeders have nothing to claim.
+                state.ember_diagnostics.ember_dht_udp_unreachable = firewalled_like
+                    || settings.ember_native_enabled;
+                return;
+            }
         },
     };
+
+    if firewalled_like {
+        state.ember_diagnostics.ember_dht_firewalled_publishing = true;
+    }
 
     // Select shared files whose source record is missing or past its
     // republish interval, bounded per tick. Snapshot under a short read lock
@@ -25139,11 +25186,13 @@ async fn maybe_publish_ember_sources(
         return;
     }
 
-    let flags = if settings.obfuscation_enabled {
-        ember::SOURCE_FLAG_OBFUSCATION
-    } else {
-        0
-    };
+    let mut flags = 0u8;
+    if settings.obfuscation_enabled {
+        flags |= ember::SOURCE_FLAG_OBFUSCATION;
+    }
+    if firewalled_like {
+        flags |= ember::SOURCE_FLAG_FIREWALLED | ember::SOURCE_FLAG_RELAY_CAPABLE;
+    }
     let contact = ember::dht::publish::SourceContact {
         ip: external_ip,
         tcp_port,
@@ -25487,10 +25536,32 @@ async fn handle_ember_dht_message(
     remote_noise_pub: [u8; 32],
     state: &mut NetworkState,
 ) {
+    // Slice 14: per-IP rate limit before any crypto/table work. Wire layout
+    // is version(1) + msg_type(1) + …; a truncated frame is dropped by the
+    // engine anyway.
+    let msg_type = payload.get(1).copied().unwrap_or(0);
+    if !state
+        .ember_dht_protection
+        .allow_message(from.ip(), msg_type)
+    {
+        state.ember_diagnostics.ember_dht_rate_limited = state
+            .ember_diagnostics
+            .ember_dht_rate_limited
+            .saturating_add(1);
+        return;
+    }
+
     let now = chrono::Utc::now().timestamp();
     let inbound = state
         .ember_dht
         .handle_message(payload, from, remote_noise_pub, now);
+
+    if inbound.store_replay_rejected {
+        state.ember_diagnostics.ember_dht_store_replays = state
+            .ember_diagnostics
+            .ember_dht_store_replays
+            .saturating_add(1);
+    }
 
     if let Some(err) = inbound.error {
         debug!("Ember DHT: dropping frame from {from}: {err}");

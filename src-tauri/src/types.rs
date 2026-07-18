@@ -558,6 +558,20 @@ pub struct EmberDiagnostics {
     /// out by the publish tick.
     #[serde(default)]
     pub ember_dht_keywords_published: u32,
+    /// Slice 14: inbound Ember DHT frames dropped by per-IP rate limits.
+    #[serde(default)]
+    pub ember_dht_rate_limited: u32,
+    /// Slice 14: inbound STORE frames rejected as short-window signature replays.
+    #[serde(default)]
+    pub ember_dht_store_replays: u32,
+    /// Slice 15: true when we are LowID/firewalled but still self-publishing
+    /// Ember DHT source records (UDP Noise path is usable).
+    #[serde(default)]
+    pub ember_dht_firewalled_publishing: bool,
+    /// Slice 15: true when Ember is on but we have no external IPv4 to put
+    /// in source records (STUN / HighID / KAD have not produced one yet).
+    #[serde(default)]
+    pub ember_dht_udp_unreachable: bool,
 }
 
 /// Serializable KAD contact info for the frontend (mirrors eMule KadContactListCtrl columns)
@@ -792,6 +806,13 @@ pub struct AppSettings {
     /// Rendezvous server URL for friend discovery
     #[serde(default = "default_rendezvous_url")]
     pub rendezvous_url: String,
+    /// Optional hex Ed25519 public key that must sign rendezvous `/bootstrap`
+    /// responses. Empty accepts any well-formed signature from the server's
+    /// advertised pubkey; the default pins the official Fly rendezvous
+    /// operator key. Set this to pin a known operator key (or clear it for
+    /// a private/self-hosted rendezvous).
+    #[serde(default = "default_rendezvous_bootstrap_pubkey")]
+    pub rendezvous_bootstrap_pubkey: String,
     /// **Experimental**: enable the Ember-native Noise-encrypted UDP
     /// transport alongside the existing eMule KAD/eD2K stack. When off
     /// (default), Ember-magic UDP packets are dropped and the live
@@ -1086,8 +1107,14 @@ fn default_max_friends() -> u32 {
 /// in Settings; the rest of the stack treats the URL as configuration,
 /// not as a trust anchor. Mirror this string in
 /// `rendezvous-server/README.md` if you change the default.
-fn default_rendezvous_url() -> String {
+pub(crate) fn default_rendezvous_url() -> String {
     "https://ember-rendezvous.fly.dev".to_string()
+}
+
+/// Official Ember rendezvous `/bootstrap` signing pubkey (Fly deploy).
+/// Bump this when rotating `EMBER_BOOTSTRAP_SIGNING_KEY` on the server.
+pub(crate) fn default_rendezvous_bootstrap_pubkey() -> String {
+    "cb97fe2a05177374cc36be50e1d8021189d1aeaff071274174237e1251c5467a".to_string()
 }
 
 fn default_spam_filter_profile() -> String {
@@ -1181,6 +1208,7 @@ impl Default for AppSettings {
             friend_session_encryption: true,
             max_friends: default_max_friends(),
             rendezvous_url: default_rendezvous_url(),
+            rendezvous_bootstrap_pubkey: default_rendezvous_bootstrap_pubkey(),
             ember_native_enabled: false,
             ember_dev_tools_enabled: false,
             close_to_tray_behavior: default_close_to_tray_behavior(),

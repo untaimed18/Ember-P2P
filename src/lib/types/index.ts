@@ -281,6 +281,14 @@ export interface EmberDiagnostics {
   ember_dht_source_records_found: number;
   /** Keyword records (re)published for our shared files this session (slice 8). */
   ember_dht_keywords_published: number;
+  /** Slice 14: inbound Ember DHT frames dropped by per-IP rate limits. */
+  ember_dht_rate_limited: number;
+  /** Slice 14: STORE frames rejected as short-window signature replays. */
+  ember_dht_store_replays: number;
+  /** Slice 15: LowID/firewalled but still publishing Ember DHT sources. */
+  ember_dht_firewalled_publishing: boolean;
+  /** Slice 15: Ember on but no external IPv4 available for source records. */
+  ember_dht_udp_unreachable: boolean;
 }
 
 /** Result of an `ember_ping_peer` harness round-trip. `rtt_ms` is set
@@ -497,6 +505,9 @@ export interface AppSettings {
   max_friends: number;
   /** Rendezvous server URL for Ember friend discovery */
   rendezvous_url: string;
+  /** Optional hex Ed25519 pubkey that must sign `/bootstrap` responses.
+   *  Defaults to the official Ember rendezvous operator key. Clear for a self-hosted server. */
+  rendezvous_bootstrap_pubkey: string;
   /** Experimental: enable the Ember-native Noise-encrypted UDP transport. */
   ember_native_enabled: boolean;
   /** Advanced: reveal the Ember developer console (`/dev/ember`) links in the UI. */
