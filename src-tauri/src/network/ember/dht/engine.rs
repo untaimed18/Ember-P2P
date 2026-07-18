@@ -92,7 +92,9 @@ pub struct DhtInbound {
     pub store_replay_rejected: bool,
     /// A verified `PROXY_STORE` the caller should fan out via the normal
     /// publish driver (buddy-assisted firewalled source publish).
-    pub proxy_store_forward: Option<SignedRecord>,
+    /// Carries the wire `request_id` so the caller can ACK only after
+    /// `start_publish` succeeds.
+    pub proxy_store_forward: Option<(u32, SignedRecord)>,
 }
 
 /// Owns our DHT identity, routing table, and local record store, and
@@ -243,6 +245,13 @@ impl EmberDht {
             messages::build_proxy_store(self.local_id, request_id, key, record, record_signature);
         let bytes = messages::encode_message(&msg, &self.signing_key, true);
         (request_id, bytes)
+    }
+
+    /// Sign a `PROXY_STORE_ACK` for `request_id` / `key` (caller sends after
+    /// successfully starting the fan-out publish).
+    pub fn build_proxy_store_ack_frame(&self, request_id: u32, key: [u8; 16]) -> Vec<u8> {
+        let msg = messages::build_proxy_store_ack(self.local_id, request_id, key);
+        messages::encode_message(&msg, &self.signing_key, true)
     }
 
     /// Build a signed `FIND_VALUE` frame querying for `keys`. The answer
@@ -570,22 +579,24 @@ impl EmberDht {
                 record_signature,
             } => {
                 // Buddy-assisted publish: a firewalled peer asks us to fan
-                // out their already-signed source record. We verify it, ack
-                // the request, and hand the record to the caller to publish
-                // via the normal STORE driver (storers accept FIREWALLED
-                // without IP anti-reflection).
+                // out their already-signed source record. We verify it and
+                // bind the requester to the publisher identity
+                // (`sender_id == BLAKE3(publisher_key)`) so a third party
+                // cannot amplify someone else's record. ACK is deferred to
+                // the network loop until `start_publish` actually starts.
                 if let Some(parsed) = SignedRecord::from_wire(&record, record_signature) {
                     let is_fw_source = parsed.record_type == RECORD_TYPE_SOURCE
                         && parsed
                             .source_contact
                             .map(|sc| sc.flags & SOURCE_FLAG_FIREWALLED != 0)
                             .unwrap_or(false);
-                    if is_fw_source && key == parsed.keyword_hash {
-                        out.proxy_store_forward = Some(parsed);
-                        let ack =
-                            messages::build_proxy_store_ack(self.local_id, msg.request_id, key);
-                        out.responses
-                            .push(messages::encode_message(&ack, &self.signing_key, true));
+                    let publisher_is_sender = crypto::node_id_from_ed25519_bytes(
+                        &parsed.publisher_key,
+                    )
+                    .map(|id| EmberNodeId(id) == msg.sender_id)
+                    .unwrap_or(false);
+                    if is_fw_source && key == parsed.keyword_hash && publisher_is_sender {
+                        out.proxy_store_forward = Some((msg.request_id, parsed));
                     }
                 }
             }
@@ -598,10 +609,9 @@ impl EmberDht {
                 out.find_value_received = true;
                 // Multi-keyword wire intersection (when `keys.len() > 1`):
                 // serve primary-key (`keys[0]`) records whose `file_hash`
-                // appears under every secondary key we *also* hold. Keys we
-                // do not hold are skipped (sparse DHT — secondary keywords
-                // live near different IDs). If we hold no primary records,
-                // fall back to FOUND_NODE toward keys[0].
+                // appears under every secondary key, but only when we hold
+                // all requested keys locally. Otherwise FOUND_NODE so the
+                // searcher keeps walking toward peers that can apply AND.
                 if let Some((primary, blobs)) = intersect_find_value_records(&self.store, &keys) {
                     out.find_value_hit = true;
                     let fv = messages::build_found_value(
@@ -657,9 +667,14 @@ fn file_hash_from_record_data(data: &[u8]) -> Option<[u8; 16]> {
 }
 
 /// Multi-keyword FIND_VALUE answer: primary-key blobs whose `file_hash`
-/// appears under every secondary key this node also holds. Secondary keys
-/// we do not hold are ignored (those records live elsewhere in the DHT).
-/// Returns `None` when we have no live primary records (caller sends FOUND_NODE).
+/// appears under every secondary key.
+///
+/// For multi-key queries we only return `FOUND_VALUE` when this node
+/// holds **every** requested key and the `file_hash` intersection is
+/// non-empty. Missing a secondary (common on a sparse DHT — those keys
+/// live near different IDs) yields `None` so the caller sends
+/// `FOUND_NODE` and the searcher keeps walking. Single-key queries are
+/// unchanged (serve all live primary records).
 fn intersect_find_value_records(
     store: &DhtStore,
     keys: &[[u8; 16]],
@@ -670,32 +685,34 @@ fn intersect_find_value_records(
         return None;
     }
 
-    let mut allowed: Option<HashSet<[u8; 16]>> = None;
-    for key in keys.iter().skip(1) {
-        let secondary = store.get_live(key);
-        if secondary.is_empty() {
-            continue;
+    let filtered: Vec<&_> = if keys.len() == 1 {
+        primary_recs
+    } else {
+        let mut allowed: Option<HashSet<[u8; 16]>> = None;
+        for key in keys.iter().skip(1) {
+            let secondary = store.get_live(key);
+            // Strict AND: any secondary we do not hold → FOUND_NODE.
+            if secondary.is_empty() {
+                return None;
+            }
+            let hashes: HashSet<[u8; 16]> = secondary
+                .iter()
+                .filter_map(|r| file_hash_from_record_data(&r.data))
+                .collect();
+            allowed = Some(match allowed {
+                None => hashes,
+                Some(prev) => prev.intersection(&hashes).copied().collect(),
+            });
         }
-        let hashes: HashSet<[u8; 16]> = secondary
-            .iter()
-            .filter_map(|r| file_hash_from_record_data(&r.data))
-            .collect();
-        allowed = Some(match allowed {
-            None => hashes,
-            Some(prev) => prev.intersection(&hashes).copied().collect(),
-        });
-    }
-
-    let filtered: Vec<&_> = match &allowed {
-        None => primary_recs,
-        Some(set) => primary_recs
+        let set = allowed?;
+        primary_recs
             .into_iter()
             .filter(|r| {
                 file_hash_from_record_data(&r.data)
                     .map(|h| set.contains(&h))
                     .unwrap_or(false)
             })
-            .collect(),
+            .collect()
     };
 
     // Applied an AND and nothing survived → FOUND_NODE so the searcher
@@ -1024,10 +1041,40 @@ mod tests {
             on_buddy.proxy_store_forward.is_some(),
             "buddy should accept PROXY_STORE"
         );
-        assert_eq!(on_buddy.responses.len(), 1, "PROXY_STORE_ACK");
-        let fwd = on_buddy.proxy_store_forward.unwrap();
+        // ACK is deferred until the network loop starts the publish.
+        assert!(
+            on_buddy.responses.is_empty(),
+            "PROXY_STORE_ACK deferred to caller"
+        );
+        let (rid, fwd) = on_buddy.proxy_store_forward.unwrap();
+        assert_ne!(rid, 0);
         assert_eq!(fwd.file_name, "buddy.mkv");
         assert_eq!(fwd.keyword_hash, key);
+    }
+
+    #[test]
+    fn proxy_store_rejects_non_publisher_sender() {
+        let publisher = dht(84);
+        let mut impostor = dht(85);
+        let mut buddy = dht(86);
+        let impostor_noise = [0xBB; 32];
+        let impostor_addr = addr(85, 4672);
+
+        let mut contact = source_contact_at(84);
+        contact.flags = crate::network::ember::SOURCE_FLAG_FIREWALLED
+            | crate::network::ember::SOURCE_FLAG_RELAY_CAPABLE;
+        let record =
+            publisher.build_source_record([5u8; 16], [0u8; 32], 7, "stolen.mkv", contact);
+        let key = record.keyword_hash;
+        // Impostor re-packs the publisher-signed record into its own
+        // PROXY_STORE frame (sender_id = impostor ≠ publisher).
+        let (_rid, frame) =
+            impostor.build_proxy_store(key, record.data.clone(), record.signature);
+        let on_buddy = buddy.handle_message(&frame, impostor_addr, impostor_noise, 2000);
+        assert!(
+            on_buddy.proxy_store_forward.is_none(),
+            "must not amplify another publisher's record"
+        );
     }
 
     #[test]

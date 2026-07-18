@@ -394,6 +394,7 @@ pub async fn download_collection_files(
                     // addresses; the network task handles full source
                     // discovery for each.
                     extra_sources: Vec::new(),
+                    ember_file_hash: String::new(),
                     transfer_id: transfer_id.clone(),
                     control: control.clone(),
                     discovery_only: false,
@@ -438,6 +439,7 @@ pub async fn download_collection_files(
                     peer_ip: String::new(),
                     peer_port: 0,
                     extra_sources: Vec::new(),
+                    ember_file_hash: String::new(),
                     transfer_id: transfer_id.clone(),
                     control,
                     discovery_only: true,

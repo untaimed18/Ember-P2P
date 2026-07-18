@@ -285,6 +285,12 @@ fn resolve_from_known(files: &mut Vec<FileInfo>, known: &KnownFileList) -> Vec<F
             // Restore the last-known Peers count so the UI doesn't flash
             // back to 0 until the next 60s source-count sync completes.
             file.complete_sources = record.complete_sources;
+            // Slice 18 migration: known.met entries created before
+            // ember_file_hash must be rehashed once so DHT publish and
+            // download verify see a real BLAKE3 (zeros skip verify).
+            if file.ember_file_hash.is_empty() {
+                needs_hashing.push(file.clone());
+            }
         } else {
             needs_hashing.push(file.clone());
         }

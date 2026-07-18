@@ -381,6 +381,22 @@
           <div class="k">{m.ember_stat_serve_hit_miss()}</div>
           <div class="v">{diag?.ember_dht_find_value_hits ?? 0}/{diag?.ember_dht_find_value_misses ?? 0}</div>
         </div>
+        <div class="kv compact">
+          <div class="k">{m.ember_stat_buddy_pub_fwd()}</div>
+          <div class="v">{diag?.ember_dht_buddy_publishes ?? 0}/{diag?.ember_dht_buddy_forwards ?? 0}</div>
+        </div>
+        <div class="kv compact">
+          <div class="k">{m.ember_stat_malformed()}</div>
+          <div class="v">{diag?.ember_dht_malformed ?? 0}</div>
+        </div>
+        <div class="kv compact">
+          <div class="k">{m.ember_stat_observed_votes()}</div>
+          <div class="v">{diag?.ember_dht_observed_votes ?? 0}</div>
+        </div>
+        <div class="kv compact">
+          <div class="k">{m.ember_stat_observed_addr()}</div>
+          <div class="v"><code>{diag?.ember_dht_observed_addr || '—'}</code></div>
+        </div>
       </section>
     </div>
 

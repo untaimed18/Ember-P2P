@@ -135,6 +135,7 @@ pub(crate) async fn start_promoted_downloads(state: &AppState, promoted: &[Trans
                 // discovery_only StartDownload; the network handler reloads
                 // them from SM when workers start.
                 extra_sources: Vec::new(),
+                ember_file_hash: String::new(),
                 transfer_id: transfer.id.clone(),
                 control,
                 discovery_only: false,
@@ -308,6 +309,8 @@ pub async fn start_download(
     // cap (`MAX_SEED_EXTRA_SOURCES = 49`) after IP-filter / ban /
     // dedup validation.
     extra_sources: Option<Vec<String>>,
+    // Optional Ember content BLAKE3 hex from search results / library.
+    ember_file_hash: Option<String>,
 ) -> Result<StartDownloadResponse, String> {
     let file_name = crate::security::sanitize_filename(&file_name);
 
@@ -481,6 +484,7 @@ pub async fn start_download(
             peer_ip,
             peer_port,
             extra_sources: parsed_extras,
+            ember_file_hash: ember_file_hash.unwrap_or_default(),
             transfer_id: transfer_id.clone(),
             control,
             discovery_only,

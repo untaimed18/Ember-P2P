@@ -446,12 +446,15 @@ and `ember_native_enabled: true` in each `config.json`:
    signed `FIREWALLED` source records; storers exempt those sources from
    IP anti-reflection. DNS seed list (slice 12) remains deferred.
 3. ~~Multi-keyword DHT intersection on the wire.~~ **Done** — FIND_VALUE
-   carries secondary keyword hashes; peers that hold those keys filter
-   primary records by `file_hash` intersection. Filename AND remains a
+   carries secondary keyword hashes; peers that hold **all** requested keys
+   filter primary records by `file_hash` intersection (missing a secondary
+   yields `FOUND_NODE` so the searcher keeps walking). Filename AND remains a
    defense-in-depth filter at emit time.
 4. ~~Diagnostic UI + richer stats (slices 16–17).~~ **Done** — `/ember`
    shows contacts, in-flight searches, local store, and hit/miss /
    replication counters.
 5. ~~Hash format + long-tail hardening (slices 18–19).~~ **Done** —
-   streaming BLAKE3 `ember_file_hash` at index/publish/download verify;
-   DHT decode caps, version-0 rejection, PONG observed-IP voting.
+   streaming BLAKE3 `ember_file_hash` at index/publish/download verify
+   (including one-time rehash for pre-upgrade known.met entries); DHT
+   decode caps, version-0 rejection, PONG observed-IP voting (ping-correlated;
+   confirms STUN mapping only, never sole `external_ip` authority).

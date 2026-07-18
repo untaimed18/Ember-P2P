@@ -2957,6 +2957,10 @@ pub enum NetworkCommand {
         /// initial multi-source download seed list. Empty means the
         /// caller only had the primary `peer_ip:peer_port` (or none).
         extra_sources: Vec<(String, u16)>,
+        /// Optional Ember content BLAKE3 hex from search/UI. Seeded into
+        /// `ember_content_hashes` so completion verify does not depend
+        /// solely on having seen a DHT keyword hit this session.
+        ember_file_hash: String,
         transfer_id: String,
         control: Arc<TransferControl>,
         /// When true, register seeds + run KAD/TCP/UDP source discovery
@@ -9563,10 +9567,26 @@ pub async fn start_network(
                                         .as_ref()
                                         .map(|record| record.aich_hash.clone())
                                         .unwrap_or_default(),
-                                    ember_file_hash: existing
-                                        .as_ref()
-                                        .map(|record| record.ember_file_hash.clone())
-                                        .unwrap_or_default(),
+                                    ember_file_hash: {
+                                        // Prefer a digest verified/learned this
+                                        // session, then any prior known.met value.
+                                        let from_map = state
+                                            .ember_content_hashes
+                                            .get(&fh)
+                                            .filter(|d| **d != [0u8; 32])
+                                            .map(hex::encode);
+                                        from_map
+                                            .or_else(|| {
+                                                existing.as_ref().and_then(|record| {
+                                                    if record.ember_file_hash.is_empty() {
+                                                        None
+                                                    } else {
+                                                        Some(record.ember_file_hash.clone())
+                                                    }
+                                                })
+                                            })
+                                            .unwrap_or_default()
+                                    },
                                     modified_at: now,
                                     all_time_transferred: existing
                                         .as_ref()
@@ -9620,10 +9640,24 @@ pub async fn start_network(
                                         .as_ref()
                                         .map(|record| record.aich_hash.clone())
                                         .unwrap_or_default(),
-                                    ember_file_hash: existing
-                                        .as_ref()
-                                        .map(|record| record.ember_file_hash.clone())
-                                        .unwrap_or_default(),
+                                    ember_file_hash: {
+                                        let from_map = state
+                                            .ember_content_hashes
+                                            .get(&fh)
+                                            .filter(|d| **d != [0u8; 32])
+                                            .map(hex::encode);
+                                        from_map
+                                            .or_else(|| {
+                                                existing.as_ref().and_then(|record| {
+                                                    if record.ember_file_hash.is_empty() {
+                                                        None
+                                                    } else {
+                                                        Some(record.ember_file_hash.clone())
+                                                    }
+                                                })
+                                            })
+                                            .unwrap_or_default()
+                                    },
                                     extension: ext,
                                     modified_at: now,
                                     priority: existing
@@ -9931,6 +9965,7 @@ pub async fn start_network(
                                         .and_then(|p| p.parse().ok())
                                         .unwrap_or(0),
                                     extra_sources: Vec::new(),
+                                    ember_file_hash: String::new(),
                                     transfer_id: t.id.clone(),
                                     control,
                                     discovery_only: false,
@@ -10738,6 +10773,7 @@ pub async fn start_network(
                             peer_ip: t.peer_id.split(':').next().unwrap_or("").to_string(),
                             peer_port: t.peer_id.split(':').nth(1).and_then(|p| p.parse().ok()).unwrap_or(0),
                             extra_sources: Vec::new(),
+                            ember_file_hash: String::new(),
                             transfer_id: t.id.clone(),
                             control,
                             discovery_only: false,
@@ -11324,6 +11360,7 @@ pub async fn start_network(
                             peer_ip: t.peer_id.split(':').next().unwrap_or("").to_string(),
                             peer_port: t.peer_id.split(':').nth(1).and_then(|p| p.parse().ok()).unwrap_or(0),
                             extra_sources: Vec::new(),
+                            ember_file_hash: String::new(),
                             transfer_id: t.id.clone(),
                             control,
                             discovery_only: false,
@@ -25038,6 +25075,10 @@ fn build_ember_keyword_results(blobs: &[Vec<u8>], keywords: &[String]) -> Vec<Se
             Some((existing, publishers)) => {
                 publishers.insert(rec.publisher_key);
                 existing.availability = publishers.len() as u32;
+                // Upgrade an empty digest when a later publisher carries one.
+                if existing.file.ember_file_hash.is_empty() && rec.ember_file_hash != [0u8; 32] {
+                    existing.file.ember_file_hash = hex::encode(rec.ember_file_hash);
+                }
             }
             None => {
                 let extension = rec
@@ -25303,6 +25344,11 @@ async fn maybe_publish_ember_sources(
             if !f.shared || f.hash.is_empty() {
                 continue;
             }
+            // Wait for slice-18 BLAKE3 before advertising; zeros skip verify
+            // on downloaders and would stick until the republish interval.
+            if f.ember_file_hash.is_empty() {
+                continue;
+            }
             let Some(hash) = hex::decode(&f.hash)
                 .ok()
                 .and_then(|v| <[u8; 16]>::try_from(v).ok())
@@ -25460,6 +25506,9 @@ async fn maybe_publish_ember_keywords(
         let mut ranked: Vec<(u64, usize)> = Vec::new();
         for (i, f) in files.iter().enumerate() {
             if !f.shared || f.hash.is_empty() {
+                continue;
+            }
+            if f.ember_file_hash.is_empty() {
                 continue;
             }
             let Some(hash) = hex::decode(&f.hash)
@@ -25833,17 +25882,39 @@ async fn handle_ember_dht_message(
     }
 
     // Buddy accepted a PROXY_STORE: fan the publisher-signed firewalled
-    // source record out via our normal publish driver.
-    if let Some(forward) = inbound.proxy_store_forward {
-        state.ember_diagnostics.ember_dht_buddy_forwards = state
-            .ember_diagnostics
-            .ember_dht_buddy_forwards
-            .saturating_add(1);
+    // source record out via the normal publish driver. ACK only after
+    // start_publish succeeds so the publisher is not told "ok" when the
+    // local publish queue is full.
+    if let Some((proxy_rid, forward)) = inbound.proxy_store_forward {
+        let key = forward.keyword_hash;
         if let Some(publish_id) = state
             .ember_publish
             .start_publish(forward, state.ember_dht.routing())
         {
+            state.ember_diagnostics.ember_dht_buddy_forwards = state
+                .ember_diagnostics
+                .ember_dht_buddy_forwards
+                .saturating_add(1);
             drive_ember_publish(socket, state, publish_id).await;
+            let ack_bytes = state
+                .ember_dht
+                .build_proxy_store_ack_frame(proxy_rid, key);
+            match state.ember_transport.prepare_outgoing(
+                from,
+                Some(&remote_noise_pub),
+                &ack_bytes,
+            ) {
+                ember::transport::OutgoingResult::Ready { packet }
+                | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+                    if let Err(e) = socket.send_to(&packet, from).await {
+                        debug!("Ember DHT: failed to send PROXY_STORE_ACK to {from}: {e}");
+                    }
+                }
+                ember::transport::OutgoingResult::Queued => {}
+                ember::transport::OutgoingResult::Error(e) => {
+                    debug!("Ember DHT: transport error sending PROXY_STORE_ACK to {from}: {e}");
+                }
+            }
         }
     }
 
@@ -25928,20 +25999,39 @@ async fn handle_ember_dht_message(
             .ember_diagnostics
             .ember_dht_pongs_received
             .saturating_add(1);
-        if let Some(observed) = inbound.pong_observed {
-            state.ember_diagnostics.ember_dht_observed_votes = state
-                .ember_diagnostics
-                .ember_dht_observed_votes
-                .saturating_add(1);
-            if let Some(confirmed) = state
-                .ember_observed_votes
-                .record_vote(observed, from.ip())
-            {
-                if state.external_ip.is_none() {
-                    if let std::net::IpAddr::V4(v4) = confirmed.ip() {
-                        set_external_ip(state, Some(v4));
-                        state.stats.external_ip = v4.to_string();
-                        state.nat_info.external_addr = Some(confirmed);
+        // Observed-IP votes are only accepted from PONGs that answer one of
+        // our outbound PINGs (pending control or maintenance). Unsolicited
+        // PONGs with forged `observed` must not drive external_ip.
+        let correlated_pong = inbound.pong_request_id.is_some_and(|rid| {
+            state.ember_dht_pending_pings.contains_key(&rid)
+                || state.ember_dht_maint_pings.contains_key(&rid)
+        });
+        if correlated_pong {
+            if let Some(observed) = inbound.pong_observed {
+                state.ember_diagnostics.ember_dht_observed_votes = state
+                    .ember_diagnostics
+                    .ember_dht_observed_votes
+                    .saturating_add(1);
+                if let Some(confirmed) = state
+                    .ember_observed_votes
+                    .record_vote(observed, from.ip())
+                {
+                    // Never set external_ip from DHT votes alone. Only confirm
+                    // an independent STUN/NAT mapping when it already matches.
+                    let stun_ip = state.nat_info.external_addr.and_then(|a| match a.ip() {
+                        std::net::IpAddr::V4(v4) => Some(v4),
+                        std::net::IpAddr::V6(_) => None,
+                    });
+                    if state.external_ip.is_none() {
+                        if let (Some(stun), std::net::IpAddr::V4(v4)) =
+                            (stun_ip, confirmed.ip())
+                        {
+                            if stun == v4 {
+                                set_external_ip(state, Some(v4));
+                                state.stats.external_ip = v4.to_string();
+                                state.nat_info.external_addr = Some(confirmed);
+                            }
+                        }
                     }
                 }
             }
@@ -29408,10 +29498,22 @@ async fn handle_command_inner(
             peer_ip,
             peer_port,
             extra_sources,
+            ember_file_hash,
             transfer_id,
             control,
             discovery_only,
         } => {
+            // Seed expected BLAKE3 from search/UI so verify does not depend
+            // solely on having processed an Ember keyword hit this session.
+            if let Ok(bytes) = hex::decode(file_hash.trim()) {
+                if let Ok(ed2k) = <[u8; 16]>::try_from(bytes.as_slice()) {
+                    let digest = parse_ember_file_hash(&ember_file_hash);
+                    if digest != [0u8; 32] {
+                        state.ember_content_hashes.insert(ed2k, digest);
+                    }
+                }
+            }
+
             let has_source = !peer_ip.is_empty() && peer_ip != "0.0.0.0" && peer_port > 0;
 
             let publish_file_name = file_name.clone();
@@ -32421,6 +32523,13 @@ async fn handle_command_inner(
                                 is_shared,
                                 complete_sources: sources,
                             });
+                            // Real BLAKE3 just landed (or was refreshed) —
+                            // drop publish timers so the next tick advertises
+                            // the digest instead of waiting out a zeros publish.
+                            if !f.ember_file_hash.is_empty() {
+                                state.ember_source_publish_at.remove(&fh);
+                                state.ember_keyword_publish_at.remove(&fh);
+                            }
                         }
                     }
                 }

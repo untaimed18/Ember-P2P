@@ -183,6 +183,14 @@ fn merge_into(existing: &mut SearchResult, incoming: SearchResult) {
     if incoming.file.name.len() > existing.file.name.len() {
         existing.file.name = incoming.file.name;
     }
+    // Prefer a real Ember content digest / AICH root when either side has one
+    // (network hits often arrive empty; local library hits carry known.met).
+    if existing.file.ember_file_hash.is_empty() && !incoming.file.ember_file_hash.is_empty() {
+        existing.file.ember_file_hash = incoming.file.ember_file_hash;
+    }
+    if existing.file.aich_hash.is_empty() && !incoming.file.aich_hash.is_empty() {
+        existing.file.aich_hash = incoming.file.aich_hash;
+    }
 }
 
 /// True when every non-empty origin part is an eD2k server/UDP label
@@ -354,6 +362,21 @@ mod tests {
             None,
             None
         ));
+    }
+
+    #[test]
+    fn merge_prefers_nonempty_ember_file_hash() {
+        let mut a = sample("cc", 1, ORIGIN_SERVER_TCP);
+        let mut b = sample("cc", 1, ORIGIN_EMBER);
+        b.file.ember_file_hash = "ab".repeat(32);
+        merge_into(&mut a, b);
+        assert_eq!(a.file.ember_file_hash, "ab".repeat(32));
+
+        let mut keep = sample("dd", 1, ORIGIN_EMBER);
+        keep.file.ember_file_hash = "cd".repeat(32);
+        let empty = sample("dd", 2, ORIGIN_KAD);
+        merge_into(&mut keep, empty);
+        assert_eq!(keep.file.ember_file_hash, "cd".repeat(32));
     }
 
     #[test]

@@ -23,7 +23,9 @@ export async function startDownload(
    * validation before seeding, and falls back to its normal KAD +
    * server source discovery whether or not extras are provided.
    */
-  extraSources?: string[]
+  extraSources?: string[],
+  /** Optional Ember content BLAKE3 hex for download completion verify. */
+  emberFileHash?: string
 ): Promise<StartDownloadResponse> {
   // A source address identifies a peer, not the file. Never let a source-bearing
   // result bypass the mandatory content hash used to identify and verify it.
@@ -37,6 +39,7 @@ export async function startDownload(
     peerIp,
     peerPort,
     extraSources: extraSources ?? null,
+    emberFileHash: emberFileHash?.trim() ? emberFileHash.trim() : null,
   });
 }
 

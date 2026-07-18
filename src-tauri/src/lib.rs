@@ -575,17 +575,19 @@ pub fn run() {
                         // Restore the last-known Peers count so the Library
                         // doesn't show 0 until the next 60s source-count sync.
                         file.complete_sources = record.complete_sources;
-                        // A matched record short-circuits hashing. If the AICH
-                        // root was cleared by the v2 migration (or is otherwise
-                        // missing) and the file is multi-part, schedule a
-                        // one-time rehash to recompute it: the ed2k hash comes
-                        // out identical, only the corrected AICH root is
-                        // restored. Single-part files never straddle a part
-                        // boundary, so their roots are always correct and are
-                        // left as-is.
-                        if file.aich_hash.is_empty()
-                            && file.size > crate::network::ed2k::hash::PARTSIZE
-                        {
+                        // A matched record short-circuits hashing unless we
+                        // still need a one-time repair pass:
+                        // - empty AICH on multi-part (v2 migration / missing root)
+                        // - empty ember_file_hash (slice 18 migration: pre-upgrade
+                        //   shares must get streaming BLAKE3 for DHT publish +
+                        //   download verify)
+                        // ed2k comes out identical; only the missing digests
+                        // are filled. Single-part empty AICH is left as-is
+                        // (roots never straddled a part boundary).
+                        let needs_aich = file.aich_hash.is_empty()
+                            && file.size > crate::network::ed2k::hash::PARTSIZE;
+                        let needs_ember = file.ember_file_hash.is_empty();
+                        if needs_aich || needs_ember {
                             files_to_hash.push(file.clone());
                         }
                     } else {

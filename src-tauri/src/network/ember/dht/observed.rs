@@ -28,6 +28,10 @@ impl EmberObservedIpVotes {
         if !is_public_vote_addr(reported) {
             return None;
         }
+        // Reject private/loopback reporters so LAN Sybils cannot vote.
+        if !is_public_reporter(reporter) {
+            return None;
+        }
         let Some(net) = reporter_net24(reporter) else {
             return None;
         };
@@ -65,7 +69,15 @@ fn reporter_net24(ip: IpAddr) -> Option<[u8; 3]> {
 fn is_public_vote_addr(addr: SocketAddr) -> bool {
     match addr.ip() {
         IpAddr::V4(ip) => is_public_v4(ip) && addr.port() != 0,
-        IpAddr::V6(_) => addr.port() != 0,
+        // Do not accept IPv6 observed addresses for IPv4 external_ip voting.
+        IpAddr::V6(_) => false,
+    }
+}
+
+fn is_public_reporter(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_public_v4(v4),
+        IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified() && !v6.is_multicast(),
     }
 }
 
@@ -95,10 +107,10 @@ mod tests {
     fn confirms_after_three_distinct_slash24s() {
         let mut votes = EmberObservedIpVotes::new();
         let target = addr(50, 4672);
-        assert!(votes.record_vote(target, reporter(10, 0, 1)).is_none());
-        assert!(votes.record_vote(target, reporter(10, 0, 2)).is_none());
-        assert!(votes.record_vote(target, reporter(10, 0, 1)).is_none());
-        let confirmed = votes.record_vote(target, reporter(10, 1, 3));
+        assert!(votes.record_vote(target, reporter(203, 0, 1)).is_none());
+        assert!(votes.record_vote(target, reporter(203, 0, 2)).is_none());
+        assert!(votes.record_vote(target, reporter(203, 0, 1)).is_none());
+        let confirmed = votes.record_vote(target, reporter(198, 51, 100));
         assert_eq!(confirmed, Some(target));
         assert_eq!(votes.confirmed(), Some(target));
     }
@@ -108,6 +120,14 @@ mod tests {
         let mut votes = EmberObservedIpVotes::new();
         let private = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 4672));
         assert!(votes.record_vote(private, reporter(203, 0, 113)).is_none());
+        assert!(votes.confirmed().is_none());
+    }
+
+    #[test]
+    fn rejects_private_reporter() {
+        let mut votes = EmberObservedIpVotes::new();
+        let target = addr(50, 4672);
+        assert!(votes.record_vote(target, reporter(10, 0, 1)).is_none());
         assert!(votes.confirmed().is_none());
     }
 }
