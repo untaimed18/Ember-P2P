@@ -137,8 +137,24 @@ export function getDraft(hash: string): string {
 }
 
 export function setDraft(hash: string, text: string) {
-  if (text) chatDrafts.set(hash, text);
-  else chatDrafts.delete(hash);
+  // Guard against a resurrection race with `closeTab`: closing the
+  // ACTIVE tab changes which hash `ChatConversation` is displaying,
+  // which fires that component's cleanup effect — the same effect
+  // that normally stashes a draft on an ordinary tab switch. That
+  // cleanup runs against `chatTabs`/`activeChatTab` reactivity, which
+  // is scheduled *after* `closeTab` has already removed the tab and
+  // wiped its draft, so without this check the cleanup's `setDraft`
+  // call would silently re-create a draft entry for a hash that no
+  // longer has an open tab — exactly the "stale draft haunts a
+  // reopened conversation" bug this module's doc comment says can't
+  // happen. Only persist a draft while its tab is still open;
+  // `closeTab`'s own `chatDrafts.delete` remains as a defensive
+  // belt-and-suspenders for any other future caller.
+  if (text && get(chatTabs).some((t) => t.hash === hash)) {
+    chatDrafts.set(hash, text);
+  } else {
+    chatDrafts.delete(hash);
+  }
 }
 
 export function clearDraft(hash: string) {
