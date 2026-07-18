@@ -880,6 +880,7 @@ pub fn run() {
             commands::search::find_sources,
             commands::search::publish_note,
             commands::search::format_ed2k_link,
+            commands::search::format_ed2k_links,
             commands::search::build_ed2k_link,
             commands::search::parse_ed2k_link,
             commands::search::mark_spam,

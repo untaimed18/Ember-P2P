@@ -196,11 +196,25 @@ export function pluralize(count: number, singular: string, plural?: string): str
   return count === 1 ? `${count} ${singular}` : `${count} ${plural || singular + 's'}`;
 }
 
-/** Copy text to clipboard with fallback. */
+/** Copy text to clipboard with a DOM fallback for WebView2 / denied permissions. */
 export async function copyToClipboard(text: string): Promise<boolean> {
   try {
     await navigator.clipboard.writeText(text);
     return true;
+  } catch {
+    // Fall through to legacy path.
+  }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    return ok;
   } catch {
     return false;
   }
