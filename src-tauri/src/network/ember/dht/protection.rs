@@ -1,4 +1,4 @@
-//! Per-IP rate limits for the Ember DHT (survival-plan slice 14).
+//! Per-IP rate limits for the Ember DHT.
 //!
 //! Transport-layer AEAD already rejects verbatim UDP replays; STORE
 //! signature replay collapse lives in [super::engine::EmberDht]. This
