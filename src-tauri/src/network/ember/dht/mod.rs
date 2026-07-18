@@ -4,7 +4,6 @@ pub mod messages;
 pub mod publish;
 pub mod routing;
 pub mod search;
-pub mod seeds;
 pub mod store;
 
 use std::net::SocketAddr;

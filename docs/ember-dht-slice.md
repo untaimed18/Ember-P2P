@@ -245,33 +245,9 @@ The trust anchor throughout is the DHT's own PING-time verification, so the
 pool stays unsigned and best-effort; a signed, load-weighted pool can come
 later without changing the client.
 
-### Hardcoded seed peers (slice 11)
-
-A second, rendezvous-independent cold-start source: a small list of
-known-good bootstrap peers baked into the build, the Ember equivalent of
-eMule's hardcoded server list.
-
-- **Where it lives.** [`dht/seeds.txt`](../src-tauri/src/network/ember/dht/seeds.txt)
-  — one peer per line, `host:port ed25519_pub_hex noise_pub_hex`,
-  `#` comments and blank lines ignored — is embedded at compile time via
-  `include_str!` in [`dht/seeds.rs`](../src-tauri/src/network/ember/dht/seeds.rs).
-  Each line is parsed into a `BootstrapNode` and validated through the same
-  `to_contact` path as a rendezvous node (so the node ID is derived from
-  the Ed25519 key and re-verified on the first PING — a baked-in seed is no
-  more trusted than any other contact).
-- **How it's wired.** `maybe_spawn_ember_cold_bootstrap` now seeds the
-  hardcoded peers first (no I/O, available even when the rendezvous URL is
-  empty or down), then runs the `/bootstrap` fetch; both flow through the
-  same `ember_boot_rx` seed-and-self-lookup arm. The helper no longer
-  requires a rendezvous URL — hardcoded seeds alone are enough to start.
-- **Ships empty.** The list is intentionally empty until long-lived Ember
-  seed nodes are deployed; populating it is a one-line *data* change to
-  `seeds.txt`. An `embedded_seeds_are_all_valid` test fails the build if a
-  baked-in line is malformed, so a typo'd seed can never ship.
-
 ### KAD-bridge bootstrap (slice 13)
 
-A third cold-start source that costs nothing while the eMule KAD network is
+A second cold-start source that costs nothing while the eMule KAD network is
 still up: every Ember client is also a KAD client, and KAD source publishes
 already carry the publisher's Noise key (`EMBER_NOISE_PUB_TAG`), cached in
 `ember_noise_keys` (`(ip, port) → noise_pub`). That cache previously only
@@ -461,17 +437,15 @@ and `ember_native_enabled: true` in each `config.json`:
 
 ## Follow-on order
 
-1. ~~Hardcoded seed peers (slice 11).~~ **Done** — see "Hardcoded seed
-   peers" above. Baked-in `seeds.txt`, wired into the cold-start path.
-2. ~~KAD-bridge bootstrap (slice 13).~~ **Done** — see "KAD-bridge
+1. ~~KAD-bridge bootstrap (slice 13).~~ **Done** — see "KAD-bridge
    bootstrap" above. KAD-learned Ember peers are DHT-pinged into the table
-   while it's sparse.
-3. **DNS seed list** (slice 12, deferred) — `_ember._udp.<domain>` SRV/TXT
-   records so the seed set can rotate without a client release; falls back
-   to the hardcoded list. Deferred until a seed domain actually exists
-   (needs a DNS-resolver dependency, inert until then).
-4. A **signed, load-weighted** rendezvous `/bootstrap` pool (the current
+   while it's sparse. Primary discovery path for the first public DHT
+   release (alongside rendezvous `/bootstrap` for KAD-off clients).
+2. **DNS seed list** (slice 12, deferred) — `_ember._udp.<domain>` SRV/TXT
+   records so a seed set can rotate without a client release. Deferred
+   until a seed domain actually exists (needs a DNS-resolver dependency).
+3. A **signed, load-weighted** rendezvous `/bootstrap` pool (the current
    pool is unsigned + best-effort, leaning on the DHT's PING-time
    verification as the trust anchor).
-5. Multi-keyword DHT intersection on the wire (UI already AND-filters
+4. Multi-keyword DHT intersection on the wire (UI already AND-filters
    locally after a primary-keyword `FIND_VALUE`).

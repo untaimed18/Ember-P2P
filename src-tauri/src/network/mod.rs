@@ -6646,6 +6646,9 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
 /// and fires a self-lookup. Safe to call when not warranted — it just
 /// no-ops. Used both at startup and when the user toggles the network on
 /// at runtime, so a fresh node joins the DHT without a restart.
+///
+/// First-contact discovery otherwise comes from the KAD bridge (slice 13)
+/// while KAD is up; rendezvous covers Ember-on / KAD-off clients.
 fn maybe_spawn_ember_cold_bootstrap(
     settings: &AppSettings,
     state: &NetworkState,
@@ -6657,16 +6660,8 @@ fn maybe_spawn_ember_cold_bootstrap(
         return;
     }
 
-    // Two cold-start sources, tried in order of cost:
-    //   1. Hardcoded seed peers (slice 11) — baked into the build, no I/O,
-    //      and available even when the rendezvous URL is empty/unreachable.
-    //   2. The rendezvous `/bootstrap` pool (slice 7+) — an HTTPS round trip.
-    // Both feed the same `boot_tx` channel; the `ember_boot_rx` arm seeds
-    // whatever arrives and self-looks-up. Seeds go first so the node has
-    // something to dial immediately while the rendezvous fetch is in flight.
-    let seeds = ember::dht::seeds::hardcoded_contacts();
     let rv_url = settings.rendezvous_url.trim().to_string();
-    if seeds.is_empty() && rv_url.is_empty() {
+    if rv_url.is_empty() {
         return;
     }
 
@@ -6695,17 +6690,6 @@ fn maybe_spawn_ember_cold_bootstrap(
         }
         let _guard = InFlightGuard(in_flight);
 
-        if !seeds.is_empty() {
-            info!(
-                "Ember DHT cold bootstrap ({trigger}): seeding {} hardcoded peer(s)",
-                seeds.len()
-            );
-            let _ = boot_tx.send(seeds).await;
-        }
-
-        if rv_url.is_empty() {
-            return;
-        }
         match ember::dht::bootstrap::fetch_bootstrap_nodes(&rv_url).await {
             Ok(nodes) => {
                 let contacts: Vec<ember::dht::EmberContact> =
