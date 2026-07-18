@@ -416,6 +416,7 @@ export interface EmberDhtMaintenanceResult {
   buckets_refreshed: number;
   liveness_pings_sent: number;
   records_republished: number;
+  announces_sent: number;
   kad_bridge_pings_sent: number;
   error?: string;
 }

@@ -3378,6 +3378,8 @@ pub struct EmberMaintenanceResult {
     pub liveness_pings_sent: usize,
     /// Locally-stored records re-published to the closest nodes.
     pub records_republished: usize,
+    /// `ANNOUNCE_PEER` contact-list exchanges started this cycle.
+    pub announces_sent: usize,
     /// KAD-bridge bootstrap `PING`s sent to KAD-learned Ember peers (slice
     /// 13). Non-zero only while the table is still sparse.
     pub kad_bridge_pings_sent: usize,
@@ -4581,6 +4583,8 @@ const EMBER_RECORD_REPUBLISH_SECS: u64 = 3600;
 const EMBER_MAINT_MAX_REFRESH: usize = 3;
 const EMBER_MAINT_MAX_PINGS: usize = 8;
 const EMBER_MAINT_MAX_REPUBLISH: usize = 5;
+/// Contact-list exchanges per maintenance cycle (`ANNOUNCE_PEER`).
+const EMBER_MAINT_MAX_ANNOUNCE: usize = 2;
 
 /// KAD-bridge bootstrap (slice 13). While the Ember DHT routing table holds
 /// fewer than this many contacts, the maintenance loop folds in Ember peers
@@ -25803,6 +25807,52 @@ async fn run_ember_maintenance(
                 .ember_dht_records_republished
                 .saturating_add(1);
             drive_ember_publish(socket, state, publish_id).await;
+        }
+    }
+
+    // 4) Peer announce — exchange contact lists with a few live peers so
+    //    the table fills beyond FIND_NODE lookup paths (churn recovery).
+    let mut announce_targets: Vec<_> = state.ember_dht.contacts();
+    announce_targets.sort_by_key(|c| std::cmp::Reverse(c.last_seen));
+    announce_targets.truncate(EMBER_MAINT_MAX_ANNOUNCE);
+    for contact in announce_targets {
+        let gossip: Vec<_> = state
+            .ember_dht
+            .routing()
+            .find_closest(&contact.node_id, ember::dht::MAX_CONTACTS_PER_RESPONSE)
+            .into_iter()
+            .filter(|c| c.node_id != contact.node_id && c.node_id != state.ember_dht.local_id())
+            .collect();
+        let (_wire_req_id, frame) = state.ember_dht.build_announce_peer(gossip);
+        let send_ok = match state.ember_transport.prepare_outgoing(
+            contact.addr,
+            Some(&contact.noise_pub),
+            &frame,
+        ) {
+            ember::transport::OutgoingResult::Ready { packet }
+            | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+                match socket.send_to(&packet, contact.addr).await {
+                    Ok(_) => true,
+                    Err(e) => {
+                        debug!(
+                            "Ember DHT maintenance: announce to {} failed: {e}",
+                            contact.addr
+                        );
+                        false
+                    }
+                }
+            }
+            ember::transport::OutgoingResult::Queued => true,
+            ember::transport::OutgoingResult::Error(e) => {
+                debug!(
+                    "Ember DHT maintenance: transport error announcing to {}: {e}",
+                    contact.addr
+                );
+                false
+            }
+        };
+        if send_ok {
+            result.announces_sent += 1;
         }
     }
 

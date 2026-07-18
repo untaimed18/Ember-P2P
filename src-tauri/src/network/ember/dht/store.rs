@@ -582,4 +582,33 @@ mod tests {
         // Identical key → distance zero → accept.
         assert!(DhtStore::should_store(&local, &[0u8; 16]));
     }
+
+    #[test]
+    fn store_churn_soak_expire_and_republish() {
+        let mut store = DhtStore::new();
+        let (sk, pk) = keypair();
+        for i in 0u8..64 {
+            let key = [i; 16];
+            let mut data = vec![0u8; 65];
+            data[0] = 1;
+            data[33] = i;
+            assert!(store.store(key, data.clone(), sign(&sk, &data), pk, now_ts()));
+        }
+        assert!(store.total_records() >= 64);
+        // Force-expire half the keys in place, then sweep.
+        for i in 0u8..32 {
+            let key = [i; 16];
+            if let Some(recs) = store.entries.get_mut(&key) {
+                for r in recs.iter_mut() {
+                    r.expires_at = Instant::now()
+                        .checked_sub(Duration::from_secs(1))
+                        .unwrap_or_else(Instant::now);
+                }
+            }
+        }
+        let removed = store.expire();
+        assert!(removed >= 32);
+        let batch = store.take_republish_batch(Duration::from_secs(0), 16, true);
+        assert!(!batch.is_empty());
+    }
 }

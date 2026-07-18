@@ -341,9 +341,9 @@ key-binding + capacity caps). The native **rendezvous bootstrap** is wired
 end-to-end (server pool + client cold-start fetch + self-lookup), so both
 warm and cold starts are KAD-free. Auto keyword/source
 publish against real shared files (slices 8–9) and search UI Ember method
-(slice 10) are live behind `ember_native_enabled`. Inbound `ANNOUNCE_PEER` /
-`PEER_LIST` are decoded and the sender is learned, but their handlers are
-deferred.
+(slice 10) are live behind `ember_native_enabled`. `ANNOUNCE_PEER` /
+`PEER_LIST` exchange contact lists during maintenance (merge inbound
+gossip; reply with closest peers) so the table fills beyond lookup paths.
 
 ## Verifying the round-trip
 
@@ -444,7 +444,7 @@ and `ember_native_enabled: true` in each `config.json`:
 2. ~~Buddy / dual-UDP publish (`PROXY_STORE`, slice 15).~~ **Done** —
    firewalled publishers ask up to 3 fresh DHT contacts to fan out their
    signed `FIREWALLED` source records; storers exempt those sources from
-   IP anti-reflection. DNS seed list (slice 12) remains deferred.
+   IP anti-reflection. DNS seed list (slice 12) was dropped from the plan.
 3. ~~Multi-keyword DHT intersection on the wire.~~ **Done** — FIND_VALUE
    carries secondary keyword hashes; peers that also hold those keys filter
    primary records by `file_hash` intersection (missing secondaries are
@@ -458,4 +458,8 @@ and `ember_native_enabled: true` in each `config.json`:
    (including one-time rehash for pre-upgrade known.met entries); DHT
    decode caps, version-0 rejection, PONG observed-IP voting (ping-correlated;
    confirms STUN when present, otherwise may set `external_ip` from votes
-   when STUN has not produced an address).
+   when STUN has not produced an address). Extended decode/engine fuzz soaks
+   and routing churn coverage live under `cargo test --lib network::ember`.
+6. ~~`ANNOUNCE_PEER` / `PEER_LIST`.~~ **Done** — maintenance exchanges
+   contact-list gossip; inbound announce merges + replies with closest peers;
+   peer-list merges like `FOUND_NODE`.

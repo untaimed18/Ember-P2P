@@ -292,6 +292,41 @@ pub fn build_found_node(
     }
 }
 
+/// Build an ANNOUNCE_PEER request carrying a contact-list gossip dump.
+/// Peers reply with [`build_peer_list`].
+pub fn build_announce_peer(
+    sender_id: EmberNodeId,
+    request_id: u32,
+    contacts: Vec<EmberContact>,
+) -> DhtMessage {
+    DhtMessage {
+        version: EMBER_DHT_VERSION,
+        msg_type: MSG_ANNOUNCE_PEER,
+        request_id,
+        sender_id,
+        sender_pub_key: None,
+        payload: DhtPayload::AnnouncePeer { contacts },
+        signature: [0u8; 64],
+    }
+}
+
+/// Build a PEER_LIST response (answer to [`build_announce_peer`]).
+pub fn build_peer_list(
+    sender_id: EmberNodeId,
+    request_id: u32,
+    contacts: Vec<EmberContact>,
+) -> DhtMessage {
+    DhtMessage {
+        version: EMBER_DHT_VERSION,
+        msg_type: MSG_PEER_LIST,
+        request_id,
+        sender_id,
+        sender_pub_key: None,
+        payload: DhtPayload::PeerList { contacts },
+        signature: [0u8; 64],
+    }
+}
+
 /// Build a STORE_RECORD request. `record` is the publisher-signed record
 /// bytes ([`super::publish::SignedRecord::data`]) and `record_signature`
 /// is that publisher's Ed25519 signature over it — distinct from the
@@ -871,12 +906,47 @@ mod tests {
     fn decode_message_fuzz_never_panics() {
         use rand::{Rng, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(0xE19E_19E1);
-        for _ in 0..200 {
-            let len = rng.gen_range(0..=512);
+        // Longer soak than the original 200×512 smoke: covers truncated
+        // headers, oversized contact lists, and random trailing junk.
+        for _ in 0..2_000 {
+            let len = rng.gen_range(0..=2_048);
             let mut buf = vec![0u8; len];
             rng.fill(&mut buf[..]);
             let _ = decode_message(&buf, true);
             let _ = decode_message(&buf, false);
+        }
+    }
+
+    #[test]
+    fn announce_peer_peer_list_round_trip() {
+        let (sk, id) = test_keypair();
+        let contacts = vec![
+            test_contact(21, "203.0.113.1:4662", 0x11),
+            test_contact(22, "203.0.113.2:4663", 0x22),
+        ];
+        let announce = build_announce_peer(id, 55, contacts.clone());
+        let encoded = encode_message(&announce, &sk, true);
+        let decoded = decode_message(&encoded, true).unwrap();
+        match decoded.payload {
+            DhtPayload::AnnouncePeer {
+                contacts: got,
+            } => {
+                assert_eq!(got.len(), 2);
+                assert_eq!(got[0].node_id, contacts[0].node_id);
+                assert_eq!(got[1].addr, contacts[1].addr);
+            }
+            _ => panic!("expected AnnouncePeer"),
+        }
+
+        let list = build_peer_list(id, 55, contacts.clone());
+        let encoded = encode_message(&list, &sk, true);
+        let decoded = decode_message(&encoded, true).unwrap();
+        match decoded.payload {
+            DhtPayload::PeerList { contacts: got } => {
+                assert_eq!(got.len(), 2);
+                assert_eq!(got[1].node_id, contacts[1].node_id);
+            }
+            _ => panic!("expected PeerList"),
         }
     }
 

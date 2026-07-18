@@ -76,6 +76,11 @@ pub struct DhtInbound {
     /// For a `FOUND_VALUE`, the `request_id` it answered plus the raw
     /// (still publisher-signed) record blobs it carried.
     pub found_value: Option<(u32, Vec<Vec<u8>>)>,
+    /// The frame was an `ANNOUNCE_PEER` we answered with a `PEER_LIST`.
+    pub announce_peer_received: bool,
+    /// For a `PEER_LIST`, the `request_id` it answered plus the contacts
+    /// it carried (also merged into the routing table).
+    pub peer_list: Option<(u32, Vec<EmberContact>)>,
     /// We learned (added) a new contact from this frame's signed sender.
     pub learned_contact: bool,
     /// Full-bucket liveness checks the caller should perform: each is the
@@ -212,6 +217,15 @@ impl EmberDht {
     pub fn build_find_node(&mut self, target: EmberNodeId) -> (u32, Vec<u8>) {
         let request_id = self.next_request_id();
         let msg = messages::build_find_node(self.local_id, request_id, target);
+        let bytes = messages::encode_message(&msg, &self.signing_key, true);
+        (request_id, bytes)
+    }
+
+    /// Build a signed `ANNOUNCE_PEER` carrying a contact-list gossip dump.
+    /// The peer answers with `PEER_LIST` (see [`Self::handle_message`]).
+    pub fn build_announce_peer(&mut self, contacts: Vec<EmberContact>) -> (u32, Vec<u8>) {
+        let request_id = self.next_request_id();
+        let msg = messages::build_announce_peer(self.local_id, request_id, contacts);
         let bytes = messages::encode_message(&msg, &self.signing_key, true);
         (request_id, bytes)
     }
@@ -492,16 +506,7 @@ impl EmberDht {
                 // `from`, but we have not heard from it directly — so it
                 // enters with the `last_seen` the wire carried (0) and
                 // will be pinged before later slices trust it.
-                for contact in &contacts {
-                    if let AddResult::PingOldest {
-                        addr,
-                        node_id,
-                        noise_pub,
-                    } = self.routing.add_contact(contact.clone())
-                    {
-                        out.ping_oldest.push((addr, node_id, noise_pub));
-                    }
-                }
+                Self::merge_gossip_contacts(&mut self.routing, &contacts, &mut out);
                 out.found_node = Some((msg.request_id, contacts));
             }
             DhtPayload::StoreRecord {
@@ -600,6 +605,24 @@ impl EmberDht {
                     }
                 }
             }
+            DhtPayload::AnnouncePeer { contacts } => {
+                // Peer-list exchange (bootstrap-style gossip): merge the
+                // asker's dump, then reply with our closest contacts to
+                // the asker so both tables thicken without a FIND_NODE.
+                out.announce_peer_received = true;
+                Self::merge_gossip_contacts(&mut self.routing, &contacts, &mut out);
+                let closest = self
+                    .routing
+                    .find_closest(&msg.sender_id, MAX_CONTACTS_PER_RESPONSE);
+                let peer_list =
+                    messages::build_peer_list(self.local_id, msg.request_id, closest);
+                out.responses
+                    .push(messages::encode_message(&peer_list, &self.signing_key, true));
+            }
+            DhtPayload::PeerList { contacts } => {
+                Self::merge_gossip_contacts(&mut self.routing, &contacts, &mut out);
+                out.peer_list = Some((msg.request_id, contacts));
+            }
             DhtPayload::ProxyStoreAck { key: _ } => {
                 // Publisher-side: buddy accepted the proxy request. No
                 // further engine work — diagnostics are updated by the
@@ -642,9 +665,8 @@ impl EmberDht {
                 out.found_value = Some((msg.request_id, records));
             }
             other => {
-                // ANNOUNCE_PEER / PEER_LIST / Unknown arrive here once
-                // peers speak them, but their handlers land in later
-                // slices. We've already learned the sender above.
+                // Unknown arrive here once peers speak them. We've already
+                // learned the sender above.
                 trace!(
                     "Ember DHT: ignoring unhandled message type from {from}: {:?}",
                     std::mem::discriminant(&other)
@@ -653,6 +675,25 @@ impl EmberDht {
         }
 
         out
+    }
+
+    /// Merge unverified gossip contacts from a signed peer frame into the
+    /// routing table, collecting any full-bucket liveness checks.
+    fn merge_gossip_contacts(
+        routing: &mut RoutingTable,
+        contacts: &[EmberContact],
+        out: &mut DhtInbound,
+    ) {
+        for contact in contacts {
+            if let AddResult::PingOldest {
+                addr,
+                node_id,
+                noise_pub,
+            } = routing.add_contact(contact.clone())
+            {
+                out.ping_oldest.push((addr, node_id, noise_pub));
+            }
+        }
     }
 }
 
@@ -842,6 +883,126 @@ mod tests {
             a.contacts().iter().any(|x| x.node_id == b.local_id()),
             "A should have learned B (the responder)"
         );
+    }
+
+    #[test]
+    fn announce_peer_exchanges_lists_and_learns_contacts() {
+        let mut a = dht(20);
+        let mut b = dht(21);
+        let a_noise = [0xAA; 32];
+        let b_noise = [0xBB; 32];
+        let a_addr = addr(20, 4672);
+        let b_addr = addr(21, 4672);
+
+        let c = dht(22);
+        let c_contact = EmberContact {
+            node_id: c.local_id(),
+            addr: addr(22, 4672),
+            noise_pub: [0xCC; 32],
+            ed25519_pub: c.ed25519_public_key(),
+            last_seen: 500,
+            failed_queries: 0,
+        };
+        assert!(b.add_contact(c_contact.clone()));
+
+        // A announces an empty dump; B merges nothing extra but replies
+        // with its closest (including C).
+        let (rid, announce) = a.build_announce_peer(Vec::new());
+        let on_b = b.handle_message(&announce, a_addr, a_noise, 1000);
+        assert!(on_b.announce_peer_received);
+        assert_eq!(on_b.responses.len(), 1);
+        assert!(on_b.learned_contact);
+
+        let on_a = a.handle_message(&on_b.responses[0], b_addr, b_noise, 1001);
+        let (got_rid, contacts) = on_a.peer_list.expect("PEER_LIST");
+        assert_eq!(got_rid, rid);
+        assert!(
+            contacts.iter().any(|x| x.node_id == c.local_id()),
+            "B should have returned C in PEER_LIST"
+        );
+        assert!(
+            a.contacts().iter().any(|x| x.node_id == c.local_id()),
+            "A should learn C from PEER_LIST"
+        );
+
+        // Reverse direction: A knows D, announces it to B.
+        let d = dht(23);
+        let d_contact = EmberContact {
+            node_id: d.local_id(),
+            addr: addr(23, 4672),
+            noise_pub: [0xDD; 32],
+            ed25519_pub: d.ed25519_public_key(),
+            last_seen: 0,
+            failed_queries: 0,
+        };
+        assert!(a.add_contact(d_contact.clone()));
+        let (_rid2, announce2) = a.build_announce_peer(vec![d_contact.clone()]);
+        let on_b2 = b.handle_message(&announce2, a_addr, a_noise, 2000);
+        assert!(
+            b.contacts().iter().any(|x| x.node_id == d.local_id()),
+            "B should learn D from ANNOUNCE_PEER gossip"
+        );
+        assert!(on_b2.announce_peer_received);
+        let _ = c_contact;
+    }
+
+    #[test]
+    fn handle_message_fuzz_never_panics() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xA11C_E11E);
+        let mut engine = dht(90);
+        let from = addr(90, 4672);
+        let noise = [0xEE; 32];
+        for _ in 0..1_000 {
+            let len = rng.gen_range(0..=1_024);
+            let mut buf = vec![0u8; len];
+            rng.fill(&mut buf[..]);
+            let _ = engine.handle_message(&buf, from, noise, 1_000);
+        }
+    }
+
+    #[test]
+    fn routing_churn_soak_add_evict_stable() {
+        let mut engine = dht(91);
+        // Flood the table with many distinct contacts, then mark failures
+        // until some evict — must not panic or corrupt contact_count.
+        for i in 0u16..256 {
+            let mut ed = [0u8; 32];
+            ed[0] = (i >> 8) as u8;
+            ed[1] = i as u8;
+            ed[2] = 0x91;
+            // Derive a plausible node_id from a synthetic keying scheme:
+            // use blake3 of ed for id so add_contact accepts the binding.
+            let id_bytes = blake3::hash(&ed);
+            let mut node = [0u8; 16];
+            node.copy_from_slice(&id_bytes.as_bytes()[..16]);
+            let contact = EmberContact {
+                node_id: EmberNodeId(node),
+                addr: addr((i % 250) as u8 + 1, 4000 + i),
+                noise_pub: {
+                    let mut n = [0u8; 32];
+                    n[0] = i as u8;
+                    n[1] = 0x42;
+                    n
+                },
+                ed25519_pub: ed,
+                last_seen: i as i64,
+                failed_queries: 0,
+            };
+            let _ = engine.add_contact(contact);
+        }
+        let before = engine.contact_count();
+        assert!(before > 0);
+        let snapshot: Vec<_> = engine.contacts().into_iter().map(|c| c.node_id).collect();
+        for id in snapshot.iter().take(snapshot.len() / 2) {
+            for _ in 0..8 {
+                if engine.mark_failed_contact(id) {
+                    let _ = engine.evict_contact(id);
+                    break;
+                }
+            }
+        }
+        assert!(engine.contact_count() <= before);
     }
 
     #[test]
