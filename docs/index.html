@@ -857,7 +857,7 @@
 
     <div class="download-box">
       <img src="icon.png" alt="Ember" width="80" height="80" style="border-radius: 16px; margin-bottom: 16px; box-shadow: 0 4px 16px rgba(0,0,0,0.12);">
-      <h3>Get Ember 1.1.7</h3>
+      <h3>Get Ember 1.2.0</h3>
       <p>The latest release is available on GitHub for Windows 10 and Windows 11.</p>
       <div class="btn-group">
         <a href="https://github.com/untaimed18/Ember-P2P/releases/latest" class="btn btn-primary" target="_blank" rel="noopener">
@@ -1309,6 +1309,114 @@ npm run tauri build</code></pre>
   <section id="releases">
     <h2>Release History</h2>
     <p>Official Ember releases for Windows. Notes mirror the <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">GitHub Releases</a> changelog style. Ember can also update itself in-app when a signed release is published.</p>
+
+    <article class="release" id="release-1-2-0">
+      <div class="release-header">
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.2.0" target="_blank" rel="noopener">Ember v1.2.0</a></h3>
+        <time class="release-date" datetime="2026-07-17">July 17, 2026</time>
+      </div>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.2.0" target="_blank" rel="noopener"><code>v1.2.0</code></a></p>
+      <div class="release-notes">
+        <h4>What's New</h4>
+        <p>Stability and accuracy release focused on transfers, search, KAD, Security/Statistics, Settings, and Library.</p>
+
+        <h5>Downloads &amp; uploads</h5>
+        <ul>
+          <li>Final hash failures can be retried instead of staying permanently failed</li>
+          <li>Stop no longer races into a false Failed state</li>
+          <li>Disk space checks use remaining bytes (large near-done resumes no longer false-flag Insufficient)</li>
+          <li>Uploads end on unique coverage; soft rejects preserve queue seniority</li>
+          <li>Pause/cancel teardown and concurrent-slot promotion hardened</li>
+          <li>Soft disk probe and startup hash timeout behavior improved</li>
+        </ul>
+
+        <h5>Sources &amp; discovery</h5>
+        <ul>
+          <li>Soft-dropped peers can re-inject; LowID callbacks flush for active downloads</li>
+          <li>Pause/resume reseeds from per-file sources; pause-offline source rows stay visible</li>
+          <li>Source counts and offer tracking corrected</li>
+        </ul>
+
+        <h5>Search</h5>
+        <ul>
+          <li>Cancel and KAD keyword results preserved across capacity eviction</li>
+          <li>Hardened filters, notes, source safety, download gating, and spam overrides</li>
+          <li>Clear Results / bulk UX races fixed; method-specific search hints improved</li>
+        </ul>
+
+        <h5>KAD &amp; network</h5>
+        <ul>
+          <li>Fail-closed IP filter no longer blocks KAD bootstrap / RT admission while ranges load</li>
+          <li>Quiet KAD timeout no longer tears down eD2K</li>
+          <li>eD2K reconnect and related filter side effects fixed</li>
+          <li>Server list / routing table no longer wiped during filter load</li>
+        </ul>
+
+        <h5>Security &amp; Statistics</h5>
+        <ul>
+          <li>IP filter Hits column tracks per-range blocks (not only the header total)</li>
+          <li><code>ranges_ready</code> shown; enable refresh/poll; fail-closed load failures visible</li>
+          <li>KAD upload overhead and status-ping wire bytes counted correctly</li>
+          <li>Fake overhead estimates removed; uptime/ratio/locale formatting cleaned up</li>
+        </ul>
+
+        <h5>Library &amp; Settings</h5>
+        <ul>
+          <li>Library Peers column updates live, clears when peers drop, and counts complete copies / KAD publish ACKs only</li>
+          <li>Internal protocol knobs and rendezvous URL removed from Settings UI</li>
+          <li>Friend session encryption forced on</li>
+          <li>Misleading obfuscation “Restart” badge removed</li>
+          <li>Database incremental auto_vacuum enabled (schema v21)</li>
+        </ul>
+
+        <h5>Friends &amp; UI</h5>
+        <ul>
+          <li>Friend connect slots / firewall rules cleared correctly; settings toggles repaired</li>
+          <li>Source drawer empty state authoritative; minor search/transfers UI polish</li>
+          <li>i18n updates across en / de / es / fr / pt-BR</li>
+        </ul>
+
+        <p class="full-changelog">
+          <strong>Full Changelog</strong>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.1.8...v1.2.0" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.1.8...v1.2.0</a>
+        </p>
+      </div>
+    </article>
+
+    <article class="release" id="release-1-1-8">
+      <div class="release-header">
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.1.8" target="_blank" rel="noopener">Ember v1.1.8</a></h3>
+        <time class="release-date" datetime="2026-07-17">July 17, 2026</time>
+      </div>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.1.8" target="_blank" rel="noopener"><code>v1.1.8</code></a></p>
+      <div class="release-notes">
+        <h4>What's Fixed / Hardened</h4>
+
+        <h5>Startup &amp; connectivity</h5>
+        <ul>
+          <li>Defer heavy network startup I/O (UPnP, ipfilter, known.met, GeoIP) so splash IPC stays responsive</li>
+          <li>Fail-close the IP filter until ranges finish loading so peers cannot slip through an empty enabled list</li>
+          <li>Fix HighID port-test / firewall sticky LowID, preferred-server auto-connect, and auto-ban edge cases</li>
+        </ul>
+
+        <h5>Transfers &amp; bandwidth</h5>
+        <ul>
+          <li>Require an upload limit for Upload Speed Sense; fix RTT throttling and single-sample USS ratchet bugs</li>
+          <li>Prevent cancelled downloads from briefly flashing red</li>
+        </ul>
+
+        <h5>Persistence &amp; sharing</h5>
+        <ul>
+          <li>Prevent silent friend-loss, disk-full state wipes, settings resets, orphaned KAD searches, and share/indexer leaks</li>
+          <li>Harden related UI races and friend-connect proof-of-possession test mocks</li>
+        </ul>
+
+        <p class="full-changelog">
+          <strong>Full Changelog</strong>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.1.7...v1.1.8" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.1.7...v1.1.8</a>
+        </p>
+      </div>
+    </article>
 
     <article class="release" id="release-1-1-7">
       <div class="release-header">
