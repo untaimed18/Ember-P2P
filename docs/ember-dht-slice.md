@@ -446,10 +446,10 @@ and `ember_native_enabled: true` in each `config.json`:
    signed `FIREWALLED` source records; storers exempt those sources from
    IP anti-reflection. DNS seed list (slice 12) remains deferred.
 3. ~~Multi-keyword DHT intersection on the wire.~~ **Done** — FIND_VALUE
-   carries secondary keyword hashes; peers that hold **all** requested keys
-   filter primary records by `file_hash` intersection (missing a secondary
-   yields `FOUND_NODE` so the searcher keeps walking). Filename AND remains a
-   defense-in-depth filter at emit time.
+   carries secondary keyword hashes; peers that also hold those keys filter
+   primary records by `file_hash` intersection (missing secondaries are
+   skipped — sparse DHT locality). Filename AND remains the cross-key
+   filter at emit time.
 4. ~~Diagnostic UI + richer stats (slices 16–17).~~ **Done** — `/ember`
    shows contacts, in-flight searches, local store, and hit/miss /
    replication counters.

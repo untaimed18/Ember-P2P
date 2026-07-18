@@ -608,10 +608,10 @@ impl EmberDht {
             DhtPayload::FindValue { keys } => {
                 out.find_value_received = true;
                 // Multi-keyword wire intersection (when `keys.len() > 1`):
-                // serve primary-key (`keys[0]`) records whose `file_hash`
-                // appears under every secondary key, but only when we hold
-                // all requested keys locally. Otherwise FOUND_NODE so the
-                // searcher keeps walking toward peers that can apply AND.
+                // serve primary-key (`keys[0]`) records; when this node also
+                // holds secondary keys, filter by `file_hash` intersection.
+                // Missing secondaries are skipped (sparse DHT locality) —
+                // filename AND at emit remains the cross-key filter.
                 if let Some((primary, blobs)) = intersect_find_value_records(&self.store, &keys) {
                     out.find_value_hit = true;
                     let fv = messages::build_found_value(
@@ -667,14 +667,15 @@ fn file_hash_from_record_data(data: &[u8]) -> Option<[u8; 16]> {
 }
 
 /// Multi-keyword FIND_VALUE answer: primary-key blobs whose `file_hash`
-/// appears under every secondary key.
+/// appears under every secondary key this node also holds.
 ///
-/// For multi-key queries we only return `FOUND_VALUE` when this node
-/// holds **every** requested key and the `file_hash` intersection is
-/// non-empty. Missing a secondary (common on a sparse DHT — those keys
-/// live near different IDs) yields `None` so the caller sends
-/// `FOUND_NODE` and the searcher keeps walking. Single-key queries are
-/// unchanged (serve all live primary records).
+/// Secondary keywords live near different IDs on a sparse DHT, so the
+/// peer closest to the primary often holds none of the extras. Missing
+/// secondaries are skipped (not treated as empty intersection) so we
+/// still serve primary hits; the searcher applies filename AND at emit
+/// as defense-in-depth. When we *do* hold one or more secondaries, we
+/// filter by `file_hash` intersection. Empty intersection → `None`
+/// (`FOUND_NODE`). Single-key queries serve all live primary records.
 fn intersect_find_value_records(
     store: &DhtStore,
     keys: &[[u8; 16]],
@@ -685,34 +686,32 @@ fn intersect_find_value_records(
         return None;
     }
 
-    let filtered: Vec<&_> = if keys.len() == 1 {
-        primary_recs
-    } else {
-        let mut allowed: Option<HashSet<[u8; 16]>> = None;
-        for key in keys.iter().skip(1) {
-            let secondary = store.get_live(key);
-            // Strict AND: any secondary we do not hold → FOUND_NODE.
-            if secondary.is_empty() {
-                return None;
-            }
-            let hashes: HashSet<[u8; 16]> = secondary
-                .iter()
-                .filter_map(|r| file_hash_from_record_data(&r.data))
-                .collect();
-            allowed = Some(match allowed {
-                None => hashes,
-                Some(prev) => prev.intersection(&hashes).copied().collect(),
-            });
+    let mut allowed: Option<HashSet<[u8; 16]>> = None;
+    for key in keys.iter().skip(1) {
+        let secondary = store.get_live(key);
+        if secondary.is_empty() {
+            continue;
         }
-        let set = allowed?;
-        primary_recs
+        let hashes: HashSet<[u8; 16]> = secondary
+            .iter()
+            .filter_map(|r| file_hash_from_record_data(&r.data))
+            .collect();
+        allowed = Some(match allowed {
+            None => hashes,
+            Some(prev) => prev.intersection(&hashes).copied().collect(),
+        });
+    }
+
+    let filtered: Vec<&_> = match &allowed {
+        None => primary_recs,
+        Some(set) => primary_recs
             .into_iter()
             .filter(|r| {
                 file_hash_from_record_data(&r.data)
                     .map(|h| set.contains(&h))
                     .unwrap_or(false)
             })
-            .collect()
+            .collect(),
     };
 
     // Applied an AND and nothing survived → FOUND_NODE so the searcher
@@ -928,6 +927,35 @@ mod tests {
         let parsed = SignedRecord::from_value_blob(&blobs[0]).unwrap();
         assert_eq!(parsed.file_hash, both);
         assert_eq!(parsed.file_name, "ubuntu-server.iso");
+    }
+
+    #[test]
+    fn find_value_serves_primary_when_secondary_not_held() {
+        // Sparse DHT: peer near "ubuntu" does not hold "server". It must
+        // still return primary hits (filename AND filters at the searcher).
+        let mut a = dht(33);
+        let mut b = dht(34);
+        let a_noise = [0xAA; 32];
+        let b_noise = [0xBB; 32];
+        let a_addr = addr(33, 4672);
+        let b_addr = addr(34, 4672);
+
+        let rec = a.build_keyword_record("ubuntu", [9u8; 16], [0u8; 32], 10, "ubuntu.iso");
+        let (_rid, store_bytes) =
+            a.build_store(rec.keyword_hash, rec.data.clone(), rec.signature);
+        assert!(b.handle_message(&store_bytes, a_addr, a_noise, 1000).stored_record);
+
+        let secondary = a.build_keyword_record("server", [9u8; 16], [0u8; 32], 10, "ubuntu.iso");
+        let (_frid, find_bytes) =
+            a.build_find_value(vec![rec.keyword_hash, secondary.keyword_hash]);
+        let on_b = b.handle_message(&find_bytes, a_addr, a_noise, 1001);
+        assert!(
+            on_b.find_value_hit,
+            "missing secondary must not suppress primary FOUND_VALUE"
+        );
+        let on_a = a.handle_message(&on_b.responses[0], b_addr, b_noise, 1002);
+        let (_rid, blobs) = on_a.found_value.expect("FOUND_VALUE");
+        assert_eq!(blobs.len(), 1);
     }
 
     fn source_contact_at(last: u8) -> SourceContact {
