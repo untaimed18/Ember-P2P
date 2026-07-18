@@ -123,6 +123,7 @@ impl DhtStore {
 
         let now = Instant::now();
         let expires_at = now + Duration::from_secs((ttl_secs - age) as u64);
+        let incoming_ember = ember_digest_from_record_data(&data);
         let record = DhtRecord {
             data,
             signature,
@@ -134,11 +135,17 @@ impl DhtStore {
 
         let records = self.entries.entry(key).or_insert_with(Vec::new);
 
-        // Deduplicate: replace if same publisher already has a record for this key
+        // Deduplicate: replace if same publisher already has a record for this key.
+        // Prefer a non-zero ember_file_hash over a later all-zero republish so
+        // pre-upgrade zero digests do not clobber a real content hash.
         if let Some(pos) = records
             .iter()
             .position(|r| r.publisher_key == publisher_key)
         {
+            let existing_ember = ember_digest_from_record_data(&records[pos].data);
+            if existing_ember != [0u8; 32] && incoming_ember == [0u8; 32] {
+                return true;
+            }
             records[pos] = record;
             return true;
         }
@@ -293,6 +300,15 @@ impl DhtStore {
             Some(bit) => bit < 127,
         }
     }
+}
+
+/// Extract the Ember BLAKE3 digests from packed record bytes (`… || ember[32] || …`).
+fn ember_digest_from_record_data(data: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    if data.len() >= 65 {
+        out.copy_from_slice(&data[33..65]);
+    }
+    out
 }
 
 /// Verify an Ed25519 signature over `data` with `publisher_key`.
@@ -529,6 +545,27 @@ mod tests {
         assert_eq!(removed, 1);
         assert_eq!(store.total_records(), 0);
         assert_eq!(store.key_count(), 0);
+    }
+
+    #[test]
+    fn prefers_nonzero_ember_over_zero_republish() {
+        let mut store = DhtStore::new();
+        let (sk, pk) = keypair();
+        let key = [7u8; 16];
+        // Packed layout: type(1) + keyword(16) + file(16) + ember(32) …
+        let mut good = vec![0u8; 65];
+        good[33..65].fill(0xAB);
+        assert!(store.store(key, good.clone(), sign(&sk, &good), pk, now_ts()));
+        let zero_ember = vec![0u8; 65];
+        assert!(store.store(
+            key,
+            zero_ember.clone(),
+            sign(&sk, &zero_ember),
+            pk,
+            now_ts()
+        ));
+        let kept = &store.get(&key).unwrap()[0].data;
+        assert_eq!(&kept[33..65], &good[33..65]);
     }
 
     #[test]

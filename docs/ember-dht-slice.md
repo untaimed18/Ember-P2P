@@ -457,4 +457,5 @@ and `ember_native_enabled: true` in each `config.json`:
    streaming BLAKE3 `ember_file_hash` at index/publish/download verify
    (including one-time rehash for pre-upgrade known.met entries); DHT
    decode caps, version-0 rejection, PONG observed-IP voting (ping-correlated;
-   confirms STUN mapping only, never sole `external_ip` authority).
+   confirms STUN when present, otherwise may set `external_ip` from votes
+   when STUN has not produced an address).

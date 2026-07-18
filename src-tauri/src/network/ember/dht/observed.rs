@@ -77,7 +77,14 @@ fn is_public_vote_addr(addr: SocketAddr) -> bool {
 fn is_public_reporter(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_public_v4(v4),
-        IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified() && !v6.is_multicast(),
+        IpAddr::V6(v6) => {
+            !v6.is_loopback()
+                && !v6.is_unspecified()
+                && !v6.is_multicast()
+                && !v6.is_unicast_link_local()
+                // Unique local addresses (fc00::/7).
+                && (v6.segments()[0] & 0xfe00) != 0xfc00
+        }
     }
 }
 
@@ -129,5 +136,21 @@ mod tests {
         let target = addr(50, 4672);
         assert!(votes.record_vote(target, reporter(10, 0, 1)).is_none());
         assert!(votes.confirmed().is_none());
+    }
+
+    #[test]
+    fn rejects_ipv6_ula_reporter() {
+        let mut votes = EmberObservedIpVotes::new();
+        let target = addr(50, 4672);
+        let ula: IpAddr = "fd12:3456:789a::1".parse().unwrap();
+        assert!(votes.record_vote(target, ula).is_none());
+    }
+
+    #[test]
+    fn rejects_ipv6_link_local_reporter() {
+        let mut votes = EmberObservedIpVotes::new();
+        let target = addr(50, 4672);
+        let link_local: IpAddr = "fe80::1".parse().unwrap();
+        assert!(votes.record_vote(target, link_local).is_none());
     }
 }

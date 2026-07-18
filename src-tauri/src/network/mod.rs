@@ -9569,13 +9569,15 @@ pub async fn start_network(
                                         .unwrap_or_default(),
                                     ember_file_hash: {
                                         // Prefer a digest verified/learned this
-                                        // session, then any prior known.met value.
-                                        let from_map = state
+                                        // session, then any prior known.met value,
+                                        // then compute BLAKE3 of the completed
+                                        // file so deep-link / paste downloads
+                                        // still get content integrity for share.
+                                        let mut ember_hex = state
                                             .ember_content_hashes
                                             .get(&fh)
                                             .filter(|d| **d != [0u8; 32])
-                                            .map(hex::encode);
-                                        from_map
+                                            .map(hex::encode)
                                             .or_else(|| {
                                                 existing.as_ref().and_then(|record| {
                                                     if record.ember_file_hash.is_empty() {
@@ -9585,7 +9587,22 @@ pub async fn start_network(
                                                     }
                                                 })
                                             })
-                                            .unwrap_or_default()
+                                            .unwrap_or_default();
+                                        if ember_hex.is_empty() {
+                                            let hash_path = completed_path.clone();
+                                            if let Ok(Ok(digest)) =
+                                                tokio::task::spawn_blocking(move || {
+                                                    crate::network::ember::crypto::blake3_hash_file_path(
+                                                        &hash_path,
+                                                    )
+                                                })
+                                                .await
+                                            {
+                                                ember_hex = hex::encode(digest);
+                                                state.ember_content_hashes.insert(fh, digest);
+                                            }
+                                        }
+                                        ember_hex
                                     },
                                     modified_at: now,
                                     all_time_transferred: existing
@@ -9621,7 +9638,7 @@ pub async fn start_network(
                                         .map(|record| record.complete_sources)
                                         .unwrap_or(0),
                                 };
-                                known_files.add_or_update(record);
+                                known_files.add_or_update(record.clone());
 
                                 // Auto-share completed download (eMule: CPartFile::PerformFileCompleteEnd)
                                 let ext = completed_path.extension()
@@ -9636,28 +9653,8 @@ pub async fn start_network(
                                     path: completed_path.to_string_lossy().to_string(),
                                     size: file_size,
                                     hash: file_hash,
-                                    aich_hash: existing
-                                        .as_ref()
-                                        .map(|record| record.aich_hash.clone())
-                                        .unwrap_or_default(),
-                                    ember_file_hash: {
-                                        let from_map = state
-                                            .ember_content_hashes
-                                            .get(&fh)
-                                            .filter(|d| **d != [0u8; 32])
-                                            .map(hex::encode);
-                                        from_map
-                                            .or_else(|| {
-                                                existing.as_ref().and_then(|record| {
-                                                    if record.ember_file_hash.is_empty() {
-                                                        None
-                                                    } else {
-                                                        Some(record.ember_file_hash.clone())
-                                                    }
-                                                })
-                                            })
-                                            .unwrap_or_default()
-                                    },
+                                    aich_hash: record.aich_hash.clone(),
+                                    ember_file_hash: record.ember_file_hash.clone(),
                                     extension: ext,
                                     modified_at: now,
                                     priority: existing
@@ -25048,8 +25045,9 @@ fn build_ember_keyword_results(blobs: &[Vec<u8>], keywords: &[String]) -> Vec<Se
         .iter()
         .max_by_key(|k| k.len())
         .map(|k| ember::dht::search::keyword_hash(k));
-    // file_hash -> (result, set of distinct publisher keys)
-    let mut dedup: HashMap<[u8; 16], (SearchResult, HashSet<[u8; 32]>)> = HashMap::new();
+    // file_hash -> (result, publisher_key -> ember digest votes)
+    let mut dedup: HashMap<[u8; 16], (SearchResult, HashMap<[u8; 32], [u8; 32]>)> =
+        HashMap::new();
 
     for blob in blobs {
         let Some(rec) = ember::dht::publish::SignedRecord::from_value_blob(blob) else {
@@ -25072,13 +25070,14 @@ fn build_ember_keyword_results(blobs: &[Vec<u8>], keywords: &[String]) -> Vec<Se
         }
 
         match dedup.get_mut(&rec.file_hash) {
-            Some((existing, publishers)) => {
-                publishers.insert(rec.publisher_key);
-                existing.availability = publishers.len() as u32;
-                // Upgrade an empty digest when a later publisher carries one.
-                if existing.file.ember_file_hash.is_empty() && rec.ember_file_hash != [0u8; 32] {
-                    existing.file.ember_file_hash = hex::encode(rec.ember_file_hash);
+            Some((existing, publisher_digests)) => {
+                if rec.ember_file_hash != [0u8; 32] {
+                    publisher_digests.insert(rec.publisher_key, rec.ember_file_hash);
+                } else {
+                    publisher_digests.entry(rec.publisher_key).or_insert([0u8; 32]);
                 }
+                existing.availability = publisher_digests.len() as u32;
+                existing.file.ember_file_hash = majority_ember_digest_hex(publisher_digests);
             }
             None => {
                 let extension = rec
@@ -25088,8 +25087,13 @@ fn build_ember_keyword_results(blobs: &[Vec<u8>], keywords: &[String]) -> Vec<Se
                     .unwrap_or_default();
                 let file_type = infer_file_type(&extension);
                 let hash_hex = hex::encode(rec.file_hash);
-                let mut publishers = HashSet::new();
-                publishers.insert(rec.publisher_key);
+                let mut publisher_digests = HashMap::new();
+                if rec.ember_file_hash != [0u8; 32] {
+                    publisher_digests.insert(rec.publisher_key, rec.ember_file_hash);
+                } else {
+                    publisher_digests.insert(rec.publisher_key, [0u8; 32]);
+                }
+                let ember_hex = majority_ember_digest_hex(&publisher_digests);
                 let sr = SearchResult {
                     file: FileInfo {
                         id: hash_hex.clone(),
@@ -25098,11 +25102,7 @@ fn build_ember_keyword_results(blobs: &[Vec<u8>], keywords: &[String]) -> Vec<Se
                         size: rec.file_size,
                         hash: hash_hex,
                         aich_hash: String::new(),
-                        ember_file_hash: if rec.ember_file_hash != [0u8; 32] {
-                            hex::encode(rec.ember_file_hash)
-                        } else {
-                            String::new()
-                        },
+                        ember_file_hash: ember_hex,
                         extension,
                         modified_at: 0,
                         priority: "normal".to_string(),
@@ -25131,12 +25131,27 @@ fn build_ember_keyword_results(blobs: &[Vec<u8>], keywords: &[String]) -> Vec<Se
                     clean_name: String::new(),
                     result_origin: crate::search::merge::ORIGIN_EMBER.to_string(),
                 };
-                dedup.insert(rec.file_hash, (sr, publishers));
+                dedup.insert(rec.file_hash, (sr, publisher_digests));
             }
         }
     }
 
     dedup.into_values().map(|(sr, _)| sr).collect()
+}
+
+/// Pick the most common non-zero Ember BLAKE3 among publishers; empty if none.
+fn majority_ember_digest_hex(publisher_digests: &HashMap<[u8; 32], [u8; 32]>) -> String {
+    let mut counts: HashMap<[u8; 32], usize> = HashMap::new();
+    for digest in publisher_digests.values() {
+        if *digest != [0u8; 32] {
+            *counts.entry(*digest).or_insert(0) += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .max_by_key(|(_, n)| *n)
+        .map(|(d, _)| hex::encode(d))
+        .unwrap_or_default()
 }
 
 /// Push a publish forward: pull the targets not yet stored on, send each
@@ -25910,7 +25925,12 @@ async fn handle_ember_dht_message(
                         debug!("Ember DHT: failed to send PROXY_STORE_ACK to {from}: {e}");
                     }
                 }
-                ember::transport::OutgoingResult::Queued => {}
+                ember::transport::OutgoingResult::Queued => {
+                    // ACK is buffered behind an in-progress Noise handshake
+                    // and will flush when the session completes — same path
+                    // as other DHT replies. Do not treat as failure.
+                    debug!("Ember DHT: PROXY_STORE_ACK to {from} queued behind handshake");
+                }
                 ember::transport::OutgoingResult::Error(e) => {
                     debug!("Ember DHT: transport error sending PROXY_STORE_ACK to {from}: {e}");
                 }
@@ -26016,17 +26036,20 @@ async fn handle_ember_dht_message(
                     .ember_observed_votes
                     .record_vote(observed, from.ip())
                 {
-                    // Never set external_ip from DHT votes alone. Only confirm
-                    // an independent STUN/NAT mapping when it already matches.
+                    // Prefer STUN corroboration. If STUN has not produced an
+                    // address yet (Ember-only / STUN failure), accept the
+                    // correlated vote majority. If STUN disagrees, ignore.
                     let stun_ip = state.nat_info.external_addr.and_then(|a| match a.ip() {
                         std::net::IpAddr::V4(v4) => Some(v4),
                         std::net::IpAddr::V6(_) => None,
                     });
                     if state.external_ip.is_none() {
-                        if let (Some(stun), std::net::IpAddr::V4(v4)) =
-                            (stun_ip, confirmed.ip())
-                        {
-                            if stun == v4 {
+                        if let std::net::IpAddr::V4(v4) = confirmed.ip() {
+                            let adopt = match stun_ip {
+                                Some(stun) => stun == v4,
+                                None => true,
+                            };
+                            if adopt {
                                 set_external_ip(state, Some(v4));
                                 state.stats.external_ip = v4.to_string();
                                 state.nat_info.external_addr = Some(confirmed);
@@ -29505,9 +29528,24 @@ async fn handle_command_inner(
         } => {
             // Seed expected BLAKE3 from search/UI so verify does not depend
             // solely on having processed an Ember keyword hit this session.
+            // Non-search starts (deep link, friend browse, collections) often
+            // omit the digest — fall back to known.met / shared library when
+            // we already hashed this file before.
             if let Ok(bytes) = hex::decode(file_hash.trim()) {
                 if let Ok(ed2k) = <[u8; 16]>::try_from(bytes.as_slice()) {
-                    let digest = parse_ember_file_hash(&ember_file_hash);
+                    let mut digest = parse_ember_file_hash(&ember_file_hash);
+                    if digest == [0u8; 32] {
+                        if let Some(rec) = known_files.find_by_hash(&ed2k) {
+                            digest = parse_ember_file_hash(&rec.ember_file_hash);
+                        }
+                    }
+                    if digest == [0u8; 32] {
+                        let hash_hex = hex::encode(ed2k);
+                        let idx = local_index.read().await;
+                        if let Some(f) = idx.get_by_hash(&hash_hex) {
+                            digest = parse_ember_file_hash(&f.ember_file_hash);
+                        }
+                    }
                     if digest != [0u8; 32] {
                         state.ember_content_hashes.insert(ed2k, digest);
                     }
