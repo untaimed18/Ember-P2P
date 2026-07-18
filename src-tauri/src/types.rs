@@ -11,6 +11,11 @@ pub struct FileInfo {
     /// AICH root hash (SHA-1 Merkle tree over 180KB blocks), hex-encoded
     #[serde(default)]
     pub aich_hash: String,
+    /// Streaming BLAKE3 of file contents (slice 18), hex-encoded. Empty when
+    /// unknown (legacy share / not yet hashed). Discovery still keys off
+    /// eD2K MD4 in [`Self::hash`].
+    #[serde(default)]
+    pub ember_file_hash: String,
     pub extension: String,
     pub modified_at: i64,
     /// Upload priority: "verylow", "low", "normal", "high", "release", "auto"
@@ -611,6 +616,15 @@ pub struct EmberDiagnostics {
     /// Average STORE replication depth this session (`replication_sum / publishes`).
     #[serde(default)]
     pub ember_dht_avg_replication: u32,
+    /// Slice 19: inbound Ember DHT frames rejected as malformed / invalid version.
+    #[serde(default)]
+    pub ember_dht_malformed: u32,
+    /// Slice 19: observed-IP votes recorded from PONG payloads.
+    #[serde(default)]
+    pub ember_dht_observed_votes: u32,
+    /// Slice 19: confirmed observed external address (`ip:port`), if any.
+    #[serde(default)]
+    pub ember_dht_observed_addr: String,
 }
 
 /// Serializable KAD contact info for the frontend (mirrors eMule KadContactListCtrl columns)

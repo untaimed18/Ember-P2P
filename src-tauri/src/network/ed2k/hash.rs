@@ -148,18 +148,14 @@ pub fn ed2k_part_hashes_file_cancellable(
 
 /// Compute both ED2K and AICH hashes in a single pass over the file,
 /// halving disk I/O compared to computing them separately.
-/// Returns (ed2k_hash_hex, aich_hash_hex, ed2k_part_hashes).
+/// Returns `(ed2k_hash_hex, aich_hash_hex, ed2k_part_hashes, ember_blake3_hex)`.
 ///
-/// `ed2k_part_hashes` is the same per-9.28MB-part MD4 digest list that
-/// [`ed2k_part_hashes_file_cancellable`] would independently recompute from
-/// disk (empty for single-part files) — this function already has to
-/// compute each part hash to derive `ed2k_hash_hex`, so returning it lets
-/// callers cache it for `known.met` instead of re-reading the whole file a
-/// second time later (see the `SharedFilesChanged` handler).
+/// `ember_blake3_hex` is the streaming BLAKE3 of the whole file (slice 18) —
+/// the Ember content integrity digest published alongside the eD2K MD4 id.
 pub fn hash_file_combined_cancellable(
     path: &Path,
     cancelled: &AtomicBool,
-) -> anyhow::Result<(String, String, Vec<[u8; 16]>)> {
+) -> anyhow::Result<(String, String, Vec<[u8; 16]>, String)> {
     use sha1::Sha1;
 
     let mut file = std::fs::File::open(path)?;
@@ -168,7 +164,8 @@ pub fn hash_file_combined_cancellable(
     if file_size == 0 {
         let ed2k = hex::encode(Md4::digest([]));
         let aich = hex::encode(<[u8; 20]>::from(Sha1::digest([])));
-        return Ok((ed2k, aich, Vec::new()));
+        let ember = hex::encode(blake3::hash(&[]).as_bytes());
+        return Ok((ed2k, aich, Vec::new(), ember));
     }
 
     let is_single_part = file_size < PARTSIZE;
@@ -191,6 +188,7 @@ pub fn hash_file_combined_cancellable(
     let mut aich_block_hasher = Sha1::new();
     let num_aich_blocks = file_size.div_ceil(aich_block_size) as usize;
     let mut aich_leaf_hashes: Vec<[u8; 20]> = Vec::with_capacity(num_aich_blocks);
+    let mut ember_hasher = crate::network::ember::crypto::Blake3FileHasher::new();
 
     let mut ed2k_part_remaining: u64 = file_size.min(PARTSIZE);
     let mut aich_block_remaining: u64 = file_size.min(aich_block_size);
@@ -207,6 +205,8 @@ pub fn hash_file_combined_cancellable(
         if n == 0 {
             anyhow::bail!("unexpected EOF: {} bytes remaining", file_remaining);
         }
+
+        ember_hasher.update(&buf[..n]);
 
         let mut offset = 0;
         while offset < n {
@@ -259,8 +259,9 @@ pub fn hash_file_combined_cancellable(
 
     let aich_root = super::aich::hierarchical_root(&aich_leaf_hashes, file_size);
     let aich_hash = hex::encode(aich_root);
+    let ember_hash = hex::encode(ember_hasher.finalize());
 
-    Ok((ed2k_hash, aich_hash, ed2k_part_hash_list))
+    Ok((ed2k_hash, aich_hash, ed2k_part_hash_list, ember_hash))
 }
 
 /// In-memory equivalent of [`ed2k_hash_file`]. Used by the
@@ -630,7 +631,7 @@ mod combined_hash_tests {
         }
 
         static NEVER: AtomicBool = AtomicBool::new(false);
-        let (_, combined_aich_hex, combined_part_hashes) =
+        let (_, combined_aich_hex, combined_part_hashes, _) =
             hash_file_combined_cancellable(&path, &NEVER).expect("combined hash");
         let hs = super::super::aich::AICHRecoveryHashSet::build_from_file(&path)
             .expect("build_from_file");

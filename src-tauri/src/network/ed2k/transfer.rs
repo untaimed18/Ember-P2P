@@ -135,6 +135,8 @@ pub struct Ed2kDownload {
     pub trusted_aich_master: Option<[u8; 20]>,
     /// GeoIP reader for country code lookups
     pub geoip: crate::geoip::GeoIpReader,
+    /// Expected Ember content BLAKE3 (slice 18). All-zero skips verify.
+    pub ember_file_hash: [u8; 32],
     /// Lock-free counter that the per-source loop bumps on every
     /// peer-to-peer Source Exchange packet (`OP_REQUESTSOURCES`,
     /// `OP_ANSWERSOURCES`, and `OP_EMBER_SOURCEEXCHANGE`) it sends
@@ -4158,27 +4160,37 @@ impl Ed2kDownload {
         // Temp-file write.
         let expected_hash = hex::encode(self.file_hash);
         let verify_path = part_path.clone();
+        let ember_expected = self.ember_file_hash;
         let verified_ok =
-            match tokio::task::spawn_blocking(move || super::hash::ed2k_hash_file(&verify_path))
-                .await
+            match tokio::task::spawn_blocking(move || {
+                let ed2k = super::hash::ed2k_hash_file(&verify_path)?;
+                if ed2k != expected_hash {
+                    anyhow::bail!("ed2k mismatch: expected={expected_hash} got={ed2k}");
+                }
+                if ember_expected != [0u8; 32] {
+                    let got = crate::network::ember::crypto::blake3_hash_file_path(&verify_path)?;
+                    if got != ember_expected {
+                        anyhow::bail!(
+                            "ember blake3 mismatch: expected={} got={}",
+                            hex::encode(ember_expected),
+                            hex::encode(got)
+                        );
+                    }
+                }
+                Ok(())
+            })
+            .await
             {
-                Ok(Ok(actual_hash)) if actual_hash == expected_hash => {
+                Ok(Ok(())) => {
                     info!(
                         "Download complete and verified from disk: {}",
                         self.file_name
                     );
                     true
                 }
-                Ok(Ok(actual_hash)) => {
-                    warn!(
-                        "Download hash mismatch for {}: expected={}, got={}",
-                        self.file_name, expected_hash, actual_hash
-                    );
-                    false
-                }
                 Ok(Err(e)) => {
                     warn!(
-                        "Could not verify hash for {}: {e} — treating as failed",
+                        "Download hash verification failed for {}: {e}",
                         self.file_name
                     );
                     false

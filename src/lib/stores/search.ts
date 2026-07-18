@@ -114,6 +114,7 @@ function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResu
       hash: incoming.file.hash || existing.file.hash,
       extension: incoming.file.extension || existing.file.extension,
       aich_hash: incoming.file.aich_hash || existing.file.aich_hash,
+      ember_file_hash: incoming.file.ember_file_hash || existing.file.ember_file_hash,
       complete_sources: Math.max(existing.file.complete_sources || 0, incoming.file.complete_sources || 0),
     },
     peer_id: existing.peer_id || incoming.peer_id,

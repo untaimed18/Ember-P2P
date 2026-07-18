@@ -564,6 +564,7 @@ pub fn run() {
                         file.id = hash.clone();
                         file.hash = hash;
                         file.aich_hash = record.aich_hash.clone();
+                        file.ember_file_hash = record.ember_file_hash.clone();
                         // Restore the per-file priority and shared/unshared
                         // choice from known.met. Without this, every cold
                         // start silently reset custom priorities to "normal"
@@ -671,6 +672,7 @@ pub fn run() {
                             ed2k_hash,
                             aich_hash,
                             part_hashes,
+                            ember_file_hash,
                             hashed_size,
                             hashed_modified_at,
                         )))) => {
@@ -679,6 +681,7 @@ pub fn run() {
                             updated.id = ed2k_hash.clone();
                             updated.hash = ed2k_hash;
                             updated.aich_hash = aich_hash;
+                            updated.ember_file_hash = ember_file_hash;
                             updated.size = hashed_size;
                             updated.modified_at = hashed_modified_at;
                             let still_shared = {

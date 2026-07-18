@@ -36,6 +36,9 @@ const FT_EMBER_UNSHARED: u8 = 0xE0;
 // of resetting to 0 until the next sync — it's a point-in-time gauge, not a
 // cumulative counter, so a fresh sync always simply overwrites it.
 const FT_EMBER_SOURCES: u8 = 0xE1;
+// Ember-only tag: streaming BLAKE3 of file contents (hex). Empty when unknown
+// (legacy known.met / not yet hashed). Discovery still keys off eD2K MD4.
+const FT_EMBER_FILE_HASH: u8 = 0xE2;
 
 const TAG_STRING: u8 = 0x02;
 const TAG_UINT32: u8 = 0x03;
@@ -54,6 +57,8 @@ pub struct KnownFileRecord {
     pub file_size: u64,
     pub file_path: String,
     pub aich_hash: String,
+    /// Streaming BLAKE3 of file contents (hex). Empty when unknown.
+    pub ember_file_hash: String,
     pub modified_at: i64,
     pub all_time_transferred: u64,
     pub all_time_requested: u32,
@@ -262,6 +267,7 @@ impl KnownFileList {
             file_size: 0,
             file_path: String::new(),
             aich_hash: String::new(),
+            ember_file_hash: String::new(),
             modified_at,
             all_time_transferred: 0,
             all_time_requested: 0,
@@ -311,6 +317,7 @@ impl KnownFileList {
                     match name_id {
                         FT_FILENAME => record.file_name = s,
                         FT_AICH_HASH => record.aich_hash = normalize_aich_hash(&s),
+                        FT_EMBER_FILE_HASH => record.ember_file_hash = s,
                         _ => {}
                     }
                 }
@@ -383,6 +390,7 @@ impl KnownFileList {
                     match name_id {
                         FT_FILENAME => record.file_name = s,
                         FT_AICH_HASH => record.aich_hash = normalize_aich_hash(&s),
+                        FT_EMBER_FILE_HASH => record.ember_file_hash = s,
                         _ => {}
                     }
                 }
@@ -642,6 +650,10 @@ impl KnownFileList {
                 let wire_aich = aich_hex_to_base32(&record.aich_hash)
                     .unwrap_or_else(|| record.aich_hash.clone());
                 write_string_tag(&mut tags, FT_AICH_HASH, &wire_aich)?;
+                tag_count += 1;
+            }
+            if !record.ember_file_hash.is_empty() {
+                write_string_tag(&mut tags, FT_EMBER_FILE_HASH, &record.ember_file_hash)?;
                 tag_count += 1;
             }
             if record.all_time_transferred > 0 {
@@ -1127,6 +1139,8 @@ mod tests {
             file_size: 1024 * 1024,
             file_path: "C:/Library/movie.mkv".to_string(),
             aich_hash: "aichaichaichaichaichaichaichaichaichaich".to_string(),
+            ember_file_hash: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+                .to_string(),
             modified_at: 1_700_000_000,
             all_time_transferred: 0,
             all_time_requested: 0,

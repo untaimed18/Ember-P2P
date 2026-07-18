@@ -1,6 +1,7 @@
 pub mod bootstrap;
 pub mod engine;
 pub mod messages;
+pub mod observed;
 pub mod protection;
 pub mod publish;
 pub mod routing;

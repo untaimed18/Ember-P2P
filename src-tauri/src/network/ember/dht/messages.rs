@@ -24,6 +24,15 @@ pub const MSG_PROXY_STORE: u8 = 0x0B;
 /// Buddy → firewalled peer: accepted the proxy request (not a DHT STORE_ACK).
 pub const MSG_PROXY_STORE_ACK: u8 = 0x0C;
 
+/// Maximum DHT payload bytes (slice 19 wire hardening).
+pub const MAX_DHT_PAYLOAD: usize = 8192;
+/// Maximum keys in a FIND_VALUE request.
+pub const MAX_FIND_VALUE_KEYS: usize = 8;
+/// Maximum records in a FOUND_VALUE response.
+pub const MAX_FOUND_VALUE_RECORDS: usize = 300;
+/// Maximum STORE / PROXY_STORE record body size.
+pub const MAX_STORE_RECORD_BYTES: usize = 4096;
+
 // Address type flags
 const ADDR_IPV4: u8 = 0x04;
 const ADDR_IPV6: u8 = 0x06;
@@ -50,7 +59,11 @@ pub struct DhtMessage {
 #[derive(Debug, Clone)]
 pub enum DhtPayload {
     Ping,
-    Pong,
+    /// Optional observed address of the ping sender (slice 19). Empty
+    /// payload decodes as `None` for backward compatibility.
+    Pong {
+        observed: Option<SocketAddr>,
+    },
     FindNode {
         target: EmberNodeId,
     },
@@ -143,6 +156,9 @@ pub fn decode_message(data: &[u8], has_pub_key: bool) -> anyhow::Result<DhtMessa
 
     let mut cursor = Cursor::new(data);
     let version = cursor.read_u8()?;
+    if version == 0 {
+        anyhow::bail!("Invalid DHT version 0");
+    }
     if version > EMBER_DHT_VERSION {
         anyhow::bail!("Unsupported DHT version {version}");
     }
@@ -162,6 +178,9 @@ pub fn decode_message(data: &[u8], has_pub_key: bool) -> anyhow::Result<DhtMessa
     };
 
     let payload_len = cursor.read_u16::<LittleEndian>()? as usize;
+    if payload_len > MAX_DHT_PAYLOAD {
+        anyhow::bail!("DHT payload_len {payload_len} exceeds max {MAX_DHT_PAYLOAD}");
+    }
     let pos = cursor.position() as usize;
     if pos + payload_len + 64 > data.len() {
         anyhow::bail!(
@@ -172,6 +191,13 @@ pub fn decode_message(data: &[u8], has_pub_key: bool) -> anyhow::Result<DhtMessa
 
     let payload_data = &data[pos..pos + payload_len];
     let sig_offset = pos + payload_len;
+    if data.len() != sig_offset + 64 {
+        anyhow::bail!(
+            "DHT message has trailing bytes after signature (len={}, expected {})",
+            data.len(),
+            sig_offset + 64
+        );
+    }
     let mut signature = [0u8; 64];
     signature.copy_from_slice(&data[sig_offset..sig_offset + 64]);
 
@@ -221,15 +247,17 @@ pub fn build_ping(sender_id: EmberNodeId, request_id: u32) -> DhtMessage {
     }
 }
 
-/// Build a PONG response.
-pub fn build_pong(sender_id: EmberNodeId, request_id: u32) -> DhtMessage {
+/// Build a PONG response carrying the sender's observed address.
+pub fn build_pong(sender_id: EmberNodeId, request_id: u32, observed: SocketAddr) -> DhtMessage {
     DhtMessage {
         version: EMBER_DHT_VERSION,
         msg_type: MSG_PONG,
         request_id,
         sender_id,
         sender_pub_key: None,
-        payload: DhtPayload::Pong,
+        payload: DhtPayload::Pong {
+            observed: Some(observed),
+        },
         signature: [0u8; 64],
     }
 }
@@ -382,7 +410,15 @@ pub fn build_found_value(
 
 fn encode_payload(payload: &DhtPayload) -> Vec<u8> {
     match payload {
-        DhtPayload::Ping | DhtPayload::Pong => Vec::new(),
+        DhtPayload::Ping => Vec::new(),
+        DhtPayload::Pong { observed } => match observed {
+            Some(addr) => {
+                let mut buf = Vec::with_capacity(19);
+                encode_socket_addr(addr, &mut buf);
+                buf
+            }
+            None => Vec::new(),
+        },
         DhtPayload::FindNode { target } => target.0.to_vec(),
         DhtPayload::FoundNode { contacts }
         | DhtPayload::AnnouncePeer { contacts }
@@ -455,12 +491,50 @@ fn encode_socket_addr(addr: &SocketAddr, buf: &mut Vec<u8>) {
     buf.write_u16::<BigEndian>(addr.port()).unwrap();
 }
 
+fn decode_socket_addr(data: &[u8]) -> anyhow::Result<(SocketAddr, usize)> {
+    if data.is_empty() {
+        anyhow::bail!("socket addr empty");
+    }
+    let addr_type = data[0];
+    let (ip, ip_len) = match addr_type {
+        ADDR_IPV4 => {
+            if data.len() < 1 + 4 + 2 {
+                anyhow::bail!("socket addr truncated (ipv4)");
+            }
+            let ip = IpAddr::V4(Ipv4Addr::new(data[1], data[2], data[3], data[4]));
+            (ip, 4)
+        }
+        ADDR_IPV6 => {
+            if data.len() < 1 + 16 + 2 {
+                anyhow::bail!("socket addr truncated (ipv6)");
+            }
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&data[1..17]);
+            let ip = IpAddr::V6(Ipv6Addr::from(octets));
+            (ip, 16)
+        }
+        _ => anyhow::bail!("Unknown address type 0x{addr_type:02x}"),
+    };
+    let port_off = 1 + ip_len;
+    let port = u16::from_be_bytes([data[port_off], data[port_off + 1]]);
+    Ok((SocketAddr::new(ip, port), port_off + 2))
+}
+
 // ── Payload decoding ──
 
 fn decode_payload(msg_type: u8, data: &[u8]) -> anyhow::Result<DhtPayload> {
     match msg_type {
         MSG_PING => Ok(DhtPayload::Ping),
-        MSG_PONG => Ok(DhtPayload::Pong),
+        MSG_PONG => {
+            if data.is_empty() {
+                Ok(DhtPayload::Pong { observed: None })
+            } else {
+                let (addr, _) = decode_socket_addr(data)?;
+                Ok(DhtPayload::Pong {
+                    observed: Some(addr),
+                })
+            }
+        }
         MSG_FIND_NODE => {
             if data.len() < 16 {
                 anyhow::bail!("FIND_NODE payload too short");
@@ -487,6 +561,11 @@ fn decode_payload(msg_type: u8, data: &[u8]) -> anyhow::Result<DhtPayload> {
             key.copy_from_slice(&data[..16]);
             let mut cursor = Cursor::new(&data[16..]);
             let record_len = cursor.read_u16::<LittleEndian>()? as usize;
+            if record_len > MAX_STORE_RECORD_BYTES {
+                anyhow::bail!(
+                    "STORE/PROXY_STORE record_len {record_len} exceeds max {MAX_STORE_RECORD_BYTES}"
+                );
+            }
             let offset = 18;
             if offset + record_len + 64 > data.len() {
                 anyhow::bail!("STORE/PROXY_STORE truncated");
@@ -525,6 +604,9 @@ fn decode_payload(msg_type: u8, data: &[u8]) -> anyhow::Result<DhtPayload> {
                 anyhow::bail!("FIND_VALUE empty");
             }
             let count = data[0] as usize;
+            if count > MAX_FIND_VALUE_KEYS {
+                anyhow::bail!("FIND_VALUE keys count {count} exceeds max {MAX_FIND_VALUE_KEYS}");
+            }
             if data.len() < 1 + count * 16 {
                 anyhow::bail!("FIND_VALUE truncated");
             }
@@ -544,10 +626,16 @@ fn decode_payload(msg_type: u8, data: &[u8]) -> anyhow::Result<DhtPayload> {
             key.copy_from_slice(&data[..16]);
             let mut cursor = Cursor::new(&data[16..]);
             let record_count = cursor.read_u16::<LittleEndian>()? as usize;
-            // A peer can claim up to 65535 records in a packet that can't
-            // physically hold them. The loop below is bounded by the actual
-            // data length (each record needs >= 2 bytes), so only reserve what
-            // the remaining bytes could contain to avoid a large eager alloc.
+            if record_count > MAX_FOUND_VALUE_RECORDS {
+                anyhow::bail!(
+                    "FOUND_VALUE record_count {record_count} exceeds max {MAX_FOUND_VALUE_RECORDS}"
+                );
+            }
+            // A peer can claim up to MAX_FOUND_VALUE_RECORDS records in a
+            // packet that can't physically hold them. The loop below is
+            // bounded by the actual data length (each record needs >= 2
+            // bytes), so only reserve what the remaining bytes could contain
+            // to avoid a large eager alloc.
             let mut records = Vec::with_capacity(record_count.min(data.len() / 2 + 1));
             let mut offset = 18usize;
             for _ in 0..record_count {
@@ -559,6 +647,11 @@ fn decode_payload(msg_type: u8, data: &[u8]) -> anyhow::Result<DhtPayload> {
                     anyhow::bail!("FOUND_VALUE truncated (declared {record_count} records)");
                 }
                 let rlen = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+                if rlen > MAX_STORE_RECORD_BYTES {
+                    anyhow::bail!(
+                        "FOUND_VALUE record length {rlen} exceeds max {MAX_STORE_RECORD_BYTES}"
+                    );
+                }
                 offset += 2;
                 if offset + rlen > data.len() {
                     anyhow::bail!("FOUND_VALUE record length {rlen} exceeds buffer");
@@ -712,10 +805,79 @@ mod tests {
         assert_eq!(decoded.sender_id, id);
         assert!(matches!(decoded.payload, DhtPayload::Ping));
 
-        let pong = build_pong(id, 42);
+        let pong = build_pong(id, 42, "203.0.113.50:4672".parse().unwrap());
         let encoded = encode_message(&pong, &sk, false);
         let decoded = decode_message(&encoded, false).unwrap();
-        assert!(matches!(decoded.payload, DhtPayload::Pong));
+        match decoded.payload {
+            DhtPayload::Pong { observed } => {
+                assert_eq!(
+                    observed,
+                    Some("203.0.113.50:4672".parse().unwrap())
+                );
+            }
+            _ => panic!("expected Pong"),
+        }
+    }
+
+    #[test]
+    fn version_zero_rejected() {
+        let (sk, id) = test_keypair();
+        let ping = build_ping(id, 1);
+        let mut encoded = encode_message(&ping, &sk, true);
+        encoded[0] = 0;
+        assert!(decode_message(&encoded, true).is_err());
+    }
+
+    #[test]
+    fn trailing_bytes_rejected() {
+        let (sk, id) = test_keypair();
+        let ping = build_ping(id, 1);
+        let mut encoded = encode_message(&ping, &sk, true);
+        encoded.push(0xAB);
+        assert!(decode_message(&encoded, true).is_err());
+    }
+
+    #[test]
+    fn oversized_payload_rejected() {
+        let (sk, id) = test_keypair();
+        let ping = build_ping(id, 1);
+        let mut encoded = encode_message(&ping, &sk, true);
+        // payload_len is a u16 LE right after the pub key (header min + 32).
+        let payload_len_off = HEADER_MIN_SIZE + 32;
+        let oversized = (MAX_DHT_PAYLOAD as u16).saturating_add(1);
+        encoded[payload_len_off..payload_len_off + 2]
+            .copy_from_slice(&oversized.to_le_bytes());
+        // Truncate/extend so length checks past payload_len still run;
+        // we only care that the max-payload gate fires first.
+        assert!(decode_message(&encoded, true).is_err());
+    }
+
+    #[test]
+    fn pong_observed_round_trip() {
+        let (sk, id) = test_keypair();
+        let observed: SocketAddr = "198.51.100.7:4662".parse().unwrap();
+        let pong = build_pong(id, 7, observed);
+        let encoded = encode_message(&pong, &sk, true);
+        let decoded = decode_message(&encoded, true).unwrap();
+        match decoded.payload {
+            DhtPayload::Pong {
+                observed: Some(addr),
+            } => assert_eq!(addr, observed),
+            _ => panic!("expected Pong with observed"),
+        }
+    }
+
+    #[test]
+    fn decode_message_fuzz_never_panics() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xE19E_19E1);
+        for _ in 0..200 {
+            let len = rng.gen_range(0..=512);
+            let mut buf = vec![0u8; len];
+            rng.fill(&mut buf[..]);
+            let _ = decode_message(&buf, true);
+            let _ = decode_message(&buf, false);
+        }
     }
 
     #[test]

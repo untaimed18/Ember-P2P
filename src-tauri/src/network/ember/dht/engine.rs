@@ -48,6 +48,8 @@ pub struct DhtInbound {
     /// For a `PONG`, the `request_id` it answered (so the caller can
     /// resolve a pending-ping waiter and compute RTT).
     pub pong_request_id: Option<u32>,
+    /// Observed address echoed in a `PONG` payload (slice 19), if present.
+    pub pong_observed: Option<SocketAddr>,
     /// The frame was a `FIND_NODE` we answered with a `FOUND_NODE`.
     pub find_node_received: bool,
     /// For a `FOUND_NODE`, the `request_id` it answered plus the
@@ -453,13 +455,14 @@ impl EmberDht {
         match msg.payload {
             DhtPayload::Ping => {
                 out.ping_received = true;
-                let pong = messages::build_pong(self.local_id, msg.request_id);
+                let pong = messages::build_pong(self.local_id, msg.request_id, from);
                 out.responses
                     .push(messages::encode_message(&pong, &self.signing_key, true));
             }
-            DhtPayload::Pong => {
+            DhtPayload::Pong { observed } => {
                 out.pong_received = true;
                 out.pong_request_id = Some(msg.request_id);
+                out.pong_observed = observed;
                 // The PONG proves liveness; refresh the contact's
                 // bucket position so it isn't evicted as stale.
                 self.routing.mark_alive(&msg.sender_id);
@@ -759,6 +762,11 @@ mod tests {
             on_a.pong_request_id,
             Some(rid),
             "PONG must echo A's request id"
+        );
+        assert_eq!(
+            on_a.pong_observed,
+            Some(a_addr),
+            "PONG must echo the observed sender addr"
         );
         assert!(on_a.learned_contact, "A should learn B");
         assert_eq!(a.contact_count(), 1);

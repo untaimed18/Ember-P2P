@@ -865,6 +865,8 @@ pub struct MultiSourceDownload {
     pub geoip: crate::geoip::GeoIpReader,
     /// Shared registry so the shutdown path can save our tracker
     pub tracker_registry: Option<SharedTrackerRegistry>,
+    /// Expected Ember content BLAKE3 (slice 18). All-zero skips verify.
+    pub ember_file_hash: [u8; 32],
     /// Lock-free counter the per-source workers bump on every
     /// peer-to-peer Source Exchange packet they send or receive.
     /// Drained on the network loop's stats tick into the
@@ -3451,28 +3453,36 @@ impl MultiSourceDownload {
             // the bytes currently on disk diverged from the verified state.
             let expected = hex::encode(self.file_hash);
             let verify_path = part_path.clone();
+            let ember_expected = self.ember_file_hash;
             let verified_ok = match tokio::task::spawn_blocking(move || {
-                super::hash::ed2k_hash_file(&verify_path)
+                let ed2k = super::hash::ed2k_hash_file(&verify_path)?;
+                if ed2k != expected {
+                    anyhow::bail!("ed2k mismatch: expected={expected} got={ed2k}");
+                }
+                if ember_expected != [0u8; 32] {
+                    let got = crate::network::ember::crypto::blake3_hash_file_path(&verify_path)?;
+                    if got != ember_expected {
+                        anyhow::bail!(
+                            "ember blake3 mismatch: expected={} got={}",
+                            hex::encode(ember_expected),
+                            hex::encode(got)
+                        );
+                    }
+                }
+                Ok(())
             })
             .await
             {
-                Ok(Ok(actual)) if actual == expected => {
+                Ok(Ok(())) => {
                     info!(
                         "Multi-source download complete and verified from disk: {}",
                         self.file_name
                     );
                     true
                 }
-                Ok(Ok(actual)) => {
-                    warn!(
-                        "Multi-source download hash mismatch for {}: expected={}, got={}",
-                        self.file_name, expected, actual
-                    );
-                    false
-                }
                 Ok(Err(e)) => {
                     warn!(
-                        "Could not verify hash for {}: {e} — treating as failed",
+                        "Multi-source download hash verification failed for {}: {e}",
                         self.file_name
                     );
                     false

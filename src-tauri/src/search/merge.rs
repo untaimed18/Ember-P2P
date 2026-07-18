@@ -273,6 +273,7 @@ mod tests {
                 size: 1,
                 hash: hash.into(),
                 aich_hash: String::new(),
+                ember_file_hash: String::new(),
                 extension: "bin".into(),
                 modified_at: 0,
                 priority: "normal".into(),

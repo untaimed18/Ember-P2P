@@ -76,20 +76,17 @@ pub fn signing_key_from_bytes(bytes: &[u8; 32]) -> SigningKey {
 
 /// Compute the BLAKE3 hash of a file's contents, returning the 32-byte digest.
 ///
-/// This is the "Ember file hash" used for file identification on the Ember
-/// network (alongside the legacy ed2k MD4 hash for KAD/ED2K interop).
-#[allow(dead_code)]
+/// This is the "Ember file hash" used for content integrity on the Ember
+/// network (alongside the legacy ed2k MD4 hash for KAD/ED2K discovery).
 pub fn blake3_hash_file(data: &[u8]) -> [u8; 32] {
     *blake3::hash(data).as_bytes()
 }
 
 /// Incremental BLAKE3 hasher for large files that cannot be loaded into memory.
-#[allow(dead_code)]
 pub struct Blake3FileHasher {
     hasher: blake3::Hasher,
 }
 
-#[allow(dead_code)]
 impl Blake3FileHasher {
     pub fn new() -> Self {
         Self {
@@ -104,6 +101,23 @@ impl Blake3FileHasher {
     pub fn finalize(self) -> [u8; 32] {
         *self.hasher.finalize().as_bytes()
     }
+}
+
+/// Streaming BLAKE3 of a file on disk (slice 18). Returns hex for storage
+/// on `FileInfo` / `known.met`.
+pub fn blake3_hash_file_path(path: &std::path::Path) -> anyhow::Result<[u8; 32]> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Blake3FileHasher::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize())
 }
 
 #[cfg(test)]

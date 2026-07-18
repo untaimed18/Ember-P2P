@@ -5,6 +5,7 @@ export interface FileInfo {
   size: number;
   hash: string;
   aich_hash: string;
+  ember_file_hash: string;
   extension: string;
   modified_at: number;
   priority: 'verylow' | 'low' | 'normal' | 'high' | 'release' | 'auto';
@@ -315,6 +316,12 @@ export interface EmberDiagnostics {
   ember_dht_publishes_completed: number;
   /** Average STORE replication depth (acks per finished publish). */
   ember_dht_avg_replication: number;
+  /** Slice 19: inbound frames rejected as malformed / bad version. */
+  ember_dht_malformed: number;
+  /** Slice 19: observed-IP votes recorded from PONG payloads. */
+  ember_dht_observed_votes: number;
+  /** Slice 19: confirmed observed external address (`ip:port`), if any. */
+  ember_dht_observed_addr?: string;
 }
 
 /** Result of an `ember_ping_peer` harness round-trip. `rtt_ms` is set

@@ -1979,6 +1979,7 @@ mod tests {
                 size: 1234,
                 hash: hash.to_string(),
                 aich_hash: String::new(),
+                ember_file_hash: String::new(),
                 extension: "bin".to_string(),
                 modified_at: 0,
                 priority: "normal".to_string(),
@@ -4375,6 +4376,10 @@ struct NetworkState {
     ember_dht: ember::dht::engine::EmberDht,
     /// Slice 14: per-IP Ember DHT rate limits.
     ember_dht_protection: ember::dht::protection::DhtProtection,
+    /// Slice 19: observed-IP voting from PONG payloads (NAT self-discovery).
+    ember_observed_votes: ember::dht::observed::EmberObservedIpVotes,
+    /// Expected Ember BLAKE3 digests learned from DHT records (ed2k -> blake3).
+    ember_content_hashes: HashMap<[u8; 16], [u8; 32]>,
     /// Pending Ember DHT `PING` requests awaiting a `PONG`, keyed by the
     /// wire `request_id`. Mirrors `ember_pending_pings` (the control
     /// ping map) and is bounded by `MAX_EMBER_PENDING_PINGS`.
@@ -4683,6 +4688,18 @@ fn parse_ed2k_hash16(hash_hex: &str) -> Option<[u8; 16]> {
     let mut h = [0u8; 16];
     h.copy_from_slice(&bytes[..16]);
     Some(h)
+}
+
+/// Parse a hex-encoded Ember content BLAKE3 (`FileInfo::ember_file_hash`) to
+/// 32 bytes. Invalid or empty input yields zeros (legacy / not-yet-hashed).
+fn parse_ember_file_hash(hash_hex: &str) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    if let Ok(bytes) = hex::decode(hash_hex) {
+        if bytes.len() == 32 {
+            out.copy_from_slice(&bytes);
+        }
+    }
+    out
 }
 
 /// Set Library KAD / eD2K badges from real publish/offer state, not mere connectivity.
@@ -5986,6 +6003,7 @@ async fn try_start_pending_download_from_known_sources(
         external_ip: state.external_ip,
         aich_pending: Some(state.aich_recovery_pending.clone()),
         trusted_aich_master: state.aich_root_map.get(&hash_bytes).copied(),
+                                ember_file_hash: state.ember_content_hashes.get(&hash_bytes).copied().unwrap_or([0u8; 32]),
         geoip: geoip.clone(),
         tracker_registry: Some(state.tracker_registry.clone()),
         sx_overhead: sx_overhead.clone(),
@@ -7435,6 +7453,8 @@ pub async fn start_network(
         ember_pending_pings: HashMap::new(),
         ember_dht: ember::dht::engine::EmberDht::new(identity.ed25519_secret_key),
         ember_dht_protection: ember::dht::protection::DhtProtection::new(),
+        ember_observed_votes: ember::dht::observed::EmberObservedIpVotes::new(),
+        ember_content_hashes: HashMap::new(),
         ember_dht_pending_pings: HashMap::new(),
         ember_dht_pending_finds: HashMap::new(),
         ember_search: ember::dht::search::SearchManager::new(),
@@ -9543,6 +9563,10 @@ pub async fn start_network(
                                         .as_ref()
                                         .map(|record| record.aich_hash.clone())
                                         .unwrap_or_default(),
+                                    ember_file_hash: existing
+                                        .as_ref()
+                                        .map(|record| record.ember_file_hash.clone())
+                                        .unwrap_or_default(),
                                     modified_at: now,
                                     all_time_transferred: existing
                                         .as_ref()
@@ -9595,6 +9619,10 @@ pub async fn start_network(
                                     aich_hash: existing
                                         .as_ref()
                                         .map(|record| record.aich_hash.clone())
+                                        .unwrap_or_default(),
+                                    ember_file_hash: existing
+                                        .as_ref()
+                                        .map(|record| record.ember_file_hash.clone())
                                         .unwrap_or_default(),
                                     extension: ext,
                                     modified_at: now,
@@ -13124,6 +13152,7 @@ pub async fn start_network(
                                         external_ip: state.external_ip,
                                         aich_pending: Some(state.aich_recovery_pending.clone()),
                                         trusted_aich_master: state.aich_root_map.get(&hash_bytes).copied(),
+                                ember_file_hash: state.ember_content_hashes.get(&hash_bytes).copied().unwrap_or([0u8; 32]),
                                         geoip: geoip.clone(),
                                         tracker_registry: Some(state.tracker_registry.clone()),
                                         sx_overhead: stats_manager.sx_counters.clone(),
@@ -17234,6 +17263,7 @@ pub async fn start_network(
                             external_ip: state.external_ip,
                             aich_pending: Some(state.aich_recovery_pending.clone()),
                             trusted_aich_master: state.aich_root_map.get(&hash_bytes).copied(),
+                                ember_file_hash: state.ember_content_hashes.get(&hash_bytes).copied().unwrap_or([0u8; 32]),
                             geoip: geoip.clone(),
                             tracker_registry: Some(state.tracker_registry.clone()),
                             sx_overhead: stats_manager.sx_counters.clone(),
@@ -17448,6 +17478,7 @@ pub async fn start_network(
                             external_ip: state.external_ip,
                             aich_pending: Some(state.aich_recovery_pending.clone()),
                             trusted_aich_master: state.aich_root_map.get(&hash_bytes).copied(),
+                                ember_file_hash: state.ember_content_hashes.get(&hash_bytes).copied().unwrap_or([0u8; 32]),
                             geoip: geoip.clone(),
                             tracker_registry: Some(state.tracker_registry.clone()),
                             sx_overhead: stats_manager.sx_counters.clone(),
@@ -18607,6 +18638,7 @@ pub async fn start_network(
                                                 size: sr.file_size,
                                                 hash: hash_hex,
                                                 aich_hash: String::new(),
+                                                ember_file_hash: String::new(),
                                                 extension: extension.clone(),
                                                 modified_at: 0,
                                                 priority: "normal".to_string(),
@@ -20029,6 +20061,7 @@ pub async fn start_network(
                                             size: sr.file_size,
                                             hash: hash_hex,
                                             aich_hash: String::new(),
+                                            ember_file_hash: String::new(),
                                             extension: extension.clone(),
                                             modified_at: 0,
                                             priority: "normal".to_string(),
@@ -20722,6 +20755,11 @@ pub async fn start_network(
                                     external_ip: state.external_ip,
                                     aich_pending: Some(state.aich_recovery_pending.clone()),
                                     trusted_aich_master: state.aich_root_map.get(&file_hash).copied(),
+                                    ember_file_hash: state
+                                        .ember_content_hashes
+                                        .get(&file_hash)
+                                        .copied()
+                                        .unwrap_or([0u8; 32]),
                                     geoip: geoip.clone(),
                                     tracker_registry: Some(state.tracker_registry.clone()),
                                     sx_overhead: stats_manager.sx_counters.clone(),
@@ -21006,6 +21044,7 @@ pub async fn start_network(
                                 external_ip: state.external_ip,
                                 aich_pending: Some(state.aich_recovery_pending.clone()),
                                 trusted_aich_master: state.aich_root_map.get(&parts.file_hash).copied(),
+                                ember_file_hash: state.ember_content_hashes.get(&parts.file_hash).copied().unwrap_or([0u8; 32]),
                                 geoip: geoip.clone(),
                                 sx_overhead: stats_manager.sx_counters.clone(),
                             };
@@ -24849,6 +24888,7 @@ fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32) {
                     self_ip,
                     &mut state.ember_diagnostics,
                     &mut state.ember_noise_keys,
+                    &mut state.ember_content_hashes,
                 );
                 if !sources.is_empty() {
                     state
@@ -24862,6 +24902,16 @@ fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32) {
                 // + app_handle). Always queued -- even when empty -- so the
                 // sweep clears `ember_pending` and `search-complete` fires.
                 let results = build_ember_keyword_results(&records, &kw.keywords);
+                for r in &results {
+                    let digest = parse_ember_file_hash(&r.file.ember_file_hash);
+                    if digest != [0u8; 32] {
+                        if let Ok(bytes) = hex::decode(r.file.hash.trim()) {
+                            if let Ok(ed2k) = <[u8; 16]>::try_from(bytes.as_slice()) {
+                                state.ember_content_hashes.insert(ed2k, digest);
+                            }
+                        }
+                    }
+                }
                 state
                     .ember_pending_keyword_results
                     .push(EmberKeywordResultBatch {
@@ -24901,6 +24951,7 @@ fn parse_ember_source_records(
     self_ip: Option<Ipv4Addr>,
     diag: &mut crate::types::EmberDiagnostics,
     noise_keys: &mut HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)>,
+    content_hashes: &mut HashMap<[u8; 16], [u8; 32]>,
 ) -> Vec<(Ipv4Addr, u16, u16, u8)> {
     let mut out = Vec::new();
     for blob in blobs {
@@ -24914,6 +24965,9 @@ fn parse_ember_source_records(
         // can't smuggle unrelated sources under our key.
         if rec.file_hash != file_hash {
             continue;
+        }
+        if rec.ember_file_hash != [0u8; 32] {
+            content_hashes.insert(file_hash, rec.ember_file_hash);
         }
         let Some(sc) = rec.source_contact else {
             continue;
@@ -25003,6 +25057,11 @@ fn build_ember_keyword_results(blobs: &[Vec<u8>], keywords: &[String]) -> Vec<Se
                         size: rec.file_size,
                         hash: hash_hex,
                         aich_hash: String::new(),
+                        ember_file_hash: if rec.ember_file_hash != [0u8; 32] {
+                            hex::encode(rec.ember_file_hash)
+                        } else {
+                            String::new()
+                        },
                         extension,
                         modified_at: 0,
                         priority: "normal".to_string(),
@@ -25236,7 +25295,7 @@ async fn maybe_publish_ember_sources(
     // of starving everything past the first `MAX_PER_TICK` entries. Only the
     // chosen few clone their name.
     let now = std::time::Instant::now();
-    let due: Vec<([u8; 16], u64, String)> = {
+    let due: Vec<([u8; 16], u64, String, [u8; 32])> = {
         let idx = local_index.read().await;
         let files = idx.all_files();
         let mut ranked: Vec<(u64, usize)> = Vec::new();
@@ -25271,7 +25330,12 @@ async fn maybe_publish_ember_sources(
                 let hash = hex::decode(&f.hash)
                     .ok()
                     .and_then(|v| <[u8; 16]>::try_from(v).ok())?;
-                Some((hash, f.size, f.name.clone()))
+                Some((
+                    hash,
+                    f.size,
+                    f.name.clone(),
+                    parse_ember_file_hash(&f.ember_file_hash),
+                ))
             })
             .collect()
     };
@@ -25307,13 +25371,14 @@ async fn maybe_publish_ember_sources(
         Vec::new()
     };
 
-    for (file_hash, file_size, file_name) in due {
-        // `ember_file_hash` (content BLAKE3) is deferred for slice 9: discovery
-        // keys off the eD2K hash and the c2c transfer verifies integrity, so
-        // we publish zeros rather than re-hash the whole library.
-        let record = state
-            .ember_dht
-            .build_source_record(file_hash, [0u8; 32], file_size, &file_name, contact);
+    for (file_hash, file_size, file_name, ember_file_hash) in due {
+        let record = state.ember_dht.build_source_record(
+            file_hash,
+            ember_file_hash,
+            file_size,
+            &file_name,
+            contact,
+        );
         if let Some(publish_id) = state
             .ember_publish
             .start_publish(record.clone(), state.ember_dht.routing())
@@ -25389,7 +25454,7 @@ async fn maybe_publish_ember_keywords(
     }
 
     let now = std::time::Instant::now();
-    let due: Vec<([u8; 16], u64, String)> = {
+    let due: Vec<([u8; 16], u64, String, [u8; 32])> = {
         let idx = local_index.read().await;
         let files = idx.all_files();
         let mut ranked: Vec<(u64, usize)> = Vec::new();
@@ -25424,7 +25489,12 @@ async fn maybe_publish_ember_keywords(
                 let hash = hex::decode(&f.hash)
                     .ok()
                     .and_then(|v| <[u8; 16]>::try_from(v).ok())?;
-                Some((hash, f.size, f.name.clone()))
+                Some((
+                    hash,
+                    f.size,
+                    f.name.clone(),
+                    parse_ember_file_hash(&f.ember_file_hash),
+                ))
             })
             .collect()
     };
@@ -25432,7 +25502,7 @@ async fn maybe_publish_ember_keywords(
         return;
     }
 
-    for (file_hash, file_size, file_name) in due {
+    for (file_hash, file_size, file_name, ember_file_hash) in due {
         // Same tokenization as KAD keyword publishing/search so an Ember
         // search hashes the identical keyword set.
         let keywords = kad::publish::extract_keywords(&file_name);
@@ -25441,11 +25511,13 @@ async fn maybe_publish_ember_keywords(
         // tick and starve the rest of the library.
         state.ember_keyword_publish_at.insert(file_hash, now);
         for keyword in keywords {
-            // `ember_file_hash` (content BLAKE3) is deferred (see
-            // `maybe_publish_ember_sources`); keyword lookup doesn't use it.
-            let record = state
-                .ember_dht
-                .build_keyword_record(&keyword, file_hash, [0u8; 32], file_size, &file_name);
+            let record = state.ember_dht.build_keyword_record(
+                &keyword,
+                file_hash,
+                ember_file_hash,
+                file_size,
+                &file_name,
+            );
             if let Some(publish_id) = state
                 .ember_publish
                 .start_publish(record, state.ember_dht.routing())
@@ -25713,6 +25785,10 @@ async fn handle_ember_dht_message(
     }
 
     if let Some(err) = inbound.error {
+        state.ember_diagnostics.ember_dht_malformed = state
+            .ember_diagnostics
+            .ember_dht_malformed
+            .saturating_add(1);
         debug!("Ember DHT: dropping frame from {from}: {err}");
         return;
     }
@@ -25852,6 +25928,24 @@ async fn handle_ember_dht_message(
             .ember_diagnostics
             .ember_dht_pongs_received
             .saturating_add(1);
+        if let Some(observed) = inbound.pong_observed {
+            state.ember_diagnostics.ember_dht_observed_votes = state
+                .ember_diagnostics
+                .ember_dht_observed_votes
+                .saturating_add(1);
+            if let Some(confirmed) = state
+                .ember_observed_votes
+                .record_vote(observed, from.ip())
+            {
+                if state.external_ip.is_none() {
+                    if let std::net::IpAddr::V4(v4) = confirmed.ip() {
+                        set_external_ip(state, Some(v4));
+                        state.stats.external_ip = v4.to_string();
+                        state.nat_info.external_addr = Some(confirmed);
+                    }
+                }
+            }
+        }
         if let Some(rid) = inbound.pong_request_id {
             if let Some((sent_at, tx)) = state.ember_dht_pending_pings.remove(&rid) {
                 let _ = tx.send(sent_at.elapsed());
@@ -29680,6 +29774,7 @@ async fn handle_command_inner(
                     external_ip: state.external_ip,
                     aich_pending: Some(state.aich_recovery_pending.clone()),
                     trusted_aich_master: state.aich_root_map.get(&hash_bytes).copied(),
+                                ember_file_hash: state.ember_content_hashes.get(&hash_bytes).copied().unwrap_or([0u8; 32]),
                     geoip: geoip.clone(),
                     tracker_registry: Some(state.tracker_registry.clone()),
                     sx_overhead: stats_manager.sx_counters.clone(),
@@ -30400,6 +30495,11 @@ async fn handle_command_inner(
             } else {
                 0
             };
+            diag.ember_dht_observed_addr = state
+                .ember_observed_votes
+                .confirmed()
+                .map(|a| a.to_string())
+                .unwrap_or_default();
             if let Some(ref broker) = state.connection_broker {
                 let bs = broker.stats();
                 diag.broker_punch_attempts = bs.punch_attempts;
@@ -30881,12 +30981,22 @@ async fn handle_command_inner(
                 return;
             }
 
-            // Sign the record with our DHT identity. `ember_file_hash` is
-            // not used by keyword lookup, so a dev-published record leaves
-            // it zeroed.
-            let record = state
-                .ember_dht
-                .build_keyword_record(&keyword, file_hash, [0u8; 32], file_size, &file_name);
+            // Prefer the content BLAKE3 from the shared library when this
+            // file_hash is one of ours; otherwise leave zeros (dev/random hash).
+            let ember_file_hash = {
+                let hash_hex = hex::encode(file_hash);
+                let idx = local_index.read().await;
+                idx.get_by_hash(&hash_hex)
+                    .map(|f| parse_ember_file_hash(&f.ember_file_hash))
+                    .unwrap_or([0u8; 32])
+            };
+            let record = state.ember_dht.build_keyword_record(
+                &keyword,
+                file_hash,
+                ember_file_hash,
+                file_size,
+                &file_name,
+            );
             let key_hex = hex::encode(record.keyword_hash);
 
             let publish_id = match state
@@ -32291,6 +32401,14 @@ async fn handle_command_inner(
                                     existing
                                         .as_ref()
                                         .map(|r| r.aich_hash.clone())
+                                        .unwrap_or_default()
+                                },
+                                ember_file_hash: if !f.ember_file_hash.is_empty() {
+                                    f.ember_file_hash.clone()
+                                } else {
+                                    existing
+                                        .as_ref()
+                                        .map(|r| r.ember_file_hash.clone())
                                         .unwrap_or_default()
                                 },
                                 modified_at: f.modified_at,
@@ -34539,6 +34657,7 @@ fn convert_search_results(
                         size: p.size,
                         hash: p.hash,
                         aich_hash: String::new(),
+                        ember_file_hash: String::new(),
                         extension: p.extension,
                         modified_at: 0,
                         priority: "normal".to_string(),
@@ -34666,6 +34785,7 @@ fn convert_note_search_results(
                     size,
                     hash: forced_hash.clone(),
                     aich_hash: String::new(),
+                    ember_file_hash: String::new(),
                     extension: String::new(),
                     modified_at: 0,
                     priority: "normal".to_string(),

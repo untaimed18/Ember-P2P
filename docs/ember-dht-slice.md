@@ -452,3 +452,6 @@ and `ember_native_enabled: true` in each `config.json`:
 4. ~~Diagnostic UI + richer stats (slices 16–17).~~ **Done** — `/ember`
    shows contacts, in-flight searches, local store, and hit/miss /
    replication counters.
+5. ~~Hash format + long-tail hardening (slices 18–19).~~ **Done** —
+   streaming BLAKE3 `ember_file_hash` at index/publish/download verify;
+   DHT decode caps, version-0 rejection, PONG observed-IP voting.

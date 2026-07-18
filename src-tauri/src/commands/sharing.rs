@@ -274,6 +274,7 @@ fn resolve_from_known(files: &mut Vec<FileInfo>, known: &KnownFileList) -> Vec<F
             file.id = hash.clone();
             file.hash = hash;
             file.aich_hash = record.aich_hash.clone();
+            file.ember_file_hash = record.ember_file_hash.clone();
             // Restore the per-file priority and shared/unshared choice from
             // known.met — without this, every rediscovery (folder add,
             // reload, or cold startup) silently reset a custom priority back
@@ -612,6 +613,7 @@ pub async fn add_shared_folder(
                     ed2k_hash,
                     aich_hash,
                     part_hashes,
+                    ember_file_hash,
                     hashed_size,
                     hashed_modified_at,
                 )))) => {
@@ -624,6 +626,7 @@ pub async fn add_shared_folder(
                     updated_file.id = ed2k_hash.clone();
                     updated_file.hash = ed2k_hash;
                     updated_file.aich_hash = aich_hash;
+                    updated_file.ember_file_hash = ember_file_hash;
                     updated_file.size = hashed_size;
                     updated_file.modified_at = hashed_modified_at;
 
@@ -1470,6 +1473,7 @@ pub async fn reload_shared_files(
                     ed2k_hash,
                     aich_hash,
                     part_hashes,
+                    ember_file_hash,
                     hashed_size,
                     hashed_modified_at,
                 )))) => {
@@ -1482,6 +1486,7 @@ pub async fn reload_shared_files(
                     updated_file.id = ed2k_hash.clone();
                     updated_file.hash = ed2k_hash;
                     updated_file.aich_hash = aich_hash;
+                    updated_file.ember_file_hash = ember_file_hash;
                     updated_file.size = hashed_size;
                     updated_file.modified_at = hashed_modified_at;
 
