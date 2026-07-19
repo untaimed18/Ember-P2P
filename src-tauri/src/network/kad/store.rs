@@ -38,6 +38,22 @@ impl StoredEntry {
     }
 }
 
+/// eMule `CIndexed::AddKeyword` minimum-content gate for a single
+/// `PublishKeyReq` entry: non-empty `TAG_FILENAME`, non-zero `TAG_FILESIZE`,
+/// and at least one tag present.
+fn keyword_entry_has_min_content(tags: &[KadTag]) -> bool {
+    if tags.is_empty() {
+        return false;
+    }
+    let has_filename = tags.iter().any(|t| {
+        matches!(&t.name, TagName::Id(TAG_FILENAME)) && matches!(&t.value, TagValue::String(s) if !s.is_empty())
+    });
+    let has_filesize = tags
+        .iter()
+        .any(|t| matches!(&t.name, TagName::Id(TAG_FILESIZE)) && t.as_uint().map_or(false, |v| v > 0));
+    has_filename && has_filesize
+}
+
 pub struct DhtStore {
     keyword_entries: HashMap<KadId, Vec<StoredEntry>>,
     source_entries: HashMap<KadId, Vec<StoredEntry>>,
@@ -97,6 +113,19 @@ impl DhtStore {
             .count();
 
         for entry in entries {
+            // eMule `CIndexed::AddKeyword` rejects a keyword entry outright
+            // when it has no filename, no size, or no tags at all:
+            // `if (!pEntry->m_uSize || pEntry->GetCommonFileName().IsEmpty()
+            //     || !pEntry->GetTagCount() || ...) return false;`
+            // Without this gate a publisher (malicious or buggy) could store
+            // an entry carrying neither a name nor a size, which we would
+            // then hand back to real searchers via `search_keywords` as an
+            // unusable result. Mirrors the same minimum-content gate already
+            // applied to source (`has_source_type`/`has_tcp_port`) and notes
+            // (`has_comment`/`has_rating`) publishes below.
+            if !keyword_entry_has_min_content(&entry.tags) {
+                continue;
+            }
             if let Some(pos) = bucket
                 .iter()
                 .position(|e| e.id == entry.id && e.source_id == *sender_id)
@@ -227,10 +256,19 @@ impl DhtStore {
         // validation at the top of this function, so we never fabricate one
         // from the UDP source port (which is not a TCP listen port and would
         // produce an unconnectable source).
-        let has_uport = tags
-            .iter()
-            .any(|t| matches!(&t.name, TagName::Id(TAG_SOURCEUPORT)));
-        if !has_uport {
+        //
+        // eMule `Process_KADEMLIA2_PUBLISH_SOURCE_REQ` only accepts an
+        // incoming `TAG_SOURCEUPORT` when it parses as a *non-zero* int
+        // (`pTag->IsInt() && (uint16)pTag->GetInt() > 0`); a present-but-zero
+        // tag is discarded and `m_uUDPPort` keeps its default of the packet's
+        // real source port. Checking presence alone (as opposed to a
+        // non-zero value) would let a publisher plant an unusable `0` UDP
+        // port that we'd then serve back to real searchers.
+        let has_valid_uport = tags.iter().any(|t| {
+            matches!(&t.name, TagName::Id(TAG_SOURCEUPORT)) && t.as_uint().is_some_and(|p| p > 0)
+        });
+        if !has_valid_uport {
+            tags.retain(|t| !matches!(&t.name, TagName::Id(TAG_SOURCEUPORT)));
             tags.push(KadTag {
                 name: TagName::Id(TAG_SOURCEUPORT),
                 value: TagValue::Uint16(sender_port),
@@ -403,7 +441,20 @@ mod keyword_store_tests {
         id[..2].copy_from_slice(&index.to_le_bytes());
         PublishEntry {
             id: KadId(id),
-            tags: Vec::new(),
+            // Minimum viable content (filename + non-zero size) so these
+            // synthetic entries pass `keyword_entry_has_min_content` and the
+            // per-sender-cap tests below exercise the cap logic itself,
+            // rather than being masked by the content gate.
+            tags: vec![
+                KadTag {
+                    name: TagName::Id(TAG_FILENAME),
+                    value: TagValue::String(format!("file-{index}.bin")),
+                },
+                KadTag {
+                    name: TagName::Id(TAG_FILESIZE),
+                    value: TagValue::Uint64(1024),
+                },
+            ],
         }
     }
 
@@ -431,6 +482,88 @@ mod keyword_store_tests {
         assert!(bucket
             .iter()
             .any(|stored| stored.source_id == second_sender));
+    }
+
+    /// eMule `CIndexed::AddKeyword` rejects an entry with no filename, no
+    /// size, or no tags at all. Without an equivalent gate here, a
+    /// malformed/malicious `PublishKeyReq` entry would be stored and later
+    /// served back to real searchers via `search_keywords`.
+    #[test]
+    fn rejects_keyword_entry_with_no_tags() {
+        let mut store = DhtStore::new();
+        let target = KadId([0x55; 16]);
+        let sender = KadId([0x66; 16]);
+        store.store_keyword_entries(
+            &target,
+            vec![PublishEntry {
+                id: KadId([0x77; 16]),
+                tags: Vec::new(),
+            }],
+            &sender,
+        );
+        assert!(
+            store.search_keywords(&target).is_empty(),
+            "an entry with no tags at all must not be indexed"
+        );
+    }
+
+    #[test]
+    fn rejects_keyword_entry_missing_filename() {
+        let mut store = DhtStore::new();
+        let target = KadId([0x55; 16]);
+        let sender = KadId([0x66; 16]);
+        store.store_keyword_entries(
+            &target,
+            vec![PublishEntry {
+                id: KadId([0x77; 16]),
+                tags: vec![KadTag {
+                    name: TagName::Id(TAG_FILESIZE),
+                    value: TagValue::Uint64(1024),
+                }],
+            }],
+            &sender,
+        );
+        assert!(
+            store.search_keywords(&target).is_empty(),
+            "an entry with no filename must not be indexed"
+        );
+    }
+
+    #[test]
+    fn rejects_keyword_entry_with_zero_filesize() {
+        let mut store = DhtStore::new();
+        let target = KadId([0x55; 16]);
+        let sender = KadId([0x66; 16]);
+        store.store_keyword_entries(
+            &target,
+            vec![PublishEntry {
+                id: KadId([0x77; 16]),
+                tags: vec![
+                    KadTag {
+                        name: TagName::Id(TAG_FILENAME),
+                        value: TagValue::String("file.bin".to_string()),
+                    },
+                    KadTag {
+                        name: TagName::Id(TAG_FILESIZE),
+                        value: TagValue::Uint64(0),
+                    },
+                ],
+            }],
+            &sender,
+        );
+        assert!(
+            store.search_keywords(&target).is_empty(),
+            "an entry with a zero-byte size must not be indexed"
+        );
+    }
+
+    #[test]
+    fn accepts_keyword_entry_with_filename_and_size() {
+        let mut store = DhtStore::new();
+        let target = KadId([0x55; 16]);
+        let sender = KadId([0x66; 16]);
+        store.store_keyword_entries(&target, vec![entry(1)], &sender);
+        assert_eq!(store.search_keywords(&target).len(), 1);
     }
 }
 
@@ -549,6 +682,36 @@ mod source_store_tests {
             .and_then(|t| t.as_uint());
         assert_eq!(tcp, Some(4662), "published TCP port must be preserved");
         assert_eq!(udp, Some(5000), "UDP port falls back to the packet source");
+    }
+
+    /// eMule `Process_KADEMLIA2_PUBLISH_SOURCE_REQ` only honors an incoming
+    /// `TAG_SOURCEUPORT` when it parses as non-zero
+    /// (`pTag->IsInt() && (uint16)pTag->GetInt() > 0`); a present-but-zero
+    /// tag is discarded and the packet's real source port is used instead.
+    /// Checking mere presence (rather than a non-zero value) would let a
+    /// publisher plant an unusable `0` UDP port that we'd then serve back
+    /// to real searchers.
+    #[test]
+    fn zero_source_uport_tag_is_replaced_with_packet_source_port() {
+        let mut store = DhtStore::new();
+        let tags = vec![
+            id_tag(TAG_SOURCETYPE, TagValue::Uint8(1)),
+            id_tag(TAG_SOURCEPORT, TagValue::Uint16(4662)),
+            id_tag(TAG_SOURCEUPORT, TagValue::Uint16(0)),
+        ];
+        store.store_source_entry(&target(), sender(), tags, Ipv4Addr::new(1, 2, 3, 4), 5000);
+        let results = store.search_sources(&target());
+        assert_eq!(results.len(), 1, "valid source must still be indexed");
+        let udp = results[0]
+            .tags
+            .iter()
+            .find(|t| matches!(&t.name, TagName::Id(TAG_SOURCEUPORT)))
+            .and_then(|t| t.as_uint());
+        assert_eq!(
+            udp,
+            Some(5000),
+            "an explicit zero UDP port tag must be replaced with the packet's real source port"
+        );
     }
 }
 
