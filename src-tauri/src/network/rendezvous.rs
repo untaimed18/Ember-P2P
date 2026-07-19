@@ -20,10 +20,10 @@ use tracing::{debug, info, warn};
 const RDV_DOMAIN: &[u8] = b"ember-rdv-v1";
 const OP_REGISTER: u8 = 0x01;
 const OP_UNREGISTER: u8 = 0x02;
-const OP_RELAY_TICKET_OFFER: u8 = 0x07;
-const OP_RELAY_TICKET_POLL: u8 = 0x08;
-const OP_RELAY_TICKET_ACCEPT: u8 = 0x09;
-const OP_RELAY_TICKET_STATUS: u8 = 0x0a;
+const OP_RELAY_TICKET_OFFER: u8 = 0x08;
+const OP_RELAY_TICKET_POLL: u8 = 0x09;
+const OP_RELAY_TICKET_ACCEPT: u8 = 0x0a;
+const OP_RELAY_TICKET_STATUS: u8 = 0x0b;
 
 fn now_unix_secs() -> i64 {
     std::time::SystemTime::now()
