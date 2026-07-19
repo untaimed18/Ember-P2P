@@ -17,6 +17,7 @@ export interface CollectionDownloadResult {
   queuedCount: number;
   skippedCount: number;
   oversizeCount: number;
+  failedCount: number;
 }
 
 export async function loadCollection(path: string): Promise<Collection> {

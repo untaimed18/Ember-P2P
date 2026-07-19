@@ -15,6 +15,15 @@ use crate::storage::identity::NodeIdentity;
 use crate::storage::statistics::TransferStats;
 use crate::types::FileInfo;
 
+/// A deep link remains durable until the frontend acknowledges successful
+/// handling. The opaque id lets repeated identical links be acknowledged
+/// independently.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct PendingDeepLink {
+    pub id: String,
+    pub payload: String,
+}
+
 /// Live shared-folder list visible to the upload server's security check.
 pub type SharedFolderList = Arc<RwLock<Vec<String>>>;
 
@@ -117,7 +126,7 @@ pub struct AppState {
     /// `deep-link-received` event wakes it. A synchronous `parking_lot::Mutex`
     /// is used because the single-instance callback runs on the OS event
     /// thread (no async context) and pushes into it directly.
-    pub pending_deep_links: Arc<parking_lot::Mutex<Vec<String>>>,
+    pub pending_deep_links: Arc<parking_lot::Mutex<Vec<PendingDeepLink>>>,
 }
 
 impl AppState {

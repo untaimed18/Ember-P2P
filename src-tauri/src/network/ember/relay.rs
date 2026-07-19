@@ -1308,16 +1308,11 @@ async fn connect_relay_target(
     Ok((send, recv))
 }
 
-fn validate_server_relay_session_id(session_id: &str) -> Result<(), String> {
-    if !session_id.is_empty()
-        && session_id.len() <= 128
-        && session_id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    {
+fn validate_server_relay_ticket_id(ticket_id: &str) -> Result<(), String> {
+    if ticket_id.len() == 64 && ticket_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         Ok(())
     } else {
-        Err("invalid server-relay session id".to_string())
+        Err("invalid server-relay ticket id".to_string())
     }
 }
 
@@ -1325,9 +1320,13 @@ fn validate_server_relay_session_id(session_id: &str) -> Result<(), String> {
 /// Returns a WsStream that implements AsyncRead + AsyncWrite.
 pub async fn connect_server_relay(
     rendezvous_url: &str,
-    session_id: &str,
+    ticket_id: &str,
+    role_token: &str,
 ) -> Result<WsStream, String> {
-    validate_server_relay_session_id(session_id)?;
+    validate_server_relay_ticket_id(ticket_id)?;
+    if role_token.len() != 64 || !role_token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("invalid server-relay role token".to_string());
+    }
 
     // Validate HTTPS and resolve exactly once through the shared SSRF guard.
     // `connect_async` would resolve the hostname again after this check,
@@ -1341,7 +1340,10 @@ pub async fn connect_server_relay(
     ws_url
         .set_scheme("wss")
         .map_err(|_| "failed to construct secure relay WebSocket URL".to_string())?;
-    let relay_path = format!("{}/relay/{session_id}", ws_url.path().trim_end_matches('/'));
+    let relay_path = format!(
+        "{}/v2/relay/{ticket_id}",
+        ws_url.path().trim_end_matches('/')
+    );
     ws_url.set_path(&relay_path);
     ws_url.set_query(None);
     ws_url.set_fragment(None);
@@ -1372,10 +1374,20 @@ pub async fn connect_server_relay(
     // `client_async_tls_with_config` derives both TLS SNI and the HTTP Host
     // header from `ws_url`, while using the already-connected pinned socket.
     // This preserves normal certificate verification without another lookup.
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut request = ws_url
+        .as_str()
+        .into_client_request()
+        .map_err(|e| format!("failed to construct relay WebSocket request: {e}"))?;
+    let authorization = format!("Bearer {role_token}")
+        .parse()
+        .map_err(|_| "failed to construct relay authorization header".to_string())?;
+    request.headers_mut().insert("authorization", authorization);
+
     let (ws_stream, _response) = tokio::time::timeout(
         RELAY_CONTROL_TIMEOUT,
         tokio_tungstenite::client_async_tls_with_config(
-            ws_url.as_str(),
+            request,
             tcp_stream,
             None,
             None,
@@ -1384,13 +1396,12 @@ pub async fn connect_server_relay(
     .await
     .map_err(|_| "server relay TLS/WebSocket handshake timed out".to_string())?
     .map_err(|e| {
-        // Do not include `ws_url`: the path contains the relay room's bearer
-        // session id. The protocol currently has no separate join credential,
-        // so keeping that value out of this helper's logs/errors is the
-        // compatible mitigation available without a wire-format migration.
+        // Do not include `ws_url`: its path contains a relay ticket id.
+        // The header carries the one-time bearer capability and must never
+        // appear in logs or surfaced error strings.
         let rendered = format!("{e}");
         if rendered.contains("404") {
-            "WS relay connect failed: 404 Not Found (deployed rendezvous is missing the /relay route; redeploy the server)".to_string()
+            "WS relay connect failed: 404 Not Found (deployed rendezvous is missing the authenticated v2 relay route; redeploy the server)".to_string()
         } else {
             format!("WS relay connect failed: {rendered}")
         }
@@ -1398,66 +1409,6 @@ pub async fn connect_server_relay(
 
     info!("Relay: server relay connected");
     Ok(WsStream::new(ws_stream))
-}
-
-/// Post a relay invitation to the rendezvous server, telling the target
-/// to connect to the given server-relay session.
-pub async fn post_relay_invite(
-    rendezvous_url: &str,
-    target_id: &str,
-    session_id: &str,
-) -> Result<(), String> {
-    require_https(rendezvous_url)?;
-    let url = format!("{}/relay-invite", rendezvous_url.trim_end_matches('/'));
-    let client = relay_http_client(rendezvous_url).await?;
-    let resp = client
-        .post(&url)
-        .json(&serde_json::json!({
-            "target_id": target_id,
-            "session_id": session_id,
-        }))
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await
-        .map_err(|e| format!("relay invite post: {e}"))?;
-
-    if resp.status().is_success() {
-        Ok(())
-    } else {
-        Err(format!("relay invite post: status {}", resp.status()))
-    }
-}
-
-/// Poll the rendezvous server for pending relay invitations targeting us.
-/// Returns a list of session_ids we should connect to via server relay.
-pub async fn poll_relay_invites(rendezvous_url: &str, our_id: &str) -> Result<Vec<String>, String> {
-    require_https(rendezvous_url)?;
-    let url = format!(
-        "{}/relay-invites/{}",
-        rendezvous_url.trim_end_matches('/'),
-        our_id
-    );
-    let client = relay_http_client(rendezvous_url).await?;
-    let resp = client
-        .get(&url)
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await
-        .map_err(|e| format!("relay invite poll: {e}"))?;
-
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(Vec::new());
-    }
-    if !resp.status().is_success() {
-        return Err(format!("relay invite poll: status {}", resp.status()));
-    }
-
-    let body: Vec<serde_json::Value> =
-        read_json_capped(resp, MAX_RENDEZVOUS_JSON_BYTES, "relay invite poll").await?;
-    Ok(body
-        .iter()
-        .filter_map(|v| v["session_id"].as_str().map(|s| s.to_string()))
-        .collect())
 }
 
 #[cfg(test)]

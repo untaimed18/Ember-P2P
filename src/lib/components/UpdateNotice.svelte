@@ -11,6 +11,7 @@
     updater,
     installUpdate,
     restartToUpdate,
+    retryUpdate,
     dismissNotice,
   } from '$lib/stores/updater';
 
@@ -115,7 +116,7 @@
           <button class="primary" onclick={() => void restartToUpdate()}>{m.updater_restart_now()}</button>
         {:else if $updater.phase === 'error'}
           <button class="ghost" onclick={dismissNotice}>{m.updater_later()}</button>
-          <button class="primary" onclick={() => void installUpdate()}>{m.updater_retry()}</button>
+          <button class="primary" onclick={() => void retryUpdate()}>{m.updater_retry()}</button>
         {:else}
           <button class="ghost" onclick={dismissNotice}>{m.updater_later()}</button>
           <button class="primary" onclick={() => void installUpdate()}>{m.updater_install()}</button>

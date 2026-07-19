@@ -13,7 +13,11 @@
   import { parseEd2kLink } from '$lib/api/search';
   import { startDownload } from '$lib/api/transfers';
   import { addServer, connectToServer, downloadServerMet } from '$lib/api/server';
-  import { openCollectionFile, takePendingDeepLinks } from '$lib/api/deeplink';
+  import {
+    ackPendingDeepLink,
+    listPendingDeepLinks,
+    openCollectionFile,
+  } from '$lib/api/deeplink';
   import { incomingCollection } from '$lib/stores/collection';
   import { toastSuccess, toastError } from '$lib/stores/toast';
   import { translateError } from '$lib/i18n';
@@ -39,14 +43,14 @@
     }
   }
 
-  async function handlePayload(raw: string) {
+  async function handlePayload(raw: string): Promise<boolean> {
     const payload = raw.trim();
     const lower = payload.toLowerCase();
     try {
       if (lower.startsWith('ed2k://|file|')) {
         const info = await parseEd2kLink(payload);
         const res = await startDownload(info.hash, info.name, info.size, '', 0);
-        if (destroyed) return;
+        if (destroyed) return false;
         toastSuccess(
           res.already_queued
             ? m.search_already_queued_name({ name: info.name })
@@ -62,7 +66,7 @@
               ? m.servers_validation_ip_invalid()
               : m.servers_validation_port_range(),
           );
-          return;
+          return false;
         }
         // Add to the list, but don't let a duplicate-add error block the
         // connect — a link pointing at an already-known server should still
@@ -73,7 +77,7 @@
           console.warn('Deep link: add server failed (continuing to connect):', e);
         }
         const msg = await connectToServer(ip, port);
-        if (destroyed) return;
+        if (destroyed) return false;
         toastSuccess(msg);
       } else if (lower.startsWith('ed2k://|serverlist|')) {
         const segs = ed2kSegments(payload); // ['serverlist', url]
@@ -82,29 +86,34 @@
           // Match the backend's pinned-fetch policy: never silently turn an
           // OS-delivered deep link into an insecure HTTP server-list request.
           toastError(m.security_url_must_be_https());
-          return;
+          return false;
         }
         const msg = await downloadServerMet(url);
-        if (destroyed) return;
+        if (destroyed) return false;
         toastSuccess(msg);
       } else if (!lower.startsWith('ed2k://') && lower.endsWith('.emulecollection')) {
         const coll = await openCollectionFile(payload);
-        if (destroyed) return;
+        if (destroyed) return false;
         incomingCollection.set(coll);
         await goto('/library');
-        if (destroyed) return;
+        if (destroyed) return false;
         toastSuccess(m.library_collection_loaded({ name: coll.name, count: coll.files.length }));
       }
       // Unknown ed2k:// variants (e.g. magnet-style or future opcodes) are
       // ignored silently — the buffer already filtered to our known prefixes.
+      return true;
     } catch (e: unknown) {
-      if (destroyed) return;
+      if (destroyed) return false;
       toastError(translateError(e));
+      return false;
     }
   }
 
   let processing = false;
   let rerun = false;
+  // Failed entries remain durable for a later app/session retry, but must not
+  // immediately re-toast in a tight drain loop.
+  const attemptedIds = new Set<string>();
   // Set on unmount so an in-flight drain stops routing payloads (goto/toasts)
   // into a component that no longer exists.
   let destroyed = false;
@@ -122,21 +131,19 @@
       do {
         rerun = false;
         if (destroyed) break;
-        let links = await takePendingDeepLinks();
+        let links = (await listPendingDeepLinks()).filter((link) => !attemptedIds.has(link.id));
         while (links.length > 0) {
           for (const link of links) {
-            // `links` was already atomically dequeued from the backend
-            // buffer by the `takePendingDeepLinks()` call above, so if
-            // `destroyed` flips mid-batch (unmount during a locale-change
-            // reload, dev HMR) there is no way to hand these back — finish
-            // applying every link already in hand (queue the download,
-            // connect the server, ...). `handlePayload`'s own `destroyed`
-            // checks still skip the toast/goto follow-up for a torn-down
-            // component. Only stop pulling *further* batches once torn down.
-            await handlePayload(link);
+            if (destroyed) break;
+            if (await handlePayload(link.payload)) {
+              await ackPendingDeepLink(link.id);
+              attemptedIds.delete(link.id);
+            } else {
+              attemptedIds.add(link.id);
+            }
           }
           if (destroyed) break;
-          links = await takePendingDeepLinks();
+          links = (await listPendingDeepLinks()).filter((link) => !attemptedIds.has(link.id));
         }
       } while (rerun);
     } catch (e) {

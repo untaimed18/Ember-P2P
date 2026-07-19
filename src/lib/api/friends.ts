@@ -97,8 +97,18 @@ export async function getOnlineFriends(): Promise<string[]> {
   return invoke('get_online_friends');
 }
 
-export async function browseFriend(userHashHex: string): Promise<void> {
-  return invoke('browse_friend', { userHashHex });
+export async function browseFriend(
+  userHashHex: string,
+  requestId: string,
+): Promise<void> {
+  return invoke('browse_friend', { userHashHex, requestId });
+}
+
+export async function cancelBrowseFriend(
+  userHashHex: string,
+  requestId: string,
+): Promise<void> {
+  return invoke('cancel_browse_friend', { userHashHex, requestId });
 }
 
 export async function getFriendRequests(): Promise<FriendRequestInfo[]> {

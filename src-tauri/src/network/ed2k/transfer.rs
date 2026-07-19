@@ -3822,17 +3822,10 @@ impl Ed2kDownload {
                     }
 
                     if last_periodic_save.elapsed() >= PERIODIC_SAVE_INTERVAL {
-                        // Fire-and-forget: snapshot inline, then save on a
-                        // blocking thread without awaiting. We don't need
-                        // periodic-save to block the receive loop — the
-                        // next periodic tick (or the per-part save above)
-                        // will catch any failure.
+                        // Snapshot after releasing mutable tracker work, then
+                        // enqueue it through the per-file ordered writer.
                         let snap = tracker.snapshot_for_save();
-                        tokio::task::spawn_blocking(move || {
-                            if let Err(e) = snap.write_to_disk() {
-                                tracing::warn!("periodic part.met save failed: {e}");
-                            }
-                        });
+                        super::part_tracker::save_snapshot_async(snap).await;
                         last_periodic_save = std::time::Instant::now();
                     }
                 }

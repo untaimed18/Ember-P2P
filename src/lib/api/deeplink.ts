@@ -1,14 +1,19 @@
 import { invoke } from '@tauri-apps/api/core';
 import type { Collection } from './collections';
 
-/**
- * Drain and return every deep-link payload (ed2k:// URI or .emulecollection
- * path) the backend has buffered. Called on mount and on each
- * `deep-link-received` event. The backend clears the buffer atomically, so
- * concurrent callers never see the same payload twice.
- */
-export async function takePendingDeepLinks(): Promise<string[]> {
-  return invoke('take_pending_deep_links');
+export interface PendingDeepLink {
+  id: string;
+  payload: string;
+}
+
+/** Lists durable pending links. A link remains queued until it is acknowledged. */
+export async function listPendingDeepLinks(): Promise<PendingDeepLink[]> {
+  return invoke('list_pending_deep_links');
+}
+
+/** Acknowledge a successfully handled durable deep link. */
+export async function ackPendingDeepLink(id: string): Promise<void> {
+  return invoke('ack_pending_deep_link', { id });
 }
 
 /**

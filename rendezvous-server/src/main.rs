@@ -20,6 +20,7 @@ use axum::{
 };
 use ed25519_dalek::{Signature, VerifyingKey};
 use futures_util::FutureExt;
+use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
@@ -43,10 +44,10 @@ use tracing::{debug, info, warn};
 const RDV_DOMAIN: &[u8] = b"ember-rdv-v1";
 const OP_REGISTER: u8 = 0x01;
 const OP_UNREGISTER: u8 = 0x02;
-// 0x03..=0x06 reserved for future signing of /punch and /relay-invite
-// endpoints once those IDs are migrated from synthetic (ip, port)
-// strings to presence-map ember-hash ids. Until then those endpoints
-// rely on per-IP rate-limiting and per-target caps for abuse control.
+const OP_RELAY_TICKET_OFFER: u8 = 0x07;
+const OP_RELAY_TICKET_POLL: u8 = 0x08;
+const OP_RELAY_TICKET_ACCEPT: u8 = 0x09;
+const OP_RELAY_TICKET_STATUS: u8 = 0x0a;
 
 /// Maximum allowed clock skew between the client and server timestamps
 /// in a signed request. 5 minutes covers normal NTP-skewed clients
@@ -87,6 +88,15 @@ fn decode_hex_sig(s: &str) -> Option<[u8; 64]> {
 
 fn decode_hex_id(s: &str) -> Option<[u8; 32]> {
     let mut out = [0u8; 32];
+    if hex::decode_to_slice(s, &mut out).is_ok() {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+fn decode_hex_nonce(s: &str) -> Option<[u8; 16]> {
+    let mut out = [0u8; 16];
     if hex::decode_to_slice(s, &mut out).is_ok() {
         Some(out)
     } else {
@@ -140,6 +150,54 @@ fn build_unregister_msg(id_raw: &[u8; 32], ts: i64) -> Vec<u8> {
     m.extend_from_slice(RDV_DOMAIN);
     m.push(OP_UNREGISTER);
     m.extend_from_slice(id_raw);
+    m.extend_from_slice(&ts.to_le_bytes());
+    m
+}
+
+fn build_relay_ticket_offer_msg(
+    initiator_id: &[u8; 32],
+    responder_id: &[u8; 32],
+    purpose: &str,
+    nonce: &[u8; 16],
+    ts: i64,
+) -> Vec<u8> {
+    let purpose_bytes = purpose.as_bytes();
+    let mut m =
+        Vec::with_capacity(RDV_DOMAIN.len() + 1 + 32 + 32 + 1 + purpose_bytes.len() + 16 + 8);
+    m.extend_from_slice(RDV_DOMAIN);
+    m.push(OP_RELAY_TICKET_OFFER);
+    m.extend_from_slice(initiator_id);
+    m.extend_from_slice(responder_id);
+    m.push(purpose_bytes.len() as u8);
+    m.extend_from_slice(purpose_bytes);
+    m.extend_from_slice(nonce);
+    m.extend_from_slice(&ts.to_le_bytes());
+    m
+}
+
+fn build_relay_ticket_poll_msg(responder_id: &[u8; 32], nonce: &[u8; 16], ts: i64) -> Vec<u8> {
+    let mut m = Vec::with_capacity(RDV_DOMAIN.len() + 1 + 32 + 16 + 8);
+    m.extend_from_slice(RDV_DOMAIN);
+    m.push(OP_RELAY_TICKET_POLL);
+    m.extend_from_slice(responder_id);
+    m.extend_from_slice(nonce);
+    m.extend_from_slice(&ts.to_le_bytes());
+    m
+}
+
+fn build_relay_ticket_action_msg(
+    operation: u8,
+    identity_id: &[u8; 32],
+    ticket_id: &[u8; 32],
+    nonce: &[u8; 16],
+    ts: i64,
+) -> Vec<u8> {
+    let mut m = Vec::with_capacity(RDV_DOMAIN.len() + 1 + 32 + 32 + 16 + 8);
+    m.extend_from_slice(RDV_DOMAIN);
+    m.push(operation);
+    m.extend_from_slice(identity_id);
+    m.extend_from_slice(ticket_id);
+    m.extend_from_slice(nonce);
     m.extend_from_slice(&ts.to_le_bytes());
     m
 }
@@ -236,10 +294,12 @@ const RELAY_SESSION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// peer2 joins, this timeout is no longer consulted — so it does not
 /// need to scale with the bandwidth/duration changes above.
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_RELAY_INVITES_PER_TARGET: usize = 8;
-const MAX_RELAY_INVITE_TARGETS: usize = 50_000;
-const MAX_RELAY_INVITES_TOTAL: usize = 100_000;
-const RELAY_INVITE_TTL: Duration = Duration::from_secs(60);
+/// A ticket is long enough to survive the client's short poll interval, but
+/// brief enough that an abandoned offer cannot become a reusable relay
+/// capability later.
+const RELAY_TICKET_TTL: Duration = Duration::from_secs(90);
+const MAX_RELAY_TICKETS: usize = 100_000;
+const MAX_RELAY_TICKETS_PER_RESPONDER: usize = 8;
 
 #[derive(Clone)]
 struct PresenceEntry {
@@ -320,10 +380,26 @@ struct RelaySessionEntry {
     created_at: Instant,
 }
 
-#[derive(Clone)]
-struct RelayInvite {
-    session_id: String,
-    created_at: Instant,
+/// A server-relay ticket never retains either raw bearer token. The matching
+/// client receives exactly one role token over its authenticated HTTPS
+/// request; later WebSocket admission hashes the presented value and compares
+/// only that digest.
+struct RelayTicket {
+    initiator_id: String,
+    responder_id: String,
+    purpose: String,
+    initiator_token_hash: [u8; 32],
+    responder_token_hash: [u8; 32],
+    initiator_joined: bool,
+    responder_joined: bool,
+    accepted: bool,
+    expires_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RelayRole {
+    Initiator,
+    Responder,
 }
 
 #[derive(Clone)]
@@ -350,7 +426,11 @@ struct AppState {
     punch_requests: Arc<RwLock<HashMap<(String, String), PunchEntry>>>,
     relay_sessions: Arc<RwLock<HashMap<String, RelaySessionEntry>>>,
     relay_ip_counts: Arc<RwLock<HashMap<IpAddr, usize>>>,
-    relay_invites: Arc<RwLock<HashMap<String, Vec<RelayInvite>>>>,
+    relay_tickets: Arc<RwLock<HashMap<String, RelayTicket>>>,
+    /// Process-lifetime secret used to issue role tokens on demand. Ticket
+    /// records retain only SHA-256 token hashes; rotating this key on restart
+    /// invalidates every outstanding short-lived ticket.
+    relay_token_key: [u8; 32],
     /// Recently accepted signed mutating requests. Timestamps keep messages
     /// fresh; this cache prevents replaying a captured fresh register or
     /// unregister within that allowed skew window.
@@ -410,6 +490,66 @@ struct UnregisterRequest {
     ts: i64,
     /// Signature over `RDV_DOMAIN || OP_UNREGISTER || sha256_id_raw || ts_le`.
     sig: String,
+}
+
+#[derive(Deserialize)]
+struct RelayTicketOfferRequest {
+    initiator_id: String,
+    responder_id: String,
+    purpose: String,
+    ts: i64,
+    /// A client-generated random nonce bound into the signature. Unlike a
+    /// timestamp alone, this lets concurrent valid requests in the same
+    /// second remain distinct while still making every captured request
+    /// replayable only once.
+    nonce: String,
+    sig: String,
+}
+
+#[derive(Deserialize)]
+struct RelayTicketPollRequest {
+    responder_id: String,
+    ts: i64,
+    nonce: String,
+    sig: String,
+}
+
+#[derive(Deserialize)]
+struct RelayTicketIdentityRequest {
+    identity_id: String,
+    ts: i64,
+    nonce: String,
+    sig: String,
+}
+
+#[derive(Serialize)]
+struct RelayTicketOfferResponse {
+    ticket_id: String,
+    initiator_token: String,
+    expires_in_secs: u64,
+}
+
+#[derive(Serialize)]
+struct RelayTicketPollResponse {
+    tickets: Vec<RelayTicketPollItem>,
+}
+
+#[derive(Serialize)]
+struct RelayTicketPollItem {
+    ticket_id: String,
+    initiator_id: String,
+    purpose: String,
+}
+
+#[derive(Serialize)]
+struct RelayTicketAcceptResponse {
+    responder_token: String,
+    expires_in_secs: u64,
+}
+
+#[derive(Serialize)]
+struct RelayTicketStatusResponse {
+    status: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -590,14 +730,6 @@ fn validate_hex_id(id: &str) -> bool {
     id.len() == 64 && id.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-fn synthetic_endpoint_id_ip(id: &str) -> Option<Ipv4Addr> {
-    if !validate_hex_id(id) || !id[..52].bytes().all(|byte| byte == b'0') {
-        return None;
-    }
-    let raw = u32::from_str_radix(&id[52..60], 16).ok()?;
-    Some(Ipv4Addr::from(raw))
-}
-
 /// Returns true only for IPv4 addresses safe to register as a
 /// friend-reachable presence address: not unspecified, loopback,
 /// multicast, broadcast, link-local, private (RFC 1918), or one of
@@ -669,12 +801,129 @@ fn is_routable_public_v6(ip: Ipv6Addr) -> bool {
     true
 }
 
-fn validate_relay_session_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 128
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+fn validate_relay_ticket_id(id: &str) -> bool {
+    validate_hex_id(id)
+}
+
+fn validate_relay_token(token: &str) -> bool {
+    token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn validate_relay_purpose(purpose: &str) -> bool {
+    // The ticket protocol is deliberately purpose-scoped. Add new values only
+    // alongside a client implementation with matching authorization rules.
+    purpose == "friend"
+}
+
+fn random_relay_secret_hex() -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+fn relay_token_hash(token: &str) -> [u8; 32] {
+    Sha256::digest(token.as_bytes()).into()
+}
+
+/// Derive the unique opaque token for one role of a random ticket. Only the
+/// process secret and the token hash are retained server-side; the plaintext
+/// token is materialized only in the authenticated offer/accept response.
+fn issue_relay_role_token(state: &AppState, ticket_id: &str, role: RelayRole) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(state.relay_token_key);
+    hasher.update(ticket_id.as_bytes());
+    match role {
+        RelayRole::Initiator => hasher.update(b"initiator"),
+        RelayRole::Responder => hasher.update(b"responder"),
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// Verify an action made by a currently registered identity and remember the
+/// signed payload before it can be acted on. The presence entry's pinned key
+/// is the authority, so callers never provide a freely-chosen pubkey.
+async fn verify_signed_relay_identity(
+    state: &AppState,
+    identity_id: &str,
+    message: &[u8],
+    sig: &[u8; 64],
+) -> Result<(), StatusCode> {
+    let pubkey = {
+        let store = state.store.read().await;
+        store
+            .get(&identity_id.to_lowercase())
+            .filter(|entry| entry.expires_at > Instant::now())
+            .map(|entry| entry.pubkey)
+    }
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    if !ed25519_verify(&pubkey, message, sig) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if !remember_signed_request(state, signed_request_replay_key(message, sig)).await {
+        return Err(StatusCode::CONFLICT);
+    }
+    Ok(())
+}
+
+fn prune_expired_relay_tickets(tickets: &mut HashMap<String, RelayTicket>, now: Instant) {
+    tickets.retain(|_, ticket| ticket.expires_at > now);
+}
+
+/// Atomically verifies a role token, consumes that role's one permitted join,
+/// and reserves relay capacity. Nothing after this point can admit a second
+/// socket under the same role token.
+async fn admit_relay_ticket_join(
+    state: &AppState,
+    ticket_id: &str,
+    token: &str,
+    client_ip: IpAddr,
+) -> Result<RelayRole, StatusCode> {
+    if !validate_relay_ticket_id(ticket_id) || !validate_relay_token(token) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let token_hash = relay_token_hash(token);
+    let now = Instant::now();
+    let mut tickets = state.relay_tickets.write().await;
+    prune_expired_relay_tickets(&mut tickets, now);
+    let ticket = tickets
+        .get_mut(&ticket_id.to_lowercase())
+        .ok_or(StatusCode::GONE)?;
+    if !ticket.accepted {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let role = if token_hash == ticket.initiator_token_hash {
+        RelayRole::Initiator
+    } else if token_hash == ticket.responder_token_hash {
+        RelayRole::Responder
+    } else {
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+
+    let already_joined = match role {
+        RelayRole::Initiator => &mut ticket.initiator_joined,
+        RelayRole::Responder => &mut ticket.responder_joined,
+    };
+    if *already_joined {
+        return Err(StatusCode::CONFLICT);
+    }
+
+    // The ticket lock stays held until the capacity reservation succeeds so a
+    // failed capacity check never burns a one-time role token.
+    let mut counts = state.relay_ip_counts.write().await;
+    let global_total: usize = counts.values().sum();
+    if global_total >= MAX_GLOBAL_RELAY_SESSIONS {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let count = counts.entry(client_ip).or_insert(0);
+    if *count >= MAX_RELAY_SESSIONS_PER_IP {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    *count += 1;
+    *already_joined = true;
+    Ok(role)
 }
 
 async fn register(
@@ -948,38 +1197,6 @@ fn prune_expired_punches(punches: &mut HashMap<(String, String), PunchEntry>, no
     punches.retain(|_, entry| now.duration_since(entry.created_at) < PUNCH_TTL);
 }
 
-fn prune_expired_relay_invites(invites: &mut HashMap<String, Vec<RelayInvite>>, now: Instant) {
-    invites.retain(|_, list| {
-        list.retain(|invite| now.duration_since(invite.created_at) < RELAY_INVITE_TTL);
-        !list.is_empty()
-    });
-}
-
-fn relay_invite_count(invites: &HashMap<String, Vec<RelayInvite>>) -> usize {
-    invites.values().map(Vec::len).sum()
-}
-
-fn evict_oldest_relay_invite(invites: &mut HashMap<String, Vec<RelayInvite>>) -> bool {
-    let oldest = invites
-        .iter()
-        .flat_map(|(target, list)| {
-            list.iter()
-                .enumerate()
-                .map(move |(index, invite)| (target.clone(), index, invite.created_at))
-        })
-        .min_by_key(|(_, _, created_at)| *created_at);
-    let Some((target, index, _)) = oldest else {
-        return false;
-    };
-    if let Some(list) = invites.get_mut(&target) {
-        list.remove(index);
-        if list.is_empty() {
-            invites.remove(&target);
-        }
-    }
-    true
-}
-
 /// Register a hole-punch request targeting another peer.
 async fn punch_register(
     State(state): State<AppState>,
@@ -1139,153 +1356,261 @@ async fn punch_poll(
 }
 
 // ---------------------------------------------------------------------------
-// Relay invitations (server-relay signaling)
+// Authenticated, role-bound server relay tickets
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
-struct RelayInviteRequest {
-    target_id: String,
-    session_id: String,
-}
-
-#[derive(Serialize)]
-struct RelayInviteResponse {
-    session_id: String,
-}
-
-async fn relay_invite_post(
+async fn relay_ticket_offer(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Json(body): Json<RelayInviteRequest>,
-) -> StatusCode {
-    if !validate_hex_id(&body.target_id) || !validate_relay_session_id(&body.session_id) {
-        return StatusCode::BAD_REQUEST;
-    }
-    // NOTE: relay-invite POSTs are intentionally NOT signed. The
-    // `target_id` here is a synthetic `(relay_ip:relay_port)`-derived
-    // hex string (see `mod.rs::our_relay_id`), not a presence-map id,
-    // so the server can't use the pinned-pubkey path that
-    // `register`/`unregister`/`punch_*` rely on. Defenses for this
-    // endpoint are: per-IP rate limiting, per-target invite cap, and
-    // (most importantly) the fact that a relay invite by itself is
-    // useless without a working QUIC session — the actual relay path
-    // is mutually authenticated via the eMule/Ember handshake the
-    // peers run AFTER they connect to the relay.
-    let client_ip = extract_client_ip(&headers, addr);
-    if !check_rate_limit(&state, client_ip).await {
-        return StatusCode::TOO_MANY_REQUESTS;
-    }
-
-    let target = body.target_id.to_lowercase();
-    let mut invites = state.relay_invites.write().await;
-    let now = Instant::now();
-    prune_expired_relay_invites(&mut invites, now);
-
-    if !invites.contains_key(&target) && invites.len() >= MAX_RELAY_INVITE_TARGETS {
-        if let Some(oldest_target) = invites
-            .iter()
-            .filter_map(|(target, list)| {
-                list.iter()
-                    .map(|invite| invite.created_at)
-                    .min()
-                    .map(|created_at| (target.clone(), created_at))
-            })
-            .min_by_key(|(_, created_at)| *created_at)
-            .map(|(target, _)| target)
-        {
-            invites.remove(&oldest_target);
-        }
-    }
-    while relay_invite_count(&invites) >= MAX_RELAY_INVITES_TOTAL {
-        if !evict_oldest_relay_invite(&mut invites) {
-            break;
-        }
-    }
-
-    let list = invites.entry(target.clone()).or_default();
-
-    if list.len() >= MAX_RELAY_INVITES_PER_TARGET {
-        if let Some(oldest) = list
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, invite)| invite.created_at)
-            .map(|(index, _)| index)
-        {
-            list.remove(oldest);
-        }
-    }
-
-    list.push(RelayInvite {
-        session_id: body.session_id.clone(),
-        created_at: now,
-    });
-    debug!(
-        "relay invite stored for {} session={} from {}",
-        &target[..8],
-        &body.session_id[..8.min(body.session_id.len())],
-        client_ip
-    );
-    StatusCode::OK
-}
-
-async fn relay_invite_poll(
-    State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Result<Json<Vec<RelayInviteResponse>>, StatusCode> {
-    if !validate_hex_id(&id) {
+    Json(body): Json<RelayTicketOfferRequest>,
+) -> Result<Json<RelayTicketOfferResponse>, StatusCode> {
+    if !validate_hex_id(&body.initiator_id)
+        || !validate_hex_id(&body.responder_id)
+        || !validate_relay_purpose(&body.purpose)
+        || !timestamp_fresh(body.ts)
+    {
         return Err(StatusCode::BAD_REQUEST);
     }
-    // NOTE: relay-invite polls are intentionally NOT signature-gated.
-    // See `relay_invite_post` for the rationale — `id` here is a
-    // `(relay_ip:relay_port)` synthesis, not an ember-hash id, so it
-    // has no pinned pubkey to verify against. The actual relay path
-    // is mutually authenticated by the eMule/Ember handshake AFTER
-    // the QUIC session is established; an attacker dequeuing an
-    // invite on the relay node simply learns "session_id X targeted
-    // this relay" and gets no privileged access.
+    let (Some(initiator_raw), Some(responder_raw), Some(nonce), Some(sig)) = (
+        decode_hex_id(&body.initiator_id),
+        decode_hex_id(&body.responder_id),
+        decode_hex_nonce(&body.nonce),
+        decode_hex_sig(&body.sig),
+    ) else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
     let client_ip = extract_client_ip(&headers, addr);
     if !check_rate_limit(&state, client_ip).await {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
-    let expected_ip = synthetic_endpoint_id_ip(&id).ok_or(StatusCode::BAD_REQUEST)?;
-    let caller_v4 = match client_ip {
-        IpAddr::V4(ip) => Some(ip),
-        IpAddr::V6(ip) => ip.to_ipv4_mapped(),
+
+    let signed = build_relay_ticket_offer_msg(
+        &initiator_raw,
+        &responder_raw,
+        &body.purpose,
+        &nonce,
+        body.ts,
+    );
+    verify_signed_relay_identity(&state, &body.initiator_id, &signed, &sig).await?;
+
+    // The target must currently be a registered identity. That prevents
+    // issuing a bearer capability for a synthetic IP:port key or an arbitrary
+    // absent identity, and cryptographically binds this ticket's responder.
+    let responder_live = {
+        let store = state.store.read().await;
+        store
+            .get(&body.responder_id.to_lowercase())
+            .is_some_and(|entry| entry.expires_at > Instant::now())
     };
-    if caller_v4 != Some(expected_ip) {
+    if !responder_live {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let ticket_id = random_relay_secret_hex();
+    let initiator_token = issue_relay_role_token(&state, &ticket_id, RelayRole::Initiator);
+    let responder_token = issue_relay_role_token(&state, &ticket_id, RelayRole::Responder);
+    let now = Instant::now();
+    let ticket = RelayTicket {
+        initiator_id: body.initiator_id.to_lowercase(),
+        responder_id: body.responder_id.to_lowercase(),
+        purpose: body.purpose,
+        initiator_token_hash: relay_token_hash(&initiator_token),
+        responder_token_hash: relay_token_hash(&responder_token),
+        initiator_joined: false,
+        responder_joined: false,
+        accepted: false,
+        expires_at: now + RELAY_TICKET_TTL,
+    };
+
+    let mut tickets = state.relay_tickets.write().await;
+    prune_expired_relay_tickets(&mut tickets, now);
+    // Never evict an unrelated user's pending friend ticket. A global or
+    // responder cap is a fail-closed admission limit, not a reason to let an
+    // attacker displace the oldest legitimate offer.
+    if tickets.len() >= MAX_RELAY_TICKETS {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    if tickets
+        .values()
+        .filter(|pending| {
+            pending.initiator_id == ticket.initiator_id
+                && pending.responder_id == ticket.responder_id
+                && !pending.accepted
+        })
+        .count()
+        >= 1
+    {
+        return Err(StatusCode::CONFLICT);
+    }
+    if tickets
+        .values()
+        .filter(|pending| pending.responder_id == ticket.responder_id)
+        .count()
+        >= MAX_RELAY_TICKETS_PER_RESPONDER
+    {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    tickets.insert(ticket_id.clone(), ticket);
+
+    debug!(
+        "relay ticket offered: {} -> {}",
+        &body.initiator_id[..8],
+        &body.responder_id[..8]
+    );
+    Ok(Json(RelayTicketOfferResponse {
+        ticket_id,
+        initiator_token,
+        expires_in_secs: RELAY_TICKET_TTL.as_secs(),
+    }))
+}
+
+async fn relay_ticket_poll(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<RelayTicketPollRequest>,
+) -> Result<Json<RelayTicketPollResponse>, StatusCode> {
+    if !validate_hex_id(&body.responder_id) || !timestamp_fresh(body.ts) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let (Some(responder_raw), Some(nonce), Some(sig)) = (
+        decode_hex_id(&body.responder_id),
+        decode_hex_nonce(&body.nonce),
+        decode_hex_sig(&body.sig),
+    ) else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    let client_ip = extract_client_ip(&headers, addr);
+    if !check_rate_limit(&state, client_ip).await {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    let signed = build_relay_ticket_poll_msg(&responder_raw, &nonce, body.ts);
+    verify_signed_relay_identity(&state, &body.responder_id, &signed, &sig).await?;
+
+    let responder_id = body.responder_id.to_lowercase();
+    let now = Instant::now();
+    let mut tickets = state.relay_tickets.write().await;
+    prune_expired_relay_tickets(&mut tickets, now);
+    let results = tickets
+        .iter()
+        .filter(|(_, ticket)| ticket.responder_id == responder_id && !ticket.accepted)
+        .map(|(ticket_id, ticket)| RelayTicketPollItem {
+            ticket_id: ticket_id.clone(),
+            initiator_id: ticket.initiator_id.clone(),
+            purpose: ticket.purpose.clone(),
+        })
+        .collect();
+    Ok(Json(RelayTicketPollResponse { tickets: results }))
+}
+
+async fn relay_ticket_accept(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(ticket_id): Path<String>,
+    Json(body): Json<RelayTicketIdentityRequest>,
+) -> Result<Json<RelayTicketAcceptResponse>, StatusCode> {
+    if !validate_relay_ticket_id(&ticket_id)
+        || !validate_hex_id(&body.identity_id)
+        || !timestamp_fresh(body.ts)
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let (Some(identity_raw), Some(ticket_raw), Some(nonce), Some(sig)) = (
+        decode_hex_id(&body.identity_id),
+        decode_hex_id(&ticket_id),
+        decode_hex_nonce(&body.nonce),
+        decode_hex_sig(&body.sig),
+    ) else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    let client_ip = extract_client_ip(&headers, addr);
+    if !check_rate_limit(&state, client_ip).await {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    let signed = build_relay_ticket_action_msg(
+        OP_RELAY_TICKET_ACCEPT,
+        &identity_raw,
+        &ticket_raw,
+        &nonce,
+        body.ts,
+    );
+    verify_signed_relay_identity(&state, &body.identity_id, &signed, &sig).await?;
+
+    let now = Instant::now();
+    let mut tickets = state.relay_tickets.write().await;
+    prune_expired_relay_tickets(&mut tickets, now);
+    let ticket = tickets
+        .get_mut(&ticket_id.to_lowercase())
+        .ok_or(StatusCode::GONE)?;
+    if ticket.responder_id != body.identity_id.to_lowercase() {
         return Err(StatusCode::FORBIDDEN);
     }
-
-    let key = id.to_lowercase();
-    let mut invites = state.relay_invites.write().await;
-
-    match invites.remove(&key) {
-        Some(list) => {
-            let now = Instant::now();
-            let results: Vec<RelayInviteResponse> = list
-                .into_iter()
-                .filter(|i| now.duration_since(i.created_at) < RELAY_INVITE_TTL)
-                .map(|i| RelayInviteResponse {
-                    session_id: i.session_id,
-                })
-                .collect();
-            if results.is_empty() {
-                Err(StatusCode::NOT_FOUND)
-            } else {
-                debug!(
-                    "relay invite poll: {} invites for {} from {}",
-                    results.len(),
-                    &key[..8],
-                    client_ip
-                );
-                Ok(Json(results))
-            }
-        }
-        None => Err(StatusCode::NOT_FOUND),
+    if ticket.accepted {
+        // Tokens are deliberately never returned twice. A response replay or
+        // a second accept request must create a new ticket rather than gaining
+        // another chance to recover a role capability.
+        return Err(StatusCode::CONFLICT);
     }
+    ticket.accepted = true;
+    let responder_token = issue_relay_role_token(&state, &ticket_id, RelayRole::Responder);
+    Ok(Json(RelayTicketAcceptResponse {
+        responder_token,
+        expires_in_secs: ticket.expires_at.saturating_duration_since(now).as_secs(),
+    }))
+}
+
+async fn relay_ticket_status(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(ticket_id): Path<String>,
+    Json(body): Json<RelayTicketIdentityRequest>,
+) -> Result<Json<RelayTicketStatusResponse>, StatusCode> {
+    if !validate_relay_ticket_id(&ticket_id)
+        || !validate_hex_id(&body.identity_id)
+        || !timestamp_fresh(body.ts)
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let (Some(identity_raw), Some(ticket_raw), Some(nonce), Some(sig)) = (
+        decode_hex_id(&body.identity_id),
+        decode_hex_id(&ticket_id),
+        decode_hex_nonce(&body.nonce),
+        decode_hex_sig(&body.sig),
+    ) else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    let client_ip = extract_client_ip(&headers, addr);
+    if !check_rate_limit(&state, client_ip).await {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    let signed = build_relay_ticket_action_msg(
+        OP_RELAY_TICKET_STATUS,
+        &identity_raw,
+        &ticket_raw,
+        &nonce,
+        body.ts,
+    );
+    verify_signed_relay_identity(&state, &body.identity_id, &signed, &sig).await?;
+
+    let now = Instant::now();
+    let mut tickets = state.relay_tickets.write().await;
+    prune_expired_relay_tickets(&mut tickets, now);
+    let ticket = tickets
+        .get(&ticket_id.to_lowercase())
+        .ok_or(StatusCode::GONE)?;
+    if ticket.initiator_id != body.identity_id.to_lowercase() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(Json(RelayTicketStatusResponse {
+        status: if ticket.accepted {
+            "accepted"
+        } else {
+            "offered"
+        },
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1297,27 +1622,45 @@ async fn relay_ws(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Path(session_id): Path<String>,
+    Path(ticket_id): Path<String>,
 ) -> impl IntoResponse {
-    if !validate_relay_session_id(&session_id) {
+    if !validate_relay_ticket_id(&ticket_id) {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    // The Ember-native v1 server-relay protocol uses this high-entropy room id
-    // as its join capability; it has no separate identity proof or role-bound
-    // token. Requiring a new bearer/header here would strand existing peers,
-    // while IP-binding either half would break same-NAT peers and roaming
-    // clients. A real fix therefore requires a versioned client/server
-    // protocol that authenticates both joins and binds their roles to the
-    // invite. Until that migration exists, avoid logging the full id and leave
-    // downstream Ember/eMule authentication intact.
+    let token = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_once(' '))
+        .and_then(|(scheme, token)| {
+            scheme
+                .eq_ignore_ascii_case("bearer")
+                .then_some(token.trim())
+        });
+    let Some(token) = token.filter(|token| !token.is_empty()) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
     let client_ip = extract_client_ip(&headers, addr);
     if !check_rate_limit(&state, client_ip).await {
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
+    let role = match admit_relay_ticket_join(&state, &ticket_id, token, client_ip).await {
+        Ok(role) => role,
+        Err(status) => return status.into_response(),
+    };
     ws.max_frame_size(1024 * 1024)
         .max_message_size(1024 * 1024)
-        .on_upgrade(move |socket| handle_relay_ws_guarded(socket, state, session_id, client_ip))
+        .on_upgrade(move |socket| {
+            handle_relay_ws_guarded(socket, state, ticket_id, client_ip, role)
+        })
         .into_response()
+}
+
+/// Legacy arbitrary room IDs are intentionally retired. A relay may only be
+/// joined with an authenticated, role-bound ticket; returning Gone makes old
+/// clients fail closed instead of preserving an unauthenticated bandwidth
+/// relay behind a compatibility path.
+async fn legacy_relay_gone() -> StatusCode {
+    StatusCode::GONE
 }
 
 async fn handle_relay_ws_guarded(
@@ -1325,11 +1668,12 @@ async fn handle_relay_ws_guarded(
     state: AppState,
     session_id: String,
     client_ip: IpAddr,
+    role: RelayRole,
 ) {
     let cleanup_state = state.clone();
     let cleanup_session = session_id.clone();
     let result =
-        std::panic::AssertUnwindSafe(handle_relay_ws(socket, state, session_id, client_ip))
+        std::panic::AssertUnwindSafe(handle_relay_ws(socket, state, session_id, client_ip, role))
             .catch_unwind()
             .await;
     if result.is_err() {
@@ -1342,38 +1686,8 @@ async fn handle_relay_ws(
     state: AppState,
     session_id: String,
     client_ip: IpAddr,
+    role: RelayRole,
 ) {
-    // Take the per-IP slot atomically with the global cap check so two
-    // concurrent joins from the same IP can't both observe `current <
-    // cap` and then both proceed. Same write-lock window also guards the
-    // global cap to close the prior TOCTOU window between the read+write
-    // halves.
-    {
-        let mut counts = state.relay_ip_counts.write().await;
-        let global_total: usize = counts.values().sum();
-        if global_total >= MAX_GLOBAL_RELAY_SESSIONS {
-            drop(counts);
-            info!(
-                "relay rejected: global cap reached ({} sessions)",
-                global_total
-            );
-            let _ = socket.send(Message::Close(None)).await;
-            return;
-        }
-        let entry = counts.entry(client_ip).or_insert(0);
-        if *entry >= MAX_RELAY_SESSIONS_PER_IP {
-            let current = *entry;
-            drop(counts);
-            debug!(
-                "relay rejected: {} already has {} sessions",
-                client_ip, current
-            );
-            let _ = socket.send(Message::Close(None)).await;
-            return;
-        }
-        *entry += 1;
-    }
-
     let mut sessions = state.relay_sessions.write().await;
 
     let session_taken = sessions.remove(&session_id);
@@ -1447,7 +1761,7 @@ async fn handle_relay_ws(
         drop(sessions);
 
         debug!(
-            "relay session {} created (peer1={})",
+            "relay session {} created ({role:?}, peer={})",
             &session_id[..8.min(session_id.len())],
             client_ip
         );
@@ -1723,13 +2037,14 @@ async fn sweep_expired(state: AppState) {
             }
         }
 
-        // Sweep expired relay invites
         {
-            let mut invites = state.relay_invites.write().await;
-            invites.retain(|_, v| {
-                v.retain(|i| now.duration_since(i.created_at) < RELAY_INVITE_TTL);
-                !v.is_empty()
-            });
+            let mut tickets = state.relay_tickets.write().await;
+            let before = tickets.len();
+            prune_expired_relay_tickets(&mut tickets, now);
+            let removed = before - tickets.len();
+            if removed > 0 {
+                debug!("swept {removed} expired relay tickets");
+            }
         }
 
         // Sweep stale relay sessions (created but never bridged)
@@ -1794,7 +2109,12 @@ async fn main() {
         punch_requests: Arc::new(RwLock::new(HashMap::new())),
         relay_sessions: Arc::new(RwLock::new(HashMap::new())),
         relay_ip_counts: Arc::new(RwLock::new(HashMap::new())),
-        relay_invites: Arc::new(RwLock::new(HashMap::new())),
+        relay_tickets: Arc::new(RwLock::new(HashMap::new())),
+        relay_token_key: {
+            let mut key = [0u8; 32];
+            OsRng.fill_bytes(&mut key);
+            key
+        },
         replay_cache: Arc::new(RwLock::new(HashMap::new())),
         started_at: Instant::now(),
     };
@@ -1807,9 +2127,20 @@ async fn main() {
         .route("/unregister", delete(unregister))
         .route("/punch", post(punch_register))
         .route("/punch/{id}", get(punch_poll))
-        .route("/relay/{session_id}", get(relay_ws))
-        .route("/relay-invite", post(relay_invite_post))
-        .route("/relay-invites/{id}", get(relay_invite_poll))
+        .route("/v2/relay-tickets/offer", post(relay_ticket_offer))
+        .route("/v2/relay-tickets/poll", post(relay_ticket_poll))
+        .route(
+            "/v2/relay-tickets/{ticket_id}/accept",
+            post(relay_ticket_accept),
+        )
+        .route(
+            "/v2/relay-tickets/{ticket_id}/status",
+            post(relay_ticket_status),
+        )
+        .route("/v2/relay/{ticket_id}", get(relay_ws))
+        .route("/relay/{session_id}", get(legacy_relay_gone))
+        .route("/relay-invite", post(legacy_relay_gone))
+        .route("/relay-invites/{id}", get(legacy_relay_gone))
         // L12: DHT bootstrap stub. The Ember DHT (`ember/dht/*`) is
         // dormant in V1 (`ember_native_enabled=false`), but the
         // bootstrap module probes `/bootstrap` proactively whenever
@@ -1878,4 +2209,99 @@ async fn shutdown_signal() {
         tokio::signal::ctrl_c().await.ok();
     }
     info!("shutdown signal received");
+}
+
+#[cfg(test)]
+mod relay_ticket_tests {
+    use super::*;
+
+    fn test_state() -> AppState {
+        AppState {
+            store: Arc::new(RwLock::new(HashMap::new())),
+            rate_limits: Arc::new(RwLock::new(HashMap::new())),
+            punch_rate_limits: Arc::new(RwLock::new(HashMap::new())),
+            punch_requests: Arc::new(RwLock::new(HashMap::new())),
+            relay_sessions: Arc::new(RwLock::new(HashMap::new())),
+            relay_ip_counts: Arc::new(RwLock::new(HashMap::new())),
+            relay_tickets: Arc::new(RwLock::new(HashMap::new())),
+            relay_token_key: [0x5a; 32],
+            replay_cache: Arc::new(RwLock::new(HashMap::new())),
+            started_at: Instant::now(),
+        }
+    }
+
+    async fn insert_ticket(
+        state: &AppState,
+        ticket_id: &str,
+        expires_at: Instant,
+    ) -> (String, String) {
+        let initiator_token = issue_relay_role_token(state, ticket_id, RelayRole::Initiator);
+        let responder_token = issue_relay_role_token(state, ticket_id, RelayRole::Responder);
+        state.relay_tickets.write().await.insert(
+            ticket_id.to_owned(),
+            RelayTicket {
+                initiator_id: "11".repeat(32),
+                responder_id: "22".repeat(32),
+                purpose: "friend".to_string(),
+                initiator_token_hash: relay_token_hash(&initiator_token),
+                responder_token_hash: relay_token_hash(&responder_token),
+                initiator_joined: false,
+                responder_joined: false,
+                accepted: true,
+                expires_at,
+            },
+        );
+        (initiator_token, responder_token)
+    }
+
+    #[tokio::test]
+    async fn relay_ticket_admission_is_role_bound_and_one_time() {
+        let state = test_state();
+        let ticket_id = "ab".repeat(32);
+        let (initiator_token, responder_token) =
+            insert_ticket(&state, &ticket_id, Instant::now() + Duration::from_secs(30)).await;
+        let client_ip: IpAddr = "8.8.8.8".parse().unwrap();
+
+        assert_eq!(
+            admit_relay_ticket_join(&state, &ticket_id, &initiator_token, client_ip)
+                .await
+                .unwrap(),
+            RelayRole::Initiator
+        );
+        assert_eq!(
+            admit_relay_ticket_join(&state, &ticket_id, &initiator_token, client_ip)
+                .await
+                .unwrap_err(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            admit_relay_ticket_join(&state, &ticket_id, &responder_token, client_ip)
+                .await
+                .unwrap(),
+            RelayRole::Responder
+        );
+        assert_eq!(
+            admit_relay_ticket_join(&state, &ticket_id, &"cd".repeat(32), client_ip)
+                .await
+                .unwrap_err(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_ticket_admission_rejects_expired_ticket() {
+        let state = test_state();
+        let ticket_id = "ef".repeat(32);
+        let (initiator_token, _) =
+            insert_ticket(&state, &ticket_id, Instant::now() - Duration::from_secs(1)).await;
+        let client_ip: IpAddr = "1.1.1.1".parse().unwrap();
+
+        assert_eq!(
+            admit_relay_ticket_join(&state, &ticket_id, &initiator_token, client_ip)
+                .await
+                .unwrap_err(),
+            StatusCode::GONE
+        );
+        assert!(state.relay_tickets.read().await.is_empty());
+    }
 }

@@ -287,7 +287,11 @@
   <SplashScreen exiting={splashExiting} />
 {/if}
 {#if showWizard && wizardSettings}
-  <SetupWizard settings={wizardSettings} oncomplete={onWizardComplete} />
+  <SetupWizard
+    settings={wizardSettings}
+    oncomplete={onWizardComplete}
+    closeDialogOpen={showCloseDialog}
+  />
 {/if}
 <div class="app-shell">
   <!--

@@ -1,6 +1,7 @@
 use std::net::Ipv4Addr;
 
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
+use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
@@ -19,10 +20,10 @@ use tracing::{debug, info, warn};
 const RDV_DOMAIN: &[u8] = b"ember-rdv-v1";
 const OP_REGISTER: u8 = 0x01;
 const OP_UNREGISTER: u8 = 0x02;
-// 0x03..=0x06 reserved for future signing of /punch and /relay-invite
-// endpoints (keyed on synthetic (ip, port) ids today, so no pubkey to
-// verify against — see rendezvous-server/src/main.rs for the matching
-// note).
+const OP_RELAY_TICKET_OFFER: u8 = 0x07;
+const OP_RELAY_TICKET_POLL: u8 = 0x08;
+const OP_RELAY_TICKET_ACCEPT: u8 = 0x09;
+const OP_RELAY_TICKET_STATUS: u8 = 0x0a;
 
 fn now_unix_secs() -> i64 {
     std::time::SystemTime::now()
@@ -116,6 +117,74 @@ fn sign_unregister(secret: &[u8; 32], id_raw: &[u8; 32], ts: i64) -> Signature {
     m.extend_from_slice(&ts.to_le_bytes());
     use ed25519_dalek::Signer;
     signing_key_from_secret(secret).sign(&m)
+}
+
+fn build_relay_ticket_offer_msg(
+    initiator_id: &[u8; 32],
+    responder_id: &[u8; 32],
+    purpose: &str,
+    nonce: &[u8; 16],
+    ts: i64,
+) -> Vec<u8> {
+    let purpose_bytes = purpose.as_bytes();
+    let mut m =
+        Vec::with_capacity(RDV_DOMAIN.len() + 1 + 32 + 32 + 1 + purpose_bytes.len() + 16 + 8);
+    m.extend_from_slice(RDV_DOMAIN);
+    m.push(OP_RELAY_TICKET_OFFER);
+    m.extend_from_slice(initiator_id);
+    m.extend_from_slice(responder_id);
+    m.push(purpose_bytes.len() as u8);
+    m.extend_from_slice(purpose_bytes);
+    m.extend_from_slice(nonce);
+    m.extend_from_slice(&ts.to_le_bytes());
+    m
+}
+
+fn build_relay_ticket_poll_msg(responder_id: &[u8; 32], nonce: &[u8; 16], ts: i64) -> Vec<u8> {
+    let mut m = Vec::with_capacity(RDV_DOMAIN.len() + 1 + 32 + 16 + 8);
+    m.extend_from_slice(RDV_DOMAIN);
+    m.push(OP_RELAY_TICKET_POLL);
+    m.extend_from_slice(responder_id);
+    m.extend_from_slice(nonce);
+    m.extend_from_slice(&ts.to_le_bytes());
+    m
+}
+
+fn build_relay_ticket_action_msg(
+    operation: u8,
+    identity_id: &[u8; 32],
+    ticket_id: &[u8; 32],
+    nonce: &[u8; 16],
+    ts: i64,
+) -> Vec<u8> {
+    let mut m = Vec::with_capacity(RDV_DOMAIN.len() + 1 + 32 + 32 + 16 + 8);
+    m.extend_from_slice(RDV_DOMAIN);
+    m.push(operation);
+    m.extend_from_slice(identity_id);
+    m.extend_from_slice(ticket_id);
+    m.extend_from_slice(nonce);
+    m.extend_from_slice(&ts.to_le_bytes());
+    m
+}
+
+fn random_nonce() -> [u8; 16] {
+    let mut nonce = [0u8; 16];
+    OsRng.fill_bytes(&mut nonce);
+    nonce
+}
+
+fn valid_ticket_secret(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn validate_ticket_response_field(value: &str, field: &str) -> Result<(), String> {
+    if valid_ticket_secret(value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "rendezvous relay ticket response has invalid {field}"
+        ))
+    }
 }
 
 fn current_timestamp() -> i64 {
@@ -510,5 +579,241 @@ pub async fn unregister(
     } else {
         let status = resp.status();
         Err(format!("rendezvous unregister returned {status}"))
+    }
+}
+
+/// Capability granted to the identity that offered a friend relay ticket.
+/// Keep the token out of logs: it authorizes exactly one WebSocket join.
+pub struct FriendRelayTicketOffer {
+    pub ticket_id: String,
+    pub initiator_token: String,
+}
+
+/// An unaccepted friend relay ticket visible only to its signed responder.
+pub struct PendingFriendRelayTicket {
+    pub ticket_id: String,
+    pub initiator_id: String,
+}
+
+fn sign_relay_ticket_message(secret: &[u8; 32], message: &[u8]) -> Signature {
+    use ed25519_dalek::Signer;
+    signing_key_from_secret(secret).sign(message)
+}
+
+fn ticket_id_raw(ticket_id: &str) -> Result<[u8; 32], String> {
+    let mut raw = [0u8; 32];
+    if !valid_ticket_secret(ticket_id) || hex::decode_to_slice(ticket_id, &mut raw).is_err() {
+        return Err("invalid rendezvous relay ticket id".to_string());
+    }
+    Ok(raw)
+}
+
+/// Offer a relay only for the fixed `friend` purpose. The server binds both
+/// registered identities and returns the initiator's one-time join token.
+pub async fn offer_friend_relay_ticket(
+    base_url: &str,
+    initiator_ember_hash: &[u8; 16],
+    responder_ember_hash: &[u8; 16],
+    secret_key: &[u8; 32],
+) -> Result<FriendRelayTicketOffer, String> {
+    require_https(base_url)?;
+    let initiator_id = hashed_id(initiator_ember_hash);
+    let responder_id = hashed_id(responder_ember_hash);
+    let initiator_raw = sha256_id_raw(initiator_ember_hash);
+    let responder_raw = sha256_id_raw(responder_ember_hash);
+    let purpose = "friend";
+    let ts = current_timestamp();
+    let nonce = random_nonce();
+    let signed = build_relay_ticket_offer_msg(&initiator_raw, &responder_raw, purpose, &nonce, ts);
+    let sig = sign_relay_ticket_message(secret_key, &signed);
+    let url = format!("{}/v2/relay-tickets/offer", base_url.trim_end_matches('/'));
+    let resp = client(base_url)
+        .await?
+        .post(&url)
+        .json(&serde_json::json!({
+            "initiator_id": initiator_id,
+            "responder_id": responder_id,
+            "purpose": purpose,
+            "ts": ts,
+            "nonce": hex::encode(nonce),
+            "sig": hex::encode(sig.to_bytes()),
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("relay ticket offer: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("relay ticket offer: status {}", resp.status()));
+    }
+    let body: serde_json::Value =
+        serde_json::from_slice(&read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await?)
+            .map_err(|e| format!("relay ticket offer bad body: {e}"))?;
+    let ticket_id = body["ticket_id"].as_str().unwrap_or_default().to_owned();
+    let initiator_token = body["initiator_token"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    validate_ticket_response_field(&ticket_id, "ticket_id")?;
+    validate_ticket_response_field(&initiator_token, "initiator_token")?;
+    Ok(FriendRelayTicketOffer {
+        ticket_id,
+        initiator_token,
+    })
+}
+
+/// Poll tickets addressed to this registered identity. The server never
+/// returns a responder bearer token here; the client must explicitly accept a
+/// known friend's offer first.
+pub async fn poll_friend_relay_tickets(
+    base_url: &str,
+    responder_ember_hash: &[u8; 16],
+    secret_key: &[u8; 32],
+) -> Result<Vec<PendingFriendRelayTicket>, String> {
+    require_https(base_url)?;
+    let responder_id = hashed_id(responder_ember_hash);
+    let responder_raw = sha256_id_raw(responder_ember_hash);
+    let ts = current_timestamp();
+    let nonce = random_nonce();
+    let signed = build_relay_ticket_poll_msg(&responder_raw, &nonce, ts);
+    let sig = sign_relay_ticket_message(secret_key, &signed);
+    let url = format!("{}/v2/relay-tickets/poll", base_url.trim_end_matches('/'));
+    let resp = client(base_url)
+        .await?
+        .post(&url)
+        .json(&serde_json::json!({
+            "responder_id": responder_id,
+            "ts": ts,
+            "nonce": hex::encode(nonce),
+            "sig": hex::encode(sig.to_bytes()),
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("relay ticket poll: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("relay ticket poll: status {}", resp.status()));
+    }
+    let body: serde_json::Value =
+        serde_json::from_slice(&read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await?)
+            .map_err(|e| format!("relay ticket poll bad body: {e}"))?;
+    let tickets = body["tickets"]
+        .as_array()
+        .ok_or_else(|| "relay ticket poll missing tickets".to_string())?;
+    let mut results = Vec::with_capacity(tickets.len());
+    for ticket in tickets {
+        let ticket_id = ticket["ticket_id"].as_str().unwrap_or_default();
+        let initiator_id = ticket["initiator_id"].as_str().unwrap_or_default();
+        let purpose = ticket["purpose"].as_str().unwrap_or_default();
+        if purpose != "friend" {
+            continue;
+        }
+        validate_ticket_response_field(ticket_id, "ticket_id")?;
+        validate_ticket_response_field(initiator_id, "initiator_id")?;
+        results.push(PendingFriendRelayTicket {
+            ticket_id: ticket_id.to_owned(),
+            initiator_id: initiator_id.to_owned(),
+        });
+    }
+    Ok(results)
+}
+
+/// Accept a ticket after the caller has verified its initiator is a known
+/// friend. This is the only endpoint that returns the responder role token.
+pub async fn accept_friend_relay_ticket(
+    base_url: &str,
+    responder_ember_hash: &[u8; 16],
+    ticket_id: &str,
+    secret_key: &[u8; 32],
+) -> Result<String, String> {
+    require_https(base_url)?;
+    let identity_id = hashed_id(responder_ember_hash);
+    let identity_raw = sha256_id_raw(responder_ember_hash);
+    let ticket_raw = ticket_id_raw(ticket_id)?;
+    let ts = current_timestamp();
+    let nonce = random_nonce();
+    let signed = build_relay_ticket_action_msg(
+        OP_RELAY_TICKET_ACCEPT,
+        &identity_raw,
+        &ticket_raw,
+        &nonce,
+        ts,
+    );
+    let sig = sign_relay_ticket_message(secret_key, &signed);
+    let url = format!(
+        "{}/v2/relay-tickets/{ticket_id}/accept",
+        base_url.trim_end_matches('/')
+    );
+    let resp = client(base_url)
+        .await?
+        .post(&url)
+        .json(&serde_json::json!({
+            "identity_id": identity_id,
+            "ts": ts,
+            "nonce": hex::encode(nonce),
+            "sig": hex::encode(sig.to_bytes()),
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("relay ticket accept: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("relay ticket accept: status {}", resp.status()));
+    }
+    let body: serde_json::Value =
+        serde_json::from_slice(&read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await?)
+            .map_err(|e| format!("relay ticket accept bad body: {e}"))?;
+    let token = body["responder_token"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    validate_ticket_response_field(&token, "responder_token")?;
+    Ok(token)
+}
+
+/// Read the offer state as its signed initiator. A client must wait for
+/// `accepted` before using its one-time initiator token.
+pub async fn friend_relay_ticket_accepted(
+    base_url: &str,
+    initiator_ember_hash: &[u8; 16],
+    ticket_id: &str,
+    secret_key: &[u8; 32],
+) -> Result<bool, String> {
+    require_https(base_url)?;
+    let identity_id = hashed_id(initiator_ember_hash);
+    let identity_raw = sha256_id_raw(initiator_ember_hash);
+    let ticket_raw = ticket_id_raw(ticket_id)?;
+    let ts = current_timestamp();
+    let nonce = random_nonce();
+    let signed = build_relay_ticket_action_msg(
+        OP_RELAY_TICKET_STATUS,
+        &identity_raw,
+        &ticket_raw,
+        &nonce,
+        ts,
+    );
+    let sig = sign_relay_ticket_message(secret_key, &signed);
+    let url = format!(
+        "{}/v2/relay-tickets/{ticket_id}/status",
+        base_url.trim_end_matches('/')
+    );
+    let resp = client(base_url)
+        .await?
+        .post(&url)
+        .json(&serde_json::json!({
+            "identity_id": identity_id,
+            "ts": ts,
+            "nonce": hex::encode(nonce),
+            "sig": hex::encode(sig.to_bytes()),
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("relay ticket status: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("relay ticket status: status {}", resp.status()));
+    }
+    let body: serde_json::Value =
+        serde_json::from_slice(&read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await?)
+            .map_err(|e| format!("relay ticket status bad body: {e}"))?;
+    match body["status"].as_str() {
+        Some("accepted") => Ok(true),
+        Some("offered") => Ok(false),
+        _ => Err("relay ticket status response is invalid".to_string()),
     }
 }

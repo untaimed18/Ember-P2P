@@ -169,44 +169,15 @@ const MAX_PEER_COMMENT_LEN: usize = 8 * 1024;
 /// download function can refer to it without re-declaring.
 const MAX_BLOCKS_PER_REQUEST: usize = 3;
 
-/// Persist a `.part.met` snapshot on the blocking pool without blocking
-/// the caller. The caller MUST have already dropped any tracker
-/// `RwLock` guard before invoking this — the previous design held
-/// `tracker.read().await` across `atomic_write`, which serialized all
-/// concurrent writers behind the fsync.
-///
-/// Coalesces overlapping periodic saves: if a prior snapshot is still
-/// writing, the newer call is dropped (verified-part saves still use
-/// `save_snapshot_now` and always await).
-static PART_MET_SAVE_IN_FLIGHT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-fn spawn_save_snapshot(snap: super::part_tracker::SaveSnapshot) {
-    if PART_MET_SAVE_IN_FLIGHT
-        .compare_exchange(
-            false,
-            true,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Relaxed,
-        )
-        .is_err()
-    {
-        return;
-    }
-    tokio::task::spawn_blocking(move || {
-        if let Err(e) = snap.write_to_disk() {
-            tracing::warn!("part.met save failed: {e}");
-        }
-        PART_MET_SAVE_IN_FLIGHT.store(false, std::sync::atomic::Ordering::Release);
-    });
+/// Persist a snapshot after releasing the tracker lock. The shared
+/// per-path coordinator in `part_tracker` preserves snapshot order.
+async fn spawn_save_snapshot(snap: super::part_tracker::SaveSnapshot) {
+    super::part_tracker::save_snapshot_async(snap).await;
 }
 
 async fn save_snapshot_now(snap: super::part_tracker::SaveSnapshot, context: &'static str) {
-    match tokio::task::spawn_blocking(move || snap.write_to_disk()).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::warn!("{context} part.met save failed: {e}"),
-        Err(e) => tracing::warn!("{context} part.met save task failed: {e}"),
-    }
+    let _ = context;
+    super::part_tracker::save_snapshot_async(snap).await;
 }
 
 /// Per-download cap on simultaneously *held* source connections
@@ -1223,7 +1194,7 @@ impl MultiSourceDownload {
                     t.set_file_name(&self.file_name);
                     t.snapshot_for_save()
                 };
-                spawn_save_snapshot(snap);
+                spawn_save_snapshot(snap).await;
             }
         }
 
@@ -8022,11 +7993,7 @@ async fn download_parts_from_source(
                         let t = tracker.read().await;
                         t.snapshot_for_save()
                     };
-                    tokio::task::spawn_blocking(move || {
-                        if let Err(e) = snap.write_to_disk() {
-                            tracing::warn!("periodic part.met save failed: {e}");
-                        }
-                    });
+                    super::part_tracker::save_snapshot_async(snap).await;
                     last_periodic_save = std::time::Instant::now();
                 }
             }
@@ -8069,7 +8036,7 @@ async fn download_parts_from_source(
                     t.set_in_progress(part_idx, false);
                     t.snapshot_for_save()
                 };
-                spawn_save_snapshot(snap);
+                spawn_save_snapshot(snap).await;
                 ip_guard.unmark(part_idx);
                 continue;
             }
@@ -8363,7 +8330,7 @@ async fn download_parts_from_source(
                         t.set_in_progress(part_idx, false);
                         (ps, pe, t.snapshot_for_save())
                     };
-                    spawn_save_snapshot(snap);
+                    spawn_save_snapshot(snap).await;
                     ip_guard.unmark(part_idx);
                     // D12: drop the per-part credit bucket for THIS part —
                     // the peer sent data that didn't verify, so no credit
@@ -8389,7 +8356,7 @@ async fn download_parts_from_source(
                         t.set_in_progress(part_idx, false);
                         t.snapshot_for_save()
                     };
-                    spawn_save_snapshot(snap);
+                    spawn_save_snapshot(snap).await;
                     ip_guard.unmark(part_idx);
                 }
             }

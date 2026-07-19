@@ -11,6 +11,14 @@ use crate::types::AppSettings;
 const NODES_DAT_URL: &str = "https://upd.emule-security.org/nodes.dat";
 const IPFILTER_URL: &str = "https://upd.emule-security.org/ipfilter.dat";
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateSettingsResult {
+    pub message: String,
+    pub settings: AppSettings,
+    pub live_apply_queued: bool,
+}
+
 fn normalized_path_components(path: &std::path::Path) -> Vec<String> {
     path.components()
         .map(|component| {
@@ -202,7 +210,7 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
     changed |= clamp_assign(&mut settings.max_connections, 1, 2000);
     changed |= clamp_assign(&mut settings.multisource_retry_rounds, 1, 20);
     changed |= clamp_assign(&mut settings.download_part_retry_rounds, 1, 20);
-    changed |= clamp_assign(&mut settings.max_download_file_size_gib, 1, 16_384);
+    changed |= clamp_assign(&mut settings.max_download_file_size_gib, 1, 593);
     changed |= clamp_assign(&mut settings.search_timeout_secs, 30, 600);
     changed |= clamp_assign(&mut settings.max_friends, 1, 500);
 
@@ -438,10 +446,10 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
             "Part hash retry rounds must be between 1 and 20",
         ));
     }
-    if !(1..=16_384).contains(&settings.max_download_file_size_gib) {
+    if !(1..=593).contains(&settings.max_download_file_size_gib) {
         return Err(coded(
             "settings_max_download_file_size_invalid",
-            "Max download file size must be between 1 and 16384 GiB",
+            "Max download file size must be between 1 and 593 GiB",
         ));
     }
     if !(30..=600).contains(&settings.search_timeout_secs) {
@@ -627,7 +635,7 @@ pub async fn update_settings(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     settings: AppSettings,
-) -> Result<String, String> {
+) -> Result<UpdateSettingsResult, String> {
     let mut settings = settings;
     settings.spam_filter_profile = settings.spam_filter_profile.trim().to_ascii_lowercase();
     settings.close_to_tray_behavior = settings.close_to_tray_behavior.trim().to_ascii_lowercase();
@@ -757,18 +765,25 @@ pub async fn update_settings(
         tracing::warn!(
             "Settings saved to disk, but live network update was dropped (channel full): {e}"
         );
-        return Err(coded_ctx(
-            "settings_saved_live_update_failed",
-            "Settings were saved, but the live network update failed; restart or retry to apply them now",
-            e,
-        ));
+        return Ok(UpdateSettingsResult {
+            message: format!(
+                "Settings were saved, but the live network update was deferred: {e}. Restart or retry to apply them now."
+            ),
+            settings,
+            live_apply_queued: false,
+        });
     }
 
-    if port_changed {
-        Ok("Settings saved. Port changes require an application restart to take effect.".into())
+    let message = if port_changed {
+        "Settings saved. Port changes require an application restart to take effect.".into()
     } else {
-        Ok("Settings saved.".into())
-    }
+        "Settings saved.".into()
+    };
+    Ok(UpdateSettingsResult {
+        message,
+        settings,
+        live_apply_queued: true,
+    })
 }
 
 #[tauri::command]

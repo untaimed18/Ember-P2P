@@ -14,6 +14,7 @@ pub struct CollectionDownloadResult {
     pub queued_count: usize,
     pub skipped_count: usize,
     pub oversize_count: usize,
+    pub failed_count: usize,
 }
 
 #[tauri::command]
@@ -384,6 +385,7 @@ pub async fn download_collection_files(
     let mut queued_count = 0usize;
     let mut skipped_count = 0usize;
     let mut oversize_count = 0usize;
+    let mut failed_count = 0usize;
     for file in files {
         if file.hash.is_empty()
             || file.name.trim().is_empty()
@@ -475,8 +477,6 @@ pub async fn download_collection_files(
             let persisted = mgr.get_transfer(&transfer_id).cloned().unwrap_or(transfer);
             (active_now, persisted)
         };
-        queued_count += 1;
-
         super::transfers::persist_transfer(&state, &persisted_transfer).await;
         let _ = app.emit("transfer-started", &persisted_transfer);
 
@@ -524,6 +524,9 @@ pub async fn download_collection_files(
                     super::transfers::persist_transfer(&state, &failed).await;
                     let _ = app.emit("transfer-failed", &failed);
                 }
+                failed_count += 1;
+            } else {
+                queued_count += 1;
             }
         } else {
             // Queued / add-paused: still run KAD+TCP+UDP discovery so sources
@@ -548,6 +551,25 @@ pub async fn download_collection_files(
                     "Failed to send discovery-only StartDownload for collection entry '{}': {e}",
                     file.name
                 );
+                {
+                    let mut mgr = state.transfer_manager.write().await;
+                    let _ = mgr.fail(
+                        &transfer_id,
+                        "Network channel unavailable",
+                        Some("permanent".to_string()),
+                        None,
+                    );
+                }
+                if let Some(failed) = {
+                    let mgr = state.transfer_manager.read().await;
+                    mgr.get_transfer(&transfer_id).cloned()
+                } {
+                    super::transfers::persist_transfer(&state, &failed).await;
+                    let _ = app.emit("transfer-failed", &failed);
+                }
+                failed_count += 1;
+            } else {
+                queued_count += 1;
             }
         }
     }
@@ -563,5 +585,6 @@ pub async fn download_collection_files(
         queued_count,
         skipped_count,
         oversize_count,
+        failed_count,
     })
 }

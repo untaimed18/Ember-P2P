@@ -1,6 +1,8 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::app_state::AppState;
+use crate::app_state::{AppState, PendingDeepLink};
 use crate::commands::errors::{coded, coded_ctx};
 use crate::network::ed2k::collection::Collection;
 
@@ -16,6 +18,34 @@ const MAX_PENDING: usize = 256;
 /// Largest `.emulecollection` we'll read when opened via the OS file
 /// association. Mirrors the spirit of the binary loader's own entry cap.
 const MAX_COLLECTION_BYTES: u64 = 32 * 1024 * 1024;
+const PENDING_QUEUE_FILE: &str = "pending_deep_links.json";
+static NEXT_PENDING_ID: AtomicU64 = AtomicU64::new(1);
+
+fn pending_queue_path(app: &AppHandle) -> std::path::PathBuf {
+    crate::storage::paths::resolve_data_dir_with_app(app).join(PENDING_QUEUE_FILE)
+}
+
+fn persist_pending_queue(app: &AppHandle, entries: &[PendingDeepLink]) -> Result<(), String> {
+    let data = serde_json::to_vec(entries)
+        .map_err(|e| coded_ctx("deeplink_queue_serialize_failed", "Deep-link queue error", e))?;
+    crate::security::atomic_write(&pending_queue_path(app), &data, false)
+        .map_err(|e| coded_ctx("deeplink_queue_save_failed", "Deep-link queue error", e))
+}
+
+/// Load a bounded durable queue before `AppState` is managed. Corrupt queues
+/// are ignored rather than preventing the application from starting.
+pub fn load_pending_queue(app: &AppHandle) -> Vec<PendingDeepLink> {
+    let path = pending_queue_path(app);
+    let Ok(data) = std::fs::read(&path) else {
+        return Vec::new();
+    };
+    serde_json::from_slice::<Vec<PendingDeepLink>>(&data)
+        .map(|entries| entries.into_iter().take(MAX_PENDING).collect())
+        .unwrap_or_else(|e| {
+            tracing::warn!("Ignoring corrupt persisted deep-link queue: {e}");
+            Vec::new()
+        })
+}
 
 /// True if `arg` looks like a deep link we should act on: an `ed2k://` URI or
 /// a path ending in `.emulecollection`.
@@ -59,7 +89,14 @@ pub fn dispatch_deep_links(app: &AppHandle, payloads: Vec<String>) {
                 tracing::warn!("Dropping deep link; pending buffer full ({MAX_PENDING})");
                 break;
             }
-            pending.push(p);
+            let sequence = NEXT_PENDING_ID.fetch_add(1, Ordering::Relaxed);
+            pending.push(PendingDeepLink {
+                id: format!("{:x}-{sequence:x}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()),
+                payload: p,
+            });
+        }
+        if let Err(error) = persist_pending_queue(app, &pending) {
+            tracing::warn!("Failed to persist deep-link queue: {error}");
         }
     } else {
         // AppState isn't managed yet (very early startup). This shouldn't
@@ -78,15 +115,42 @@ pub fn dispatch_deep_links(app: &AppHandle, payloads: Vec<String>) {
     let _ = app.emit("deep-link-received", ());
 }
 
-/// Drain and return every buffered deep-link payload. Returns an empty vector
-/// when nothing is pending. Called by the frontend on mount and on each
-/// `deep-link-received` event.
+/// Return every pending deep link without removing it. The frontend must call
+/// `ack_pending_deep_link` only after the associated action has completed.
+#[tauri::command]
+pub async fn list_pending_deep_links(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<PendingDeepLink>, String> {
+    Ok(state.pending_deep_links.lock().clone())
+}
+
+/// Compatibility alias for older frontends. It intentionally no longer drains
+/// the queue, so a setup-wizard relaunch cannot lose unacknowledged links.
 #[tauri::command]
 pub async fn take_pending_deep_links(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<String>, String> {
+    Ok(state
+        .pending_deep_links
+        .lock()
+        .iter()
+        .map(|entry| entry.payload.clone())
+        .collect())
+}
+
+#[tauri::command]
+pub async fn ack_pending_deep_link(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
     let mut pending = state.pending_deep_links.lock();
-    Ok(std::mem::take(&mut *pending))
+    let before = pending.len();
+    pending.retain(|entry| entry.id != id);
+    if pending.len() == before {
+        return Ok(());
+    }
+    persist_pending_queue(&app, &pending)
 }
 
 /// Load a collection from a path supplied by the OS file association.

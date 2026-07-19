@@ -70,7 +70,6 @@ impl std::fmt::Debug for BrokerConnection {
 pub enum ConnectionMethod {
     HolePunch,
     PeerRelay,
-    ServerRelay,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -393,7 +392,7 @@ impl ConnectionBroker {
             ConnectionMethod::HolePunch => {
                 self.stats.punch_successes = self.stats.punch_successes.saturating_add(1);
             }
-            ConnectionMethod::PeerRelay | ConnectionMethod::ServerRelay => {
+            ConnectionMethod::PeerRelay => {
                 self.stats.relay_successes = self.stats.relay_successes.saturating_add(1);
             }
         }
