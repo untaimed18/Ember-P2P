@@ -96,7 +96,7 @@ pub struct KeywordPublishBatch {
 pub struct PublishManager {
     local_id: KadId,
     user_hash: [u8; 16],
-    tcp_port: u16,
+    pub(crate) tcp_port: u16,
     pub(crate) udp_port: u16,
     /// Local Ember Noise X25519 static public key. Emitted in source
     /// publishes via [`EMBER_NOISE_PUB_TAG`] so other Ember peers can

@@ -1693,6 +1693,14 @@
 
           <div class="field toggle-row">
             <div class="toggle-info">
+              <span class="toggle-title">{m.settings_stun_keepalive_label()}</span>
+              <span class="hint">{m.settings_stun_keepalive_hint()}</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.stun_keepalive_enabled} ariaLabel={m.settings_stun_keepalive_label()} />
+          </div>
+
+          <div class="field toggle-row">
+            <div class="toggle-info">
               <span class="toggle-title">{m.settings_ember_native_label()} <span class="badge-experimental">{m.ember_experimental()}</span></span>
               <span class="hint">{m.settings_ember_native_hint()} <a href="/ember" onclick={(e) => { e.preventDefault(); goto('/ember'); }}>{m.settings_ember_open_page()}</a></span>
             </div>

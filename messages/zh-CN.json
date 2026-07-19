@@ -1614,6 +1614,8 @@
   "settings_udp_port_hint": "KAD DHT（默认 4672）。若 VPN 仅转发单个端口，可与 TCP 端口相同。",
   "settings_upnp_label": "UPnP 端口映射",
   "settings_upnp_hint": "自动配置路由器端口。需要手动转发时请关闭。",
+  "settings_stun_keepalive_label": "STUN 端口保活（全锥 / CGNAT）",
+  "settings_stun_keepalive_hint": "通过 STUN 和从监听端口发起的 TCP 保活维持 NAT 映射，并向外通告公网端口以获得 HighID。适合无 UPnP 的 CGNAT 或全锥 NAT。在对称 NAT / VPN 式端口抖动时会自动暂停并回退到设置中的端口。",
   "settings_auto_connect_kad": "自动连接 KAD",
   "settings_auto_connect_kad_hint": "启动时自动引导 KAD。关闭后需点击「连接」才能启动。",
   "settings_downloading": "下载中...",
@@ -2036,5 +2038,9 @@
   "statusbar_epx_status_active": "活跃",
   "statusbar_epx_status_idle": "空闲",
   "statusbar_epx_status_inactive": "离线",
-  "servers_connect_select_hint": "在列表中选择一个服务器以连接"
+  "servers_connect_select_hint": "在列表中选择一个服务器以连接",
+  "kad_stat_stun_keepalive": "STUN 保活",
+  "kad_stun_active": "活跃",
+  "kad_stun_inactive": "关闭",
+  "kad_stat_public_ports": "公网端口"
 }

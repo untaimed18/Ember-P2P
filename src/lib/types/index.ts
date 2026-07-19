@@ -207,6 +207,10 @@ export interface NetworkStats {
   ember_peers: number;
   epx_sources_received: number;
   server_status?: string;
+  stun_keepalive_active?: boolean;
+  public_udp_port?: number;
+  public_tcp_port?: number;
+  tcp_mapping_hold_ok?: boolean;
   stale?: boolean;
   degraded?: boolean;
   /** Stable reason code (localized at render time via
@@ -502,6 +506,8 @@ export interface AppSettings {
   udp_port: number;
   nodes_dat_path: string;
   upnp_enabled: boolean;
+  /** Keep full-cone/CGNAT mappings alive via STUN + TCP hold; advertise public ports. */
+  stun_keepalive_enabled: boolean;
   obfuscation_enabled: boolean;
   ip_filter_enabled: boolean;
   filter_incoming_connections: boolean;

@@ -14,7 +14,7 @@ use tracing::{debug, info};
 /// quiet. This is the *primary* signal for NAT type — if every entry
 /// here fails, hole-punch falls back to the HighID-derived heuristic
 /// in `mod.rs`.
-const DEFAULT_STUN_SERVERS: &[&str] = &[
+pub(crate) const DEFAULT_STUN_SERVERS: &[&str] = &[
     "stun.l.google.com:19302",
     "stun1.l.google.com:19302",
     "stun2.l.google.com:19302",
@@ -22,7 +22,7 @@ const DEFAULT_STUN_SERVERS: &[&str] = &[
     "global.stun.twilio.com:3478",
 ];
 
-const STUN_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const STUN_TIMEOUT: Duration = Duration::from_secs(5);
 const STUN_MAX_RETRIES: usize = 2;
 const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
 const STUN_BINDING_REQUEST: u16 = 0x0001;
@@ -226,10 +226,15 @@ fn build_nat_info_from_results(
             .cloned()
             .collect::<Vec<_>>()
             .join("; ");
+        // Promoted from debug! to info! — this and the "type=" log below are
+        // the only two possible outcomes of a probe attempt, and without
+        // this one visible at the default log level, a probe that silently
+        // never gets a single STUN reply back is indistinguishable from a
+        // probe that never ran at all.
         if detail.is_empty() {
-            debug!("NAT probe: all STUN servers failed");
+            info!("NAT probe: all STUN servers failed");
         } else {
-            debug!("NAT probe: all STUN servers failed ({detail})");
+            info!("NAT probe: all STUN servers failed ({detail})");
         }
         return NatInfo {
             nat_type: NatType::Unknown,
@@ -361,7 +366,7 @@ async fn try_stun_server_with_replies(
     ))
 }
 
-fn build_binding_request(txn_id: &[u8; 12]) -> Vec<u8> {
+pub(crate) fn build_binding_request(txn_id: &[u8; 12]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(20);
     buf.extend_from_slice(&STUN_BINDING_REQUEST.to_be_bytes());
     buf.extend_from_slice(&0u16.to_be_bytes());
@@ -370,7 +375,10 @@ fn build_binding_request(txn_id: &[u8; 12]) -> Vec<u8> {
     buf
 }
 
-fn parse_binding_response(data: &[u8], expected_txn_id: &[u8; 12]) -> Result<SocketAddr, String> {
+pub(crate) fn parse_binding_response(
+    data: &[u8],
+    expected_txn_id: &[u8; 12],
+) -> Result<SocketAddr, String> {
     if data.len() < 20 {
         return Err("Response too short".into());
     }

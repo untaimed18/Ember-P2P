@@ -414,6 +414,18 @@ pub struct NetworkStats {
     /// Current eD2K server connection status: "connected", "connecting", or "disconnected"
     #[serde(default)]
     pub server_status: String,
+    /// STUN/NATMAP-style keep-alive is actively refreshing mappings this session.
+    #[serde(default)]
+    pub stun_keepalive_active: bool,
+    /// Last STUN-discovered public UDP port (0 = unknown).
+    #[serde(default)]
+    pub public_udp_port: u16,
+    /// Last discovered public TCP listen port (0 = unknown / same as local).
+    #[serde(default)]
+    pub public_tcp_port: u16,
+    /// Whether the last TCP mapping hold (reuseaddr connect) succeeded.
+    #[serde(default)]
+    pub tcp_mapping_hold_ok: bool,
 }
 
 /// Diagnostic counters for the Ember mesh (EPX, LowID broker). Surfaced
@@ -680,6 +692,10 @@ impl Default for NetworkStats {
             ember_peers: 0,
             epx_sources_received: 0,
             server_status: String::from("disconnected"),
+            stun_keepalive_active: false,
+            public_udp_port: 0,
+            public_tcp_port: 0,
+            tcp_mapping_hold_ok: false,
         }
     }
 }
@@ -710,6 +726,12 @@ pub struct AppSettings {
     pub udp_port: u16,
     pub nodes_dat_path: String,
     pub upnp_enabled: bool,
+    /// Keep full-cone / CGNAT port mappings alive with STUN (and a TCP
+    /// hold from the listen port), and advertise the discovered public
+    /// ports for HighID. Safe no-op on open/UPnP networks; disable if
+    /// outbound STUN is blocked on your network.
+    #[serde(default = "default_true")]
+    pub stun_keepalive_enabled: bool,
     /// Prefer obfuscated (encrypted) KAD communication when the peer supports it
     #[serde(default = "default_true")]
     pub obfuscation_enabled: bool,
@@ -1214,6 +1236,7 @@ impl Default for AppSettings {
             folder_priorities: std::collections::HashMap::new(),
             nodes_dat_path: String::new(),
             upnp_enabled: false,
+            stun_keepalive_enabled: true,
             obfuscation_enabled: true,
             ip_filter_enabled: true,
             filter_incoming_connections: false,

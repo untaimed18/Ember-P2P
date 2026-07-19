@@ -739,7 +739,12 @@ pub async fn build_ed2k_link(
         let valid_ip = ip.parse::<std::net::Ipv4Addr>().ok().filter(|a| {
             !a.is_loopback() && !a.is_unspecified() && !a.is_private() && !a.is_link_local()
         });
-        let tcp_port = {
+        // Prefer the STUN-confirmed public TCP port (may differ from the
+        // configured/bind port behind CGNAT/full-cone NAT) so the generated
+        // link points somewhere actually reachable; 0 means "not confirmed".
+        let tcp_port = if stats.public_tcp_port > 0 {
+            stats.public_tcp_port
+        } else {
             let cfg = state.config.read().await;
             cfg.settings.tcp_port
         };

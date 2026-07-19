@@ -1614,6 +1614,8 @@
   "settings_udp_port_hint": "KAD DHT (Standard 4672). Kann mit dem TCP-Port übereinstimmen, wenn Ihr VPN nur einen einzelnen Port weiterleitet.",
   "settings_upnp_label": "UPnP-Portzuordnung",
   "settings_upnp_hint": "Router-Ports automatisch konfigurieren. Für manuelle Weiterleitung deaktivieren.",
+  "settings_stun_keepalive_label": "STUN-Port-Keepalive (Full-Cone / CGNAT)",
+  "settings_stun_keepalive_hint": "Haelt NAT-Mappings mit STUN und einem TCP-Hold vom Listen-Port am Leben und bewirbt die oeffentlichen Ports fuer HighID. Ideal hinter CGNAT oder Full-Cone-NAT ohne UPnP. Pausiert automatisch bei Symmetric/VPN-Remapping und faellt auf die Ports in den Einstellungen zurueck.",
   "settings_auto_connect_kad": "KAD automatisch verbinden",
   "settings_auto_connect_kad_hint": "KAD beim Start automatisch bootstrappen. Wenn deaktiviert, drücken Sie Verbinden, um zu starten.",
   "settings_downloading": "Download läuft...",
@@ -2037,5 +2039,9 @@
   "statusbar_epx_status_active": "Aktiv",
   "statusbar_epx_status_idle": "Wartend",
   "statusbar_epx_status_inactive": "Offline",
-  "servers_connect_select_hint": "Wählen Sie einen Server in der Liste zum Verbinden"
+  "servers_connect_select_hint": "Wählen Sie einen Server in der Liste zum Verbinden",
+  "kad_stat_stun_keepalive": "STUN-Keepalive",
+  "kad_stun_active": "Aktiv",
+  "kad_stun_inactive": "Aus",
+  "kad_stat_public_ports": "Oeffentliche Ports"
 }
