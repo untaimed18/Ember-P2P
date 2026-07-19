@@ -374,7 +374,7 @@
     s.download_queue_wait_secs = ci(s.download_queue_wait_secs, 60, 14400, 600);
     s.multisource_retry_rounds = ci(s.multisource_retry_rounds, 1, 20, 3);
     s.download_part_retry_rounds = ci(s.download_part_retry_rounds, 1, 20, 3);
-    s.max_download_file_size_gib = ci(s.max_download_file_size_gib, 1, 16384, 4096);
+    s.max_download_file_size_gib = ci(s.max_download_file_size_gib, 1, 593, 593);
     s.search_timeout_secs = ci(s.search_timeout_secs, 30, 600, 120);
     s.max_friends = ci(s.max_friends, 1, 500, 100);
     return { error: null, adjusted };
@@ -1435,7 +1435,7 @@
 
           <div class="field">
             <label for="max-dl-gib">{m.settings_max_file_size_label()}</label>
-            <input id="max-dl-gib" type="number" min="1" max="16384" bind:value={settings.max_download_file_size_gib} />
+            <input id="max-dl-gib" type="number" min="1" max="593" bind:value={settings.max_download_file_size_gib} />
             <span class="hint">{m.settings_max_file_size_hint()}</span>
           </div>
 

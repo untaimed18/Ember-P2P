@@ -151,6 +151,7 @@
       let queued = 0;
       let skipped = 0;
       let oversize = 0;
+    let failed = 0;
       let firstError: unknown = null;
       for (let start = 0; start < loadedCollection.files.length; start += batchSize) {
         try {
@@ -160,6 +161,7 @@
           queued += result.queuedCount;
           skipped += result.skippedCount;
           oversize += result.oversizeCount;
+          failed += result.failedCount;
         } catch (e: unknown) {
           firstError ??= e;
         }
@@ -169,9 +171,10 @@
       }
       if (skipped > 0 || oversize > 0) {
         const totalSkipped = skipped + oversize;
-        toastWarning(
-          `${totalSkipped} collection entr${totalSkipped === 1 ? 'y was' : 'ies were'} skipped.`,
-        );
+        toastWarning(m.library_collection_entries_skipped({ count: totalSkipped }));
+      }
+      if (failed > 0) {
+        toastWarning(m.library_collection_start_failed({ count: failed }));
       }
       if (firstError) throw firstError;
     } catch (e: unknown) {
@@ -2807,7 +2810,7 @@
     {/if}
     {#if scanTruncated}
       <div class="scan-banner scan-warning" role="status">
-        <span class="scan-text">Library indexing reached the 100,000-file per-folder limit. Some files are not listed.</span>
+        <span class="scan-text">{m.library_scan_truncated({ limit: 100000 })}</span>
       </div>
     {/if}
     {#if sortedFiles.length === 0 && !scanning && hasActiveLibraryFilters && files.length > 0}

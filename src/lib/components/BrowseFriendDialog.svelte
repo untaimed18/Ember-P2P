@@ -1,7 +1,11 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-  import { browseFriend, type BrowseFileEntry } from '$lib/api/friends';
+  import {
+    browseFriend,
+    cancelBrowseFriend,
+    type BrowseFileEntry,
+  } from '$lib/api/friends';
   import { startDownload } from '$lib/api/transfers';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
@@ -36,6 +40,7 @@
   // Generation the listeners currently accept. requestBrowse assigns this
   // to myGen so a late result from a prior open can't land after reopen.
   let expectedBrowseGen = 0;
+  let expectedRequestId = '';
 
   $effect(() => {
     if (open && friendHash) {
@@ -55,9 +60,13 @@
       })();
     }
     return () => {
+      if (expectedRequestId && friendHash) {
+        void cancelBrowseFriend(friendHash, expectedRequestId);
+      }
       listenerGen++;
       currentBrowseGen = 0;
       expectedBrowseGen = 0;
+      expectedRequestId = '';
       loading = false;
       clearTimeout(browseTimeout);
       if (unlisten) { unlisten(); unlisten = null; }
@@ -79,12 +88,16 @@
     if (unlistenError) { unlistenError(); unlistenError = null; }
     let fn: UnlistenFn;
     try {
-      fn = await listen<{ user_hash: string; files: BrowseFileEntry[] }>('ember:browse-result', (event) => {
+      fn = await listen<{ user_hash: string; request_id: string; files: BrowseFileEntry[] }>('ember:browse-result', (event) => {
         if (event.payload.user_hash !== hash) return;
         // Only accept results for the in-flight browse generation.
         // `currentBrowseGen === 0` means dismissed; mismatch vs
         // `expectedBrowseGen` means a stale result from a prior open.
-        if (currentBrowseGen === 0 || currentBrowseGen !== expectedBrowseGen) return;
+        if (
+          currentBrowseGen === 0 ||
+          currentBrowseGen !== expectedBrowseGen ||
+          event.payload.request_id !== expectedRequestId
+        ) return;
         clearTimeout(browseTimeout);
         // Defensive: treat missing/invalid `files` as empty rather than
         // crashing the dialog if the backend ever emits a malformed payload.
@@ -109,12 +122,16 @@
 
     let errFn: UnlistenFn;
     try {
-      errFn = await listen<{ user_hash: string; reason: string }>('ember:browse-error', (event) => {
+      errFn = await listen<{ user_hash: string; request_id: string; reason: string }>('ember:browse-error', (event) => {
         if (event.payload.user_hash !== hash) return;
         // M4: key on browse generation so a late error after a
         // successful result (gen cleared) is discarded, and a stale
         // error from a prior open can't land after reopen.
-        if (currentBrowseGen === 0 || currentBrowseGen !== expectedBrowseGen) return;
+        if (
+          currentBrowseGen === 0 ||
+          currentBrowseGen !== expectedBrowseGen ||
+          event.payload.request_id !== expectedRequestId
+        ) return;
         clearTimeout(browseTimeout);
         // Run the backend reason through `translateError` so a coded error is
         // localized; a plain string falls through unchanged, and an empty
@@ -154,12 +171,17 @@
     currentBrowseGen++;
     const myGen = currentBrowseGen;
     expectedBrowseGen = myGen;
+    expectedRequestId = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : `${instanceId}-${Date.now()}-${myGen}`;
+    const myRequestId = expectedRequestId;
     try {
-      await browseFriend(hash);
+      await browseFriend(hash, myRequestId);
       browseTimeout = setTimeout(() => {
-        if (currentBrowseGen === myGen && loading) {
+        if (currentBrowseGen === myGen && expectedRequestId === myRequestId && loading) {
           loading = false;
           error = m.browse_request_timed_out();
+          void cancelBrowseFriend(hash, myRequestId);
           currentBrowseGen = 0;
         }
       }, 30_000);

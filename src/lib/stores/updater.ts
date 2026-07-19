@@ -124,6 +124,7 @@ let pending: Update | null = null;
 // `downloadAndInstall` concurrently, so a double-click on "Install" could
 // otherwise corrupt the download / surface a spurious error.
 let installInFlight = false;
+let retryAction: 'check' | 'install' | 'relaunch' = 'check';
 
 /** True while `checkForUpdates` is awaiting the plugin `check()` call. */
 let checkInFlight = false;
@@ -204,6 +205,7 @@ export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<
     updater.set({ ...INITIAL, phase: opts.silent ? 'idle' : 'uptodate' });
     return false;
   } catch (e) {
+    retryAction = 'check';
     if (keepPendingUntilSuccess && pending) {
       // Re-check failed but we still have a usable Update resource — restore
       // the available phase instead of disposing it.
@@ -229,7 +231,16 @@ export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<
  * banner) then triggers {@link restartToUpdate}.
  */
 export async function installUpdate(): Promise<void> {
-  if (!pending || installInFlight) return;
+  if (installInFlight) return;
+  if (!pending) {
+    retryAction = 'check';
+    updater.update((s) => ({
+      ...s,
+      phase: 'error',
+      error: 'No staged update is available; checking again is required.',
+    }));
+    return;
+  }
   installInFlight = true;
   updater.update((s) => ({ ...s, phase: 'downloading', downloaded: 0, total: null, error: null }));
   let downloaded = 0;
@@ -258,6 +269,7 @@ export async function installUpdate(): Promise<void> {
     // it.)
     await disposePending();
   } catch (e) {
+    retryAction = 'install';
     updater.update((s) => ({ ...s, phase: 'error', error: toMessage(e) }));
   } finally {
     installInFlight = false;
@@ -269,7 +281,19 @@ export async function restartToUpdate(): Promise<void> {
   try {
     await relaunch();
   } catch (e) {
+    retryAction = 'relaunch';
     updater.update((s) => ({ ...s, phase: 'error', error: toMessage(e) }));
+  }
+}
+
+/** Retry the action that produced the current update error. */
+export async function retryUpdate(): Promise<void> {
+  if (retryAction === 'relaunch') {
+    await restartToUpdate();
+  } else if (retryAction === 'install' && pending) {
+    await installUpdate();
+  } else {
+    await checkForUpdates();
   }
 }
 

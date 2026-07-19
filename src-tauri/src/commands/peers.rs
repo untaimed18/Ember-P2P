@@ -693,7 +693,14 @@ pub async fn retry_friend_search(
 pub async fn browse_friend(
     state: tauri::State<'_, AppState>,
     user_hash_hex: String,
+    request_id: String,
 ) -> Result<(), String> {
+    if request_id.is_empty() || request_id.len() > 128 {
+        return Err(coded(
+            "peers_invalid_browse_request",
+            "Invalid browse request",
+        ));
+    }
     let canonical = user_hash_hex.to_lowercase();
     let hash = parse_user_hash(&canonical)?;
     if !state.friend_hashes.read().await.contains(&hash) {
@@ -707,11 +714,35 @@ pub async fn browse_friend(
         &state.network_tx,
         NetworkCommand::BrowseFriend {
             ember_hash: hash,
+            request_id,
             tx,
         },
     )
     .await?;
     await_reply(rx, "peers_no_response", "No response").await?
+}
+
+#[tauri::command]
+pub async fn cancel_browse_friend(
+    state: tauri::State<'_, AppState>,
+    user_hash_hex: String,
+    request_id: String,
+) -> Result<(), String> {
+    let hash = parse_user_hash(&user_hash_hex.to_lowercase())?;
+    if request_id.is_empty() || request_id.len() > 128 {
+        return Err(coded(
+            "peers_invalid_browse_request",
+            "Invalid browse request",
+        ));
+    }
+    bounded_send(
+        &state.network_tx,
+        NetworkCommand::CancelBrowseFriend {
+            ember_hash: hash,
+            request_id,
+        },
+    )
+    .await
 }
 
 async fn resolve_kad_host(input: &str, port: u16) -> Result<String, String> {

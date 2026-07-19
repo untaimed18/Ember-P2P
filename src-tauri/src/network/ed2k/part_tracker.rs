@@ -1,5 +1,9 @@
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, OnceLock,
+};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
@@ -39,6 +43,19 @@ const TAGTYPE_BLOB: u8 = 0x07;
 /// compared with an unusable .part.met).
 const MAX_GAP_ENTRIES: usize = 8192;
 
+fn save_path_guard(path: &Path) -> Arc<parking_lot::Mutex<()>> {
+    static GUARDS: OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<PathBuf, Arc<parking_lot::Mutex<()>>>>,
+    > = OnceLock::new();
+    let mut guards = GUARDS
+        .get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+        .lock();
+    guards
+        .entry(path.to_path_buf())
+        .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
+        .clone()
+}
+
 /// Byte-level gap list matching eMule's CPartFile::m_gaplist.
 /// Each gap is a (start, end_exclusive) byte range that has NOT been received.
 /// A file with no gaps is complete.
@@ -68,6 +85,8 @@ pub struct PartTracker {
     /// Saved in `.part.met` only transiently — completion normally deletes
     /// the `.met` via `delete_met()` before the next process start.
     file_hash_verified: bool,
+    /// Invalidates queued snapshots when completion deletes `.part.met`.
+    save_generation: Arc<AtomicU64>,
 }
 
 impl PartTracker {
@@ -95,6 +114,7 @@ impl PartTracker {
             part_hashes: Vec::new(),
             part_verified: vec![false; part_count],
             file_hash_verified: false,
+            save_generation: Arc::new(AtomicU64::new(0)),
         };
 
         tracker.load();
@@ -125,6 +145,7 @@ impl PartTracker {
             part_hashes: Vec::new(),
             part_verified: vec![false; part_count],
             file_hash_verified: false,
+            save_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -496,6 +517,11 @@ impl PartTracker {
     /// File-format byte-for-byte identical to `save_emule_format` so eMule
     /// resume metadata interop is preserved.
     pub fn snapshot_for_save(&self) -> SaveSnapshot {
+        // Allocate a monotonically increasing sequence while the tracker is
+        // locked. A delayed older writer checks this value before replacing
+        // the file, so it cannot overwrite a newer snapshot that was taken
+        // concurrently by another source worker.
+        let generation = self.save_generation.fetch_add(1, Ordering::AcqRel).saturating_add(1);
         SaveSnapshot {
             met_path: self.met_path.clone(),
             file_size: self.file_size,
@@ -504,6 +530,8 @@ impl PartTracker {
             part_hashes: self.part_hashes.clone(),
             gaps: self.gaps.clone(),
             part_verified: self.part_verified.clone(),
+            save_generation: self.save_generation.clone(),
+            generation,
         }
     }
 
@@ -779,16 +807,18 @@ impl PartTracker {
             return Ok(());
         }
 
-        // If all tags parsed but zero gap tags were found, the .part.met is
-        // either for a genuinely complete file or is missing gap data.  Since
-        // .part.met files only exist for incomplete downloads, treat this as
-        // fully incomplete to be safe — the final hash will verify completeness.
+        // If all tags parsed but zero gap tags were found, preserve it as a
+        // complete-but-unverified candidate. This is the crash window after
+        // the final bytes and metadata were written but before the completed
+        // file was moved. The normal final whole-file verification runs before
+        // completion, while the all-false verified bitmap keeps it unsafe to
+        // advertise to uploads.
         if gap_starts.is_empty() && self.file_size > 0 {
             tracing::warn!(
-                "part.met has {} tags but no gap entries — assuming file is incomplete",
+                "part.met has {} tags but no gap entries — retaining complete candidate for final verification",
                 tag_count,
             );
-            self.gaps = vec![(0, self.file_size)];
+            self.gaps = Vec::new();
             return Ok(());
         }
 
@@ -874,6 +904,9 @@ impl PartTracker {
     }
 
     pub fn delete_met(&self) {
+        self.save_generation.fetch_add(1, Ordering::AcqRel);
+        let path_guard = save_path_guard(&self.met_path);
+        let _guard = path_guard.lock();
         let _ = std::fs::remove_file(&self.met_path);
     }
 }
@@ -890,6 +923,8 @@ pub struct SaveSnapshot {
     part_hashes: Vec<[u8; 16]>,
     gaps: Vec<(u64, u64)>,
     part_verified: Vec<bool>,
+    save_generation: Arc<AtomicU64>,
+    generation: u64,
 }
 
 impl SaveSnapshot {
@@ -984,6 +1019,11 @@ impl SaveSnapshot {
 /// caller MUST drop any tracker lock guard before awaiting this.
 pub async fn save_snapshot_async(snap: SaveSnapshot) {
     if let Err(join_err) = tokio::task::spawn_blocking(move || {
+        let path_guard = save_path_guard(&snap.met_path);
+        let _write_guard = path_guard.lock();
+        if snap.save_generation.load(Ordering::Acquire) != snap.generation {
+            return;
+        }
         if let Err(e) = snap.write_to_disk() {
             tracing::warn!("Failed to save part.met (async): {e}");
         }

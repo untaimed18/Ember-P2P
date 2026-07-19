@@ -951,6 +951,11 @@ pub struct AppSettings {
     /// separately from folder defaults because an explicit action must win.
     #[serde(default)]
     pub pending_file_priorities: std::collections::HashMap<String, String>,
+    /// Resume keys for bounded shared-folder discovery pages. Each normalized
+    /// folder path advances only after its page has been committed, so folders
+    /// larger than the in-memory scan budget are eventually indexed in full.
+    #[serde(default)]
+    pub shared_folder_scan_cursors: std::collections::HashMap<String, String>,
     /// Automatically check for Ember updates in the background shortly
     /// after launch (subject to `update_check_frequency`). This only gates
     /// the *silent* startup check — the "Check for Updates" button in
@@ -980,9 +985,13 @@ pub struct Ed2kDownloadLimits {
 
 impl AppSettings {
     pub fn ed2k_download_limits(&self) -> Ed2kDownloadLimits {
-        let gib = self.max_download_file_size_gib.clamp(1, 16_384) as u128;
-        let max_download_bytes =
-            (gib.saturating_mul(1024 * 1024 * 1024)).min(u64::MAX as u128) as u64;
+        // Standard ED2K wire part counts are u16. The integer GiB setting is
+        // capped at 593, then the exact byte ceiling closes the remaining
+        // fractional-GiB gap so malformed settings cannot reintroduce wraps.
+        let gib = self.max_download_file_size_gib.clamp(1, 593) as u128;
+        let max_download_bytes = (gib.saturating_mul(1024 * 1024 * 1024))
+            .min(crate::network::ed2k::messages::ED2K_MAX_FILE_SIZE_BYTES as u128)
+            as u64;
         Ed2kDownloadLimits {
             queue_wait_secs: self.download_queue_wait_secs.clamp(60, 14400),
             multisource_retry_rounds: self.multisource_retry_rounds.clamp(1, 20),
@@ -1132,7 +1141,7 @@ fn default_download_part_retry_rounds() -> u32 {
 }
 
 fn default_max_download_file_size_gib() -> u32 {
-    4096
+    593
 }
 
 fn default_search_timeout_secs() -> u64 {
@@ -1245,6 +1254,7 @@ impl Default for AppSettings {
             folder_priorities: std::collections::HashMap::new(),
             pending_share_states: std::collections::HashMap::new(),
             pending_file_priorities: std::collections::HashMap::new(),
+            shared_folder_scan_cursors: std::collections::HashMap::new(),
             nodes_dat_path: String::new(),
             upnp_enabled: false,
             stun_keepalive_enabled: true,

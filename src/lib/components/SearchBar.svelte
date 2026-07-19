@@ -41,6 +41,14 @@
   let wrapEl: HTMLDivElement | undefined = $state(undefined);
   let clearRecentConfirmOpen = $state(false);
   let inputEl: HTMLInputElement | undefined = $state(undefined);
+  const recentListId = $derived(
+    `search-recent-${(recentKey ?? 'default').replace(/[^a-z0-9_-]+/gi, '-')}`,
+  );
+  const activeOptionId = $derived(
+    showRecent && activeIndex >= 0 && activeIndex < recent.length
+      ? `${recentListId}-option-${activeIndex}`
+      : undefined,
+  );
 
   function loadRecent() {
     if (!recentKey) return;
@@ -131,6 +139,11 @@
         pickRecent(recent[activeIndex]);
         return;
       }
+      if ((e.key === 'Delete' || e.key === 'Backspace') && activeIndex >= 0) {
+        e.preventDefault();
+        removeRecent(recent[activeIndex]);
+        return;
+      }
     }
     if (e.key === 'Enter') {
       submit(value);
@@ -195,7 +208,8 @@
         role="combobox"
         aria-autocomplete="list"
         aria-expanded={showRecent}
-        aria-controls="search-recent-list"
+        aria-controls={recentListId}
+        aria-activedescendant={activeOptionId}
         autocomplete="off"
       />
     {:else}
@@ -223,21 +237,20 @@
   </div>
 
   {#if recentKey && showRecent && recent.length > 0}
-    <div id="search-recent-list" class="recent-dropdown" role="listbox" aria-label={m.search_bar_recent_searches()}>
+    <div class="recent-dropdown">
       <div class="recent-header">
         <span>{m.search_bar_recent_searches()}</span>
         <button type="button" class="recent-clear" onclick={requestClearRecent}>{m.search_bar_clear_all()}</button>
       </div>
-      {#each recent as q, i (q)}
-        <div
-          class="recent-item"
-          class:active={i === activeIndex}
-          role="option"
-          aria-selected={i === activeIndex}
-        >
-          <button
-            type="button"
-            class="recent-pick"
+      <div id={recentListId} role="listbox" aria-label={m.search_bar_recent_searches()}>
+        {#each recent as q, i (q)}
+          <div
+            class="recent-item"
+            class:active={i === activeIndex}
+            role="option"
+            id={`${recentListId}-option-${i}`}
+            aria-selected={i === activeIndex}
+            tabindex="-1"
             onmousedown={(e) => { e.preventDefault(); pickRecent(q); }}
             onmouseenter={() => (activeIndex = i)}
           >
@@ -246,20 +259,9 @@
               <path d="M8 4.5V8l2.25 1.5"/>
             </svg>
             <span class="recent-text">{q}</span>
-          </button>
-          <button
-            type="button"
-            class="recent-remove"
-            aria-label={m.search_bar_remove_recent({ query: q })}
-            onmousedown={(e) => { e.preventDefault(); removeRecent(q); }}
-          >
-            <svg viewBox="0 0 14 14" width="10" height="10" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
-              <line x1="3.5" y1="3.5" x2="10.5" y2="10.5"/>
-              <line x1="10.5" y1="3.5" x2="3.5" y2="10.5"/>
-            </svg>
-          </button>
-        </div>
-      {/each}
+          </div>
+        {/each}
+      </div>
     </div>
   {/if}
 </div>
@@ -403,22 +405,11 @@
   }
 
   .recent-item {
-    display: flex;
-    align-items: stretch;
-    min-height: 32px;
-  }
-
-  .recent-item.active,
-  .recent-item:hover {
-    background: var(--bg-hover);
-  }
-
-  .recent-pick {
-    flex: 1;
     min-width: 0;
     display: flex;
     align-items: center;
     gap: 8px;
+    min-height: 32px;
     padding: 6px 12px;
     border: none;
     background: transparent;
@@ -428,7 +419,12 @@
     cursor: pointer;
   }
 
-  .recent-pick:focus-visible {
+  .recent-item.active,
+  .recent-item:hover {
+    background: var(--bg-hover);
+  }
+
+  .recent-item:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: -2px;
   }
@@ -444,27 +440,4 @@
     white-space: nowrap;
   }
 
-  .recent-remove {
-    width: 28px;
-    padding: 0;
-    border: none;
-    background: transparent;
-    color: var(--text-muted);
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    cursor: pointer;
-    opacity: 0.6;
-    flex-shrink: 0;
-  }
-
-  .recent-item:hover .recent-remove,
-  .recent-item.active .recent-remove {
-    opacity: 1;
-  }
-
-  .recent-remove:hover {
-    color: var(--danger);
-    background: var(--bg-hover);
-  }
 </style>

@@ -6,6 +6,7 @@ use walkdir::WalkDir;
 
 use crate::network::ed2k::aich::compute_aich_root;
 use crate::network::ed2k::hash::{ed2k_hash_file, hash_file_combined_cancellable};
+use crate::search::index::normalize_path_key;
 use crate::types::FileInfo;
 
 pub struct FileIndexer;
@@ -16,6 +17,9 @@ const MAX_DISCOVERED_FILES: usize = 100_000;
 pub struct DiscoveryResult {
     pub files: Vec<FileInfo>,
     pub truncated: bool,
+    /// Normalized path after which the next bounded scan should continue.
+    /// `None` means this page covered the whole folder.
+    pub next_cursor: Option<String>,
 }
 
 impl FileIndexer {
@@ -24,13 +28,26 @@ impl FileIndexer {
     /// UI immediately.  A temporary id is generated from the path so the file
     /// can be identified until its real ED2K hash is computed.
     pub fn discover_directory(dir: &str) -> DiscoveryResult {
+        Self::discover_directory_page(dir, None)
+    }
+
+    /// Discover one deterministic page of a directory. The indexer keeps a
+    /// bounded page in memory but walks through the directory to collect a
+    /// wraparound page after `cursor`, so repeated scans eventually cover files
+    /// beyond the old fixed 100k prefix.
+    pub fn discover_directory_page(dir: &str, cursor: Option<&str>) -> DiscoveryResult {
         let mut files = Vec::new();
-        let mut truncated = false;
+        let mut wraparound = Vec::new();
+        let mut eligible_count = 0usize;
         let path = Path::new(dir);
 
         if !path.exists() || !path.is_dir() {
             warn!("Directory does not exist or is not a directory: {dir}");
-            return DiscoveryResult { files, truncated };
+            return DiscoveryResult {
+                files,
+                truncated: false,
+                next_cursor: None,
+            };
         }
 
         // Defense in depth: if a parent of the Ember data dir was somehow
@@ -42,6 +59,13 @@ impl FileIndexer {
 
         for entry in WalkDir::new(path)
             .follow_links(false)
+            // Cursor comparisons use normalized full paths, so traversal must
+            // use the same ordering. Sorting only basenames can cycle between
+            // DFS directory groups and permanently starve later paths.
+            .sort_by(|left, right| {
+                normalize_path_key(&left.path().to_string_lossy())
+                    .cmp(&normalize_path_key(&right.path().to_string_lossy()))
+            })
             .into_iter()
             .filter_entry(|e| {
                 if e.path_is_symlink() {
@@ -93,14 +117,15 @@ impl FileIndexer {
                 }
                 match Self::discover_file(entry.path()) {
                     Ok(info) => {
-                        debug!("Discovered: {}", info.name);
-                        files.push(info);
-                        if files.len() >= MAX_DISCOVERED_FILES {
-                            warn!(
-                                "Stopping discovery in {dir}: reached file cap {MAX_DISCOVERED_FILES}"
-                            );
-                            truncated = true;
-                            break;
+                        eligible_count = eligible_count.saturating_add(1);
+                        let key = normalize_path_key(&info.path);
+                        if cursor.is_none_or(|value| key.as_str() > value) {
+                            if files.len() < MAX_DISCOVERED_FILES {
+                                debug!("Discovered: {}", info.name);
+                                files.push(info);
+                            }
+                        } else if wraparound.len() < MAX_DISCOVERED_FILES {
+                            wraparound.push(info);
                         }
                     }
                     Err(e) => {
@@ -110,8 +135,26 @@ impl FileIndexer {
             }
         }
 
+        if files.len() < MAX_DISCOVERED_FILES {
+            let remaining = MAX_DISCOVERED_FILES - files.len();
+            files.extend(wraparound.into_iter().take(remaining));
+        }
+        let truncated = eligible_count > files.len();
+        let next_cursor = truncated
+            .then(|| files.last().map(|file| normalize_path_key(&file.path)))
+            .flatten();
+        if truncated {
+            warn!(
+                "Discovery page in {dir} reached file cap {MAX_DISCOVERED_FILES}; a later scan resumes after {}",
+                next_cursor.as_deref().unwrap_or_default()
+            );
+        }
         info!("Discovered {} files from {dir}", files.len());
-        DiscoveryResult { files, truncated }
+        DiscoveryResult {
+            files,
+            truncated,
+            next_cursor,
+        }
     }
 
     /// Collect file metadata WITHOUT hashing (instant).

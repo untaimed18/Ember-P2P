@@ -749,7 +749,27 @@ pub async fn connect_friend_with_fallback(
         }
     }
 
-    match relay_friend(&rendezvous_url, our_ember_hash, expected_ember_hash, addr).await {
+    // Server relay tickets are deliberately restricted to a manually-known
+    // friend. The transport's later Ember handshake also verifies the peer,
+    // but refusing before issuing a ticket avoids turning arbitrary source
+    // addresses into authenticated relay capabilities.
+    if !friend_hashes.read().await.contains(&expected_ember_hash) {
+        return Err(anyhow::anyhow!(
+            "server relay is restricted to known friends"
+        ));
+    }
+    let relay_secret = ed25519_secret_key.ok_or_else(|| {
+        anyhow::anyhow!("server relay requires the local registered identity key")
+    })?;
+
+    match relay_friend(
+        &rendezvous_url,
+        our_ember_hash,
+        expected_ember_hash,
+        &relay_secret,
+    )
+    .await
+    {
         Ok(ws_stream) => {
             info!(
                 "Friend relay to {} connected",
@@ -864,47 +884,50 @@ async fn punch_friend(
 /// Fall back to a rendezvous-brokered WebSocket relay to reach a friend
 /// whose hole-punch (if attempted) didn't land.
 ///
-/// Addressed by `(ip, port)` — the same synthetic id scheme the download
-/// broker uses for LowID sources, and the *only* scheme the existing
-/// relay-invite responder (`network/mod.rs`'s "poll for incoming
-/// server-relay invitations" task, which every rendezvous-registered node
-/// already runs unconditionally) knows how to answer. `friend_addr` is
-/// the friend's last rendezvous-registered `(ip, tcp_port)` — the exact
-/// value that responder independently recomputes from its own
-/// `state.external_ip` / `state.quic_port`, so no new responder-side code
-/// is needed: the friend's own client picks this invitation up the next
-/// time its existing poller runs.
+/// The ticket is addressed to the friend's registered Ember identity, not a
+/// synthetic IP:port. The peer's signed ticket poller accepts it only after
+/// confirming that our identity is in its known-friend set.
 async fn relay_friend(
     rendezvous_url: &str,
     our_ember_hash: [u8; 16],
     friend_ember_hash: [u8; 16],
-    friend_addr: SocketAddr,
+    secret_key: &[u8; 32],
 ) -> Result<crate::network::ember::relay::WsStream, String> {
-    let target_id = match friend_addr.ip() {
-        std::net::IpAddr::V4(v4) => format!(
-            "{:0>64}",
-            format!("{:08x}{:04x}", u32::from(v4), friend_addr.port())
-        ),
-        std::net::IpAddr::V6(_) => {
-            return Err("friend relay requires an IPv4 rendezvous address".to_string())
-        }
-    };
-    let nonce = {
-        use rand::RngCore;
-        let mut n = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut n);
-        hex::encode(n)
-    };
-    let session_id = format!(
-        "friend-{}-{}-{}",
-        hex::encode(our_ember_hash),
-        hex::encode(friend_ember_hash),
-        nonce
-    );
+    let offer = crate::network::rendezvous::offer_friend_relay_ticket(
+        rendezvous_url,
+        &our_ember_hash,
+        &friend_ember_hash,
+        secret_key,
+    )
+    .await?;
 
-    crate::network::ember::relay::post_relay_invite(rendezvous_url, &target_id, &session_id)
-        .await?;
-    crate::network::ember::relay::connect_server_relay(rendezvous_url, &session_id).await
+    // The responder polls independently. Ticket expiry is 90 seconds; wait
+    // less than that so a transient failure can create a clean new offer.
+    for _ in 0..45 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        match crate::network::rendezvous::friend_relay_ticket_accepted(
+            rendezvous_url,
+            &our_ember_hash,
+            &offer.ticket_id,
+            secret_key,
+        )
+        .await
+        {
+            Ok(true) => {
+                return crate::network::ember::relay::connect_server_relay(
+                    rendezvous_url,
+                    &offer.ticket_id,
+                    &offer.initiator_token,
+                )
+                .await;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                return Err(format!("friend relay ticket status failed: {e}"));
+            }
+        }
+    }
+    Err("friend relay ticket was not accepted before timeout".to_string())
 }
 
 use super::multi_source::parse_browse_response;

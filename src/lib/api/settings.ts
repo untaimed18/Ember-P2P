@@ -5,13 +5,19 @@ export async function getSettings(): Promise<AppSettings> {
   return invoke('get_settings');
 }
 
+interface UpdateSettingsResult {
+  message: string;
+  settings: AppSettings;
+  liveApplyQueued: boolean;
+}
+
 export async function updateSettings(settings: AppSettings): Promise<string> {
-  const result = await invoke<string>('update_settings', { settings });
-  // The backend accepts this exact revision and commits revision + 1.
-  // Keep the caller's snapshot current so a subsequent save from the same
-  // screen/wizard is not incorrectly rejected as stale.
-  settings.settings_revision += 1;
-  return result;
+  const result = await invoke<UpdateSettingsResult>('update_settings', { settings });
+  // Always use the canonical persisted revision, including the partial-success
+  // path where runtime application was deferred because the command queue was
+  // full. A retry must never submit a stale revision.
+  Object.assign(settings, result.settings);
+  return result.message;
 }
 
 export async function downloadNodesDat(): Promise<string> {

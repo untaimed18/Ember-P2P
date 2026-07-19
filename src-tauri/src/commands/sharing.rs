@@ -647,6 +647,54 @@ async fn persist_pending_intents(
     Ok(())
 }
 
+/// Persist completed shared-folder discovery pages. Cursors are advanced only
+/// after the page has entered the in-memory index; if this save fails, a later
+/// scan may repeat a page but it can never skip files.
+pub(crate) async fn persist_scan_cursors(
+    state: &AppState,
+    updates: &std::collections::HashMap<String, Option<String>>,
+) -> Result<(), String> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let _settings_save_guard = state.settings_save_lock.lock().await;
+    let mut settings = {
+        let config = state.config.read().await;
+        config.settings.clone()
+    };
+    for (folder, cursor) in updates {
+        match cursor {
+            Some(value) => {
+                settings
+                    .shared_folder_scan_cursors
+                    .insert(crate::search::index::normalize_path_key(folder), value.clone());
+            }
+            None => {
+                settings
+                    .shared_folder_scan_cursors
+                    .remove(&crate::search::index::normalize_path_key(folder));
+            }
+        }
+    }
+    // Scan cursors are internal recovery bookkeeping, not a user setting;
+    // changing the visible revision here would make an open Settings form
+    // spuriously stale whenever a large folder advances a page.
+    let (data, tmp, final_path) = {
+        let config = state.config.read().await;
+        config
+            .prepare_save_settings(&settings)
+            .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?
+    };
+    tokio::task::spawn_blocking(move || {
+        crate::storage::config::AppConfig::write_to_disk(&data, &tmp, &final_path)
+    })
+    .await
+    .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?
+    .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?;
+    state.config.write().await.settings = settings;
+    Ok(())
+}
+
 /// eMule-style shared folder addition -- returns IMMEDIATELY.
 /// All discovery and hashing runs in a background task:
 ///   Phase 1: discover files (metadata only) → show in UI via event
@@ -876,6 +924,7 @@ pub async fn add_shared_folder(
                 serde_json::json!({ "folder": path, "limit": 100_000 }),
             );
         }
+        let discovery_next_cursor = discovery.next_cursor;
         let mut discovered = discovery.files;
 
         let total_files = discovered.len();
@@ -952,6 +1001,7 @@ pub async fn add_shared_folder(
         let mut hashed_count: usize = 0;
         let mut last_cache_refresh = std::time::Instant::now();
         let mut was_cancelled = false;
+        let mut page_complete = true;
 
         for file in &files_to_hash {
             if cancel_flag.load(Ordering::Relaxed) {
@@ -1029,9 +1079,13 @@ pub async fn add_shared_folder(
                     }
                     {
                         let mut index = local_index.write().await;
-                        index.remove_file_by_id(&file_temp_id);
                         if !cancel_flag.load(Ordering::Relaxed) && still_shared {
-                            index.add_file_no_rebuild(updated_file.clone());
+                            // Preserve share/priority changes made while this
+                            // pending row was hashing. If it was removed by a
+                            // concurrent unshare/cancel, do not resurrect it.
+                            let _ = index.finalize_pending_hash(&file_temp_id, updated_file.clone());
+                        } else {
+                            index.remove_file_by_id(&file_temp_id);
                         }
                     }
 
@@ -1060,11 +1114,13 @@ pub async fn add_shared_folder(
                         break;
                     }
                     warn!("Failed to hash {}: {e}", file.name);
+                    page_complete = false;
                     let mut index = local_index.write().await;
                     index.remove_file_by_id(&file_temp_id);
                 }
                 Ok(Err(e)) => {
                     tracing::error!("Hash task panicked for {}: {e}", file.name);
+                    page_complete = false;
                     let mut index = local_index.write().await;
                     index.remove_file_by_id(&file_temp_id);
                 }
@@ -1073,6 +1129,7 @@ pub async fn add_shared_folder(
                     // finish hashing; dropping it here made slow/cloud files
                     // disappear from the share list after one timeout.
                     warn!("Hash timed out after 5 min for {} (file may be on cloud storage or locked); leaving pending for retry", file.name);
+                    page_complete = false;
                 }
             }
         }
@@ -1088,6 +1145,14 @@ pub async fn add_shared_folder(
             index.rebuild();
         }
 
+        if !was_cancelled && page_complete {
+            let mut cursor_update = std::collections::HashMap::new();
+            cursor_update.insert(canonical_str.clone(), discovery_next_cursor);
+            let app_state = app.state::<AppState>();
+            if let Err(error) = persist_scan_cursors(&app_state, &cursor_update).await {
+                warn!("Shared-folder page was indexed but its resume cursor was not saved: {error}");
+            }
+        }
         refresh_file_cache(&local_index, &file_cache).await;
 
         if !was_cancelled {
@@ -1230,6 +1295,9 @@ pub async fn remove_shared_folder(
         new_settings.pending_file_priorities.retain(|path, _| {
             !crate::security::path_matches_dir(path, &canonical_path)
         });
+        new_settings.shared_folder_scan_cursors.retain(|folder, _| {
+            !paths_equal_ignore_case(folder, &canonical_path)
+        });
         new_settings.settings_revision = config.settings.settings_revision.saturating_add(1);
         config
             .prepare_save_settings(&new_settings)
@@ -1259,6 +1327,9 @@ pub async fn remove_shared_folder(
         });
         config.settings.pending_file_priorities.retain(|path, _| {
             !crate::security::path_matches_dir(path, &canonical_path)
+        });
+        config.settings.shared_folder_scan_cursors.retain(|folder, _| {
+            !paths_equal_ignore_case(folder, &canonical_path)
         });
         config.settings.settings_revision = config.settings.settings_revision.saturating_add(1);
     }
@@ -1766,9 +1837,12 @@ pub async fn reload_shared_files(
     state.hashing_fs_dirty.store(false, Ordering::Relaxed);
     state.library_scan_truncated.store(false, Ordering::Relaxed);
 
-    let folders = {
+    let (folders, scan_cursors) = {
         let config = state.config.read().await;
-        config.settings.shared_folders.clone()
+        (
+            config.settings.shared_folders.clone(),
+            config.settings.shared_folder_scan_cursors.clone(),
+        )
     };
 
     let local_index = state.local_index.clone();
@@ -1781,6 +1855,7 @@ pub async fn reload_shared_files(
     let config = state.config.clone();
     let scan_truncated = state.library_scan_truncated.clone();
     let discovery_folders = folders.clone();
+    let discovery_cursors = scan_cursors;
 
     let cancel_flag = Arc::new(AtomicBool::new(false));
     let reload_key = format!(
@@ -1807,16 +1882,23 @@ pub async fn reload_shared_files(
         scanning.fetch_add(1, Ordering::Relaxed);
         let _scan_guard = ScanGuard(scanning.clone());
 
-        let (mut discovered, discovery_truncated): (Vec<FileInfo>, bool) =
+        let (mut discovered, discovery_truncated, discovery_cursor_updates):
+            (Vec<FileInfo>, bool, std::collections::HashMap<String, Option<String>>) =
             match tokio::task::spawn_blocking(move || {
                 let mut files = Vec::new();
                 let mut truncated = false;
+                let mut cursor_updates = std::collections::HashMap::new();
                 for folder in &discovery_folders {
-                    let result = FileIndexer::discover_directory(folder);
+                    let key = crate::search::index::normalize_path_key(folder);
+                    let result = FileIndexer::discover_directory_page(
+                        folder,
+                        discovery_cursors.get(&key).map(String::as_str),
+                    );
                     truncated |= result.truncated;
+                    cursor_updates.insert(folder.clone(), result.next_cursor);
                     files.extend(result.files);
                 }
-                (files, truncated)
+                (files, truncated, cursor_updates)
             })
             .await
             {
@@ -1905,6 +1987,7 @@ pub async fn reload_shared_files(
         let mut hashed_count: usize = 0;
         let mut last_cache_refresh = std::time::Instant::now();
         let mut was_cancelled = false;
+        let mut page_complete = true;
 
         for file in &files_to_hash {
             if cancel_flag.load(Ordering::Relaxed) {
@@ -1982,9 +2065,12 @@ pub async fn reload_shared_files(
                     }
                     {
                         let mut index = local_index.write().await;
-                        index.remove_file_by_id(&file_temp_id);
                         if !cancel_flag.load(Ordering::Relaxed) && still_shared {
-                            index.add_file_no_rebuild(updated_file.clone());
+                            // The current pending row is authoritative for
+                            // user-controlled share state and priority.
+                            let _ = index.finalize_pending_hash(&file_temp_id, updated_file.clone());
+                        } else {
+                            index.remove_file_by_id(&file_temp_id);
                         }
                     }
 
@@ -2013,11 +2099,13 @@ pub async fn reload_shared_files(
                         break;
                     }
                     warn!("Failed to hash {}: {e}", file.name);
+                    page_complete = false;
                     let mut index = local_index.write().await;
                     index.remove_file_by_id(&file_temp_id);
                 }
                 Ok(Err(e)) => {
                     tracing::error!("Hash task panicked for {}: {e}", file.name);
+                    page_complete = false;
                     let mut index = local_index.write().await;
                     index.remove_file_by_id(&file_temp_id);
                 }
@@ -2026,6 +2114,7 @@ pub async fn reload_shared_files(
                     // finish hashing; dropping it here made slow/cloud files
                     // disappear from the share list after one timeout.
                     warn!("Hash timed out after 5 min for {} (file may be on cloud storage or locked); leaving pending for retry", file.name);
+                    page_complete = false;
                 }
             }
         }
@@ -2040,6 +2129,20 @@ pub async fn reload_shared_files(
             index.rebuild();
         }
 
+        if !was_cancelled && page_complete {
+            let cursor_updates = discovery_cursor_updates
+                .into_iter()
+                .filter(|(folder, _)| {
+                    reloaded_folders
+                        .iter()
+                        .any(|active| paths_equal_ignore_case(active, folder))
+                })
+                .collect::<std::collections::HashMap<_, _>>();
+            let app_state = app.state::<AppState>();
+            if let Err(error) = persist_scan_cursors(&app_state, &cursor_updates).await {
+                warn!("Shared-folder scan page was indexed but its resume cursor was not saved: {error}");
+            }
+        }
         refresh_file_cache(&local_index, &file_cache).await;
 
         if !was_cancelled {

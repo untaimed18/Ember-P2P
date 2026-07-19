@@ -21,9 +21,11 @@
   let {
     settings,
     oncomplete,
+    closeDialogOpen = false,
   }: {
     settings: AppSettings;
     oncomplete: (updated: AppSettings) => Promise<void>;
+    closeDialogOpen?: boolean;
   } = $props();
 
   const TOTAL_STEPS = 8;
@@ -50,7 +52,7 @@
   let cardEl: HTMLDivElement | undefined = $state(undefined);
 
   $effect(() => {
-    if (!overlayEl) return;
+    if (!overlayEl || closeDialogOpen) return;
     return inertBackground(overlayEl);
   });
   $effect(() => {
@@ -573,7 +575,7 @@
   .wizard-overlay {
     position: fixed;
     inset: 0;
-    z-index: 99999;
+    z-index: 9999;
     display: grid;
     place-items: center;
     background: var(--bg-primary);

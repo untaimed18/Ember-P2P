@@ -361,6 +361,8 @@ pub fn run() {
             // Allow WebView media playback for files under shared/download dirs.
             commands::sharing::sync_asset_protocol_scope(&app_handle, &config);
 
+            let pending_deep_links =
+                commands::deeplink::load_pending_queue(&app_handle);
             app.manage(AppState {
                 network_tx,
                 db: db.clone(),
@@ -391,7 +393,7 @@ pub fn run() {
                 close_behavior: Arc::new(parking_lot::RwLock::new(
                     settings.close_to_tray_behavior.clone(),
                 )),
-                pending_deep_links: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                pending_deep_links: Arc::new(parking_lot::Mutex::new(pending_deep_links)),
             });
 
             // Non-silent recovery notice: if config.json was corrupt at load,
@@ -508,6 +510,7 @@ pub fn run() {
 
             let index_clone = local_index.clone();
             let shared_folders = settings.shared_folders.clone();
+            let startup_scan_cursors = settings.shared_folder_scan_cursors.clone();
             let startup_scanning = scanning_count.clone();
             let startup_scan_coordination = scan_coordination.clone();
             let csf = cached_shared_files.clone();
@@ -537,11 +540,20 @@ pub fn run() {
                     .iter()
                     .map(|folder| {
                         let f = folder.clone();
-                        tokio::task::spawn_blocking(move || FileIndexer::discover_directory(&f))
+                        let cursor = startup_scan_cursors
+                            .get(&crate::search::index::normalize_path_key(folder))
+                            .cloned();
+                        (
+                            folder.clone(),
+                            tokio::task::spawn_blocking(move || {
+                                FileIndexer::discover_directory_page(&f, cursor.as_deref())
+                            }),
+                        )
                     })
                     .collect();
                 let mut all_discovered: Vec<crate::types::FileInfo> = Vec::new();
-                for handle in discovery_handles {
+                let mut startup_cursor_updates = std::collections::HashMap::new();
+                for (folder, handle) in discovery_handles {
                     match handle.await {
                         Ok(result) => {
                             if result.truncated {
@@ -557,6 +569,7 @@ pub fn run() {
                                     serde_json::json!({ "folder": "startup", "limit": 100_000 }),
                                 );
                             }
+                            startup_cursor_updates.insert(folder, result.next_cursor);
                             all_discovered.extend(result.files);
                         }
                         Err(e) => tracing::error!("discover_directory panicked for folder: {e}"),
@@ -686,6 +699,7 @@ pub fn run() {
                 let mut last_known_met_persist = std::time::Instant::now();
                 let mut hashed_since_persist = 0usize;
                 let mut was_cancelled = false;
+                let mut page_complete = true;
 
                 for file in &files_to_hash {
                     if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
@@ -752,9 +766,14 @@ pub fn run() {
                             }
                             {
                                 let mut idx = index_clone.write().await;
-                                idx.remove_file_by_id(&file_temp_id);
                                 if !cancel_flag.load(std::sync::atomic::Ordering::Relaxed) && still_shared {
-                                    idx.add_file_no_rebuild(updated.clone());
+                                    // Keep any explicit share/priority choice
+                                    // made while this row was pending. A
+                                    // removed pending row must not return just
+                                    // because its hash computation finished.
+                                    let _ = idx.finalize_pending_hash(&file_temp_id, updated.clone());
+                                } else {
+                                    idx.remove_file_by_id(&file_temp_id);
                                 }
                             }
                             if !cancel_flag.load(std::sync::atomic::Ordering::Relaxed) && still_shared {
@@ -797,11 +816,13 @@ pub fn run() {
                                 break;
                             }
                             tracing::warn!("Startup hash failed for {}: {e}", file.name);
+                            page_complete = false;
                             let mut idx = index_clone.write().await;
                             idx.remove_file_by_id(&file_temp_id);
                         }
                         Ok(Err(e)) => {
                             tracing::error!("Startup hash task panicked for {}: {e}", file.name);
+                            page_complete = false;
                             let mut idx = index_clone.write().await;
                             idx.remove_file_by_id(&file_temp_id);
                         }
@@ -813,6 +834,7 @@ pub fn run() {
                                 "Startup hash timed out for {} (file may be on cloud storage or locked); leaving pending for retry",
                                 file.name
                             );
+                            page_complete = false;
                         }
                     }
                 }
@@ -825,6 +847,19 @@ pub fn run() {
                     idx.rebuild();
                 }
 
+                if !was_cancelled && page_complete {
+                    let app_state = startup_app.state::<AppState>();
+                    if let Err(error) = commands::sharing::persist_scan_cursors(
+                        &app_state,
+                        &startup_cursor_updates,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            "Startup shared-folder pages were indexed but scan cursors were not saved: {error}"
+                        );
+                    }
+                }
                 commands::sharing::refresh_file_cache(&index_clone, &csf).await;
 
                 if !was_cancelled {
@@ -1009,6 +1044,7 @@ pub fn run() {
             commands::peers::accept_friend_request,
             commands::peers::reject_friend_request,
             commands::peers::browse_friend,
+            commands::peers::cancel_browse_friend,
             commands::peers::retry_friend_search,
             commands::peers::is_friend_discoverable,
             commands::peers::get_online_friends,
@@ -1075,6 +1111,8 @@ pub fn run() {
             commands::preview::preview_file,
             commands::speed_test::run_speed_test,
             commands::deeplink::take_pending_deep_links,
+            commands::deeplink::list_pending_deep_links,
+            commands::deeplink::ack_pending_deep_link,
             commands::deeplink::open_collection_file,
         ])
         .on_window_event(|window, event| {

@@ -788,7 +788,7 @@ fn peer_part_status_hex(advertised: u16, bitmap: &[u8], total_size: u64) -> Opti
         return None;
     }
     let real_parts = ed2k_part_count_for_size(total_size);
-    if real_parts == 0 || advertised != ed2k_wire_part_count(total_size) as u16 {
+    if real_parts == 0 || Some(advertised) != ed2k_wire_part_count_u16(total_size) {
         return None;
     }
     let need = (advertised as usize).div_ceil(8);
@@ -5505,7 +5505,13 @@ impl UploadHandler {
                         if let Some(file) = self.resolve_upload_file(&hash).await {
                             self.record_share_request_once(&hash, &mut recorded_share_request)
                                 .await;
-                            let ed2k_part_count = ed2k_wire_part_count(file.size) as u16;
+                            let Some(ed2k_part_count) = ed2k_wire_part_count_u16(file.size) else {
+                                warn!(
+                                    "Refusing OP_FILESTATUS for {}: file exceeds standard ED2K wire part-count limit",
+                                    file.name
+                                );
+                                continue;
+                            };
                             let bitmap_bytes = ((ed2k_part_count as usize) + 7) / 8;
                             let mut status_payload = Vec::with_capacity(18 + bitmap_bytes);
                             status_payload.extend_from_slice(&hash);
@@ -7651,7 +7657,11 @@ impl UploadHandler {
                 (OP_EMULEPROT, OP_MULTIPACKET)
                 | (OP_EMULEPROT, OP_MULTIPACKET_EXT)
                 | (OP_EMULEPROT, OP_MULTIPACKET_EXT2) => {
-                    match parse_multipacket(&payload, opcode) {
+                    match parse_multipacket(
+                        &payload,
+                        opcode,
+                        hello_caps.extended_requests_ver,
+                    ) {
                         Ok(mpreq) => {
                             let hash_hex = hex::encode(mpreq.file_hash);
                             if let Some(file) = self.resolve_upload_file(&mpreq.file_hash).await {
@@ -7740,7 +7750,7 @@ impl UploadHandler {
                                     None
                                 };
 
-                                let answer = build_multipacket_answer(
+                                let Some(answer) = build_multipacket_answer(
                                     &mpreq.file_hash,
                                     &file.name,
                                     file.size,
@@ -7749,7 +7759,19 @@ impl UploadHandler {
                                     parse_aich_root_hash(&file.aich_hash_hex),
                                     mpreq.is_ext2,
                                     &mpreq.sub_opcodes,
-                                );
+                                ) else {
+                                    debug!(
+                                        "Refusing MultiPacket response for {hash_hex}: file exceeds standard ED2K wire part-count limit"
+                                    );
+                                    write_packet_async(
+                                        &mut writer,
+                                        OP_EDONKEYHEADER,
+                                        OP_FILEREQANSNOFIL,
+                                        &mpreq.file_hash,
+                                    )
+                                    .await?;
+                                    continue;
+                                };
 
                                 let resp_opcode = if mpreq.is_ext2 {
                                     OP_MULTIPACKETANSWER_EXT2

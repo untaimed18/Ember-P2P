@@ -210,6 +210,33 @@ impl LocalIndex {
         self.rebuild_indices();
     }
 
+    /// Replace a pending discovery row with its completed identity while
+    /// retaining the *current* user-controlled state. Share/priority edits can
+    /// arrive while hashing is in progress, so cloning the stale discovery
+    /// snapshot here would undo an explicit Unshare or priority change.
+    ///
+    /// Returns the completed row only when the pending row still exists. A
+    /// folder removal or cancellation that removed it wins over hash completion.
+    pub fn finalize_pending_hash(
+        &mut self,
+        pending_id: &str,
+        mut completed: FileInfo,
+    ) -> Option<FileInfo> {
+        let pos = self.files.iter().position(|file| file.id == pending_id)?;
+        let pending = self.swap_remove_indexed(pos);
+        completed.shared = pending.shared;
+        completed.priority = pending.priority;
+        completed.bytes_transferred = pending.bytes_transferred;
+        completed.requests = pending.requests;
+        completed.accepted = pending.accepted;
+        completed.alltime_requests = pending.alltime_requests;
+        completed.alltime_accepted = pending.alltime_accepted;
+        completed.alltime_transferred = pending.alltime_transferred;
+        completed.complete_sources = pending.complete_sources;
+        self.add_file_no_rebuild(completed.clone());
+        Some(completed)
+    }
+
     /// Return all unique file hashes present in the index.
     pub fn all_hashes(&self) -> Vec<String> {
         self.hash_map.keys().cloned().collect()
@@ -880,5 +907,35 @@ mod local_index_tests {
         assert_eq!(mutation.changed_paths, 1);
         assert!(mutation.hashes.is_empty());
         assert!(!index.get_by_path("A/pending.bin").unwrap().shared);
+    }
+
+    #[test]
+    fn finalize_pending_hash_keeps_live_share_and_priority() {
+        let mut index = LocalIndex::new();
+        let mut pending = file("A/pending.bin", "", true, "normal");
+        pending.id = "pending:A/pending.bin".to_string();
+        index.add_file(pending);
+
+        let _ = index.set_file_shared_by_path("A/pending.bin", false);
+        assert_eq!(
+            index.set_file_priority_by_path_count("A/pending.bin", "high"),
+            1
+        );
+
+        let completed = file(
+            "A/pending.bin",
+            "cccccccccccccccccccccccccccccccc",
+            true,
+            "normal",
+        );
+        let finalized = index
+            .finalize_pending_hash("pending:A/pending.bin", completed)
+            .expect("pending row should still exist");
+
+        assert!(!finalized.shared);
+        assert_eq!(finalized.priority, "high");
+        assert!(index.get_by_path("A/pending.bin").is_some());
+        assert!(!index.get_by_path("A/pending.bin").unwrap().shared);
+        assert_eq!(index.get_by_path("A/pending.bin").unwrap().priority, "high");
     }
 }

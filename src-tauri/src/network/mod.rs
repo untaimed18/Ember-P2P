@@ -317,16 +317,6 @@ fn apply_udp_mapping_keepalive(
             if state.external_udp_port == Some(stun_port) {
                 state.external_udp_port = state.firewall_checker.external_udp_port();
             }
-            // Same-port TCP mirrors whatever the UDP remap was advertising
-            // (see the `tcp_port == udp_port` branch below); a return to
-            // 1:1 must drop that override too, or `advertised_tcp_port()`
-            // (Hello/FirewalledReq/KAD publish) keeps advertising the
-            // stale remapped port forever.
-            if state.tcp_port == state.udp_port && state.external_tcp_port == Some(stun_port) {
-                state.external_tcp_port = None;
-                state.stats.public_tcp_port = 0;
-                state.publish_manager.tcp_port = state.tcp_port;
-            }
             update_publish_manager_state(state);
         }
         // `stun_ka_candidate_port`/`stun_ka_stable_hits` track an
@@ -393,14 +383,6 @@ fn apply_udp_mapping_keepalive(
     state
         .advertise_udp_port
         .store(port, std::sync::atomic::Ordering::Relaxed);
-
-    if state.tcp_port == state.udp_port {
-        state.external_tcp_port = Some(port);
-        state.stats.public_tcp_port = port;
-        state
-            .advertise_tcp_port
-            .store(port, std::sync::atomic::Ordering::Relaxed);
-    }
 
     if let Some(ip) = ember::mapping_keepalive::ipv4_from_mapped(mapped) {
         if state.external_ip.is_none() {
@@ -3572,7 +3554,12 @@ pub enum NetworkCommand {
     },
     BrowseFriend {
         ember_hash: [u8; 16],
+        request_id: String,
         tx: oneshot::Sender<Result<(), String>>,
+    },
+    CancelBrowseFriend {
+        ember_hash: [u8; 16],
+        request_id: String,
     },
     FriendRemoved {
         ember_hash: [u8; 16],
@@ -4697,6 +4684,10 @@ struct NetworkState {
     firewall_req_cooldown: HashMap<Ipv4Addr, i64>,
     /// Ember friends currently connected (ember_hash -> last_seen_timestamp)
     online_friends: HashMap<[u8; 16], i64>,
+    /// FIFO correlation IDs for friend browse requests. The Ember browse wire
+    /// response has no request id, so serializing requests per friend lets a
+    /// delayed response be attributed to the correct local generation.
+    pending_browse_requests: HashMap<[u8; 16], Vec<String>>,
     /// Short-lived dedup for inbound Ember chat messages: ember_hash ->
     /// (last message text, received-at timestamp). A friend's chat can
     /// legitimately arrive via either the dedicated `friend_connect.rs`
@@ -7870,6 +7861,7 @@ pub async fn start_network(
         firewall_connect_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
         firewall_req_cooldown: HashMap::new(),
         online_friends: HashMap::new(),
+        pending_browse_requests: HashMap::new(),
         recent_ember_chat: HashMap::new(),
         ember_sessions: Arc::new(RwLock::new(HashMap::new())),
         // Mirror the `stats.status` initialization above: the upload
@@ -8003,6 +7995,10 @@ pub async fn start_network(
     // state transitions (handled separately via `update_transfer_status`).
     const DB_PROGRESS_PERSIST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
     let mut db_progress_last_persist: HashMap<String, std::time::Instant> = HashMap::new();
+    // Upload `transferred` is intentionally capped to the file size for UI
+    // progress. Keep a separate raw counter for durable Library accounting so
+    // retransmitted payload bytes are not silently discarded.
+    let mut upload_raw_progress: HashMap<String, u64> = HashMap::new();
 
     // Load comments from database
     if let Ok(rows) = db.load_file_comments() {
@@ -8086,10 +8082,10 @@ pub async fn start_network(
     let (kad_callback_tx, mut kad_callback_rx) =
         mpsc::channel::<upload_server::KadCallbackParts>(256);
 
-    // Punch-responder / relay-invite adopted streams: pre-established,
-    // transport-encrypted connections handed to the upload listener to serve
-    // directly (we're the upload/source side; there's no matching active
-    // download for these, so they can't go through `kad_callback_tx`). See
+    // Punch-responder adopted streams: pre-established, transport-encrypted
+    // connections handed to the upload listener to serve directly (we're the
+    // upload/source side; there's no matching active download for these, so
+    // they can't go through `kad_callback_tx`). See
     // `upload_server::InboundStreamRequest`.
     let (inbound_stream_tx, inbound_stream_rx) =
         mpsc::channel::<upload_server::InboundStreamRequest>(256);
@@ -10857,10 +10853,37 @@ pub async fn start_network(
                         let clean_name = crate::security::sanitize_display_name(name);
                         serde_json::json!({ "hash": hash, "size": size, "name": clean_name })
                     }).collect();
-                    let _ = app_handle.emit("ember:browse-result", serde_json::json!({
-                        "user_hash": hash_hex,
-                        "files": files,
-                    }));
+                    let (request_id, send_next) = {
+                        let (request_id, send_next, remove_queue) =
+                            match state.pending_browse_requests.get_mut(&browse_ember_hash) {
+                                Some(requests) => {
+                                    let request_id =
+                                        (!requests.is_empty()).then(|| requests.remove(0));
+                                    (request_id, !requests.is_empty(), requests.is_empty())
+                                }
+                                None => (None, false, false),
+                            };
+                        if remove_queue {
+                            state.pending_browse_requests.remove(&browse_ember_hash);
+                        }
+                        (request_id, send_next)
+                    };
+                    if let Some(request_id) = request_id {
+                        let _ = app_handle.emit("ember:browse-result", serde_json::json!({
+                            "user_hash": hash_hex,
+                            "request_id": request_id,
+                            "files": files,
+                        }));
+                    }
+                    if send_next {
+                        if let Some(sender) = state.ember_sessions.read().await.get(&browse_ember_hash).filter(|h| h.is_fresh()) {
+                            let mut packet = Vec::with_capacity(6);
+                            packet.push(OP_EMULEPROT);
+                            packet.extend_from_slice(&(1u32).to_le_bytes());
+                            packet.push(ed2k::messages::OP_EMBER_BROWSE_REQ);
+                            let _ = sender.tx.try_send(packet);
+                        }
+                    }
                     continue;
                 }
 
@@ -11330,18 +11353,18 @@ pub async fn start_network(
                 // exact and cannot double-count repeated/coalesced updates.
                 let library_upload_delta = if let UploadEventKind::Progress {
                     uploaded,
-                    total,
                     ..
                 } = &event.kind
                 {
                     let manager = transfer_manager.read().await;
                     manager.get_transfer(&event.transfer_id).and_then(|transfer| {
-                        let next = if *total > 0 {
-                            (*uploaded).min(*total)
-                        } else {
-                            *uploaded
-                        };
-                        let delta = next.saturating_sub(transfer.transferred);
+                        let previous = upload_raw_progress
+                            .get(&event.transfer_id)
+                            .copied()
+                            .unwrap_or_default();
+                        let next = (*uploaded).max(previous);
+                        upload_raw_progress.insert(event.transfer_id.clone(), next);
+                        let delta = next.saturating_sub(previous);
                         (delta > 0 && !transfer.file_hash.is_empty())
                             .then(|| (transfer.file_hash.clone(), delta))
                     })
@@ -11392,6 +11415,12 @@ pub async fn start_network(
                             );
                         }
                     }
+                }
+                if matches!(
+                    &event.kind,
+                    UploadEventKind::Completed { .. } | UploadEventKind::Failed { .. }
+                ) {
+                    upload_raw_progress.remove(&event.transfer_id);
                 }
 
                 if let UploadEventKind::ShareInterest {
@@ -11658,10 +11687,37 @@ pub async fn start_network(
                         let clean_name = crate::security::sanitize_display_name(name);
                         serde_json::json!({ "hash": hash, "size": size, "name": clean_name })
                     }).collect();
-                    let _ = app_handle.emit("ember:browse-result", serde_json::json!({
-                        "user_hash": hash_hex,
-                        "files": files,
-                    }));
+                    let (request_id, send_next) = {
+                        let (request_id, send_next, remove_queue) =
+                            match state.pending_browse_requests.get_mut(&browse_eh) {
+                                Some(requests) => {
+                                    let request_id =
+                                        (!requests.is_empty()).then(|| requests.remove(0));
+                                    (request_id, !requests.is_empty(), requests.is_empty())
+                                }
+                                None => (None, false, false),
+                            };
+                        if remove_queue {
+                            state.pending_browse_requests.remove(&browse_eh);
+                        }
+                        (request_id, send_next)
+                    };
+                    if let Some(request_id) = request_id {
+                        let _ = app_handle.emit("ember:browse-result", serde_json::json!({
+                            "user_hash": hash_hex,
+                            "request_id": request_id,
+                            "files": files,
+                        }));
+                    }
+                    if send_next {
+                        if let Some(sender) = state.ember_sessions.read().await.get(&browse_eh).filter(|h| h.is_fresh()) {
+                            let mut packet = Vec::with_capacity(6);
+                            packet.push(OP_EMULEPROT);
+                            packet.extend_from_slice(&(1u32).to_le_bytes());
+                            packet.push(ed2k::messages::OP_EMBER_BROWSE_REQ);
+                            let _ = sender.tx.try_send(packet);
+                        }
+                    }
                 }
 
                 if let UploadEventKind::EmberFriendDisconnected { ember_hash: dc_eh } = event.kind {
@@ -11671,10 +11727,17 @@ pub async fn start_network(
                     let _ = app_handle.emit("ember:friend-offline", serde_json::json!({
                         "user_hash": hash_hex,
                     }));
-                    let _ = app_handle.emit("ember:browse-error", serde_json::json!({
-                        "user_hash": hash_hex,
-                        "reason": "Friend disconnected",
-                    }));
+                    for request_id in state
+                        .pending_browse_requests
+                        .remove(&dc_eh)
+                        .unwrap_or_default()
+                    {
+                        let _ = app_handle.emit("ember:browse-error", serde_json::json!({
+                            "user_hash": hash_hex,
+                            "request_id": request_id,
+                            "reason": "Friend disconnected",
+                        }));
+                    }
 
                     if friend_hashes.read().await.contains(&dc_eh)
                         && !state.ember_sessions.read().await.get(&dc_eh).is_some_and(|h| h.is_fresh())
@@ -15212,132 +15275,128 @@ pub async fn start_network(
                     }
                 }
 
-                // Poll for incoming server-relay invitations (if registered & have external IP).
-                // Key by our own `tcp_port`, NOT `quic_port`: every producer of a
-                // relay-invite target_id addresses us by the port it already knows
-                // us at — the download broker's `StartRelay` uses the LowID
-                // source's KAD-advertised `tcp_port` (see `attempt_low_to_low`
-                // callers), and `friend_connect::relay_friend` uses the friend's
-                // rendezvous-registered `(ip, tcp_port)` (rendezvous `/register`
-                // always advertises `settings.tcp_port`, never `quic_port` — see
-                // the two `rendezvous::register(...)` call sites above). `quic_port`
-                // only differs from `tcp_port` when the QUIC endpoint had to fall
-                // back off an already-bound port, but even then no peer ever learns
-                // that fallback port through any of the id-construction paths above,
-                // so keying our own poll by it just makes us unreachable in that
-                // case. `quic_port` is still the right value to advertise as the
-                // *destination* to dial (the payload the peer connects to) — see the
-                // `connect_server_relay`/`punch_quic` targets below — just not for
-                // the lookup key itself.
+                // Poll only authenticated, identity-bound friend relay offers.
+                // Anonymous LowID source relays intentionally have no server
+                // fallback; their former synthetic IP:port invite protocol was
+                // unauthenticated and is retired.
                 if state.rendezvous_registered {
-                    if let Some(ext_ip) = state.external_ip {
-                        // Must match the port producers actually key their
-                        // invite by: KAD source publish and rendezvous
-                        // /register both now use `advertised_tcp_port`, so
-                        // this lookup key does too — otherwise a STUN remap
-                        // makes every relay invite for us unfindable.
-                        let our_relay_id = format!("{:0>64}", format!("{:08x}{:04x}", u32::from(ext_ip), advertised_tcp_port(&state)));
-                        let rv_url = settings.rendezvous_url.clone();
-                        let relay_cb_tx = inbound_stream_tx.clone();
-                        // Friend-connect context, needed only when an invite turns
-                        // out to be a `friend_connect::relay_friend` session
-                        // (session_id `friend-{their_eh}-{our_eh}-{nonce}`) rather
-                        // than a download-broker `StartRelay` upload-serve session.
-                        // Cloned up front so the per-`sid` task below is self
-                        // contained; cheap even when unused (a handful of Copy
-                        // fields + one Arc clone per invite, and invites are rare).
-                        let fc_our_user_hash = state.user_hash;
-                        let fc_our_ember_hash = ember_hash;
-                        let fc_nickname = settings.nickname.clone();
-                        let fc_client_id = state
-                            .external_ip
-                            .map(|eip| u32::from_le_bytes(eip.octets()))
-                            .unwrap_or(0);
-                        let fc_tcp_port = advertised_tcp_port(&state);
-                        let fc_udp_port = advertised_udp_port(&state);
-                        let fc_obfuscate = settings.friend_session_encryption;
-                        let fc_ember_sessions = state.ember_sessions.clone();
-                        let fc_ul_event_tx = ul_event_tx.clone();
-                        let fc_friend_hashes = friend_hashes.clone();
-                        tokio::spawn(async move {
-                            match ember::relay::poll_relay_invites(&rv_url, &our_relay_id).await {
-                                Ok(session_ids) => {
-                                    for sid in session_ids {
-                                        tracing::info!("Relay invite received, connecting to session {}", &sid[..16.min(sid.len())]);
-                                        let cb_tx = relay_cb_tx.clone();
-                                        let url = rv_url.clone();
-                                        // A friend-relay invite (see `relay_friend`) embeds
-                                        // the inviter's ember_hash as the first `-`-delimited
-                                        // hex segment after the `friend-` prefix. Anything
-                                        // else is a download-broker `StartRelay` invite for a
-                                        // LowID source we should serve as an upload.
-                                        let friend_peer_hash: Option<[u8; 16]> = sid
-                                            .strip_prefix("friend-")
-                                            .and_then(|rest| rest.split('-').next())
-                                            .filter(|h| h.len() == 32)
-                                            .and_then(|h| {
-                                                let mut buf = [0u8; 16];
-                                                hex::decode_to_slice(h, &mut buf).ok()?;
-                                                Some(buf)
-                                            });
-                                        let our_uh = fc_our_user_hash;
-                                        let our_eh = fc_our_ember_hash;
-                                        let nick = fc_nickname.clone();
-                                        let cid = fc_client_id;
-                                        let tcp = fc_tcp_port;
-                                        let udp = fc_udp_port;
-                                        let obfs = fc_obfuscate;
-                                        let sess = fc_ember_sessions.clone();
-                                        let ultx = fc_ul_event_tx.clone();
-                                        let fh = fc_friend_hashes.clone();
-                                        tokio::spawn(async move {
-                                            match ember::relay::connect_server_relay(&url, &sid).await {
-                                                Ok(ws) => {
-                                                    let (reader, writer) = tokio::io::split(ws);
-                                                    if let Some(peer_eh) = friend_peer_hash {
-                                                        let addr = SocketAddr::new(
-                                                            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0,
-                                                        );
-                                                        match ed2k::friend_connect::run_friend_session_over_transport(
-                                                            Box::new(reader), Box::new(writer), addr, peer_eh,
-                                                            our_uh, our_eh, nick, cid, tcp, udp, obfs,
-                                                            sess, ultx, fh, Some(ed25519_pubkey), Some(ed25519_secret_key),
-                                                        ).await {
-                                                            Ok(_) => tracing::info!(
-                                                                "Friend relay session established for {}",
-                                                                hex::encode(peer_eh)
-                                                            ),
-                                                            Err(e) => tracing::debug!(
-                                                                "Friend relay session failed for {}: {e}",
-                                                                hex::encode(peer_eh)
-                                                            ),
-                                                        }
-                                                        return;
-                                                    }
-                                                    let req = crate::network::ed2k::upload::InboundStreamRequest {
-                                                        peer_addr: SocketAddr::new(
-                                                            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0,
-                                                        ),
-                                                        reader: Box::new(reader),
-                                                        writer: Box::new(writer),
-                                                    };
-                                                    if let Err(e) = cb_tx.try_send(req) {
-                                                        tracing::debug!("Dropping relay-adopted stream: {e}");
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    tracing::debug!("Relay invite connect failed for session: {e}");
-                                                }
-                                            }
-                                        });
+                    let rv_url = settings.rendezvous_url.clone();
+                    let fc_our_user_hash = state.user_hash;
+                    let fc_our_ember_hash = ember_hash;
+                    let fc_nickname = settings.nickname.clone();
+                    let fc_client_id = state
+                        .external_ip
+                        .map(|eip| u32::from_le_bytes(eip.octets()))
+                        .unwrap_or(0);
+                    let fc_tcp_port = advertised_tcp_port(&state);
+                    let fc_udp_port = advertised_udp_port(&state);
+                    let fc_obfuscate = settings.friend_session_encryption;
+                    let fc_ember_sessions = state.ember_sessions.clone();
+                    let fc_ul_event_tx = ul_event_tx.clone();
+                    let fc_friend_hashes = friend_hashes.clone();
+                    tokio::spawn(async move {
+                        let offers = match rendezvous::poll_friend_relay_tickets(
+                            &rv_url,
+                            &fc_our_ember_hash,
+                            &ed25519_secret_key,
+                        )
+                        .await
+                        {
+                            Ok(offers) => offers,
+                            Err(e) => {
+                                tracing::trace!("Friend relay ticket poll: {e}");
+                                return;
+                            }
+                        };
+
+                        for offer in offers {
+                            let peer_ember_hash = {
+                                let friends = fc_friend_hashes.read().await;
+                                friends.iter().copied().find(|hash| {
+                                    rendezvous::hashed_id(hash).eq_ignore_ascii_case(&offer.initiator_id)
+                                })
+                            };
+                            let Some(peer_ember_hash) = peer_ember_hash else {
+                                tracing::debug!(
+                                    "Ignoring relay ticket from a non-friend identity"
+                                );
+                                continue;
+                            };
+
+                            let responder_token = match rendezvous::accept_friend_relay_ticket(
+                                &rv_url,
+                                &fc_our_ember_hash,
+                                &offer.ticket_id,
+                                &ed25519_secret_key,
+                            )
+                            .await
+                            {
+                                Ok(token) => token,
+                                Err(e) => {
+                                    tracing::debug!("Friend relay ticket accept failed: {e}");
+                                    continue;
+                                }
+                            };
+
+                            let url = rv_url.clone();
+                            let ticket_id = offer.ticket_id;
+                            let nick = fc_nickname.clone();
+                            let sess = fc_ember_sessions.clone();
+                            let ultx = fc_ul_event_tx.clone();
+                            let fh = fc_friend_hashes.clone();
+                            tokio::spawn(async move {
+                                match ember::relay::connect_server_relay(
+                                    &url,
+                                    &ticket_id,
+                                    &responder_token,
+                                )
+                                .await
+                                {
+                                    Ok(ws) => {
+                                        let (reader, writer) = tokio::io::split(ws);
+                                        let addr = SocketAddr::new(
+                                            std::net::IpAddr::V4(
+                                                std::net::Ipv4Addr::UNSPECIFIED,
+                                            ),
+                                            0,
+                                        );
+                                        match ed2k::friend_connect::run_friend_session_over_transport(
+                                            Box::new(reader),
+                                            Box::new(writer),
+                                            addr,
+                                            peer_ember_hash,
+                                            fc_our_user_hash,
+                                            fc_our_ember_hash,
+                                            nick,
+                                            fc_client_id,
+                                            fc_tcp_port,
+                                            fc_udp_port,
+                                            fc_obfuscate,
+                                            sess,
+                                            ultx,
+                                            fh,
+                                            Some(ed25519_pubkey),
+                                            Some(ed25519_secret_key),
+                                        )
+                                        .await
+                                        {
+                                            Ok(_) => tracing::info!(
+                                                "Friend relay session established for {}",
+                                                hex::encode(peer_ember_hash)
+                                            ),
+                                            Err(e) => tracing::debug!(
+                                                "Friend relay session failed for {}: {e}",
+                                                hex::encode(peer_ember_hash)
+                                            ),
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!("Friend relay ticket join failed: {e}");
                                     }
                                 }
-                                Err(e) => {
-                                    tracing::trace!("Relay invite poll: {e}");
-                                }
-                            }
-                        });
-                    }
+                            });
+                        }
+                    });
                 }
 
                 // Poll for incoming hole-punch requests targeting our own
@@ -15347,7 +15406,7 @@ pub async fn start_network(
                 // callers, which key `StartPunch`/`StartRelay` by
                 // `(source_ip, source_port)` using the KAD-advertised
                 // `tcp_port`, never `quic_port` — same rationale as the
-                // relay-invite poller immediately above).
+                // authenticated friend ticket poller immediately above).
                 //
                 // Before this, only the *initiator* side of a broker
                 // attempt ever called `register_punch`/`poll_punch` — the
@@ -15356,8 +15415,7 @@ pub async fn start_network(
                 // side could never find a match and every LowID-to-LowID
                 // hole-punch attempt burned its full `PUNCH_TIMEOUT`
                 // before falling back to relay. This mirrors the
-                // relay-invite poller immediately above: reciprocally
-                // register ourselves back at the initiator so its own
+                // reciprocal rendezvous flow: register ourselves back at the initiator so its own
                 // poll finds us, then also dial out ourselves (NAT
                 // hole-punching needs an outbound packet from *both*
                 // sides to open a pinhole for the other's inbound
@@ -16269,7 +16327,6 @@ pub async fn start_network(
                                 tracing::info!("Broker: initiating relay for {} -> {}:{} (relay={:?})", attempt_key, source_ip, source_port, relay_addr);
 
                                 let attempt_key_owned = attempt_key.clone();
-                                let rv_url = settings.rendezvous_url.clone();
 
                                 let (attempt_transfer_id, _) = state.connection_broker.as_ref()
                                     .and_then(|b| b.get_attempt_info(&attempt_key_owned))
@@ -16384,124 +16441,16 @@ pub async fn start_network(
                                             }
                                         }
                                     });
-                                } else if !rv_url.is_empty() {
-                                    let target_id = format!("{:0>64}", format!("{:08x}{:04x}", u32::from(source_ip), source_port));
-                                    // Session id MUST be unique per (us, file, peer)
-                                    // triple. Previously we used `{user}-{file}` which
-                                    // collided whenever multiple LowID peers wanted the
-                                    // same file: the rendezvous server pairs WebSockets
-                                    // two at a time per session_id, so the second
-                                    // connection would tear down the first peer's
-                                    // socket via the `sessions.remove(&session_id)` →
-                                    // bridge_relay path. Our adopted callback streams
-                                    // would then immediately fail on the next send
-                                    // with `WebSocket protocol error: Sending after
-                                    // closing is not allowed`. Including `target_id`
-                                    // gives each LowID peer its own room. The peer side
-                                    // gets the matching session_id via the relay-invite
-                                    // we POST below, so it will dial the right room.
-                                    //
-                                    // Use the *trailing* portion of target_id, not
-                                    // the leading slice — `target_id` is `{:0>64}`
-                                    // formatted (52 leading zeros + 12 chars of
-                                    // ip:port hex). Slicing `[..16]` would give us
-                                    // 16 zeros for every peer, which is exactly the
-                                    // bug we just hit (every session_id ended in
-                                    // `-0000000000000000-` and collided again).
-                                    let peer_tag = &target_id[target_id.len().saturating_sub(12)..];
-                                    let relay_nonce = {
-                                        use rand::RngCore;
-                                        let mut nonce = [0u8; 16];
-                                        rand::rngs::OsRng.fill_bytes(&mut nonce);
-                                        hex::encode(nonce)
-                                    };
-                                    let session_id = format!(
-                                        "{}-{}-{}-{}",
-                                        hex::encode(ember_hash),
-                                        peer_tag,
-                                        hex::encode(file_hash),
-                                        relay_nonce,
-                                    );
-                                    let transfer_id = attempt_transfer_id;
-
-                                    let invite_rv_url = rv_url.clone();
-                                    let invite_sid = session_id.clone();
-                                    tokio::spawn(async move {
-                                        if let Err(e) = ember::relay::post_relay_invite(&invite_rv_url, &target_id, &invite_sid).await {
-                                            tracing::debug!("Broker: relay invite post failed: {e}");
-                                        }
-                                    });
-
-                                    tokio::spawn(async move {
-                                        use futures::FutureExt;
-                                        let Some(broker_tx) = broker_tx else { return; };
-                                        // Wrap in `catch_unwind`. `tokio_tungstenite::connect_async`
-                                        // dispatches into rustls, which `panic!`s on the worker
-                                        // thread if the process-wide CryptoProvider isn't
-                                        // installed. We DO install it in `lib.rs::run()` now,
-                                        // but if any future code path (test binary, alternate
-                                        // entry point, third-party plugin) ever lands without
-                                        // doing so, an uncaught panic would kill this spawned
-                                        // task, no `RelayFailed` event would ever be sent, and
-                                        // the broker entry would sit stuck at `RelayConnect`
-                                        // until `RELAY_TIMEOUT` (30 s) reaped it via
-                                        // `broker.tick()`. Catching the panic here keeps the
-                                        // broker state machine driven by explicit events
-                                        // regardless.
-                                        let result = std::panic::AssertUnwindSafe(
-                                            ember::relay::connect_server_relay(&rv_url, &session_id),
-                                        ).catch_unwind().await;
-                                        match result {
-                                            Ok(Ok(ws_stream)) => {
-                                                tracing::info!("Broker: server relay connected for {attempt_key_owned}");
-                                                let (reader, writer) = tokio::io::split(ws_stream);
-                                                let _ = broker_tx.send(ember::broker::BrokerEvent::ConnectionReady(
-                                                    ember::broker::BrokerConnection {
-                                                        transfer_id,
-                                                        file_hash,
-                                                        source_ip,
-                                                        source_port,
-                                                        method: ember::broker::ConnectionMethod::ServerRelay,
-                                                        relay_addr: None,
-                                                        reader: Box::new(reader),
-                                                        writer: Box::new(writer),
-                                                    },
-                                                )).await;
-                                            }
-                                            Ok(Err(e)) => {
-                                                tracing::debug!("Broker: server relay failed: {e}");
-                                                if let Err(send_err) = broker_tx.try_send(ember::broker::BrokerEvent::RelayFailed {
-                                                    attempt_key: attempt_key_owned,
-                                                    reason: e,
-                                                }) {
-                                                    tracing::debug!("Broker: dropping relay failure event (queue full/closed): {send_err}");
-                                                }
-                                            }
-                                            Err(panic) => {
-                                                let msg = if let Some(s) = panic.downcast_ref::<&'static str>() {
-                                                    (*s).to_string()
-                                                } else if let Some(s) = panic.downcast_ref::<String>() {
-                                                    s.clone()
-                                                } else {
-                                                    "non-string panic payload".to_string()
-                                                };
-                                                tracing::error!("Broker: server relay panicked: {msg}");
-                                                if let Err(send_err) = broker_tx.try_send(ember::broker::BrokerEvent::RelayFailed {
-                                                    attempt_key: attempt_key_owned,
-                                                    reason: format!("panic: {msg}"),
-                                                }) {
-                                                    tracing::debug!("Broker: dropping relay failure event (queue full/closed): {send_err}");
-                                                }
-                                            }
-                                        }
-                                    });
                                 } else {
-                                    tracing::debug!("Broker: no peer relay candidate and no rendezvous URL for {attempt_key_owned}");
+                                    tracing::debug!(
+                                        "Broker: no peer relay candidate for {attempt_key_owned}; \
+                                         authenticated server relay is restricted to known friends"
+                                    );
                                     tokio::spawn(async move {
                                         let Some(broker_tx) = broker_tx else { return; };
                                         if let Err(send_err) = broker_tx.try_send(ember::broker::BrokerEvent::RelayFailed {
                                             attempt_key: attempt_key_owned,
-                                            reason: "no relay candidate and no rendezvous URL".into(),
+                                            reason: "anonymous LowID sources cannot use server relay".into(),
                                         }) {
                                             tracing::debug!("Broker: dropping relay failure event (queue full/closed): {send_err}");
                                         }
@@ -18298,12 +18247,17 @@ pub async fn start_network(
                             .map(|pfs| pfs.complete_source_count())
                             .unwrap_or(0);
 
-                        let reask_payload = ed2k::messages::build_reask_file_ping(
+                        let Some(reask_payload) = ed2k::messages::build_reask_file_ping(
                             &fh,
                             file_size,
                             complete_sources,
                             reask_bitmaps.get(tid).map(Vec::as_slice),
-                        );
+                        ) else {
+                            warn!(
+                                "Skipping UDP reask for {tid}: file exceeds standard ED2K wire part-count limit"
+                            );
+                            continue;
+                        };
 
                         let total_udp = sm.get_udp_sources(&fh).len();
                         let udp_sources = sm.get_udp_sources_due_for_reask(&fh, reask_interval);
@@ -19121,13 +19075,17 @@ pub async fn start_network(
                                     })
                                     .unwrap_or(0);
                                 if file_size > 0 {
-                                    let mut pkt = vec![OP_EMULEPROT, ed2k::messages::OP_REASKFILEPING];
-                                    pkt.extend_from_slice(&ed2k::messages::build_reask_file_ping(
+                                    let Some(reask_payload) = ed2k::messages::build_reask_file_ping(
                                         &swap.to_file,
                                         file_size,
                                         complete_sources,
                                         None,
-                                    ));
+                                    ) else {
+                                        warn!("Skipping swapped UDP reask: file exceeds standard ED2K wire part-count limit");
+                                        continue;
+                                    };
+                                    let mut pkt = vec![OP_EMULEPROT, ed2k::messages::OP_REASKFILEPING];
+                                    pkt.extend_from_slice(&reask_payload);
                                     let addr = SocketAddr::new(v4.into(), moved_udp_port);
                                     let _ = udp_socket.send_to(&pkt, addr).await;
                                 }
@@ -21490,13 +21448,17 @@ pub async fn start_network(
                             .map(|pfs| pfs.complete_source_count())
                             .unwrap_or(0);
                         let addr = SocketAddr::new(dest_ip.into(), dest_port);
-                        let mut pkt = vec![OP_EMULEPROT, ed2k::messages::OP_REASKFILEPING];
-                        pkt.extend_from_slice(&ed2k::messages::build_reask_file_ping(
+                        let Some(reask_payload) = ed2k::messages::build_reask_file_ping(
                             &file_hash,
                             file_size,
                             complete_sources,
                             completed_parts.as_deref(),
-                        ));
+                        ) else {
+                            warn!("Skipping buddy UDP reask: file exceeds standard ED2K wire part-count limit");
+                            continue;
+                        };
+                        let mut pkt = vec![OP_EMULEPROT, ed2k::messages::OP_REASKFILEPING];
+                        pkt.extend_from_slice(&reask_payload);
                         let _ = udp_socket.send_to(&pkt, addr).await;
                         debug!("Sent UDP reask to {}:{} via buddy relay for file {}", dest_ip, dest_port, hash_hex);
                     }
@@ -27177,13 +27139,19 @@ async fn handle_udp_packet_inner(
                     )
                     .await
                     .unwrap_or(u16::MAX);
-                    let mut resp = vec![OP_EMULEPROT, ed2k::messages::OP_REASKACK];
                     let enhanced = reask.completed_parts.is_some();
-                    resp.extend_from_slice(&ed2k::messages::build_reask_ack(
+                    let Some(ack_payload) = ed2k::messages::build_reask_ack(
                         file_size,
                         Some(rank),
                         enhanced.then_some(available_parts.as_slice()),
-                    ));
+                    ) else {
+                        let resp = vec![OP_EMULEPROT, ed2k::messages::OP_FILENOTFOUND_UDP];
+                        let _ = socket.send_to(&resp, from).await;
+                        debug!("Refused UDP reask from {from} for oversized {hash_hex}");
+                        return;
+                    };
+                    let mut resp = vec![OP_EMULEPROT, ed2k::messages::OP_REASKACK];
+                    resp.extend_from_slice(&ack_payload);
                     let _ = socket.send_to(&resp, from).await;
                     debug!(
                         "Answered UDP reask from {from} for {hash_hex}: file available, rank={rank}"
@@ -34099,8 +34067,45 @@ async fn handle_command_inner(
             }
         }
 
+        NetworkCommand::CancelBrowseFriend {
+            ember_hash: friend_eh,
+            request_id,
+        } => {
+            let send_next = {
+                let mut send_next = false;
+                let mut remove_queue = false;
+                if let Some(queue) = state.pending_browse_requests.get_mut(&friend_eh) {
+                    if let Some(position) = queue.iter().position(|id| id == &request_id) {
+                        queue.remove(position);
+                        send_next = position == 0 && !queue.is_empty();
+                    }
+                    remove_queue = queue.is_empty();
+                }
+                if remove_queue {
+                    state.pending_browse_requests.remove(&friend_eh);
+                }
+                send_next
+            };
+            if send_next {
+                if let Some(sender) = state
+                    .ember_sessions
+                    .read()
+                    .await
+                    .get(&friend_eh)
+                    .filter(|handle| handle.is_fresh())
+                {
+                    let mut packet = Vec::with_capacity(6);
+                    packet.push(OP_EMULEPROT);
+                    packet.extend_from_slice(&(1u32).to_le_bytes());
+                    packet.push(ed2k::messages::OP_EMBER_BROWSE_REQ);
+                    let _ = sender.tx.try_send(packet);
+                }
+            }
+        }
+
         NetworkCommand::BrowseFriend {
             ember_hash: friend_eh,
+            request_id,
             tx,
         } => {
             if settings.friend_browse_disabled {
@@ -34114,20 +34119,29 @@ async fn handle_command_inner(
                 // would queue the browse request into a channel whose
                 // socket write never reaches a live peer.
                 if let Some(sender) = sessions.get(&friend_eh).filter(|h| h.is_fresh()) {
-                    let mut packet = Vec::with_capacity(6);
-                    packet.push(OP_EMULEPROT);
-                    let size: u32 = 1;
-                    packet.extend_from_slice(&size.to_le_bytes());
-                    packet.push(ed2k::messages::OP_EMBER_BROWSE_REQ);
-                    match sender.tx.try_send(packet) {
-                        Ok(()) => {
-                            let _ = tx.send(Ok(()));
-                        }
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                            let _ = tx.send(Err("Connection channel full".into()));
-                        }
-                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                            let _ = tx.send(Err("Connection to friend closed".into()));
+                    let queue = state.pending_browse_requests.entry(friend_eh).or_default();
+                    let send_now = queue.is_empty();
+                    queue.push(request_id);
+                    if !send_now {
+                        let _ = tx.send(Ok(()));
+                    } else {
+                        let mut packet = Vec::with_capacity(6);
+                        packet.push(OP_EMULEPROT);
+                        let size: u32 = 1;
+                        packet.extend_from_slice(&size.to_le_bytes());
+                        packet.push(ed2k::messages::OP_EMBER_BROWSE_REQ);
+                        match sender.tx.try_send(packet) {
+                            Ok(()) => {
+                                let _ = tx.send(Ok(()));
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                state.pending_browse_requests.remove(&friend_eh);
+                                let _ = tx.send(Err("Connection channel full".into()));
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                state.pending_browse_requests.remove(&friend_eh);
+                                let _ = tx.send(Err("Connection to friend closed".into()));
+                            }
                         }
                     }
                 } else {

@@ -150,6 +150,12 @@ pub const PARTSIZE: u64 = 9_728_000;
 /// entry and comes back empty — which is why we must classify large files the
 /// same way eMule does in every OP_OFFERFILES / OP_GETSOURCES / OP_GLOBGETSOURCES2.
 pub const OLD_MAX_EMULE_FILE_SIZE: u64 = 4_290_048_000;
+/// ED2K file-status/hashset wire fields use a u16 part count. Because the
+/// wire count is `floor(size / PARTSIZE) + 1`, this is the largest file that
+/// can be represented without wrapping a standard eMule peer.
+pub const ED2K_MAX_WIRE_PARTS: usize = u16::MAX as usize;
+pub const ED2K_MAX_FILE_SIZE_BYTES: u64 =
+    (ED2K_MAX_WIRE_PARTS as u64).saturating_mul(PARTSIZE).saturating_sub(1);
 
 /// Number of actual data chunks (≈9.28 MiB each) for a given file size.
 ///
@@ -177,6 +183,13 @@ pub fn ed2k_wire_part_count(file_size: u64) -> usize {
     } else {
         (file_size / PARTSIZE + 1) as usize
     }
+}
+
+/// Checked form for packet builders. Never truncate a count into a different
+/// valid-looking u16 value: callers must reject or avoid advertising files
+/// that standard ED2K peers cannot represent.
+pub fn ed2k_wire_part_count_u16(file_size: u64) -> Option<u16> {
+    u16::try_from(ed2k_wire_part_count(file_size)).ok()
 }
 
 pub fn source_exchange_id_to_ipv4(version: u8, source_id: u32) -> std::net::Ipv4Addr {
@@ -1122,8 +1135,8 @@ pub fn build_reask_file_ping(
     file_size: u64,
     complete_source_count: u16,
     completed_parts: Option<&[bool]>,
-) -> Vec<u8> {
-    let part_count = ed2k_wire_part_count(file_size) as u16;
+ ) -> Option<Vec<u8>> {
+    let part_count = ed2k_wire_part_count_u16(file_size)?;
     let bitmap_bytes = ((part_count as usize) + 7) / 8;
     let mut buf = Vec::with_capacity(16 + 2 + bitmap_bytes + 2);
     buf.extend_from_slice(file_hash);
@@ -1143,7 +1156,7 @@ pub fn build_reask_file_ping(
         buf.push(byte);
     }
     buf.extend_from_slice(&complete_source_count.to_le_bytes());
-    buf
+    Some(buf)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1164,11 +1177,9 @@ fn bitmap_len_for_part_count(part_count: usize) -> usize {
 }
 
 /// Upper bound on a wire-declared part count accepted by the UDP reask parsers.
-/// A 10 000-part file is ~95 GiB (PARTSIZE = 9.28 MiB); a larger count is
-/// malformed or hostile and would only force a pointless `Vec<bool>` allocation
-/// and decode loop on every datagram. Mirrors the `MAX_FILE_STATUS_PARTS` guard
-/// applied to TCP file-status parsing.
-const MAX_REASK_PARTS: usize = 10_000;
+/// A wire count is u16, so accepting the full protocol range is still bounded
+/// (~8 KiB bitmap). This must match standard large-file peers.
+const MAX_REASK_PARTS: usize = ED2K_MAX_WIRE_PARTS;
 
 fn decode_part_bitmap(part_count: usize, data: &[u8]) -> io::Result<Vec<bool>> {
     let need = bitmap_len_for_part_count(part_count);
@@ -1261,17 +1272,17 @@ pub fn build_reask_ack(
     file_size: u64,
     rank: Option<u16>,
     available_parts: Option<&[bool]>,
-) -> Vec<u8> {
-    let part_count = ed2k_wire_part_count(file_size) as usize;
+) -> Option<Vec<u8>> {
+    let part_count = ed2k_wire_part_count_u16(file_size)?;
     let mut buf = Vec::new();
     if let Some(parts) = available_parts {
-        buf.extend_from_slice(&(part_count as u16).to_le_bytes());
-        encode_part_bitmap(part_count, Some(parts), &mut buf);
+        buf.extend_from_slice(&part_count.to_le_bytes());
+        encode_part_bitmap(part_count as usize, Some(parts), &mut buf);
     }
     if let Some(rank) = rank {
         buf.extend_from_slice(&rank.to_le_bytes());
     }
-    buf
+    Some(buf)
 }
 
 /// Parse OP_REASKACK. A 2-byte payload is legacy rank-only. Enhanced ACKs
@@ -1480,7 +1491,7 @@ pub fn parse_hashset_answer(payload: &[u8]) -> io::Result<([u8; 16], Vec<[u8; 16
     cursor.read_exact(&mut hash)?;
     let count = cursor.read_u16::<LittleEndian>()? as usize;
 
-    const MAX_HASHSET_PARTS: usize = 10_000;
+    const MAX_HASHSET_PARTS: usize = ED2K_MAX_WIRE_PARTS;
     if count > MAX_HASHSET_PARTS {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1674,7 +1685,7 @@ pub fn parse_hashset_answer2(payload: &[u8]) -> io::Result<Hashset2Response> {
     let options = cursor.read_u8()?;
     let has_md4 = (options & 0x01) != 0;
     let has_aich = (options & 0x02) != 0;
-    const MAX_HASHSET2_PARTS: usize = 10_000;
+    const MAX_HASHSET2_PARTS: usize = ED2K_MAX_WIRE_PARTS;
     let mut md4_hashes = None;
     if has_md4 {
         let mut md4_hash = [0u8; 16];
@@ -2010,7 +2021,11 @@ pub struct MultiPacketRequest {
 /// on the opcode. We handle the two that eMule always sends:
 ///   OP_REQUESTFILENAME (0x58) - no extra data
 ///   OP_SETREQFILEID    (0x4F) - no extra data
-pub fn parse_multipacket(payload: &[u8], opcode: u8) -> io::Result<MultiPacketRequest> {
+pub fn parse_multipacket(
+    payload: &[u8],
+    opcode: u8,
+    extended_requests_ver: u8,
+) -> io::Result<MultiPacketRequest> {
     const MAX_MULTIPACKET_SUBOPS: usize = 32;
 
     if payload.len() < 17 {
@@ -2054,54 +2069,38 @@ pub fn parse_multipacket(payload: &[u8], opcode: u8) -> io::Result<MultiPacketRe
                 sub_opcodes.push(MultiPacketSubReq::RequestFileName);
                 // eMule ExtendedRequests v1+: partcount(u16) + part_status_bitmap
                 // eMule ExtendedRequests v2+: + complete_sources(u16)
-                // We must consume this data to keep alignment with subsequent sub-opcodes.
-                let remaining = payload.len().saturating_sub(cursor.position() as usize);
-                if remaining >= 2 {
-                    let part_count = cursor.read_u16::<LittleEndian>()? as usize;
-                    if part_count > MAX_REASK_PARTS {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "multipacket part count {part_count} exceeds maximum {MAX_REASK_PARTS}"
-                            ),
-                        ));
-                    }
-                    let bitmap_bytes = (part_count + 7) / 8;
-                    let pos = cursor.position() as usize;
-                    if pos
-                        .checked_add(bitmap_bytes)
-                        .is_some_and(|end| end <= payload.len())
-                    {
-                        // Capture the advertised bitmap before skipping past it,
-                        // so the uploader can paint the peer's pre-existing parts.
-                        req_part_status =
-                            Some((part_count as u16, payload[pos..pos + bitmap_bytes].to_vec()));
-                        cursor.set_position((pos + bitmap_bytes) as u64);
-                        // v2: complete sources count. Only consume it if it does not
-                        // look like the next byte is already another sub-opcode.
-                        let next_pos = cursor.position() as usize;
-                        if next_pos + 2 <= payload.len() {
-                            let next_byte = payload[next_pos];
-                            let next_after_u16 = payload.get(next_pos + 2).copied();
-                            let is_known_subop = |b: u8| {
-                                matches!(
-                                    b,
-                                    OP_REQUESTFILENAME
-                                        | OP_SETREQFILEID
-                                        | OP_REQUESTSOURCES
-                                        | OP_REQUESTSOURCES2
-                                        | OP_AICHFILEHASHREQ
-                                )
-                            };
-                            if !is_known_subop(next_byte)
-                                && next_after_u16.is_some_and(is_known_subop)
-                            {
-                                let _complete_sources = cursor.read_u16::<LittleEndian>()?;
-                            }
-                        }
-                    } else {
-                        break;
-                    }
+                // Decode by the negotiated capability, never by inspecting
+                // bytes that might legally be the low byte of a v2 source
+                // count and also happen to equal a sub-opcode.
+                if extended_requests_ver == 0 {
+                    continue;
+                }
+                let part_count = cursor.read_u16::<LittleEndian>()? as usize;
+                if part_count > MAX_REASK_PARTS {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "multipacket part count {part_count} exceeds maximum {MAX_REASK_PARTS}"
+                        ),
+                    ));
+                }
+                let bitmap_bytes = (part_count + 7) / 8;
+                let pos = cursor.position() as usize;
+                let end = pos.checked_add(bitmap_bytes).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "multipacket bitmap overflow")
+                })?;
+                if end > payload.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "multipacket part bitmap is truncated",
+                    ));
+                }
+                // Capture the advertised bitmap before skipping past it, so
+                // the uploader can paint the peer's pre-existing parts.
+                req_part_status = Some((part_count as u16, payload[pos..end].to_vec()));
+                cursor.set_position(end as u64);
+                if extended_requests_ver >= 2 {
+                    let _complete_sources = cursor.read_u16::<LittleEndian>()?;
                 }
             }
             OP_SETREQFILEID => {
@@ -2157,8 +2156,8 @@ pub fn build_multipacket_answer(
     aich_hash: Option<[u8; 20]>,
     is_ext2: bool,
     sub_opcodes: &[MultiPacketSubReq],
-) -> Vec<u8> {
-    let ed2k_part_count = ed2k_wire_part_count(file_size) as u16;
+) -> Option<Vec<u8>> {
+    let ed2k_part_count = ed2k_wire_part_count_u16(file_size)?;
     let bitmap_bytes = ((ed2k_part_count as usize) + 7) / 8;
     let name_bytes = file_name.as_bytes();
 
@@ -2216,7 +2215,7 @@ pub fn build_multipacket_answer(
         }
     }
 
-    buf
+    Some(buf)
 }
 
 /// Parsed MultiPacketAnswer payload.
@@ -2291,7 +2290,7 @@ pub fn parse_multipacket_answer(payload: &[u8], opcode: u8) -> io::Result<MultiP
                 // peer can otherwise force a 65 535-entry Vec<bool> + O(n) inner
                 // loop per multipacket. 10 000 parts * PARTSIZE = ~95 GiB, which
                 // already exceeds realistic shared files.
-                const MAX_FILE_STATUS_PARTS: usize = 10_000;
+                const MAX_FILE_STATUS_PARTS: usize = ED2K_MAX_WIRE_PARTS;
                 if part_count > MAX_FILE_STATUS_PARTS {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -2343,7 +2342,7 @@ pub fn parse_file_status(payload: &[u8]) -> io::Result<([u8; 16], Vec<bool>)> {
     cursor.read_exact(&mut hash)?;
     let part_count = cursor.read_u16::<LittleEndian>()? as usize;
 
-    const MAX_FILE_STATUS_PARTS: usize = 10_000;
+    const MAX_FILE_STATUS_PARTS: usize = ED2K_MAX_WIRE_PARTS;
     if part_count > MAX_FILE_STATUS_PARTS {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

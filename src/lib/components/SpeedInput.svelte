@@ -28,6 +28,9 @@
   let showUnlimited = $derived(value === 0 && !focused);
   let internalUpdate = false;
   let lastSyncedValue = -1;
+  const inputId = $derived(
+    `speed-input-${label.toLowerCase().replace(/[^a-z0-9]+/g, '-') || 'limit'}`,
+  );
 
   function syncFromBytes(bytes: number) {
     if (bytes === 0) {
@@ -98,7 +101,7 @@
 </script>
 
 {#if label}
-  <span class="speed-label">{label}</span>
+  <label class="speed-label" for={inputId}>{label}</label>
 {/if}
 <div class="speed-input" class:unlimited={showUnlimited}>
   {#if showUnlimited}
@@ -106,7 +109,7 @@
       class="unlimited-display"
       role="button"
       tabindex="0"
-      aria-label={m.speed_input_unlimited_aria()}
+      aria-label={label ? `${label}: ${m.speed_input_unlimited()}` : m.speed_input_unlimited_aria()}
       onclick={toggleUnlimited}
       onkeydown={(e) => {
         if (e.key === 'Enter' || e.key === ' ') {
@@ -120,6 +123,7 @@
     </div>
   {:else}
     <input
+      id={inputId}
       type="number"
       min="0"
       step="any"
@@ -129,6 +133,7 @@
       onblur={() => (focused = false)}
       class="speed-number"
       placeholder="0"
+      aria-label={label || undefined}
     />
     <select value={unit} onchange={handleUnitChange} class="speed-unit" aria-label={m.speed_input_unit_label()}>
       <option value="B/s">B/s</option>

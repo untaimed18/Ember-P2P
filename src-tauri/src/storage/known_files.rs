@@ -77,10 +77,22 @@ pub struct KnownFileRecord {
     pub complete_sources: u32,
 }
 
+/// Per-physical-path metadata for a content-level known.met record. known.met
+/// has one entry per ED2K hash, but a Library can contain several copies of
+/// that content with different names and mtimes. Keeping this separately
+/// avoids making every non-canonical copy rehash on the next startup.
+#[derive(Debug, Clone)]
+struct KnownPathEntry {
+    hash: [u8; 16],
+    path: String,
+    size: u64,
+    modified_at: i64,
+}
+
 #[derive(Clone)]
 pub struct KnownFileList {
     files: HashMap<[u8; 16], KnownFileRecord>,
-    path_index: HashMap<String, [u8; 16]>,
+    path_index: HashMap<String, KnownPathEntry>,
     dirty: bool,
     dirty_generation: u64,
 }
@@ -102,17 +114,24 @@ impl KnownFileList {
         for (hash, record) in other.files {
             if let std::collections::hash_map::Entry::Vacant(e) = self.files.entry(hash) {
                 if !record.file_path.is_empty() {
-                    self.path_index
-                        .insert(normalize_path_key(&record.file_path), hash);
+                    self.path_index.insert(
+                        normalize_path_key(&record.file_path),
+                        KnownPathEntry {
+                            hash,
+                            path: record.file_path.clone(),
+                            size: record.file_size,
+                            modified_at: record.modified_at,
+                        },
+                    );
                 }
                 e.insert(record);
             }
         }
         // Path index entries for hashes we already had stay as-is; disk-only
         // path mappings for absorbed hashes are already inserted above.
-        for (path_key, hash) in other.path_index {
-            if self.files.contains_key(&hash) && !self.path_index.contains_key(&path_key) {
-                self.path_index.insert(path_key, hash);
+        for (path_key, entry) in other.path_index {
+            if self.files.contains_key(&entry.hash) && !self.path_index.contains_key(&path_key) {
+                self.path_index.insert(path_key, entry);
             }
         }
     }
@@ -210,7 +229,23 @@ impl KnownFileList {
                 // Normalize the key so Windows path-casing differences
                 // between sessions still hit on lookup (the record keeps
                 // the original-case `file_path`).
-                self.path_index.insert(normalize_path_key(&path), hash);
+                self.path_index.insert(
+                    normalize_path_key(&path),
+                    KnownPathEntry {
+                        hash,
+                        path,
+                        size: self
+                            .files
+                            .get(&hash)
+                            .map(|record| record.file_size)
+                            .unwrap_or_default(),
+                        modified_at: self
+                            .files
+                            .get(&hash)
+                            .map(|record| record.modified_at)
+                            .unwrap_or_default(),
+                    },
+                );
             }
         }
 
@@ -414,9 +449,9 @@ impl KnownFileList {
         size: u64,
         mtime: i64,
     ) -> Option<&KnownFileRecord> {
-        if let Some(hash) = self.path_index.get(&normalize_path_key(path)) {
-            if let Some(record) = self.files.get(hash) {
-                if record.file_size == size && record.modified_at == mtime {
+        if let Some(entry) = self.path_index.get(&normalize_path_key(path)) {
+            if let Some(record) = self.files.get(&entry.hash) {
+                if entry.size == size && entry.modified_at == mtime {
                     return Some(record);
                 }
             }
@@ -508,18 +543,25 @@ impl KnownFileList {
         discovered_path: &str,
         discovered_size: u64,
         discovered_mtime: i64,
-        discovered_name: &str,
+        _discovered_name: &str,
         discovered_aich: &str,
     ) -> bool {
+        if let Some(entry) = self.path_index.get(&normalize_path_key(discovered_path)) {
+            return entry.hash != *hash
+                || entry.size != discovered_size
+                || entry.modified_at != discovered_mtime
+                || (!discovered_aich.is_empty()
+                    && self
+                        .files
+                        .get(hash)
+                        .is_none_or(|record| record.aich_hash != discovered_aich));
+        }
         match self.files.get(hash) {
             None => true,
-            Some(record) => {
-                record.file_path != discovered_path
-                    || record.modified_at != discovered_mtime
-                    || record.file_size != discovered_size
-                    || record.file_name != discovered_name
-                    || (!discovered_aich.is_empty() && record.aich_hash != discovered_aich)
-            }
+            // A new physical path for existing content must be persisted
+            // independently. Do not compare it to the content record's
+            // canonical name/mtime: those belong to another copy.
+            Some(_) => true,
         }
     }
 
@@ -532,30 +574,54 @@ impl KnownFileList {
             // different path casing updates the same entry instead of
             // accumulating a stale duplicate.
             let new_key = normalize_path_key(&new_path);
-            if let Some(&old_hash) = self.path_index.get(&new_key) {
+            if let Some(old_entry) = self.path_index.get(&new_key) {
+                let old_hash = old_entry.hash;
                 if old_hash != hash {
                     let other_refs = self
                         .path_index
                         .iter()
-                        .any(|(p, h)| *h == old_hash && *p != new_key);
+                        .any(|(p, entry)| entry.hash == old_hash && *p != new_key);
                     if !other_refs {
                         self.files.remove(&old_hash);
                     }
                 }
             }
-            // Remove stale path_index entry if this hash was previously at a different path
-            if let Some(existing) = self.files.get(&hash) {
-                let old_path = &existing.file_path;
-                if !old_path.is_empty() {
-                    let old_key = normalize_path_key(old_path);
-                    if old_key != new_key && self.path_index.get(&old_key) == Some(&hash) {
-                        self.path_index.remove(&old_key);
-                    }
-                }
-            }
-            self.path_index.insert(new_key, hash);
+            self.path_index.insert(
+                new_key,
+                KnownPathEntry {
+                    hash,
+                    path: new_path,
+                    size: record.file_size,
+                    modified_at: record.modified_at,
+                },
+            );
         }
-        self.files.insert(hash, record);
+        if let Some(existing) = self.files.get_mut(&hash) {
+            // Counters are content-wide, but path/name/mtime belong to one
+            // canonical copy. Keep that canonical metadata when another
+            // duplicate is reconciled and update fields that are genuinely
+            // content-wide or newly available.
+            existing.part_hashes = record.part_hashes;
+            if !record.aich_hash.is_empty() {
+                existing.aich_hash = record.aich_hash;
+            }
+            existing.upload_priority = record.upload_priority;
+            existing.is_shared = record.is_shared;
+            existing.complete_sources = record.complete_sources;
+            existing.last_publish_src = record.last_publish_src;
+            existing.last_shared = record.last_shared;
+            if existing.file_path.is_empty()
+                || normalize_path_key(&existing.file_path)
+                    == normalize_path_key(&record.file_path)
+            {
+                existing.file_name = record.file_name;
+                existing.file_size = record.file_size;
+                existing.file_path = record.file_path;
+                existing.modified_at = record.modified_at;
+            }
+        } else {
+            self.files.insert(hash, record);
+        }
         self.touch_dirty();
     }
 
@@ -799,9 +865,11 @@ impl KnownFileList {
             Err(_) => return,
         };
         // Version 2 adds a known.met mtime tag so we can detect pairs that
-        // drifted apart (partial write / crash). Version 1 (no mtime) is
+        // drifted apart (partial write / crash). Version 3 additionally
+        // stores path-local size/mtime, allowing multiple physical copies of
+        // one hash to skip rehashing independently. Version 1 (no mtime) is
         // still accepted for backward compatibility with older installs.
-        if version == 2 {
+        if version == 2 || version == 3 {
             let expected_mtime = match cur.read_u64::<LittleEndian>() {
                 Ok(m) => m,
                 Err(_) => return,
@@ -826,13 +894,15 @@ impl KnownFileList {
             );
             return;
         }
-        // A mapping always needs at least a u16 length plus a 16-byte hash.
+        // A v1/v2 mapping needs at least a u16 length plus a 16-byte hash;
+        // v3 appends path-local size and mtime.
         // This also rejects a corrupt huge count without iterating it.
         let remaining = data.len().saturating_sub(cur.position() as usize);
-        if count > remaining / 18 {
+        let min_mapping_bytes = if version == 3 { 34 } else { 18 };
+        if count > remaining / min_mapping_bytes {
             warn!(
                 "known_paths.dat is truncated: declares {count} mappings but at most {} fit",
-                remaining / 18
+                remaining / min_mapping_bytes
             );
             return;
         }
@@ -875,6 +945,34 @@ impl KnownFileList {
                 );
                 return;
             }
+            let (size, modified_at) = if version == 3 {
+                let size = match cur.read_u64::<LittleEndian>() {
+                    Ok(value) => value,
+                    Err(e) => {
+                        warn!(
+                            "known_paths.dat mapping {} of {count} has no size: {e}; discarding path index",
+                            mapping_index + 1
+                        );
+                        return;
+                    }
+                };
+                let modified_at = match cur.read_i64::<LittleEndian>() {
+                    Ok(value) => value,
+                    Err(e) => {
+                        warn!(
+                            "known_paths.dat mapping {} of {count} has no mtime: {e}; discarding path index",
+                            mapping_index + 1
+                        );
+                        return;
+                    }
+                };
+                (size, modified_at)
+            } else {
+                self.files
+                    .get(&hash)
+                    .map(|record| (record.file_size, record.modified_at))
+                    .unwrap_or((0, 0))
+            };
             let fp = match String::from_utf8(pbuf) {
                 Ok(path) => path,
                 Err(e) => {
@@ -886,7 +984,12 @@ impl KnownFileList {
                 }
             };
             if !fp.is_empty() && self.files.contains_key(&hash) {
-                mappings.push((fp, hash));
+                mappings.push(KnownPathEntry {
+                    hash,
+                    path: fp,
+                    size,
+                    modified_at,
+                });
             }
         }
         if cur.position() as usize != data.len() {
@@ -898,12 +1001,13 @@ impl KnownFileList {
         }
 
         let mut loaded = 0usize;
-        for (fp, hash) in mappings {
-            if let Some(record) = self.files.get_mut(&hash) {
+        for entry in mappings {
+            if let Some(record) = self.files.get_mut(&entry.hash) {
                 if record.file_path.is_empty() {
-                    record.file_path = fp.clone();
+                    record.file_path = entry.path.clone();
                 }
-                self.path_index.insert(normalize_path_key(&fp), hash);
+                self.path_index
+                    .insert(normalize_path_key(&entry.path), entry);
                 loaded += 1;
             }
         }
@@ -921,26 +1025,26 @@ impl KnownFileList {
             }
             return Ok(());
         }
-        let mut buf = Vec::with_capacity(17 + self.path_index.len() * 40);
+        let mut buf = Vec::with_capacity(17 + self.path_index.len() * 56);
         buf.write_all(b"NXPI")?;
-        buf.write_u8(2)?;
+        buf.write_u8(3)?;
         buf.write_u64::<LittleEndian>(known_mtime_ns)?;
         buf.write_u32::<LittleEndian>(self.path_index.len() as u32)?;
-        for (norm_key, hash) in &self.path_index {
-            // Persist the record's ORIGINAL-case path (not the normalized index
-            // key) so a reload restores the real path for display/use; the
-            // index key is re-normalized on load.
-            let file_path = self
-                .files
-                .get(hash)
-                .map(|r| r.file_path.as_str())
-                .filter(|p| !p.is_empty())
-                .unwrap_or(norm_key.as_str());
+        for (norm_key, entry) in &self.path_index {
+            // Persist the original-case physical path and its own metadata,
+            // not the content record's canonical path/mtime.
+            let file_path = if entry.path.is_empty() {
+                norm_key.as_str()
+            } else {
+                entry.path.as_str()
+            };
             let pb = file_path.as_bytes();
             let len = pb.len().min(u16::MAX as usize);
             buf.write_u16::<LittleEndian>(len as u16)?;
             buf.write_all(&pb[..len])?;
-            buf.write_all(hash)?;
+            buf.write_all(&entry.hash)?;
+            buf.write_u64::<LittleEndian>(entry.size)?;
+            buf.write_i64::<LittleEndian>(entry.modified_at)?;
         }
         crate::security::atomic_write(path, &buf, false)?;
         Ok(())
@@ -1240,6 +1344,43 @@ mod tests {
             1_700_000_000,
             "movie.mkv",
             &aich,
+        ));
+    }
+
+    #[test]
+    fn duplicate_paths_keep_independent_metadata() {
+        let mut kf = KnownFileList::new();
+        let first = sample_record();
+        let hash = first.file_hash;
+        kf.add_or_update(first);
+
+        let mut second = sample_record();
+        second.file_path = "C:/Library/renamed-copy.mkv".to_string();
+        second.file_name = "renamed-copy.mkv".to_string();
+        second.modified_at = 1_700_000_123;
+        kf.add_or_update(second);
+
+        assert!(kf
+            .find_by_path_and_meta(
+                "C:/Library/movie.mkv",
+                1024 * 1024,
+                1_700_000_000
+            )
+            .is_some());
+        assert!(kf
+            .find_by_path_and_meta(
+                "C:/Library/renamed-copy.mkv",
+                1024 * 1024,
+                1_700_000_123
+            )
+            .is_some());
+        assert!(!kf.record_needs_refresh(
+            &hash,
+            "C:/Library/renamed-copy.mkv",
+            1024 * 1024,
+            1_700_000_123,
+            "renamed-copy.mkv",
+            "",
         ));
     }
 
