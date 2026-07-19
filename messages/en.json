@@ -1614,6 +1614,8 @@
   "settings_udp_port_hint": "KAD DHT (default 4672). May match the TCP port if your VPN only forwards a single port.",
   "settings_upnp_label": "UPnP Port Mapping",
   "settings_upnp_hint": "Auto-configure router ports. Disable for manual forwarding.",
+  "settings_stun_keepalive_label": "STUN port keep-alive (full-cone / CGNAT)",
+  "settings_stun_keepalive_hint": "Keeps NAT mappings alive with STUN and a TCP hold from your listen port, and advertises the public ports for HighID. Best behind CGNAT or full-cone NAT without UPnP. Auto-suspends on symmetric/VPN-style remapping and falls back to Settings ports.",
   "settings_auto_connect_kad": "Auto-Connect KAD",
   "settings_auto_connect_kad_hint": "Automatically bootstrap KAD on startup. When off, press Connect to start.",
   "settings_downloading": "Downloading...",
@@ -2036,5 +2038,9 @@
   "statusbar_epx_status_active": "Active",
   "statusbar_epx_status_idle": "Idle",
   "statusbar_epx_status_inactive": "Offline",
-  "servers_connect_select_hint": "Select a server in the list to connect"
+  "servers_connect_select_hint": "Select a server in the list to connect",
+  "kad_stat_stun_keepalive": "STUN keep-alive",
+  "kad_stun_active": "Active",
+  "kad_stun_inactive": "Off",
+  "kad_stat_public_ports": "Public ports"
 }

@@ -162,6 +162,20 @@ impl BuddyManager {
         self.tcp_port
     }
 
+    /// Keep the port we advertise to our buddy in sync with STUN keep-alive
+    /// remaps discovered after construction — without this, a mid-session
+    /// remap would never reach the buddy Hello handshake / `OP_CALLBACK`
+    /// payloads, which bake in whatever `tcp_port` was at startup.
+    pub fn set_tcp_port(&mut self, tcp_port: u16) {
+        self.tcp_port = tcp_port;
+    }
+
+    /// Same as `set_tcp_port` but for the UDP/Kad port advertised in the
+    /// buddy Hello handshake (`HelloOptions::udp_port`/`kad_port`).
+    pub fn set_udp_port(&mut self, udp_port: u16) {
+        self.udp_port = udp_port;
+    }
+
     pub fn buddy_id(&self) -> Option<&KadId> {
         self.buddy_id.as_ref()
     }

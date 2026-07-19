@@ -9,7 +9,7 @@ use flate2::Compression;
 use futures::FutureExt;
 use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
@@ -1112,8 +1112,13 @@ struct UploadHandler {
     /// rest of the network stack — without this the listener would be
     /// stuck on whatever value was active at process start.
     obfuscation_enabled: Arc<std::sync::atomic::AtomicBool>,
+    /// Local bind port (process-lifetime).
     tcp_port: u16,
+    /// Port advertised in Hello / shared-files answers. May differ from
+    /// `tcp_port` when STUN discovers a remapped public TCP port.
+    advertise_tcp_port: Arc<std::sync::atomic::AtomicU16>,
     udp_port: u16,
+    advertise_udp_port: Arc<std::sync::atomic::AtomicU16>,
     active_count: Arc<std::sync::atomic::AtomicUsize>,
     max_concurrent_uploads: Arc<std::sync::atomic::AtomicUsize>,
     upload_event_tx: tokio::sync::mpsc::Sender<UploadEvent>,
@@ -1854,9 +1859,11 @@ pub(crate) async fn udp_queue_rank_for_peer(
 
 pub async fn start_upload_server(
     tcp_port: u16,
+    advertise_tcp_port: Arc<std::sync::atomic::AtomicU16>,
     user_hash: [u8; 16],
     nickname: Arc<tokio::sync::RwLock<String>>,
     udp_port: u16,
+    advertise_udp_port: Arc<std::sync::atomic::AtomicU16>,
     shared_folders: Arc<RwLock<Vec<String>>>,
     download_folder: PathBuf,
     local_index: Arc<RwLock<LocalIndex>>,
@@ -1927,13 +1934,23 @@ pub async fn start_upload_server(
     mut inbound_stream_rx: tokio::sync::mpsc::Receiver<InboundStreamRequest>,
 ) -> anyhow::Result<()> {
     let addr: SocketAddr = format!("0.0.0.0:{tcp_port}").parse()?;
-    let listener = match TcpListener::bind(addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!(
-                "TCP port {tcp_port} is already in use: {e}. Peer-to-peer uploads will not work."
-            );
-            anyhow::bail!("TCP port {tcp_port} already in use: {e}");
+    // SO_REUSEADDR so the NATMAP-style TCP mapping hold can bind the same
+    // local port for outbound keep-alive connects without conflicting.
+    let listener = {
+        let sock = tokio::net::TcpSocket::new_v4()
+            .map_err(|e| anyhow::anyhow!("TCP socket create failed: {e}"))?;
+        sock.set_reuseaddr(true)
+            .map_err(|e| anyhow::anyhow!("TCP SO_REUSEADDR failed: {e}"))?;
+        sock.bind(addr)
+            .map_err(|e| anyhow::anyhow!("TCP bind {tcp_port} failed: {e}"))?;
+        match sock.listen(1024) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!(
+                    "TCP port {tcp_port} is already in use: {e}. Peer-to-peer uploads will not work."
+                );
+                anyhow::bail!("TCP port {tcp_port} is already in use: {e}");
+            }
         }
     };
     let current_max = max_concurrent_uploads.load(std::sync::atomic::Ordering::Relaxed);
@@ -1955,7 +1972,9 @@ pub async fn start_upload_server(
         nickname,
         obfuscation_enabled,
         tcp_port,
+        advertise_tcp_port,
         udp_port,
+        advertise_udp_port,
         active_count,
         max_concurrent_uploads,
         upload_event_tx,
@@ -2555,6 +2574,28 @@ pub async fn start_upload_server(
 }
 
 impl UploadHandler {
+    fn advertised_tcp_port(&self) -> u16 {
+        let p = self
+            .advertise_tcp_port
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if p == 0 {
+            self.tcp_port
+        } else {
+            p
+        }
+    }
+
+    fn advertised_udp_port(&self) -> u16 {
+        let p = self
+            .advertise_udp_port
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if p == 0 {
+            self.udp_port
+        } else {
+            p
+        }
+    }
+
     async fn nickname_snapshot(&self) -> String {
         self.nickname.read().await.clone()
     }
@@ -2710,7 +2751,7 @@ impl UploadHandler {
                 .collect()
         };
 
-        encode_shared_files_answer(&files, client_id, self.tcp_port)
+        encode_shared_files_answer(&files, client_id, self.advertised_tcp_port())
     }
 
     /// Periodic eMule-style queue maintenance: evict waiting peers whose
@@ -2905,8 +2946,8 @@ impl UploadHandler {
             .unwrap_or(0);
         let server_port = server.map(|addr| addr.port()).unwrap_or(0);
         HelloOptions {
-            udp_port: self.udp_port,
-            kad_port: self.udp_port,
+            udp_port: self.advertised_udp_port(),
+            kad_port: self.advertised_udp_port(),
             supports_crypt_layer: self
                 .obfuscation_enabled
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -3341,7 +3382,7 @@ impl UploadHandler {
             let hello_payload = build_hello_with_buddy_opts(
                 &self.user_hash,
                 our_client_id,
-                self.tcp_port,
+                self.advertised_tcp_port(),
                 &nickname,
                 buddy,
                 &hello_options,
@@ -3382,7 +3423,7 @@ impl UploadHandler {
             // non-EmuleInfo packet here (peer jumped straight to a file request)
             // is captured as `first_packet` and replayed by the serve loop.
             let emule_payload =
-                build_emule_info(self.udp_port, obf_enabled, Some(&self.ember_hash), None);
+                build_emule_info(self.advertised_udp_port(), obf_enabled, Some(&self.ember_hash), None);
             write_packet_async(&mut writer, OP_EMULEPROT, OP_EMULEINFO, &emule_payload).await?;
             let mut first_packet: Option<(u8, u8, Vec<u8>)> = None;
             if let Ok(Ok((eproto, eopcode, epayload))) = tokio::time::timeout(
@@ -3397,7 +3438,7 @@ impl UploadHandler {
                     merge_caps(&mut hello_caps, parse_emule_info(&epayload));
                     if eopcode == OP_EMULEINFO {
                         let answer = build_emule_info(
-                            self.udp_port,
+                            self.advertised_udp_port(),
                             obf_enabled,
                             Some(&self.ember_hash),
                             None,
@@ -3552,7 +3593,7 @@ impl UploadHandler {
                 let hello_payload = build_hello_answer_with_buddy_opts(
                     &self.user_hash,
                     our_client_id,
-                    self.tcp_port,
+                    self.advertised_tcp_port(),
                     &nickname,
                     buddy,
                     &hello_options,
@@ -3566,7 +3607,7 @@ impl UploadHandler {
                 // Hello-only reply as half-baked and silently FIN on the first
                 // file request).
                 let emule_payload = build_emule_info(
-                    self.udp_port,
+                    self.advertised_udp_port(),
                     self.obfuscation_enabled
                         .load(std::sync::atomic::Ordering::Relaxed),
                     Some(&self.ember_hash),
@@ -3666,7 +3707,7 @@ impl UploadHandler {
                                 let hello_payload = build_hello_answer_with_buddy_opts(
                                     &self.user_hash,
                                     our_client_id,
-                                    self.tcp_port,
+                                    self.advertised_tcp_port(),
                                     &nickname,
                                     buddy,
                                     &hello_options,
@@ -3684,7 +3725,7 @@ impl UploadHandler {
                                 raw_writer.flush().await?;
 
                                 let emule_payload = build_emule_info(
-                                    self.udp_port,
+                                    self.advertised_udp_port(),
                                     self.obfuscation_enabled
                                         .load(std::sync::atomic::Ordering::Relaxed),
                                     Some(&self.ember_hash),
@@ -3842,7 +3883,7 @@ impl UploadHandler {
                         let hello_payload = build_hello_answer_with_buddy_opts(
                             &self.user_hash,
                             our_client_id,
-                            self.tcp_port,
+                            self.advertised_tcp_port(),
                             &nickname,
                             buddy,
                             &hello_options,
@@ -3888,7 +3929,7 @@ impl UploadHandler {
                         // `SetConnectionEncryption(false, NULL, false)`), which
                         // is why this regression only ever bit callback flows.
                         let emule_payload = build_emule_info(
-                            self.udp_port,
+                            self.advertised_udp_port(),
                             self.obfuscation_enabled
                                 .load(std::sync::atomic::Ordering::Relaxed),
                             Some(&self.ember_hash),
@@ -4330,7 +4371,7 @@ impl UploadHandler {
                     ul_peer_name = hello_caps.peer_name.clone();
                 }
                 let emule_payload = build_emule_info(
-                    self.udp_port,
+                    self.advertised_udp_port(),
                     self.obfuscation_enabled
                         .load(std::sync::atomic::Ordering::Relaxed),
                     Some(&self.ember_hash),

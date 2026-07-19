@@ -1688,6 +1688,14 @@
 
           <div class="field toggle-row">
             <div class="toggle-info">
+              <span class="toggle-title">{m.settings_stun_keepalive_label()}</span>
+              <span class="hint">{m.settings_stun_keepalive_hint()}</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.stun_keepalive_enabled} ariaLabel={m.settings_stun_keepalive_label()} />
+          </div>
+
+          <div class="field toggle-row">
+            <div class="toggle-info">
               <span class="toggle-title">{m.settings_auto_connect_kad()} <span class="restart-badge">{m.settings_restart_badge()}</span></span>
               <span class="hint">{m.settings_auto_connect_kad_hint()}</span>
             </div>

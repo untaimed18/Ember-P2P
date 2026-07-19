@@ -803,6 +803,20 @@
             {/if}
           </div>
           <div class="stat-tile">
+            <span class="stat-label">{m.kad_stat_stun_keepalive()}</span>
+            <span class="stat-value">{$networkStats.stun_keepalive_active ? m.kad_stun_active() : m.kad_stun_inactive()}</span>
+          </div>
+          <div class="stat-tile">
+            <span class="stat-label">{m.kad_stat_public_ports()}</span>
+            <span class="stat-value">
+              {#if ($networkStats.public_tcp_port || 0) > 0 || ($networkStats.public_udp_port || 0) > 0}
+                TCP {$networkStats.public_tcp_port || '—'} / UDP {$networkStats.public_udp_port || '—'}
+              {:else}
+                —
+              {/if}
+            </span>
+          </div>
+          <div class="stat-tile">
             <span class="stat-label">{m.kad_stat_buddy()}</span>
             <span class="stat-value">
               {!$networkStats.buddy_status || $networkStats.buddy_status === 'none' ? m.kad_buddy_none() :

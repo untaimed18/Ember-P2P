@@ -1609,6 +1609,8 @@
   "settings_udp_port_hint": "KAD DHT (padrão 4672). Pode ser igual à porta TCP se sua VPN só encaminhar uma única porta.",
   "settings_upnp_label": "Mapeamento de Portas UPnP",
   "settings_upnp_hint": "Configurar automaticamente as portas do roteador. Desative para encaminhamento manual.",
+  "settings_stun_keepalive_label": "Keep-alive STUN de portas (full-cone / CGNAT)",
+  "settings_stun_keepalive_hint": "Mantem mapeamentos NAT vivos com STUN e um hold TCP da porta de escuta, e anuncia as portas publicas para HighID. Ideal atras de CGNAT ou NAT full-cone sem UPnP. Suspende automaticamente em NAT simetrico/VPN e volta para as portas das Configuracoes.",
   "settings_auto_connect_kad": "Conectar Automaticamente ao KAD",
   "settings_auto_connect_kad_hint": "Executar bootstrap do KAD automaticamente na inicialização. Se desativado, pressione Conectar para iniciar.",
   "settings_downloading": "Baixando...",
@@ -2031,5 +2033,9 @@
   "statusbar_epx_status_active": "Ativo",
   "statusbar_epx_status_idle": "Ocioso",
   "statusbar_epx_status_inactive": "Offline",
-  "servers_connect_select_hint": "Selecione um servidor na lista para conectar"
+  "servers_connect_select_hint": "Selecione um servidor na lista para conectar",
+  "kad_stat_stun_keepalive": "Keep-alive STUN",
+  "kad_stun_active": "Ativo",
+  "kad_stun_inactive": "Desligado",
+  "kad_stat_public_ports": "Portas publicas"
 }

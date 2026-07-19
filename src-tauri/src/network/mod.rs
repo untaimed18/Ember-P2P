@@ -130,28 +130,418 @@ fn spawn_nat_probe(
     packet_tx
 }
 
-fn route_nat_probe_packet(
-    packet_tx: &mut Option<mpsc::Sender<(Vec<u8>, SocketAddr)>>,
+fn route_stun_binding_packet(
+    probe_tx: &mut Option<mpsc::Sender<(Vec<u8>, SocketAddr)>>,
+    keepalive_tx: &mut Option<mpsc::Sender<(Vec<u8>, SocketAddr)>>,
     data: &[u8],
     from: SocketAddr,
 ) -> bool {
     if !ember::nat::is_stun_binding_response(data) {
         return false;
     }
-    let Some(tx) = packet_tx.as_ref() else {
-        return true;
-    };
-    match tx.try_send((data.to_vec(), from)) {
-        Ok(()) => true,
-        Err(mpsc::error::TrySendError::Full(_)) => {
-            debug!("Dropping STUN response from {from}: NAT probe channel full");
-            true
-        }
-        Err(mpsc::error::TrySendError::Closed(_)) => {
-            *packet_tx = None;
-            true
+    for slot in [probe_tx, keepalive_tx] {
+        let Some(tx) = slot.as_ref() else {
+            continue;
+        };
+        match tx.try_send((data.to_vec(), from)) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                debug!("Dropping STUN response from {from}: channel full");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                *slot = None;
+            }
         }
     }
+    true
+}
+
+struct UdpMappingKeepaliveResult {
+    generation: u64,
+    mapped: Option<SocketAddr>,
+}
+
+struct TcpMappingKeepaliveResult {
+    generation: u64,
+    hold_ok: bool,
+    mapped: Option<SocketAddr>,
+}
+
+fn spawn_udp_mapping_keepalive(
+    udp_socket: Arc<UdpSocket>,
+    result_tx: mpsc::UnboundedSender<UdpMappingKeepaliveResult>,
+    generation: u64,
+    server_index: usize,
+) -> mpsc::Sender<(Vec<u8>, SocketAddr)> {
+    let (packet_tx, packet_rx) = mpsc::channel(8);
+    tokio::spawn(async move {
+        let mapped =
+            ember::mapping_keepalive::stun_keepalive_with_replies(udp_socket, packet_rx, server_index)
+                .await;
+        let _ = result_tx.send(UdpMappingKeepaliveResult { generation, mapped });
+    });
+    packet_tx
+}
+
+fn advertised_tcp_port(state: &NetworkState) -> u16 {
+    state
+        .external_tcp_port
+        .filter(|p| *p != 0)
+        .unwrap_or(state.tcp_port)
+}
+
+/// UDP counterpart of `advertised_tcp_port` — the KAD-peer-voted or
+/// STUN-confirmed public UDP port when known, otherwise the raw bind port.
+fn advertised_udp_port(state: &NetworkState) -> u16 {
+    state
+        .external_udp_port
+        .filter(|p| *p != 0)
+        .unwrap_or(state.udp_port)
+}
+
+/// Whether STUN keep-alive should actively refresh/advertise mappings.
+/// Symmetric / unstable remapping (typical VPN) must not override Settings ports.
+fn stun_keepalive_should_run(state: &NetworkState) -> bool {
+    state.stun_keepalive_enabled && !state.stun_ka_auto_suspended
+}
+
+/// Whether `external_udp_port` currently holds a STUN-confirmed mapping that
+/// keep-alive is actively maintaining. KAD firewall Pong/FirewallUdp peer
+/// votes must not silently clobber this — otherwise a stale or minority vote
+/// for the internal bind port can undo a live full-cone/CGNAT remap advertise.
+fn stun_udp_mapping_active(state: &NetworkState) -> bool {
+    stun_keepalive_should_run(state)
+        && state.stun_sourced_udp_port.is_some()
+        && state.stun_sourced_udp_port == state.external_udp_port
+}
+
+/// Fully reset STUN keep-alive session state: clears auto-suspend, all
+/// candidate/stability tracking (UDP + TCP), and reverts advertise ports to
+/// Settings. Used for state transitions where prior STUN progress is no
+/// longer meaningful — disabling the feature, re-enabling it after it was
+/// off, and KAD disconnect (a new session may be a different network).
+fn reset_stun_keepalive_session(state: &mut NetworkState) {
+    state.stun_ka_auto_suspended = false;
+    state.stun_ka_suspended_at = None;
+    state.stun_ka_candidate_port = None;
+    state.stun_ka_stable_hits = 0;
+    state.stun_ka_tcp_candidate_port = None;
+    state.stun_ka_tcp_stable_hits = 0;
+    // Invalidate any UDP/TCP mapping keep-alive cycle still in flight from
+    // before this reset (mirrors nat_probe_generation) — otherwise a stale
+    // result computed against pre-reset conditions can land right after and
+    // silently re-populate the fields this function just cleared.
+    state.mapping_ka_generation = state.mapping_ka_generation.wrapping_add(1);
+    revert_stun_advertise_to_settings(state);
+}
+
+fn revert_stun_advertise_to_settings(state: &mut NetworkState) {
+    // Drop STUN TCP override always.
+    state.external_tcp_port = None;
+    // Only clear UDP when the current external port was STUN-sourced, so
+    // KAD firewall peer votes survive STUN disable/suspend. Prefer the
+    // firewall checker's vote when available.
+    if let Some(stun_port) = state.stun_sourced_udp_port.take() {
+        if state.external_udp_port == Some(stun_port) {
+            state.external_udp_port = state.firewall_checker.external_udp_port();
+        }
+    }
+    state.stats.public_tcp_port = 0;
+    state.stats.public_udp_port = 0;
+    state.stats.stun_keepalive_active = false;
+    state.publish_manager.tcp_port = state.tcp_port;
+    update_publish_manager_state(state);
+}
+
+/// Clear `external_udp_port` for a firewall recheck without wiping a
+/// STUN-confirmed remapping (shared field; advertise must stay coherent).
+fn clear_external_udp_for_firewall_recheck(state: &mut NetworkState) {
+    if state
+        .stun_sourced_udp_port
+        .is_some_and(|p| state.external_udp_port == Some(p))
+    {
+        return;
+    }
+    state.external_udp_port = None;
+}
+
+fn suspend_stun_keepalive(state: &mut NetworkState, reason: &'static str) {
+    if state.stun_ka_auto_suspended {
+        return;
+    }
+    state.stun_ka_auto_suspended = true;
+    state.stun_ka_suspended_at = Some(std::time::Instant::now());
+    state.stun_ka_candidate_port = None;
+    state.stun_ka_stable_hits = 0;
+    state.stun_ka_tcp_candidate_port = None;
+    state.stun_ka_tcp_stable_hits = 0;
+    revert_stun_advertise_to_settings(state);
+    info!(
+        "STUN keepalive auto-suspended ({reason}); advertising Settings ports TCP {} / UDP {}",
+        state.tcp_port, state.udp_port
+    );
+}
+
+fn maybe_suspend_stun_from_nat_type(state: &mut NetworkState) {
+    match state.nat_info.nat_type {
+        ember::nat::NatType::Symmetric => {
+            suspend_stun_keepalive(state, "symmetric NAT — public port is per-destination");
+        }
+        ember::nat::NatType::Open => {
+            // No remapping needed; Settings ports are already correct.
+            suspend_stun_keepalive(state, "open internet — STUN advertise unnecessary");
+        }
+        _ => {}
+    }
+}
+
+/// Apply a UDP STUN keep-alive observation. Returns `true` when the mapping
+/// is confirmed (1:1 hold or stable remapped advertise).
+fn apply_udp_mapping_keepalive(
+    state: &mut NetworkState,
+    mapped: SocketAddr,
+    app: &tauri::AppHandle,
+) -> bool {
+    if !stun_keepalive_should_run(state) {
+        return false;
+    }
+
+    let port = mapped.port();
+    // UI always shows the latest observed mapping.
+    state.stats.public_udp_port = port;
+
+    // 1:1 mapping (public port == local bind): good for keep-alive hold, no
+    // need to override advertise (Settings already match).
+    if port == state.udp_port {
+        if let Some(stun_port) = state.stun_sourced_udp_port.take() {
+            if state.external_udp_port == Some(stun_port) {
+                state.external_udp_port = state.firewall_checker.external_udp_port();
+            }
+            // Same-port TCP mirrors whatever the UDP remap was advertising
+            // (see the `tcp_port == udp_port` branch below); a return to
+            // 1:1 must drop that override too, or `advertised_tcp_port()`
+            // (Hello/FirewalledReq/KAD publish) keeps advertising the
+            // stale remapped port forever.
+            if state.tcp_port == state.udp_port && state.external_tcp_port == Some(stun_port) {
+                state.external_tcp_port = None;
+                state.stats.public_tcp_port = 0;
+                state.publish_manager.tcp_port = state.tcp_port;
+            }
+            update_publish_manager_state(state);
+        }
+        // `stun_ka_candidate_port`/`stun_ka_stable_hits` track an
+        // *unconfirmed remap* only (see the match below) — they must NOT
+        // hold the 1:1 bind port, or the very first genuine remap after a
+        // 1:1 period would see a "changed" candidate and be misdiagnosed as
+        // flapping/unstable, auto-suspending on exactly the transition this
+        // feature exists to handle.
+        state.stun_ka_candidate_port = None;
+        state.stun_ka_stable_hits = 0;
+        // Log only on the false->true transition — the steady-state 1:1
+        // case (the common CGNAT/port-forward outcome) would otherwise be
+        // completely silent every cycle at INFO level, making it
+        // indistinguishable in the logs from the feature not running at
+        // all. See the analogous "stable public UDP mapping" log below for
+        // the remapped case.
+        if !state.stats.stun_keepalive_active {
+            info!(
+                "STUN keepalive: confirmed 1:1 UDP mapping {mapped} (no remap needed)"
+            );
+        }
+        state.stats.stun_keepalive_active = true;
+        if let Some(ip) = ember::mapping_keepalive::ipv4_from_mapped(mapped) {
+            if state.external_ip.is_none() {
+                set_external_ip(state, Some(ip));
+            }
+        }
+        return true;
+    }
+
+    // Remapped public port: only advertise after two consecutive identical
+    // observations (stable full-cone / CGNAT). Flapping ⇒ auto-suspend
+    // (VPN / symmetric behavior).
+    match state.stun_ka_candidate_port {
+        Some(prev) if prev == port => {
+            state.stun_ka_stable_hits = state.stun_ka_stable_hits.saturating_add(1);
+        }
+        Some(prev) => {
+            info!(
+                "STUN keepalive: public UDP port changed {prev} → {port}; treating as unstable"
+            );
+            suspend_stun_keepalive(state, "unstable public UDP port (not full-cone)");
+            state.stats.public_udp_port = port; // still show last observation
+            return false;
+        }
+        None => {
+            state.stun_ka_candidate_port = Some(port);
+            state.stun_ka_stable_hits = 1;
+            info!(
+                "STUN keepalive: candidate public UDP mapping {mapped} (awaiting confirm)"
+            );
+            return false;
+        }
+    }
+
+    if state.stun_ka_stable_hits < 2 {
+        return false;
+    }
+
+    let prev = state.external_udp_port;
+    state.external_udp_port = Some(port);
+    state.stun_sourced_udp_port = Some(port);
+    state.stats.stun_keepalive_active = true;
+    state
+        .advertise_udp_port
+        .store(port, std::sync::atomic::Ordering::Relaxed);
+
+    if state.tcp_port == state.udp_port {
+        state.external_tcp_port = Some(port);
+        state.stats.public_tcp_port = port;
+        state
+            .advertise_tcp_port
+            .store(port, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    if let Some(ip) = ember::mapping_keepalive::ipv4_from_mapped(mapped) {
+        if state.external_ip.is_none() {
+            set_external_ip(state, Some(ip));
+        }
+        if state.nat_info.external_addr != Some(mapped) {
+            state.nat_info.external_addr = Some(mapped);
+            state.nat_info.last_probed = std::time::Instant::now();
+            // Deliberately do NOT infer `nat_type` from a 1:1 keep-alive
+            // confirmation. This used to assume PortRestricted here, which
+            // closes the `nat_type == Unknown` gate that all three NAT-probe
+            // trigger sites depend on — since this 1:1 path fires within
+            // ~3s of startup (often before the dedicated multi-server probe
+            // even gets a chance to run), it was permanently short-circuiting
+            // the real Open/Symmetric classification that `maybe_suspend_
+            // stun_from_nat_type` needs, so auto-suspend could never fire.
+            // Leave nat_type to the dedicated probe (and its own
+            // apply_highid_fallback) to determine.
+            if let Ok(mut ctx) = state.friend_nat_context.write() {
+                ctx.external_addr = Some(mapped);
+                ctx.nat_type = state.nat_info.nat_type;
+            }
+        }
+    }
+
+    update_publish_manager_state(state);
+    if prev != Some(port) {
+        info!("STUN keepalive: stable public UDP mapping {mapped} (was {prev:?})");
+        let _ = app.emit(
+            "stun-keepalive",
+            serde_json::json!({
+                "public_udp_port": port,
+                "public_tcp_port": state.stats.public_tcp_port,
+                "tcp_hold_ok": state.stats.tcp_mapping_hold_ok,
+            }),
+        );
+    }
+    true
+}
+
+/// Apply a TCP mapping keep-alive result. Returns `true` when the cycle
+/// contributed something useful (a successful hold and/or a confirmed
+/// public TCP mapping), so the caller can decide whether the overall
+/// keep-alive "Active" indicator should stay on.
+fn apply_tcp_mapping_keepalive(
+    state: &mut NetworkState,
+    hold_ok: bool,
+    mapped: Option<SocketAddr>,
+    app: &tauri::AppHandle,
+) -> bool {
+    if !stun_keepalive_should_run(state) {
+        return false;
+    }
+    state.stats.tcp_mapping_hold_ok = hold_ok;
+    let mut changed = false;
+    let mut confirmed = false;
+    if let Some(addr) = mapped {
+        let port = addr.port();
+        // 1:1 (no remap) or matches the already-stable STUN-confirmed UDP
+        // public port: both are directly corroborated, so accept
+        // immediately without requiring their own consecutive-observation
+        // streak. Deliberately checks `stun_sourced_udp_port`, NOT the
+        // shared `external_udp_port` — the latter can hold a KAD
+        // Pong/FirewallUdp peer vote that never passed STUN's own
+        // stability gate.
+        if port == state.tcp_port || state.stun_sourced_udp_port == Some(port) {
+            state.stun_ka_tcp_candidate_port = None;
+            state.stun_ka_tcp_stable_hits = 0;
+            confirmed = true;
+        } else {
+            // Independent stability tracking for a TCP-only remap — do NOT
+            // reuse `stun_ka_stable_hits`, which tracks the *UDP* candidate
+            // and may already be >=2 for a completely different port.
+            match state.stun_ka_tcp_candidate_port {
+                Some(prev) if prev == port => {
+                    state.stun_ka_tcp_stable_hits =
+                        state.stun_ka_tcp_stable_hits.saturating_add(1);
+                }
+                _ => {
+                    state.stun_ka_tcp_candidate_port = Some(port);
+                    state.stun_ka_tcp_stable_hits = 1;
+                }
+            }
+            if state.stun_ka_tcp_stable_hits >= 2 {
+                confirmed = true;
+            } else {
+                // Deliberately do NOT surface this candidate via
+                // `stats.public_tcp_port` before it's confirmed — unlike the
+                // UDP tile (which is purely informational), this value is
+                // also consumed as "our actually-advertised TCP port" by
+                // ed2k link generation (see `build_ed2k_link`), so showing
+                // an unconfirmed/possibly-flapping value here could hand
+                // out a port nothing is actually advertising to peers yet.
+                return false;
+            }
+        }
+        if confirmed {
+            if state.external_tcp_port != Some(port) {
+                changed = true;
+            }
+            state.external_tcp_port = Some(port);
+            state.stats.public_tcp_port = port;
+            state
+                .advertise_tcp_port
+                .store(port, std::sync::atomic::Ordering::Relaxed);
+            if let Some(ip) = ember::mapping_keepalive::ipv4_from_mapped(addr) {
+                if state.external_ip.is_none() {
+                    set_external_ip(state, Some(ip));
+                }
+            }
+            state.publish_manager.tcp_port = port;
+            update_publish_manager_state(state);
+        }
+    } else if hold_ok {
+        // TCP hold alone (no twin-STUN reading, e.g. same_port case) is
+        // still a successful keep-alive contribution. Same false->true
+        // transition logging rationale as the UDP 1:1 case above — this
+        // path is otherwise silent every cycle.
+        if !state.stats.stun_keepalive_active {
+            info!("STUN keepalive: TCP mapping hold confirmed (local port {})", state.tcp_port);
+        }
+        confirmed = true;
+    }
+    if confirmed {
+        state.stats.stun_keepalive_active = true;
+    }
+    if changed {
+        info!(
+            "STUN keepalive: public TCP mapping {:?} hold_ok={hold_ok}",
+            mapped
+        );
+        let _ = app.emit(
+            "stun-keepalive",
+            serde_json::json!({
+                "public_udp_port": state.stats.public_udp_port,
+                "public_tcp_port": state.stats.public_tcp_port,
+                "tcp_hold_ok": hold_ok,
+            }),
+        );
+    }
+    confirmed
 }
 
 /// Try to connect to a server, attempting the DH-encrypted connection first (for HighID),
@@ -1077,7 +1467,11 @@ async fn send_kad_callback_req(
         // eMule writes `CUInt128(reqfile->GetFileHash())` here, i.e. the
         // MD4 hash in KAD/CUInt128 byte order, not raw ed2k hash order.
         file_id: md4_bytes_to_kad_id(&file_hash),
-        tcp_port: state.tcp_port,
+        // The buddy relays this so the target peer knows what port to
+        // connect back to us on — must be the STUN-confirmed public port
+        // when remapped, not the raw local bind port (same reasoning as
+        // FirewalledReq/Firewalled2Req).
+        tcp_port: advertised_tcp_port(state),
     };
     let Ok(packet) = kad::messages::encode_packet(&callback_req) else {
         return false;
@@ -1663,8 +2057,8 @@ fn spawn_rendezvous_friend_lookup(
         .external_ip
         .map(|eip| u32::from_le_bytes(eip.octets()))
         .unwrap_or(0);
-    let tcp = settings.tcp_port;
-    let udp = settings.udp_port;
+    let tcp = advertised_tcp_port(state);
+    let udp = advertised_udp_port(state);
     let obfuscate = settings.friend_session_encryption;
     let app_fc = app_handle.clone();
     let fh_fc = friend_hashes.clone();
@@ -3513,6 +3907,30 @@ struct NetworkState {
     nodes_save_lock: Arc<tokio::sync::Mutex<()>>,
     external_ip: Option<Ipv4Addr>,
     external_udp_port: Option<u16>,
+    /// Public TCP listen port discovered via twin-port STUN (may differ from bind).
+    external_tcp_port: Option<u16>,
+    /// Live Hello / publish TCP port (updated by mapping keep-alive).
+    advertise_tcp_port: Arc<std::sync::atomic::AtomicU16>,
+    /// Live Hello / publish UDP port (updated by mapping keep-alive).
+    advertise_udp_port: Arc<std::sync::atomic::AtomicU16>,
+    stun_keepalive_enabled: bool,
+    /// Session auto-suspend when NAT is symmetric/open/unstable (Settings ports win).
+    stun_ka_auto_suspended: bool,
+    /// When auto-suspend started (for periodic retry).
+    stun_ka_suspended_at: Option<std::time::Instant>,
+    /// Last STUN-observed public UDP port awaiting stability confirmation.
+    stun_ka_candidate_port: Option<u16>,
+    /// Consecutive identical candidate observations (need 2 before advertise).
+    stun_ka_stable_hits: u8,
+    /// Same stability tracking as `stun_ka_candidate_port` /
+    /// `stun_ka_stable_hits`, but for the *TCP* twin-STUN reading — kept
+    /// separate so a stable UDP mapping cannot rubber-stamp an unrelated,
+    /// unconfirmed TCP port.
+    stun_ka_tcp_candidate_port: Option<u16>,
+    stun_ka_tcp_stable_hits: u8,
+    /// Public UDP port last stably advertised by STUN keep-alive (if any).
+    /// Used so revert/firewall recheck do not wipe peer-voted ports.
+    stun_sourced_udp_port: Option<u16>,
     firewalled: bool,
     firewall_checks_sent: u32,
     peer_nicknames: HashMap<KadId, String>,
@@ -3935,6 +4353,13 @@ struct NetworkState {
     /// Invalidates NAT probe results that arrive after a watchdog/disconnect
     /// has superseded the task.
     nat_probe_generation: u64,
+    /// Invalidates mapping keep-alive (STUN/TCP-hold) cycle results that
+    /// arrive after a disconnect has superseded them — a `NetworkState`
+    /// field (not a loop-local) specifically so `NetworkCommand::KadDisconnect`
+    /// can bump it and stop a stale in-flight result from re-populating
+    /// `external_udp_port` / `stun_sourced_udp_port` / advertise ports right
+    /// after `reset_stun_keepalive_session` just cleared them.
+    mapping_ka_generation: u64,
     /// Live-updated mirror of `nat_info` (plus the QUIC endpoint once
     /// available) shared with spawned friend-dial tasks via
     /// `connect_friend_with_fallback`, so a fresh read right before the
@@ -4188,7 +4613,9 @@ fn is_source_admissible(
         return false;
     }
     if let Some(ext) = state.external_ip {
-        if ip == ext && port == state.tcp_port {
+        // Compare against both the raw bind port and whatever we actually
+        // publish (which may be STUN-remapped) — see `is_self_source`.
+        if ip == ext && (port == state.tcp_port || port == advertised_tcp_port(state)) {
             return false;
         }
     }
@@ -4812,7 +5239,7 @@ async fn initiate_server_connect(
     }
     let user_hash = state.user_hash;
     let nickname = settings.nickname.clone();
-    let tcp_port = state.tcp_port;
+    let tcp_port = advertised_tcp_port(state);
     let obf_port = state
         .server_list
         .servers()
@@ -5299,8 +5726,8 @@ async fn try_start_pending_download_from_known_sources(
         download_dir: PathBuf::from(&settings.download_folder),
         user_hash: state.user_hash,
         nickname: settings.nickname.clone(),
-        tcp_port: settings.tcp_port,
-        udp_port: settings.udp_port,
+        tcp_port: advertised_tcp_port(&state),
+        udp_port: advertised_udp_port(&state),
         bandwidth_limiter: bandwidth_limiter.clone(),
         control: pending.control,
         source_manager: Some(source_manager.clone()),
@@ -5962,6 +6389,15 @@ fn apply_network_settings(
     settings: &mut AppSettings,
     new_settings: AppSettings,
 ) {
+    let stun_was_enabled = state.stun_keepalive_enabled;
+    state.stun_keepalive_enabled = new_settings.stun_keepalive_enabled;
+    if !new_settings.stun_keepalive_enabled {
+        reset_stun_keepalive_session(state);
+    } else if !stun_was_enabled {
+        // User turned STUN back on: clear auto-suspend so it can try again.
+        // Do not clear on unrelated settings saves while already enabled.
+        reset_stun_keepalive_session(state);
+    }
     state.obfuscation_enabled = new_settings.obfuscation_enabled;
     state.obfuscation_enabled_shared.store(
         new_settings.obfuscation_enabled,
@@ -6456,6 +6892,17 @@ pub async fn start_network(
         nodes_save_lock: Arc::new(tokio::sync::Mutex::new(())),
         external_ip: None,
         external_udp_port: None,
+        external_tcp_port: None,
+        advertise_tcp_port: Arc::new(std::sync::atomic::AtomicU16::new(tcp_port)),
+        advertise_udp_port: Arc::new(std::sync::atomic::AtomicU16::new(udp_port)),
+        stun_keepalive_enabled: settings.stun_keepalive_enabled,
+        stun_ka_auto_suspended: false,
+        stun_ka_suspended_at: None,
+        stun_ka_candidate_port: None,
+        stun_ka_stable_hits: 0,
+        stun_ka_tcp_candidate_port: None,
+        stun_ka_tcp_stable_hits: 0,
+        stun_sourced_udp_port: None,
         firewalled: !upnp_success,
         firewall_checks_sent: 0,
         peer_nicknames: HashMap::new(),
@@ -6604,6 +7051,7 @@ pub async fn start_network(
         tracker_registry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         nat_info: ember::nat::NatInfo::unknown(),
         nat_probe_generation: 0,
+        mapping_ka_generation: 0,
         friend_nat_context: ember::nat::new_shared_friend_nat_context(),
         connection_broker: None,
         broker_event_rx: None,
@@ -6982,12 +7430,16 @@ pub async fn start_network(
         let ul_queue = upload_queue_handle.clone();
         let ul_sx_overhead = stats_manager.sx_counters.clone();
         let ul_inbound_stream_rx = inbound_stream_rx;
+        let ul_adv_tcp = state.advertise_tcp_port.clone();
+        let ul_adv_udp = state.advertise_udp_port.clone();
         tokio::spawn(async move {
             if let Err(e) = upload_server::start_upload_server(
                 tcp_port,
+                ul_adv_tcp,
                 user_hash,
                 ul_nickname,
                 udp_port,
+                ul_adv_udp,
                 ul_folders,
                 PathBuf::from(&ul_download_folder),
                 ul_index,
@@ -7252,6 +7704,26 @@ pub async fn start_network(
     let (nat_probe_result_tx, mut nat_probe_result_rx) =
         mpsc::unbounded_channel::<NatProbeResult>();
     let mut nat_probe_packet_tx: Option<mpsc::Sender<(Vec<u8>, SocketAddr)>> = None;
+    let (udp_map_ka_result_tx, mut udp_map_ka_result_rx) =
+        mpsc::unbounded_channel::<UdpMappingKeepaliveResult>();
+    let mut udp_map_ka_packet_tx: Option<mpsc::Sender<(Vec<u8>, SocketAddr)>> = None;
+    let (tcp_map_ka_result_tx, mut tcp_map_ka_result_rx) =
+        mpsc::unbounded_channel::<TcpMappingKeepaliveResult>();
+    let mut mapping_ka_server_index: usize = 0;
+    let mut udp_map_ka_in_flight = false;
+    let mut tcp_map_ka_in_flight = false;
+    // Whether *any* keep-alive contribution (confirmed UDP mapping, applied
+    // TCP mapping, or a successful TCP hold) succeeded for the current
+    // generation. Reset when a new round starts; checked once both the UDP
+    // and TCP results for that round have been processed so a fully failed
+    // cycle can clear the "Active" indicator instead of leaving it sticky.
+    let mut mapping_ka_cycle_success = false;
+    let mut next_mapping_ka_at = tokio::time::Instant::now()
+        + if settings.stun_keepalive_enabled {
+            std::time::Duration::from_secs(3)
+        } else {
+            ember::mapping_keepalive::MAPPING_KEEPALIVE_INTERVAL
+        };
     let mut known_met_save_in_flight = false;
     let mut known_met_save_started_at: Option<tokio::time::Instant> = None;
     let mut stats_save_in_flight = false;
@@ -8049,9 +8521,10 @@ pub async fn start_network(
                     .unwrap_or(200);
                 let end = limit.min(files.len());
                 let chunk: Vec<_> = files.drain(..end).collect();
+                let offer_tcp_port = advertised_tcp_port(&state);
                 if let Some(conn) = state.server_connection.as_mut() {
                     if !chunk.is_empty() {
-                        match conn.offer_files_chunk(&chunk, settings.tcp_port).await {
+                        match conn.offer_files_chunk(&chunk, offer_tcp_port).await {
                             Ok(()) => {
                                 record_offered_ed2k_hashes(&mut state, &chunk);
                                 if files.is_empty() {
@@ -8162,9 +8635,26 @@ pub async fn start_network(
         }
 
         if state.stats.status == NetworkStatus::Disconnected {
-            nat_probe_in_flight = false;
-            nat_probe_started_at = None;
-            nat_probe_packet_tx = None;
+            // Don't stomp a probe that just started: this runs on EVERY
+            // loop iteration while disconnected (not just once on the
+            // disconnect transition), and STUN keepalive's own external-IP
+            // discovery can satisfy the NAT-probe trigger conditions before
+            // `KadConnect` ever flips status away from `Disconnected` (often
+            // within the same second at startup). Without this guard, each
+            // iteration here would reset `nat_probe_in_flight = false`,
+            // letting the catch-all trigger below immediately spawn a NEW
+            // probe and orphan the previous one's reply-routing channel —
+            // observed in practice as 3 probes spawned within ~40ms and a
+            // "STUN reply channel closed" error on the abandoned ones.
+            let probe_is_fresh = nat_probe_in_flight
+                && nat_probe_started_at
+                    .map(|t| t.elapsed() < NAT_PROBE_WATCHDOG)
+                    .unwrap_or(false);
+            if !probe_is_fresh {
+                nat_probe_in_flight = false;
+                nat_probe_started_at = None;
+                nat_probe_packet_tx = None;
+            }
             rendezvous_register_in_flight = false;
             rendezvous_register_started_at = None;
         }
@@ -8176,6 +8666,15 @@ pub async fn start_network(
                 tokio::time::Instant::now() >= deadline
             })
         {
+            // This catch-all trigger (unlike the two dedicated "External IP
+            // discovered via X — scheduling initial NAT probe" sites) had no
+            // log line at all, making it indistinguishable from "never
+            // fires" in normal logs. Needed to diagnose why nat_info stayed
+            // Unknown all session despite external_ip being known early
+            // (STUN keepalive's own 1:1 confirmation can set external_ip
+            // before either of the other two trigger sites sees a
+            // None->Some transition, silently skipping them).
+            info!("NAT probe: external IP available — scheduling probe (catch-all trigger)");
             nat_probe_in_flight = true;
             nat_probe_started_at = Some(tokio::time::Instant::now());
             state.nat_probe_generation = state.nat_probe_generation.saturating_add(1);
@@ -8254,8 +8753,9 @@ pub async fn start_network(
             result = udp_socket.recv_from(&mut udp_buf) => {
                 match result {
                     Ok((len, from)) => {
-                        if route_nat_probe_packet(
+                        if route_stun_binding_packet(
                             &mut nat_probe_packet_tx,
+                            &mut udp_map_ka_packet_tx,
                             &udp_buf[..len],
                             from,
                         ) {
@@ -8321,8 +8821,9 @@ pub async fn start_network(
                 for _ in 0..19 {
                     match udp_socket.try_recv_from(&mut udp_buf) {
                         Ok((len, from)) => {
-                            if route_nat_probe_packet(
+                            if route_stun_binding_packet(
                                 &mut nat_probe_packet_tx,
+                                &mut udp_map_ka_packet_tx,
                                 &udp_buf[..len],
                                 from,
                             ) {
@@ -8470,8 +8971,9 @@ pub async fn start_network(
                             is_complete: false,
                             file_type: String::new(),
                         }];
+                        let offer_tcp_port = advertised_tcp_port(&state);
                         let offered_ok = if let Some(conn) = state.server_connection.as_mut() {
-                            match conn.offer_files(&offer, settings.tcp_port).await {
+                            match conn.offer_files(&offer, offer_tcp_port).await {
                                 Ok(()) => true,
                                 Err(e) => {
                                     debug!("Failed to offer new partial to server: {e}");
@@ -8810,9 +9312,10 @@ pub async fn start_network(
                                             is_complete: true,
                                             file_type: String::new(),
                                         }];
+                                        let offer_tcp_port = advertised_tcp_port(&state);
                                         let offered_ok =
                                             if let Some(conn) = state.server_connection.as_mut() {
-                                                match conn.offer_files(&offer, state.tcp_port).await
+                                                match conn.offer_files(&offer, offer_tcp_port).await
                                                 {
                                                     Ok(()) => true,
                                                     Err(e) => {
@@ -9269,8 +9772,8 @@ pub async fn start_network(
                             let our_eh = ember_hash;
                             let nick = settings.nickname.clone();
                             let cid = state.external_ip.map(|eip| u32::from_le_bytes(eip.octets())).unwrap_or(0);
-                            let tcp = settings.tcp_port;
-                            let udp = settings.udp_port;
+                            let tcp = advertised_tcp_port(&state);
+                            let udp = advertised_udp_port(&state);
                             let obfs = settings.friend_session_encryption;
                             let sess = state.ember_sessions.clone();
                             let ultx = ul_event_tx.clone();
@@ -11577,7 +12080,10 @@ pub async fn start_network(
                             for ds in &direct_callback_sources {
                                 let addr = SocketAddr::new(ds.ip.into(), ds.udp_port);
                                 let mut pkt = vec![OP_EMULEPROT, ed2k::messages::OP_DIRECTCALLBACKREQ];
-                                pkt.extend_from_slice(&state.tcp_port.to_le_bytes());
+                                // Tell the peer the STUN-confirmed public port
+                                // to connect back to, not the raw local bind
+                                // port (same reasoning as CallbackReq/HelloRes).
+                                pkt.extend_from_slice(&advertised_tcp_port(&state).to_le_bytes());
                                 pkt.extend_from_slice(&state.user_hash);
                                 pkt.push(build_kad_connect_options(&state) & 0x07);
                                 // Match eMule: when the peer advertises crypt support and we
@@ -12178,8 +12684,8 @@ pub async fn start_network(
                                         download_dir: PathBuf::from(&settings.download_folder),
                                         user_hash: state.user_hash,
                                         nickname: settings.nickname.clone(),
-                                        tcp_port: settings.tcp_port,
-                                        udp_port: settings.udp_port,
+                                        tcp_port: advertised_tcp_port(&state),
+                                        udp_port: advertised_udp_port(&state),
                                         bandwidth_limiter: bandwidth_limiter.clone(),
                                         control: pending.control,
                                         source_manager: Some(source_manager.clone()),
@@ -12921,7 +13427,7 @@ pub async fn start_network(
                 // Firewall detection using FirewallChecker
                 if !state.firewall_checker.is_checking() && state.firewall_checker.should_recheck() && table_size >= 10 {
                     state.firewall_checker.start_check();
-                    state.external_udp_port = None;
+                    clear_external_udp_for_firewall_recheck(&mut state);
                     if let Ok(mut probes) = firewall_probe_ips.lock() { probes.clear(); }
                     let checks = state.firewall_checker.checks_to_send() as usize;
 
@@ -12932,16 +13438,17 @@ pub async fn start_network(
                         .take(checks)
                         .cloned()
                         .collect();
+                    let fw_tcp_port = advertised_tcp_port(&state);
                     for contact in &fw_contacts {
                         let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                         let (msg, track_opcode) = if contact.version > KADEMLIA_VERSION6_49ABETA {
                             (KadMessage::Firewalled2Req {
-                                tcp_port: state.tcp_port,
+                                tcp_port: fw_tcp_port,
                                 user_hash: state.user_hash,
                                 connect_options: build_kad_connect_options(&state),
                             }, 0x53u8)
                         } else {
-                            (KadMessage::FirewalledReq { tcp_port: state.tcp_port }, 0x50u8)
+                            (KadMessage::FirewalledReq { tcp_port: fw_tcp_port }, 0x50u8)
                         };
                         if let Ok(packet) = messages::encode_packet(&msg) {
                             state.flood_protection.track_request(addr, track_opcode);
@@ -13433,8 +13940,13 @@ pub async fn start_network(
                     // the broker / relay path, which has its own
                     // `(ip, advertised_port)` keying — rendezvous is
                     // exclusively about friend-presence over TCP.
+                    // `advertised_tcp_port` (not the raw `settings.tcp_port`)
+                    // so a STUN-confirmed CGNAT/full-cone remap is what
+                    // friends actually get told to dial — still "the TCP
+                    // listener port" per the rationale above, just the
+                    // correct current value of it.
                     let rv_url = settings.rendezvous_url.clone();
-                    let rv_port = settings.tcp_port;
+                    let rv_port = advertised_tcp_port(&state);
                     let rv_hash = ember_hash;
                     // The outer `if !state.friend_presence_initial_done
                     // && state.external_ip.is_some()` already guarantees
@@ -13566,12 +14078,13 @@ pub async fn start_network(
                     if needs_heartbeat {
                         if let Some(rv_ip) = state.external_ip {
                             let rv_url = settings.rendezvous_url.clone();
-                            // Heartbeat must advertise the same port we
-                            // registered with — see the friend-dial
-                            // rationale at the initial registration
-                            // site for why this is the TCP listener
-                            // port and not the QUIC bind port.
-                            let rv_port = settings.tcp_port;
+                            // Heartbeat must advertise the same *kind* of
+                            // port we registered with (TCP listener, not
+                            // QUIC — see the initial registration site) —
+                            // using `advertised_tcp_port` here too means a
+                            // STUN remap discovered between heartbeats
+                            // naturally refreshes the rendezvous entry.
+                            let rv_port = advertised_tcp_port(&state);
                             let rv_hash = ember_hash;
                             let rv_pubkey = ed25519_pubkey;
                             let rv_secret = ed25519_secret_key;
@@ -13618,7 +14131,12 @@ pub async fn start_network(
                 // the lookup key itself.
                 if state.rendezvous_registered {
                     if let Some(ext_ip) = state.external_ip {
-                        let our_relay_id = format!("{:0>64}", format!("{:08x}{:04x}", u32::from(ext_ip), state.tcp_port));
+                        // Must match the port producers actually key their
+                        // invite by: KAD source publish and rendezvous
+                        // /register both now use `advertised_tcp_port`, so
+                        // this lookup key does too — otherwise a STUN remap
+                        // makes every relay invite for us unfindable.
+                        let our_relay_id = format!("{:0>64}", format!("{:08x}{:04x}", u32::from(ext_ip), advertised_tcp_port(&state)));
                         let rv_url = settings.rendezvous_url.clone();
                         let relay_cb_tx = inbound_stream_tx.clone();
                         // Friend-connect context, needed only when an invite turns
@@ -13635,8 +14153,8 @@ pub async fn start_network(
                             .external_ip
                             .map(|eip| u32::from_le_bytes(eip.octets()))
                             .unwrap_or(0);
-                        let fc_tcp_port = settings.tcp_port;
-                        let fc_udp_port = settings.udp_port;
+                        let fc_tcp_port = advertised_tcp_port(&state);
+                        let fc_udp_port = advertised_udp_port(&state);
                         let fc_obfuscate = settings.friend_session_encryption;
                         let fc_ember_sessions = state.ember_sessions.clone();
                         let fc_ul_event_tx = ul_event_tx.clone();
@@ -13749,9 +14267,12 @@ pub async fn start_network(
                         (state.external_ip, state.connection_broker.as_ref())
                     {
                         if let Some(endpoint) = broker.quic_endpoint().cloned() {
+                            // Must match the KAD-advertised tcp_port other
+                            // producers key `(source_ip, source_port)` by —
+                            // see the doc comment above this block.
                             let our_punch_id = format!(
                                 "{:0>64}",
-                                format!("{:08x}{:04x}", u32::from(ext_ip), state.tcp_port)
+                                format!("{:08x}{:04x}", u32::from(ext_ip), advertised_tcp_port(&state))
                             );
                             // The port we ask the initiator to dial back on IS
                             // the QUIC port (opposite of the id above): this is
@@ -14911,8 +15432,21 @@ pub async fn start_network(
                                     .external_ip
                                     .map(|ip| u32::from_le_bytes(ip.octets()))
                                     .unwrap_or(0);
-                                let greet_tcp_port = state.tcp_port;
-                                let greet_udp_port = state.udp_port;
+                                // Inlined `advertised_tcp_port(&state)`: a
+                                // whole-struct borrow would conflict with the
+                                // active `state.broker_event_rx` mutable
+                                // borrow (`rx`) for this match arm.
+                                let greet_tcp_port = state
+                                    .external_tcp_port
+                                    .filter(|p| *p != 0)
+                                    .unwrap_or(state.tcp_port);
+                                // Same STUN-aware fallback as TCP above (via
+                                // `advertised_udp_port`, inlined for the same
+                                // borrow-conflict reason as `greet_tcp_port`).
+                                let greet_udp_port = state
+                                    .external_udp_port
+                                    .filter(|p| *p != 0)
+                                    .unwrap_or(state.udp_port);
                                 let greet_nickname = settings.nickname.clone();
                                 let greet_peer_ip = conn.source_ip;
                                 let greet_peer_port = conn.source_port;
@@ -15212,7 +15746,7 @@ pub async fn start_network(
                     }
                     let msg = match messages::build_hello_req(
                         &state.local_id,
-                        settings.tcp_port,
+                        advertised_tcp_port(&state),
                         KADEMLIA_VERSION,
                         &hello_tags,
                     ) {
@@ -16214,8 +16748,8 @@ pub async fn start_network(
                             download_dir: PathBuf::from(&settings.download_folder),
                             user_hash: state.user_hash,
                             nickname: settings.nickname.clone(),
-                            tcp_port: settings.tcp_port,
-                            udp_port: settings.udp_port,
+                            tcp_port: advertised_tcp_port(&state),
+                            udp_port: advertised_udp_port(&state),
                             bandwidth_limiter: bandwidth_limiter.clone(),
                             control: pending.control,
                             source_manager: Some(source_manager.clone()),
@@ -16428,8 +16962,8 @@ pub async fn start_network(
                             download_dir: PathBuf::from(&settings.download_folder),
                             user_hash: state.user_hash,
                             nickname: settings.nickname.clone(),
-                            tcp_port: settings.tcp_port,
-                            udp_port: settings.udp_port,
+                            tcp_port: advertised_tcp_port(&state),
+                            udp_port: advertised_udp_port(&state),
                             bandwidth_limiter: bandwidth_limiter.clone(),
                             control: pending.control,
                             source_manager: Some(source_manager.clone()),
@@ -17797,9 +18331,14 @@ pub async fn start_network(
                                                     // dialed and forwarded via
                                                     // Source Exchange. Mirrors
                                                     // `is_self_source` + the
-                                                    // inject gate.
+                                                    // inject gate. Checks both
+                                                    // the raw bind port and
+                                                    // the currently-advertised
+                                                    // (possibly STUN-remapped)
+                                                    // one.
                                                     let is_self = (state.external_ip == Some(v4)
-                                                        && src.port == state.tcp_port)
+                                                        && (src.port == state.tcp_port
+                                                            || src.port == advertised_tcp_port(&state)))
                                                         || matches!(
                                                             src.user_hash,
                                                             Some(uh) if uh != [0u8; 16] && uh == state.user_hash
@@ -18009,6 +18548,7 @@ pub async fn start_network(
                                                 port,
                                                 state.external_ip,
                                                 state.tcp_port,
+                                                advertised_tcp_port(&state),
                                                 user_hash,
                                                 &state.user_hash,
                                             )
@@ -18396,7 +18936,7 @@ pub async fn start_network(
                         let addr_str = format!("{ip}:{port}");
                         let user_hash = state.user_hash;
                         let nickname = settings.nickname.clone();
-                        let tcp_port = state.tcp_port;
+                        let tcp_port = advertised_tcp_port(&state);
                         let force_plain = state.server_reconnect_failures >= 2;
                         let obfuscation_enabled = state.obfuscation_enabled;
                         state.server_last_connect_attempt = Some(std::time::Instant::now());
@@ -18712,7 +19252,8 @@ pub async fn start_network(
                                                 continue;
                                             }
                                             if state.external_ip == Some(*ip)
-                                                && *port == state.tcp_port
+                                                && (*port == state.tcp_port
+                                                    || *port == advertised_tcp_port(&state))
                                             {
                                                 continue;
                                             }
@@ -19527,6 +20068,7 @@ pub async fn start_network(
                                 dest_port,
                                 state.external_ip,
                                 state.tcp_port,
+                                advertised_tcp_port(&state),
                                 None,
                                 &state.user_hash,
                             );
@@ -19612,8 +20154,8 @@ pub async fn start_network(
                                     download_dir: PathBuf::from(&settings.download_folder),
                                     user_hash: state.user_hash,
                                     nickname: settings.nickname.clone(),
-                                    tcp_port: settings.tcp_port,
-                                    udp_port: settings.udp_port,
+                                    tcp_port: advertised_tcp_port(&state),
+                                    udp_port: advertised_udp_port(&state),
                                     bandwidth_limiter: bandwidth_limiter.clone(),
                                     control: pd.control,
                                     source_manager: Some(source_manager.clone()),
@@ -19899,8 +20441,8 @@ pub async fn start_network(
                                 file_size: pd.file_size,
                                 source_addr,
                                 download_dir: PathBuf::from(&settings.download_folder),
-                                tcp_port: settings.tcp_port,
-                                udp_port: settings.udp_port,
+                                tcp_port: advertised_tcp_port(&state),
+                                udp_port: advertised_udp_port(&state),
                                 bandwidth_limiter: bandwidth_limiter.clone(),
                                 control: pd.control,
                                 source_manager: Some(source_manager.clone()),
@@ -20439,6 +20981,20 @@ pub async fn start_network(
                 nat_probe_started_at = None;
                 nat_probe_packet_tx = None;
                 state.nat_info = result.info;
+                // A STUN keep-alive-confirmed mapping is more current than
+                // whatever this probe found (or failed to find) — restore it
+                // so a failed/partial probe cannot silently drop it.
+                if stun_udp_mapping_active(&state) {
+                    if let (Some(ip), Some(port)) =
+                        (state.external_ip, state.stun_sourced_udp_port)
+                    {
+                        let confirmed = SocketAddr::new(std::net::IpAddr::V4(ip), port);
+                        state.nat_info.external_addr = Some(confirmed);
+                        if state.nat_info.nat_type == ember::nat::NatType::Unknown {
+                            state.nat_info.nat_type = ember::nat::NatType::PortRestricted;
+                        }
+                    }
+                }
                 if state.nat_info.nat_type == ember::nat::NatType::Unknown {
                     nat_probe_backoff_until = Some(
                         tokio::time::Instant::now() + std::time::Duration::from_secs(300),
@@ -20464,9 +21020,151 @@ pub async fn start_network(
                     ctx.nat_type = state.nat_info.nat_type;
                     ctx.external_addr = state.nat_info.external_addr;
                 }
+                maybe_suspend_stun_from_nat_type(&mut state);
                 }).catch_unwind().await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'nat_probe_result_rx' panicked: {}", describe_panic(&*__p));
+                }
+            }
+
+            Some(result) = udp_map_ka_result_rx.recv() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
+                // Always clear in-flight so a slow cycle cannot permanently
+                // stall keep-alive after the timer advances generation.
+                udp_map_ka_in_flight = false;
+                udp_map_ka_packet_tx = None;
+                if result.generation != state.mapping_ka_generation {
+                    return;
+                }
+                if let Some(mapped) = result.mapped {
+                    if apply_udp_mapping_keepalive(&mut state, mapped, &app_handle) {
+                        mapping_ka_cycle_success = true;
+                        // Confirmed (1:1 or 2-hit stable) — this is the
+                        // freshest known-good mapping, so it always wins
+                        // over whatever a NAT probe last found. A later
+                        // probe result restores this too (see
+                        // nat_probe_result_rx / stun_udp_mapping_active).
+                        // Deliberately does NOT set nat_type here — see the
+                        // matching comment in apply_udp_mapping_keepalive's
+                        // 1:1 branch for why inferring PortRestricted from a
+                        // keep-alive confirmation defeats the dedicated
+                        // NAT-type probe (and therefore auto-suspend).
+                        state.nat_info.external_addr = Some(mapped);
+                    }
+                }
+                if !udp_map_ka_in_flight && !tcp_map_ka_in_flight && !mapping_ka_cycle_success {
+                    if state.stats.stun_keepalive_active {
+                        info!(
+                            "STUN keepalive: cycle {} without a confirmed UDP mapping or TCP hold — marking inactive until the next cycle",
+                            if result.mapped.is_none() { "timed out" } else { "completed" }
+                        );
+                    }
+                    state.stats.stun_keepalive_active = false;
+                }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'udp_map_ka_result_rx' panicked: {}", describe_panic(&*__p));
+                }
+            }
+
+            Some(result) = tcp_map_ka_result_rx.recv() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
+                tcp_map_ka_in_flight = false;
+                if result.generation != state.mapping_ka_generation {
+                    return;
+                }
+                if apply_tcp_mapping_keepalive(&mut state, result.hold_ok, result.mapped, &app_handle) {
+                    mapping_ka_cycle_success = true;
+                }
+                if !udp_map_ka_in_flight && !tcp_map_ka_in_flight && !mapping_ka_cycle_success {
+                    if state.stats.stun_keepalive_active {
+                        info!(
+                            "STUN keepalive: cycle completed without a confirmed UDP mapping or TCP hold (tcp_hold_ok={}) — marking inactive until the next cycle",
+                            result.hold_ok
+                        );
+                    }
+                    state.stats.stun_keepalive_active = false;
+                }
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'tcp_map_ka_result_rx' panicked: {}", describe_panic(&*__p));
+                }
+            }
+
+            _ = tokio::time::sleep_until(next_mapping_ka_at) => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
+                let now = tokio::time::Instant::now();
+                if !state.stun_keepalive_enabled {
+                    state.stats.stun_keepalive_active = false;
+                    next_mapping_ka_at = now
+                        + ember::mapping_keepalive::MAPPING_KEEPALIVE_INTERVAL;
+                    return;
+                }
+                if state.stun_ka_auto_suspended {
+                    state.stats.stun_keepalive_active = false;
+                    // Retry every ~5 minutes in case the path became full-cone/CGNAT.
+                    let cooldown = std::time::Duration::from_secs(300);
+                    let ready = state
+                        .stun_ka_suspended_at
+                        .is_none_or(|at| at.elapsed() >= cooldown);
+                    if !ready {
+                        next_mapping_ka_at = now
+                            + ember::mapping_keepalive::MAPPING_KEEPALIVE_INTERVAL;
+                        return;
+                    }
+                    info!("STUN keepalive: retrying after auto-suspend cooldown");
+                    state.stun_ka_auto_suspended = false;
+                    state.stun_ka_suspended_at = None;
+                    state.stun_ka_candidate_port = None;
+                    state.stun_ka_stable_hits = 0;
+                    state.stun_ka_tcp_candidate_port = None;
+                    state.stun_ka_tcp_stable_hits = 0;
+                }
+                // Wait for any in-flight cycle; retry soon (not a full extra
+                // interval) so a slow STUN/TCP hold (worst case up to ~70s:
+                // multiple timed-out TCP hold targets/STUN servers tried
+                // serially) delays the next round by as little as possible.
+                if udp_map_ka_in_flight || tcp_map_ka_in_flight {
+                    next_mapping_ka_at = now + std::time::Duration::from_secs(1);
+                    return;
+                }
+                next_mapping_ka_at = now
+                    + ember::mapping_keepalive::MAPPING_KEEPALIVE_INTERVAL;
+                // Skip twin-UDP STUN on tcp_port when it equals the KAD UDP port
+                // (socket collision); UDP keepalive on the KAD socket still runs.
+                state.mapping_ka_generation = state.mapping_ka_generation.wrapping_add(1);
+                mapping_ka_cycle_success = false;
+                let gen = state.mapping_ka_generation;
+                udp_map_ka_in_flight = true;
+                udp_map_ka_packet_tx = Some(spawn_udp_mapping_keepalive(
+                    udp_socket.clone(),
+                    udp_map_ka_result_tx.clone(),
+                    gen,
+                    mapping_ka_server_index,
+                ));
+                mapping_ka_server_index = mapping_ka_server_index.wrapping_add(1);
+                tcp_map_ka_in_flight = true;
+                let tcp_port = state.tcp_port;
+                let tx = tcp_map_ka_result_tx.clone();
+                // When TCP port == UDP port, twin STUN cannot bind; still
+                // attempt TCP hold, and reuse UDP mapping for TCP advertise.
+                let same_port = state.tcp_port == state.udp_port;
+                tokio::spawn(async move {
+                    let (hold_ok, mapped) = if same_port {
+                        let hold = ember::mapping_keepalive::hold_tcp_mapping_once(tcp_port).await;
+                        (hold, None)
+                    } else {
+                        ember::mapping_keepalive::tcp_mapping_cycle(tcp_port).await
+                    };
+                    let _ = tx.send(TcpMappingKeepaliveResult {
+                        generation: gen,
+                        hold_ok,
+                        mapped,
+                    });
+                });
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'mapping_keepalive_timer' panicked: {}", describe_panic(&*__p));
                 }
             }
 
@@ -22600,6 +23298,18 @@ fn update_publish_manager_state(state: &mut NetworkState) {
     state.publish_manager.use_extern_kad_port =
         matches!(state.external_udp_port, Some(port) if port != 0 && port != state.udp_port);
     state.publish_manager.udp_port = state.external_udp_port.unwrap_or(state.udp_port);
+    state.publish_manager.tcp_port = advertised_tcp_port(state);
+    // BuddyManager bakes tcp_port/udp_port in at construction (buddy Hello
+    // handshake / OP_CALLBACK payloads) with no other refresh path — without
+    // this, a mid-session STUN remap would never reach the buddy protocol.
+    state.buddy_manager.set_tcp_port(state.publish_manager.tcp_port);
+    state.buddy_manager.set_udp_port(state.publish_manager.udp_port);
+    state
+        .advertise_tcp_port
+        .store(state.publish_manager.tcp_port, std::sync::atomic::Ordering::Relaxed);
+    state
+        .advertise_udp_port
+        .store(state.publish_manager.udp_port, std::sync::atomic::Ordering::Relaxed);
     state.publish_manager.direct_udp_callback = can_advertise_direct_udp_callback(state);
     state.publish_manager.connect_options = build_kad_connect_options(state);
 
@@ -22739,8 +23449,8 @@ fn dispatch_udp_firewall_probe_requests(
             contact,
             state.user_hash,
             settings.nickname.clone(),
-            state.tcp_port,
-            state.udp_port,
+            advertised_tcp_port(state),
+            advertised_udp_port(state),
             external_udp_port,
             state.udp_key_seed,
             external_ip,
@@ -23812,7 +24522,7 @@ async fn handle_udp_packet_inner(
             let contacts = state.routing_table.export_bootstrap_contacts(20);
             let res = KadMessage::BootstrapRes {
                 sender_id: state.local_id,
-                tcp_port: state.tcp_port,
+                tcp_port: advertised_tcp_port(&state),
                 version: KADEMLIA_VERSION,
                 contacts,
             };
@@ -23873,7 +24583,7 @@ async fn handle_udp_packet_inner(
             // Hello the bootstrap node itself, then the first returned contacts.
             let hello = KadMessage::HelloReq {
                 sender_id: state.local_id,
-                tcp_port: state.tcp_port,
+                tcp_port: advertised_tcp_port(&state),
                 version: KADEMLIA_VERSION,
                 tags: {
                     let mut tags = Vec::new();
@@ -24077,7 +24787,7 @@ async fn handle_udp_packet_inner(
 
             let res = KadMessage::HelloRes {
                 sender_id: state.local_id,
-                tcp_port: state.tcp_port,
+                tcp_port: advertised_tcp_port(&state),
                 version: KADEMLIA_VERSION,
                 tags: res_tags,
             };
@@ -24957,8 +25667,20 @@ async fn handle_udp_packet_inner(
                 // would be anomalous — skip it rather than guess a subnet.
                 if let std::net::IpAddr::V4(reporter) = from.ip() {
                     state.firewall_checker.handle_pong(udp_port, reporter);
-                    if let Some(ext_port) = state.firewall_checker.external_udp_port() {
-                        state.external_udp_port = Some(ext_port);
+                    // Record the vote, but don't let it override a live
+                    // STUN-confirmed remap (see stun_udp_mapping_active).
+                    if !stun_udp_mapping_active(state) {
+                        if let Some(ext_port) = state.firewall_checker.external_udp_port() {
+                            if state.external_udp_port != Some(ext_port) {
+                                state.external_udp_port = Some(ext_port);
+                                // Keep advertise_udp_port/publish_manager in
+                                // sync immediately — otherwise a peer we
+                                // Hello/publish to before the next periodic
+                                // refresh (~5s) gets the stale port baked
+                                // into that handshake.
+                                update_publish_manager_state(state);
+                            }
+                        }
                     }
                     dispatch_udp_firewall_probe_requests(state, app_handle, settings);
                 }
@@ -25748,8 +26470,12 @@ async fn handle_udp_packet_inner(
                 state.udp_firewalled = false;
                 state.udp_fw_verified = true;
                 state.stats.firewalled = state.firewalled;
-                if udp_port > 0 {
+                if udp_port > 0
+                    && !stun_udp_mapping_active(state)
+                    && state.external_udp_port != Some(udp_port)
+                {
                     state.external_udp_port = Some(udp_port);
+                    update_publish_manager_state(state);
                 }
                 state.stats.tcp_status = format!("{:?}", state.firewall_checker.tcp_status());
                 state.stats.udp_status = format!("{:?}", state.firewall_checker.udp_status());
@@ -25789,7 +26515,7 @@ async fn handle_udp_packet_inner(
                 let res = KadMessage::FindBuddyRes {
                     buddy_id,
                     user_hash: state.user_hash,
-                    tcp_port: state.tcp_port,
+                    tcp_port: advertised_tcp_port(state),
                     connect_options: build_kad_connect_options(state),
                 };
                 if let Ok(packet) = messages::encode_packet(&res) {
@@ -25863,8 +26589,8 @@ async fn handle_udp_packet_inner(
                     state.buddy_manager.local_id().clone(),
                     state.user_hash,
                     settings.nickname.clone(),
-                    state.tcp_port,
-                    state.udp_port,
+                    advertised_tcp_port(state),
+                    advertised_udp_port(state),
                     state.pending_buddy_hashes.clone(),
                 );
                 state.pending_outgoing_buddy = Some(tokio::spawn(async move {
@@ -26833,8 +27559,8 @@ async fn handle_command_inner(
                     download_dir: PathBuf::from(&settings.download_folder),
                     user_hash: state.user_hash,
                     nickname: settings.nickname.clone(),
-                    tcp_port: settings.tcp_port,
-                    udp_port: settings.udp_port,
+                    tcp_port: advertised_tcp_port(&state),
+                    udp_port: advertised_udp_port(&state),
                     bandwidth_limiter: bandwidth_limiter.clone(),
                     control,
                     source_manager: Some(source_manager.clone()),
@@ -28249,6 +28975,17 @@ async fn handle_command_inner(
             set_external_ip(state, None);
             state.external_udp_port = None;
             state.firewalled = true;
+            // New KAD session (possibly a different network): any STUN
+            // candidate/suspend progress and remapped advertise ports from
+            // before this disconnect are stale. Also resets the live
+            // advertise_tcp_port/advertise_udp_port atomics the upload
+            // listener reads directly, back to Settings ports. Done after
+            // `firewalled` is updated so update_publish_manager_state (called
+            // inside) reflects the post-disconnect state, not the pre-reset one.
+            // (reset_stun_keepalive_session also bumps mapping_ka_generation,
+            // invalidating any in-flight STUN/TCP-hold cycle from before this
+            // disconnect — see its doc comment.)
+            reset_stun_keepalive_session(state);
             state
                 .firewalled_shared
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -28690,7 +29427,7 @@ async fn handle_command_inner(
             state.firewall_checks_sent = 0;
 
             state.firewall_checker.start_check();
-            state.external_udp_port = None;
+            clear_external_udp_for_firewall_recheck(state);
             if let Ok(mut probes) = firewall_probe_ips.lock() {
                 probes.clear();
             }
@@ -28703,12 +29440,13 @@ async fn handle_command_inner(
                 .cloned()
                 .collect();
 
+            let fw_tcp_port = advertised_tcp_port(state);
             for contact in &contacts {
                 let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                 let (msg, track_opcode) = if contact.version > KADEMLIA_VERSION6_49ABETA {
                     (
                         KadMessage::Firewalled2Req {
-                            tcp_port: state.tcp_port,
+                            tcp_port: fw_tcp_port,
                             user_hash: state.user_hash,
                             connect_options: build_kad_connect_options(&state),
                         },
@@ -28717,7 +29455,7 @@ async fn handle_command_inner(
                 } else {
                     (
                         KadMessage::FirewalledReq {
-                            tcp_port: state.tcp_port,
+                            tcp_port: fw_tcp_port,
                         },
                         0x50u8,
                     )
@@ -29446,8 +30184,8 @@ async fn handle_command_inner(
                                     .external_ip
                                     .map(|eip| u32::from_le_bytes(eip.octets()))
                                     .unwrap_or(0);
-                                let tcp = settings.tcp_port;
-                                let udp = settings.udp_port;
+                                let tcp = advertised_tcp_port(&state);
+                                let udp = advertised_udp_port(&state);
                                 let obfs = settings.friend_session_encryption;
                                 let sessions_clone = state.ember_sessions.clone();
                                 let ul_tx = ul_event_tx.clone();
@@ -29578,8 +30316,8 @@ async fn handle_command_inner(
                                 .external_ip
                                 .map(|eip| u32::from_le_bytes(eip.octets()))
                                 .unwrap_or(0);
-                            let tcp = settings.tcp_port;
-                            let udp = settings.udp_port;
+                            let tcp = advertised_tcp_port(&state);
+                            let udp = advertised_udp_port(&state);
                             let obfs = settings.friend_session_encryption;
                             let sess = state.ember_sessions.clone();
                             let ultx = ul_event_tx.clone();
@@ -29749,8 +30487,8 @@ async fn handle_command_inner(
                                     .external_ip
                                     .map(|eip| u32::from_le_bytes(eip.octets()))
                                     .unwrap_or(0);
-                                let tcp = settings.tcp_port;
-                                let udp = settings.udp_port;
+                                let tcp = advertised_tcp_port(&state);
+                                let udp = advertised_udp_port(&state);
                                 let obfs = settings.friend_session_encryption;
                                 let sessions_clone = state.ember_sessions.clone();
                                 let ul_tx = ul_event_tx.clone();
@@ -29859,8 +30597,8 @@ async fn handle_command_inner(
                                 .external_ip
                                 .map(|eip| u32::from_le_bytes(eip.octets()))
                                 .unwrap_or(0);
-                            let tcp = settings.tcp_port;
-                            let udp = settings.udp_port;
+                            let tcp = advertised_tcp_port(&state);
+                            let udp = advertised_udp_port(&state);
                             let obfs = settings.friend_session_encryption;
                             let sess = state.ember_sessions.clone();
                             let ultx = ul_event_tx.clone();
@@ -31496,7 +32234,14 @@ struct KadSource {
 /// one we report now.
 fn is_self_source(src: &KadSource, state: &NetworkState) -> bool {
     if let Some(ext) = state.external_ip {
-        if src.ip == ext && src.tcp_port == state.tcp_port {
+        // Compare against whatever port we actually publish (which may be
+        // STUN-remapped), not the raw local bind port — otherwise our own
+        // echoed-back publish is missed as "foreign" whenever a remap is
+        // active, producing the exact self-connect noise this function
+        // exists to prevent.
+        if src.ip == ext
+            && (src.tcp_port == state.tcp_port || src.tcp_port == advertised_tcp_port(state))
+        {
             return true;
         }
     }
@@ -31521,6 +32266,7 @@ fn connect_serve_target_ok(
     dest_port: u16,
     external_ip: Option<Ipv4Addr>,
     self_tcp_port: u16,
+    self_tcp_port_alt: u16,
     dest_user_hash: Option<[u8; 16]>,
     self_user_hash: &[u8; 16],
 ) -> bool {
@@ -31528,7 +32274,12 @@ fn connect_serve_target_ok(
         return false;
     }
     if let Some(ext) = external_ip {
-        if dest_ip == ext && dest_port == self_tcp_port {
+        // Check both the raw bind port and whatever we currently advertise
+        // (which may be STUN-remapped) — a caller may echo either back,
+        // depending on when it last learned our port. See `is_self_source`.
+        if dest_ip == ext
+            && (dest_port == self_tcp_port || dest_port == self_tcp_port_alt)
+        {
             return false;
         }
     }
