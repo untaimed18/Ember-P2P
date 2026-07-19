@@ -460,6 +460,39 @@
     if (col.sortField) toggleSort(col.sortField);
   }
 
+  function onRowKeydown(event: KeyboardEvent, file: FileInfo) {
+    // Do not replace a checkbox's own native keyboard behavior.
+    if (event.target !== event.currentTarget) return;
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      event.stopPropagation();
+      onOpenFile(file.path);
+      return;
+    }
+    if (event.key === ' ') {
+      event.preventDefault();
+      event.stopPropagation();
+      onSelectPath(file.path);
+      onToggleCheck?.(file.path, event.shiftKey);
+      return;
+    }
+    if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) {
+      event.preventDefault();
+      event.stopPropagation();
+      const row = event.currentTarget;
+      const rect = row instanceof HTMLElement ? row.getBoundingClientRect() : null;
+      onRowContextMenu(
+        new MouseEvent('contextmenu', {
+          bubbles: true,
+          cancelable: true,
+          clientX: rect ? rect.left + Math.min(24, rect.width / 2) : 0,
+          clientY: rect ? rect.top + Math.min(16, rect.height / 2) : 0,
+        }),
+        file,
+      );
+    }
+  }
+
   // --- Lifecycle ---
   onMount(() => {
     loadColumnState();
@@ -555,9 +588,12 @@
             class:selected={selectedPath === file.path}
             class:ctx-target={contextPath === file.path && selectedPath !== file.path}
             class:row-missing={missingPaths.has(file.path)}
+            tabindex="0"
+            aria-selected={selectedPath === file.path}
             onclick={() => onSelectPath(file.path)}
             ondblclick={() => onOpenFile(file.path)}
             oncontextmenu={(e) => onRowContextMenu(e, file)}
+            onkeydown={(e) => onRowKeydown(e, file)}
             style="height:{ROW_HEIGHT}px;"
           >
             {#if onToggleCheck}
@@ -796,6 +832,10 @@
   }
   .lib-table tbody tr:hover td {
     background: var(--bg-hover);
+  }
+  .lib-table tbody tr:focus-visible td {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
   }
   .lib-table tbody tr.selected td {
     background: color-mix(in srgb, var(--accent-dim) 55%, transparent);

@@ -286,7 +286,7 @@
   // tag for complete-source counts, so this filters the results we already
   // received (the count arrives on each hit as `file.complete_sources`).
   let filterMinComplete = $state('');
-  let hideSpam = $state(true);
+  let hideSpam: boolean = $state(true);
   /** True when the hit is only from the shared library (not merged with KAD/Server/UDP/Notes). */
   function isLocalOnlySearchResult(r: SearchResult): boolean {
     const o = (r.result_origin || '').trim();
@@ -1815,7 +1815,7 @@
     (filterMinSources !== '' ? 1 : 0) +
     (filterMinComplete !== '' ? 1 : 0) +
     // Default is hide-spam on; count only when the user opted out.
-    (hideSpam === false ? 1 : 0)
+    (!hideSpam ? 1 : 0)
   );
 
 </script>

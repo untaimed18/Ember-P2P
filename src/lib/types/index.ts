@@ -197,7 +197,7 @@ export interface NetworkStats {
   status: 'connected' | 'connecting' | 'disconnected';
   external_ip: string;
   firewalled: boolean;
-  buddy_status: 'none' | 'connecting' | 'connecting_lowid' | 'connected' | 'connected_lowid' | 'serving' | 'serving_lowid';
+  buddy_status: 'none' | 'searching' | 'connecting' | 'connecting_lowid' | 'connected' | 'connected_lowid' | 'serving' | 'serving_lowid';
   upnp_mapped: boolean;
   stores_acknowledged: number;
   kad_users_estimate: number;

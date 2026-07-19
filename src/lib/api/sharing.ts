@@ -56,6 +56,10 @@ export async function getScanStatus(): Promise<boolean> {
   return invoke('get_scan_status');
 }
 
+export async function getLibraryScanTruncated(): Promise<boolean> {
+  return invoke('get_library_scan_truncated');
+}
+
 export async function stopHashing(): Promise<string[]> {
   return invoke('stop_hashing');
 }

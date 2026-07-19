@@ -793,6 +793,7 @@
   "library_top_by_uploads": "Par envois",
   "library_top_empty_session": "Aucun envoi pour l'instant dans cette session. L'activité est réinitialisée à chaque démarrage d'Ember.",
   "library_top_empty_alltime": "Aucune activité d'envoi pour l'instant. Les fichiers que vous partagez apparaîtront ici lorsque des pairs commenceront à les télécharger.",
+  "library_top_history_unattributed": "Les anciennes versions d'Ember enregistraient le total envoyé, mais pas le détail par fichier. Les nouveaux envois alimenteront ce classement.",
   "library_uploads_one": "1 envoi",
   "library_uploads_other": "{count} envois",
   "library_resize_sidebar": "Redimensionner la barre latérale",
