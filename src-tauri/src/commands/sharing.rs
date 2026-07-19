@@ -1,7 +1,9 @@
 use std::collections::HashSet;
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use tauri::Emitter;
+use tauri::Manager;
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -108,14 +110,62 @@ async fn persist_shared_states(
     Ok(())
 }
 
-async fn persist_shared_states_best_effort(
+async fn persist_upload_priorities(
     network_tx: &tokio::sync::mpsc::Sender<NetworkCommand>,
     hashes: &[String],
-    shared: bool,
-) {
-    if let Err(e) = persist_shared_states(network_tx, hashes, shared).await {
-        warn!("Failed to persist file sharing state (best-effort): {e}");
+    priority: u8,
+) -> Result<(), String> {
+    let file_hashes = hashes
+        .iter()
+        .filter(|hash| !hash.is_empty())
+        .cloned()
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if file_hashes.is_empty() {
+        return Ok(());
     }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    bounded_send(
+        network_tx,
+        NetworkCommand::SetUploadPriorities {
+            file_hashes,
+            priority,
+            tx,
+        },
+    )
+    .await?;
+    await_reply(
+        rx,
+        "sharing_persist_priority_failed",
+        "Failed to persist upload priority",
+    )
+    .await?
+}
+
+async fn persist_priority_snapshot(
+    network_tx: &tokio::sync::mpsc::Sender<NetworkCommand>,
+    files: &[FileInfo],
+) -> Result<(), String> {
+    let mut by_priority: std::collections::HashMap<u8, HashSet<String>> =
+        std::collections::HashMap::new();
+    for file in files {
+        if !file.hash.is_empty() {
+            by_priority
+                .entry(priority_str_to_u8(&file.priority))
+                .or_default()
+                .insert(file.hash.clone());
+        }
+    }
+    for (priority, hashes) in by_priority {
+        persist_upload_priorities(
+            network_tx,
+            &hashes.into_iter().collect::<Vec<_>>(),
+            priority,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 fn paths_equal_ignore_case(a: &str, b: &str) -> bool {
@@ -173,6 +223,50 @@ pub(crate) async fn refresh_file_cache(
     *cache.write().await = snap;
 }
 
+async fn rollback_index_mutation(state: &AppState, snapshot: Vec<FileInfo>) {
+    {
+        let mut index = state.local_index.write().await;
+        index.restore_snapshot(snapshot);
+    }
+    refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
+}
+
+async fn persist_share_mutation(
+    state: &AppState,
+    mutation: &crate::search::index::ShareMutation,
+    shared: bool,
+    snapshot: Vec<FileInfo>,
+) -> Result<(), String> {
+    if let Err(e) = persist_shared_states(&state.network_tx, &mutation.hashes, shared).await {
+        rollback_index_mutation(state, snapshot).await;
+        return Err(e);
+    }
+    let pending_updates = mutation
+        .pending_paths
+        .iter()
+        .cloned()
+        .map(|path| (path, shared))
+        .collect::<Vec<_>>();
+    if let Err(e) = persist_pending_intents(state, &pending_updates, &[]).await {
+        // The known.met half already committed. Compensate it before rolling
+        // back the optimistic index so a failed config write cannot leave the
+        // next restart with the opposite share state.
+        let persistence_rollback =
+            persist_shared_states(&state.network_tx, &mutation.hashes, !shared).await;
+        rollback_index_mutation(state, snapshot).await;
+        return match persistence_rollback {
+            Ok(()) => Err(e),
+            Err(rollback_error) => Err(coded_ctx(
+                "sharing_state_rollback_failed",
+                "Share-state save and rollback both failed",
+                format!("{e}; rollback: {rollback_error}"),
+            )),
+        };
+    }
+    reconcile_shared_files_best_effort(&state.network_tx).await;
+    Ok(())
+}
+
 fn load_known_files() -> KnownFileList {
     let data_dir = crate::storage::paths::resolve_data_dir();
     KnownFileList::load(&data_dir.join("known.met"))
@@ -189,49 +283,187 @@ pub(crate) fn shared_access_dirs(config: &crate::storage::config::AppConfig) -> 
     allowed_dirs
 }
 
-/// Previously applied asset-protocol directory roots (for logging / future
-/// reconciliation). Removals intentionally do **not** call `forbid_directory`:
-/// forbid permanently wins over allow in Tauri's scope, so removing then
-/// re-adding a shared folder would leave in-app playback broken until restart.
-/// Access is still gated per request by `resolve_media_asset_path`.
-static ASSET_SCOPE_DIRS: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
-
-/// Keep the WebView asset protocol aligned with folders the UI may open for
-/// in-app playback (shared folders + download tree). Called on startup and
-/// whenever those paths change.
+/// Legacy call site retained while media moves to the dynamic `ember-media`
+/// protocol. The Tauri asset scope is intentionally not granted any folders:
+/// `allow_directory` cannot revoke a previous root without making a later
+/// re-add permanently inaccessible in this process.
 pub(crate) fn sync_asset_protocol_scope(
-    app: &tauri::AppHandle,
-    config: &crate::storage::config::AppConfig,
+    _app: &tauri::AppHandle,
+    _config: &crate::storage::config::AppConfig,
 ) {
-    use tauri::Manager;
-
-    let new_dirs: Vec<String> = shared_access_dirs(config)
-        .into_iter()
-        .filter(|d| !d.trim().is_empty())
-        .collect();
-    let scope = app.asset_protocol_scope();
-    let mut prev = ASSET_SCOPE_DIRS.lock();
-
-    for dir in &new_dirs {
-        if let Err(e) = scope.allow_directory(dir, true) {
-            warn!("Failed to allow asset protocol scope for {dir}: {e}");
-        }
-    }
-
-    *prev = new_dirs;
 }
 
-/// Strip Windows verbatim (`\\?\`) prefixes so `convertFileSrc` / WebView2 get
-/// a user-namespace path (matches explorer open helpers elsewhere).
-fn path_for_asset_url(canonical: &std::path::Path) -> String {
-    let raw = canonical.to_string_lossy();
-    if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{rest}")
-    } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
-        rest.to_string()
-    } else {
-        raw.into_owned()
+fn percent_decode_path(value: &str) -> Option<String> {
+    let mut out = Vec::with_capacity(value.len());
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let high = *bytes.get(i + 1)?;
+            let low = *bytes.get(i + 2)?;
+            let nibble = |byte: u8| match byte {
+                b'0'..=b'9' => Some(byte - b'0'),
+                b'a'..=b'f' => Some(byte - b'a' + 10),
+                b'A'..=b'F' => Some(byte - b'A' + 10),
+                _ => None,
+            };
+            out.push((nibble(high)? << 4) | nibble(low)?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
     }
+    String::from_utf8(out).ok()
+}
+
+fn media_content_type(path: &std::path::Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "ogg" | "opus" => "audio/ogg",
+        "aac" => "audio/aac",
+        "flac" => "audio/flac",
+        "m4a" => "audio/mp4",
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        _ => "application/octet-stream",
+    }
+}
+
+const MAX_MEDIA_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
+
+fn parse_single_range(range: Option<&str>, length: u64) -> Result<Option<(u64, u64)>, ()> {
+    let Some(range) = range else {
+        return Ok(None);
+    };
+    let range = range.strip_prefix("bytes=").ok_or(())?;
+    let (start, end) = range.split_once('-').ok_or(())?;
+    if start.contains(',') || end.contains(',') || length == 0 {
+        return Err(());
+    }
+    if start.is_empty() {
+        let suffix = end.parse::<u64>().map_err(|_| ())?.min(length);
+        return Ok(Some((length.saturating_sub(suffix), length.saturating_sub(1))));
+    }
+    let start = start.parse::<u64>().map_err(|_| ())?;
+    if start >= length {
+        return Err(());
+    }
+    let end = if end.is_empty() {
+        length - 1
+    } else {
+        end.parse::<u64>().map_err(|_| ())?.min(length - 1)
+    };
+    (start <= end).then_some((start, end)).ok_or(()).map(Some)
+}
+
+/// Serve in-app media with a containment decision made at request time, not
+/// only when the UI originally created the URL. This makes a removed share root
+/// immediately inaccessible even if a stale WebView URL is retained.
+pub(crate) async fn serve_media_request(
+    app: tauri::AppHandle,
+    encoded_path: String,
+    range: Option<String>,
+) -> tauri::http::Response<Vec<u8>> {
+    let Some(file_path) = percent_decode_path(&encoded_path) else {
+        return tauri::http::Response::builder()
+            .status(tauri::http::StatusCode::BAD_REQUEST)
+            .body(b"invalid media path".to_vec())
+            .unwrap_or_default();
+    };
+    let (allowed_dirs, indexed_paths) = {
+        let state = app.state::<AppState>();
+        let config = state.config.read().await;
+        let allowed_dirs = shared_access_dirs(&config);
+        drop(config);
+        let index = state.local_index.read().await;
+        let indexed_paths = index
+            .all_files()
+            .iter()
+            .map(|file| crate::search::index::normalize_path_key(&file.path))
+            .collect::<HashSet<_>>();
+        (allowed_dirs, indexed_paths)
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let canonical = std::path::Path::new(&file_path).canonicalize()?;
+        if !canonical.is_file()
+            || !crate::security::is_path_within_dirs(&canonical, &allowed_dirs)
+            || !indexed_paths.contains(&crate::search::index::normalize_path_key(
+                &canonical.to_string_lossy(),
+            ))
+            || crate::security::is_dangerous_extension(&canonical.to_string_lossy())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "media path is not currently authorized",
+            ));
+        }
+        let mut file = std::fs::File::open(&canonical)?;
+        let length = file.metadata()?.len();
+        let selected_range = parse_single_range(range.as_deref(), length)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid range"))?;
+        if length == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "empty media file",
+            ));
+        }
+        let (start, requested_end) = selected_range.unwrap_or((0, length - 1));
+        // Tauri URI responders take an owned byte buffer, not an async stream.
+        // Cap each response so `bytes=0-` and range-less requests cannot turn a
+        // multi-gigabyte video into one allocation. Media engines issue follow-up
+        // byte ranges after a valid 206 response.
+        let end = requested_end.min(
+            start
+                .saturating_add(MAX_MEDIA_RESPONSE_BYTES.saturating_sub(1)),
+        );
+        let partial = start != 0 || end != length - 1;
+        let bytes_len = end.saturating_sub(start).saturating_add(1);
+        let mut body = vec![0; bytes_len as usize];
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut body)?;
+        Ok::<_, std::io::Error>((canonical, length, start, end, partial, body))
+    })
+    .await;
+    let (canonical, length, start, end, partial, body) = match result {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::InvalidInput => {
+            return tauri::http::Response::builder()
+                .status(tauri::http::StatusCode::RANGE_NOT_SATISFIABLE)
+                .body(b"invalid media range".to_vec())
+                .unwrap_or_default();
+        }
+        _ => {
+            return tauri::http::Response::builder()
+                .status(tauri::http::StatusCode::NOT_FOUND)
+                .body(b"media is unavailable".to_vec())
+                .unwrap_or_default();
+        }
+    };
+    let mut response = tauri::http::Response::builder()
+        .status(if partial {
+            tauri::http::StatusCode::PARTIAL_CONTENT
+        } else {
+            tauri::http::StatusCode::OK
+        })
+        .header(tauri::http::header::CONTENT_TYPE, media_content_type(&canonical))
+        .header(tauri::http::header::ACCEPT_RANGES, "bytes")
+        .header(tauri::http::header::CONTENT_LENGTH, body.len().to_string());
+    if partial {
+        response = response.header(
+            tauri::http::header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{length}"),
+        );
+    }
+    response.body(body).unwrap_or_default()
 }
 
 pub(crate) fn file_in_shared_folders(file_path: &str, shared_folders: &[String]) -> bool {
@@ -282,6 +514,13 @@ fn resolve_from_known(files: &mut Vec<FileInfo>, known: &KnownFileList) -> Vec<F
             // unshared.
             file.priority = priority_u8_to_str(record.upload_priority).to_string();
             file.shared = record.is_shared;
+            // The Library's Top Uploads panel and all-time activity columns
+            // are populated from these persisted known.met counters. Restore
+            // them with the hash instead of showing an empty Library until the
+            // network cache refresh happens to run.
+            file.alltime_requests = record.all_time_requested;
+            file.alltime_accepted = record.all_time_accepted;
+            file.alltime_transferred = record.all_time_transferred;
             // Restore the last-known Peers count so the UI doesn't flash
             // back to 0 until the next 60s source-count sync completes.
             file.complete_sources = record.complete_sources;
@@ -296,6 +535,116 @@ fn resolve_from_known(files: &mut Vec<FileInfo>, known: &KnownFileList) -> Vec<F
         }
     }
     needs_hashing
+}
+
+/// Apply a folder's configured default priority only to paths that need a new
+/// hash. Known files keep their persisted per-file priority, while pending
+/// files and their later hash-completion replacements inherit this value.
+fn apply_folder_defaults_to_new_files(
+    discovered: &mut [FileInfo],
+    files_to_hash: &mut [FileInfo],
+    folder_priorities: &std::collections::HashMap<String, String>,
+) {
+    if folder_priorities.is_empty() || files_to_hash.is_empty() {
+        return;
+    }
+    let pending_paths = files_to_hash
+        .iter()
+        .map(|file| crate::search::index::normalize_path_key(&file.path))
+        .collect::<HashSet<_>>();
+    let priority_for_path = |path: &str| {
+        folder_priorities
+            .iter()
+            .filter(|(folder, priority)| {
+                !priority.is_empty()
+                    && crate::security::path_matches_dir(path, folder)
+            })
+            .max_by_key(|(folder, _)| folder.len())
+            .map(|(_, priority)| priority.clone())
+    };
+    for file in discovered.iter_mut().filter(|file| {
+        pending_paths.contains(&crate::search::index::normalize_path_key(&file.path))
+    }) {
+        if let Some(priority) = priority_for_path(&file.path) {
+            file.priority = priority;
+        }
+    }
+    for file in files_to_hash.iter_mut() {
+        if let Some(priority) = priority_for_path(&file.path) {
+            file.priority = priority;
+        }
+    }
+}
+
+pub(crate) fn apply_pending_intents(
+    discovered: &mut [FileInfo],
+    files_to_hash: &mut [FileInfo],
+    pending_share_states: &std::collections::HashMap<String, bool>,
+    pending_file_priorities: &std::collections::HashMap<String, String>,
+) {
+    let pending_paths = files_to_hash
+        .iter()
+        .map(|file| crate::search::index::normalize_path_key(&file.path))
+        .collect::<HashSet<_>>();
+    let apply = |file: &mut FileInfo| {
+        let key = crate::search::index::normalize_path_key(&file.path);
+        if let Some(shared) = pending_share_states.get(&key) {
+            file.shared = *shared;
+        }
+        if let Some(priority) = pending_file_priorities.get(&key) {
+            file.priority = priority.clone();
+        }
+    };
+    for file in discovered.iter_mut().filter(|file| {
+        pending_paths.contains(&crate::search::index::normalize_path_key(&file.path))
+    }) {
+        apply(file);
+    }
+    for file in files_to_hash {
+        apply(file);
+    }
+}
+
+async fn persist_pending_intents(
+    state: &AppState,
+    share_updates: &[(String, bool)],
+    priority_updates: &[(String, String)],
+) -> Result<(), String> {
+    if share_updates.is_empty() && priority_updates.is_empty() {
+        return Ok(());
+    }
+    let _settings_save_guard = state.settings_save_lock.lock().await;
+    let mut settings = {
+        let config = state.config.read().await;
+        config.settings.clone()
+    };
+    for (path, shared) in share_updates {
+        settings
+            .pending_share_states
+            .insert(crate::search::index::normalize_path_key(path), *shared);
+    }
+    for (path, priority) in priority_updates {
+        settings.pending_file_priorities.insert(
+            crate::search::index::normalize_path_key(path),
+            priority.clone(),
+        );
+    }
+    settings.settings_revision = settings.settings_revision.saturating_add(1);
+    let save_data = {
+        let config = state.config.read().await;
+        config
+            .prepare_save_settings(&settings)
+            .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?
+    };
+    let (data, tmp, final_path) = save_data;
+    tokio::task::spawn_blocking(move || {
+        crate::storage::config::AppConfig::write_to_disk(&data, &tmp, &final_path)
+    })
+    .await
+    .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?
+    .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?;
+    state.config.write().await.settings = settings;
+    Ok(())
 }
 
 /// eMule-style shared folder addition -- returns IMMEDIATELY.
@@ -490,6 +839,7 @@ pub async fn add_shared_folder(
     let cancel_flags = state.hash_cancel_flags.clone();
     let fresh_part_hashes = state.fresh_part_hashes.clone();
     let config = state.config.clone();
+    let scan_truncated = state.library_scan_truncated.clone();
 
     let cancel_flag = Arc::new(AtomicBool::new(false));
     let cancel_key = canonical_str.clone();
@@ -520,6 +870,11 @@ pub async fn add_shared_folder(
             warn!(
                 "Discovery for {path} reached the per-folder file cap; additional files will be picked up by a later scan"
             );
+            scan_truncated.store(true, Ordering::Relaxed);
+            let _ = app.emit(
+                "shared-files-scan-truncated",
+                serde_json::json!({ "folder": path, "limit": 100_000 }),
+            );
         }
         let mut discovered = discovery.files;
 
@@ -541,7 +896,26 @@ pub async fn add_shared_folder(
         }
 
         let known_list = load_known_files();
-        let files_to_hash = resolve_from_known(&mut discovered, &known_list);
+        let mut files_to_hash = resolve_from_known(&mut discovered, &known_list);
+        let (folder_priorities, pending_share_states, pending_file_priorities) = {
+            let cfg = config.read().await;
+            (
+                cfg.settings.folder_priorities.clone(),
+                cfg.settings.pending_share_states.clone(),
+                cfg.settings.pending_file_priorities.clone(),
+            )
+        };
+        apply_folder_defaults_to_new_files(
+            &mut discovered,
+            &mut files_to_hash,
+            &folder_priorities,
+        );
+        apply_pending_intents(
+            &mut discovered,
+            &mut files_to_hash,
+            &pending_share_states,
+            &pending_file_priorities,
+        );
 
         {
             let mut index = local_index.write().await;
@@ -669,6 +1043,10 @@ pub async fn add_shared_folder(
                         && last_cache_refresh.elapsed() >= std::time::Duration::from_secs(5)
                     {
                         refresh_file_cache(&local_index, &file_cache).await;
+                        let _ = app.emit(
+                            "shared-files-changed",
+                            serde_json::json!({ "phase": "hash-progress" }),
+                        );
                         last_cache_refresh = std::time::Instant::now();
                     }
                 }
@@ -776,16 +1154,11 @@ pub async fn remove_shared_folder(
             MAX_PATH_LEN,
         ));
     }
-    // Earlier this fell back to the raw `path` string when canonicalize
-    // failed. That made the unshare operation silently incomplete: the
-    // index keys are stored in canonical form (see `add_shared_folder`),
-    // so the index/cancel-flag retain step would no-op while the
-    // `shared_folders` config row was happily stripped — causing the
-    // folder to come back on the next reload, but with the index
-    // already torn down. Reject the call instead so the UI can surface
-    // a clear error and the on-disk state stays consistent.
     // Canonicalize off the async runtime (blocking I/O on slow/network paths).
-    let canonical_path = tokio::task::spawn_blocking({
+    // An unavailable USB/network root cannot canonicalize, but it still must
+    // be removable. In that case only accept an exact normalized entry already
+    // present in configuration; never fall back to an arbitrary raw path.
+    let resolved_path = tokio::task::spawn_blocking({
         let path = path.clone();
         move || -> Result<String, String> {
             std::path::Path::new(&path)
@@ -801,7 +1174,20 @@ pub async fn remove_shared_folder(
         }
     })
     .await
-    .map_err(|e| coded_ctx("sharing_task_failed", "Task failed", e))??;
+    .map_err(|e| coded_ctx("sharing_task_failed", "Task failed", e))?;
+    let canonical_path = match resolved_path {
+        Ok(path) => path,
+        Err(canonical_error) => {
+            let config = state.config.read().await;
+            config
+                .settings
+                .shared_folders
+                .iter()
+                .find(|configured| paths_equal_ignore_case(configured, &path))
+                .cloned()
+                .ok_or(canonical_error)?
+        }
+    };
     // `add_shared_folder` stores the *canonical* form in
     // `shared_folders` and `upload_shared_folders`; the cancel-flag
     // map is also keyed by canonical paths. Comparing against the
@@ -826,8 +1212,6 @@ pub async fn remove_shared_folder(
             }
         }
     }
-    let scan_coordination_guard = state.scan_coordination.lock().await;
-
     // Persist the removal to disk before committing it in-memory or to the live
     // upload list, so a failed write can't drop a folder that's still saved.
     let settings_save_guard = state.settings_save_lock.lock().await;
@@ -837,6 +1221,15 @@ pub async fn remove_shared_folder(
         new_settings
             .shared_folders
             .retain(|f| !paths_equal_ignore_case(f, &canonical_path));
+        new_settings
+            .folder_priorities
+            .retain(|folder, _| !paths_equal_ignore_case(folder, &canonical_path));
+        new_settings.pending_share_states.retain(|path, _| {
+            !crate::security::path_matches_dir(path, &canonical_path)
+        });
+        new_settings.pending_file_priorities.retain(|path, _| {
+            !crate::security::path_matches_dir(path, &canonical_path)
+        });
         new_settings.settings_revision = config.settings.settings_revision.saturating_add(1);
         config
             .prepare_save_settings(&new_settings)
@@ -857,6 +1250,16 @@ pub async fn remove_shared_folder(
             .settings
             .shared_folders
             .retain(|f| !paths_equal_ignore_case(f, &canonical_path));
+        config
+            .settings
+            .folder_priorities
+            .retain(|folder, _| !paths_equal_ignore_case(folder, &canonical_path));
+        config.settings.pending_share_states.retain(|path, _| {
+            !crate::security::path_matches_dir(path, &canonical_path)
+        });
+        config.settings.pending_file_priorities.retain(|path, _| {
+            !crate::security::path_matches_dir(path, &canonical_path)
+        });
         config.settings.settings_revision = config.settings.settings_revision.saturating_add(1);
     }
     drop(settings_save_guard);
@@ -865,6 +1268,11 @@ pub async fn remove_shared_folder(
         live.retain(|f| !paths_equal_ignore_case(f, &canonical_path));
     }
 
+    // Revocation above is intentionally ahead of this wait: a long-running
+    // startup/reload scan must not leave the folder uploadable or media-
+    // accessible while removal waits for its final index cleanup. Once the
+    // existing generation yields, remove any rows it raced to add.
+    let scan_coordination_guard = state.scan_coordination.lock().await;
     {
         let mut index = state.local_index.write().await;
         index.remove_files_by_path_prefix(&canonical_path);
@@ -1053,7 +1461,7 @@ pub async fn set_folder_priority(
         }
     }
     let settings_save_guard = state.settings_save_lock.lock().await;
-    {
+    let (new_settings, save_data) = {
         let config = state.config.read().await;
         if !config
             .settings
@@ -1066,11 +1474,6 @@ pub async fn set_folder_priority(
                 "Folder is not a shared folder",
             ));
         }
-    }
-    // Persist before committing in-memory so a failed write can't leave the
-    // live folder-priority map diverged from disk.
-    let save_data = {
-        let config = state.config.read().await;
         let mut new_settings = config.settings.clone();
         // Drop any case-variant key first so the map never accumulates dupes.
         new_settings
@@ -1082,11 +1485,15 @@ pub async fn set_folder_priority(
                 .insert(folder_path.clone(), priority.clone());
         }
         new_settings.settings_revision = config.settings.settings_revision.saturating_add(1);
-        config
+        let save_data = config
             .prepare_save_settings(&new_settings)
-            .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?
+            .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?;
+        (new_settings, save_data)
     };
-    {
+
+    // Clearing only stops the default from being re-applied; existing files
+    // keep whatever priority they currently have.
+    if clearing {
         let (data, tmp, final_path) = save_data;
         tokio::task::spawn_blocking(move || {
             crate::storage::config::AppConfig::write_to_disk(&data, &tmp, &final_path)
@@ -1094,31 +1501,19 @@ pub async fn set_folder_priority(
         .await
         .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?
         .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?;
-    }
-    {
-        let mut config = state.config.write().await;
-        config
-            .settings
-            .folder_priorities
-            .retain(|k, _| !paths_equal_ignore_case(k, &folder_path));
-        if !clearing {
-            config
-                .settings
-                .folder_priorities
-                .insert(folder_path.clone(), priority.clone());
-        }
-        config.settings.settings_revision = config.settings.settings_revision.saturating_add(1);
-    }
-    drop(settings_save_guard);
-    // Clearing only stops the default from being re-applied; existing files
-    // keep whatever priority they currently have.
-    if clearing {
+        state.config.write().await.settings = new_settings;
+        drop(settings_save_guard);
         info!("Cleared folder priority for {folder_path}");
         return Ok(0);
     }
-    let changed = {
+
+    // Apply hash-wide file priorities first, but keep a complete snapshot so a
+    // known.met or config write failure can restore both persistence domains.
+    let (index_snapshot, changed) = {
         let mut index = state.local_index.write().await;
-        index.set_priority_under_folder(&folder_path, &priority)
+        let snapshot = index.all_files().to_vec();
+        let changed = index.set_priority_under_folder(&folder_path, &priority);
+        (snapshot, changed)
     };
     if !changed.is_empty() {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
@@ -1126,19 +1521,43 @@ pub async fn set_folder_priority(
             .iter()
             .map(|(_, hash)| hash.clone())
             .filter(|hash| !hash.is_empty())
-            .collect();
-        if let Err(e) = bounded_send(
+            .collect::<Vec<_>>();
+        if let Err(error) = persist_upload_priorities(
             &state.network_tx,
-            NetworkCommand::SetUploadPriorities {
-                file_hashes: hashes,
-                priority: priority_str_to_u8(&priority),
-            },
+            &hashes,
+            priority_str_to_u8(&priority),
         )
         .await
         {
-            warn!("Failed to push upload priorities to network task: {e}");
+            rollback_index_mutation(&state, index_snapshot).await;
+            return Err(error);
         }
     }
+
+    let (data, tmp, final_path) = save_data;
+    let config_result = tokio::task::spawn_blocking(move || {
+        crate::storage::config::AppConfig::write_to_disk(&data, &tmp, &final_path)
+    })
+    .await
+    .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))
+    .and_then(|result| {
+        result.map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))
+    });
+    if let Err(error) = config_result {
+        let rollback_result =
+            persist_priority_snapshot(&state.network_tx, &index_snapshot).await;
+        rollback_index_mutation(&state, index_snapshot).await;
+        return match rollback_result {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(coded_ctx(
+                "sharing_priority_rollback_failed",
+                "Folder priority save and rollback both failed",
+                format!("{error}; rollback: {rollback_error}"),
+            )),
+        };
+    }
+    state.config.write().await.settings = new_settings;
+    drop(settings_save_guard);
     info!(
         "Set folder priority {priority} for {folder_path} ({} files)",
         changed.len()
@@ -1160,25 +1579,44 @@ pub async fn set_file_priority(
             &priority,
         ));
     }
-    let file_hash = {
+    let (snapshot, changed, file_hash) = {
         let mut index = state.local_index.write().await;
-        if !index.set_file_priority_by_path(&file_path, &priority) {
+        let snapshot = index.all_files().to_vec();
+        if index.get_by_path(&file_path).is_none() {
             return Err(coded("sharing_file_not_found", "File not found"));
         }
-        index.get_by_path(&file_path).map(|f| f.hash.clone())
+        let changed = index.set_file_priority_by_path(&file_path, &priority);
+        (
+            snapshot,
+            changed,
+            index.get_by_path(&file_path).map(|f| f.hash.clone()),
+        )
     };
+    if !changed {
+        return Ok(());
+    }
     refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
     if let Some(hash) = file_hash.filter(|h| !h.is_empty()) {
-        if let Err(e) = bounded_send(
+        if let Err(e) = persist_upload_priorities(
             &state.network_tx,
-            NetworkCommand::SetUploadPriorities {
-                file_hashes: vec![hash],
-                priority: priority_str_to_u8(&priority),
-            },
+            &[hash],
+            priority_str_to_u8(&priority),
         )
         .await
         {
-            warn!("Failed to push upload priorities to network task: {e}");
+            rollback_index_mutation(&state, snapshot).await;
+            return Err(e);
+        }
+    } else {
+        if let Err(e) = persist_pending_intents(
+            &state,
+            &[],
+            &[(file_path.clone(), priority.clone())],
+        )
+        .await
+        {
+            rollback_index_mutation(&state, snapshot).await;
+            return Err(e);
         }
     }
     info!("Set priority for {} to {}", file_path, priority);
@@ -1210,13 +1648,15 @@ pub async fn batch_set_priority(
             &priority,
         ));
     }
-    let (count, hashes) = {
+    let (snapshot, count, hashes) = {
         let mut index = state.local_index.write().await;
+        let snapshot = index.all_files().to_vec();
         let mut n = 0u32;
         let mut hashes = Vec::new();
         for path in &file_paths {
-            if index.set_file_priority_by_path(path, &priority) {
-                n += 1;
+            let changed_paths = index.set_file_priority_by_path_count(path, &priority);
+            if changed_paths > 0 {
+                n = n.saturating_add(changed_paths as u32);
                 if let Some(f) = index.get_by_path(path) {
                     if !f.hash.is_empty() {
                         hashes.push(f.hash.clone());
@@ -1224,20 +1664,19 @@ pub async fn batch_set_priority(
                 }
             }
         }
-        (n, hashes)
+        (snapshot, n, hashes)
     };
     if count > 0 {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        if let Err(e) = bounded_send(
+        if let Err(e) = persist_upload_priorities(
             &state.network_tx,
-            NetworkCommand::SetUploadPriorities {
-                file_hashes: hashes,
-                priority: priority_str_to_u8(&priority),
-            },
+            &hashes,
+            priority_str_to_u8(&priority),
         )
         .await
         {
-            warn!("Failed to push upload priorities to network task: {e}");
+            rollback_index_mutation(&state, snapshot).await;
+            return Err(e);
         }
         info!(
             "Batch set priority to {priority} for {count}/{} files",
@@ -1263,15 +1702,16 @@ pub async fn batch_share(
             MAX_BATCH_IDS,
         ));
     }
-    let changed_hashes = {
+    let (snapshot, mutation) = {
         let mut index = state.local_index.write().await;
-        index.set_shared_by_paths(&file_paths, true)
+        let snapshot = index.all_files().to_vec();
+        let mutation = index.set_shared_by_paths(&file_paths, true);
+        (snapshot, mutation)
     };
-    let count = changed_hashes.len() as u32;
+    let count = mutation.changed_paths as u32;
     if count > 0 {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        reconcile_shared_files_best_effort(&state.network_tx).await;
-        persist_shared_states_best_effort(&state.network_tx, &changed_hashes, true).await;
+        persist_share_mutation(&state, &mutation, true, snapshot).await?;
         let _ = app.emit(
             "shared-files-changed",
             serde_json::json!({ "shared": count }),
@@ -1296,15 +1736,16 @@ pub async fn batch_unshare(
             MAX_BATCH_IDS,
         ));
     }
-    let changed_hashes = {
+    let (snapshot, mutation) = {
         let mut index = state.local_index.write().await;
-        index.set_shared_by_paths(&file_paths, false)
+        let snapshot = index.all_files().to_vec();
+        let mutation = index.set_shared_by_paths(&file_paths, false);
+        (snapshot, mutation)
     };
-    let count = changed_hashes.len() as u32;
+    let count = mutation.changed_paths as u32;
     if count > 0 {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        reconcile_shared_files_best_effort(&state.network_tx).await;
-        persist_shared_states_best_effort(&state.network_tx, &changed_hashes, false).await;
+        persist_share_mutation(&state, &mutation, false, snapshot).await?;
         let _ = app.emit(
             "shared-files-changed",
             serde_json::json!({ "unshared": count }),
@@ -1323,6 +1764,7 @@ pub async fn reload_shared_files(
     // never reaches this path while paused (it checks hashing_paused first).
     state.hashing_paused.store(false, Ordering::Relaxed);
     state.hashing_fs_dirty.store(false, Ordering::Relaxed);
+    state.library_scan_truncated.store(false, Ordering::Relaxed);
 
     let folders = {
         let config = state.config.read().await;
@@ -1337,6 +1779,7 @@ pub async fn reload_shared_files(
     let cancel_flags = state.hash_cancel_flags.clone();
     let fresh_part_hashes = state.fresh_part_hashes.clone();
     let config = state.config.clone();
+    let scan_truncated = state.library_scan_truncated.clone();
     let discovery_folders = folders.clone();
 
     let cancel_flag = Arc::new(AtomicBool::new(false));
@@ -1388,6 +1831,11 @@ pub async fn reload_shared_files(
             warn!(
                 "Reload discovery reached the per-folder file cap; retaining existing entries not seen in this partial scan"
             );
+            scan_truncated.store(true, Ordering::Relaxed);
+            let _ = app.emit(
+                "shared-files-scan-truncated",
+                serde_json::json!({ "folders": folders, "limit": 100_000 }),
+            );
         }
 
         let total_files = discovered.len();
@@ -1418,7 +1866,26 @@ pub async fn reload_shared_files(
         }
 
         let known_list = load_known_files();
-        let files_to_hash = resolve_from_known(&mut discovered, &known_list);
+        let mut files_to_hash = resolve_from_known(&mut discovered, &known_list);
+        let (folder_priorities, pending_share_states, pending_file_priorities) = {
+            let cfg = config.read().await;
+            (
+                cfg.settings.folder_priorities.clone(),
+                cfg.settings.pending_share_states.clone(),
+                cfg.settings.pending_file_priorities.clone(),
+            )
+        };
+        apply_folder_defaults_to_new_files(
+            &mut discovered,
+            &mut files_to_hash,
+            &folder_priorities,
+        );
+        apply_pending_intents(
+            &mut discovered,
+            &mut files_to_hash,
+            &pending_share_states,
+            &pending_file_priorities,
+        );
 
         {
             let mut index = local_index.write().await;
@@ -1529,6 +1996,10 @@ pub async fn reload_shared_files(
                         && last_cache_refresh.elapsed() >= std::time::Duration::from_secs(5)
                     {
                         refresh_file_cache(&local_index, &file_cache).await;
+                        let _ = app.emit(
+                            "shared-files-changed",
+                            serde_json::json!({ "phase": "hash-progress" }),
+                        );
                         last_cache_refresh = std::time::Instant::now();
                     }
                 }
@@ -1624,6 +2095,13 @@ pub async fn get_scan_status(state: tauri::State<'_, AppState>) -> Result<bool, 
 }
 
 #[tauri::command]
+pub async fn get_library_scan_truncated(
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    Ok(state.library_scan_truncated.load(Ordering::Relaxed))
+}
+
+#[tauri::command]
 pub async fn stop_hashing(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
     // Latch pause before signalling cancel so a concurrent FS-watcher tick
     // cannot start a new reload that races past the cancel flags.
@@ -1681,7 +2159,7 @@ pub async fn unshare_file(
     file_path: String,
     file_hash: Option<String>,
 ) -> Result<(), String> {
-    let file = {
+    let (snapshot, mutation) = {
         let mut index = state.local_index.write().await;
         if index.get_by_path(&file_path).is_none() {
             // Surface a desync instead of silently reporting success: the UI
@@ -1691,20 +2169,20 @@ pub async fn unshare_file(
                 "File not found in shared index",
             ));
         }
-        if index.set_file_shared_by_path(&file_path, false) {
-            index.get_by_path(&file_path).cloned()
-        } else {
-            None
-        }
+        let snapshot = index.all_files().to_vec();
+        let mutation = index.set_file_shared_by_path(&file_path, false);
+        (snapshot, mutation)
     };
-    if let Some(f) = &file {
+    if mutation.changed_paths > 0 {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        reconcile_shared_files_best_effort(&state.network_tx).await;
-        persist_shared_states_best_effort(&state.network_tx, std::slice::from_ref(&f.hash), false)
-            .await;
-        let _ = app.emit("shared-files-changed", serde_json::json!({ "unshared": 1 }));
+        persist_share_mutation(&state, &mutation, false, snapshot).await?;
+        let _ = app.emit(
+            "shared-files-changed",
+            serde_json::json!({ "unshared": mutation.changed_paths }),
+        );
         info!(
-            "Unshared file {}{}",
+            "Unshared {} file path(s) from {}{}",
+            mutation.changed_paths,
             file_path,
             file_hash
                 .filter(|hash| !hash.is_empty())
@@ -1721,7 +2199,7 @@ pub async fn share_file(
     state: tauri::State<'_, AppState>,
     file_path: String,
 ) -> Result<(), String> {
-    let file = {
+    let (snapshot, mutation) = {
         let mut index = state.local_index.write().await;
         if index.get_by_path(&file_path).is_none() {
             // Surface a desync instead of silently reporting success: the UI
@@ -1731,16 +2209,27 @@ pub async fn share_file(
                 "File not found in shared index",
             ));
         }
-        index.set_file_shared_by_path(&file_path, true);
-        index.get_by_path(&file_path).cloned()
+        if index
+            .get_by_path(&file_path)
+            .is_some_and(|file| file.hash.is_empty())
+        {
+            return Err(coded(
+                "sharing_file_hash_pending",
+                "File is still hashing and cannot be shared individually",
+            ));
+        }
+        let snapshot = index.all_files().to_vec();
+        let mutation = index.set_file_shared_by_path(&file_path, true);
+        (snapshot, mutation)
     };
-    if let Some(f) = &file {
+    if mutation.changed_paths > 0 {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        reconcile_shared_files_best_effort(&state.network_tx).await;
-        persist_shared_states_best_effort(&state.network_tx, std::slice::from_ref(&f.hash), true)
-            .await;
-        let _ = app.emit("shared-files-changed", serde_json::json!({ "shared": 1 }));
-        info!("Shared file {}", file_path);
+        persist_share_mutation(&state, &mutation, true, snapshot).await?;
+        let _ = app.emit(
+            "shared-files-changed",
+            serde_json::json!({ "shared": mutation.changed_paths }),
+        );
+        info!("Shared {} file path(s) from {}", mutation.changed_paths, file_path);
     }
     Ok(())
 }
@@ -1751,17 +2240,21 @@ pub async fn unshare_folder(
     state: tauri::State<'_, AppState>,
     path: String,
 ) -> Result<(), String> {
-    let affected_hashes = {
+    let (snapshot, mutation) = {
         let mut index = state.local_index.write().await;
-        index.set_shared_by_path_prefix(&path, false)
+        let snapshot = index.all_files().to_vec();
+        let mutation = index.set_shared_by_path_prefix(&path, false);
+        (snapshot, mutation)
     };
-    if !affected_hashes.is_empty() {
+    if mutation.changed_paths > 0 {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        reconcile_shared_files_best_effort(&state.network_tx).await;
-        persist_shared_states_best_effort(&state.network_tx, &affected_hashes, false).await;
+        persist_share_mutation(&state, &mutation, false, snapshot).await?;
         let _ = app.emit(
             "shared-files-changed",
-            serde_json::json!({ "folder": path, "unshared": true }),
+            serde_json::json!({
+                "folder": path,
+                "unshared": mutation.changed_paths,
+            }),
         );
     }
     Ok(())
@@ -1781,6 +2274,21 @@ pub async fn delete_shared_file(
             MAX_PATH_LEN,
         ));
     }
+    // This command is the Library's destructive action. Do not let its broad
+    // shared/download containment scope become a generic delete primitive for
+    // active `.part` files or any other unindexed download.
+    let indexed_path = {
+        let index = state.local_index.read().await;
+        index
+            .get_by_path(&file_path)
+            .map(|file| file.path.clone())
+            .ok_or_else(|| {
+                coded(
+                    "sharing_file_not_in_index",
+                    "File is not in the shared-file index",
+                )
+            })?
+    };
     let allowed_dirs = {
         let config = state.config.read().await;
         shared_access_dirs(&config)
@@ -1788,6 +2296,7 @@ pub async fn delete_shared_file(
 
     let canonical = tokio::task::spawn_blocking({
         let file_path = file_path.clone();
+        let indexed_path = indexed_path.clone();
         move || -> Result<std::path::PathBuf, String> {
             let path = std::path::Path::new(&file_path);
             if !path.exists() {
@@ -1805,6 +2314,21 @@ pub async fn delete_shared_file(
                     "File is not within a shared or download folder",
                 ));
             }
+            let indexed_canonical = std::path::Path::new(&indexed_path)
+                .canonicalize()
+                .map_err(|e| {
+                    coded_ctx(
+                        "sharing_file_not_in_index",
+                        "Indexed file can no longer be resolved",
+                        e,
+                    )
+                })?;
+            if canonical != indexed_canonical {
+                return Err(coded(
+                    "sharing_file_not_in_index",
+                    "File is not the indexed Library entry",
+                ));
+            }
             Ok(canonical)
         }
     })
@@ -1816,9 +2340,9 @@ pub async fn delete_shared_file(
     let canonical_str = canonical.to_string_lossy().to_string();
     let removed = {
         let mut index = state.local_index.write().await;
-        index
-            .remove_file_by_path(&canonical_str)
-            .or_else(|| index.remove_file_by_path(&file_path))
+        index.remove_file_by_path(&canonical_str).or_else(|| {
+            index.remove_file_by_path(&file_path)
+        })
     };
     refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
 
@@ -1831,11 +2355,7 @@ pub async fn delete_shared_file(
     info!(
         "Deleted shared file {}{}{}",
         canonical.display(),
-        if removed.is_none() {
-            " (not indexed)"
-        } else {
-            ""
-        },
+        if removed.is_none() { " (index race)" } else { "" },
         file_hash
             .filter(|hash| !hash.is_empty())
             .map(|hash| format!(" ({hash})"))
@@ -2063,7 +2583,7 @@ pub async fn resolve_media_asset_path(
                 "Cannot open potentially dangerous file types",
             ));
         }
-        Ok(path_for_asset_url(&canonical))
+        Ok(canonical.to_string_lossy().into_owned())
     })
     .await
     .map_err(|e| coded_ctx("sharing_task_failed", "Task failed", e))?

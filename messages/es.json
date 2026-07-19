@@ -869,6 +869,7 @@
   "library_top_by_uploads": "Por subidas",
   "library_top_empty_session": "Aún no hay subidas en esta sesión. La actividad se reinicia al iniciar Ember.",
   "library_top_empty_alltime": "Aún no hay subidas. Los archivos que compartas aparecerán aquí cuando los pares empiecen a descargar.",
+  "library_top_history_unattributed": "Las versiones anteriores de Ember guardaban el total subido, pero no el desglose por archivo. Las nuevas subidas llenarán esta clasificación.",
   "library_uploads_one": "1 subida",
   "library_uploads_other": "{count} subidas",
   "library_resize_sidebar": "Redimensionar barra lateral",

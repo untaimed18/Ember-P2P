@@ -147,6 +147,23 @@ pub fn run() {
             storage::paths::EMBER_DATA_DIR_ENV
         );
     }
+    builder = builder.register_asynchronous_uri_scheme_protocol(
+        "ember-media",
+        |ctx, request, responder| {
+            let app = ctx.app_handle().clone();
+            let encoded_path = request.uri().path().trim_start_matches('/').to_string();
+            let range = request
+                .headers()
+                .get(tauri::http::header::RANGE)
+                .and_then(|header| header.to_str().ok())
+                .map(str::to_string);
+            tauri::async_runtime::spawn(async move {
+                responder.respond(
+                    commands::sharing::serve_media_request(app, encoded_path, range).await,
+                );
+            });
+        },
+    );
     builder
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
@@ -356,6 +373,7 @@ pub fn run() {
                 shutdown_complete,
                 bw_shutdown: bw_shutdown.clone(),
                 scanning_count: scanning_count.clone(),
+                library_scan_truncated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 scan_coordination: scan_coordination.clone(),
                 hashing_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 hashing_fs_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -530,6 +548,14 @@ pub fn run() {
                                 tracing::warn!(
                                     "Startup discovery reached the per-folder file cap; some files will wait for a later scan"
                                 );
+                                startup_app
+                                    .state::<AppState>()
+                                    .library_scan_truncated
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                                let _ = startup_app.emit(
+                                    "shared-files-scan-truncated",
+                                    serde_json::json!({ "folder": "startup", "limit": 100_000 }),
+                                );
                             }
                             all_discovered.extend(result.files);
                         }
@@ -572,6 +598,9 @@ pub fn run() {
                         // unshared.
                         file.priority = storage::known_files::priority_u8_to_str(record.upload_priority).to_string();
                         file.shared = record.is_shared;
+                        file.alltime_requests = record.all_time_requested;
+                        file.alltime_accepted = record.all_time_accepted;
+                        file.alltime_transferred = record.all_time_transferred;
                         // Restore the last-known Peers count so the Library
                         // doesn't show 0 until the next 60s source-count sync.
                         file.complete_sources = record.complete_sources;
@@ -605,11 +634,21 @@ pub fn run() {
                     commands::sharing::file_in_shared_folders(&file.path, &current_shared_folders)
                 });
 
-                let folder_priorities = {
+                let (folder_priorities, pending_share_states, pending_file_priorities) = {
                     let state = startup_app.state::<AppState>();
                     let cfg = state.config.read().await;
-                    cfg.settings.folder_priorities.clone()
+                    (
+                        cfg.settings.folder_priorities.clone(),
+                        cfg.settings.pending_share_states.clone(),
+                        cfg.settings.pending_file_priorities.clone(),
+                    )
                 };
+                commands::sharing::apply_pending_intents(
+                    &mut all_discovered,
+                    &mut files_to_hash,
+                    &pending_share_states,
+                    &pending_file_priorities,
+                );
                 {
                     let mut index = index_clone.write().await;
                     index.add_files(all_discovered.clone());
@@ -622,6 +661,11 @@ pub fn run() {
                     // that was already known.
                     for (folder, priority) in &folder_priorities {
                         index.set_priority_under_folder_for_paths(folder, priority, &new_paths);
+                    }
+                    // An explicit priority selected while this path was
+                    // pending wins over its folder default.
+                    for (path, priority) in &pending_file_priorities {
+                        index.set_file_priority_by_path(path, priority);
                     }
                 }
                 commands::sharing::refresh_file_cache(&index_clone, &csf).await;
@@ -938,6 +982,7 @@ pub fn run() {
             commands::sharing::share_file,
             commands::sharing::unshare_folder,
             commands::sharing::get_scan_status,
+            commands::sharing::get_library_scan_truncated,
             commands::sharing::stop_hashing,
             commands::sharing::resume_hashing,
             commands::sharing::open_shared_file,
@@ -1023,7 +1068,9 @@ pub fn run() {
             commands::comments::get_file_comments,
             commands::statistics::get_statistics,
             commands::collections::load_collection,
+            commands::collections::pick_and_load_collection,
             commands::collections::create_collection,
+            commands::collections::create_collection_with_dialog,
             commands::collections::download_collection_files,
             commands::preview::preview_file,
             commands::speed_test::run_speed_test,

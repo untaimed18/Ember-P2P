@@ -38,6 +38,9 @@ pub struct AppState {
     pub bw_shutdown: Arc<std::sync::atomic::AtomicBool>,
     /// Number of folder scans currently running in the background.
     pub scanning_count: Arc<AtomicUsize>,
+    /// Set when discovery reaches the per-folder file cap. This survives the
+    /// startup interval before the webview attaches its event listeners.
+    pub library_scan_truncated: Arc<AtomicBool>,
     /// Single-flight guard shared by startup, per-folder, and watcher reload
     /// scans. Index mutations from different scan generations must not overlap.
     pub scan_coordination: Arc<tokio::sync::Mutex<()>>,

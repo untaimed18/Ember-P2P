@@ -869,6 +869,7 @@
   "library_top_by_uploads": "By Uploads",
   "library_top_empty_session": "No uploads yet this session. Activity resets each time Ember starts.",
   "library_top_empty_alltime": "No upload activity yet. Files you've shared will appear here once peers start downloading.",
+  "library_top_history_unattributed": "Earlier Ember versions saved the total uploaded but not its per-file breakdown. New uploads will populate this ranking.",
   "library_uploads_one": "1 upload",
   "library_uploads_other": "{count} uploads",
   "library_resize_sidebar": "Resize sidebar",

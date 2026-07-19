@@ -942,6 +942,15 @@ pub struct AppSettings {
     /// under a folder adopt its priority unless individually overridden.
     #[serde(default)]
     pub folder_priorities: std::collections::HashMap<String, String>,
+    /// Explicit share choices made for files that were still hashing. Keys are
+    /// normalized paths; values are applied before their first hash completes
+    /// so an unshare action survives an app restart.
+    #[serde(default)]
+    pub pending_share_states: std::collections::HashMap<String, bool>,
+    /// Explicit priorities made for files that were still hashing. Kept
+    /// separately from folder defaults because an explicit action must win.
+    #[serde(default)]
+    pub pending_file_priorities: std::collections::HashMap<String, String>,
     /// Automatically check for Ember updates in the background shortly
     /// after launch (subject to `update_check_frequency`). This only gates
     /// the *silent* startup check — the "Check for Updates" button in
@@ -1234,6 +1243,8 @@ impl Default for AppSettings {
             tcp_port: DEFAULT_TCP_PORT,
             udp_port: DEFAULT_UDP_PORT,
             folder_priorities: std::collections::HashMap::new(),
+            pending_share_states: std::collections::HashMap::new(),
+            pending_file_priorities: std::collections::HashMap::new(),
             nodes_dat_path: String::new(),
             upnp_enabled: false,
             stun_keepalive_enabled: true,

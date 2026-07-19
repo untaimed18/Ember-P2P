@@ -798,6 +798,7 @@
   "library_top_by_uploads": "按次数",
   "library_top_empty_session": "本次会话尚无上传。每次启动 Ember 后会重置。",
   "library_top_empty_alltime": "尚无上传记录。共享的文件在被下载后将显示在此处。",
+  "library_top_history_unattributed": "早期 Ember 版本只保存了上传总量，未保存每个文件的明细。新的上传将显示在此排名中。",
   "library_uploads_one": "1 次上传",
   "library_uploads_other": "{count} 次上传",
   "library_resize_sidebar": "调整侧边栏大小",

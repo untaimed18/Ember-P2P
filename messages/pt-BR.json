@@ -793,6 +793,7 @@
   "library_top_by_uploads": "Por Uploads",
   "library_top_empty_session": "Nenhum upload nesta sessão. A atividade é reiniciada a cada início do Ember.",
   "library_top_empty_alltime": "Nenhuma atividade de upload ainda. Os arquivos que você compartilhou aparecerão aqui quando os pares começarem a baixar.",
+  "library_top_history_unattributed": "Versões anteriores do Ember salvaram o total enviado, mas não o detalhamento por arquivo. Novos uploads preencherão esta classificação.",
   "library_uploads_one": "1 upload",
   "library_uploads_other": "{count} uploads",
   "library_resize_sidebar": "Redimensionar barra lateral",

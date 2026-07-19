@@ -7,6 +7,7 @@
     getSharedFolders,
     reloadSharedFiles,
     getScanStatus,
+    getLibraryScanTruncated,
     stopHashing,
     resumeHashing,
     setFilePriority,
@@ -26,8 +27,9 @@
     getFileMediaMetadata,
   } from '$lib/api/sharing';
   import { getFileComments, setFileComment, type FileCommentInfo } from '$lib/api/comments';
+  import { getStatistics, type TransferStats } from '$lib/api/statistics';
   import { formatEd2kLink, formatEd2kLinks, buildEd2kLink } from '$lib/api/search';
-  import { loadCollection, createCollection, downloadCollectionFiles, type Collection, type CollectionFile } from '$lib/api/collections';
+  import { pickAndLoadCollection, createCollectionWithDialog, downloadCollectionFiles, type Collection, type CollectionFile } from '$lib/api/collections';
   import { incomingCollection } from '$lib/stores/collection';
   import { toastSuccess, toastError, toastWarning } from '$lib/stores/toast';
   import { networkStats } from '$lib/stores/network';
@@ -49,7 +51,9 @@
   let folders: string[] = $state([]);
   let folderPriorities: Record<string, string> = $state({});
   let files: FileInfo[] = $state([]);
+  let aggregateStats = $state<TransferStats | null>(null);
   let scanning = $state(false);
+  let scanTruncated = $state(false);
   let error: string | null = $state(null);
   // Tracks the message last shown by a failed `refresh()` so we can clear
   // the banner on the next successful load without clobbering an unrelated
@@ -121,16 +125,12 @@
   let copyingCollectionLinks = $state(false);
 
   async function handleOpenCollection() {
+    collectionLoading = true;
     try {
-      const { open: openDialog } = await import('@tauri-apps/plugin-dialog');
-      const selected = await openDialog({
-        multiple: false,
-        filters: [{ name: 'eMule Collection', extensions: ['emulecollection', 'txt'] }],
-      });
-      if (!selected) return;
-      collectionLoading = true;
+      const collection = await pickAndLoadCollection();
+      if (!collection) return;
       collectionsOpen = true;
-      loadedCollection = await loadCollection(selected as string);
+      loadedCollection = collection;
       toastSuccess(m.library_collection_loaded({ name: loadedCollection.name, count: loadedCollection.files.length }));
     } catch (e: unknown) {
       toastError(toErr(e));
@@ -144,8 +144,36 @@
     if (!loadedCollection || downloadingCollection) return;
     downloadingCollection = true;
     try {
-      const msg = await downloadCollectionFiles(loadedCollection.files);
-      toastSuccess(msg || m.library_queued_files_download({ count: loadedCollection.files.length }));
+      // The backend deliberately bounds each enqueue transaction to 200
+      // entries. A collection itself may be much larger, so dispatch bounded
+      // chunks rather than presenting a Download All action that always fails.
+      const batchSize = 200;
+      let queued = 0;
+      let skipped = 0;
+      let oversize = 0;
+      let firstError: unknown = null;
+      for (let start = 0; start < loadedCollection.files.length; start += batchSize) {
+        try {
+          const result = await downloadCollectionFiles(
+            loadedCollection.files.slice(start, start + batchSize),
+          );
+          queued += result.queuedCount;
+          skipped += result.skippedCount;
+          oversize += result.oversizeCount;
+        } catch (e: unknown) {
+          firstError ??= e;
+        }
+      }
+      if (queued > 0) {
+        toastSuccess(m.library_queued_files_download({ count: queued }));
+      }
+      if (skipped > 0 || oversize > 0) {
+        const totalSkipped = skipped + oversize;
+        toastWarning(
+          `${totalSkipped} collection entr${totalSkipped === 1 ? 'y was' : 'ies were'} skipped.`,
+        );
+      }
+      if (firstError) throw firstError;
     } catch (e: unknown) {
       toastError(toErr(e));
     } finally {
@@ -253,19 +281,6 @@
     }
   }
 
-  function sanitizeFilename(raw: string): string {
-    // Strip characters forbidden by Windows/macOS/Linux plus path separators
-    // and control chars. Collapse runs of whitespace and trim dots/spaces
-    // from the ends so that e.g. "My:Mix/2025." -> "My_Mix_2025".
-    const cleaned = raw
-      // eslint-disable-next-line no-control-regex
-      .replace(/[\\/:*?"<>|\x00-\x1f]/g, '_')
-      .replace(/\s+/g, ' ')
-      .replace(/^[.\s]+|[.\s]+$/g, '')
-      .slice(0, 120);
-    return cleaned.length > 0 ? cleaned : 'Collection';
-  }
-
   async function handleCreateCollection() {
     // Guard re-entry (double Enter / double click). `creatingCollection` is
     // set before the first `await` so a second call bails immediately rather
@@ -274,16 +289,7 @@
     if (!newCollName.trim() || selectedFileHashes.size === 0) return;
     creatingCollection = true;
     try {
-      const { save: saveDialog } = await import('@tauri-apps/plugin-dialog');
       const isBinary = newCollFormat === 'binary';
-      const ext = isBinary ? 'emulecollection' : 'txt';
-      const filterName = isBinary ? m.library_emule_collection() : m.library_ed2k_links_text();
-      const safeName = sanitizeFilename(newCollName.trim());
-      const outputPath = await saveDialog({
-        defaultPath: `${safeName}.${ext}`,
-        filters: [{ name: filterName, extensions: [ext] }],
-      });
-      if (!outputPath) return;
       // De-dupe by hash: two distinct library paths can share one ed2k hash
       // (the same file shared from two locations), and a collection keyed by
       // hash should list each file once. Keep first occurrence.
@@ -294,7 +300,13 @@
         seenHashes.add(f.hash);
         collFiles.push({ name: f.name, size: f.size, hash: f.hash, aich_hash: f.aich_hash });
       }
-      const msg = await createCollection(newCollName.trim(), newCollAuthor.trim(), collFiles, outputPath, isBinary);
+      const msg = await createCollectionWithDialog(
+        newCollName.trim(),
+        newCollAuthor.trim(),
+        collFiles,
+        isBinary,
+      );
+      if (!msg) return;
       toastSuccess(msg || m.library_collection_created({ name: newCollName.trim(), count: collFiles.length }));
       closeCreateDialog();
     } catch (e: unknown) {
@@ -408,12 +420,20 @@
         m.library_remove_missing_title(),
       );
       if (!confirmed) return;
-      const removed = await removeMissingFiles([...missingPathSet]);
-      toastSuccess(removed === 1 ? m.library_removed_missing_one() : m.library_removed_missing_other({ count: removed }));
-      missingPathSet = new Set();
-      missingScanTruncated = false;
-      missingTotalCount = 0;
-      showMissingOnly = false;
+      let removed = 0;
+      // A scan intentionally returns at most 10,000 paths. Keep rescanning
+      // and removing until it is complete so "Remove missing" never clears
+      // the UI while unseen missing rows remain in the index.
+      while (missingPathSet.size > 0) {
+        const removedThisBatch = await removeMissingFiles([...missingPathSet]);
+        removed += removedThisBatch;
+        await refreshMissingSet(true);
+        if (removedThisBatch === 0) break;
+      }
+      if (removed > 0) {
+        toastSuccess(removed === 1 ? m.library_removed_missing_one() : m.library_removed_missing_other({ count: removed }));
+      }
+      if (missingPathSet.size === 0) showMissingOnly = false;
       await refresh();
     } catch (e: unknown) {
       toastError(toErr(e));
@@ -437,6 +457,7 @@
       missingTotalCount = Math.max(0, missingTotalCount - 1);
       if (selectedPath === f.path) selectedPath = null;
       if (showMissingOnly && missingPathSet.size === 0) showMissingOnly = false;
+      await refreshMissingSet(true);
       await refresh();
     } catch (e: unknown) {
       toastError(toErr(e));
@@ -531,12 +552,14 @@
     busy = true;
     pendingRefresh = false;
     try {
-      const [newFolders, newFiles, isScanning, newPriorities] = await withTimeout(
+      const [newFolders, newFiles, isScanning, newPriorities, newScanTruncated, newAggregateStats] = await withTimeout(
         Promise.all([
           getSharedFolders(),
           getSharedFiles(),
           getScanStatus(),
           getFolderPriorities(),
+          getLibraryScanTruncated(),
+          getStatistics().catch(() => null),
         ]),
         5000,
       );
@@ -545,6 +568,8 @@
       if (!stoppedByUser) scanning = isScanning;
       files = newFiles;
       folderPriorities = newPriorities;
+      scanTruncated = newScanTruncated;
+      aggregateStats = newAggregateStats;
       // Successful load: clear a previously-surfaced load error (but leave
       // any error a user action raised in the meantime untouched).
       if (lastLoadError !== null) {
@@ -713,6 +738,7 @@
       if (!mounted || !selected) return;
       stoppedByUser = false;
       scanning = true;
+      scanTruncated = false;
       await addSharedFolder(selected as string);
       if (mounted) await refresh();
     } catch (e: unknown) {
@@ -776,6 +802,7 @@
     // banner lingers.
     stoppedByUser = false;
     scanning = true;
+    scanTruncated = false;
     try {
       await reloadSharedFiles();
     } catch (e: unknown) {
@@ -824,6 +851,7 @@
   async function handleResume() {
     stoppedByUser = false;
     scanning = true;
+    scanTruncated = false;
     try {
       await resumeHashing();
       await refresh();
@@ -895,23 +923,21 @@
   // disabled while this is true.
   let bulkBusy = $state(false);
   let checkedCount = $derived.by(() => {
-    let n = 0;
-    for (const f of sortedFiles) if (checkedPaths.has(f.path)) n++;
-    return n;
+    return checkedPaths.size;
   });
   let checkedHashedCount = $derived.by(() => {
     let n = 0;
-    for (const f of sortedFiles) if (checkedPaths.has(f.path) && f.hash) n++;
+    for (const f of files) if (checkedPaths.has(f.path) && f.hash) n++;
     return n;
   });
   let checkedShareCount = $derived.by(() => {
     let n = 0;
-    for (const f of sortedFiles) if (checkedPaths.has(f.path) && f.hash && !f.shared) n++;
+    for (const f of files) if (checkedPaths.has(f.path) && f.hash && !f.shared) n++;
     return n;
   });
   let checkedUnshareCount = $derived.by(() => {
     let n = 0;
-    for (const f of sortedFiles) if (checkedPaths.has(f.path) && f.hash && f.shared) n++;
+    for (const f of files) if (checkedPaths.has(f.path) && f.hash && f.shared) n++;
     return n;
   });
   // Selections persist across filter changes, but bulk actions only operate on
@@ -977,7 +1003,21 @@
   }
 
   function getCheckedFiles(): FileInfo[] {
-    return sortedFiles.filter(f => checkedPaths.has(f.path));
+    return files.filter(f => checkedPaths.has(f.path));
+  }
+
+  const BULK_IPC_BATCH_SIZE = 10_000;
+  async function runBulkBatches(
+    targets: FileInfo[],
+    action: (paths: string[]) => Promise<number>,
+  ): Promise<number> {
+    let changed = 0;
+    for (let start = 0; start < targets.length; start += BULK_IPC_BATCH_SIZE) {
+      changed += await action(
+        targets.slice(start, start + BULK_IPC_BATCH_SIZE).map((file) => file.path),
+      );
+    }
+    return changed;
   }
 
   async function bulkSetPriority(priority: FileInfo['priority']) {
@@ -990,7 +1030,10 @@
     }
     bulkBusy = true;
     try {
-      const count = await batchSetPriority(targets.map(f => f.path), priority);
+      const count = await runBulkBatches(
+        targets,
+        (paths) => batchSetPriority(paths, priority),
+      );
       await refresh();
       toastSuccess(count === 1
         ? m.library_set_priority_one({ priority: priorityLabel(priority) })
@@ -1011,7 +1054,7 @@
     }
     bulkBusy = true;
     try {
-      const count = await batchShare(targets.map(f => f.path));
+      const count = await runBulkBatches(targets, batchShare);
       await refresh();
       toastSuccess(count === 1 ? m.library_shared_one() : m.library_shared_other({ count }));
     } catch (e: unknown) { error = toErr(e); }
@@ -1030,7 +1073,7 @@
     }
     bulkBusy = true;
     try {
-      const count = await batchUnshare(targets.map(f => f.path));
+      const count = await runBulkBatches(targets, batchUnshare);
       await refresh();
       toastSuccess(count === 1 ? m.library_unshared_one() : m.library_unshared_other({ count }));
     } catch (e: unknown) { error = toErr(e); }
@@ -1214,6 +1257,9 @@
   let topPanelMetric: 'bytes' | 'requests' = $state('bytes');
   let topPanelScope: 'session' | 'alltime' = $state('alltime');
   const TOP_PANEL_SIZE = 10;
+  let aggregateUploaded = $derived(
+    (aggregateStats?.cum_uploaded ?? 0) + (aggregateStats?.session_uploaded ?? 0),
+  );
 
   function topValueFor(f: FileInfo): number {
     if (topPanelScope === 'session') {
@@ -1223,8 +1269,14 @@
   }
 
   let topFiles = $derived.by(() => {
-    return [...files]
-      .filter((f) => f.hash && topValueFor(f) > 0)
+    const seen = new Set<string>();
+    return files
+      .filter((f) => {
+        const hash = f.hash.trim().toLowerCase();
+        if (!hash || seen.has(hash) || topValueFor(f) <= 0) return false;
+        seen.add(hash);
+        return true;
+      })
       .sort((a, b) => topValueFor(b) - topValueFor(a))
       .slice(0, TOP_PANEL_SIZE);
   });
@@ -1622,7 +1674,7 @@
     if (typing) return;
 
     // Ignore shortcuts while a modal is open.
-    if (createCollectionOpen || confirmOpen) return;
+    if (createCollectionOpen || confirmOpen || stopConfirmVisible || collectionsOpen) return;
 
     // Ctrl/Cmd+A selects all visible. Merge into the existing selection
     // (matching `toggleCheckAll`) rather than replacing it — selections are
@@ -1991,6 +2043,7 @@
     if (added > 0) {
       stoppedByUser = false;
       scanning = true;
+      scanTruncated = false;
       const base = added === 1 ? m.library_added_folder_one() : m.library_added_folder_other({ count: added });
       toastSuccess(failures.length ? m.library_added_with_skipped({ base, skipped: failures.length }) : base);
       if (mounted) await refresh();
@@ -2086,6 +2139,7 @@
     (async () => {
       let u1: (() => void) | null = null;
       let u2: (() => void) | null = null;
+      let u3: (() => void) | null = null;
       try {
         u1 = await listen<{ phase: string; count: number }>(
           'shared-files-changed', () => { if (mounted) debouncedRefresh(); }
@@ -2109,11 +2163,17 @@
           }
         );
         if (destroyed) { u1(); u2(); return; }
-        unlisteners.push(u1, u2);
+        u3 = await listen<{ folder?: string; folders?: string[]; limit: number }>(
+          'shared-files-scan-truncated',
+          () => { if (mounted) scanTruncated = true; },
+        );
+        if (destroyed) { u1(); u2(); u3(); return; }
+        unlisteners.push(u1, u2, u3);
       } catch (e) {
         console.warn('library: failed to register file-system event listeners', e);
         if (u1) u1();
         if (u2) u2();
+        if (u3) u3();
       }
     })();
 
@@ -2150,6 +2210,10 @@
     return () => {
       mounted = false;
       destroyed = true;
+      // A navigation while a confirmation is open must settle the awaiting
+      // action; otherwise its promise stays pending for the page lifetime.
+      confirmResolver?.(false);
+      confirmResolver = null;
       clearInterval(scanPoll);
       if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null; }
       if (searchDebounceTimer) { clearTimeout(searchDebounceTimer); searchDebounceTimer = null; }
@@ -2308,6 +2372,8 @@
       <span class="inline-stat">{m.library_stat_hashed({ count: libraryFileStats.hashed.toLocaleString() })}</span>
       <span class="inline-sep">&middot;</span>
       <span class="inline-stat">{m.library_stat_folders({ count: folders.length.toLocaleString() })}</span>
+      <span class="inline-sep">&middot;</span>
+      <span class="inline-stat">{m.stats_total_uploaded()}: {formatSize(aggregateUploaded)}</span>
     </span>
   </div>
 </div>
@@ -2360,7 +2426,7 @@
               </tr>
             </thead>
             <tbody>
-              {#each displayedLoadedCollectionFiles as cf (cf.hash)}
+              {#each displayedLoadedCollectionFiles as cf, i (`${cf.hash}:${i}`)}
                 <tr>
                   <td title={cf.name}>{cf.name}</td>
                   <td class="coll-col-size">{formatSize(cf.size)}</td>
@@ -2640,12 +2706,18 @@
             onclick={() => (topPanelMetric = 'requests')}
           >{m.library_top_by_uploads()}</button>
         </div>
+        <div class="top-total">
+          <span>{m.stats_total_uploaded()}</span>
+          <strong>{formatSize(aggregateUploaded)}</strong>
+        </div>
         <div class="top-list">
           {#if topFiles.length === 0}
             <div class="top-empty">
               {topPanelScope === 'session'
                 ? m.library_top_empty_session()
-                : m.library_top_empty_alltime()}
+                : aggregateUploaded > 0
+                  ? m.library_top_history_unattributed()
+                  : m.library_top_empty_alltime()}
             </div>
           {:else}
             {#each topFiles as tf, i (tf.path)}
@@ -2733,6 +2805,11 @@
         <button class="scan-btn resume-btn" onclick={handleResume}>{m.library_resume_hashing()}</button>
       </div>
     {/if}
+    {#if scanTruncated}
+      <div class="scan-banner scan-warning" role="status">
+        <span class="scan-text">Library indexing reached the 100,000-file per-folder limit. Some files are not listed.</span>
+      </div>
+    {/if}
     {#if sortedFiles.length === 0 && !scanning && hasActiveLibraryFilters && files.length > 0}
       <div class="empty-state">
         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="56" height="56" aria-hidden="true">
@@ -2793,7 +2870,6 @@
             type="button"
             class="bulk-hidden-note"
             onclick={clearLibraryFilters}
-            title={m.library_bulk_hidden_title({ shown: checkedCount.toLocaleString() })}
           >
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="11" height="11" aria-hidden="true">
               <path d="M2 3h12l-4.5 5.5V13l-3 1.5V8.5z"/>
@@ -3260,6 +3336,11 @@
   }
   .confirm-text { flex: 1; }
   .resume-banner { color: var(--warning); }
+  .scan-warning {
+    color: var(--warning);
+    border-bottom-color: color-mix(in srgb, var(--warning) 45%, var(--border));
+    background: color-mix(in srgb, var(--warning) 10%, var(--bg-secondary));
+  }
   .scan-btn {
     padding: 2px 10px;
     font-size: 11px;
@@ -3373,6 +3454,19 @@
     padding: 4px 6px 8px;
     flex: 1;
     min-height: 0;
+  }
+  .top-total {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 4px 10px 6px;
+    color: var(--text-muted);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+  }
+  .top-total strong {
+    color: var(--text-primary);
+    font-weight: 600;
   }
   .top-empty {
     padding: 10px 8px;
@@ -4585,7 +4679,10 @@
       animation: none;
     }
   }
-  .create-coll-modal { width: 520px; }
+  .create-coll-modal {
+    width: min(520px, calc(100vw - 2rem));
+    max-width: calc(100vw - 2rem);
+  }
   .modal-header {
     display: flex;
     align-items: center;
@@ -4727,5 +4824,25 @@
       width: 100%;
     }
     .inline-stats { display: none; }
+  }
+
+  @media (max-width: 760px) {
+    .shared-layout { position: relative; }
+    .detail-drawer {
+      position: absolute;
+      inset: 0 0 0 auto;
+      width: min(90vw, 420px);
+      min-width: 0;
+      z-index: 20;
+    }
+  }
+
+  @media (max-width: 520px) {
+    .sidebar,
+    .sidebar-divider { display: none; }
+    .detail-drawer { width: min(100vw, 420px); }
+    .modal-body { padding: 12px; }
+    .modal-footer,
+    .modal-header { padding-left: 12px; padding-right: 12px; }
   }
 </style>

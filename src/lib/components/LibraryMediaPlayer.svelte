@@ -66,7 +66,13 @@
       try {
         const canonical = await resolveMediaAssetPath(filePath);
         if (cancelled) return;
-        src = convertFileSrc(canonical);
+        // The `ember-media` protocol re-checks current shared/download roots
+        // for every request. Unlike a global asset-protocol allowance, a URL
+        // retained after its folder is removed cannot keep serving that file.
+        // Tauri maps custom protocols to `http://<scheme>.localhost` on
+        // WebView2. `convertFileSrc` produces that platform-correct URL while
+        // the Rust protocol still validates the canonical path per request.
+        src = convertFileSrc(canonical, 'ember-media');
       } catch (e: unknown) {
         if (cancelled) return;
         loadError = translateError(e, m.library_media_playback_error());

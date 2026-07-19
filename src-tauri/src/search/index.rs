@@ -12,6 +12,16 @@ pub struct LocalIndex {
     name_tokens: HashMap<String, Vec<usize>>,
 }
 
+/// Result of applying a hash-wide share-state change. `hashes` contains each
+/// complete file identity once for `known.met` persistence; `changed_paths`
+/// also counts pending rows, which have no hash to persist yet.
+#[derive(Debug, Default)]
+pub struct ShareMutation {
+    pub hashes: Vec<String>,
+    pub changed_paths: usize,
+    pub pending_paths: Vec<String>,
+}
+
 /// Windows filesystems are (by default) case-insensitive; indexing a path that
 /// arrived from the watcher in one casing and lookups that arrive from the UI
 /// in another would spuriously miss. Lowercase the path on Windows; preserve
@@ -193,6 +203,13 @@ impl LocalIndex {
         &self.files
     }
 
+    /// Restore a previously captured snapshot when a cross-component
+    /// persistence transaction fails after an optimistic in-memory mutation.
+    pub fn restore_snapshot(&mut self, files: Vec<FileInfo>) {
+        self.files = files;
+        self.rebuild_indices();
+    }
+
     /// Return all unique file hashes present in the index.
     pub fn all_hashes(&self) -> Vec<String> {
         self.hash_map.keys().cloned().collect()
@@ -360,7 +377,12 @@ impl LocalIndex {
     }
 
     /// Add bytes uploaded this session and to the displayed all-time total for this file.
-    pub fn apply_upload_completed_bytes(&mut self, hash_hex: &str, bytes: u64) {
+    pub fn apply_upload_completed_bytes(
+        &mut self,
+        hash_hex: &str,
+        bytes: u64,
+        persist_alltime: bool,
+    ) {
         if bytes == 0 {
             return;
         }
@@ -368,20 +390,42 @@ impl LocalIndex {
             for idx in indices {
                 if let Some(file) = self.files.get_mut(idx) {
                     file.bytes_transferred = file.bytes_transferred.saturating_add(bytes);
-                    file.alltime_transferred = file.alltime_transferred.saturating_add(bytes);
+                    if persist_alltime {
+                        file.alltime_transferred =
+                            file.alltime_transferred.saturating_add(bytes);
+                    }
                 }
             }
         }
     }
 
     pub fn set_file_priority_by_path(&mut self, path: &str, priority: &str) -> bool {
-        if let Some(&idx) = self.path_map.get(&normalize_path_key(path)) {
-            if let Some(file) = self.files.get_mut(idx) {
+        self.set_file_priority_by_path_count(path, priority) > 0
+    }
+
+    /// Hash-wide counterpart of [`set_file_priority_by_path`]. Returns every
+    /// path that changed so bulk-operation feedback remains accurate when one
+    /// selected duplicate updates several physical copies.
+    pub fn set_file_priority_by_path_count(&mut self, path: &str, priority: &str) -> usize {
+        let key = normalize_path_key(path);
+        let Some(selected) = self.files.iter().find(|file| normalize_path_key(&file.path) == key)
+        else {
+            return 0;
+        };
+        let hash = selected.hash.clone();
+        let mut changed = 0usize;
+        for file in &mut self.files {
+            let is_target = if hash.is_empty() {
+                normalize_path_key(&file.path) == key
+            } else {
+                file.hash == hash
+            };
+            if is_target && file.priority != priority {
                 file.priority = priority.to_string();
-                return true;
+                changed += 1;
             }
         }
-        false
+        changed
     }
 
     /// Apply `priority` to every file that lives under `folder` (the folder
@@ -394,9 +438,28 @@ impl LocalIndex {
         folder: &str,
         priority: &str,
     ) -> Vec<(String, String)> {
+        let hashes: HashSet<String> = self
+            .files
+            .iter()
+            .filter(|file| crate::security::path_matches_dir(&file.path, folder))
+            .filter_map(|file| (!file.hash.is_empty()).then(|| file.hash.clone()))
+            .collect();
+        let pending_paths: HashSet<String> = self
+            .files
+            .iter()
+            .filter(|file| {
+                file.hash.is_empty()
+                    && crate::security::path_matches_dir(&file.path, folder)
+            })
+            .map(|file| normalize_path_key(&file.path))
+            .collect();
         let mut changed = Vec::new();
         for file in &mut self.files {
-            if crate::security::path_matches_dir(&file.path, folder) && file.priority != priority {
+            if (hashes.contains(&file.hash)
+                || (file.hash.is_empty()
+                    && pending_paths.contains(&normalize_path_key(&file.path))))
+                && file.priority != priority
+            {
                 file.priority = priority.to_string();
                 changed.push((file.path.clone(), file.hash.clone()));
             }
@@ -417,10 +480,28 @@ impl LocalIndex {
         priority: &str,
         only_paths: &HashSet<String>,
     ) -> Vec<(String, String)> {
+        let hashes: HashSet<String> = self
+            .files
+            .iter()
+            .filter(|file| only_paths.contains(&normalize_path_key(&file.path)))
+            .filter(|file| crate::security::path_matches_dir(&file.path, folder))
+            .filter_map(|file| (!file.hash.is_empty()).then(|| file.hash.clone()))
+            .collect();
+        let pending_paths: HashSet<String> = self
+            .files
+            .iter()
+            .filter(|file| {
+                file.hash.is_empty()
+                    && only_paths.contains(&normalize_path_key(&file.path))
+                    && crate::security::path_matches_dir(&file.path, folder)
+            })
+            .map(|file| normalize_path_key(&file.path))
+            .collect();
         let mut changed = Vec::new();
         for file in &mut self.files {
-            if only_paths.contains(&normalize_path_key(&file.path))
-                && crate::security::path_matches_dir(&file.path, folder)
+            if (hashes.contains(&file.hash)
+                || (file.hash.is_empty()
+                    && pending_paths.contains(&normalize_path_key(&file.path))))
                 && file.priority != priority
             {
                 file.priority = priority.to_string();
@@ -430,28 +511,66 @@ impl LocalIndex {
         changed
     }
 
-    pub fn set_file_shared_by_path(&mut self, path: &str, shared: bool) -> bool {
-        if let Some(&idx) = self.path_map.get(&normalize_path_key(path)) {
-            if let Some(file) = self.files.get_mut(idx) {
+    pub fn set_file_shared_by_path(&mut self, path: &str, shared: bool) -> ShareMutation {
+        let key = normalize_path_key(path);
+        let Some(selected) = self.files.iter().find(|file| normalize_path_key(&file.path) == key)
+        else {
+            return ShareMutation::default();
+        };
+        let hash = selected.hash.clone();
+        let mut mutation = ShareMutation::default();
+        for file in &mut self.files {
+            let is_target = if hash.is_empty() {
+                normalize_path_key(&file.path) == key
+            } else {
+                file.hash == hash
+            };
+            if is_target && file.shared != shared {
                 file.shared = shared;
-                return true;
+                mutation.changed_paths += 1;
+                if file.hash.is_empty() {
+                    mutation.pending_paths.push(file.path.clone());
+                } else if !mutation.hashes.contains(&file.hash) {
+                    mutation.hashes.push(file.hash.clone());
+                }
             }
         }
-        false
+        mutation
     }
 
-    pub fn set_shared_by_path_prefix(&mut self, prefix: &str, shared: bool) -> Vec<String> {
-        let mut affected = Vec::new();
+    pub fn set_shared_by_path_prefix(&mut self, prefix: &str, shared: bool) -> ShareMutation {
+        let hashes: HashSet<String> = self
+            .files
+            .iter()
+            .filter(|file| crate::security::path_matches_dir(&file.path, prefix))
+            .filter_map(|file| (!file.hash.is_empty()).then(|| file.hash.clone()))
+            .collect();
+        let pending_paths: HashSet<String> = self
+            .files
+            .iter()
+            .filter(|file| {
+                file.hash.is_empty()
+                    && crate::security::path_matches_dir(&file.path, prefix)
+            })
+            .map(|file| normalize_path_key(&file.path))
+            .collect();
+        let mut mutation = ShareMutation::default();
         for file in &mut self.files {
-            if crate::security::path_matches_dir(&file.path, prefix)
-                && !file.hash.is_empty()
+            if (hashes.contains(&file.hash)
+                || (file.hash.is_empty()
+                    && pending_paths.contains(&normalize_path_key(&file.path))))
                 && file.shared != shared
             {
                 file.shared = shared;
-                affected.push(file.hash.clone());
+                mutation.changed_paths += 1;
+                if file.hash.is_empty() {
+                    mutation.pending_paths.push(file.path.clone());
+                } else if !mutation.hashes.contains(&file.hash) {
+                    mutation.hashes.push(file.hash.clone());
+                }
             }
         }
-        affected
+        mutation
     }
 
     /// Bulk variant of [`set_file_shared_by_path`](Self::set_file_shared_by_path)
@@ -461,19 +580,39 @@ impl LocalIndex {
     /// second round of path lookups. Files with no hash yet (still hashing)
     /// are skipped — there's no known.met record to persist the flag into
     /// yet, mirroring `set_shared_by_path_prefix`.
-    pub fn set_shared_by_paths(&mut self, paths: &[String], shared: bool) -> Vec<String> {
+    pub fn set_shared_by_paths(&mut self, paths: &[String], shared: bool) -> ShareMutation {
         let keys: HashSet<String> = paths.iter().map(|p| normalize_path_key(p)).collect();
-        let mut affected = Vec::new();
+        let hashes: HashSet<String> = self
+            .files
+            .iter()
+            .filter(|file| keys.contains(&normalize_path_key(&file.path)))
+            .filter_map(|file| (!file.hash.is_empty()).then(|| file.hash.clone()))
+            .collect();
+        let pending_paths: HashSet<String> = self
+            .files
+            .iter()
+            .filter(|file| {
+                file.hash.is_empty() && keys.contains(&normalize_path_key(&file.path))
+            })
+            .map(|file| normalize_path_key(&file.path))
+            .collect();
+        let mut mutation = ShareMutation::default();
         for file in &mut self.files {
-            if keys.contains(&normalize_path_key(&file.path))
-                && !file.hash.is_empty()
+            if (hashes.contains(&file.hash)
+                || (file.hash.is_empty()
+                    && pending_paths.contains(&normalize_path_key(&file.path))))
                 && file.shared != shared
             {
                 file.shared = shared;
-                affected.push(file.hash.clone());
+                mutation.changed_paths += 1;
+                if file.hash.is_empty() {
+                    mutation.pending_paths.push(file.path.clone());
+                } else if !mutation.hashes.contains(&file.hash) {
+                    mutation.hashes.push(file.hash.clone());
+                }
             }
         }
-        affected
+        mutation
     }
 
     /// Like `upsert_file`, but keeps `path_map`/`hash_map`/`name_tokens`
@@ -667,5 +806,79 @@ mod tests {
             normalize_path_key(r"\\?\C:\Downloads\Video.mkv"),
             normalize_path_key(r"C:\Downloads\Video.mkv"),
         );
+    }
+}
+
+#[cfg(test)]
+mod local_index_tests {
+    use super::LocalIndex;
+    use crate::types::FileInfo;
+
+    fn file(path: &str, hash: &str, shared: bool, priority: &str) -> FileInfo {
+        FileInfo {
+            id: hash.to_string(),
+            name: path.rsplit(['/', '\\']).next().unwrap_or(path).to_string(),
+            path: path.to_string(),
+            size: 1,
+            hash: hash.to_string(),
+            aich_hash: String::new(),
+            extension: "bin".to_string(),
+            modified_at: 0,
+            priority: priority.to_string(),
+            requests: 0,
+            accepted: 0,
+            bytes_transferred: 0,
+            alltime_requests: 0,
+            alltime_accepted: 0,
+            alltime_transferred: 0,
+            complete_sources: 0,
+            folder: path
+                .rsplit_once(['/', '\\'])
+                .map_or_else(String::new, |(folder, _)| folder.to_string()),
+            shared,
+            shared_kad: false,
+            shared_ed2k: false,
+        }
+    }
+
+    #[test]
+    fn path_share_change_is_hash_wide() {
+        let mut index = LocalIndex::new();
+        index.add_files(vec![
+            file("A/copy.bin", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", true, "normal"),
+            file("B/copy.bin", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", true, "normal"),
+        ]);
+
+        let mutation = index.set_file_shared_by_path("A/copy.bin", false);
+
+        assert_eq!(mutation.changed_paths, 2);
+        assert_eq!(mutation.hashes, vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]);
+        assert!(!index.get_by_path("A/copy.bin").unwrap().shared);
+        assert!(!index.get_by_path("B/copy.bin").unwrap().shared);
+    }
+
+    #[test]
+    fn path_priority_change_is_hash_wide() {
+        let mut index = LocalIndex::new();
+        index.add_files(vec![
+            file("A/copy.bin", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", true, "normal"),
+            file("B/copy.bin", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", true, "normal"),
+        ]);
+
+        assert_eq!(index.set_file_priority_by_path_count("A/copy.bin", "high"), 2);
+        assert_eq!(index.get_by_path("A/copy.bin").unwrap().priority, "high");
+        assert_eq!(index.get_by_path("B/copy.bin").unwrap().priority, "high");
+    }
+
+    #[test]
+    fn folder_unshare_includes_pending_rows() {
+        let mut index = LocalIndex::new();
+        index.add_files(vec![file("A/pending.bin", "", true, "normal")]);
+
+        let mutation = index.set_shared_by_path_prefix("A", false);
+
+        assert_eq!(mutation.changed_paths, 1);
+        assert!(mutation.hashes.is_empty());
+        assert!(!index.get_by_path("A/pending.bin").unwrap().shared);
     }
 }

@@ -3515,6 +3515,7 @@ pub enum NetworkCommand {
     SetUploadPriorities {
         file_hashes: Vec<String>,
         priority: u8,
+        tx: oneshot::Sender<Result<(), String>>,
     },
     ConnectToServer {
         ip: String,
@@ -11318,6 +11319,81 @@ pub async fn start_network(
 
             // Upload events from the peer-to-peer upload listener
             Some(event) = ul_event_rx.recv() => {
+                // Attribute payload bytes to the Library as Progress events
+                // arrive. The old completion-only path depended on finding a
+                // still-live transfer row at session teardown; in real uploads
+                // that lookup frequently missed, leaving known.met counters at
+                // zero despite gigabytes in aggregate Statistics. Events from
+                // one upload connection are ordered, and the manager still
+                // contains the previous progress snapshot here (the generic
+                // handler below applies this event afterward), so the delta is
+                // exact and cannot double-count repeated/coalesced updates.
+                let library_upload_delta = if let UploadEventKind::Progress {
+                    uploaded,
+                    total,
+                    ..
+                } = &event.kind
+                {
+                    let manager = transfer_manager.read().await;
+                    manager.get_transfer(&event.transfer_id).and_then(|transfer| {
+                        let next = if *total > 0 {
+                            (*uploaded).min(*total)
+                        } else {
+                            *uploaded
+                        };
+                        let delta = next.saturating_sub(transfer.transferred);
+                        (delta > 0 && !transfer.file_hash.is_empty())
+                            .then(|| (transfer.file_hash.clone(), delta))
+                    })
+                } else {
+                    None
+                };
+                if let Some((hash_hex, uploaded_bytes)) = library_upload_delta {
+                    if let Ok(bytes) = hex::decode(&hash_hex) {
+                        if bytes.len() == 16 {
+                            let mut file_hash = [0u8; 16];
+                            file_hash.copy_from_slice(&bytes);
+                            let persisted_alltime = known_files
+                                .add_all_time_transferred(&file_hash, uploaded_bytes);
+                            if !persisted_alltime {
+                                warn!(
+                                    "Upload progress for {hash_hex} has no known.met record; keeping session stats only"
+                                );
+                            }
+                            {
+                                let mut index = local_index.write().await;
+                                index.apply_upload_completed_bytes(
+                                    &hash_hex,
+                                    uploaded_bytes,
+                                    persisted_alltime,
+                                );
+                            }
+                            {
+                                let mut cached = shared_files.write().await;
+                                for file in cached.iter_mut() {
+                                    if file.hash.eq_ignore_ascii_case(&hash_hex) {
+                                        file.bytes_transferred = file
+                                            .bytes_transferred
+                                            .saturating_add(uploaded_bytes);
+                                        if persisted_alltime {
+                                            file.alltime_transferred = file
+                                                .alltime_transferred
+                                                .saturating_add(uploaded_bytes);
+                                        }
+                                    }
+                                }
+                            }
+                            let _ = app_handle.emit(
+                                "shared-files-changed",
+                                serde_json::json!({
+                                    "phase": "upload-progress",
+                                    "count": 1,
+                                }),
+                            );
+                        }
+                    }
+                }
+
                 if let UploadEventKind::ShareInterest {
                     ref file_hash,
                     inc_requests,
@@ -11329,7 +11405,15 @@ pub async fn start_network(
                             if bytes.len() == 16 {
                                 let mut fh = [0u8; 16];
                                 fh.copy_from_slice(&bytes);
-                                known_files.bump_share_interest(&fh, inc_requests, inc_accepted);
+                                if !known_files.bump_share_interest(
+                                    &fh,
+                                    inc_requests,
+                                    inc_accepted,
+                                ) {
+                                    warn!(
+                                        "Upload interest for {file_hash} has no known.met record"
+                                    );
+                                }
                                 {
                                     let mut idx = local_index.write().await;
                                     idx.apply_upload_share_deltas(file_hash, inc_requests, inc_accepted);
@@ -11354,47 +11438,6 @@ pub async fn start_network(
                                 }
                                 let _ = app_handle.emit("shared-files-changed", serde_json::json!({
                                     "phase": "upload-stats",
-                                    "count": 1,
-                                }));
-                            }
-                        }
-                    }
-                }
-
-                let completed_payload = if matches!(&event.kind, UploadEventKind::Completed { .. }) {
-                    let mgr = transfer_manager.read().await;
-                    let out = mgr
-                        .get_transfer(&event.transfer_id)
-                        .map(|t| (t.file_hash.clone(), t.transferred));
-                    drop(mgr);
-                    out
-                } else {
-                    None
-                };
-                if let Some((hash_hex, uploaded_bytes)) = completed_payload {
-                    if uploaded_bytes > 0 {
-                        if let Ok(v) = hex::decode(&hash_hex) {
-                            if v.len() == 16 {
-                                let mut fh = [0u8; 16];
-                                fh.copy_from_slice(&v);
-                                known_files.add_all_time_transferred(&fh, uploaded_bytes);
-                                {
-                                    let mut idx = local_index.write().await;
-                                    idx.apply_upload_completed_bytes(&hash_hex, uploaded_bytes);
-                                }
-                                // Target-update the cached snapshot in place
-                                // (see ShareInterest above for rationale).
-                                {
-                                    let mut cached = shared_files.write().await;
-                                    for f in cached.iter_mut() {
-                                        if f.hash == hash_hex {
-                                            f.bytes_transferred = f.bytes_transferred.saturating_add(uploaded_bytes);
-                                            f.alltime_transferred = f.alltime_transferred.saturating_add(uploaded_bytes);
-                                        }
-                                    }
-                                }
-                                let _ = app_handle.emit("shared-files-changed", serde_json::json!({
-                                    "phase": "upload-complete",
                                     "count": 1,
                                 }));
                             }
@@ -33145,24 +33188,66 @@ async fn handle_command_inner(
         NetworkCommand::SetUploadPriorities {
             file_hashes,
             priority,
+            tx,
         } => {
-            let mut updated = false;
+            let mut parsed = Vec::with_capacity(file_hashes.len());
             for file_hash_hex in file_hashes {
-                if let Ok(hash_bytes) = hex::decode(&file_hash_hex) {
-                    if hash_bytes.len() != 16 {
-                        continue;
+                let hash_bytes = match hex::decode(&file_hash_hex) {
+                    Ok(bytes) if bytes.len() == 16 => bytes,
+                    Ok(bytes) => {
+                        let _ = tx.send(Err(format!(
+                            "Invalid upload-priority hash {file_hash_hex}: expected 16 bytes, got {}",
+                            bytes.len()
+                        )));
+                        return;
                     }
-                    let mut file_hash = [0u8; 16];
-                    file_hash.copy_from_slice(&hash_bytes);
-                    if let Some(record) = known_files.find_by_hash_mut(&file_hash) {
+                    Err(e) => {
+                        let _ = tx.send(Err(format!(
+                            "Invalid upload-priority hash {file_hash_hex}: {e}"
+                        )));
+                        return;
+                    }
+                };
+                let mut hash = [0u8; 16];
+                hash.copy_from_slice(&hash_bytes);
+                if known_files.find_by_hash(&hash).is_none() {
+                    let _ = tx.send(Err(format!(
+                        "No known.met record for file hash {file_hash_hex}"
+                    )));
+                    return;
+                }
+                parsed.push(hash);
+            }
+            if !parsed.is_empty() {
+                let before = known_files.clone();
+                for hash in parsed {
+                    if let Some(record) = known_files.find_by_hash_mut(&hash) {
                         record.upload_priority = priority;
-                        updated = true;
                     }
                 }
-            }
-            if updated {
                 known_files.mark_dirty();
+                // A Library command must not report a priority change as
+                // durable merely because it was queued for the 120s periodic
+                // writer. Serialize an immediate snapshot save with that
+                // writer so a restart immediately after the IPC reply keeps
+                // the state the UI displayed.
+                let ownership = state.known_met_save_lock.clone().lock_owned().await;
+                let known_path = state.data_dir.join("known.met");
+                let mut snapshot = known_files.clone();
+                let save_result = tokio::task::spawn_blocking(move || {
+                    let _ownership = ownership;
+                    snapshot.save(&known_path)
+                })
+                .await
+                .map_err(|e| format!("known.met priority save task failed: {e}"))
+                .and_then(|result| result.map_err(|e| e.to_string()));
+                if let Err(e) = save_result {
+                    *known_files = before;
+                    let _ = tx.send(Err(format!("Failed to persist upload priority: {e}")));
+                    return;
+                }
             }
+            let _ = tx.send(Ok(()));
         }
 
         NetworkCommand::SetFilesShared { updates, tx } => {
@@ -33197,6 +33282,7 @@ async fn handle_command_inner(
                 let _ = tx.send(Err(error));
                 return;
             }
+            let before = known_files.clone();
             for (hash, shared) in &parsed {
                 if let Some(record) = known_files.find_by_hash_mut(hash) {
                     record.is_shared = *shared;
@@ -33204,6 +33290,24 @@ async fn handle_command_inner(
             }
             if !parsed.is_empty() {
                 known_files.mark_dirty();
+                // See SetUploadPriorities: persist before acknowledging so
+                // share/unshare cannot appear successful and then revert on
+                // the next application start.
+                let ownership = state.known_met_save_lock.clone().lock_owned().await;
+                let known_path = state.data_dir.join("known.met");
+                let mut snapshot = known_files.clone();
+                let save_result = tokio::task::spawn_blocking(move || {
+                    let _ownership = ownership;
+                    snapshot.save(&known_path)
+                })
+                .await
+                .map_err(|e| format!("known.met share-state save task failed: {e}"))
+                .and_then(|result| result.map_err(|e| e.to_string()));
+                if let Err(e) = save_result {
+                    *known_files = before;
+                    let _ = tx.send(Err(format!("Failed to persist file sharing state: {e}")));
+                    return;
+                }
             }
             let _ = tx.send(Ok(parsed.len()));
         }

@@ -3,9 +3,18 @@ use crate::commands::errors::{bounded_send, coded, coded_ctx};
 use crate::network::ed2k::collection::{Collection, CollectionFile};
 use crate::types::{Transfer, TransferDirection, TransferStatus};
 use tauri::Emitter;
+use tauri_plugin_dialog::DialogExt;
 
 const MAX_COLLECTION_FIELD_LEN: usize = 1024;
 const MAX_COLLECTION_ENTRY_NAME_LEN: usize = 1024;
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectionDownloadResult {
+    pub queued_count: usize,
+    pub skipped_count: usize,
+    pub oversize_count: usize,
+}
 
 #[tauri::command]
 pub async fn load_collection(
@@ -101,14 +110,44 @@ pub async fn load_collection(
     .map_err(|e| coded_ctx("collections_load_task_failed", "Load task failed", e))?
 }
 
+/// Native picker path for Library. Selecting a file is an explicit user
+/// authorization, so use the same bounded parser as OS file-association opens
+/// instead of the raw IPC command's shared/download-root policy.
 #[tauri::command]
-pub async fn create_collection(
-    state: tauri::State<'_, AppState>,
+pub async fn pick_and_load_collection(
+    app: tauri::AppHandle,
+) -> Result<Option<Collection>, String> {
+    let selected = tokio::task::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .add_filter("eMule Collection", &["emulecollection", "txt"])
+            .blocking_pick_file()
+            .map(|file| {
+                file.into_path()
+                    .map_err(|e| coded_ctx("collections_invalid_path", "Invalid collection path", e))
+            })
+            .transpose()
+    })
+    .await
+    .map_err(|e| coded_ctx("collections_dialog_task_failed", "Open dialog failed", e))??;
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    crate::commands::deeplink::open_collection_file(
+        selected.to_string_lossy().into_owned(),
+    )
+    .await
+    .map(Some)
+}
+
+async fn create_collection_internal(
+    state: &AppState,
     name: String,
     author: String,
     files: Vec<CollectionFile>,
     output_path: String,
     binary: bool,
+    enforce_output_scope: bool,
 ) -> Result<String, String> {
     if name.len() > MAX_COLLECTION_FIELD_LEN {
         return Err(coded_ctx(
@@ -199,28 +238,30 @@ pub async fn create_collection(
         ));
     }
 
-    let config = state.config.read().await;
-    let mut allowed_dirs: Vec<String> = config.settings.shared_folders.clone();
-    if !config.settings.download_folder.is_empty() {
-        allowed_dirs.push(
-            std::path::PathBuf::from(&config.settings.download_folder)
-                .to_string_lossy()
-                .into_owned(),
-        );
-    }
-    drop(config);
+    if enforce_output_scope {
+        let config = state.config.read().await;
+        let mut allowed_dirs: Vec<String> = config.settings.shared_folders.clone();
+        if !config.settings.download_folder.is_empty() {
+            allowed_dirs.push(
+                std::path::PathBuf::from(&config.settings.download_folder)
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        drop(config);
 
-    if allowed_dirs.is_empty() {
-        return Err(coded(
-            "collections_no_folders_configured",
-            "No shared or download folders configured",
-        ));
-    }
-    if !crate::security::is_path_within_dirs(&canonical, &allowed_dirs) {
-        return Err(coded(
-            "collections_output_outside_allowed_dirs",
-            "Output path must be inside a shared or download folder",
-        ));
+        if allowed_dirs.is_empty() {
+            return Err(coded(
+                "collections_no_folders_configured",
+                "No shared or download folders configured",
+            ));
+        }
+        if !crate::security::is_path_within_dirs(&canonical, &allowed_dirs) {
+            return Err(coded(
+                "collections_output_outside_allowed_dirs",
+                "Output path must be inside a shared or download folder",
+            ));
+        }
     }
 
     let ext = canonical
@@ -254,12 +295,70 @@ pub async fn create_collection(
     ))
 }
 
+/// Legacy raw-path command. Retains the Library-root restriction so arbitrary
+/// WebView IPC cannot write elsewhere; normal Library exports use the native
+/// save dialog command below.
+#[tauri::command]
+pub async fn create_collection(
+    state: tauri::State<'_, AppState>,
+    name: String,
+    author: String,
+    files: Vec<CollectionFile>,
+    output_path: String,
+    binary: bool,
+) -> Result<String, String> {
+    create_collection_internal(&state, name, author, files, output_path, binary, true).await
+}
+
+#[tauri::command]
+pub async fn create_collection_with_dialog(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    name: String,
+    author: String,
+    files: Vec<CollectionFile>,
+    binary: bool,
+) -> Result<Option<String>, String> {
+    let extension = if binary { "emulecollection" } else { "txt" };
+    let filter_name = if binary { "eMule Collection" } else { "ED2K Links" };
+    let safe_name = crate::security::sanitize_filename(&name);
+    let default_name = format!("{safe_name}.{extension}");
+    let selected = tokio::task::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .add_filter(filter_name, &[extension])
+            .set_file_name(default_name)
+            .blocking_save_file()
+            .map(|file| {
+                file.into_path()
+                    .map_err(|e| coded_ctx("collections_invalid_output_path", "Invalid output path", e))
+            })
+            .transpose()
+    })
+    .await
+    .map_err(|e| coded_ctx("collections_dialog_task_failed", "Save dialog failed", e))??;
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    create_collection_internal(
+        &state,
+        name,
+        author,
+        files,
+        selected.to_string_lossy().into_owned(),
+        binary,
+        false,
+    )
+    .await
+    .map(Some)
+}
+
 #[tauri::command]
 pub async fn download_collection_files(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     files: Vec<CollectionFile>,
-) -> Result<String, String> {
+) -> Result<CollectionDownloadResult, String> {
     if files.len() > 200 {
         return Err(coded(
             "collections_too_many_files",
@@ -462,11 +561,9 @@ pub async fn download_collection_files(
             "Collection download: skipped {oversize_count} entries that exceed max_download_file_size_gib"
         );
     }
-    let mut msg = format!("Queued {queued_count} files for download");
-    if oversize_count > 0 {
-        msg.push_str(&format!(
-            " ({oversize_count} skipped: exceeds Max File Size in Settings > Downloads)"
-        ));
-    }
-    Ok(msg)
+    Ok(CollectionDownloadResult {
+        queued_count,
+        skipped_count,
+        oversize_count,
+    })
 }

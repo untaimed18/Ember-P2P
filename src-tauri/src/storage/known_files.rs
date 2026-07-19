@@ -560,25 +560,36 @@ impl KnownFileList {
     }
 
     /// Increment all-time request/accept counters (eMule-style per-file upload interest).
-    pub fn bump_share_interest(&mut self, hash: &[u8; 16], requested: u32, accepted: u32) {
+    pub fn bump_share_interest(
+        &mut self,
+        hash: &[u8; 16],
+        requested: u32,
+        accepted: u32,
+    ) -> bool {
         if requested == 0 && accepted == 0 {
-            return;
+            return true;
         }
         if let Some(record) = self.files.get_mut(hash) {
             record.all_time_requested = record.all_time_requested.saturating_add(requested);
             record.all_time_accepted = record.all_time_accepted.saturating_add(accepted);
             self.touch_dirty();
+            true
+        } else {
+            false
         }
     }
 
     /// Add payload bytes to all-time uploaded for this file.
-    pub fn add_all_time_transferred(&mut self, hash: &[u8; 16], bytes: u64) {
+    pub fn add_all_time_transferred(&mut self, hash: &[u8; 16], bytes: u64) -> bool {
         if bytes == 0 {
-            return;
+            return true;
         }
         if let Some(record) = self.files.get_mut(hash) {
             record.all_time_transferred = record.all_time_transferred.saturating_add(bytes);
             self.touch_dirty();
+            true
+        } else {
+            false
         }
     }
 

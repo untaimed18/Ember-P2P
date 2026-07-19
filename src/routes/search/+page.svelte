@@ -1892,7 +1892,7 @@
     (filterMinSources !== '' ? 1 : 0) +
     (filterMinComplete !== '' ? 1 : 0) +
     // Default is hide-spam on; count only when the user opted out.
-    (hideSpam === false ? 1 : 0)
+    (!hideSpam ? 1 : 0)
   );
 
 </script>
