@@ -791,7 +791,7 @@
       </div>
     </div>
 
-    <p>Ember is not a fork or reskin of eMule. It is a complete reimplementation of the eMule protocol stack in safe Rust, paired with a lightweight Tauri + Svelte shell. It speaks the same KAD wire protocol as eMule 0.50a and compatible clients (aMule, eMule Xtreme, etc.), participates in the same network, finds the same sources, and respects the same credit system. Ember also automatically connects to the eMule Security server for ED2K peer exchange while downloading, requiring no configuration.</p>
+    <p>Ember is not a fork or reskin of eMule. It is a complete reimplementation of the eMule protocol stack in safe Rust, paired with a lightweight Tauri + Svelte shell. It speaks the same KAD wire protocol as eMule 0.50a and compatible clients (aMule, eMule Xtreme, etc.), participates in the same network, finds the same sources, and respects the same credit system. On first launch Ember can seed a community <code>server.met</code> from emule-security.org; you connect to KAD and ED2K servers when you choose (or enable optional auto-connect in Settings).</p>
     <p>Ember also introduces <a href="#epx">EPX (Ember Peer Exchange)</a>, an Ember-exclusive extension that accelerates source discovery between Ember peers without affecting compatibility with other clients.</p>
   </section>
 
@@ -809,7 +809,7 @@
       <div class="hl-card">
         <div class="hl-icon">&#x1F310;</div>
         <h4>Full Protocol Compliance</h4>
-        <p>Wire-compatible with eMule 0.50a and the broader eMule ecosystem. KAD v8/v9, automatic ED2K peer exchange, credits, SecIdent, obfuscation, and AICH all work out of the box.</p>
+        <p>Wire-compatible with eMule 0.50a and the broader eMule ecosystem. KAD v8/v9, ED2K servers &amp; peer exchange, credits, SecIdent, obfuscation, and AICH all work out of the box.</p>
       </div>
       <div class="hl-card">
         <div class="hl-icon">&#x1F504;</div>
@@ -819,7 +819,7 @@
       <div class="hl-card">
         <div class="hl-icon">&#x1F50D;</div>
         <h4>Advanced Search</h4>
-        <p>Multi-tab keyword search with type, size, source, and extension filters. Built-in spam detection with configurable profiles surfaces quality results.</p>
+        <p>Global, Server, and KAD keyword search with multi-tab results, type/size/source/extension filters, and built-in spam detection.</p>
       </div>
       <div class="hl-card">
         <div class="hl-icon">&#x1F6E1;</div>
@@ -839,7 +839,7 @@
       <div class="hl-card">
         <div class="hl-icon">&#x1F4DA;</div>
         <h4>Library Management</h4>
-        <p>Virtual-scrolling tables that handle thousands of files. Sort, filter, bulk-edit priorities, add comments and ratings, and create collections.</p>
+        <p>Virtual-scrolling tables that handle thousands of files. Sort, filter, play media in-app, copy eD2K links, add comments and ratings, and create collections.</p>
       </div>
       <div class="hl-card">
         <div class="hl-icon">&#x1F465;</div>
@@ -857,7 +857,7 @@
 
     <div class="download-box">
       <img src="icon.png" alt="Ember" width="80" height="80" style="border-radius: 16px; margin-bottom: 16px; box-shadow: 0 4px 16px rgba(0,0,0,0.12);">
-      <h3>Get Ember 1.1.7</h3>
+      <h3>Get Ember 1.2.1</h3>
       <p>The latest release is available on GitHub for Windows 10 and Windows 11.</p>
       <div class="btn-group">
         <a href="https://github.com/untaimed18/Ember-P2P/releases/latest" class="btn btn-primary" target="_blank" rel="noopener">
@@ -898,16 +898,16 @@
       </li>
       <li>
         <strong>Connect</strong><br>
-        <span style="color: var(--text-secondary)">Ember automatically connects to the KAD network on launch. It also connects to the eMule Security server for ED2K peer exchange automatically while downloading &mdash; no configuration needed.</span>
+        <span style="color: var(--text-secondary)">Press <strong>Connect</strong> on the KAD Network page and/or connect from the ED2K Servers page. Optionally enable Auto-Connect KAD and Auto-Connect Server in Settings (or the Setup Wizard) so Ember reconnects on launch. A community <code>server.met</code> list can be downloaded from emule-security.org on first run.</span>
       </li>
       <li>
         <strong>Share &amp; Download</strong><br>
-        <span style="color: var(--text-secondary)">Add folders to your library, search for files across the network, and start downloading. Ember handles multi-source transfers, queue management, and source discovery automatically.</span>
+        <span style="color: var(--text-secondary)">Add folders to your library, search with Global / Server / KAD methods, open <code>ed2k://</code> links, and start downloading. Ember handles multi-source transfers, queue management, and source discovery automatically.</span>
       </li>
     </ol>
 
     <div class="callout">
-      <p><strong>Tip:</strong> For best performance (High ID), forward your TCP and UDP ports on your router or enable UPnP in Settings &gt; Network. See the <a href="#highid">High ID vs Low ID</a> section for details.</p>
+      <p><strong>Tip:</strong> For best performance (High ID), forward your TCP and UDP ports on your router, enable UPnP, or leave STUN port keep-alive on in Settings &gt; Network. See the <a href="#highid">High ID vs Low ID</a> section for details.</p>
     </div>
   </section>
 
@@ -919,24 +919,29 @@
 
     <h3>Networking</h3>
     <ul>
-      <li><strong>KAD Network &amp; ED2K Peer Exchange</strong> &mdash; Connect to the decentralized KAD DHT for peer discovery and search. Automatically connects to the eMule Security server for ED2K peer exchange while downloading.</li>
+      <li><strong>KAD Network</strong> &mdash; Connect to the decentralized KAD DHT for peer discovery, keyword search, publishing, firewall checks, and buddy relay. Optional Auto-Connect KAD in Settings; otherwise press Connect on the KAD Network page.</li>
+      <li><strong>ED2K Servers &amp; Peer Exchange</strong> &mdash; Manage servers on the ED2K Servers page, download a community <code>server.met</code> from emule-security.org, and optionally Auto-Connect Server (last server, else eMule Sunrise). Once connected, peer exchange helps find sources.</li>
       <li><strong>EPX Source Exchange</strong> &mdash; Ember peers share source lists with each other for faster downloads. Non-Ember clients are unaffected.</li>
-      <li><strong>NAT Traversal</strong> &mdash; UPnP automatic port mapping, firewall detection, and KAD buddy relay for LowID peers.</li>
+      <li><strong>NAT Traversal</strong> &mdash; UPnP automatic port mapping, firewall detection, KAD buddy relay for LowID peers, and EPX peer-relay (ERAT) for LowID&harr;LowID paths when attestations allow.</li>
+      <li><strong>STUN Port Keep-Alive</strong> &mdash; Periodic STUN plus a TCP hold from your listen port keeps NAT mappings alive and advertises the discovered public TCP/UDP ports for High ID. Designed for CGNAT and full-cone NAT when UPnP is unavailable; auto-suspends on symmetric or unstable remapping.</li>
       <li><strong>Protocol Obfuscation</strong> &mdash; RC4-based TCP and UDP header encryption to help with ISP throttling.</li>
+      <li><strong>Deep Links</strong> &mdash; Opens <code>ed2k://</code> URIs and <code>.emulecollection</code> files from the OS (including while Ember is already running).</li>
     </ul>
 
     <h3>Transfers</h3>
     <ul>
       <li><strong>Multi-Source Downloads</strong> &mdash; Download from multiple peers simultaneously with part-level hash verification, automatic source rotation, and queue management.</li>
       <li><strong>Transfer Monitoring</strong> &mdash; Real-time progress bars, per-source detail drawers, upload tracking, health indicators, and archive recovery.</li>
+      <li><strong>Upload Speed Sense (USS)</strong> &mdash; Optionally adjusts upload speed from network latency to reduce congestion (requires an upload speed limit).</li>
       <li><strong>AICH</strong> &mdash; Advanced Intelligent Corruption Handling for part-level hash verification and recovery.</li>
     </ul>
 
     <h3>Search &amp; Library</h3>
     <ul>
-      <li><strong>Advanced Search</strong> &mdash; Multi-tab keyword search with type, size, source, and extension filters.</li>
+      <li><strong>Advanced Search</strong> &mdash; Global, Server, and KAD keyword search with multi-tab results plus type, size, source, and extension filters.</li>
       <li><strong>Spam Detection</strong> &mdash; Built-in spam detection with balanced and aggressive profiles. Configurable spam threshold and automatic result hiding.</li>
-      <li><strong>Library Management</strong> &mdash; Virtual-scrolling tables that handle thousands of files. Sort, filter, bulk-edit priorities, and create collections.</li>
+      <li><strong>Library Management</strong> &mdash; Virtual-scrolling tables that handle thousands of files. Sort, filter, bulk-edit priorities, scan for missing files, copy all eD2K links for the current view, and create collections.</li>
+      <li><strong>In-App Media Player</strong> &mdash; Play supported audio and video from the Library detail drawer, with Open Externally still available.</li>
       <li><strong>Comments &amp; Ratings</strong> &mdash; Add metadata to your shared files for other peers to see.</li>
     </ul>
 
@@ -949,6 +954,7 @@
     <h3>Security</h3>
     <ul>
       <li><strong>IP Filtering</strong> &mdash; Load ipfilter.dat / ipfilter.zip with automatic update support. Incoming connection filtering is off by default because VPN IP ranges commonly appear in ipfilter.dat hosting blocks, silently blocking legitimate peers. Outbound filtering remains active regardless of this setting.</li>
+      <li><strong>Anti-Leech Filter</strong> &mdash; Reject incoming connections from known leech client patterns (customizable regex list in Settings).</li>
       <li><strong>Private IP Blocking</strong> &mdash; Prevents connections to reserved IP ranges.</li>
       <li><strong>Content Security Policy</strong> &mdash; Strict CSP headers in the Tauri webview.</li>
       <li><strong>Path Traversal Protection</strong> &mdash; Sanitized file paths prevent directory escape attacks.</li>
@@ -956,10 +962,12 @@
 
     <h3>User Experience</h3>
     <ul>
-      <li><strong>First-Time Setup Wizard</strong> &mdash; Guided configuration on first launch: nickname, download folder, ports, speed limits, KAD auto-connect, and theme.</li>
+      <li><strong>First-Time Setup Wizard</strong> &mdash; Guided configuration on first launch: nickname, download folder, ports, speed limits, optional KAD auto-connect, and theme.</li>
       <li><strong>Clean UI</strong> &mdash; Modern, responsive interface with real-time transfer monitoring and inline search filtering.</li>
+      <li><strong>Close to System Tray</strong> &mdash; Keep Ember running in the tray when the window is closed (configurable in Settings).</li>
       <li><strong>Statistics</strong> &mdash; Session and cumulative transfer statistics, connection uptime, and network health indicators.</li>
       <li><strong>Automatic Updates</strong> &mdash; Ember checks for new versions on launch and installs cryptographically signed updates in-app with one click. You can also check manually under Settings &gt; About.</li>
+      <li><strong>Languages</strong> &mdash; Full UI localization for English, Spanish, French, Brazilian Portuguese, German, and Simplified Chinese, with a Settings language picker and system-language detection.</li>
       <li><strong>GeoIP</strong> &mdash; Country identification for connected peers via bundled MaxMind DB.</li>
     </ul>
   </section>
@@ -1054,7 +1062,7 @@ peer_count    (u16 LE)
     </ul>
 
     <h3 id="friends-privacy">Privacy</h3>
-    <p>The rendezvous server only stores SHA-256 hashes of Friend IDs paired with IP and port &mdash; it never sees raw Friend IDs. Entries expire automatically after 5 minutes without a heartbeat. The Ember Hash is also exchanged between peers during the EmuleInfo handshake, but only to other Ember clients.</p>
+    <p>The rendezvous server stores presence as a SHA-256 hash of your Friend ID (never the raw ID), paired with IP and port. Registration is pubkey-bound and signature-checked so entries cannot be spoofed with a stolen hash alone. Entries expire automatically after 5 minutes without a heartbeat. Between Ember peers, the Ember Hash is exchanged via the private <code>OP_EMBER_HELLO</code> / <code>OP_EMBER_HELLOANSWER</code> handshake (with Ed25519 proof-of-possession on TCP) &mdash; not via the legacy EmuleInfo path used for ordinary eMule metadata.</p>
   </section>
 
   <hr>
@@ -1074,8 +1082,8 @@ peer_count    (u16 LE)
           <td>KAD v8/v9 for decentralized peer and file discovery, firewall checks, buddy relay for firewalled peers, keyword publishing, and note publishing.</td>
         </tr>
         <tr>
-          <td><strong>ED2K Peer Exchange</strong></td>
-          <td>Automatically connects to the eMule Security server while downloading for peer connection and source finding. No manual server configuration required.</td>
+          <td><strong>ED2K Servers &amp; Peer Exchange</strong></td>
+          <td>Connect from the ED2K Servers page or optional Auto-Connect Server (last server, else eMule Sunrise). Community <code>server.met</code> lists can be downloaded from emule-security.org. Once connected, servers provide High/Low ID and peer/source exchange.</td>
         </tr>
         <tr>
           <td><strong>Credits &amp; SecIdent</strong></td>
@@ -1110,10 +1118,11 @@ peer_count    (u16 LE)
       </tbody>
     </table>
 
-    <p>For best performance (High ID), forward both ports on your router or enable <strong>UPnP</strong> in Settings to have Ember map them automatically.</p>
+    <p>For best performance (High ID), forward both ports on your router, enable <strong>UPnP</strong> for automatic mapping, or use <strong>STUN port keep-alive</strong> when you are behind CGNAT or full-cone NAT without UPnP.</p>
 
     <div class="callout">
       <p><strong>UPnP:</strong> When enabled, Ember uses the IGD protocol to automatically request port mappings from your router. This works with most consumer routers and is the easiest path to High ID.</p>
+      <p style="margin-top: 10px;"><strong>STUN port keep-alive:</strong> On by default in Settings &gt; Network. Ember periodically refreshes your NAT mappings with STUN (and a TCP hold from the listen port) and advertises the public ports peers should connect to. It auto-suspends on Open / Symmetric NAT or unstable remapping and falls back to your Settings ports.</p>
     </div>
   </section>
 
@@ -1149,7 +1158,8 @@ peer_count    (u16 LE)
       <li>Check that your OS firewall allows Ember through on both protocols.</li>
       <li>Restart Ember to reconnect to the ED2K server.</li>
       <li>Enable UPnP in Settings &gt; Network for automatic port mapping.</li>
-      <li>If behind CGNAT (common with mobile/ISP connections), High ID may not be achievable without a VPN or tunneling solution.</li>
+      <li>Leave STUN port keep-alive enabled (Settings &gt; Network) if you are behind CGNAT or full-cone NAT without UPnP &mdash; Ember will try to hold and advertise remapped public ports.</li>
+      <li>If behind symmetric NAT or a VPN that remaps ports unstably, STUN keep-alive suspends automatically; High ID may still require a VPN with a fixed forwarded port or another tunneling solution.</li>
     </ul>
   </section>
 
@@ -1183,7 +1193,7 @@ peer_count    (u16 LE)
 
     <h3>Prerequisites</h3>
     <ul>
-      <li><a href="https://rustup.rs/" target="_blank" rel="noopener">Rust</a> (1.91+)</li>
+      <li><a href="https://rustup.rs/" target="_blank" rel="noopener">Rust</a> (1.94+)</li>
       <li><a href="https://nodejs.org/" target="_blank" rel="noopener">Node.js</a> (18+)</li>
       <li><strong>Windows:</strong> Visual Studio Build Tools with C++ workload</li>
     </ul>
@@ -1227,7 +1237,7 @@ npm run tauri build</code></pre>
         Is Ember compatible with regular eMule clients?
         <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
       </button>
-      <div class="faq-a">Yes. Ember speaks the same KAD wire protocol as eMule 0.50a and compatible clients (aMule, eMule Xtreme, etc.). It participates in the same network, finds the same sources, and respects the same credit system. It also automatically connects to the eMule Security server for ED2K peer exchange while downloading. The EPX extension is only activated between Ember peers and is silently ignored by other clients.</div>
+      <div class="faq-a">Yes. Ember speaks the same KAD wire protocol as eMule 0.50a and compatible clients (aMule, eMule Xtreme, etc.). It participates in the same network, finds the same sources, and respects the same credit system. Connect to KAD and/or an ED2K server from the app (or enable optional auto-connect in Settings). The EPX extension is only activated between Ember peers and is silently ignored by other clients.</div>
     </div>
 
     <div class="faq-item">
@@ -1243,7 +1253,7 @@ npm run tauri build</code></pre>
         Is ED2K Low ID the same as KAD Firewalled?
         <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
       </button>
-      <div class="faq-a">No. ED2K High/Low ID is assigned when Ember connects to the eMule Security server and reflects TCP reachability. KAD Open/Firewalled is KAD's independent assessment of UDP reachability. You can have a High ID on ED2K while being Firewalled on KAD if only your TCP port is open but UDP is blocked.</div>
+      <div class="faq-a">No. ED2K High/Low ID is assigned when Ember connects to an ED2K server and reflects TCP reachability. KAD Open/Firewalled is KAD's independent assessment of UDP reachability. You can have a High ID on ED2K while being Firewalled on KAD if only your TCP port is open but UDP is blocked.</div>
     </div>
 
     <div class="faq-item">
@@ -1251,7 +1261,7 @@ npm run tauri build</code></pre>
         How do I get High ID?
         <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
       </button>
-      <div class="faq-a">Forward ports 4662 (TCP) and 4672 (UDP) on your router, or enable UPnP in Ember's network settings. Make sure your OS firewall also allows Ember through. If you're behind CGNAT (common with some ISPs and mobile connections), achieving High ID may not be possible without a VPN.</div>
+      <div class="faq-a">Forward ports 4662 (TCP) and 4672 (UDP) on your router, enable UPnP, or leave STUN port keep-alive on in Settings &gt; Network. Make sure your OS firewall also allows Ember through. On CGNAT or full-cone NAT without UPnP, STUN keep-alive can hold remapped public ports and advertise them for High ID. Symmetric or unstable VPN remapping still often needs a VPN with a fixed forwarded port.</div>
     </div>
 
     <div class="faq-item">
@@ -1309,6 +1319,155 @@ npm run tauri build</code></pre>
   <section id="releases">
     <h2>Release History</h2>
     <p>Official Ember releases for Windows. Notes mirror the <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">GitHub Releases</a> changelog style. Ember can also update itself in-app when a signed release is published.</p>
+
+    <article class="release" id="release-1-2-1">
+      <div class="release-header">
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.2.1" target="_blank" rel="noopener">Ember v1.2.1</a></h3>
+        <time class="release-date" datetime="2026-07-19">July 19, 2026</time>
+      </div>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.2.1" target="_blank" rel="noopener"><code>v1.2.1</code></a></p>
+      <div class="release-notes">
+        <h4>What's New</h4>
+        <p>Connectivity and Library quality-of-life release: STUN/NATMAP port keep-alive for CGNAT and cone NATs, Simplified Chinese UI, and a few Library / chat fixes.</p>
+
+        <h5>Network &amp; HighID</h5>
+        <ul>
+          <li><strong>STUN port keep-alive</strong> (Settings, on by default): keeps NAT mappings alive with periodic STUN plus a TCP hold from your listen port, and advertises the discovered public TCP/UDP ports for HighID &mdash; useful behind CGNAT or full-cone NAT without UPnP</li>
+          <li>Auto-suspends on Open / Symmetric NAT or unstable port remapping, then falls back to your Settings ports</li>
+          <li>Home status shows when STUN keep-alive is active and which public ports are being advertised</li>
+        </ul>
+
+        <h5>Library</h5>
+        <ul>
+          <li><strong>Copy all eD2K links</strong> for the current Library view in one shot (single IPC batch, works on large libraries)</li>
+        </ul>
+
+        <h5>Localization</h5>
+        <ul>
+          <li><strong>Simplified Chinese (zh-CN)</strong> UI language, including Settings picker and system-language detection (<code>zh</code> / <code>zh-Hans</code> &rarr; zh-CN)</li>
+        </ul>
+
+        <h4>What's Fixed</h4>
+        <ul>
+          <li>Library <strong>Missing</strong> stays greyed out until a scan actually finds missing files</li>
+          <li>Closing an active chat tab no longer resurrects its wiped draft when you reopen a chat later</li>
+          <li>Rendezvous-server Docker image builds again (Rust toolchain pin aligned with <code>rust-version</code>)</li>
+        </ul>
+
+        <p class="full-changelog">
+          <strong>Full Changelog</strong>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.2.0...v1.2.1" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.2.0...v1.2.1</a>
+        </p>
+      </div>
+    </article>
+
+    <article class="release" id="release-1-2-0">
+      <div class="release-header">
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.2.0" target="_blank" rel="noopener">Ember v1.2.0</a></h3>
+        <time class="release-date" datetime="2026-07-17">July 17, 2026</time>
+      </div>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.2.0" target="_blank" rel="noopener"><code>v1.2.0</code></a></p>
+      <div class="release-notes">
+        <h4>What's New</h4>
+        <p>Stability and accuracy release focused on transfers, search, KAD, Security/Statistics, Settings, and Library.</p>
+
+        <h5>Downloads &amp; uploads</h5>
+        <ul>
+          <li>Final hash failures can be retried instead of staying permanently failed</li>
+          <li>Stop no longer races into a false Failed state</li>
+          <li>Disk space checks use remaining bytes (large near-done resumes no longer false-flag Insufficient)</li>
+          <li>Uploads end on unique coverage; soft rejects preserve queue seniority</li>
+          <li>Pause/cancel teardown and concurrent-slot promotion hardened</li>
+          <li>Soft disk probe and startup hash timeout behavior improved</li>
+        </ul>
+
+        <h5>Sources &amp; discovery</h5>
+        <ul>
+          <li>Soft-dropped peers can re-inject; LowID callbacks flush for active downloads</li>
+          <li>Pause/resume reseeds from per-file sources; pause-offline source rows stay visible</li>
+          <li>Source counts and offer tracking corrected</li>
+        </ul>
+
+        <h5>Search</h5>
+        <ul>
+          <li>Cancel and KAD keyword results preserved across capacity eviction</li>
+          <li>Hardened filters, notes, source safety, download gating, and spam overrides</li>
+          <li>Clear Results / bulk UX races fixed; method-specific search hints improved</li>
+        </ul>
+
+        <h5>KAD &amp; network</h5>
+        <ul>
+          <li>Fail-closed IP filter no longer blocks KAD bootstrap / RT admission while ranges load</li>
+          <li>Quiet KAD timeout no longer tears down eD2K</li>
+          <li>eD2K reconnect and related filter side effects fixed</li>
+          <li>Server list / routing table no longer wiped during filter load</li>
+        </ul>
+
+        <h5>Security &amp; Statistics</h5>
+        <ul>
+          <li>IP filter Hits column tracks per-range blocks (not only the header total)</li>
+          <li><code>ranges_ready</code> shown; enable refresh/poll; fail-closed load failures visible</li>
+          <li>KAD upload overhead and status-ping wire bytes counted correctly</li>
+          <li>Fake overhead estimates removed; uptime/ratio/locale formatting cleaned up</li>
+        </ul>
+
+        <h5>Library &amp; Settings</h5>
+        <ul>
+          <li>Library Peers column updates live, clears when peers drop, and counts complete copies / KAD publish ACKs only</li>
+          <li>Internal protocol knobs and rendezvous URL removed from Settings UI</li>
+          <li>Friend session encryption forced on</li>
+          <li>Misleading obfuscation “Restart” badge removed</li>
+          <li>Database incremental auto_vacuum enabled (schema v21)</li>
+        </ul>
+
+        <h5>Friends &amp; UI</h5>
+        <ul>
+          <li>Friend connect slots / firewall rules cleared correctly; settings toggles repaired</li>
+          <li>Source drawer empty state authoritative; minor search/transfers UI polish</li>
+          <li>i18n updates across en / de / es / fr / pt-BR</li>
+        </ul>
+
+        <p class="full-changelog">
+          <strong>Full Changelog</strong>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.1.8...v1.2.0" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.1.8...v1.2.0</a>
+        </p>
+      </div>
+    </article>
+
+    <article class="release" id="release-1-1-8">
+      <div class="release-header">
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.1.8" target="_blank" rel="noopener">Ember v1.1.8</a></h3>
+        <time class="release-date" datetime="2026-07-17">July 17, 2026</time>
+      </div>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.1.8" target="_blank" rel="noopener"><code>v1.1.8</code></a></p>
+      <div class="release-notes">
+        <h4>What's Fixed / Hardened</h4>
+
+        <h5>Startup &amp; connectivity</h5>
+        <ul>
+          <li>Defer heavy network startup I/O (UPnP, ipfilter, known.met, GeoIP) so splash IPC stays responsive</li>
+          <li>Fail-close the IP filter until ranges finish loading so peers cannot slip through an empty enabled list</li>
+          <li>Fix HighID port-test / firewall sticky LowID, preferred-server auto-connect, and auto-ban edge cases</li>
+        </ul>
+
+        <h5>Transfers &amp; bandwidth</h5>
+        <ul>
+          <li>Require an upload limit for Upload Speed Sense; fix RTT throttling and single-sample USS ratchet bugs</li>
+          <li>Prevent cancelled downloads from briefly flashing red</li>
+        </ul>
+
+        <h5>Persistence &amp; sharing</h5>
+        <ul>
+          <li>Prevent silent friend-loss, disk-full state wipes, settings resets, orphaned KAD searches, and share/indexer leaks</li>
+          <li>Harden related UI races and friend-connect proof-of-possession test mocks</li>
+        </ul>
+
+        <p class="full-changelog">
+          <strong>Full Changelog</strong>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.1.7...v1.1.8" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.1.7...v1.1.8</a>
+        </p>
+      </div>
+    </article>
 
     <article class="release" id="release-1-1-7">
       <div class="release-header">
