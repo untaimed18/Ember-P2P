@@ -974,9 +974,7 @@ impl TransferManager {
             freed_active_download_slot = transfer.direction == TransferDirection::Download
                 && !matches!(
                     transfer.status,
-                    TransferStatus::Paused
-                        | TransferStatus::Stopped
-                        | TransferStatus::Insufficient
+                    TransferStatus::Paused | TransferStatus::Stopped | TransferStatus::Insufficient
                 );
         }
         self.pause(id);

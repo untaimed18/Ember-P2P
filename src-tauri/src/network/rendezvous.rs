@@ -24,6 +24,50 @@ const OP_RELAY_TICKET_OFFER: u8 = 0x07;
 const OP_RELAY_TICKET_POLL: u8 = 0x08;
 const OP_RELAY_TICKET_ACCEPT: u8 = 0x09;
 const OP_RELAY_TICKET_STATUS: u8 = 0x0a;
+const OP_RELAY_TICKET_POLL_V3: u8 = 0x0b;
+/// The initiator gives the responder this total window to accept an offered
+/// ticket. The network loop polls frequently enough to leave multiple
+/// attempts inside this period, even when one request reaches its timeout.
+pub(crate) const FRIEND_RELAY_TICKET_INITIATOR_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(45);
+pub(crate) const FRIEND_RELAY_TICKET_RESPONDER_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(1);
+pub(crate) const FRIEND_RELAY_TICKET_POLL_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(1);
+pub(crate) const FRIEND_RELAY_TICKET_ACTION_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10);
+/// Per-request candidates match the bounded response page because each pair
+/// has at most one live ticket. This prevents dense offer sets from creating
+/// a cursor backlog for any candidate slice.
+pub(crate) const FRIEND_RELAY_TICKET_POLL_CANDIDATES_PER_REQUEST: usize = 16;
+pub(crate) const FRIEND_RELAY_TICKET_PARALLEL_POLL_REQUESTS: usize = 8;
+/// Legacy v2 shares its server's 60/min general budget with initiator status
+/// reads, so one responder poll every ten seconds leaves reliable headroom.
+pub(crate) const FRIEND_RELAY_TICKET_LEGACY_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(10);
+/// Eight 16-candidate requests each second cover this many friends in under
+/// the 45-second initiator wait. Larger lists remain usable for ordinary
+/// discovery, but relay-offer discovery is intentionally capped and logged.
+pub(crate) const FRIEND_RELAY_TICKET_SUPPORTED_FRIENDS: usize = 4_096;
+const RELAY_TICKET_READ_NONCE_DOMAIN: &[u8] = b"ember-relay-ticket-read-nonce-v1\0";
+
+pub(crate) fn is_transient_relay_ticket_read_error(error: &str) -> bool {
+    [
+        "status 408",
+        "status 425",
+        "status 429",
+        "status 500",
+        "status 502",
+        "status 503",
+        "status 504",
+    ]
+    .iter()
+    .any(|status| error.contains(status))
+}
+
+pub(crate) fn is_v3_relay_ticket_poll_unsupported(error: &str) -> bool {
+    error == "relay ticket poll v3 unsupported"
+}
 
 fn now_unix_secs() -> i64 {
     std::time::SystemTime::now()
@@ -140,11 +184,48 @@ fn build_relay_ticket_offer_msg(
     m
 }
 
-fn build_relay_ticket_poll_msg(responder_id: &[u8; 32], nonce: &[u8; 16], ts: i64) -> Vec<u8> {
+fn build_relay_ticket_poll_v2_msg(responder_id: &[u8; 32], nonce: &[u8; 16], ts: i64) -> Vec<u8> {
     let mut m = Vec::with_capacity(RDV_DOMAIN.len() + 1 + 32 + 16 + 8);
     m.extend_from_slice(RDV_DOMAIN);
     m.push(OP_RELAY_TICKET_POLL);
     m.extend_from_slice(responder_id);
+    m.extend_from_slice(nonce);
+    m.extend_from_slice(&ts.to_le_bytes());
+    m
+}
+
+fn build_relay_ticket_poll_v3_msg(
+    responder_id: &[u8; 32],
+    friend_candidates: &[[u8; 32]],
+    cursor: Option<&[u8; 32]>,
+    nonce: &[u8; 16],
+    ts: i64,
+) -> Vec<u8> {
+    let mut m = Vec::with_capacity(
+        RDV_DOMAIN.len()
+            + 1
+            + 32
+            + 2
+            + friend_candidates.len() * 32
+            + 1
+            + cursor.map_or(0, |_| 32)
+            + 16
+            + 8,
+    );
+    m.extend_from_slice(RDV_DOMAIN);
+    m.push(OP_RELAY_TICKET_POLL_V3);
+    m.extend_from_slice(responder_id);
+    m.extend_from_slice(&(friend_candidates.len() as u16).to_le_bytes());
+    for candidate in friend_candidates {
+        m.extend_from_slice(candidate);
+    }
+    match cursor {
+        Some(cursor) => {
+            m.push(1);
+            m.extend_from_slice(cursor);
+        }
+        None => m.push(0),
+    }
     m.extend_from_slice(nonce);
     m.extend_from_slice(&ts.to_le_bytes());
     m
@@ -173,6 +254,17 @@ fn random_nonce() -> [u8; 16] {
     nonce
 }
 
+fn stable_relay_ticket_read_nonce(secret: &[u8; 32], scope: &[u8]) -> [u8; 16] {
+    let mut hasher = Sha256::new();
+    hasher.update(RELAY_TICKET_READ_NONCE_DOMAIN);
+    hasher.update(secret);
+    hasher.update(scope);
+    let digest = hasher.finalize();
+    let mut nonce = [0u8; 16];
+    nonce.copy_from_slice(&digest[..16]);
+    nonce
+}
+
 fn valid_ticket_secret(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -187,7 +279,7 @@ fn validate_ticket_response_field(value: &str, field: &str) -> Result<(), String
     }
 }
 
-fn current_timestamp() -> i64 {
+pub(crate) fn current_timestamp() -> i64 {
     now_unix_secs()
 }
 
@@ -595,6 +687,12 @@ pub struct PendingFriendRelayTicket {
     pub initiator_id: String,
 }
 
+/// One bounded, candidate-filtered page of pending ticket offers.
+pub struct FriendRelayTicketPollPage {
+    pub tickets: Vec<PendingFriendRelayTicket>,
+    pub next_cursor: Option<String>,
+}
+
 fn sign_relay_ticket_message(secret: &[u8; 32], message: &[u8]) -> Signature {
     use ed25519_dalek::Signer;
     signing_key_from_secret(secret).sign(message)
@@ -606,6 +704,15 @@ fn ticket_id_raw(ticket_id: &str) -> Result<[u8; 32], String> {
         return Err("invalid rendezvous relay ticket id".to_string());
     }
     Ok(raw)
+}
+
+/// A ticket is binary data encoded as hex. Normalize its textual form before
+/// using it in a signed URL path or carrying it into relay admission, so
+/// uppercase and lowercase spellings cannot diverge from server token
+/// derivation.
+fn canonical_ticket_id(ticket_id: &str) -> Result<String, String> {
+    ticket_id_raw(ticket_id)?;
+    Ok(ticket_id.to_ascii_lowercase())
 }
 
 /// Offer a relay only for the fixed `friend` purpose. The server binds both
@@ -647,7 +754,7 @@ pub async fn offer_friend_relay_ticket(
     let body: serde_json::Value =
         serde_json::from_slice(&read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await?)
             .map_err(|e| format!("relay ticket offer bad body: {e}"))?;
-    let ticket_id = body["ticket_id"].as_str().unwrap_or_default().to_owned();
+    let ticket_id = canonical_ticket_id(body["ticket_id"].as_str().unwrap_or_default())?;
     let initiator_token = body["initiator_token"]
         .as_str()
         .unwrap_or_default()
@@ -662,18 +769,88 @@ pub async fn offer_friend_relay_ticket(
 
 /// Poll tickets addressed to this registered identity. The server never
 /// returns a responder bearer token here; the client must explicitly accept a
-/// known friend's offer first.
+/// known friend's offer first. The network poller owns the one-time v3→v2
+/// mode switch so one unsupported v3 route cannot fan out into parallel v2
+/// requests against an older server.
 pub async fn poll_friend_relay_tickets(
     base_url: &str,
     responder_ember_hash: &[u8; 16],
+    friend_candidates: &[[u8; 16]],
+    cursor: Option<&str>,
+    round_timestamp: i64,
     secret_key: &[u8; 32],
-) -> Result<Vec<PendingFriendRelayTicket>, String> {
+) -> Result<FriendRelayTicketPollPage, String> {
+    require_https(base_url)?;
+    if friend_candidates.len() > FRIEND_RELAY_TICKET_POLL_CANDIDATES_PER_REQUEST {
+        return Err(format!(
+            "too many friend relay ticket candidates (max {})",
+            FRIEND_RELAY_TICKET_POLL_CANDIDATES_PER_REQUEST
+        ));
+    }
+    let responder_id = hashed_id(responder_ember_hash);
+    let responder_raw = sha256_id_raw(responder_ember_hash);
+    let mut candidate_raw: Vec<[u8; 32]> = friend_candidates.iter().map(sha256_id_raw).collect();
+    candidate_raw.sort_unstable();
+    candidate_raw.dedup();
+    let cursor = match cursor {
+        Some(cursor) => Some(canonical_ticket_id(cursor)?),
+        None => None,
+    };
+    let cursor_raw = cursor.as_deref().map(ticket_id_raw).transpose()?;
+    // All pages dispatched in one v3 round share this timestamp. The server
+    // treats same-(identity, nonce, timestamp) pages as concurrent,
+    // idempotent reads, so arrival order cannot reject a candidate slice.
+    let ts = round_timestamp;
+    let mut nonce_scope = Vec::with_capacity(b"poll".len() + responder_raw.len());
+    nonce_scope.extend_from_slice(b"poll-v3");
+    nonce_scope.extend_from_slice(&responder_raw);
+    let nonce = stable_relay_ticket_read_nonce(secret_key, &nonce_scope);
+    let signed = build_relay_ticket_poll_v3_msg(
+        &responder_raw,
+        &candidate_raw,
+        cursor_raw.as_ref(),
+        &nonce,
+        ts,
+    );
+    let sig = sign_relay_ticket_message(secret_key, &signed);
+    let url = format!("{}/v3/relay-tickets/poll", base_url.trim_end_matches('/'));
+    let resp = client(base_url)
+        .await?
+        .post(&url)
+        .json(&serde_json::json!({
+            "responder_id": responder_id,
+            "friend_candidates": candidate_raw.iter().map(hex::encode).collect::<Vec<_>>(),
+            "cursor": cursor,
+            "ts": ts,
+            "nonce": hex::encode(nonce),
+            "sig": hex::encode(sig.to_bytes()),
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("relay ticket poll: {e}"))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err("relay ticket poll v3 unsupported".to_string());
+    }
+    if !resp.status().is_success() {
+        return Err(format!("relay ticket poll: status {}", resp.status()));
+    }
+    parse_friend_relay_ticket_poll_response(resp).await
+}
+
+pub(crate) async fn poll_friend_relay_tickets_v2_compat(
+    base_url: &str,
+    responder_ember_hash: &[u8; 16],
+    secret_key: &[u8; 32],
+) -> Result<FriendRelayTicketPollPage, String> {
     require_https(base_url)?;
     let responder_id = hashed_id(responder_ember_hash);
     let responder_raw = sha256_id_raw(responder_ember_hash);
     let ts = current_timestamp();
+    // Older servers expect each v2 request to have a distinct signed nonce.
+    // Reusing the v3 stable nonce across parallel fallback attempts produces
+    // duplicate signed payloads and conflicts in their replay cache.
     let nonce = random_nonce();
-    let signed = build_relay_ticket_poll_msg(&responder_raw, &nonce, ts);
+    let signed = build_relay_ticket_poll_v2_msg(&responder_raw, &nonce, ts);
     let sig = sign_relay_ticket_message(secret_key, &signed);
     let url = format!("{}/v2/relay-tickets/poll", base_url.trim_end_matches('/'));
     let resp = client(base_url)
@@ -687,10 +864,19 @@ pub async fn poll_friend_relay_tickets(
         }))
         .send()
         .await
-        .map_err(|e| format!("relay ticket poll: {e}"))?;
+        .map_err(|e| format!("relay ticket v2 fallback poll: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("relay ticket poll: status {}", resp.status()));
+        return Err(format!(
+            "relay ticket v2 fallback poll: status {}",
+            resp.status()
+        ));
     }
+    parse_friend_relay_ticket_poll_response(resp).await
+}
+
+async fn parse_friend_relay_ticket_poll_response(
+    resp: reqwest::Response,
+) -> Result<FriendRelayTicketPollPage, String> {
     let body: serde_json::Value =
         serde_json::from_slice(&read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await?)
             .map_err(|e| format!("relay ticket poll bad body: {e}"))?;
@@ -705,14 +891,21 @@ pub async fn poll_friend_relay_tickets(
         if purpose != "friend" {
             continue;
         }
-        validate_ticket_response_field(ticket_id, "ticket_id")?;
+        let ticket_id = canonical_ticket_id(ticket_id)?;
         validate_ticket_response_field(initiator_id, "initiator_id")?;
         results.push(PendingFriendRelayTicket {
-            ticket_id: ticket_id.to_owned(),
+            ticket_id,
             initiator_id: initiator_id.to_owned(),
         });
     }
-    Ok(results)
+    let next_cursor = match body["next_cursor"].as_str() {
+        Some(cursor) => Some(canonical_ticket_id(cursor)?),
+        None => None,
+    };
+    Ok(FriendRelayTicketPollPage {
+        tickets: results,
+        next_cursor,
+    })
 }
 
 /// Accept a ticket after the caller has verified its initiator is a known
@@ -726,7 +919,8 @@ pub async fn accept_friend_relay_ticket(
     require_https(base_url)?;
     let identity_id = hashed_id(responder_ember_hash);
     let identity_raw = sha256_id_raw(responder_ember_hash);
-    let ticket_raw = ticket_id_raw(ticket_id)?;
+    let ticket_id = canonical_ticket_id(ticket_id)?;
+    let ticket_raw = ticket_id_raw(&ticket_id)?;
     let ts = current_timestamp();
     let nonce = random_nonce();
     let signed = build_relay_ticket_action_msg(
@@ -778,9 +972,13 @@ pub async fn friend_relay_ticket_accepted(
     require_https(base_url)?;
     let identity_id = hashed_id(initiator_ember_hash);
     let identity_raw = sha256_id_raw(initiator_ember_hash);
-    let ticket_raw = ticket_id_raw(ticket_id)?;
+    let ticket_id = canonical_ticket_id(ticket_id)?;
+    let ticket_raw = ticket_id_raw(&ticket_id)?;
     let ts = current_timestamp();
-    let nonce = random_nonce();
+    let mut nonce_scope = Vec::with_capacity(b"status".len() + ticket_raw.len());
+    nonce_scope.extend_from_slice(b"status");
+    nonce_scope.extend_from_slice(&ticket_raw);
+    let nonce = stable_relay_ticket_read_nonce(secret_key, &nonce_scope);
     let signed = build_relay_ticket_action_msg(
         OP_RELAY_TICKET_STATUS,
         &identity_raw,
@@ -815,5 +1013,97 @@ pub async fn friend_relay_ticket_accepted(
         Some("accepted") => Ok(true),
         Some("offered") => Ok(false),
         _ => Err("relay ticket status response is invalid".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod relay_ticket_tests {
+    use super::*;
+
+    #[test]
+    fn relay_ticket_operation_codes_are_stable() {
+        assert_eq!(OP_RELAY_TICKET_OFFER, 0x07);
+        assert_eq!(OP_RELAY_TICKET_POLL, 0x08);
+        assert_eq!(OP_RELAY_TICKET_ACCEPT, 0x09);
+        assert_eq!(OP_RELAY_TICKET_STATUS, 0x0a);
+        assert_eq!(OP_RELAY_TICKET_POLL_V3, 0x0b);
+    }
+
+    #[test]
+    fn responder_poll_has_multiple_attempts_inside_initiator_wait() {
+        assert!(
+            FRIEND_RELAY_TICKET_RESPONDER_POLL_INTERVAL + FRIEND_RELAY_TICKET_POLL_TIMEOUT
+                < FRIEND_RELAY_TICKET_INITIATOR_WAIT
+        );
+        let pages = FRIEND_RELAY_TICKET_SUPPORTED_FRIENDS
+            .div_ceil(FRIEND_RELAY_TICKET_POLL_CANDIDATES_PER_REQUEST);
+        let rounds = pages.div_ceil(FRIEND_RELAY_TICKET_PARALLEL_POLL_REQUESTS);
+        assert!(
+            FRIEND_RELAY_TICKET_RESPONDER_POLL_INTERVAL.max(FRIEND_RELAY_TICKET_POLL_TIMEOUT)
+                * (rounds as u32)
+                < FRIEND_RELAY_TICKET_INITIATOR_WAIT
+        );
+    }
+
+    #[test]
+    fn canonical_ticket_ids_have_one_textual_form() {
+        let lower = "ab".repeat(32);
+        let upper = lower.to_ascii_uppercase();
+        assert_eq!(canonical_ticket_id(&upper).unwrap(), lower);
+        assert!(canonical_ticket_id("not-a-ticket").is_err());
+    }
+
+    #[test]
+    fn ticket_read_nonces_are_stable_and_scope_bound() {
+        let secret = [7u8; 32];
+        let poll = stable_relay_ticket_read_nonce(&secret, b"poll-scope");
+        assert_eq!(poll, stable_relay_ticket_read_nonce(&secret, b"poll-scope"));
+        assert_ne!(
+            poll,
+            stable_relay_ticket_read_nonce(&secret, b"status-scope")
+        );
+    }
+
+    #[test]
+    fn poll_v3_signature_binds_candidates_and_cursor() {
+        let responder = [1u8; 32];
+        let candidates = [[2u8; 32], [3u8; 32]];
+        let nonce = [4u8; 16];
+        let first = build_relay_ticket_poll_v3_msg(&responder, &candidates, None, &nonce, 5);
+        let paged =
+            build_relay_ticket_poll_v3_msg(&responder, &candidates, Some(&[6u8; 32]), &nonce, 5);
+        let filtered = build_relay_ticket_poll_v3_msg(&responder, &[[2u8; 32]], None, &nonce, 5);
+        assert_ne!(first, paged);
+        assert_ne!(first, filtered);
+        assert_ne!(first, build_relay_ticket_poll_v2_msg(&responder, &nonce, 5));
+    }
+
+    #[test]
+    fn transient_ticket_read_statuses_are_retryable() {
+        assert!(is_transient_relay_ticket_read_error(
+            "relay ticket status: status 429 Too Many Requests"
+        ));
+        assert!(is_transient_relay_ticket_read_error(
+            "relay ticket poll: status 503 Service Unavailable"
+        ));
+        assert!(!is_transient_relay_ticket_read_error(
+            "relay ticket status: status 403 Forbidden"
+        ));
+    }
+
+    #[test]
+    fn legacy_fallback_is_explicit_and_rate_safe() {
+        assert!(is_v3_relay_ticket_poll_unsupported(
+            "relay ticket poll v3 unsupported"
+        ));
+        assert!(!is_v3_relay_ticket_poll_unsupported(
+            "relay ticket poll: status 403 Forbidden"
+        ));
+        let legacy_polls = FRIEND_RELAY_TICKET_INITIATOR_WAIT
+            .as_secs()
+            .div_ceil(FRIEND_RELAY_TICKET_LEGACY_POLL_INTERVAL.as_secs());
+        // Old servers have a shared 60/min budget; status checks account for
+        // at most one per second of the 45-second initiator wait.
+        assert!(legacy_polls + FRIEND_RELAY_TICKET_INITIATOR_WAIT.as_secs() < 60);
     }
 }

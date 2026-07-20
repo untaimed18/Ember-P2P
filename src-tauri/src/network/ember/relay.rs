@@ -1043,18 +1043,16 @@ pub async fn run_quic_accept_loop(
                     return;
                 }
 
-                let verified = match parse_and_verify_relay_request_v2(peer_session_id, &payload_buf)
-                {
-                    Ok(req) => req,
-                    Err(reason) => {
-                        debug!(
-                            "QUIC accept: refusing relay request from {remote}: {reason}"
-                        );
-                        let reject = build_relay_reject(peer_session_id, REJECT_BAD_SIGNATURE);
-                        let _ = init_send.write_all(&reject).await;
-                        return;
-                    }
-                };
+                let verified =
+                    match parse_and_verify_relay_request_v2(peer_session_id, &payload_buf) {
+                        Ok(req) => req,
+                        Err(reason) => {
+                            debug!("QUIC accept: refusing relay request from {remote}: {reason}");
+                            let reject = build_relay_reject(peer_session_id, REJECT_BAD_SIGNATURE);
+                            let _ = init_send.write_all(&reject).await;
+                            return;
+                        }
+                    };
 
                 // Refuse to relay to non-public destinations (SSRF/scan guard).
                 if verified.target_port == 0 || !is_public_relay_target(verified.target_ip) {
@@ -1077,8 +1075,7 @@ pub async fn run_quic_accept_loop(
                         let _ = init_send.write_all(&reject).await;
                         return;
                     }
-                    if !mgr_lock
-                        .consume_request_nonce(&verified.requester_pubkey, &verified.nonce)
+                    if !mgr_lock.consume_request_nonce(&verified.requester_pubkey, &verified.nonce)
                     {
                         debug!(
                             "QUIC accept: refusing relay request from {remote}: replayed or cache-full nonce"
@@ -1316,6 +1313,11 @@ fn validate_server_relay_ticket_id(ticket_id: &str) -> Result<(), String> {
     }
 }
 
+fn canonical_server_relay_ticket_id(ticket_id: &str) -> Result<String, String> {
+    validate_server_relay_ticket_id(ticket_id)?;
+    Ok(ticket_id.to_ascii_lowercase())
+}
+
 /// Connect to the rendezvous server's WebSocket relay endpoint.
 /// Returns a WsStream that implements AsyncRead + AsyncWrite.
 pub async fn connect_server_relay(
@@ -1323,7 +1325,7 @@ pub async fn connect_server_relay(
     ticket_id: &str,
     role_token: &str,
 ) -> Result<WsStream, String> {
-    validate_server_relay_ticket_id(ticket_id)?;
+    let ticket_id = canonical_server_relay_ticket_id(ticket_id)?;
     if role_token.len() != 64 || !role_token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err("invalid server-relay role token".to_string());
     }
@@ -1507,6 +1509,16 @@ mod tests {
         let nonce = [6u8; 16];
         assert!(mgr.consume_request_nonce(&pk, &nonce));
         assert!(!mgr.consume_request_nonce(&pk, &nonce));
+    }
+
+    #[test]
+    fn server_relay_ticket_path_is_canonicalized() {
+        let lower = "ab".repeat(32);
+        assert_eq!(
+            canonical_server_relay_ticket_id(&lower.to_ascii_uppercase()).unwrap(),
+            lower
+        );
+        assert!(canonical_server_relay_ticket_id("invalid").is_err());
     }
 
     #[test]

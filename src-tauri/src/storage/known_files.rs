@@ -603,8 +603,7 @@ impl KnownFileList {
             existing.last_publish_src = record.last_publish_src;
             existing.last_shared = record.last_shared;
             if existing.file_path.is_empty()
-                || normalize_path_key(&existing.file_path)
-                    == normalize_path_key(&record.file_path)
+                || normalize_path_key(&existing.file_path) == normalize_path_key(&record.file_path)
             {
                 existing.file_name = record.file_name;
                 existing.file_size = record.file_size;
@@ -618,12 +617,7 @@ impl KnownFileList {
     }
 
     /// Increment all-time request/accept counters (eMule-style per-file upload interest).
-    pub fn bump_share_interest(
-        &mut self,
-        hash: &[u8; 16],
-        requested: u32,
-        accepted: u32,
-    ) -> bool {
+    pub fn bump_share_interest(&mut self, hash: &[u8; 16], requested: u32, accepted: u32) -> bool {
         if requested == 0 && accepted == 0 {
             return true;
         }
@@ -1347,18 +1341,10 @@ mod tests {
         kf.add_or_update(second);
 
         assert!(kf
-            .find_by_path_and_meta(
-                "C:/Library/movie.mkv",
-                1024 * 1024,
-                1_700_000_000
-            )
+            .find_by_path_and_meta("C:/Library/movie.mkv", 1024 * 1024, 1_700_000_000)
             .is_some());
         assert!(kf
-            .find_by_path_and_meta(
-                "C:/Library/renamed-copy.mkv",
-                1024 * 1024,
-                1_700_000_123
-            )
+            .find_by_path_and_meta("C:/Library/renamed-copy.mkv", 1024 * 1024, 1_700_000_123)
             .is_some());
         assert!(!kf.record_needs_refresh(
             &hash,

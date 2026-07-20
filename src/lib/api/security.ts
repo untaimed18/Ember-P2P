@@ -18,6 +18,13 @@ export interface IpFilterStats {
   entries: IpFilterEntry[];
 }
 
+export type IpFilterApplyOutcome = 'applied' | 'deferred' | 'failed';
+
+export interface IpFilterApplyResult {
+  outcome: IpFilterApplyOutcome;
+  entryCount: number;
+}
+
 export async function getIpFilterStats(): Promise<IpFilterStats> {
   return invoke('get_ip_filter_stats');
 }
@@ -42,7 +49,7 @@ export async function setBlockPrivateIps(blockPrivate: boolean): Promise<void> {
   return invoke('set_block_private_ips', { blockPrivate });
 }
 
-export async function downloadAndLoadIpfilter(): Promise<string> {
+export async function downloadAndLoadIpfilter(): Promise<IpFilterApplyResult> {
   return invoke('download_and_load_ipfilter');
 }
 
@@ -56,14 +63,14 @@ export async function downloadAndLoadIpfilter(): Promise<string> {
  * pinned), caps the response at 50 MiB, auto-extracts zip archives,
  * atomically writes to `ipfilter.dat`, and re-enables the filter.
  *
- * Returns a human-readable success summary; throws with a concrete
- * error message on failure so the UI can surface it verbatim.
+ * Returns a structured live-apply outcome; errors are reserved for download,
+ * validation, and persistence failures.
  */
-export async function updateIpfilterFromUrl(url: string): Promise<string> {
+export async function updateIpfilterFromUrl(url: string): Promise<IpFilterApplyResult> {
   return invoke('update_ipfilter_from_url', { url });
 }
 
-export async function importIpfilterFile(filePath: string): Promise<string> {
+export async function importIpfilterFile(filePath: string): Promise<IpFilterApplyResult> {
   return invoke('import_ipfilter_file', { filePath });
 }
 

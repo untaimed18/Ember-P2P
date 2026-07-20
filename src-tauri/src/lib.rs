@@ -390,6 +390,7 @@ pub fn run() {
                 background_scans: Arc::new(RwLock::new(std::collections::HashMap::new())),
                 background_scan_seq: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 quit_confirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                pending_close_request: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 close_behavior: Arc::new(parking_lot::RwLock::new(
                     settings.close_to_tray_behavior.clone(),
                 )),
@@ -744,33 +745,37 @@ pub fn run() {
                                 let cfg = state.config.read().await;
                                 commands::sharing::file_in_shared_folders(&updated.path, &cfg.settings.shared_folders)
                             };
-                            // Hand the part hashes already computed above off to
-                            // the network task's `SharedFilesChanged` handler so
-                            // it doesn't re-read this file from disk just to
-                            // recompute the same values for known.met. Skipped
-                            // for single-part files (empty list) and files no
-                            // longer shared (nothing will ever drain them).
-                            if still_shared && !part_hashes.is_empty() {
-                                if let Ok(hash_bytes) = hex::decode(&updated.hash) {
-                                    if hash_bytes.len() == 16 {
-                                        let mut fh = [0u8; 16];
-                                        fh.copy_from_slice(&hash_bytes);
-                                        startup_fresh_part_hashes.write().await.insert(fh, part_hashes);
-                                    }
-                                }
-                            }
-                            {
+                            // Keep the combined-pass handoff only after the
+                            // completed row is committed. A cancellation can
+                            // remove the pending row after hashing, leaving no
+                            // reconciliation path to drain an early insert.
+                            let fresh_handoff = still_shared
+                                .then(|| {
+                                    commands::sharing::fresh_part_hash_handoff(
+                                        &updated.hash,
+                                        part_hashes,
+                                    )
+                                })
+                                .flatten();
+                            let finalized = {
                                 let mut idx = index_clone.write().await;
                                 if !cancel_flag.load(std::sync::atomic::Ordering::Relaxed) && still_shared {
                                     // Keep any explicit share/priority choice
                                     // made while this row was pending. A
                                     // removed pending row must not return just
                                     // because its hash computation finished.
-                                    let _ = idx.finalize_pending_hash(&file_temp_id, updated.clone());
+                                    idx.finalize_pending_hash(&file_temp_id, updated.clone()).is_some()
                                 } else {
                                     idx.remove_file_by_id(&file_temp_id);
+                                    false
                                 }
-                            }
+                            };
+                            commands::sharing::cache_fresh_part_hash_handoff(
+                                &startup_fresh_part_hashes,
+                                finalized,
+                                fresh_handoff,
+                            )
+                            .await;
                             if !cancel_flag.load(std::sync::atomic::Ordering::Relaxed) && still_shared {
                                 hashed += 1;
                             }
@@ -1060,6 +1065,7 @@ pub fn run() {
             commands::settings::hide_to_tray,
             commands::settings::quit_app,
             commands::settings::set_close_behavior,
+            commands::settings::take_pending_close_request,
             commands::settings::open_ember_website,
             commands::security::get_ip_filter_stats,
             commands::security::add_ip_filter_range,
@@ -1152,6 +1158,12 @@ pub fn run() {
                     // re-issues either `hide_to_tray` or `quit_app` to
                     // continue down one of the other branches above.
                     api.prevent_close();
+                    // The frontend listener is registered asynchronously
+                    // during startup. Record the request first so it can be
+                    // consumed after registration if this emit is missed.
+                    state
+                        .pending_close_request
+                        .store(true, std::sync::atomic::Ordering::Release);
                     if let Err(e) = app_handle.emit("close-requested", ()) {
                         tracing::warn!(
                             "Failed to emit close-requested event; falling back to exit: {e}"

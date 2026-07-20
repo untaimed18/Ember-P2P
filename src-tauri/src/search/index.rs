@@ -248,6 +248,27 @@ impl LocalIndex {
         self.rebuild_indices();
     }
 
+    /// Remove indexed rows that are no longer covered by any active shared
+    /// root, returning every removed row (including pending/unhashed rows).
+    /// Used by whole-settings root topology changes where replacing a parent
+    /// with one of its children must retain the child's existing entries.
+    pub fn remove_files_outside_folders(&mut self, folders: &[String]) -> Vec<FileInfo> {
+        let mut removed = Vec::new();
+        self.files.retain(|file| {
+            let keep = folders
+                .iter()
+                .any(|folder| crate::security::path_matches_dir(&file.path, folder));
+            if !keep {
+                removed.push(file.clone());
+            }
+            keep
+        });
+        if !removed.is_empty() {
+            self.rebuild_indices();
+        }
+        removed
+    }
+
     /// Remove all files that still have a "pending:..." temp id (unhashed).
     pub fn remove_pending_files(&mut self) {
         let before = self.files.len();
@@ -418,8 +439,7 @@ impl LocalIndex {
                 if let Some(file) = self.files.get_mut(idx) {
                     file.bytes_transferred = file.bytes_transferred.saturating_add(bytes);
                     if persist_alltime {
-                        file.alltime_transferred =
-                            file.alltime_transferred.saturating_add(bytes);
+                        file.alltime_transferred = file.alltime_transferred.saturating_add(bytes);
                     }
                 }
             }
@@ -435,7 +455,10 @@ impl LocalIndex {
     /// selected duplicate updates several physical copies.
     pub fn set_file_priority_by_path_count(&mut self, path: &str, priority: &str) -> usize {
         let key = normalize_path_key(path);
-        let Some(selected) = self.files.iter().find(|file| normalize_path_key(&file.path) == key)
+        let Some(selected) = self
+            .files
+            .iter()
+            .find(|file| normalize_path_key(&file.path) == key)
         else {
             return 0;
         };
@@ -475,8 +498,7 @@ impl LocalIndex {
             .files
             .iter()
             .filter(|file| {
-                file.hash.is_empty()
-                    && crate::security::path_matches_dir(&file.path, folder)
+                file.hash.is_empty() && crate::security::path_matches_dir(&file.path, folder)
             })
             .map(|file| normalize_path_key(&file.path))
             .collect();
@@ -540,7 +562,10 @@ impl LocalIndex {
 
     pub fn set_file_shared_by_path(&mut self, path: &str, shared: bool) -> ShareMutation {
         let key = normalize_path_key(path);
-        let Some(selected) = self.files.iter().find(|file| normalize_path_key(&file.path) == key)
+        let Some(selected) = self
+            .files
+            .iter()
+            .find(|file| normalize_path_key(&file.path) == key)
         else {
             return ShareMutation::default();
         };
@@ -576,8 +601,7 @@ impl LocalIndex {
             .files
             .iter()
             .filter(|file| {
-                file.hash.is_empty()
-                    && crate::security::path_matches_dir(&file.path, prefix)
+                file.hash.is_empty() && crate::security::path_matches_dir(&file.path, prefix)
             })
             .map(|file| normalize_path_key(&file.path))
             .collect();
@@ -618,9 +642,7 @@ impl LocalIndex {
         let pending_paths: HashSet<String> = self
             .files
             .iter()
-            .filter(|file| {
-                file.hash.is_empty() && keys.contains(&normalize_path_key(&file.path))
-            })
+            .filter(|file| file.hash.is_empty() && keys.contains(&normalize_path_key(&file.path)))
             .map(|file| normalize_path_key(&file.path))
             .collect();
         let mut mutation = ShareMutation::default();
@@ -872,8 +894,18 @@ mod local_index_tests {
     fn path_share_change_is_hash_wide() {
         let mut index = LocalIndex::new();
         index.add_files(vec![
-            file("A/copy.bin", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", true, "normal"),
-            file("B/copy.bin", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", true, "normal"),
+            file(
+                "A/copy.bin",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                true,
+                "normal",
+            ),
+            file(
+                "B/copy.bin",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                true,
+                "normal",
+            ),
         ]);
 
         let mutation = index.set_file_shared_by_path("A/copy.bin", false);
@@ -888,11 +920,24 @@ mod local_index_tests {
     fn path_priority_change_is_hash_wide() {
         let mut index = LocalIndex::new();
         index.add_files(vec![
-            file("A/copy.bin", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", true, "normal"),
-            file("B/copy.bin", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", true, "normal"),
+            file(
+                "A/copy.bin",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                true,
+                "normal",
+            ),
+            file(
+                "B/copy.bin",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                true,
+                "normal",
+            ),
         ]);
 
-        assert_eq!(index.set_file_priority_by_path_count("A/copy.bin", "high"), 2);
+        assert_eq!(
+            index.set_file_priority_by_path_count("A/copy.bin", "high"),
+            2
+        );
         assert_eq!(index.get_by_path("A/copy.bin").unwrap().priority, "high");
         assert_eq!(index.get_by_path("B/copy.bin").unwrap().priority, "high");
     }
@@ -937,5 +982,31 @@ mod local_index_tests {
         assert!(index.get_by_path("A/pending.bin").is_some());
         assert!(!index.get_by_path("A/pending.bin").unwrap().shared);
         assert_eq!(index.get_by_path("A/pending.bin").unwrap().priority, "high");
+    }
+
+    #[test]
+    fn active_child_root_keeps_child_and_reports_pending_removal() {
+        let mut index = LocalIndex::new();
+        index.add_files(vec![
+            file(
+                "/library/parent/child/kept.bin",
+                "dddddddddddddddddddddddddddddddd",
+                true,
+                "normal",
+            ),
+            file("/library/parent/other/pending.bin", "", true, "normal"),
+        ]);
+        let active_roots = vec!["/library/parent/child".to_string()];
+
+        let removed = index.remove_files_outside_folders(&active_roots);
+
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].path, "/library/parent/other/pending.bin");
+        assert!(index
+            .get_by_path("/library/parent/child/kept.bin")
+            .is_some());
+        assert!(index
+            .get_by_path("/library/parent/other/pending.bin")
+            .is_none());
     }
 }

@@ -1,4 +1,4 @@
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tracing::{info, warn};
 
 use crate::app_state::AppState;
@@ -12,11 +12,52 @@ const NODES_DAT_URL: &str = "https://upd.emule-security.org/nodes.dat";
 const IPFILTER_URL: &str = "https://upd.emule-security.org/ipfilter.dat";
 
 #[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettingsUpdateOutcome {
+    Applied,
+    RestartRequired,
+    Deferred,
+}
+
+#[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateSettingsResult {
-    pub message: String,
+    pub outcome: SettingsUpdateOutcome,
     pub settings: AppSettings,
-    pub live_apply_queued: bool,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveApplyOutcome {
+    Applied,
+    Deferred,
+    Failed,
+}
+
+fn ip_filter_outcome_from_ack(ack: Option<Result<(), String>>) -> LiveApplyOutcome {
+    match ack {
+        Some(Ok(())) => LiveApplyOutcome::Applied,
+        Some(Err(_)) => LiveApplyOutcome::Failed,
+        None => LiveApplyOutcome::Deferred,
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodesDatDownloadResult {
+    pub outcome: LiveApplyOutcome,
+    pub parsed_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied_count: Option<usize>,
+    pub byte_count: usize,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IpFilterDownloadResult {
+    pub outcome: LiveApplyOutcome,
+    pub entry_count: usize,
+    pub byte_count: usize,
 }
 
 fn normalized_path_components(path: &std::path::Path) -> Vec<String> {
@@ -88,9 +129,7 @@ fn normalize_shared_folders(folders: Vec<String>) -> Result<Vec<String>, String>
         let canonical = match configured.canonicalize() {
             Ok(path) => path,
             Err(e) => {
-                warn!(
-                    "Shared folder cannot be resolved (keeping configured path): {folder} ({e})"
-                );
+                warn!("Shared folder cannot be resolved (keeping configured path): {folder} ({e})");
                 configured
             }
         };
@@ -117,6 +156,67 @@ fn normalize_shared_folders(folders: Vec<String>) -> Result<Vec<String>, String>
         .into_iter()
         .map(|path| path.to_string_lossy().into_owned())
         .collect())
+}
+
+fn shared_folder_paths_equal(a: &str, b: &str) -> bool {
+    crate::search::index::normalize_path_key(a).trim_end_matches(|c| c == '/' || c == '\\')
+        == crate::search::index::normalize_path_key(b).trim_end_matches(|c| c == '/' || c == '\\')
+}
+
+fn shared_folder_changes(
+    old_folders: &[String],
+    new_folders: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let removed = old_folders
+        .iter()
+        .filter(|old| {
+            !new_folders
+                .iter()
+                .any(|new| shared_folder_paths_equal(old, new))
+        })
+        .cloned()
+        .collect();
+    let added = new_folders
+        .iter()
+        .filter(|new| {
+            !old_folders
+                .iter()
+                .any(|old| shared_folder_paths_equal(old, new))
+        })
+        .cloned()
+        .collect();
+    (removed, added)
+}
+
+fn prune_removed_shared_folder_state(
+    settings: &mut AppSettings,
+    removed_folders: &[String],
+    active_folders: &[String],
+) {
+    if removed_folders.is_empty() {
+        return;
+    }
+    let is_under_removed_root = |path: &str| {
+        removed_folders.iter().any(|root| {
+            crate::security::path_matches_dir(path, root)
+                && !active_folders
+                    .iter()
+                    .any(|active| crate::security::path_matches_dir(path, active))
+        })
+    };
+
+    settings
+        .folder_priorities
+        .retain(|folder, _| !is_under_removed_root(folder));
+    settings
+        .pending_share_states
+        .retain(|path, _| !is_under_removed_root(path));
+    settings
+        .pending_file_priorities
+        .retain(|path, _| !is_under_removed_root(path));
+    settings
+        .shared_folder_scan_cursors
+        .retain(|folder, _| !is_under_removed_root(folder));
 }
 
 #[tauri::command]
@@ -685,6 +785,18 @@ pub async fn update_settings(
             "Settings changed in another window or command; reload and apply your changes again",
         ));
     }
+    let (removed_shared_folders, added_shared_folders) =
+        shared_folder_changes(&old_settings.shared_folders, &settings.shared_folders);
+    // Per-folder defaults, pending file intents, and page cursors have no
+    // meaning after their root is removed. Prune them in the same durable
+    // settings transaction as the root update so they cannot be restored by a
+    // later re-add of an unrelated path.
+    let active_shared_folders = settings.shared_folders.clone();
+    prune_removed_shared_folder_state(
+        &mut settings,
+        &removed_shared_folders,
+        &active_shared_folders,
+    );
     settings.settings_revision = old_settings.settings_revision.saturating_add(1);
 
     let port_changed =
@@ -738,59 +850,53 @@ pub async fn update_settings(
         super::transfers::start_promoted_downloads(&state, &promoted).await;
     }
 
-    {
-        let mut live = state.upload_shared_folders.write().await;
-        *live = settings.shared_folders.clone();
-    }
-
-    // Keep the shared-folder filesystem watcher in sync. The dedicated
-    // add/remove-folder commands do this, but the generic settings save can
-    // also change `shared_folders`, and without re-syncing the watcher would
-    // keep monitoring the old set (missing auto-detection of files in newly
-    // added folders, and needlessly watching removed ones).
-    if let Some(watcher) = state.shared_folder_watcher.as_ref() {
-        watcher.sync_paths(&settings.shared_folders);
-    }
-    {
-        let config = state.config.read().await;
-        crate::commands::sharing::sync_asset_protocol_scope(&app, &config);
-    }
-
-    // Settings are already persisted to disk above; if the runtime update
-    // cannot be queued, report partial success instead of silently leaving the
-    // live network task on old values until restart.
-    if let Err(e) = state.network_tx.try_send(NetworkCommand::UpdateSettings {
+    // Queue the loop-owned runtime settings before releasing the transaction
+    // lock, preserving commit order with a concurrent settings save. Root
+    // reconciliation below may wait for a scan that persists cursors under
+    // this same lock, so it must run only after the durable transaction ends.
+    let runtime_update_deferred = match state.network_tx.try_send(NetworkCommand::UpdateSettings {
         settings: settings.clone(),
     }) {
-        tracing::warn!(
-            "Settings saved to disk, but live network update was dropped (channel full): {e}"
-        );
+        Ok(()) => false,
+        Err(e) => {
+            tracing::warn!(
+                "Settings saved to disk, but live network update was dropped (channel full): {e}"
+            );
+            true
+        }
+    };
+    drop(_settings_save_guard);
+
+    if !removed_shared_folders.is_empty() || !added_shared_folders.is_empty() {
+        crate::commands::sharing::reconcile_shared_folder_roots(
+            &app,
+            &state,
+            &removed_shared_folders,
+            &added_shared_folders,
+        )
+        .await;
+    }
+
+    if runtime_update_deferred {
         return Ok(UpdateSettingsResult {
-            message: format!(
-                "Settings were saved, but the live network update was deferred: {e}. Restart or retry to apply them now."
-            ),
+            outcome: SettingsUpdateOutcome::Deferred,
             settings,
-            live_apply_queued: false,
         });
     }
 
-    let message = if port_changed {
-        "Settings saved. Port changes require an application restart to take effect.".into()
+    let outcome = if port_changed {
+        SettingsUpdateOutcome::RestartRequired
     } else {
-        "Settings saved.".into()
+        SettingsUpdateOutcome::Applied
     };
-    Ok(UpdateSettingsResult {
-        message,
-        settings,
-        live_apply_queued: true,
-    })
+    Ok(UpdateSettingsResult { outcome, settings })
 }
 
 #[tauri::command]
 pub async fn download_nodes_dat(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
-) -> Result<String, String> {
+) -> Result<NodesDatDownloadResult, String> {
     info!("Downloading nodes.dat from {NODES_DAT_URL}");
 
     const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
@@ -899,7 +1005,7 @@ pub async fn download_nodes_dat(
         })?;
     }
 
-    let contact_count = contacts.len();
+    let parsed_count = contacts.len();
     let byte_count = bytes.len();
 
     // Inject contacts into the running network. The file is already
@@ -908,31 +1014,61 @@ pub async fn download_nodes_dat(
     // on the next launch (or as soon as the network drains the queue
     // and we manually re-trigger). Mirrors the "saved but not applied
     // live" message style used by `update_settings`.
-    let live_msg = match state
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    let (outcome, applied_count) = match state
         .network_tx
-        .try_send(NetworkCommand::BootstrapContacts { contacts })
+        .try_send(NetworkCommand::BootstrapContacts { contacts, tx })
     {
-        Ok(()) => "bootstrapping now",
+        Ok(()) => match tokio::time::timeout(std::time::Duration::from_secs(5), &mut rx).await {
+            Ok(Ok(count)) => (LiveApplyOutcome::Applied, Some(count)),
+            Ok(Err(_)) => {
+                tracing::warn!(
+                    "nodes.dat was saved, but the network task did not confirm live contact injection"
+                );
+                (LiveApplyOutcome::Deferred, None)
+            }
+            Err(_) => {
+                tracing::warn!("nodes.dat was saved, but live contact injection is still pending");
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let Ok(applied_count) = rx.await else {
+                        return;
+                    };
+                    let _ = app.emit(
+                        "nodes-bootstrap-result",
+                        serde_json::json!({
+                            "outcome": "applied",
+                            "parsed_count": parsed_count,
+                            "applied_count": applied_count,
+                            "byte_count": byte_count,
+                        }),
+                    );
+                });
+                (LiveApplyOutcome::Deferred, None)
+            }
+        },
         Err(e) => {
             tracing::warn!(
                 "nodes.dat saved to disk, but live bootstrap injection was dropped (channel full): {e}"
             );
-            "will bootstrap on next launch"
+            (LiveApplyOutcome::Deferred, None)
         }
     };
 
-    let msg = format!(
-        "Downloaded and loaded {contact_count} contacts ({byte_count} bytes) — {live_msg}",
-    );
-    info!("{msg}");
-    Ok(msg)
+    info!("Downloaded nodes.dat with {parsed_count} contacts ({byte_count} bytes)");
+    Ok(NodesDatDownloadResult {
+        outcome,
+        parsed_count,
+        applied_count,
+        byte_count,
+    })
 }
 
 #[tauri::command]
 pub async fn download_ipfilter(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
-) -> Result<String, String> {
+) -> Result<IpFilterDownloadResult, String> {
     info!("Downloading ipfilter.dat from {IPFILTER_URL}");
 
     const MAX_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
@@ -1024,22 +1160,56 @@ pub async fn download_ipfilter(
 
     let byte_count = bytes.len();
 
-    let reload_ok = state
-        .network_tx
-        .try_send(NetworkCommand::ReloadIpFilter { path: filter_path })
-        .is_ok();
-
-    let msg = if reload_ok {
-        format!(
-            "Downloaded ipfilter.dat ({byte_count} bytes, {entry_count} entries) — reloading filter now"
-        )
-    } else {
-        format!(
-            "Downloaded ipfilter.dat ({byte_count} bytes, {entry_count} entries) — network busy, filter will load on restart"
-        )
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    let outcome = match state.network_tx.try_send(NetworkCommand::ReloadIpFilter {
+        path: filter_path,
+        tx: Some(tx),
+    }) {
+        Ok(()) => match tokio::time::timeout(std::time::Duration::from_secs(5), &mut rx).await {
+            Ok(Ok(ack)) => {
+                if let Err(error) = &ack {
+                    tracing::warn!("ipfilter.dat was saved, but live reload failed: {error}");
+                }
+                ip_filter_outcome_from_ack(Some(ack))
+            }
+            Ok(Err(_)) => {
+                tracing::warn!(
+                    "ipfilter.dat was saved, but the network task did not confirm live reload"
+                );
+                ip_filter_outcome_from_ack(None)
+            }
+            Err(_) => {
+                tracing::warn!("ipfilter.dat was saved, but live reload is still pending");
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let outcome = match rx.await {
+                        Ok(Ok(())) => "applied",
+                        Ok(Err(_)) => "failed",
+                        Err(_) => return,
+                    };
+                    let _ = app.emit(
+                        "ipfilter-reload-result",
+                        serde_json::json!({
+                            "outcome": outcome,
+                            "entry_count": entry_count,
+                            "byte_count": byte_count,
+                        }),
+                    );
+                });
+                ip_filter_outcome_from_ack(None)
+            }
+        },
+        Err(error) => {
+            tracing::warn!("ipfilter.dat was saved, but live reload was not queued: {error}");
+            ip_filter_outcome_from_ack(None)
+        }
     };
-    info!("{msg}");
-    Ok(msg)
+    info!("Downloaded ipfilter.dat ({byte_count} bytes, {entry_count} entries)");
+    Ok(IpFilterDownloadResult {
+        outcome,
+        entry_count,
+        byte_count,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1085,6 +1255,16 @@ pub async fn quit_app(
         .store(true, std::sync::atomic::Ordering::Release);
     app.exit(0);
     Ok(())
+}
+
+/// Consume a close request that arrived before the frontend listener was
+/// ready. `swap(false)` makes the handoff one-shot while allowing a later
+/// native close to set the latch again.
+#[tauri::command]
+pub async fn take_pending_close_request(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    Ok(state
+        .pending_close_request
+        .swap(false, std::sync::atomic::Ordering::AcqRel))
 }
 
 #[tauri::command]
@@ -1164,6 +1344,19 @@ mod tests {
     }
 
     #[test]
+    fn ipfilter_outcome_requires_successful_reload_ack() {
+        assert_eq!(
+            ip_filter_outcome_from_ack(Some(Ok(()))),
+            LiveApplyOutcome::Applied
+        );
+        assert_eq!(
+            ip_filter_outcome_from_ack(Some(Err("parse failed".into()))),
+            LiveApplyOutcome::Failed
+        );
+        assert_eq!(ip_filter_outcome_from_ack(None), LiveApplyOutcome::Deferred);
+    }
+
+    #[test]
     fn soft_repair_clamps_ranges_and_enums() {
         let mut settings = AppSettings::default();
         settings.tcp_port = 0;
@@ -1233,9 +1426,107 @@ mod tests {
             vec!["root/media".to_string(), "root/other".to_string()]
         );
 
-        let (same, unchanged) =
-            dedupe_overlapping_shared_folders(vec!["a/b".into(), "c/d".into()]);
+        let (same, unchanged) = dedupe_overlapping_shared_folders(vec!["a/b".into(), "c/d".into()]);
         assert!(!unchanged);
         assert_eq!(same, vec!["a/b".to_string(), "c/d".to_string()]);
+    }
+
+    #[test]
+    fn shared_folder_settings_change_prunes_removed_root_state() {
+        let old_folders = vec!["/library/removed".to_string(), "/library/kept".to_string()];
+        let new_folders = vec!["/library/kept".to_string(), "/library/added".to_string()];
+        let (removed, added) = shared_folder_changes(&old_folders, &new_folders);
+        assert_eq!(removed, vec!["/library/removed"]);
+        assert_eq!(added, vec!["/library/added"]);
+
+        let mut settings = AppSettings::default();
+        settings
+            .folder_priorities
+            .insert("/library/removed".to_string(), "high".to_string());
+        settings.folder_priorities.insert(
+            "/library/removed/stale-child".to_string(),
+            "release".to_string(),
+        );
+        settings
+            .folder_priorities
+            .insert("/library/kept".to_string(), "low".to_string());
+        settings
+            .pending_share_states
+            .insert("/library/removed/pending.bin".to_string(), false);
+        settings
+            .pending_share_states
+            .insert("/library/kept/pending.bin".to_string(), true);
+        settings.pending_file_priorities.insert(
+            "/library/removed/pending.bin".to_string(),
+            "release".to_string(),
+        );
+        settings
+            .shared_folder_scan_cursors
+            .insert("/library/removed".to_string(), "cursor".to_string());
+        settings.shared_folder_scan_cursors.insert(
+            "/library/removed/stale-child".to_string(),
+            "cursor".to_string(),
+        );
+
+        prune_removed_shared_folder_state(&mut settings, &removed, &new_folders);
+
+        assert_eq!(settings.folder_priorities.len(), 1);
+        assert!(settings.folder_priorities.contains_key("/library/kept"));
+        assert_eq!(settings.pending_share_states.len(), 1);
+        assert!(settings
+            .pending_share_states
+            .contains_key("/library/kept/pending.bin"));
+        assert!(settings.pending_file_priorities.is_empty());
+        assert!(settings.shared_folder_scan_cursors.is_empty());
+    }
+
+    #[test]
+    fn parent_to_child_root_change_preserves_child_scoped_state() {
+        let old_folders = vec!["/library/parent".to_string()];
+        let new_folders = vec!["/library/parent/child".to_string()];
+        let (removed, added) = shared_folder_changes(&old_folders, &new_folders);
+        assert_eq!(removed, old_folders);
+        assert_eq!(added, new_folders);
+
+        let mut settings = AppSettings::default();
+        settings
+            .folder_priorities
+            .insert("/library/parent/child".to_string(), "release".to_string());
+        settings
+            .folder_priorities
+            .insert("/library/parent/other".to_string(), "low".to_string());
+        settings
+            .pending_share_states
+            .insert("/library/parent/child/pending.bin".to_string(), false);
+        settings
+            .pending_share_states
+            .insert("/library/parent/other/pending.bin".to_string(), false);
+        settings
+            .pending_file_priorities
+            .insert("/library/parent/child/pending.bin".to_string(), "high".to_string());
+        settings
+            .shared_folder_scan_cursors
+            .insert("/library/parent/child".to_string(), "child-cursor".to_string());
+
+        prune_removed_shared_folder_state(&mut settings, &removed, &new_folders);
+
+        assert!(settings
+            .folder_priorities
+            .contains_key("/library/parent/child"));
+        assert!(!settings
+            .folder_priorities
+            .contains_key("/library/parent/other"));
+        assert!(settings
+            .pending_share_states
+            .contains_key("/library/parent/child/pending.bin"));
+        assert!(!settings
+            .pending_share_states
+            .contains_key("/library/parent/other/pending.bin"));
+        assert!(settings
+            .pending_file_priorities
+            .contains_key("/library/parent/child/pending.bin"));
+        assert!(settings
+            .shared_folder_scan_cursors
+            .contains_key("/library/parent/child"));
     }
 }

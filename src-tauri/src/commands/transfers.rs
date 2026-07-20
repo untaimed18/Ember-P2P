@@ -1353,9 +1353,7 @@ pub async fn resume_all_transfers(
             .filter(|t| {
                 matches!(
                     t.status,
-                    TransferStatus::Paused
-                        | TransferStatus::Stopped
-                        | TransferStatus::Insufficient
+                    TransferStatus::Paused | TransferStatus::Stopped | TransferStatus::Insufficient
                 )
             })
             .map(|t| t.id.clone())

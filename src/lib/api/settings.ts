@@ -1,30 +1,45 @@
 import { invoke } from '@tauri-apps/api/core';
 import type { AppSettings } from '$lib/types';
 
+export type SettingsUpdateOutcome = 'applied' | 'restart_required' | 'deferred';
+export type LiveApplyOutcome = 'applied' | 'deferred' | 'failed';
+
 export async function getSettings(): Promise<AppSettings> {
   return invoke('get_settings');
 }
 
-interface UpdateSettingsResult {
-  message: string;
+export interface UpdateSettingsResult {
+  outcome: SettingsUpdateOutcome;
   settings: AppSettings;
-  liveApplyQueued: boolean;
 }
 
-export async function updateSettings(settings: AppSettings): Promise<string> {
+export interface NodesDatDownloadResult {
+  outcome: LiveApplyOutcome;
+  parsedCount: number;
+  appliedCount?: number;
+  byteCount: number;
+}
+
+export interface IpFilterDownloadResult {
+  outcome: LiveApplyOutcome;
+  entryCount: number;
+  byteCount: number;
+}
+
+export async function updateSettings(settings: AppSettings): Promise<UpdateSettingsResult> {
   const result = await invoke<UpdateSettingsResult>('update_settings', { settings });
   // Always use the canonical persisted revision, including the partial-success
   // path where runtime application was deferred because the command queue was
   // full. A retry must never submit a stale revision.
   Object.assign(settings, result.settings);
-  return result.message;
+  return result;
 }
 
-export async function downloadNodesDat(): Promise<string> {
+export async function downloadNodesDat(): Promise<NodesDatDownloadResult> {
   return invoke('download_nodes_dat');
 }
 
-export async function downloadIpfilter(): Promise<string> {
+export async function downloadIpfilter(): Promise<IpFilterDownloadResult> {
   return invoke('download_ipfilter');
 }
 
@@ -48,6 +63,11 @@ export async function quitApp(): Promise<void> {
  *  go through `updateSettings`. */
 export async function setCloseBehavior(behavior: 'ask' | 'tray' | 'exit'): Promise<void> {
   return invoke('set_close_behavior', { behavior });
+}
+
+/** Consume a native close request that preceded listener registration. */
+export async function takePendingCloseRequest(): Promise<boolean> {
+  return invoke('take_pending_close_request');
 }
 
 /** Open the official Ember website in the default browser. */

@@ -18,7 +18,7 @@
     listPendingDeepLinks,
     openCollectionFile,
   } from '$lib/api/deeplink';
-  import { incomingCollection } from '$lib/stores/collection';
+  import { presentIncomingCollection } from '$lib/stores/collection';
   import { toastSuccess, toastError } from '$lib/stores/toast';
   import { translateError } from '$lib/i18n';
   import * as m from '$lib/paraglide/messages';
@@ -50,12 +50,13 @@
       if (lower.startsWith('ed2k://|file|')) {
         const info = await parseEd2kLink(payload);
         const res = await startDownload(info.hash, info.name, info.size, '', 0);
-        if (destroyed) return false;
-        toastSuccess(
-          res.already_queued
-            ? m.search_already_queued_name({ name: info.name })
-            : m.search_queued_name({ name: info.name }),
-        );
+        if (!destroyed) {
+          toastSuccess(
+            res.already_queued
+              ? m.search_already_queued_name({ name: info.name })
+              : m.search_queued_name({ name: info.name }),
+          );
+        }
       } else if (lower.startsWith('ed2k://|server|')) {
         const segs = ed2kSegments(payload); // ['server', ip, port]
         const ip = segs[1] ?? '';
@@ -77,8 +78,7 @@
           console.warn('Deep link: add server failed (continuing to connect):', e);
         }
         const msg = await connectToServer(ip, port);
-        if (destroyed) return false;
-        toastSuccess(msg);
+        if (!destroyed) toastSuccess(msg);
       } else if (lower.startsWith('ed2k://|serverlist|')) {
         const segs = ed2kSegments(payload); // ['serverlist', url]
         const url = segs[1] ?? '';
@@ -89,15 +89,16 @@
           return false;
         }
         const msg = await downloadServerMet(url);
-        if (destroyed) return false;
-        toastSuccess(msg);
+        if (!destroyed) toastSuccess(msg);
       } else if (!lower.startsWith('ed2k://') && lower.endsWith('.emulecollection')) {
         const coll = await openCollectionFile(payload);
         if (destroyed) return false;
-        incomingCollection.set(coll);
+        const presented = presentIncomingCollection(coll);
         await goto('/library');
-        if (destroyed) return false;
-        toastSuccess(m.library_collection_loaded({ name: coll.name, count: coll.files.length }));
+        await presented;
+        if (!destroyed) {
+          toastSuccess(m.library_collection_loaded({ name: coll.name, count: coll.files.length }));
+        }
       }
       // Unknown ed2k:// variants (e.g. magnet-style or future opcodes) are
       // ignored silently — the buffer already filtered to our known prefixes.
@@ -111,12 +112,37 @@
 
   let processing = false;
   let rerun = false;
+  // A completed side effect stays here until its durable ack succeeds. A
+  // retry therefore performs only the acknowledgement, never another
+  // download/connect/navigation.
+  const completedIds = new Set<string>();
   // Failed entries remain durable for a later app/session retry, but must not
   // immediately re-toast in a tight drain loop.
-  const attemptedIds = new Set<string>();
+  const failedIds = new Set<string>();
+  let ackRetryTimer: ReturnType<typeof setTimeout> | undefined;
   // Set on unmount so an in-flight drain stops routing payloads (goto/toasts)
   // into a component that no longer exists.
   let destroyed = false;
+
+  function scheduleAckRetry() {
+    if (destroyed || ackRetryTimer) return;
+    ackRetryTimer = setTimeout(() => {
+      ackRetryTimer = undefined;
+      void drain();
+    }, 1_000);
+  }
+
+  async function acknowledgeCompletedLink(id: string): Promise<boolean> {
+    try {
+      await ackPendingDeepLink(id);
+      completedIds.delete(id);
+      return true;
+    } catch (e) {
+      console.warn('Failed to acknowledge completed deep link; retrying:', e);
+      scheduleAckRetry();
+      return false;
+    }
+  }
 
   async function drain() {
     // Coalesce concurrent triggers (mount + event, or two rapid events) into a
@@ -131,19 +157,20 @@
       do {
         rerun = false;
         if (destroyed) break;
-        let links = (await listPendingDeepLinks()).filter((link) => !attemptedIds.has(link.id));
-        while (links.length > 0) {
-          for (const link of links) {
-            if (destroyed) break;
+        const links = (await listPendingDeepLinks()).filter((link) => !failedIds.has(link.id));
+        for (const link of links) {
+          if (destroyed) break;
+          if (!completedIds.has(link.id)) {
             if (await handlePayload(link.payload)) {
-              await ackPendingDeepLink(link.id);
-              attemptedIds.delete(link.id);
+              completedIds.add(link.id);
             } else {
-              attemptedIds.add(link.id);
+              failedIds.add(link.id);
+              continue;
             }
           }
-          if (destroyed) break;
-          links = (await listPendingDeepLinks()).filter((link) => !attemptedIds.has(link.id));
+          // Preserve queue order: if the head cannot be persisted as
+          // acknowledged, retry it before presenting later payloads.
+          if (!(await acknowledgeCompletedLink(link.id))) break;
         }
       } while (rerun);
     } catch (e) {
@@ -160,23 +187,29 @@
     let mounted = true;
     let unlisten: UnlistenFn | null = null;
 
-    // Register the wake listener before the initial drain so a link that lands
-    // between the two still triggers processing.
-    listen('deep-link-received', () => {
-      void drain();
-    })
-      .then((fn) => {
-        if (mounted) unlisten = fn;
-        else fn();
-      })
-      .catch((e) => console.error('Failed to register deep-link listener:', e));
-
-    // Drain anything buffered before we mounted (cold start).
-    void drain();
+    // Await listener registration before the first drain. The backend queue is
+    // durable, but a running-instance wake event could otherwise land in the
+    // registration gap and remain queued until another link arrives.
+    void (async () => {
+      try {
+        const fn = await listen('deep-link-received', () => {
+          void drain();
+        });
+        if (!mounted) {
+          fn();
+          return;
+        }
+        unlisten = fn;
+      } catch (e) {
+        console.error('Failed to register deep-link listener:', e);
+      }
+      if (mounted) void drain();
+    })();
 
     return () => {
       mounted = false;
       destroyed = true;
+      clearTimeout(ackRetryTimer);
       if (unlisten) unlisten();
     };
   });

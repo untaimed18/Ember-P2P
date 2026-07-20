@@ -644,8 +644,7 @@ impl IpFilter {
         if s > e {
             return false;
         }
-        self.blocked_ranges
-            .push(IpRange::new(s, e, description));
+        self.blocked_ranges.push(IpRange::new(s, e, description));
         self.blocked_ranges.sort_by_key(|r| r.start);
         self.merge_overlapping();
         true
@@ -1231,7 +1230,10 @@ mod tests {
         let stats = filter.get_stats();
         // 1 range hit + 2 special hits, none double-counted.
         assert_eq!(stats.total_hits, 3);
-        assert_eq!(stats.entries[0].hits, 1, "shared range hits must show in the Hits column");
+        assert_eq!(
+            stats.entries[0].hits, 1,
+            "shared range hits must show in the Hits column"
+        );
     }
 
     #[test]

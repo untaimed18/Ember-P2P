@@ -18,7 +18,13 @@
   import { initTheme, cleanupTheme } from '$lib/stores/theme';
   import { applyDocumentLang, translateError } from '$lib/i18n';
   import * as m from '$lib/paraglide/messages';
-  import { getSettings, hideToTray, quitApp, setCloseBehavior } from '$lib/api/settings';
+  import {
+    getSettings,
+    hideToTray,
+    quitApp,
+    setCloseBehavior,
+    takePendingCloseRequest,
+  } from '$lib/api/settings';
   import { checkForUpdates, isUpdateCheckDue } from '$lib/stores/updater';
   import { clearAllToasts, toastWarning } from '$lib/stores/toast';
   import type { AppSettings } from '$lib/types';
@@ -127,13 +133,30 @@
     let unlistenConfigCorrupt: UnlistenFn | null = null;
     let unlistenDbCorrupt: UnlistenFn | null = null;
 
-    // Surface the native close confirmation. The splash masks the first frames
-    // so the window can't be closed before this lands.
-    listen('close-requested', () => {
-      showCloseDialog = true;
-    })
-      .then((fn) => { if (mounted) unlistenClose = fn; else fn(); })
-      .catch((e) => console.error('Failed to register close-requested listener:', e));
+    // Register before consuming the native latch. A close can be prevented by
+    // Tauri before this async registration resolves; the backend records that
+    // request so it is still surfaced exactly once after the listener is live.
+    void (async () => {
+      try {
+        const fn = await listen('close-requested', () => {
+          if (!mounted) return;
+          showCloseDialog = true;
+          // Clear the backend latch for a live event too, preventing a later
+          // remount from reopening a dialog the user already dismissed.
+          void takePendingCloseRequest().catch((e) =>
+            console.error('Failed to consume close-request latch:', e),
+          );
+        });
+        if (!mounted) {
+          fn();
+          return;
+        }
+        unlistenClose = fn;
+        if (await takePendingCloseRequest()) showCloseDialog = true;
+      } catch (e) {
+        console.error('Failed to register close-requested listener:', e);
+      }
+    })();
 
     // Surface a corrupt-config recovery (backend reset settings to defaults and
     // preserved the original as a .bak). The backend's emit is delayed, so

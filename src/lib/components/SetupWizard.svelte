@@ -7,7 +7,13 @@
   import type { AppSettings } from '$lib/types';
   import ToggleSwitch from './ToggleSwitch.svelte';
   import SpeedInput from './SpeedInput.svelte';
-  import { updateSettings as saveSettings, downloadNodesDat, downloadIpfilter } from '$lib/api/settings';
+  import {
+    updateSettings as saveSettings,
+    downloadNodesDat,
+    downloadIpfilter,
+    type NodesDatDownloadResult,
+    type IpFilterDownloadResult,
+  } from '$lib/api/settings';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
   import { inertBackground, trapTabKey } from '$lib/a11y';
@@ -66,10 +72,23 @@
     });
   });
 
-  type DlStatus = 'idle' | 'pending' | 'ok' | 'error';
+  type DlStatus = 'idle' | 'pending' | 'ok' | 'deferred' | 'failed' | 'error';
   let dlNodesStatus = $state<DlStatus>('idle');
   let dlIpStatus = $state<DlStatus>('idle');
   let downloading = $state(false);
+
+  function structuredDownloadStatus(
+    result: NodesDatDownloadResult | IpFilterDownloadResult,
+  ): DlStatus {
+    switch (result.outcome) {
+      case 'applied':
+        return 'ok';
+      case 'failed':
+        return 'failed';
+      default:
+        return 'deferred';
+    }
+  }
 
   let stepTimer: ReturnType<typeof setTimeout> | undefined;
   onDestroy(() => clearTimeout(stepTimer));
@@ -209,8 +228,12 @@
       downloadIpfilter(),
     ]);
 
-    dlNodesStatus = nodesResult.status === 'fulfilled' ? 'ok' : 'error';
-    dlIpStatus = ipResult.status === 'fulfilled' ? 'ok' : 'error';
+    dlNodesStatus = nodesResult.status === 'fulfilled'
+      ? structuredDownloadStatus(nodesResult.value)
+      : 'error';
+    dlIpStatus = ipResult.status === 'fulfilled'
+      ? structuredDownloadStatus(ipResult.value)
+      : 'error';
 
     // Brief pause so the user can see the green checkmarks
     await new Promise(r => setTimeout(r, 900));
@@ -514,26 +537,38 @@
                   <span class="spinner xs" aria-hidden="true"></span>
                 {:else if dlNodesStatus === 'ok'}
                   <svg class="dl-icon ok" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M6.5 12.5l-4-4 1.4-1.4 2.6 2.6 5.6-5.6 1.4 1.4z"/></svg>
-                {:else if dlNodesStatus === 'error'}
+                {:else if dlNodesStatus === 'error' || dlNodesStatus === 'failed' || dlNodesStatus === 'deferred'}
                   <svg class="dl-icon err" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 1a7 7 0 100 14A7 7 0 008 1zm.75 3.5v4h-1.5v-4h1.5zm0 5.5v1.5h-1.5V10h1.5z"/></svg>
                 {:else}
                   <span class="dl-icon placeholder" aria-hidden="true"></span>
                 {/if}
                 <span>{m.wizard_dl_nodes_label()}</span>
-                {#if dlNodesStatus === 'error'}<span class="dl-warn">{m.wizard_dl_nodes_skipped()}</span>{/if}
+                {#if dlNodesStatus === 'error'}
+                  <span class="dl-warn">{m.wizard_dl_nodes_skipped()}</span>
+                {:else if dlNodesStatus === 'deferred'}
+                  <span class="dl-warn">{m.wizard_dl_nodes_deferred()}</span>
+                {:else if dlNodesStatus === 'failed'}
+                  <span class="dl-warn">{m.wizard_dl_nodes_failed()}</span>
+                {/if}
               </div>
               <div class="dl-item">
                 {#if dlIpStatus === 'pending'}
                   <span class="spinner xs" aria-hidden="true"></span>
                 {:else if dlIpStatus === 'ok'}
                   <svg class="dl-icon ok" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M6.5 12.5l-4-4 1.4-1.4 2.6 2.6 5.6-5.6 1.4 1.4z"/></svg>
-                {:else if dlIpStatus === 'error'}
+                {:else if dlIpStatus === 'error' || dlIpStatus === 'failed' || dlIpStatus === 'deferred'}
                   <svg class="dl-icon err" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 1a7 7 0 100 14A7 7 0 008 1zm.75 3.5v4h-1.5v-4h1.5zm0 5.5v1.5h-1.5V10h1.5z"/></svg>
                 {:else}
                   <span class="dl-icon placeholder" aria-hidden="true"></span>
                 {/if}
                 <span>{m.wizard_dl_ipfilter_label()}</span>
-                {#if dlIpStatus === 'error'}<span class="dl-warn">{m.wizard_dl_ipfilter_skipped()}</span>{/if}
+                {#if dlIpStatus === 'error'}
+                  <span class="dl-warn">{m.wizard_dl_ipfilter_skipped()}</span>
+                {:else if dlIpStatus === 'deferred'}
+                  <span class="dl-warn">{m.wizard_dl_ipfilter_deferred()}</span>
+                {:else if dlIpStatus === 'failed'}
+                  <span class="dl-warn">{m.wizard_dl_ipfilter_failed()}</span>
+                {/if}
               </div>
             </div>
           {/if}

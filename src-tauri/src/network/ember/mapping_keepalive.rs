@@ -187,9 +187,7 @@ async fn tcp_hold_connect(local_port: u16, host: &str, port: u16) -> Result<(), 
         .await
         .map_err(|e| format!("DNS {host}: {e}"))?
         .filter(|a| a.is_ipv4());
-    let remote = addrs
-        .next()
-        .ok_or_else(|| format!("No IPv4 for {host}"))?;
+    let remote = addrs.next().ok_or_else(|| format!("No IPv4 for {host}"))?;
 
     let tcp = TcpSocket::new_v4().map_err(|e| format!("socket: {e}"))?;
     tcp.set_reuseaddr(true)

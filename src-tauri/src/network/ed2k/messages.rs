@@ -145,8 +145,9 @@ pub const OLD_MAX_EMULE_FILE_SIZE: u64 = 4_290_048_000;
 /// wire count is `floor(size / PARTSIZE) + 1`, this is the largest file that
 /// can be represented without wrapping a standard eMule peer.
 pub const ED2K_MAX_WIRE_PARTS: usize = u16::MAX as usize;
-pub const ED2K_MAX_FILE_SIZE_BYTES: u64 =
-    (ED2K_MAX_WIRE_PARTS as u64).saturating_mul(PARTSIZE).saturating_sub(1);
+pub const ED2K_MAX_FILE_SIZE_BYTES: u64 = (ED2K_MAX_WIRE_PARTS as u64)
+    .saturating_mul(PARTSIZE)
+    .saturating_sub(1);
 
 /// Number of actual data chunks (≈9.28 MiB each) for a given file size.
 ///
@@ -1126,7 +1127,7 @@ pub fn build_reask_file_ping(
     file_size: u64,
     complete_source_count: u16,
     completed_parts: Option<&[bool]>,
- ) -> Option<Vec<u8>> {
+) -> Option<Vec<u8>> {
     let part_count = ed2k_wire_part_count_u16(file_size)?;
     let bitmap_bytes = ((part_count as usize) + 7) / 8;
     let mut buf = Vec::with_capacity(16 + 2 + bitmap_bytes + 2);

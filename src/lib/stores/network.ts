@@ -114,8 +114,8 @@ async function persistUpnpDisabled() {
     const current = await getSettings();
     if (current.upnp_enabled) {
       const updated = { ...current, upnp_enabled: false };
-      await updateSettings(updated);
-      setAppSettings(updated);
+      const result = await updateSettings(updated);
+      setAppSettings(result.settings);
     }
   } catch {
     // Let a later event retry — the on-disk setting wasn't changed.

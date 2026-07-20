@@ -1426,7 +1426,7 @@ mod tests {
         packet.extend_from_slice(&1u32.to_le_bytes());
         packet.extend_from_slice(&4662u16.to_le_bytes());
         packet.extend_from_slice(&3u32.to_le_bytes()); // filename + sources + complete
-        // FT_FILENAME
+                                                       // FT_FILENAME
         packet.push(0x80 | 0x02);
         packet.push(0x01);
         let name = b"movie.mkv";

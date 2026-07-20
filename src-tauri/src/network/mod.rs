@@ -102,6 +102,30 @@ struct RendezvousRegisterResult {
     result: Result<(), String>,
 }
 
+struct FriendRelayTicketPollResult {
+    result: Result<rendezvous::FriendRelayTicketPollPage, String>,
+    protocol: FriendRelayTicketPollProtocol,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FriendRelayTicketPollProtocol {
+    V3,
+    LegacyV2,
+}
+
+fn relay_ticket_next_round_delay(
+    round_started_at: tokio::time::Instant,
+    completed_at: tokio::time::Instant,
+) -> std::time::Duration {
+    (round_started_at + rendezvous::FRIEND_RELAY_TICKET_RESPONDER_POLL_INTERVAL)
+        .saturating_duration_since(completed_at)
+}
+
+/// This mirrors the rendezvous server's accepted-ticket cap. Keeping the
+/// responder's active join/session work bounded prevents a hostile or slow
+/// relay endpoint from accumulating background tasks across poll cycles.
+const MAX_FRIEND_RELAY_TICKET_SESSIONS: usize = 8;
+
 struct NatProbeResult {
     generation: u64,
     reason: &'static str,
@@ -175,19 +199,29 @@ fn spawn_udp_mapping_keepalive(
 ) -> mpsc::Sender<(Vec<u8>, SocketAddr)> {
     let (packet_tx, packet_rx) = mpsc::channel(8);
     tokio::spawn(async move {
-        let mapped =
-            ember::mapping_keepalive::stun_keepalive_with_replies(udp_socket, packet_rx, server_index)
-                .await;
+        let mapped = ember::mapping_keepalive::stun_keepalive_with_replies(
+            udp_socket,
+            packet_rx,
+            server_index,
+        )
+        .await;
         let _ = result_tx.send(UdpMappingKeepaliveResult { generation, mapped });
     });
     packet_tx
 }
 
 fn advertised_tcp_port(state: &NetworkState) -> u16 {
-    state
-        .external_tcp_port
-        .filter(|p| *p != 0)
-        .unwrap_or(state.tcp_port)
+    configured_tcp_port_for_advertising(state.tcp_port, None)
+}
+
+/// A UDP socket bound to the TCP port cannot establish the public endpoint of
+/// the TCP listener. Keep its STUN result diagnostic-only: every TCP-bearing
+/// protocol surface must advertise the configured listener port.
+fn configured_tcp_port_for_advertising(
+    configured_tcp_port: u16,
+    _udp_stun_observed_port: Option<u16>,
+) -> u16 {
+    configured_tcp_port
 }
 
 /// UDP counterpart of `advertised_tcp_port` — the KAD-peer-voted or
@@ -236,8 +270,6 @@ fn reset_stun_keepalive_session(state: &mut NetworkState) {
 }
 
 fn revert_stun_advertise_to_settings(state: &mut NetworkState) {
-    // Drop STUN TCP override always.
-    state.external_tcp_port = None;
     // Only clear UDP when the current external port was STUN-sourced, so
     // KAD firewall peer votes survive STUN disable/suspend. Prefer the
     // firewall checker's vote when available.
@@ -334,9 +366,7 @@ fn apply_udp_mapping_keepalive(
         // all. See the analogous "stable public UDP mapping" log below for
         // the remapped case.
         if !state.stats.stun_keepalive_active {
-            info!(
-                "STUN keepalive: confirmed 1:1 UDP mapping {mapped} (no remap needed)"
-            );
+            info!("STUN keepalive: confirmed 1:1 UDP mapping {mapped} (no remap needed)");
         }
         state.stats.stun_keepalive_active = true;
         if let Some(ip) = ember::mapping_keepalive::ipv4_from_mapped(mapped) {
@@ -355,9 +385,7 @@ fn apply_udp_mapping_keepalive(
             state.stun_ka_stable_hits = state.stun_ka_stable_hits.saturating_add(1);
         }
         Some(prev) => {
-            info!(
-                "STUN keepalive: public UDP port changed {prev} → {port}; treating as unstable"
-            );
+            info!("STUN keepalive: public UDP port changed {prev} → {port}; treating as unstable");
             suspend_stun_keepalive(state, "unstable public UDP port (not full-cone)");
             state.stats.public_udp_port = port; // still show last observation
             return false;
@@ -365,9 +393,7 @@ fn apply_udp_mapping_keepalive(
         None => {
             state.stun_ka_candidate_port = Some(port);
             state.stun_ka_stable_hits = 1;
-            info!(
-                "STUN keepalive: candidate public UDP mapping {mapped} (awaiting confirm)"
-            );
+            info!("STUN keepalive: candidate public UDP mapping {mapped} (awaiting confirm)");
             return false;
         }
     }
@@ -423,10 +449,10 @@ fn apply_udp_mapping_keepalive(
     true
 }
 
-/// Apply a TCP mapping keep-alive result. Returns `true` when the cycle
-/// contributed something useful (a successful hold and/or a confirmed
-/// public TCP mapping), so the caller can decide whether the overall
-/// keep-alive "Active" indicator should stay on.
+/// Apply a TCP mapping keep-alive result. The twin-port STUN probe uses UDP,
+/// so it can only provide diagnostic information about a UDP mapping; it must
+/// never override the configured TCP listener port. Returns `true` when the
+/// TCP hold itself succeeds.
 fn apply_tcp_mapping_keepalive(
     state: &mut NetworkState,
     hold_ok: bool,
@@ -436,83 +462,31 @@ fn apply_tcp_mapping_keepalive(
     if !stun_keepalive_should_run(state) {
         return false;
     }
+    let hold_changed = state.stats.tcp_mapping_hold_ok != hold_ok;
     state.stats.tcp_mapping_hold_ok = hold_ok;
-    let mut changed = false;
-    let mut confirmed = false;
     if let Some(addr) = mapped {
-        let port = addr.port();
-        // 1:1 (no remap) or matches the already-stable STUN-confirmed UDP
-        // public port: both are directly corroborated, so accept
-        // immediately without requiring their own consecutive-observation
-        // streak. Deliberately checks `stun_sourced_udp_port`, NOT the
-        // shared `external_udp_port` — the latter can hold a KAD
-        // Pong/FirewallUdp peer vote that never passed STUN's own
-        // stability gate.
-        if port == state.tcp_port || state.stun_sourced_udp_port == Some(port) {
-            state.stun_ka_tcp_candidate_port = None;
-            state.stun_ka_tcp_stable_hits = 0;
-            confirmed = true;
-        } else {
-            // Independent stability tracking for a TCP-only remap — do NOT
-            // reuse `stun_ka_stable_hits`, which tracks the *UDP* candidate
-            // and may already be >=2 for a completely different port.
-            match state.stun_ka_tcp_candidate_port {
-                Some(prev) if prev == port => {
-                    state.stun_ka_tcp_stable_hits =
-                        state.stun_ka_tcp_stable_hits.saturating_add(1);
-                }
-                _ => {
-                    state.stun_ka_tcp_candidate_port = Some(port);
-                    state.stun_ka_tcp_stable_hits = 1;
-                }
-            }
-            if state.stun_ka_tcp_stable_hits >= 2 {
-                confirmed = true;
-            } else {
-                // Deliberately do NOT surface this candidate via
-                // `stats.public_tcp_port` before it's confirmed — unlike the
-                // UDP tile (which is purely informational), this value is
-                // also consumed as "our actually-advertised TCP port" by
-                // ed2k link generation (see `build_ed2k_link`), so showing
-                // an unconfirmed/possibly-flapping value here could hand
-                // out a port nothing is actually advertising to peers yet.
-                return false;
-            }
-        }
-        if confirmed {
-            if state.external_tcp_port != Some(port) {
-                changed = true;
-            }
-            state.external_tcp_port = Some(port);
-            state.stats.public_tcp_port = port;
-            state
-                .advertise_tcp_port
-                .store(port, std::sync::atomic::Ordering::Relaxed);
-            if let Some(ip) = ember::mapping_keepalive::ipv4_from_mapped(addr) {
-                if state.external_ip.is_none() {
-                    set_external_ip(state, Some(ip));
-                }
-            }
-            state.publish_manager.tcp_port = port;
-            update_publish_manager_state(state);
-        }
-    } else if hold_ok {
-        // TCP hold alone (no twin-STUN reading, e.g. same_port case) is
-        // still a successful keep-alive contribution. Same false->true
-        // transition logging rationale as the UDP 1:1 case above — this
-        // path is otherwise silent every cycle.
-        if !state.stats.stun_keepalive_active {
-            info!("STUN keepalive: TCP mapping hold confirmed (local port {})", state.tcp_port);
-        }
-        confirmed = true;
+        debug!(
+            "TCP-port twin UDP STUN observed {addr}; retaining configured TCP port {}",
+            state.tcp_port
+        );
     }
-    if confirmed {
+    // `public_tcp_port` is consumed by source-link generation. Report the
+    // configured listener port rather than a UDP-STUN-derived value.
+    state.stats.public_tcp_port = state.tcp_port;
+    update_publish_manager_state(state);
+    if hold_ok {
+        if !state.stats.stun_keepalive_active {
+            info!(
+                "STUN keepalive: TCP mapping hold confirmed (local port {})",
+                state.tcp_port
+            );
+        }
         state.stats.stun_keepalive_active = true;
     }
-    if changed {
+    if hold_changed {
         info!(
-            "STUN keepalive: public TCP mapping {:?} hold_ok={hold_ok}",
-            mapped
+            "STUN keepalive: configured TCP port {} (hold_ok={hold_ok})",
+            state.tcp_port
         );
         let _ = app.emit(
             "stun-keepalive",
@@ -523,7 +497,7 @@ fn apply_tcp_mapping_keepalive(
             }),
         );
     }
-    confirmed
+    hold_ok
 }
 
 /// Try to connect to a server, attempting the DH-encrypted connection first (for HighID),
@@ -1114,9 +1088,7 @@ fn owned_or_downloading_search_hashes(
         }
         if local_index.get_by_hash(hash).is_some()
             || transfer_manager.has_pending_for_hash(hash)
-            || pending_downloads
-                .values()
-                .any(|pd| pd.file_hash == hash)
+            || pending_downloads.values().any(|pd| pd.file_hash == hash)
         {
             owned.insert(hash.to_string());
         }
@@ -1147,7 +1119,9 @@ fn note_ed2k_search_results(
         let skip_count = skip_hashes.contains(&r.file.hash);
         let prev = active.ed2k_noted_availability.get(&r.file.hash).copied();
         let sum_incoming = crate::search::merge::is_ed2k_network_origin(&r.result_origin)
-            && r.result_origin.split('·').any(|p| p.trim() == crate::search::merge::ORIGIN_SERVER_UDP);
+            && r.result_origin
+                .split('·')
+                .any(|p| p.trim() == crate::search::merge::ORIGIN_SERVER_UDP);
         let (new_avail, old_contrib) = match prev {
             Some(p) => {
                 let merged = if sum_incoming {
@@ -1700,12 +1674,7 @@ fn inject_source_into_active_transfers(
     // `is_special_use_v4` gate here — that would permanently deny LAN
     // peers even when the user turned private blocking off.
     if let Some(v4) = parsed_ip {
-        if !is_source_admissible(
-            state,
-            v4,
-            source.peer_port,
-            source.peer_user_hash.as_ref(),
-        ) {
+        if !is_source_admissible(state, v4, source.peer_port, source.peer_user_hash.as_ref()) {
             stats.dropped_full += transfer_ids.len();
             return stats;
         }
@@ -2297,6 +2266,151 @@ mod tests {
     use crate::network::kad::types::{
         KadTag, TagName, TagValue, TAG_DESCRIPTION, TAG_FILENAME, TAG_FILERATING,
     };
+
+    #[test]
+    fn relay_poll_success_preserves_one_second_minimum_cadence() {
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            relay_ticket_next_round_delay(
+                started,
+                started + std::time::Duration::from_millis(200)
+            ),
+            std::time::Duration::from_millis(800)
+        );
+        assert_eq!(
+            relay_ticket_next_round_delay(
+                started,
+                started + std::time::Duration::from_secs(2)
+            ),
+            std::time::Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn tcp_mapping_never_advertises_udp_stun_port() {
+        let observed_udp_mapping: Option<SocketAddr> = Some("203.0.113.42:51234".parse().unwrap());
+        assert_eq!(
+            configured_tcp_port_for_advertising(4662, observed_udp_mapping.map(|addr| addr.port())),
+            4662
+        );
+    }
+
+    #[test]
+    fn bootstrap_contact_result_uses_injection_cap() {
+        assert_eq!(applied_bootstrap_contact_count(12), 12);
+        assert_eq!(
+            applied_bootstrap_contact_count(MAX_BOOTSTRAP_CONTACTS + 1),
+            MAX_BOOTSTRAP_CONTACTS
+        );
+    }
+
+    #[test]
+    fn bootstrap_contact_result_counts_only_routing_table_accepts() {
+        let mut calls = 0;
+        let accepted = count_accepted_bootstrap_contacts([1, 2, 3], |_| {
+            calls += 1;
+            calls != 2
+        });
+        assert_eq!(accepted, 2);
+    }
+
+    #[test]
+    fn browse_responses_are_bound_to_the_sending_session() {
+        let friend = [0xA1; 16];
+        let mut pending = PendingBrowseRequests::new();
+        assert_eq!(
+            enqueue_browse_request(&mut pending, friend, "first".into(), 11),
+            Ok(())
+        );
+        assert_eq!(
+            enqueue_browse_request(&mut pending, friend, "second".into(), 12),
+            Ok(())
+        );
+
+        // A response from a new/reconnected session cannot consume the old
+        // session's queue head.
+        assert_eq!(complete_browse_request(&mut pending, friend, 12), None);
+        assert_eq!(
+            complete_browse_request(&mut pending, friend, 11),
+            Some("first".into())
+        );
+        // The replacement-session request is now the unsent head. The
+        // dispatcher must see this transition and send it on session 12.
+        let next = pending
+            .get(&friend)
+            .and_then(|queue| queue.front())
+            .unwrap();
+        assert_eq!(next.request_id, "second");
+        assert_eq!(next.session_id, 12);
+        assert!(!next.dispatched);
+    }
+
+    #[test]
+    fn cancelling_active_browse_retires_its_session_queue() {
+        let friend = [0xB2; 16];
+        let mut pending = PendingBrowseRequests::new();
+        enqueue_browse_request(&mut pending, friend, "cancelled".into(), 21).unwrap();
+        enqueue_browse_request(&mut pending, friend, "queued".into(), 21).unwrap();
+
+        assert_eq!(
+            cancel_browse_request(&mut pending, friend, "cancelled"),
+            Some((Some(21), vec!["queued".into()]))
+        );
+        // A late response after cancellation cannot be shown as either the
+        // cancelled request or a later browse on the replacement session.
+        assert_eq!(complete_browse_request(&mut pending, friend, 21), None);
+        enqueue_browse_request(&mut pending, friend, "replacement".into(), 22).unwrap();
+        assert_eq!(complete_browse_request(&mut pending, friend, 21), None);
+        assert_eq!(
+            complete_browse_request(&mut pending, friend, 22),
+            Some("replacement".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_browse_retires_the_live_session_before_rebrowse() {
+        let friend = [0xC3; 16];
+        let sessions: upload_server::EmberSessionMap = Arc::new(RwLock::new(HashMap::new()));
+        let (first_tx, _first_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let first = upload_server::EmberSessionHandle::new(first_tx);
+        let first_id = first.session_id();
+        let mut first_shutdown = first.subscribe_shutdown();
+        sessions.write().await.insert(friend, first);
+
+        let mut pending = PendingBrowseRequests::new();
+        enqueue_browse_request(&mut pending, friend, "first".into(), first_id).unwrap();
+        let (retired, _) = cancel_browse_request(&mut pending, friend, "first").unwrap();
+        assert_eq!(retired, Some(first_id));
+        assert!(retire_ember_session(&sessions, friend, first_id).await);
+        first_shutdown
+            .changed()
+            .await
+            .expect("retired session sends shutdown");
+        assert!(*first_shutdown.borrow());
+        assert!(!sessions.read().await.contains_key(&friend));
+
+        // A re-browse receives a distinct session, and an accidental repeat
+        // cancellation cannot close the retired session a second time.
+        assert!(!retire_ember_session(&sessions, friend, first_id).await);
+        let (second_tx, _second_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let second = upload_server::EmberSessionHandle::new(second_tx);
+        let second_id = second.session_id();
+        sessions.write().await.insert(friend, second);
+        assert_ne!(first_id, second_id);
+        assert!(retire_ember_session(&sessions, friend, second_id).await);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_drains_fresh_part_hashes_even_when_unused() {
+        let hash = [0xA5; 16];
+        let fresh = Arc::new(RwLock::new(HashMap::from([(hash, vec![[0x5A; 16]])])));
+
+        assert_eq!(
+            take_fresh_part_hashes(&fresh, &hash).await,
+            Some(vec![[0x5A; 16]])
+        );
+        assert!(fresh.read().await.is_empty());
+    }
 
     fn sample_download_source() -> DownloadSource {
         DownloadSource {
@@ -3140,6 +3254,22 @@ pub struct SearchFilters {
     pub min_availability: Option<u32>,
 }
 
+const MAX_BOOTSTRAP_CONTACTS: usize = 1_000;
+
+fn applied_bootstrap_contact_count(parsed_count: usize) -> usize {
+    parsed_count.min(MAX_BOOTSTRAP_CONTACTS)
+}
+
+fn count_accepted_bootstrap_contacts<T>(
+    contacts: impl IntoIterator<Item = T>,
+    mut insert: impl FnMut(T) -> bool,
+) -> usize {
+    contacts
+        .into_iter()
+        .map(|contact| usize::from(insert(contact)))
+        .sum()
+}
+
 #[derive(Debug)]
 pub enum NetworkCommand {
     SearchFiles {
@@ -3220,9 +3350,14 @@ pub enum NetworkCommand {
     },
     BootstrapContacts {
         contacts: Vec<kad::types::KadContact>,
+        tx: oneshot::Sender<usize>,
     },
     ReloadIpFilter {
         path: PathBuf,
+        /// When present, report whether the network task actually loaded and
+        /// installed the fresh filter rather than merely accepting the queue
+        /// item.
+        tx: Option<oneshot::Sender<Result<(), String>>>,
     },
     GetIpFilterStats {
         tx: oneshot::Sender<IpFilterStats>,
@@ -3834,6 +3969,253 @@ fn build_publish_notes_message(
 /// and tear down the underlying KAD search if the IPC caller times out.
 type PendingHelperSearchTx<T> = (u64, oneshot::Sender<T>);
 
+/// A browse request is correlated to the exact authenticated friend TCP
+/// session that carried its wire request. The ED2K browse response has no
+/// request ID, so a per-friend FIFO alone is unsafe after a reconnect: an old
+/// session's delayed response could otherwise be rendered as a new request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingBrowseRequest {
+    request_id: String,
+    session_id: u64,
+    /// True once the wire request has been queued on `session_id`. A later
+    /// enqueue must not transmit the current queue head a second time.
+    dispatched: bool,
+}
+
+type PendingBrowseRequests = HashMap<[u8; 16], VecDeque<PendingBrowseRequest>>;
+
+fn enqueue_browse_request(
+    pending: &mut PendingBrowseRequests,
+    friend: [u8; 16],
+    request_id: String,
+    session_id: u64,
+) -> Result<(), ()> {
+    let queue = pending.entry(friend).or_default();
+    if queue.iter().any(|request| request.request_id == request_id) {
+        return Err(());
+    }
+    queue.push_back(PendingBrowseRequest {
+        request_id,
+        session_id,
+        dispatched: false,
+    });
+    Ok(())
+}
+
+/// Take the queue head only when the response came from the same session that
+/// sent it. The caller must always run [`dispatch_browse_head`] afterward:
+/// the next head may belong to a newer session.
+fn complete_browse_request(
+    pending: &mut PendingBrowseRequests,
+    friend: [u8; 16],
+    session_id: u64,
+) -> Option<String> {
+    let queue = pending.get_mut(&friend)?;
+    if queue
+        .front()
+        .map_or(true, |request| request.session_id != session_id)
+    {
+        return None;
+    }
+    let request_id = queue.pop_front()?.request_id;
+    if queue.is_empty() {
+        pending.remove(&friend);
+    }
+    Some(request_id)
+}
+
+fn remove_browse_requests_for_session(
+    pending: &mut PendingBrowseRequests,
+    friend: [u8; 16],
+    session_id: u64,
+) -> Vec<String> {
+    let Some(queue) = pending.get_mut(&friend) else {
+        return Vec::new();
+    };
+    let mut removed = Vec::new();
+    queue.retain(|request| {
+        if request.session_id == session_id {
+            removed.push(request.request_id.clone());
+            false
+        } else {
+            true
+        }
+    });
+    if queue.is_empty() {
+        pending.remove(&friend);
+    }
+    removed
+}
+
+/// Cancel a request. Cancelling the active head invalidates every request
+/// bound to that session: a late reply cannot be distinguished on the wire,
+/// so the caller must retire the session before starting another browse.
+fn cancel_browse_request(
+    pending: &mut PendingBrowseRequests,
+    friend: [u8; 16],
+    request_id: &str,
+) -> Option<(Option<u64>, Vec<String>)> {
+    let queue = pending.get_mut(&friend)?;
+    let position = queue
+        .iter()
+        .position(|request| request.request_id == request_id)?;
+    if position != 0 {
+        queue.remove(position);
+        return Some((None, Vec::new()));
+    }
+
+    let session_id = queue.front()?.session_id;
+    let mut invalidated = Vec::new();
+    queue.retain(|request| {
+        if request.session_id == session_id {
+            if request.request_id != request_id {
+                invalidated.push(request.request_id.clone());
+            }
+            false
+        } else {
+            true
+        }
+    });
+    if queue.is_empty() {
+        pending.remove(&friend);
+    }
+    Some((Some(session_id), invalidated))
+}
+
+/// Bind an on-demand browse placeholder (session ID 0) to the freshly opened
+/// session before its first wire packet is queued.
+fn bind_browse_request_to_session(
+    pending: &mut PendingBrowseRequests,
+    friend: [u8; 16],
+    request_id: &str,
+    session_id: u64,
+) -> Option<()> {
+    let queue = pending.get_mut(&friend)?;
+    let position = queue
+        .iter()
+        .position(|request| request.request_id == request_id)?;
+    let request = queue.get_mut(position)?;
+    if request.session_id != 0 {
+        return None;
+    }
+    request.session_id = session_id;
+    Some(())
+}
+
+fn remove_browse_request(
+    pending: &mut PendingBrowseRequests,
+    friend: [u8; 16],
+    request_id: &str,
+) -> Option<PendingBrowseRequest> {
+    let queue = pending.get_mut(&friend)?;
+    let position = queue
+        .iter()
+        .position(|request| request.request_id == request_id)?;
+    let removed = queue.remove(position)?;
+    if queue.is_empty() {
+        pending.remove(&friend);
+    }
+    Some(removed)
+}
+
+fn browse_request_is_pending(
+    pending: &PendingBrowseRequests,
+    friend: [u8; 16],
+    request_id: &str,
+) -> bool {
+    pending
+        .get(&friend)
+        .is_some_and(|queue| queue.iter().any(|request| request.request_id == request_id))
+}
+
+async fn retire_ember_session(
+    sessions: &upload_server::EmberSessionMap,
+    friend: [u8; 16],
+    session_id: u64,
+) -> bool {
+    let mut sessions = sessions.write().await;
+    let Some(handle) = sessions
+        .get(&friend)
+        .filter(|handle| handle.session_id() == session_id)
+        .cloned()
+    else {
+        return false;
+    };
+    handle.close();
+    sessions.remove(&friend);
+    true
+}
+
+async fn dispatch_browse_head(
+    state: &mut NetworkState,
+    app_handle: &tauri::AppHandle,
+    friend: [u8; 16],
+) {
+    loop {
+        let Some(head) = state
+            .pending_browse_requests
+            .get(&friend)
+            .and_then(|queue| queue.front())
+            .cloned()
+        else {
+            return;
+        };
+        // Session ID 0 is a placeholder while an on-demand dial is in
+        // progress. Its `EmberBrowseSessionReady` event will re-enter this
+        // dispatcher after binding the real session ID.
+        if head.session_id == 0 || head.dispatched {
+            return;
+        }
+
+        let current = state.ember_sessions.read().await.get(&friend).cloned();
+        let reason = match current {
+            Some(handle) if handle.session_id() == head.session_id && handle.is_fresh() => {
+                let mut packet = Vec::with_capacity(6);
+                packet.push(OP_EMULEPROT);
+                packet.extend_from_slice(&(1u32).to_le_bytes());
+                packet.push(ed2k::messages::OP_EMBER_BROWSE_REQ);
+                match handle.tx.try_send(packet) {
+                    Ok(()) => {
+                        if let Some(request) = state
+                            .pending_browse_requests
+                            .get_mut(&friend)
+                            .and_then(|queue| queue.front_mut())
+                            .filter(|request| {
+                                request.request_id == head.request_id
+                                    && request.session_id == head.session_id
+                            })
+                        {
+                            request.dispatched = true;
+                        }
+                        return;
+                    }
+                    Err(error) => {
+                        let _ =
+                            retire_ember_session(&state.ember_sessions, friend, head.session_id)
+                                .await;
+                        format!("Browse request could not be queued: {error}")
+                    }
+                }
+            }
+            Some(_) => "Browse session was replaced before the request was sent".into(),
+            None => "Friend disconnected before the browse request was sent".into(),
+        };
+
+        // A stale head must never block a request already associated with the
+        // current replacement session. Drop it and immediately inspect the
+        // new head in the next loop iteration.
+        let _ = remove_browse_request(&mut state.pending_browse_requests, friend, &head.request_id);
+        let _ = app_handle.emit(
+            "ember:browse-error",
+            serde_json::json!({
+                "user_hash": hex::encode(friend),
+                "request_id": head.request_id,
+                "reason": reason,
+            }),
+        );
+    }
+}
+
 struct NetworkState {
     local_id: KadId,
     user_hash: [u8; 16],
@@ -3863,7 +4245,8 @@ struct NetworkState {
     /// `request_id` (caller-generated) lets `NetworkCommand::CancelSearch`
     /// cancel a `find_sources` call on IPC timeout, same as it already does
     /// for `search_files`'s keyword searches.
-    pending_source_searches: HashMap<SearchId, PendingHelperSearchTx<Result<Vec<(String, u16)>, String>>>,
+    pending_source_searches:
+        HashMap<SearchId, PendingHelperSearchTx<Result<Vec<(String, u16)>, String>>>,
     /// Source searches tied to pending downloads (search_id -> (transfer_id, file_hash_md4)).
     /// File hash is carried alongside so the search-completion handler can build
     /// CallbackReqs / inject sources without re-reading `pending_downloads`, which
@@ -3895,8 +4278,6 @@ struct NetworkState {
     nodes_save_lock: Arc<tokio::sync::Mutex<()>>,
     external_ip: Option<Ipv4Addr>,
     external_udp_port: Option<u16>,
-    /// Public TCP listen port discovered via twin-port STUN (may differ from bind).
-    external_tcp_port: Option<u16>,
     /// Live Hello / publish TCP port (updated by mapping keep-alive).
     advertise_tcp_port: Arc<std::sync::atomic::AtomicU16>,
     /// Live Hello / publish UDP port (updated by mapping keep-alive).
@@ -3976,7 +4357,8 @@ struct NetworkState {
     store_source_searches: HashMap<SearchId, (KadId, KadMessage)>,
     /// Pending notes searches: search_id -> (request_id, response sender).
     /// See `pending_source_searches` for why `request_id` is carried here.
-    pending_notes_searches: HashMap<SearchId, PendingHelperSearchTx<Result<Vec<SearchResult>, String>>>,
+    pending_notes_searches:
+        HashMap<SearchId, PendingHelperSearchTx<Result<Vec<SearchResult>, String>>>,
     /// Pending note publishes, including the exact StorePacket payload used by
     /// both eager lookup sends and completion mop-up.
     pending_note_publishes: HashMap<SearchId, PendingNotePublish>,
@@ -4290,10 +4672,9 @@ struct NetworkState {
     firewall_req_cooldown: HashMap<Ipv4Addr, i64>,
     /// Ember friends currently connected (ember_hash -> last_seen_timestamp)
     online_friends: HashMap<[u8; 16], i64>,
-    /// FIFO correlation IDs for friend browse requests. The Ember browse wire
-    /// response has no request id, so serializing requests per friend lets a
-    /// delayed response be attributed to the correct local generation.
-    pending_browse_requests: HashMap<[u8; 16], Vec<String>>,
+    /// Session-bound FIFO correlation for friend browse requests. See
+    /// [`PendingBrowseRequest`] for why a request ID alone is insufficient.
+    pending_browse_requests: PendingBrowseRequests,
     /// Short-lived dedup for inbound Ember chat messages: ember_hash ->
     /// (last message text, received-at timestamp). A friend's chat can
     /// legitimately arrive via either the dedicated `friend_connect.rs`
@@ -4470,11 +4851,8 @@ fn apply_publish_badges(
 ) {
     for f in files {
         let hash = parse_ed2k_hash16(&f.hash);
-        f.shared_kad = f.shared
-            && kad_connected
-            && hash
-                .map(|h| kad_published.contains(&h))
-                .unwrap_or(false);
+        f.shared_kad =
+            f.shared && kad_connected && hash.map(|h| kad_published.contains(&h)).unwrap_or(false);
         f.shared_ed2k = f.shared
             && server_connected
             && hash.map(|h| ed2k_offered.contains(&h)).unwrap_or(false);
@@ -4805,13 +5183,10 @@ fn finalize_removed_searches_with_keyword_results(
         {
             if let Some(entries) = preserved_results.get(sid) {
                 if !entries.is_empty() {
-                    let mut network_results = convert_search_results(entries, |ip| {
-                        is_search_source_safe(state, ip)
-                    });
+                    let mut network_results =
+                        convert_search_results(entries, |ip| is_search_source_safe(state, ip));
                     if !query_expr.is_trivial() {
-                        network_results.retain(|r| {
-                            query_expr.matches(&r.file.name.to_lowercase())
-                        });
+                        network_results.retain(|r| query_expr.matches(&r.file.name.to_lowercase()));
                     }
                     if let Some(active) = state.active_search_request.as_ref() {
                         if active.request_id == request_id {
@@ -4860,7 +5235,7 @@ fn finalize_removed_searches_with_keyword_results(
                 let _ = tx.send(Ok(sources));
             } else {
                 let _ = tx.send(Err(
-                    "Source search busy: KAD search capacity reached".to_string(),
+                    "Source search busy: KAD search capacity reached".to_string()
                 ));
             }
         }
@@ -4868,15 +5243,12 @@ fn finalize_removed_searches_with_keyword_results(
             if let Some(entries) = preserved_results.get(sid) {
                 // Notes conversion forces the searched file hash onto results;
                 // use the first entry id (Kad key) or zeros if empty after filter.
-                let target = entries
-                    .first()
-                    .map(|e| e.id)
-                    .unwrap_or(KadId([0u8; 16]));
+                let target = entries.first().map(|e| e.id).unwrap_or(KadId([0u8; 16]));
                 let notes = convert_note_search_results(entries, &target);
                 let _ = tx.send(Ok(notes));
             } else {
                 let _ = tx.send(Err(
-                    "Notes search busy: KAD search capacity reached".to_string(),
+                    "Notes search busy: KAD search capacity reached".to_string()
                 ));
             }
         }
@@ -5175,7 +5547,11 @@ fn emit_server_auto_connect_failed(app_handle: &tauri::AppHandle, detail: &str) 
     );
 }
 
-fn abandon_server_auto_reconnect(state: &mut NetworkState, app_handle: &tauri::AppHandle, detail: &str) {
+fn abandon_server_auto_reconnect(
+    state: &mut NetworkState,
+    app_handle: &tauri::AppHandle,
+    detail: &str,
+) {
     state.server_auto_reconnect = false;
     emit_server_auto_connect_failed(app_handle, detail);
 }
@@ -5471,9 +5847,7 @@ fn spawn_save_server_met(
                 if generation.load(std::sync::atomic::Ordering::Relaxed) != gen {
                     return;
                 }
-                if let Err(e) =
-                    ed2k::server_list::ServerList::write_server_met_bytes(&path, &buf)
-                {
+                if let Err(e) = ed2k::server_list::ServerList::write_server_met_bytes(&path, &buf) {
                     warn!("Failed to save server.met: {e}");
                 }
             });
@@ -6276,9 +6650,7 @@ async fn known_clients_snapshot(
             let ember = record
                 .ember_hash
                 .or_else(|| live_ember.get(&record.user_hash).copied());
-            let is_friend = ember
-                .map(|eh| friends.contains(&eh))
-                .unwrap_or(false);
+            let is_friend = ember.map(|eh| friends.contains(&eh)).unwrap_or(false);
             crate::types::KnownClient {
                 user_hash: hex::encode(record.user_hash),
                 downloaded: record.downloaded,
@@ -6845,9 +7217,8 @@ pub async fn start_network(
         }
     };
     let mut pending_server_met_bootstrap = server_list.is_empty();
-    let mut server_met_bootstrap_task: Option<
-        tokio::task::JoinHandle<Result<Vec<u8>, String>>,
-    > = None;
+    let mut server_met_bootstrap_task: Option<tokio::task::JoinHandle<Result<Vec<u8>, String>>> =
+        None;
 
     let mut state = NetworkState {
         local_id,
@@ -6884,7 +7255,6 @@ pub async fn start_network(
         nodes_save_lock: Arc::new(tokio::sync::Mutex::new(())),
         external_ip: None,
         external_udp_port: None,
-        external_tcp_port: None,
         advertise_tcp_port: Arc::new(std::sync::atomic::AtomicU16::new(tcp_port)),
         advertise_udp_port: Arc::new(std::sync::atomic::AtomicU16::new(udp_port)),
         stun_keepalive_enabled: settings.stun_keepalive_enabled,
@@ -7236,8 +7606,16 @@ pub async fn start_network(
         let mut cm = CreditManager::new();
         cm.load_or_create_keypair(&data_dir);
         if let Ok(records) = db.load_credits() {
-            for (hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state, ember_hash) in
-                records
+            for (
+                hash,
+                uploaded,
+                downloaded,
+                last_seen,
+                public_key,
+                ident_ip,
+                ident_state,
+                ember_hash,
+            ) in records
             {
                 // `get_or_create` bumps `last_seen` to "now" — the right
                 // behaviour for live mutations but wrong on a startup
@@ -7683,6 +8061,9 @@ pub async fn start_network(
 
     let mut ember_refresh_timer = tokio::time::interval(std::time::Duration::from_secs(30));
     ember_refresh_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut friend_relay_ticket_poll_timer =
+        tokio::time::interval(rendezvous::FRIEND_RELAY_TICKET_RESPONDER_POLL_INTERVAL);
+    friend_relay_ticket_poll_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     let mut source_count_sync_timer = tokio::time::interval(std::time::Duration::from_secs(60));
     source_count_sync_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -7698,6 +8079,10 @@ pub async fn start_network(
         mpsc::unbounded_channel::<UpnpMaintainResult>();
     let (rendezvous_register_result_tx, mut rendezvous_register_result_rx) =
         mpsc::unbounded_channel::<RendezvousRegisterResult>();
+    let (friend_relay_ticket_poll_result_tx, mut friend_relay_ticket_poll_result_rx) =
+        mpsc::unbounded_channel::<FriendRelayTicketPollResult>();
+    let (friend_relay_ticket_session_done_tx, mut friend_relay_ticket_session_done_rx) =
+        mpsc::unbounded_channel::<String>();
     let (nat_probe_result_tx, mut nat_probe_result_rx) =
         mpsc::unbounded_channel::<NatProbeResult>();
     let mut nat_probe_packet_tx: Option<mpsc::Sender<(Vec<u8>, SocketAddr)>> = None;
@@ -7737,6 +8122,14 @@ pub async fn start_network(
     let mut upnp_maintain_started_at: Option<tokio::time::Instant> = None;
     let mut rendezvous_register_in_flight = false;
     let mut rendezvous_register_started_at: Option<tokio::time::Instant> = None;
+    let mut friend_relay_ticket_polls_in_flight = 0usize;
+    let mut friend_relay_ticket_sessions_in_flight = HashSet::<String>::new();
+    let mut friend_relay_ticket_candidate_offset = 0usize;
+    let mut friend_relay_ticket_poll_protocol = FriendRelayTicketPollProtocol::V3;
+    let mut friend_relay_ticket_friend_limit_warned = false;
+    let mut friend_relay_ticket_poll_retry_delay = std::time::Duration::from_secs(1);
+    let mut friend_relay_ticket_poll_not_before = tokio::time::Instant::now();
+    let mut friend_relay_ticket_poll_round_started_at: Option<tokio::time::Instant> = None;
     let mut nat_probe_in_flight = false;
     let mut nat_probe_started_at: Option<tokio::time::Instant> = None;
     let mut nat_probe_backoff_until: Option<tokio::time::Instant> = None;
@@ -9792,7 +10185,7 @@ pub async fn start_network(
                                     info!("Proactive friend session to {} failed: {e}", hex::encode(friend_eh));
                                     let _ = ultx2.send(upload_server::UploadEvent {
                                         transfer_id: String::new(),
-                                        kind: upload_server::UploadEventKind::EmberFriendDisconnected { ember_hash: friend_eh },
+                                        kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
                                     }).await;
                                 }
                             });
@@ -9885,43 +10278,20 @@ pub async fn start_network(
                     continue;
                 }
 
-                if let DownloadEvent::EmberBrowseResponse { ember_hash: browse_ember_hash, ref entries } = event {
-                    let hash_hex = hex::encode(browse_ember_hash);
-                    let files: Vec<serde_json::Value> = entries.iter().map(|(hash, size, name)| {
-                        let clean_name = crate::security::sanitize_display_name(name);
-                        serde_json::json!({ "hash": hash, "size": size, "name": clean_name })
-                    }).collect();
-                    let (request_id, send_next) = {
-                        let (request_id, send_next, remove_queue) =
-                            match state.pending_browse_requests.get_mut(&browse_ember_hash) {
-                                Some(requests) => {
-                                    let request_id =
-                                        (!requests.is_empty()).then(|| requests.remove(0));
-                                    (request_id, !requests.is_empty(), requests.is_empty())
-                                }
-                                None => (None, false, false),
-                            };
-                        if remove_queue {
-                            state.pending_browse_requests.remove(&browse_ember_hash);
-                        }
-                        (request_id, send_next)
-                    };
-                    if let Some(request_id) = request_id {
-                        let _ = app_handle.emit("ember:browse-result", serde_json::json!({
-                            "user_hash": hash_hex,
-                            "request_id": request_id,
-                            "files": files,
-                        }));
-                    }
-                    if send_next {
-                        if let Some(sender) = state.ember_sessions.read().await.get(&browse_ember_hash).filter(|h| h.is_fresh()) {
-                            let mut packet = Vec::with_capacity(6);
-                            packet.push(OP_EMULEPROT);
-                            packet.extend_from_slice(&(1u32).to_le_bytes());
-                            packet.push(ed2k::messages::OP_EMBER_BROWSE_REQ);
-                            let _ = sender.tx.try_send(packet);
-                        }
-                    }
+                if let DownloadEvent::EmberBrowseResponse {
+                    ember_hash,
+                    ref entries,
+                } = event
+                {
+                    // Browse requests are dispatched only over a canonical
+                    // friend session. A generic download connection has no
+                    // session generation, so accepting its response could
+                    // reintroduce cross-reconnect mis-correlation.
+                    debug!(
+                        "Ignoring unbound browse response from download connection for {} ({} entries)",
+                        hex::encode(ember_hash),
+                        entries.len()
+                    );
                     continue;
                 }
 
@@ -10717,65 +11087,130 @@ pub async fn start_network(
                     }
                 }
 
-                if let UploadEventKind::EmberBrowseResponse { ember_hash: browse_eh, ref entries } = event.kind {
+                if let UploadEventKind::EmberBrowseSessionReady {
+                    ember_hash: browse_eh,
+                    request_id,
+                    session_id,
+                    tx,
+                } = event.kind
+                {
+                    let Some(()) = bind_browse_request_to_session(
+                        &mut state.pending_browse_requests,
+                        browse_eh,
+                        &request_id,
+                        session_id,
+                    ) else {
+                        let _ = tx.send(Err(
+                            "Browse request was cancelled before the friend session opened".into(),
+                        ));
+                        continue;
+                    };
+                    dispatch_browse_head(&mut state, &app_handle, browse_eh).await;
+                    if browse_request_is_pending(
+                        &state.pending_browse_requests,
+                        browse_eh,
+                        &request_id,
+                    ) {
+                        let _ = tx.send(Ok(()));
+                    } else {
+                        let _ = tx.send(Err(
+                            "Browse session was replaced before the request was sent".into(),
+                        ));
+                    }
+                    continue;
+                }
+
+                if let UploadEventKind::EmberBrowseSessionFailed {
+                    ember_hash: browse_eh,
+                    request_id,
+                    error,
+                    tx,
+                } = event.kind
+                {
+                    let _ = remove_browse_request(
+                        &mut state.pending_browse_requests,
+                        browse_eh,
+                        &request_id,
+                    );
+                    dispatch_browse_head(&mut state, &app_handle, browse_eh).await;
+                    let _ = tx.send(Err(error));
+                    continue;
+                }
+
+                if let UploadEventKind::EmberBrowseResponse {
+                    ember_hash: browse_eh,
+                    session_id,
+                    ref entries,
+                } = event.kind
+                {
                     let hash_hex = hex::encode(browse_eh);
                     let files: Vec<serde_json::Value> = entries.iter().map(|(hash, size, name)| {
                         let clean_name = crate::security::sanitize_display_name(name);
                         serde_json::json!({ "hash": hash, "size": size, "name": clean_name })
                     }).collect();
-                    let (request_id, send_next) = {
-                        let (request_id, send_next, remove_queue) =
-                            match state.pending_browse_requests.get_mut(&browse_eh) {
-                                Some(requests) => {
-                                    let request_id =
-                                        (!requests.is_empty()).then(|| requests.remove(0));
-                                    (request_id, !requests.is_empty(), requests.is_empty())
-                                }
-                                None => (None, false, false),
-                            };
-                        if remove_queue {
-                            state.pending_browse_requests.remove(&browse_eh);
-                        }
-                        (request_id, send_next)
-                    };
-                    if let Some(request_id) = request_id {
+                    if let Some(request_id) = complete_browse_request(
+                        &mut state.pending_browse_requests,
+                        browse_eh,
+                        session_id,
+                    ) {
                         let _ = app_handle.emit("ember:browse-result", serde_json::json!({
                             "user_hash": hash_hex,
                             "request_id": request_id,
                             "files": files,
                         }));
-                    }
-                    if send_next {
-                        if let Some(sender) = state.ember_sessions.read().await.get(&browse_eh).filter(|h| h.is_fresh()) {
-                            let mut packet = Vec::with_capacity(6);
-                            packet.push(OP_EMULEPROT);
-                            packet.extend_from_slice(&(1u32).to_le_bytes());
-                            packet.push(ed2k::messages::OP_EMBER_BROWSE_REQ);
-                            let _ = sender.tx.try_send(packet);
-                        }
+                        dispatch_browse_head(&mut state, &app_handle, browse_eh).await;
+                    } else {
+                        debug!(
+                            "Ignoring stale or unbound browse response from {} session {}",
+                            hash_hex, session_id
+                        );
                     }
                 }
 
-                if let UploadEventKind::EmberFriendDisconnected { ember_hash: dc_eh } = event.kind {
+                if let UploadEventKind::EmberFriendDisconnected {
+                    ember_hash: dc_eh,
+                    session_id,
+                } = event.kind
+                {
                     let hash_hex = hex::encode(dc_eh);
-                    state.online_friends.remove(&dc_eh);
-                    state.outbound_session_tasks.remove(&dc_eh);
-                    let _ = app_handle.emit("ember:friend-offline", serde_json::json!({
-                        "user_hash": hash_hex,
-                    }));
-                    for request_id in state
-                        .pending_browse_requests
-                        .remove(&dc_eh)
-                        .unwrap_or_default()
-                    {
+                    for request_id in remove_browse_requests_for_session(
+                        &mut state.pending_browse_requests,
+                        dc_eh,
+                        session_id,
+                    ) {
                         let _ = app_handle.emit("ember:browse-error", serde_json::json!({
                             "user_hash": hash_hex,
                             "request_id": request_id,
                             "reason": "Friend disconnected",
                         }));
                     }
+                    // The queue may still contain requests already bound to a
+                    // newer replacement session. Re-enter the sole dispatcher
+                    // so the new head is sent instead of being stranded.
+                    dispatch_browse_head(&mut state, &app_handle, dc_eh).await;
+                    let newer_session_active = state
+                        .ember_sessions
+                        .read()
+                        .await
+                        .get(&dc_eh)
+                        .is_some_and(|handle| {
+                            handle.session_id() != session_id && handle.is_fresh()
+                        });
+                    if newer_session_active {
+                        debug!(
+                            "Ignoring disconnect from retired friend session {} for {}",
+                            session_id, hash_hex
+                        );
+                    } else {
+                        state.online_friends.remove(&dc_eh);
+                        state.outbound_session_tasks.remove(&dc_eh);
+                        let _ = app_handle.emit("ember:friend-offline", serde_json::json!({
+                            "user_hash": hash_hex,
+                        }));
+                    }
 
-                    if friend_hashes.read().await.contains(&dc_eh)
+                    if !newer_session_active
+                        && friend_hashes.read().await.contains(&dc_eh)
                         && !state.ember_sessions.read().await.get(&dc_eh).is_some_and(|h| h.is_fresh())
                     {
                         let now_inst = std::time::Instant::now();
@@ -14131,6 +14566,317 @@ pub async fn start_network(
                 }
             }
 
+            // Poll authenticated friend relay offers independently from the
+            // 60-second publishing heartbeat. The bounded timeout and
+            // in-flight flag guarantee a slow rendezvous cannot create one
+            // task per cadence tick.
+            _ = friend_relay_ticket_poll_timer.tick() => {
+                if state.rendezvous_registered
+                    && friend_relay_ticket_polls_in_flight == 0
+                    && tokio::time::Instant::now() >= friend_relay_ticket_poll_not_before
+                {
+                    let mut friend_candidates: Vec<[u8; 16]> =
+                        friend_hashes.read().await.iter().copied().collect();
+                    friend_candidates.sort_unstable();
+                    if friend_candidates.len() > rendezvous::FRIEND_RELAY_TICKET_SUPPORTED_FRIENDS {
+                        if !friend_relay_ticket_friend_limit_warned {
+                            tracing::warn!(
+                                "Friend relay ticket discovery supports at most {} friends; \
+                                 limiting this polling cycle from {} entries",
+                                rendezvous::FRIEND_RELAY_TICKET_SUPPORTED_FRIENDS,
+                                friend_candidates.len(),
+                            );
+                            friend_relay_ticket_friend_limit_warned = true;
+                        }
+                        friend_candidates
+                            .truncate(rendezvous::FRIEND_RELAY_TICKET_SUPPORTED_FRIENDS);
+                    } else {
+                        friend_relay_ticket_friend_limit_warned = false;
+                    }
+                    if !friend_candidates.is_empty() {
+                        match friend_relay_ticket_poll_protocol {
+                            FriendRelayTicketPollProtocol::V3 => {
+                                friend_relay_ticket_poll_round_started_at =
+                                    Some(tokio::time::Instant::now());
+                                let round_timestamp = rendezvous::current_timestamp();
+                                let page_count = friend_candidates.len().div_ceil(
+                                    rendezvous::FRIEND_RELAY_TICKET_POLL_CANDIDATES_PER_REQUEST,
+                                );
+                                let requests_this_round = page_count.min(
+                                    rendezvous::FRIEND_RELAY_TICKET_PARALLEL_POLL_REQUESTS,
+                                );
+                                for _ in 0..requests_this_round {
+                                    let start =
+                                        friend_relay_ticket_candidate_offset % friend_candidates.len();
+                                    let end = (start
+                                        + rendezvous::FRIEND_RELAY_TICKET_POLL_CANDIDATES_PER_REQUEST)
+                                        .min(friend_candidates.len());
+                                    friend_relay_ticket_candidate_offset = if end == friend_candidates.len() {
+                                        0
+                                    } else {
+                                        end
+                                    };
+                                    let candidate_page = friend_candidates[start..end].to_vec();
+                                    let rv_url = settings.rendezvous_url.clone();
+                                    let poll_tx = friend_relay_ticket_poll_result_tx.clone();
+                                    friend_relay_ticket_polls_in_flight += 1;
+                                    tokio::spawn(async move {
+                                        let result = match tokio::time::timeout(
+                                            rendezvous::FRIEND_RELAY_TICKET_POLL_TIMEOUT,
+                                            rendezvous::poll_friend_relay_tickets(
+                                                &rv_url,
+                                                &ember_hash,
+                                                &candidate_page,
+                                                None,
+                                                round_timestamp,
+                                                &ed25519_secret_key,
+                                            ),
+                                        )
+                                        .await
+                                        {
+                                            Ok(result) => result,
+                                            Err(_) => Err("friend relay ticket poll timed out".to_string()),
+                                        };
+                                        let _ = poll_tx.send(FriendRelayTicketPollResult {
+                                            result,
+                                            protocol: FriendRelayTicketPollProtocol::V3,
+                                        });
+                                    });
+                                }
+                            }
+                            FriendRelayTicketPollProtocol::LegacyV2 => {
+                                let rv_url = settings.rendezvous_url.clone();
+                                let poll_tx = friend_relay_ticket_poll_result_tx.clone();
+                                friend_relay_ticket_polls_in_flight += 1;
+                                friend_relay_ticket_poll_not_before =
+                                    tokio::time::Instant::now()
+                                        + rendezvous::FRIEND_RELAY_TICKET_LEGACY_POLL_INTERVAL;
+                                tokio::spawn(async move {
+                                    let result = match tokio::time::timeout(
+                                        rendezvous::FRIEND_RELAY_TICKET_POLL_TIMEOUT,
+                                        rendezvous::poll_friend_relay_tickets_v2_compat(
+                                            &rv_url,
+                                            &ember_hash,
+                                            &ed25519_secret_key,
+                                        ),
+                                    )
+                                    .await
+                                    {
+                                        Ok(result) => result,
+                                        Err(_) => Err("friend relay ticket v2 poll timed out".to_string()),
+                                    };
+                                    let _ = poll_tx.send(FriendRelayTicketPollResult {
+                                        result,
+                                        protocol: FriendRelayTicketPollProtocol::LegacyV2,
+                                    });
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            Some(result) = friend_relay_ticket_poll_result_rx.recv() => {
+                friend_relay_ticket_polls_in_flight =
+                    friend_relay_ticket_polls_in_flight.saturating_sub(1);
+                if result.protocol != friend_relay_ticket_poll_protocol {
+                    // A result from the v3 batch that detected an unsupported
+                    // route cannot re-enable parallel polling after we have
+                    // switched to the legacy budget.
+                    if friend_relay_ticket_poll_protocol
+                        == FriendRelayTicketPollProtocol::LegacyV2
+                        && friend_relay_ticket_polls_in_flight == 0
+                    {
+                        friend_relay_ticket_poll_timer.reset_immediately();
+                    }
+                    continue;
+                }
+                let page = match result.result {
+                    Ok(page) => page,
+                    Err(e) => {
+                        tracing::trace!("Friend relay ticket poll: {e}");
+                        if result.protocol == FriendRelayTicketPollProtocol::V3
+                            && rendezvous::is_v3_relay_ticket_poll_unsupported(&e)
+                        {
+                            friend_relay_ticket_poll_protocol =
+                                FriendRelayTicketPollProtocol::LegacyV2;
+                            friend_relay_ticket_candidate_offset = 0;
+                            friend_relay_ticket_poll_round_started_at = None;
+                            friend_relay_ticket_poll_retry_delay =
+                                std::time::Duration::from_secs(1);
+                            friend_relay_ticket_poll_not_before = tokio::time::Instant::now();
+                            if friend_relay_ticket_polls_in_flight == 0 {
+                                friend_relay_ticket_poll_timer.reset_immediately();
+                            }
+                            continue;
+                        }
+                        if rendezvous::is_transient_relay_ticket_read_error(&e)
+                            || e.contains("timed out")
+                        {
+                            let minimum_delay =
+                                if result.protocol == FriendRelayTicketPollProtocol::LegacyV2 {
+                                    rendezvous::FRIEND_RELAY_TICKET_LEGACY_POLL_INTERVAL
+                                } else {
+                                    std::time::Duration::ZERO
+                                };
+                            friend_relay_ticket_poll_not_before =
+                                tokio::time::Instant::now()
+                                    + friend_relay_ticket_poll_retry_delay.max(minimum_delay);
+                            friend_relay_ticket_poll_retry_delay =
+                                (friend_relay_ticket_poll_retry_delay * 2)
+                                    .min(std::time::Duration::from_secs(5));
+                        }
+                        continue;
+                    }
+                };
+                friend_relay_ticket_poll_retry_delay = std::time::Duration::from_secs(1);
+                if result.protocol == FriendRelayTicketPollProtocol::V3 {
+                    if friend_relay_ticket_polls_in_flight == 0 {
+                        let now = tokio::time::Instant::now();
+                        let delay = friend_relay_ticket_poll_round_started_at
+                            .take()
+                            .map(|started_at| relay_ticket_next_round_delay(started_at, now))
+                            .unwrap_or(rendezvous::FRIEND_RELAY_TICKET_RESPONDER_POLL_INTERVAL);
+                        // Reset to the scheduled cadence boundary, not
+                        // immediately: fast responses must never create a
+                        // tight poll loop, while a completion just after a
+                        // missed tick can still begin the next round now.
+                        friend_relay_ticket_poll_not_before = now + delay;
+                        friend_relay_ticket_poll_timer.reset_after(delay);
+                    }
+                }
+                if page.next_cursor.is_some() {
+                    // A v3 request has at most 16 candidates and one ticket
+                    // per pair, so a cursor should be unreachable. Do not
+                    // stall other candidate slices if a malformed/legacy
+                    // response supplies one.
+                    tracing::debug!("Ignoring unexpected relay ticket poll cursor");
+                }
+                let offers = page.tickets;
+
+                // The server only sees identities, not local friend
+                // relationships. Filter offers locally, then keep at most the
+                // accepted-ticket capacity worth of join/session tasks alive.
+                for offer in offers {
+                    if friend_relay_ticket_sessions_in_flight.len()
+                        >= MAX_FRIEND_RELAY_TICKET_SESSIONS
+                    {
+                        break;
+                    }
+                    let peer_ember_hash = {
+                        let friends = friend_hashes.read().await;
+                        friends.iter().copied().find(|hash| {
+                            rendezvous::hashed_id(hash)
+                                .eq_ignore_ascii_case(&offer.initiator_id)
+                        })
+                    };
+                    let Some(peer_ember_hash) = peer_ember_hash else {
+                        tracing::debug!("Ignoring relay ticket from a non-friend identity");
+                        continue;
+                    };
+
+                    let ticket_id = offer.ticket_id;
+                    if !friend_relay_ticket_sessions_in_flight.insert(ticket_id.clone()) {
+                        continue;
+                    }
+
+                    let rv_url = settings.rendezvous_url.clone();
+                    let done_tx = friend_relay_ticket_session_done_tx.clone();
+                    let fc_our_user_hash = state.user_hash;
+                    let fc_our_ember_hash = ember_hash;
+                    let fc_nickname = settings.nickname.clone();
+                    let fc_client_id = state
+                        .external_ip
+                        .map(|eip| u32::from_le_bytes(eip.octets()))
+                        .unwrap_or(0);
+                    let fc_tcp_port = advertised_tcp_port(&state);
+                    let fc_udp_port = advertised_udp_port(&state);
+                    let fc_obfuscate = settings.friend_session_encryption;
+                    let fc_ember_sessions = state.ember_sessions.clone();
+                    let fc_ul_event_tx = ul_event_tx.clone();
+                    let fc_friend_hashes = friend_hashes.clone();
+
+                    tokio::spawn(async move {
+                        let responder_token = match tokio::time::timeout(
+                            rendezvous::FRIEND_RELAY_TICKET_ACTION_TIMEOUT,
+                            rendezvous::accept_friend_relay_ticket(
+                                &rv_url,
+                                &fc_our_ember_hash,
+                                &ticket_id,
+                                &ed25519_secret_key,
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(Ok(token)) => token,
+                            Ok(Err(e)) => {
+                                tracing::debug!("Friend relay ticket accept failed: {e}");
+                                let _ = done_tx.send(ticket_id);
+                                return;
+                            }
+                            Err(_) => {
+                                tracing::debug!("Friend relay ticket accept timed out");
+                                let _ = done_tx.send(ticket_id);
+                                return;
+                            }
+                        };
+
+                        match ember::relay::connect_server_relay(
+                            &rv_url,
+                            &ticket_id,
+                            &responder_token,
+                        )
+                        .await
+                        {
+                            Ok(ws) => {
+                                let (reader, writer) = tokio::io::split(ws);
+                                let addr = SocketAddr::new(
+                                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                                    0,
+                                );
+                                match ed2k::friend_connect::run_friend_session_over_transport(
+                                    Box::new(reader),
+                                    Box::new(writer),
+                                    addr,
+                                    peer_ember_hash,
+                                    fc_our_user_hash,
+                                    fc_our_ember_hash,
+                                    fc_nickname,
+                                    fc_client_id,
+                                    fc_tcp_port,
+                                    fc_udp_port,
+                                    fc_obfuscate,
+                                    fc_ember_sessions,
+                                    fc_ul_event_tx,
+                                    fc_friend_hashes,
+                                    Some(ed25519_pubkey),
+                                    Some(ed25519_secret_key),
+                                )
+                                .await
+                                {
+                                    Ok(_) => tracing::info!(
+                                        "Friend relay session established for {}",
+                                        hex::encode(peer_ember_hash)
+                                    ),
+                                    Err(e) => tracing::debug!(
+                                        "Friend relay session failed for {}: {e}",
+                                        hex::encode(peer_ember_hash)
+                                    ),
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!("Friend relay ticket join failed: {e}");
+                            }
+                        }
+                        let _ = done_tx.send(ticket_id);
+                    });
+                }
+            }
+
+            Some(ticket_id) = friend_relay_ticket_session_done_rx.recv() => {
+                friend_relay_ticket_sessions_in_flight.remove(&ticket_id);
+            }
+
             // Periodic publishing
             _ = publish_timer.tick() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
@@ -14216,130 +14962,6 @@ pub async fn start_network(
                             );
                         }
                     }
-                }
-
-                // Poll only authenticated, identity-bound friend relay offers.
-                // Anonymous LowID source relays intentionally have no server
-                // fallback; their former synthetic IP:port invite protocol was
-                // unauthenticated and is retired.
-                if state.rendezvous_registered {
-                    let rv_url = settings.rendezvous_url.clone();
-                    let fc_our_user_hash = state.user_hash;
-                    let fc_our_ember_hash = ember_hash;
-                    let fc_nickname = settings.nickname.clone();
-                    let fc_client_id = state
-                        .external_ip
-                        .map(|eip| u32::from_le_bytes(eip.octets()))
-                        .unwrap_or(0);
-                    let fc_tcp_port = advertised_tcp_port(&state);
-                    let fc_udp_port = advertised_udp_port(&state);
-                    let fc_obfuscate = settings.friend_session_encryption;
-                    let fc_ember_sessions = state.ember_sessions.clone();
-                    let fc_ul_event_tx = ul_event_tx.clone();
-                    let fc_friend_hashes = friend_hashes.clone();
-                    tokio::spawn(async move {
-                        let offers = match rendezvous::poll_friend_relay_tickets(
-                            &rv_url,
-                            &fc_our_ember_hash,
-                            &ed25519_secret_key,
-                        )
-                        .await
-                        {
-                            Ok(offers) => offers,
-                            Err(e) => {
-                                tracing::trace!("Friend relay ticket poll: {e}");
-                                return;
-                            }
-                        };
-
-                        for offer in offers {
-                            let peer_ember_hash = {
-                                let friends = fc_friend_hashes.read().await;
-                                friends.iter().copied().find(|hash| {
-                                    rendezvous::hashed_id(hash).eq_ignore_ascii_case(&offer.initiator_id)
-                                })
-                            };
-                            let Some(peer_ember_hash) = peer_ember_hash else {
-                                tracing::debug!(
-                                    "Ignoring relay ticket from a non-friend identity"
-                                );
-                                continue;
-                            };
-
-                            let responder_token = match rendezvous::accept_friend_relay_ticket(
-                                &rv_url,
-                                &fc_our_ember_hash,
-                                &offer.ticket_id,
-                                &ed25519_secret_key,
-                            )
-                            .await
-                            {
-                                Ok(token) => token,
-                                Err(e) => {
-                                    tracing::debug!("Friend relay ticket accept failed: {e}");
-                                    continue;
-                                }
-                            };
-
-                            let url = rv_url.clone();
-                            let ticket_id = offer.ticket_id;
-                            let nick = fc_nickname.clone();
-                            let sess = fc_ember_sessions.clone();
-                            let ultx = fc_ul_event_tx.clone();
-                            let fh = fc_friend_hashes.clone();
-                            tokio::spawn(async move {
-                                match ember::relay::connect_server_relay(
-                                    &url,
-                                    &ticket_id,
-                                    &responder_token,
-                                )
-                                .await
-                                {
-                                    Ok(ws) => {
-                                        let (reader, writer) = tokio::io::split(ws);
-                                        let addr = SocketAddr::new(
-                                            std::net::IpAddr::V4(
-                                                std::net::Ipv4Addr::UNSPECIFIED,
-                                            ),
-                                            0,
-                                        );
-                                        match ed2k::friend_connect::run_friend_session_over_transport(
-                                            Box::new(reader),
-                                            Box::new(writer),
-                                            addr,
-                                            peer_ember_hash,
-                                            fc_our_user_hash,
-                                            fc_our_ember_hash,
-                                            nick,
-                                            fc_client_id,
-                                            fc_tcp_port,
-                                            fc_udp_port,
-                                            fc_obfuscate,
-                                            sess,
-                                            ultx,
-                                            fh,
-                                            Some(ed25519_pubkey),
-                                            Some(ed25519_secret_key),
-                                        )
-                                        .await
-                                        {
-                                            Ok(_) => tracing::info!(
-                                                "Friend relay session established for {}",
-                                                hex::encode(peer_ember_hash)
-                                            ),
-                                            Err(e) => tracing::debug!(
-                                                "Friend relay session failed for {}: {e}",
-                                                hex::encode(peer_ember_hash)
-                                            ),
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::debug!("Friend relay ticket join failed: {e}");
-                                    }
-                                }
-                            });
-                        }
-                    });
                 }
 
                 // Poll for incoming hole-punch requests targeting our own
@@ -15424,14 +16046,12 @@ pub async fn start_network(
                                     .external_ip
                                     .map(|ip| u32::from_le_bytes(ip.octets()))
                                     .unwrap_or(0);
-                                // Inlined `advertised_tcp_port(&state)`: a
-                                // whole-struct borrow would conflict with the
-                                // active `state.broker_event_rx` mutable
-                                // borrow (`rx`) for this match arm.
-                                let greet_tcp_port = state
-                                    .external_tcp_port
-                                    .filter(|p| *p != 0)
-                                    .unwrap_or(state.tcp_port);
+                                // The active broker-event receiver prevents a
+                                // whole-struct borrow here. TCP always uses
+                                // the configured listener port; a twin UDP
+                                // STUN observation is never a TCP advertise
+                                // override.
+                                let greet_tcp_port = state.tcp_port;
                                 // Same STUN-aware fallback as TCP above (via
                                 // `advertised_udp_port`, inlined for the same
                                 // borrow-conflict reason as `greet_tcp_port`).
@@ -22765,9 +23385,7 @@ pub async fn start_network(
                     PeriodicSaveJob::Stats => {
                         stats_save_in_flight = false;
                         if let Err(e) = result.result {
-                            error!(
-                                "Periodic statistics save (drained at shutdown) failed: {e}"
-                            );
+                            error!("Periodic statistics save (drained at shutdown) failed: {e}");
                         }
                     }
                     // Sibling periodic jobs may finish while we wait for Stats;
@@ -22965,7 +23583,12 @@ pub async fn start_network(
     }
 
     let server_met_path = state.data_dir.join("server.met");
-    spawn_save_server_met(&state.server_list, server_met_path.clone(), &state.server_met_save_generation, &state.server_met_save_lock);
+    spawn_save_server_met(
+        &state.server_list,
+        server_met_path.clone(),
+        &state.server_met_save_generation,
+        &state.server_met_save_lock,
+    );
 
     // Unregister from the rendezvous server LAST and with a short bound.
     // This is a best-effort courtesy call to a remote host that may be slow
@@ -23112,14 +23735,24 @@ async fn maybe_send_hello_challenge(
             receiver: contact_id,
         };
         if let Ok(packet) = messages::encode_packet(&req) {
-            state
-                .legacy_challenges
-                .add(contact_id, challenge, ip, LegacyChallengeTracker::OPCODE_REQ);
+            state.legacy_challenges.add(
+                contact_id,
+                challenge,
+                ip,
+                LegacyChallengeTracker::OPCODE_REQ,
+            );
             state
                 .flood_protection
                 .track_request(from, messages::KADEMLIA2_REQ);
-            let _ = send_kad_response(socket, &packet, from, state, Some(&contact_id), peer_udp_key)
-                .await;
+            let _ = send_kad_response(
+                socket,
+                &packet,
+                from,
+                state,
+                Some(&contact_id),
+                peer_udp_key,
+            )
+            .await;
             debug!("Sent legacy KadReq challenge to {from} (version={version})");
         }
     } else if version == KADEMLIA_VERSION7_49A {
@@ -23132,8 +23765,15 @@ async fn maybe_send_hello_challenge(
                 LegacyChallengeTracker::OPCODE_PING,
             );
             state.flood_protection.track_request(from, 0x60);
-            let _ = send_kad_response(socket, &packet, from, state, Some(&contact_id), peer_udp_key)
-                .await;
+            let _ = send_kad_response(
+                socket,
+                &packet,
+                from,
+                state,
+                Some(&contact_id),
+                peer_udp_key,
+            )
+            .await;
             debug!("Sent legacy Ping challenge to {from}");
         }
     }
@@ -23307,14 +23947,20 @@ fn update_publish_manager_state(state: &mut NetworkState) {
     // BuddyManager bakes tcp_port/udp_port in at construction (buddy Hello
     // handshake / OP_CALLBACK payloads) with no other refresh path — without
     // this, a mid-session STUN remap would never reach the buddy protocol.
-    state.buddy_manager.set_tcp_port(state.publish_manager.tcp_port);
-    state.buddy_manager.set_udp_port(state.publish_manager.udp_port);
     state
-        .advertise_tcp_port
-        .store(state.publish_manager.tcp_port, std::sync::atomic::Ordering::Relaxed);
+        .buddy_manager
+        .set_tcp_port(state.publish_manager.tcp_port);
     state
-        .advertise_udp_port
-        .store(state.publish_manager.udp_port, std::sync::atomic::Ordering::Relaxed);
+        .buddy_manager
+        .set_udp_port(state.publish_manager.udp_port);
+    state.advertise_tcp_port.store(
+        state.publish_manager.tcp_port,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    state.advertise_udp_port.store(
+        state.publish_manager.udp_port,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     state.publish_manager.direct_udp_callback = can_advertise_direct_udp_callback(state);
     state.publish_manager.connect_options = build_kad_connect_options(state);
 
@@ -23391,7 +24037,8 @@ fn dispatch_udp_firewall_probe_requests(
                 .routing_table
                 .find_closest_prefer_verified(&target, SEARCH_INITIAL_CONTACTS);
             if !closest.is_empty() {
-                let sid = start_kad_search(state, app_handle, target, SearchType::FindNode, closest);
+                let sid =
+                    start_kad_search(state, app_handle, target, SearchType::FindNode, closest);
                 if sid != SearchId(0) {
                     if let Some(s) = state.search_manager.get_mut(&sid) {
                         s.is_udp_fw_probe_search = true;
@@ -24671,13 +25318,8 @@ async fn handle_udp_packet_inner(
                     .find_closest(&state.local_id, SEARCH_INITIAL_CONTACTS);
                 if !closest.is_empty() {
                     let self_id = state.local_id;
-                    let sid = start_kad_search(
-                        state,
-                        app_handle,
-                        self_id,
-                        SearchType::FindNode,
-                        closest,
-                    );
+                    let sid =
+                        start_kad_search(state, app_handle, self_id, SearchType::FindNode, closest);
                     if sid != SearchId(0) {
                         info!("Started self-lookup from BootstrapRes, search {}, {table_size} contacts", sid.0);
                         state.self_lookup_done = true;
@@ -25052,7 +25694,10 @@ async fn handle_udp_packet_inner(
                     v4,
                     LegacyChallengeTracker::OPCODE_REQ,
                 ) {
-                    if state.routing_table.get_contact(&contact_id).map(|c| c.ip == v4)
+                    if state
+                        .routing_table
+                        .get_contact(&contact_id)
+                        .map(|c| c.ip == v4)
                         == Some(true)
                     {
                         state.routing_table.mark_verified(&contact_id);
@@ -25704,7 +26349,10 @@ async fn handle_udp_packet_inner(
                     v4,
                     LegacyChallengeTracker::OPCODE_PING,
                 ) {
-                    if state.routing_table.get_contact(&contact_id).map(|c| c.ip == v4)
+                    if state
+                        .routing_table
+                        .get_contact(&contact_id)
+                        .map(|c| c.ip == v4)
                         == Some(true)
                     {
                         state.routing_table.mark_verified(&contact_id);
@@ -25733,7 +26381,10 @@ async fn handle_udp_packet_inner(
             // (firewall checks, legacy challenges) must not clear pending or
             // feed the RTT queue, and a late pong from a rotated host must
             // not reset the new host's miss counter.
-            if state.uss_enabled_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            if state
+                .uss_enabled_flag
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
                 let is_current_uss_host = state
                     .uss_host
                     .as_ref()
@@ -26279,10 +26930,8 @@ async fn handle_udp_packet_inner(
                 // Sync before emit so a FirewalledRes that arrives after TCP
                 // connect-backs already proved Open doesn't push a stale
                 // stats.tcp_status string (often still "Unknown") to the UI.
-                state.stats.tcp_status =
-                    format!("{:?}", state.firewall_checker.tcp_status());
-                state.stats.udp_status =
-                    format!("{:?}", state.firewall_checker.udp_status());
+                state.stats.tcp_status = format!("{:?}", state.firewall_checker.tcp_status());
+                state.stats.udp_status = format!("{:?}", state.firewall_checker.udp_status());
                 let _ = app_handle.emit(
                     "firewall-status",
                     serde_json::json!({
@@ -26662,6 +27311,13 @@ async fn handle_udp_packet_inner(
     }
 }
 
+async fn take_fresh_part_hashes(
+    fresh_part_hashes: &Arc<RwLock<HashMap<[u8; 16], Vec<[u8; 16]>>>>,
+    file_hash: &[u8; 16],
+) -> Option<Vec<[u8; 16]>> {
+    fresh_part_hashes.write().await.remove(file_hash)
+}
+
 /// Panic-isolating wrapper around [`handle_command_inner`]. Frontend/IPC
 /// commands drive nearly every operation; a panic in one handler must not
 /// permanently freeze networking, so it is caught and the loop carries on.
@@ -26812,7 +27468,9 @@ async fn handle_command_inner(
                 file_type_filter: file_type_filter.clone(),
                 min_size: search_filters.as_ref().and_then(|f| f.min_size),
                 max_size: search_filters.as_ref().and_then(|f| f.max_size),
-                file_extension: search_filters.as_ref().and_then(|f| f.file_extension.clone()),
+                file_extension: search_filters
+                    .as_ref()
+                    .and_then(|f| f.file_extension.clone()),
                 min_availability: search_filters.as_ref().and_then(|f| f.min_availability),
                 keywords: Vec::new(),
                 server_ip: state.server_addr.map(|a| a.ip().to_string()),
@@ -26902,8 +27560,7 @@ async fn handle_command_inner(
 
             // --- UDP global search ---
             if run_udp {
-                let uses_64bit_search =
-                    kad::messages::search_expression_uses_64bit(&search_expr);
+                let uses_64bit_search = kad::messages::search_expression_uses_64bit(&search_expr);
                 let connected_addr = state.server_addr;
                 let servers = state.server_list.servers().to_vec();
                 let mut dropped = 0usize;
@@ -27271,12 +27928,7 @@ async fn handle_command_inner(
                 let primary_ok = match source_addr.ip() {
                     std::net::IpAddr::V4(primary_v4) => {
                         seen_addrs.insert((primary_v4, source_addr.port()));
-                        is_source_admissible(
-                            &state,
-                            primary_v4,
-                            source_addr.port(),
-                            None,
-                        )
+                        is_source_admissible(&state, primary_v4, source_addr.port(), None)
                     }
                     _ => false,
                 };
@@ -27480,9 +28132,8 @@ async fn handle_command_inner(
 
                 let download_sources = {
                     let sm = source_manager.read().await;
-                    let mut sources = Vec::with_capacity(
-                        usize::from(primary_ok) + validated_extras.len(),
-                    );
+                    let mut sources =
+                        Vec::with_capacity(usize::from(primary_ok) + validated_extras.len());
                     if primary_ok {
                         let uh = if let std::net::IpAddr::V4(v4) = source_addr.ip() {
                             sm.get_user_hash(&hash_bytes, v4, source_addr.port())
@@ -27545,92 +28196,95 @@ async fn handle_command_inner(
                         },
                     );
                 } else {
-                if !validated_extras.is_empty() {
-                    info!(
+                    if !validated_extras.is_empty() {
+                        info!(
                         "Seeded multi-source download {} with primary {}:{} + {} extra source(s)",
                         transfer_id,
                         peer_ip,
                         peer_port,
                         validated_extras.len()
                     );
-                }
-                let (src_inject_tx, src_inject_rx) = mpsc::channel::<DownloadSource>(32);
-                let (est_inject_tx, est_inject_rx) =
-                    mpsc::channel::<ed2k::multi_source::EstablishedSource>(
-                        ESTABLISHED_SOURCE_CHANNEL_CAP,
-                    );
-                let ms_download = MultiSourceDownload {
-                    // Clone instead of move so the outer `transfer_id`
-                    // survives for the source-discovery dispatch below.
-                    transfer_id: transfer_id.clone(),
-                    file_hash: hash_bytes,
-                    file_name,
-                    file_size,
-                    sources: download_sources,
-                    download_dir: PathBuf::from(&settings.download_folder),
-                    user_hash: state.user_hash,
-                    nickname: settings.nickname.clone(),
-                    tcp_port: advertised_tcp_port(&state),
-                    udp_port: advertised_udp_port(&state),
-                    bandwidth_limiter: bandwidth_limiter.clone(),
-                    control,
-                    source_manager: Some(source_manager.clone()),
-                    comment_manager: Some(state.comment_manager.clone()),
-                    credit_manager: Some(credit_manager.clone()),
-                    shared_buddy_info: Some(state.shared_buddy_info.clone()),
-                    obfuscation_enabled: state.obfuscation_enabled,
-                    server_addr: state.server_addr,
-                    new_source_rx: Some(src_inject_rx),
-                    new_established_rx: Some(est_inject_rx),
-                    ed2k_limits: settings.ed2k_download_limits(),
-                    ember_hash,
-                    ed25519_public_key: ed25519_pubkey,
-                    ed25519_secret_key,
-                    friend_hashes: Some(friend_hashes.clone()),
-                    ember_payload: shared_ember_payload.clone(),
-                    ember_payload_generation: ember_payload_generation.clone(),
-                    ip_filter: Some(state.shared_ip_filter.clone()),
-                    banned_ips: Some(shared_banned_ips.clone()),
-                    external_ip: state.external_ip,
-                    aich_pending: Some(state.aich_recovery_pending.clone()),
-                    trusted_aich_master: state.aich_root_map.get(&hash_bytes).copied(),
-                    geoip: geoip.clone(),
-                    tracker_registry: Some(state.tracker_registry.clone()),
-                    sx_overhead: stats_manager.sx_counters.clone(),
-                };
+                    }
+                    let (src_inject_tx, src_inject_rx) = mpsc::channel::<DownloadSource>(32);
+                    let (est_inject_tx, est_inject_rx) =
+                        mpsc::channel::<ed2k::multi_source::EstablishedSource>(
+                            ESTABLISHED_SOURCE_CHANNEL_CAP,
+                        );
+                    let ms_download = MultiSourceDownload {
+                        // Clone instead of move so the outer `transfer_id`
+                        // survives for the source-discovery dispatch below.
+                        transfer_id: transfer_id.clone(),
+                        file_hash: hash_bytes,
+                        file_name,
+                        file_size,
+                        sources: download_sources,
+                        download_dir: PathBuf::from(&settings.download_folder),
+                        user_hash: state.user_hash,
+                        nickname: settings.nickname.clone(),
+                        tcp_port: advertised_tcp_port(&state),
+                        udp_port: advertised_udp_port(&state),
+                        bandwidth_limiter: bandwidth_limiter.clone(),
+                        control,
+                        source_manager: Some(source_manager.clone()),
+                        comment_manager: Some(state.comment_manager.clone()),
+                        credit_manager: Some(credit_manager.clone()),
+                        shared_buddy_info: Some(state.shared_buddy_info.clone()),
+                        obfuscation_enabled: state.obfuscation_enabled,
+                        server_addr: state.server_addr,
+                        new_source_rx: Some(src_inject_rx),
+                        new_established_rx: Some(est_inject_rx),
+                        ed2k_limits: settings.ed2k_download_limits(),
+                        ember_hash,
+                        ed25519_public_key: ed25519_pubkey,
+                        ed25519_secret_key,
+                        friend_hashes: Some(friend_hashes.clone()),
+                        ember_payload: shared_ember_payload.clone(),
+                        ember_payload_generation: ember_payload_generation.clone(),
+                        ip_filter: Some(state.shared_ip_filter.clone()),
+                        banned_ips: Some(shared_banned_ips.clone()),
+                        external_ip: state.external_ip,
+                        aich_pending: Some(state.aich_recovery_pending.clone()),
+                        trusted_aich_master: state.aich_root_map.get(&hash_bytes).copied(),
+                        geoip: geoip.clone(),
+                        tracker_registry: Some(state.tracker_registry.clone()),
+                        sx_overhead: stats_manager.sx_counters.clone(),
+                    };
 
-                let tx = dl_event_tx.clone();
-                let tid = ms_download.transfer_id.clone();
-                let tid2 = tid.clone();
-                state
-                    .active_source_senders
-                    .insert(tid.clone(), src_inject_tx);
-                state
-                    .active_established_senders
-                    .insert(tid.clone(), est_inject_tx);
-                let tx2 = tx.clone();
-                if let Some(old_handle) = state.download_handles.remove(&tid2) {
-                    debug!("Aborting existing download task for {tid2} before starting new one");
-                    old_handle.abort();
-                    // Match CancelDownload: wait for the old worker (and its
-                    // spawn_blocking children) to release the .part before the
-                    // new multi-source task opens it.
-                    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), old_handle).await;
-                }
-                let handle = tokio::spawn(async move {
-                    if let Err(e) = ms_download.run(tx).await {
-                        error!("Multi-source download failed: {e}");
-                        let kind = classify_error(&e.to_string());
-                        let _ = tx2
-                            .send(DownloadEvent::Failed {
-                                transfer_id: tid,
-                                error: e.to_string(),
-                                failure_kind: kind,
-                            })
+                    let tx = dl_event_tx.clone();
+                    let tid = ms_download.transfer_id.clone();
+                    let tid2 = tid.clone();
+                    state
+                        .active_source_senders
+                        .insert(tid.clone(), src_inject_tx);
+                    state
+                        .active_established_senders
+                        .insert(tid.clone(), est_inject_tx);
+                    let tx2 = tx.clone();
+                    if let Some(old_handle) = state.download_handles.remove(&tid2) {
+                        debug!(
+                            "Aborting existing download task for {tid2} before starting new one"
+                        );
+                        old_handle.abort();
+                        // Match CancelDownload: wait for the old worker (and its
+                        // spawn_blocking children) to release the .part before the
+                        // new multi-source task opens it.
+                        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), old_handle)
                             .await;
                     }
-                });
-                state.download_handles.insert(tid2, handle);
+                    let handle = tokio::spawn(async move {
+                        if let Err(e) = ms_download.run(tx).await {
+                            error!("Multi-source download failed: {e}");
+                            let kind = classify_error(&e.to_string());
+                            let _ = tx2
+                                .send(DownloadEvent::Failed {
+                                    transfer_id: tid,
+                                    error: e.to_string(),
+                                    failure_kind: kind,
+                                })
+                                .await;
+                        }
+                    });
+                    state.download_handles.insert(tid2, handle);
                 } // end non-empty sources spawn
 
                 // ─── Source-discovery fan-out for new downloads ──────────────
@@ -28039,7 +28693,13 @@ async fn handle_command_inner(
                 return;
             }
 
-            let sid = start_kad_search(state, app_handle, file_hash, SearchType::StoreNotes, closest);
+            let sid = start_kad_search(
+                state,
+                app_handle,
+                file_hash,
+                SearchType::StoreNotes,
+                closest,
+            );
             if sid == SearchId(0) {
                 debug!("Failed to start StoreNotes search: too many active searches");
                 let _ = tx.send(Err(
@@ -28256,10 +28916,8 @@ async fn handle_command_inner(
         NetworkCommand::GetNetworkStatsSnapshot { tx } => {
             // Always reflect the live checker — poll consumers must not see a
             // stale "Unknown" after connect-backs / HighID already proved Open.
-            state.stats.tcp_status =
-                format!("{:?}", state.firewall_checker.tcp_status());
-            state.stats.udp_status =
-                format!("{:?}", state.firewall_checker.udp_status());
+            state.stats.tcp_status = format!("{:?}", state.firewall_checker.tcp_status());
+            state.stats.udp_status = format!("{:?}", state.firewall_checker.udp_status());
             let _ = tx.send(state.stats.clone());
         }
 
@@ -28552,7 +29210,7 @@ async fn handle_command_inner(
             if sid == SearchId(0) {
                 warn!("FindNotes rejected: active search cap reached");
                 let _ = tx.send(Err(
-                    "Notes search busy: too many active KAD searches".to_string(),
+                    "Notes search busy: too many active KAD searches".to_string()
                 ));
                 return;
             }
@@ -28585,14 +29243,14 @@ async fn handle_command_inner(
             if sid == SearchId(0) {
                 warn!("FindSources rejected: active search cap reached");
                 let _ = tx.send(Err(
-                    "Source search busy: too many active KAD searches".to_string(),
+                    "Source search busy: too many active KAD searches".to_string()
                 ));
                 return;
             }
             state.pending_source_searches.insert(sid, (request_id, tx));
         }
 
-        NetworkCommand::BootstrapContacts { contacts } => {
+        NetworkCommand::BootstrapContacts { contacts, tx } => {
             // Our own export path (`export_bootstrap_contacts`) caps at 200
             // contacts, but a hand-crafted or third-party-client nodes.dat
             // is only bounded by the download size cap (10-16MB), which
@@ -28601,18 +29259,19 @@ async fn handle_command_inner(
             // (to tolerate larger legitimate lists from other clients)
             // without letting a pathological file drive an unbounded burst
             // of routing-table insert work on this single command handler.
-            const MAX_BOOTSTRAP_CONTACTS: usize = 1000;
             let declared_count = contacts.len();
             if declared_count > MAX_BOOTSTRAP_CONTACTS {
                 warn!(
                     "BootstrapContacts: {declared_count} contacts exceeds cap, truncating to {MAX_BOOTSTRAP_CONTACTS}"
                 );
             }
-            let contacts: Vec<_> = contacts.into_iter().take(MAX_BOOTSTRAP_CONTACTS).collect();
-            let count = contacts.len();
-            for c in &contacts {
-                state.routing_table.insert(c.clone());
-            }
+            let contacts: Vec<_> = contacts
+                .into_iter()
+                .take(applied_bootstrap_contact_count(declared_count))
+                .collect();
+            let count = count_accepted_bootstrap_contacts(contacts.iter().cloned(), |contact| {
+                state.routing_table.insert(contact)
+            });
             let table_size = state.routing_table.len();
             info!(
                 "Injected {} bootstrap contacts, routing table now has {} entries",
@@ -28631,9 +29290,10 @@ async fn handle_command_inner(
                 }
             }
             info!("Sent bootstrap requests to {sample_size} contacts (table has {table_size})");
+            let _ = tx.send(count);
         }
 
-        NetworkCommand::ReloadIpFilter { path } => {
+        NetworkCommand::ReloadIpFilter { path, tx } => {
             // Persist the imported filter to ipfilter.dat so it loads on
             // next startup, then parse on a blocking-pool thread.
             //
@@ -28647,7 +29307,7 @@ async fn handle_command_inner(
             let enabled = state.ip_filter.is_enabled();
             let block_private = state.ip_filter.blocks_private();
             let load_path = default_path.clone();
-            let loaded = tokio::task::spawn_blocking(move || {
+            let loaded = tokio::task::spawn_blocking(move || -> Result<IpFilter, String> {
                 if path != load_path {
                     // Defense in depth: `import_ipfilter_file` (the only
                     // caller that can supply an arbitrary local path)
@@ -28666,18 +29326,21 @@ async fn handle_command_inner(
                                 meta.len(),
                                 MAX_IMPORTED_IPFILTER_BYTES / (1024 * 1024)
                             );
-                            return None;
+                            return Err(format!(
+                                "Imported IP filter exceeds the {} MiB limit",
+                                MAX_IMPORTED_IPFILTER_BYTES / (1024 * 1024)
+                            ));
                         }
                         Ok(_) => {
                             if let Err(e) = std::fs::copy(&path, &load_path) {
                                 warn!("Failed to persist IP filter to {:?}: {}", load_path, e);
-                                return None;
+                                return Err(format!("Failed to persist imported IP filter: {e}"));
                             }
                             info!("Persisted imported IP filter to {:?}", load_path);
                         }
                         Err(e) => {
                             warn!("Failed to stat IP filter import path {:?}: {}", path, e);
-                            return None;
+                            return Err(format!("Failed to read imported IP filter: {e}"));
                         }
                     }
                 }
@@ -28685,19 +29348,19 @@ async fn handle_command_inner(
                 match fresh.load_from_file(&load_path) {
                     Some(n) => {
                         info!("ReloadIpFilter: parsed {n} ranges from {load_path:?}");
-                        Some(fresh)
+                        Ok(fresh)
                     }
                     None => {
                         warn!(
                             "ReloadIpFilter: failed to read {load_path:?}; keeping the previous filter"
                         );
-                        None
+                        Err("Failed to parse IP filter".into())
                     }
                 }
             })
             .await;
-            match loaded {
-                Ok(Some(fresh)) => {
+            let result = match loaded {
+                Ok(Ok(fresh)) => {
                     state.ip_filter = fresh;
                     state.ip_filter.mark_ranges_ready();
                     state
@@ -28712,26 +29375,35 @@ async fn handle_command_inner(
                         let removed = state.server_list.remove_filtered(&mut state.ip_filter);
                         if removed > 0 {
                             let met_path = state.data_dir.join("server.met");
-                            spawn_save_server_met(&state.server_list, met_path, &state.server_met_save_generation, &state.server_met_save_lock);
+                            spawn_save_server_met(
+                                &state.server_list,
+                                met_path,
+                                &state.server_met_save_generation,
+                                &state.server_met_save_lock,
+                            );
                             info!("Removed {removed} servers blocked by updated IP filter");
                         }
                     }
+                    Ok(())
                 }
-                Ok(None) => {
+                Ok(Err(error)) => {
                     // Keep previous ranges — load/copy failed closed.
+                    Err(error)
                 }
                 Err(e) => {
                     error!(
                         "ReloadIpFilter background task panicked: {e}; keeping the previous filter"
                     );
+                    Err("IP filter reload task failed".into())
                 }
+            };
+            if let Some(tx) = tx {
+                let _ = tx.send(result);
             }
         }
 
         NetworkCommand::GetIpFilterStats { tx } => {
-            state
-                .ip_filter
-                .collect_shared_hits(&state.shared_ip_filter);
+            state.ip_filter.collect_shared_hits(&state.shared_ip_filter);
             let _ = tx.send(state.ip_filter.get_stats());
         }
 
@@ -29558,7 +30230,12 @@ async fn handle_command_inner(
                     ) {
                         AddServerOutcome::Added => {
                             let met_path = state.data_dir.join("server.met");
-                            spawn_save_server_met(&state.server_list, met_path.clone(), &state.server_met_save_generation, &state.server_met_save_lock);
+                            spawn_save_server_met(
+                                &state.server_list,
+                                met_path.clone(),
+                                &state.server_met_save_generation,
+                                &state.server_met_save_lock,
+                            );
                             Ok(format!("Added server {ip}:{port}"))
                         }
                         AddServerOutcome::Duplicate => {
@@ -29579,7 +30256,12 @@ async fn handle_command_inner(
         NetworkCommand::RemoveServer { ip, port, tx } => {
             let result = if state.server_list.remove(&ip, port) {
                 let met_path = state.data_dir.join("server.met");
-                spawn_save_server_met(&state.server_list, met_path.clone(), &state.server_met_save_generation, &state.server_met_save_lock);
+                spawn_save_server_met(
+                    &state.server_list,
+                    met_path.clone(),
+                    &state.server_met_save_generation,
+                    &state.server_met_save_lock,
+                );
                 Ok(format!("Removed server {ip}:{port}"))
             } else {
                 Err(format!("Server {ip}:{port} not found in the list"))
@@ -29739,6 +30421,12 @@ async fn handle_command_inner(
                     if hash_bytes.len() == 16 {
                         let mut fh = [0u8; 16];
                         fh.copy_from_slice(&hash_bytes);
+                        // Always drain the hash-pass handoff, including when
+                        // known.met already matches this file. Otherwise a
+                        // correct existing record leaves the freshly-produced
+                        // vector resident forever.
+                        let fresh_part_hashes_for_file =
+                            take_fresh_part_hashes(fresh_part_hashes, &fh).await;
                         // Refresh-on-drift fix: if a record already
                         // exists for this hash but its `file_path`
                         // or `modified_at` no longer match what we
@@ -29823,7 +30511,7 @@ async fn handle_command_inner(
                                 // hashing pass. spawn_blocking alone didn't
                                 // fix that: it only keeps the disk I/O off the
                                 // async worker threads, not off *this* task.
-                                if let Some(cached) = fresh_part_hashes.write().await.remove(&fh) {
+                                if let Some(cached) = fresh_part_hashes_for_file {
                                     part_hashes = cached;
                                 } else {
                                     // Do not await a full-file re-hash on the
@@ -30085,7 +30773,12 @@ async fn handle_command_inner(
             );
             if result.is_ok() {
                 let met_path = state.data_dir.join("server.met");
-                spawn_save_server_met(&state.server_list, met_path, &state.server_met_save_generation, &state.server_met_save_lock);
+                spawn_save_server_met(
+                    &state.server_list,
+                    met_path,
+                    &state.server_met_save_generation,
+                    &state.server_met_save_lock,
+                );
             }
             let _ = tx.send(result);
         }
@@ -30505,35 +31198,27 @@ async fn handle_command_inner(
             ember_hash: friend_eh,
             request_id,
         } => {
-            let send_next = {
-                let mut send_next = false;
-                let mut remove_queue = false;
-                if let Some(queue) = state.pending_browse_requests.get_mut(&friend_eh) {
-                    if let Some(position) = queue.iter().position(|id| id == &request_id) {
-                        queue.remove(position);
-                        send_next = position == 0 && !queue.is_empty();
+            if let Some((retired_session_id, invalidated)) =
+                cancel_browse_request(&mut state.pending_browse_requests, friend_eh, &request_id)
+            {
+                if let Some(session_id) = retired_session_id.filter(|id| *id != 0) {
+                    // A browse response cannot be cancelled on the ED2K wire.
+                    // Retire this canonical session so its late response is
+                    // never attributed to a later local request.
+                    let _ =
+                        retire_ember_session(&state.ember_sessions, friend_eh, session_id).await;
+                    for invalidated_id in invalidated {
+                        let _ = app_handle.emit(
+                            "ember:browse-error",
+                            serde_json::json!({
+                                "user_hash": hex::encode(friend_eh),
+                                "request_id": invalidated_id,
+                                "reason": "Browse session was reset after cancellation",
+                            }),
+                        );
                     }
-                    remove_queue = queue.is_empty();
                 }
-                if remove_queue {
-                    state.pending_browse_requests.remove(&friend_eh);
-                }
-                send_next
-            };
-            if send_next {
-                if let Some(sender) = state
-                    .ember_sessions
-                    .read()
-                    .await
-                    .get(&friend_eh)
-                    .filter(|handle| handle.is_fresh())
-                {
-                    let mut packet = Vec::with_capacity(6);
-                    packet.push(OP_EMULEPROT);
-                    packet.extend_from_slice(&(1u32).to_le_bytes());
-                    packet.push(ed2k::messages::OP_EMBER_BROWSE_REQ);
-                    let _ = sender.tx.try_send(packet);
-                }
+                dispatch_browse_head(state, &app_handle, friend_eh).await;
             }
         }
 
@@ -30547,43 +31232,58 @@ async fn handle_command_inner(
             } else if !friend_hashes.read().await.contains(&friend_eh) {
                 let _ = tx.send(Err("Can only browse friends".into()));
             } else {
-                let sessions = state.ember_sessions.read().await;
                 // See the identical `filter(|h| h.is_fresh())` in
                 // `SendChatMessage` above: reusing a stale session here
                 // would queue the browse request into a channel whose
                 // socket write never reaches a live peer.
-                if let Some(sender) = sessions.get(&friend_eh).filter(|h| h.is_fresh()) {
-                    let queue = state.pending_browse_requests.entry(friend_eh).or_default();
-                    let send_now = queue.is_empty();
-                    queue.push(request_id);
-                    if !send_now {
-                        let _ = tx.send(Ok(()));
-                    } else {
-                        let mut packet = Vec::with_capacity(6);
-                        packet.push(OP_EMULEPROT);
-                        let size: u32 = 1;
-                        packet.extend_from_slice(&size.to_le_bytes());
-                        packet.push(ed2k::messages::OP_EMBER_BROWSE_REQ);
-                        match sender.tx.try_send(packet) {
-                            Ok(()) => {
+                let sender = state
+                    .ember_sessions
+                    .read()
+                    .await
+                    .get(&friend_eh)
+                    .filter(|handle| handle.is_fresh())
+                    .cloned();
+                if let Some(sender) = sender {
+                    match enqueue_browse_request(
+                        &mut state.pending_browse_requests,
+                        friend_eh,
+                        request_id.clone(),
+                        sender.session_id(),
+                    ) {
+                        Err(()) => {
+                            let _ = tx.send(Err("Duplicate browse request".into()));
+                        }
+                        Ok(()) => {
+                            dispatch_browse_head(state, &app_handle, friend_eh).await;
+                            if browse_request_is_pending(
+                                &state.pending_browse_requests,
+                                friend_eh,
+                                &request_id,
+                            ) {
                                 let _ = tx.send(Ok(()));
-                            }
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                state.pending_browse_requests.remove(&friend_eh);
-                                let _ = tx.send(Err("Connection channel full".into()));
-                            }
-                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                state.pending_browse_requests.remove(&friend_eh);
-                                let _ = tx.send(Err("Connection to friend closed".into()));
+                            } else {
+                                let _ = tx.send(Err(
+                                    "Friend session closed before browse could be sent".into(),
+                                ));
                             }
                         }
                     }
                 } else {
-                    drop(sessions);
                     if state.outbound_session_tasks.contains_key(&friend_eh) {
                         let _ =
                             tx.send(Err("Connecting to friend, please retry in a moment".into()));
                     } else {
+                        if enqueue_browse_request(
+                            &mut state.pending_browse_requests,
+                            friend_eh,
+                            request_id.clone(),
+                            0,
+                        )
+                        .is_err()
+                        {
+                            let _ = tx.send(Err("Duplicate browse request".into()));
+                            return;
+                        }
                         let db2 = db.clone();
                         let hash_hex = hex::encode(friend_eh);
                         let addr_opt =
@@ -30611,6 +31311,7 @@ async fn handle_command_inner(
                                 let sessions_clone = state.ember_sessions.clone();
                                 let ul_tx = ul_event_tx.clone();
                                 let fh = friend_hashes.clone();
+                                let browse_event_tx = ul_event_tx.clone();
                                 let ul_tx2 = ul_event_tx.clone();
                                 let rv_url = settings.rendezvous_url.clone();
                                 let nat_ctx = state.friend_nat_context.clone();
@@ -30642,35 +31343,34 @@ async fn handle_command_inner(
                                     .await
                                     {
                                         Ok(handle) => {
-                                            let mut packet = Vec::with_capacity(6);
-                                            packet.push(OP_EMULEPROT);
-                                            let size: u32 = 1;
-                                            packet.extend_from_slice(&size.to_le_bytes());
-                                            packet.push(ed2k::messages::OP_EMBER_BROWSE_REQ);
-                                            // Surface a real error to the caller if the
-                                            // browse packet couldn't even be queued
-                                            // (channel full or session closed mid-spawn).
-                                            // The previous `let _ = ...; tx.send(Ok(()))`
-                                            // pattern reported success unconditionally,
-                                            // and the UI had no way to know the request
-                                            // never went out.
-                                            match handle.outbound_tx.try_send(packet) {
-                                                Ok(()) => {
-                                                    let _ = tx.send(Ok(()));
-                                                }
-                                                Err(e) => {
-                                                    let _ = tx.send(Err(format!(
-                                                        "Friend session opened but browse request could not be queued: {e}"
-                                                    )));
-                                                }
-                                            }
+                                            let _ = browse_event_tx
+                                                .send(upload_server::UploadEvent {
+                                                    transfer_id: String::new(),
+                                                    kind: upload_server::UploadEventKind::EmberBrowseSessionReady {
+                                                        ember_hash: friend_eh,
+                                                        request_id,
+                                                        session_id: handle.session_id,
+                                                        tx,
+                                                    },
+                                                })
+                                                .await;
                                         }
                                         Err(e) => {
                                             info!(
                                                 "Auto-connect for browse to {} failed: {e}",
                                                 hex::encode(friend_eh)
                                             );
-                                            let _ = tx.send(Err(format!("Could not connect: {e}")));
+                                            let _ = browse_event_tx
+                                                .send(upload_server::UploadEvent {
+                                                    transfer_id: String::new(),
+                                                    kind: upload_server::UploadEventKind::EmberBrowseSessionFailed {
+                                                        ember_hash: friend_eh,
+                                                        request_id,
+                                                        error: format!("Could not connect: {e}"),
+                                                        tx,
+                                                    },
+                                                })
+                                                .await;
                                             // Stored IP is dead; clear it so
                                             // the next browse / chat attempt
                                             // jumps straight to rendezvous
@@ -30704,6 +31404,11 @@ async fn handle_command_inner(
                                     db_for_clear.clear_friend_address(&hash_hex_clear)
                                 })
                                 .await;
+                                let _ = cancel_browse_request(
+                                    &mut state.pending_browse_requests,
+                                    friend_eh,
+                                    &request_id,
+                                );
                                 let _ = tx.send(Err("Invalid friend IP address".into()));
                             }
                         } else {
@@ -30722,6 +31427,7 @@ async fn handle_command_inner(
                             let ultx = ul_event_tx.clone();
                             let fh = friend_hashes.clone();
                             let app2 = app_handle.clone();
+                            let browse_event_tx = ul_event_tx.clone();
                             let ultx2 = ul_event_tx.clone();
                             let nat_ctx = state.friend_nat_context.clone();
                             state
@@ -30757,40 +31463,51 @@ async fn handle_command_inner(
                                         .await
                                         {
                                             Ok(handle) => {
-                                                let mut packet = Vec::with_capacity(6);
-                                                packet.push(OP_EMULEPROT);
-                                                let size: u32 = 1;
-                                                packet.extend_from_slice(&size.to_le_bytes());
-                                                packet.push(ed2k::messages::OP_EMBER_BROWSE_REQ);
-                                                // See sibling tx.send() above — surface a
-                                                // real error rather than reporting success
-                                                // when the outbound channel rejected the
-                                                // browse packet.
-                                                match handle.outbound_tx.try_send(packet) {
-                                                    Ok(()) => {
-                                                        let _ = app2.emit(
-                                                            "ember:friend-online",
-                                                            serde_json::json!({
-                                                                "user_hash": hex::encode(friend_eh),
-                                                            }),
-                                                        );
-                                                        let _ = tx.send(Ok(()));
-                                                    }
-                                                    Err(e) => {
-                                                        let _ = tx.send(Err(format!(
-                                                            "Friend session opened but browse request could not be queued: {e}"
-                                                        )));
-                                                    }
-                                                }
+                                                let _ = app2.emit(
+                                                    "ember:friend-online",
+                                                    serde_json::json!({
+                                                        "user_hash": hex::encode(friend_eh),
+                                                    }),
+                                                );
+                                                let _ = browse_event_tx
+                                                    .send(upload_server::UploadEvent {
+                                                        transfer_id: String::new(),
+                                                        kind: upload_server::UploadEventKind::EmberBrowseSessionReady {
+                                                            ember_hash: friend_eh,
+                                                            request_id,
+                                                            session_id: handle.session_id,
+                                                            tx,
+                                                        },
+                                                    })
+                                                    .await;
                                             }
                                             Err(e) => {
-                                                let _ =
-                                                    tx.send(Err(format!("Could not connect: {e}")));
+                                                let _ = browse_event_tx
+                                                    .send(upload_server::UploadEvent {
+                                                        transfer_id: String::new(),
+                                                        kind: upload_server::UploadEventKind::EmberBrowseSessionFailed {
+                                                            ember_hash: friend_eh,
+                                                            request_id,
+                                                            error: format!("Could not connect: {e}"),
+                                                            tx,
+                                                        },
+                                                    })
+                                                    .await;
                                             }
                                         }
                                     }
                                     _ => {
-                                        let _ = tx.send(Err("Friend is offline".into()));
+                                        let _ = browse_event_tx
+                                            .send(upload_server::UploadEvent {
+                                                transfer_id: String::new(),
+                                                kind: upload_server::UploadEventKind::EmberBrowseSessionFailed {
+                                                    ember_hash: friend_eh,
+                                                    request_id,
+                                                    error: "Friend is offline".into(),
+                                                    tx,
+                                                },
+                                            })
+                                            .await;
                                     }
                                 }
                                 // Always release the outbound-task slot
@@ -30811,7 +31528,15 @@ async fn handle_command_inner(
             ember_hash: removed_hash,
         } => {
             state.online_friends.remove(&removed_hash);
-            state.ember_sessions.write().await.remove(&removed_hash);
+            if let Some(session_id) = state
+                .ember_sessions
+                .read()
+                .await
+                .get(&removed_hash)
+                .map(|handle| handle.session_id())
+            {
+                let _ = retire_ember_session(&state.ember_sessions, removed_hash, session_id).await;
+            }
             // Also drop any pending outbound-search slot so a remove
             // immediately followed by re-add isn't blocked for up to
             // 10 minutes by a stale entry.
@@ -31465,9 +32190,7 @@ async fn handle_download_event(
             if matches!(
                 current_status,
                 Some(
-                    TransferStatus::Paused
-                        | TransferStatus::Stopped
-                        | TransferStatus::Insufficient
+                    TransferStatus::Paused | TransferStatus::Stopped | TransferStatus::Insufficient
                 )
             ) {
                 return;
@@ -31755,6 +32478,8 @@ async fn handle_upload_event(
         | UploadEventKind::EmberChatMessage { .. }
         | UploadEventKind::EmberBrowseRequest { .. }
         | UploadEventKind::EmberBrowseResponse { .. }
+        | UploadEventKind::EmberBrowseSessionReady { .. }
+        | UploadEventKind::EmberBrowseSessionFailed { .. }
         | UploadEventKind::EmberFriendDisconnected { .. }
         | UploadEventKind::EmberFriendConnected { .. }
         | UploadEventKind::EmberFriendSearchFailed { .. }
@@ -32395,9 +33120,7 @@ fn connect_serve_target_ok(
         // Check both the raw bind port and whatever we currently advertise
         // (which may be STUN-remapped) — a caller may echo either back,
         // depending on when it last learned our port. See `is_self_source`.
-        if dest_ip == ext
-            && (dest_port == self_tcp_port || dest_port == self_tcp_port_alt)
-        {
+        if dest_ip == ext && (dest_port == self_tcp_port || dest_port == self_tcp_port_alt) {
             return false;
         }
     }

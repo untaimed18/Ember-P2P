@@ -3961,17 +3961,11 @@ async fn download_parts_from_source(
                 return Ok(());
             }
         } else {
-            debug!(
-                "Source {} ({}) skip dial: non-IPv4 address",
-                _src_idx, addr,
-            );
+            debug!("Source {} ({}) skip dial: non-IPv4 address", _src_idx, addr,);
             return Ok(());
         }
         if addr.port() == 0 {
-            debug!(
-                "Source {} ({}) skip dial: port 0",
-                _src_idx, addr,
-            );
+            debug!("Source {} ({}) skip dial: port 0", _src_idx, addr,);
             return Ok(());
         }
         emit_source!("connecting", None, 0u64);
@@ -5514,8 +5508,7 @@ async fn download_parts_from_source(
                                         .await
                                         .is_ok()
                                         {
-                                            sx_overhead
-                                                .record_upload((6 + epx_data.len()) as u64);
+                                            sx_overhead.record_upload((6 + epx_data.len()) as u64);
                                             initial_epx_sent_generation = Some(sent_gen);
                                         }
                                     } else {
@@ -6015,19 +6008,19 @@ async fn download_parts_from_source(
             sx2_req.push(SOURCEEXCHANGE2_VERSION);
             sx2_req.extend_from_slice(&0u16.to_le_bytes());
             sx2_req.extend_from_slice(file_hash);
-            let ok = write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_REQUESTSOURCES2, &sx2_req)
-                .await
-                .is_ok();
+            let ok =
+                write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_REQUESTSOURCES2, &sx2_req)
+                    .await
+                    .is_ok();
             if ok {
                 sx_overhead.record_upload((6 + sx2_req.len()) as u64);
             }
             ok
         } else {
             let sx_req = build_file_request(file_hash);
-            let ok =
-                write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_REQUESTSOURCES, &sx_req)
-                    .await
-                    .is_ok();
+            let ok = write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_REQUESTSOURCES, &sx_req)
+                .await
+                .is_ok();
             if ok {
                 sx_overhead.record_upload((6 + sx_req.len()) as u64);
             }

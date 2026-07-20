@@ -559,7 +559,11 @@ mod tests {
         let expr = parse("matrix reloaded").unwrap();
         let stripped = expr.without_term("matrix").unwrap();
         assert_eq!(stripped, term("reloaded"));
-        assert!(expr.without_term("matrix").unwrap().without_term("reloaded").is_none());
+        assert!(expr
+            .without_term("matrix")
+            .unwrap()
+            .without_term("reloaded")
+            .is_none());
         assert!(!expr.contains_or());
         assert!(!expr.contains_not());
         let or_expr = parse("matrix OR reloaded").unwrap();

@@ -378,12 +378,7 @@ impl PerFileSourceList {
 
     /// Clear Connecting/Downloading after a duplicate-route skip without
     /// bumping `fail_count` (another live source task owns this peer).
-    pub fn clear_duplicate_route(
-        &mut self,
-        ip: Ipv4Addr,
-        port: u16,
-        user_hash: Option<[u8; 16]>,
-    ) {
+    pub fn clear_duplicate_route(&mut self, ip: Ipv4Addr, port: u16, user_hash: Option<[u8; 16]>) {
         if let Some(s) = self.find_mut(ip, port, user_hash) {
             if matches!(
                 s.state,

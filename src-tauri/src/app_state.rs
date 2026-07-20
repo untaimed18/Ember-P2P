@@ -112,6 +112,11 @@ pub struct AppState {
     /// would still get intercepted by the close-to-tray policy and the window
     /// would just hide instead of quitting.
     pub quit_confirmed: Arc<AtomicBool>,
+    /// Set by the native close handler before it emits `close-requested`.
+    /// The layout consumes this latch after registering its listener, closing
+    /// the startup race where the event arrives before the webview can hear
+    /// it and would otherwise leave a prevented native close with no dialog.
+    pub pending_close_request: Arc<AtomicBool>,
     /// Mirror of `config.settings.close_to_tray_behavior` behind a synchronous
     /// `parking_lot::RwLock` so the `WindowEvent::CloseRequested` handler can
     /// read it from the main UI thread without blocking on the async tokio

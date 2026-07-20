@@ -1,5 +1,5 @@
-use tokio::sync::oneshot;
 use tauri::Emitter;
+use tokio::sync::oneshot;
 
 use crate::app_state::AppState;
 use crate::commands::errors::{coded, coded_ctx};
@@ -151,10 +151,7 @@ pub fn apply_search_enrichment_with_batch(
     community: &HashMap<String, CommunityRating>,
     use_batch_context: bool,
 ) {
-    let batch = if spam_enabled
-        && spam_profile != SpamFilterProfile::Relaxed
-        && use_batch_context
-    {
+    let batch = if spam_enabled && spam_profile != SpamFilterProfile::Relaxed && use_batch_context {
         BatchSpamContext::analyze(results)
     } else {
         BatchSpamContext::default()
@@ -400,12 +397,7 @@ pub async fn find_notes(
     let mut results =
         match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
             Ok(Ok(Ok(results))) => results,
-            Ok(Ok(Err(e))) => {
-                return Err(coded(
-                    "search_notes_busy",
-                    e,
-                ))
-            }
+            Ok(Ok(Err(e))) => return Err(coded("search_notes_busy", e)),
             Ok(Err(e)) => {
                 return Err(coded_ctx(
                     "search_notes_search_failed",

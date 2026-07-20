@@ -354,11 +354,7 @@ mod tests {
         let resp_response_sig_bytes: [u8; 64] = resp_response[32..].try_into().unwrap();
         let resp_response_sig = Signature::from_bytes(&resp_response_sig_bytes);
         let resp_vk = VerifyingKey::from_bytes(&resp_response_pk).unwrap();
-        assert!(verify_auth_nonce(
-            &resp_vk,
-            &init_nonce,
-            &resp_response_sig
-        ));
+        assert!(verify_auth_nonce(&resp_vk, &init_nonce, &resp_response_sig));
         assert!(
             resp_vk
                 .verify_strict(&auth_signature_message(&init_nonce), &resp_response_sig)
@@ -366,7 +362,9 @@ mod tests {
             "emit signs the domain-separated auth message"
         );
         assert!(
-            resp_vk.verify_strict(&init_nonce, &resp_response_sig).is_err(),
+            resp_vk
+                .verify_strict(&init_nonce, &resp_response_sig)
+                .is_err(),
             "bare-nonce signatures are no longer accepted"
         );
         assert!(crate::network::ember::crypto::verify_ember_hash_binding(

@@ -1,8 +1,9 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    hash::Hash,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, OnceLock,
     },
     time::{Duration, Instant},
@@ -48,6 +49,9 @@ const OP_RELAY_TICKET_OFFER: u8 = 0x07;
 const OP_RELAY_TICKET_POLL: u8 = 0x08;
 const OP_RELAY_TICKET_ACCEPT: u8 = 0x09;
 const OP_RELAY_TICKET_STATUS: u8 = 0x0a;
+/// Candidate-filtered polling has a distinct operation and route so its
+/// signed payload can never be confused with the deployed v2 schema.
+const OP_RELAY_TICKET_POLL_V3: u8 = 0x0b;
 
 /// Maximum allowed clock skew between the client and server timestamps
 /// in a signed request. 5 minutes covers normal NTP-skewed clients
@@ -55,6 +59,33 @@ const OP_RELAY_TICKET_STATUS: u8 = 0x0a;
 const MAX_TIMESTAMP_SKEW_SECS: i64 = 300;
 const REPLAY_CACHE_TTL: Duration = Duration::from_secs((MAX_TIMESTAMP_SKEW_SECS as u64) * 2);
 const MAX_REPLAY_CACHE_ENTRIES: usize = 100_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplayCacheAdmission {
+    Remembered,
+    Replay,
+    Full,
+}
+
+/// Read-only ticket poll/status requests intentionally reuse a stable nonce
+/// and are safe to serve idempotently. Keep just one nonce per read scope,
+/// rather than one entry per periodic request, so normal polling cannot
+/// exhaust the mutation replay cache.
+#[derive(Clone, Copy)]
+struct IdempotentReadNonce {
+    nonce: [u8; 16],
+    last_ts: i64,
+    expires_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdempotentReadAdmission {
+    New,
+    Idempotent,
+    Replay,
+    NonceConflict,
+    Full,
+}
 
 fn now_unix_secs() -> i64 {
     std::time::SystemTime::now()
@@ -175,11 +206,48 @@ fn build_relay_ticket_offer_msg(
     m
 }
 
-fn build_relay_ticket_poll_msg(responder_id: &[u8; 32], nonce: &[u8; 16], ts: i64) -> Vec<u8> {
+fn build_relay_ticket_poll_v2_msg(responder_id: &[u8; 32], nonce: &[u8; 16], ts: i64) -> Vec<u8> {
     let mut m = Vec::with_capacity(RDV_DOMAIN.len() + 1 + 32 + 16 + 8);
     m.extend_from_slice(RDV_DOMAIN);
     m.push(OP_RELAY_TICKET_POLL);
     m.extend_from_slice(responder_id);
+    m.extend_from_slice(nonce);
+    m.extend_from_slice(&ts.to_le_bytes());
+    m
+}
+
+fn build_relay_ticket_poll_v3_msg(
+    responder_id: &[u8; 32],
+    friend_candidates: &[[u8; 32]],
+    cursor: Option<&[u8; 32]>,
+    nonce: &[u8; 16],
+    ts: i64,
+) -> Vec<u8> {
+    let mut m = Vec::with_capacity(
+        RDV_DOMAIN.len()
+            + 1
+            + 32
+            + 2
+            + friend_candidates.len() * 32
+            + 1
+            + cursor.map_or(0, |_| 32)
+            + 16
+            + 8,
+    );
+    m.extend_from_slice(RDV_DOMAIN);
+    m.push(OP_RELAY_TICKET_POLL_V3);
+    m.extend_from_slice(responder_id);
+    m.extend_from_slice(&(friend_candidates.len() as u16).to_le_bytes());
+    for candidate in friend_candidates {
+        m.extend_from_slice(candidate);
+    }
+    match cursor {
+        Some(cursor) => {
+            m.push(1);
+            m.extend_from_slice(cursor);
+        }
+        None => m.push(0),
+    }
     m.extend_from_slice(nonce);
     m.extend_from_slice(&ts.to_le_bytes());
     m
@@ -212,6 +280,10 @@ fn signed_request_replay_key(message: &[u8], sig: &[u8; 64]) -> [u8; 32] {
 const ENTRY_TTL: Duration = Duration::from_secs(300);
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_REQUESTS_PER_MINUTE: u64 = 60;
+/// A normal relay fallback can issue up to 60 status reads/minute plus eight
+/// parallel candidate poll pages per second (480/min) and bounded retries.
+/// Keep those authenticated reads isolated from general and punch budgets.
+const MAX_TICKET_READS_PER_MINUTE: u64 = 600;
 const RATE_WINDOW: Duration = Duration::from_secs(60);
 const MAX_STORE_ENTRIES: usize = 100_000;
 const MAX_RATE_ENTRIES: usize = 200_000;
@@ -294,12 +366,39 @@ const RELAY_SESSION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// peer2 joins, this timeout is no longer consulted — so it does not
 /// need to scale with the bandwidth/duration changes above.
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-/// A ticket is long enough to survive the client's short poll interval, but
-/// brief enough that an abandoned offer cannot become a reusable relay
-/// capability later.
+/// A pre-upgrade reservation is short-lived and is rolled back if Axum never
+/// invokes the upgrade callback (client disconnect / failed handshake).
+const RELAY_UPGRADE_RESERVATION_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_PREBRIDGE_RELAY_FRAMES: usize = 32;
+const MAX_PREBRIDGE_RELAY_BYTES: usize = 1024 * 1024;
+/// A ticket outlives the client's 45-second initiator wait and its documented
+/// 4,096-friend discovery bound (eight 512-candidate pages at a worst-case
+/// two-second request timeout), while remaining brief enough that an
+/// abandoned offer cannot become a reusable relay capability later.
 const RELAY_TICKET_TTL: Duration = Duration::from_secs(90);
 const MAX_RELAY_TICKETS: usize = 100_000;
-const MAX_RELAY_TICKETS_PER_RESPONDER: usize = 8;
+/// The offerer can have a small burst for several friends, but cannot hold
+/// every pending-ticket slot by targeting arbitrary responders.
+const MAX_PENDING_RELAY_TICKETS_PER_INITIATOR: usize = 16;
+/// Bound only tickets a responder has explicitly accepted. Unaccepted offers
+/// are intentionally not counted here: the server cannot know which
+/// initiators are friends, so applying this cap at offer time would let
+/// arbitrary non-friends block a legitimate friend from ever reaching the
+/// responder's local authorization check.
+const MAX_ACCEPTED_RELAY_TICKETS_PER_RESPONDER: usize = 8;
+/// A response remains well below the client's 8 KiB bounded JSON reader.
+/// Unknown initiators are filtered before this limit is applied.
+const MAX_RELAY_TICKET_POLL_RESULTS: usize = 16;
+/// Legacy v2 clients cannot provide a signed candidate filter or cursor.
+/// Keep their response bounded while retaining authenticated compatibility.
+const MAX_LEGACY_RELAY_TICKET_POLL_RESULTS: usize = 16;
+/// 512 hex IDs plus the signed request fields fit under the route's 64 KiB
+/// body limit while letting even large friend lists make progress quickly.
+const MAX_RELAY_TICKET_POLL_CANDIDATES: usize = 512;
+const POLL_READ_NONCE_TTL: Duration = Duration::from_secs(10 * 60);
+const STATUS_READ_NONCE_TTL: Duration = RELAY_TICKET_TTL;
+const MAX_POLL_READ_NONCES: usize = 100_000;
+const MAX_STATUS_READ_NONCES: usize = MAX_RELAY_TICKETS;
 
 #[derive(Clone)]
 struct PresenceEntry {
@@ -392,14 +491,189 @@ struct RelayTicket {
     responder_token_hash: [u8; 32],
     initiator_joined: bool,
     responder_joined: bool,
+    initiator_reservation: Option<u64>,
+    responder_reservation: Option<u64>,
     accepted: bool,
     expires_at: Instant,
+}
+
+/// Ticket state and its admission indexes are mutated atomically under one
+/// lock. Polling looks up only the caller's signed candidates via
+/// `by_responder`,
+/// never scans/sorts every pending offer.
+#[derive(Default)]
+struct RelayTicketStore {
+    tickets: HashMap<String, RelayTicket>,
+    by_responder: HashMap<String, BTreeMap<String, String>>,
+    legacy_v2_cursors: HashMap<String, String>,
+    initiator_counts: HashMap<String, usize>,
+    accepted_responder_counts: HashMap<String, usize>,
+    expirations: VecDeque<(Instant, String)>,
+}
+
+impl RelayTicketStore {
+    fn insert(&mut self, ticket_id: String, ticket: RelayTicket) {
+        self.by_responder
+            .entry(ticket.responder_id.clone())
+            .or_default()
+            .insert(ticket.initiator_id.clone(), ticket_id.clone());
+        *self
+            .initiator_counts
+            .entry(ticket.initiator_id.clone())
+            .or_insert(0) += 1;
+        if ticket.accepted {
+            *self
+                .accepted_responder_counts
+                .entry(ticket.responder_id.clone())
+                .or_insert(0) += 1;
+        }
+        self.expirations
+            .push_back((ticket.expires_at, ticket_id.clone()));
+        self.tickets.insert(ticket_id, ticket);
+    }
+
+    fn remove(&mut self, ticket_id: &str) -> Option<RelayTicket> {
+        let ticket = self.tickets.remove(ticket_id)?;
+        if let Some(by_initiator) = self.by_responder.get_mut(&ticket.responder_id) {
+            if by_initiator
+                .get(&ticket.initiator_id)
+                .is_some_and(|id| id == ticket_id)
+            {
+                by_initiator.remove(&ticket.initiator_id);
+            }
+            if by_initiator.is_empty() {
+                self.by_responder.remove(&ticket.responder_id);
+            }
+        }
+        if let Some(count) = self.initiator_counts.get_mut(&ticket.initiator_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.initiator_counts.remove(&ticket.initiator_id);
+            }
+        }
+        if ticket.accepted {
+            if let Some(count) = self.accepted_responder_counts.get_mut(&ticket.responder_id) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.accepted_responder_counts.remove(&ticket.responder_id);
+                }
+            }
+        }
+        Some(ticket)
+    }
+
+    fn prune_expired(&mut self, now: Instant) {
+        while self
+            .expirations
+            .front()
+            .is_some_and(|(expires_at, _)| *expires_at <= now)
+        {
+            let (_, ticket_id) = self
+                .expirations
+                .pop_front()
+                .expect("front was checked above");
+            if self
+                .tickets
+                .get(&ticket_id)
+                .is_some_and(|ticket| ticket.expires_at <= now)
+            {
+                self.remove(&ticket_id);
+            }
+        }
+    }
+
+    fn mark_accepted(&mut self, ticket_id: &str) -> bool {
+        let Some(ticket) = self.tickets.get_mut(ticket_id) else {
+            return false;
+        };
+        if ticket.accepted {
+            return false;
+        }
+        ticket.accepted = true;
+        *self
+            .accepted_responder_counts
+            .entry(ticket.responder_id.clone())
+            .or_insert(0) += 1;
+        true
+    }
+}
+
+#[derive(Default)]
+struct ReplayCache {
+    entries: HashMap<[u8; 32], Instant>,
+    expirations: VecDeque<(Instant, [u8; 32])>,
+}
+
+impl ReplayCache {
+    fn prune_expired(&mut self, now: Instant) {
+        while self
+            .expirations
+            .front()
+            .is_some_and(|(expires_at, _)| *expires_at <= now)
+        {
+            let (_, key) = self
+                .expirations
+                .pop_front()
+                .expect("front was checked above");
+            if self
+                .entries
+                .get(&key)
+                .is_some_and(|expires_at| *expires_at <= now)
+            {
+                self.entries.remove(&key);
+            }
+        }
+    }
+}
+
+/// Bounded, scope-keyed nonce cache with O(expired) pruning. `K` is either
+/// one responder identity (poll) or one `(initiator, ticket)` pair (status).
+struct ScopedNonceCache<K> {
+    entries: HashMap<K, IdempotentReadNonce>,
+    expirations: VecDeque<(Instant, K)>,
+}
+
+impl<K: Eq + Hash + Copy> ScopedNonceCache<K> {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            expirations: VecDeque::new(),
+        }
+    }
+
+    fn prune_expired(&mut self, now: Instant) {
+        while self
+            .expirations
+            .front()
+            .is_some_and(|(expires_at, _)| *expires_at <= now)
+        {
+            let (_, key) = self
+                .expirations
+                .pop_front()
+                .expect("front was checked above");
+            if self
+                .entries
+                .get(&key)
+                .is_some_and(|entry| entry.expires_at <= now)
+            {
+                self.entries.remove(&key);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RelayRole {
     Initiator,
     Responder,
+}
+
+#[derive(Clone)]
+struct RelayReservation {
+    ticket_id: String,
+    role: RelayRole,
+    client_ip: IpAddr,
+    id: u64,
 }
 
 #[derive(Clone)]
@@ -412,6 +686,10 @@ struct AppState {
     /// endpoints — earlier this map was shared, and a single LowID
     /// peer's punch retries could 429 lookup/register for the same IP.
     rate_limits: Arc<RwLock<HashMap<IpAddr, RateEntry>>>,
+    /// Separate per-IP budget for authenticated relay ticket poll/status
+    /// reads. This prevents normal fallback traffic from consuming punch or
+    /// general API capacity.
+    ticket_read_rate_limits: Arc<RwLock<HashMap<IpAddr, RateEntry>>>,
     /// Per-IP rate-limit window for hole-punch register traffic.
     /// Counted separately from `rate_limits` so the documented
     /// `MAX_PUNCH_PER_MINUTE` budget is the only thing throttling
@@ -426,15 +704,25 @@ struct AppState {
     punch_requests: Arc<RwLock<HashMap<(String, String), PunchEntry>>>,
     relay_sessions: Arc<RwLock<HashMap<String, RelaySessionEntry>>>,
     relay_ip_counts: Arc<RwLock<HashMap<IpAddr, usize>>>,
-    relay_tickets: Arc<RwLock<HashMap<String, RelayTicket>>>,
+    next_relay_reservation_id: Arc<AtomicU64>,
+    relay_tickets: Arc<RwLock<RelayTicketStore>>,
     /// Process-lifetime secret used to issue role tokens on demand. Ticket
     /// records retain only SHA-256 token hashes; rotating this key on restart
     /// invalidates every outstanding short-lived ticket.
     relay_token_key: [u8; 32],
     /// Recently accepted signed mutating requests. Timestamps keep messages
     /// fresh; this cache prevents replaying a captured fresh register or
-    /// unregister within that allowed skew window.
-    replay_cache: Arc<RwLock<HashMap<[u8; 32], Instant>>>,
+    /// unregister within that allowed skew window. It intentionally excludes
+    /// idempotent ticket reads; see the scope-bounded caches below.
+    replay_cache: Arc<RwLock<ReplayCache>>,
+    /// One stable poll nonce per live responder identity. Replays are
+    /// idempotent reads, while a different nonce for the same identity is
+    /// rejected until the entry expires.
+    poll_read_nonces: Arc<RwLock<ScopedNonceCache<[u8; 32]>>>,
+    /// One stable status nonce per `(initiator, ticket)` pair. Keeping this
+    /// separate bounds rapid initiator status checks without weakening the
+    /// one-time mutation cache used by offer/accept.
+    status_read_nonces: Arc<RwLock<ScopedNonceCache<([u8; 32], [u8; 32])>>>,
     started_at: Instant,
 }
 
@@ -506,9 +794,26 @@ struct RelayTicketOfferRequest {
     sig: String,
 }
 
+/// Original v2 poll schema. Keep this route and signature format for clients
+/// already deployed before candidate-filtered paging existed.
 #[derive(Deserialize)]
-struct RelayTicketPollRequest {
+struct RelayTicketPollV2Request {
     responder_id: String,
+    ts: i64,
+    nonce: String,
+    sig: String,
+}
+
+/// Explicit v3 candidate-filtered polling schema.
+#[derive(Deserialize)]
+struct RelayTicketPollV3Request {
+    responder_id: String,
+    /// Signed, local-known friend candidates. The server filters before
+    /// applying its response page limit, so unknown offers cannot hide a
+    /// legitimate candidate in an oversized response.
+    friend_candidates: Vec<String>,
+    /// Opaque ticket-ID cursor for the next page of matching offers.
+    cursor: Option<String>,
     ts: i64,
     nonce: String,
     sig: String,
@@ -532,9 +837,10 @@ struct RelayTicketOfferResponse {
 #[derive(Serialize)]
 struct RelayTicketPollResponse {
     tickets: Vec<RelayTicketPollItem>,
+    next_cursor: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, PartialEq, Eq, Serialize)]
 struct RelayTicketPollItem {
     ticket_id: String,
     initiator_id: String,
@@ -676,8 +982,12 @@ fn extract_client_ip(headers: &HeaderMap, addr: SocketAddr) -> IpAddr {
     addr.ip()
 }
 
-async fn check_rate_limit(state: &AppState, ip: IpAddr) -> bool {
-    let mut limits = state.rate_limits.write().await;
+async fn check_rate_limit_bucket(
+    limits: &Arc<RwLock<HashMap<IpAddr, RateEntry>>>,
+    ip: IpAddr,
+    max_requests: u64,
+) -> bool {
+    let mut limits = limits.write().await;
     let now = Instant::now();
     if limits.len() >= MAX_RATE_ENTRIES && !limits.contains_key(&ip) {
         // Same rationale as the store cap in `register`: purge
@@ -700,30 +1010,143 @@ async fn check_rate_limit(state: &AppState, ip: IpAddr) -> bool {
         true
     } else {
         entry.count += 1;
-        entry.count <= MAX_REQUESTS_PER_MINUTE
+        entry.count <= max_requests
     }
 }
 
-async fn remember_signed_request(state: &AppState, key: [u8; 32]) -> bool {
-    let now = Instant::now();
+async fn check_rate_limit(state: &AppState, ip: IpAddr) -> bool {
+    check_rate_limit_bucket(&state.rate_limits, ip, MAX_REQUESTS_PER_MINUTE).await
+}
+
+async fn check_ticket_read_rate_limit(state: &AppState, ip: IpAddr) -> bool {
+    check_rate_limit_bucket(
+        &state.ticket_read_rate_limits,
+        ip,
+        MAX_TICKET_READS_PER_MINUTE,
+    )
+    .await
+}
+
+fn admit_replay_key(
+    cache: &mut ReplayCache,
+    key: [u8; 32],
+    now: Instant,
+    max_entries: usize,
+) -> ReplayCacheAdmission {
+    cache.prune_expired(now);
+    if cache.entries.contains_key(&key) {
+        return ReplayCacheAdmission::Replay;
+    }
+    if cache.entries.len() >= max_entries {
+        // A still-fresh replay entry is security state. Evicting it to make
+        // room would re-open its replay window, so fail closed instead.
+        return ReplayCacheAdmission::Full;
+    }
+    let expires_at = now + REPLAY_CACHE_TTL;
+    cache.entries.insert(key, expires_at);
+    cache.expirations.push_back((expires_at, key));
+    ReplayCacheAdmission::Remembered
+}
+
+async fn remember_signed_request(state: &AppState, key: [u8; 32]) -> ReplayCacheAdmission {
     let mut cache = state.replay_cache.write().await;
-    cache.retain(|_, seen_at| now.duration_since(*seen_at) < REPLAY_CACHE_TTL);
-    if cache.contains_key(&key) {
-        return false;
-    }
-    if cache.len() >= MAX_REPLAY_CACHE_ENTRIES {
-        if let Some(oldest) = cache
-            .iter()
-            .min_by_key(|(_, seen_at)| *seen_at)
-            .map(|(k, _)| *k)
-        {
-            cache.remove(&oldest);
-        } else {
-            return false;
+    admit_replay_key(&mut cache, key, Instant::now(), MAX_REPLAY_CACHE_ENTRIES)
+}
+
+fn admit_idempotent_read_nonce<K: Eq + Hash + Copy>(
+    cache: &mut ScopedNonceCache<K>,
+    key: K,
+    nonce: [u8; 16],
+    ts: i64,
+    now: Instant,
+    ttl: Duration,
+    max_entries: usize,
+) -> IdempotentReadAdmission {
+    cache.prune_expired(now);
+    if let Some(entry) = cache.entries.get_mut(&key) {
+        if entry.nonce != nonce {
+            return IdempotentReadAdmission::NonceConflict;
         }
+        if ts < entry.last_ts {
+            return IdempotentReadAdmission::Replay;
+        }
+        let admission = if ts == entry.last_ts {
+            IdempotentReadAdmission::Idempotent
+        } else {
+            entry.last_ts = ts;
+            IdempotentReadAdmission::New
+        };
+        return admission;
     }
-    cache.insert(key, now);
-    true
+    if cache.entries.len() >= max_entries {
+        return IdempotentReadAdmission::Full;
+    }
+    let expires_at = now + ttl;
+    cache.entries.insert(
+        key,
+        IdempotentReadNonce {
+            nonce,
+            last_ts: ts,
+            expires_at,
+        },
+    );
+    cache.expirations.push_back((expires_at, key));
+    IdempotentReadAdmission::New
+}
+
+async fn remember_ticket_poll_nonce(
+    state: &AppState,
+    responder_id: [u8; 32],
+    nonce: [u8; 16],
+    ts: i64,
+) -> IdempotentReadAdmission {
+    let mut cache = state.poll_read_nonces.write().await;
+    admit_idempotent_read_nonce(
+        &mut cache,
+        responder_id,
+        nonce,
+        ts,
+        Instant::now(),
+        POLL_READ_NONCE_TTL,
+        MAX_POLL_READ_NONCES,
+    )
+}
+
+async fn remember_ticket_status_nonce(
+    state: &AppState,
+    initiator_id: [u8; 32],
+    ticket_id: [u8; 32],
+    nonce: [u8; 16],
+    ts: i64,
+) -> IdempotentReadAdmission {
+    let mut cache = state.status_read_nonces.write().await;
+    admit_idempotent_read_nonce(
+        &mut cache,
+        (initiator_id, ticket_id),
+        nonce,
+        ts,
+        Instant::now(),
+        STATUS_READ_NONCE_TTL,
+        MAX_STATUS_READ_NONCES,
+    )
+}
+
+fn replay_cache_status(admission: ReplayCacheAdmission) -> Result<(), StatusCode> {
+    match admission {
+        ReplayCacheAdmission::Remembered => Ok(()),
+        ReplayCacheAdmission::Replay => Err(StatusCode::CONFLICT),
+        ReplayCacheAdmission::Full => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+fn idempotent_read_status(admission: IdempotentReadAdmission) -> Result<(), StatusCode> {
+    match admission {
+        IdempotentReadAdmission::New | IdempotentReadAdmission::Idempotent => Ok(()),
+        IdempotentReadAdmission::Replay | IdempotentReadAdmission::NonceConflict => {
+            Err(StatusCode::CONFLICT)
+        }
+        IdempotentReadAdmission::Full => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
 }
 
 fn validate_hex_id(id: &str) -> bool {
@@ -805,6 +1228,13 @@ fn validate_relay_ticket_id(id: &str) -> bool {
     validate_hex_id(id)
 }
 
+/// Ticket IDs are binary values represented as hex. Use one lowercase text
+/// form everywhere they become map keys, URL path components, or token-input
+/// bytes so alternate-case spellings cannot produce different capabilities.
+fn canonical_relay_ticket_id(id: &str) -> Option<String> {
+    validate_relay_ticket_id(id).then(|| id.to_ascii_lowercase())
+}
+
 fn validate_relay_token(token: &str) -> bool {
     token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -829,6 +1259,8 @@ fn relay_token_hash(token: &str) -> [u8; 32] {
 /// process secret and the token hash are retained server-side; the plaintext
 /// token is materialized only in the authenticated offer/accept response.
 fn issue_relay_role_token(state: &AppState, ticket_id: &str, role: RelayRole) -> String {
+    let ticket_id = canonical_relay_ticket_id(ticket_id)
+        .expect("internal relay ticket IDs must be valid 32-byte hex");
     let mut hasher = Sha256::new();
     hasher.update(state.relay_token_key);
     hasher.update(ticket_id.as_bytes());
@@ -839,10 +1271,10 @@ fn issue_relay_role_token(state: &AppState, ticket_id: &str, role: RelayRole) ->
     hex::encode(hasher.finalize())
 }
 
-/// Verify an action made by a currently registered identity and remember the
-/// signed payload before it can be acted on. The presence entry's pinned key
-/// is the authority, so callers never provide a freely-chosen pubkey.
-async fn verify_signed_relay_identity(
+/// Verify a signature made by a currently registered identity. The presence
+/// entry's pinned key is the authority, so callers never provide a
+/// freely-chosen pubkey.
+async fn verify_signed_relay_identity_signature(
     state: &AppState,
     identity_id: &str,
     message: &[u8],
@@ -860,35 +1292,209 @@ async fn verify_signed_relay_identity(
     if !ed25519_verify(&pubkey, message, sig) {
         return Err(StatusCode::FORBIDDEN);
     }
-    if !remember_signed_request(state, signed_request_replay_key(message, sig)).await {
-        return Err(StatusCode::CONFLICT);
-    }
     Ok(())
 }
 
-fn prune_expired_relay_tickets(tickets: &mut HashMap<String, RelayTicket>, now: Instant) {
-    tickets.retain(|_, ticket| ticket.expires_at > now);
+/// Verify and one-time-admit a mutating ticket action. Poll/status reads use
+/// their own bounded idempotent nonce caches instead.
+async fn verify_signed_relay_identity(
+    state: &AppState,
+    identity_id: &str,
+    message: &[u8],
+    sig: &[u8; 64],
+) -> Result<(), StatusCode> {
+    verify_signed_relay_identity_signature(state, identity_id, message, sig).await?;
+    replay_cache_status(
+        remember_signed_request(state, signed_request_replay_key(message, sig)).await,
+    )?;
+    Ok(())
 }
 
-/// Atomically verifies a role token, consumes that role's one permitted join,
-/// and reserves relay capacity. Nothing after this point can admit a second
-/// socket under the same role token.
-async fn admit_relay_ticket_join(
+fn prune_expired_relay_tickets(tickets: &mut RelayTicketStore, now: Instant) {
+    tickets.prune_expired(now);
+}
+
+fn initiator_has_ticket_capacity(tickets: &RelayTicketStore, initiator_id: &str) -> bool {
+    tickets
+        .initiator_counts
+        .get(initiator_id)
+        .copied()
+        .unwrap_or(0)
+        < MAX_PENDING_RELAY_TICKETS_PER_INITIATOR
+}
+
+fn responder_has_accepted_ticket_capacity(tickets: &RelayTicketStore, responder_id: &str) -> bool {
+    tickets
+        .accepted_responder_counts
+        .get(responder_id)
+        .copied()
+        .unwrap_or(0)
+        < MAX_ACCEPTED_RELAY_TICKETS_PER_RESPONDER
+}
+
+fn decode_relay_ticket_poll_candidates(values: &[String]) -> Option<Vec<[u8; 32]>> {
+    if values.len() > MAX_RELAY_TICKET_POLL_CANDIDATES {
+        return None;
+    }
+    let mut candidates = Vec::with_capacity(values.len());
+    let mut seen = HashSet::with_capacity(values.len());
+    for value in values {
+        if !validate_hex_id(value) {
+            return None;
+        }
+        let raw = decode_hex_id(value)?;
+        if !seen.insert(raw) {
+            return None;
+        }
+        candidates.push(raw);
+    }
+    Some(candidates)
+}
+
+fn relay_ticket_poll_page(
+    tickets: &RelayTicketStore,
+    responder_id: &str,
+    friend_candidates: &HashSet<String>,
+    cursor: Option<&str>,
+    now: Instant,
+) -> (Vec<RelayTicketPollItem>, Option<String>) {
+    let mut matching: Vec<(&String, &RelayTicket)> = friend_candidates
+        .iter()
+        .filter_map(|initiator_id| {
+            let ticket_id = tickets.by_responder.get(responder_id)?.get(initiator_id)?;
+            let ticket = tickets.tickets.get(ticket_id)?;
+            (ticket.responder_id == responder_id
+                && !ticket.accepted
+                && cursor.is_none_or(|cursor| ticket_id.as_str() > cursor)
+                && ticket.expires_at > now)
+                .then_some((ticket_id, ticket))
+        })
+        .collect();
+    matching.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+
+    let has_more = matching.len() > MAX_RELAY_TICKET_POLL_RESULTS;
+    matching.truncate(MAX_RELAY_TICKET_POLL_RESULTS);
+    let next_cursor = has_more.then(|| {
+        matching
+            .last()
+            .expect("a non-empty overfull ticket page has a final item")
+            .0
+            .clone()
+    });
+    let tickets = matching
+        .into_iter()
+        .map(|(ticket_id, ticket)| RelayTicketPollItem {
+            ticket_id: ticket_id.clone(),
+            initiator_id: ticket.initiator_id.clone(),
+            purpose: ticket.purpose.clone(),
+        })
+        .collect();
+    (tickets, next_cursor)
+}
+
+fn relay_ticket_poll_v2_page(
+    tickets: &mut RelayTicketStore,
+    responder_id: &str,
+    now: Instant,
+) -> Vec<RelayTicketPollItem> {
+    let cursor = tickets.legacy_v2_cursors.get(responder_id).cloned();
+    let mut selected: Vec<(String, String)> = Vec::new();
+    if let Some(by_initiator) = tickets.by_responder.get(responder_id) {
+        if let Some(cursor) = cursor.as_ref() {
+            for (initiator_id, ticket_id) in by_initiator.range((
+                std::ops::Bound::Excluded(cursor.clone()),
+                std::ops::Bound::Unbounded,
+            )) {
+                if selected.len() >= MAX_LEGACY_RELAY_TICKET_POLL_RESULTS {
+                    break;
+                }
+                if tickets
+                    .tickets
+                    .get(ticket_id)
+                    .is_some_and(|ticket| !ticket.accepted && ticket.expires_at > now)
+                {
+                    selected.push((initiator_id.clone(), ticket_id.clone()));
+                }
+            }
+            if selected.len() < MAX_LEGACY_RELAY_TICKET_POLL_RESULTS {
+                for (initiator_id, ticket_id) in by_initiator.range(..=cursor.clone()) {
+                    if selected.len() >= MAX_LEGACY_RELAY_TICKET_POLL_RESULTS {
+                        break;
+                    }
+                    if tickets
+                        .tickets
+                        .get(ticket_id)
+                        .is_some_and(|ticket| !ticket.accepted && ticket.expires_at > now)
+                    {
+                        selected.push((initiator_id.clone(), ticket_id.clone()));
+                    }
+                }
+            }
+        } else {
+            for (initiator_id, ticket_id) in by_initiator {
+                if selected.len() >= MAX_LEGACY_RELAY_TICKET_POLL_RESULTS {
+                    break;
+                }
+                if tickets
+                    .tickets
+                    .get(ticket_id)
+                    .is_some_and(|ticket| !ticket.accepted && ticket.expires_at > now)
+                {
+                    selected.push((initiator_id.clone(), ticket_id.clone()));
+                }
+            }
+        }
+    }
+
+    match selected.last() {
+        Some((initiator_id, _)) => {
+            tickets
+                .legacy_v2_cursors
+                .insert(responder_id.to_owned(), initiator_id.clone());
+        }
+        None => {
+            tickets.legacy_v2_cursors.remove(responder_id);
+        }
+    }
+    selected
+        .into_iter()
+        .filter_map(|(_, ticket_id)| {
+            tickets
+                .tickets
+                .get(&ticket_id)
+                .map(|ticket| RelayTicketPollItem {
+                    ticket_id,
+                    initiator_id: ticket.initiator_id.clone(),
+                    purpose: ticket.purpose.clone(),
+                })
+        })
+        .collect()
+}
+
+/// Atomically reserves a role token and capacity before sending HTTP 101.
+/// The reservation is either committed by the upgrade callback or rolled back
+/// by its watchdog, so a successful handshake never races capacity admission.
+async fn reserve_relay_ticket_join(
     state: &AppState,
     ticket_id: &str,
     token: &str,
     client_ip: IpAddr,
-) -> Result<RelayRole, StatusCode> {
-    if !validate_relay_ticket_id(ticket_id) || !validate_relay_token(token) {
+) -> Result<RelayReservation, StatusCode> {
+    let ticket_id = canonical_relay_ticket_id(ticket_id).ok_or(StatusCode::BAD_REQUEST)?;
+    if !validate_relay_token(token) {
         return Err(StatusCode::BAD_REQUEST);
     }
 
     let token_hash = relay_token_hash(token);
+    let reservation_id = state
+        .next_relay_reservation_id
+        .fetch_add(1, Ordering::Relaxed);
     let now = Instant::now();
     let mut tickets = state.relay_tickets.write().await;
     prune_expired_relay_tickets(&mut tickets, now);
     let ticket = tickets
-        .get_mut(&ticket_id.to_lowercase())
+        .tickets
+        .get_mut(&ticket_id)
         .ok_or(StatusCode::GONE)?;
     if !ticket.accepted {
         return Err(StatusCode::FORBIDDEN);
@@ -902,16 +1508,22 @@ async fn admit_relay_ticket_join(
         return Err(StatusCode::UNAUTHORIZED);
     };
 
-    let already_joined = match role {
-        RelayRole::Initiator => &mut ticket.initiator_joined,
-        RelayRole::Responder => &mut ticket.responder_joined,
+    let (already_joined, reservation) = match role {
+        RelayRole::Initiator => (
+            &mut ticket.initiator_joined,
+            &mut ticket.initiator_reservation,
+        ),
+        RelayRole::Responder => (
+            &mut ticket.responder_joined,
+            &mut ticket.responder_reservation,
+        ),
     };
-    if *already_joined {
+    if *already_joined || reservation.is_some() {
         return Err(StatusCode::CONFLICT);
     }
 
-    // The ticket lock stays held until the capacity reservation succeeds so a
-    // failed capacity check never burns a one-time role token.
+    // The ticket lock stays held until capacity is reserved so a failed
+    // pre-upgrade check neither burns the token nor returns a false 101.
     let mut counts = state.relay_ip_counts.write().await;
     let global_total: usize = counts.values().sum();
     if global_total >= MAX_GLOBAL_RELAY_SESSIONS {
@@ -922,8 +1534,80 @@ async fn admit_relay_ticket_join(
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     *count += 1;
-    *already_joined = true;
-    Ok(role)
+    *reservation = Some(reservation_id);
+    Ok(RelayReservation {
+        ticket_id,
+        role,
+        client_ip,
+        id: reservation_id,
+    })
+}
+
+async fn commit_relay_ticket_reservation(
+    state: &AppState,
+    reservation: &RelayReservation,
+) -> Result<(), StatusCode> {
+    let mut tickets = state.relay_tickets.write().await;
+    let ticket = tickets
+        .tickets
+        .get_mut(&reservation.ticket_id)
+        .ok_or(StatusCode::GONE)?;
+    let (joined, pending) = match reservation.role {
+        RelayRole::Initiator => (
+            &mut ticket.initiator_joined,
+            &mut ticket.initiator_reservation,
+        ),
+        RelayRole::Responder => (
+            &mut ticket.responder_joined,
+            &mut ticket.responder_reservation,
+        ),
+    };
+    if *joined || *pending != Some(reservation.id) {
+        return Err(StatusCode::CONFLICT);
+    }
+    *pending = None;
+    *joined = true;
+    Ok(())
+}
+
+async fn rollback_relay_ticket_reservation(state: &AppState, reservation: &RelayReservation) {
+    let released = {
+        let mut tickets = state.relay_tickets.write().await;
+        let Some(ticket) = tickets.tickets.get_mut(&reservation.ticket_id) else {
+            return;
+        };
+        let pending = match reservation.role {
+            RelayRole::Initiator => &mut ticket.initiator_reservation,
+            RelayRole::Responder => &mut ticket.responder_reservation,
+        };
+        if *pending == Some(reservation.id) {
+            *pending = None;
+            true
+        } else {
+            false
+        }
+    };
+    if released {
+        let mut counts = state.relay_ip_counts.write().await;
+        if let Some(count) = counts.get_mut(&reservation.client_ip) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&reservation.client_ip);
+            }
+        }
+    }
+}
+
+/// Unit-test helper for immediate, non-WebSocket callers.
+async fn admit_relay_ticket_join(
+    state: &AppState,
+    ticket_id: &str,
+    token: &str,
+    client_ip: IpAddr,
+) -> Result<RelayRole, StatusCode> {
+    let reservation = reserve_relay_ticket_join(state, ticket_id, token, client_ip).await?;
+    commit_relay_ticket_reservation(state, &reservation).await?;
+    Ok(reservation.role)
 }
 
 async fn register(
@@ -1033,8 +1717,10 @@ async fn register(
     if !ed25519_verify(&pubkey, &msg, &sig_bytes) {
         return StatusCode::FORBIDDEN;
     }
-    if !remember_signed_request(&state, signed_request_replay_key(&msg, &sig_bytes)).await {
-        return StatusCode::CONFLICT;
+    if let Err(status) = replay_cache_status(
+        remember_signed_request(&state, signed_request_replay_key(&msg, &sig_bytes)).await,
+    ) {
+        return status;
     }
 
     let entry = PresenceEntry {
@@ -1155,8 +1841,10 @@ async fn unregister(
         // the only authority that survives address churn.
         let msg = build_unregister_msg(&id_raw, body.ts);
         if ed25519_verify(&pubkey, &msg, &sig_bytes) {
-            if !remember_signed_request(&state, signed_request_replay_key(&msg, &sig_bytes)).await {
-                return StatusCode::CONFLICT;
+            if let Err(status) = replay_cache_status(
+                remember_signed_request(&state, signed_request_replay_key(&msg, &sig_bytes)).await,
+            ) {
+                return status;
             }
             // Crypto and replay-cache work is deliberately outside the global
             // presence write lock. Re-check the pinned key before removal in
@@ -1407,7 +2095,8 @@ async fn relay_ticket_offer(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let ticket_id = random_relay_secret_hex();
+    let ticket_id = canonical_relay_ticket_id(&random_relay_secret_hex())
+        .expect("random relay ticket IDs are valid lowercase hex");
     let initiator_token = issue_relay_role_token(&state, &ticket_id, RelayRole::Initiator);
     let responder_token = issue_relay_role_token(&state, &ticket_id, RelayRole::Responder);
     let now = Instant::now();
@@ -1419,36 +2108,34 @@ async fn relay_ticket_offer(
         responder_token_hash: relay_token_hash(&responder_token),
         initiator_joined: false,
         responder_joined: false,
+        initiator_reservation: None,
+        responder_reservation: None,
         accepted: false,
         expires_at: now + RELAY_TICKET_TTL,
     };
 
     let mut tickets = state.relay_tickets.write().await;
     prune_expired_relay_tickets(&mut tickets, now);
-    // Never evict an unrelated user's pending friend ticket. A global or
-    // responder cap is a fail-closed admission limit, not a reason to let an
-    // attacker displace the oldest legitimate offer.
-    if tickets.len() >= MAX_RELAY_TICKETS {
+    // Never evict an unrelated user's pending friend ticket. The global cap
+    // is a fail-closed admission limit, not a reason to let an attacker
+    // displace the oldest legitimate offer.
+    if tickets.tickets.len() >= MAX_RELAY_TICKETS {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
+    // A pair remains occupied until its ticket expires, even after
+    // acceptance. Otherwise one initiator could repeatedly issue/accept
+    // tickets to the same responder and consume all accepted slots.
     if tickets
-        .values()
-        .filter(|pending| {
-            pending.initiator_id == ticket.initiator_id
-                && pending.responder_id == ticket.responder_id
-                && !pending.accepted
-        })
-        .count()
-        >= 1
+        .by_responder
+        .get(&ticket.responder_id)
+        .is_some_and(|by_initiator| by_initiator.contains_key(&ticket.initiator_id))
     {
         return Err(StatusCode::CONFLICT);
     }
-    if tickets
-        .values()
-        .filter(|pending| pending.responder_id == ticket.responder_id)
-        .count()
-        >= MAX_RELAY_TICKETS_PER_RESPONDER
-    {
+    // Accepted tickets count here too. This caps a known-but-malicious
+    // initiator without reviving a responder-wide pending-offer cap that
+    // unknown identities could use to block real friends.
+    if !initiator_has_ticket_capacity(&tickets, &ticket.initiator_id) {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     tickets.insert(ticket_id.clone(), ticket);
@@ -1465,11 +2152,14 @@ async fn relay_ticket_offer(
     }))
 }
 
-async fn relay_ticket_poll(
+/// Compatibility handler for the deployed v2 signed poll schema. Its bounded
+/// response is intentionally less capable than v3, but it stays authenticated
+/// and prevents old clients from failing with a signature-mismatch 403.
+async fn relay_ticket_poll_v2(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Json(body): Json<RelayTicketPollRequest>,
+    Json(body): Json<RelayTicketPollV2Request>,
 ) -> Result<Json<RelayTicketPollResponse>, StatusCode> {
     if !validate_hex_id(&body.responder_id) || !timestamp_fresh(body.ts) {
         return Err(StatusCode::BAD_REQUEST);
@@ -1482,26 +2172,81 @@ async fn relay_ticket_poll(
         return Err(StatusCode::BAD_REQUEST);
     };
     let client_ip = extract_client_ip(&headers, addr);
-    if !check_rate_limit(&state, client_ip).await {
+    if !check_ticket_read_rate_limit(&state, client_ip).await {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
-    let signed = build_relay_ticket_poll_msg(&responder_raw, &nonce, body.ts);
-    verify_signed_relay_identity(&state, &body.responder_id, &signed, &sig).await?;
+    let signed = build_relay_ticket_poll_v2_msg(&responder_raw, &nonce, body.ts);
+    // v2 clients generate a fresh nonce per request. This is a read-only
+    // compatibility path, so preserve its authenticated timestamp/signature
+    // verification without imposing v3's stable-nonce rule.
+    verify_signed_relay_identity_signature(&state, &body.responder_id, &signed, &sig).await?;
 
     let responder_id = body.responder_id.to_lowercase();
-    let now = Instant::now();
     let mut tickets = state.relay_tickets.write().await;
-    prune_expired_relay_tickets(&mut tickets, now);
-    let results = tickets
-        .iter()
-        .filter(|(_, ticket)| ticket.responder_id == responder_id && !ticket.accepted)
-        .map(|(ticket_id, ticket)| RelayTicketPollItem {
-            ticket_id: ticket_id.clone(),
-            initiator_id: ticket.initiator_id.clone(),
-            purpose: ticket.purpose.clone(),
-        })
-        .collect();
-    Ok(Json(RelayTicketPollResponse { tickets: results }))
+    prune_expired_relay_tickets(&mut tickets, Instant::now());
+    Ok(Json(RelayTicketPollResponse {
+        tickets: relay_ticket_poll_v2_page(&mut tickets, &responder_id, Instant::now()),
+        next_cursor: None,
+    }))
+}
+
+async fn relay_ticket_poll_v3(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<RelayTicketPollV3Request>,
+) -> Result<Json<RelayTicketPollResponse>, StatusCode> {
+    if !validate_hex_id(&body.responder_id) || !timestamp_fresh(body.ts) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let (Some(responder_raw), Some(nonce), Some(sig), Some(friend_candidates)) = (
+        decode_hex_id(&body.responder_id),
+        decode_hex_nonce(&body.nonce),
+        decode_hex_sig(&body.sig),
+        decode_relay_ticket_poll_candidates(&body.friend_candidates),
+    ) else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    let cursor = match body.cursor.as_deref() {
+        Some(cursor) => canonical_relay_ticket_id(cursor).ok_or(StatusCode::BAD_REQUEST)?,
+        None => String::new(),
+    };
+    let cursor_raw = if cursor.is_empty() {
+        None
+    } else {
+        Some(decode_hex_id(&cursor).expect("canonical relay ticket cursors are valid 32-byte hex"))
+    };
+    let client_ip = extract_client_ip(&headers, addr);
+    if !check_ticket_read_rate_limit(&state, client_ip).await {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    let signed = build_relay_ticket_poll_v3_msg(
+        &responder_raw,
+        &friend_candidates,
+        cursor_raw.as_ref(),
+        &nonce,
+        body.ts,
+    );
+    verify_signed_relay_identity_signature(&state, &body.responder_id, &signed, &sig).await?;
+    idempotent_read_status(
+        remember_ticket_poll_nonce(&state, responder_raw, nonce, body.ts).await,
+    )?;
+
+    let responder_id = body.responder_id.to_lowercase();
+    let friend_candidates: HashSet<String> = friend_candidates.iter().map(hex::encode).collect();
+    let now = Instant::now();
+    let tickets = state.relay_tickets.read().await;
+    let (tickets, next_cursor) = relay_ticket_poll_page(
+        &tickets,
+        &responder_id,
+        &friend_candidates,
+        (!cursor.is_empty()).then_some(cursor.as_str()),
+        now,
+    );
+    Ok(Json(RelayTicketPollResponse {
+        tickets,
+        next_cursor,
+    }))
 }
 
 async fn relay_ticket_accept(
@@ -1511,10 +2256,8 @@ async fn relay_ticket_accept(
     Path(ticket_id): Path<String>,
     Json(body): Json<RelayTicketIdentityRequest>,
 ) -> Result<Json<RelayTicketAcceptResponse>, StatusCode> {
-    if !validate_relay_ticket_id(&ticket_id)
-        || !validate_hex_id(&body.identity_id)
-        || !timestamp_fresh(body.ts)
-    {
+    let ticket_id = canonical_relay_ticket_id(&ticket_id).ok_or(StatusCode::BAD_REQUEST)?;
+    if !validate_hex_id(&body.identity_id) || !timestamp_fresh(body.ts) {
         return Err(StatusCode::BAD_REQUEST);
     }
     let (Some(identity_raw), Some(ticket_raw), Some(nonce), Some(sig)) = (
@@ -1541,10 +2284,9 @@ async fn relay_ticket_accept(
     let now = Instant::now();
     let mut tickets = state.relay_tickets.write().await;
     prune_expired_relay_tickets(&mut tickets, now);
-    let ticket = tickets
-        .get_mut(&ticket_id.to_lowercase())
-        .ok_or(StatusCode::GONE)?;
-    if ticket.responder_id != body.identity_id.to_lowercase() {
+    let responder_id = body.identity_id.to_lowercase();
+    let ticket = tickets.tickets.get(&ticket_id).ok_or(StatusCode::GONE)?;
+    if ticket.responder_id != responder_id {
         return Err(StatusCode::FORBIDDEN);
     }
     if ticket.accepted {
@@ -1553,11 +2295,22 @@ async fn relay_ticket_accept(
         // another chance to recover a role capability.
         return Err(StatusCode::CONFLICT);
     }
-    ticket.accepted = true;
+    if !responder_has_accepted_ticket_capacity(&tickets, &responder_id) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    if !tickets.mark_accepted(&ticket_id) {
+        return Err(StatusCode::CONFLICT);
+    }
     let responder_token = issue_relay_role_token(&state, &ticket_id, RelayRole::Responder);
     Ok(Json(RelayTicketAcceptResponse {
         responder_token,
-        expires_in_secs: ticket.expires_at.saturating_duration_since(now).as_secs(),
+        expires_in_secs: tickets
+            .tickets
+            .get(&ticket_id)
+            .expect("accepted ticket remains present while the store lock is held")
+            .expires_at
+            .saturating_duration_since(now)
+            .as_secs(),
     }))
 }
 
@@ -1568,10 +2321,8 @@ async fn relay_ticket_status(
     Path(ticket_id): Path<String>,
     Json(body): Json<RelayTicketIdentityRequest>,
 ) -> Result<Json<RelayTicketStatusResponse>, StatusCode> {
-    if !validate_relay_ticket_id(&ticket_id)
-        || !validate_hex_id(&body.identity_id)
-        || !timestamp_fresh(body.ts)
-    {
+    let ticket_id = canonical_relay_ticket_id(&ticket_id).ok_or(StatusCode::BAD_REQUEST)?;
+    if !validate_hex_id(&body.identity_id) || !timestamp_fresh(body.ts) {
         return Err(StatusCode::BAD_REQUEST);
     }
     let (Some(identity_raw), Some(ticket_raw), Some(nonce), Some(sig)) = (
@@ -1583,7 +2334,7 @@ async fn relay_ticket_status(
         return Err(StatusCode::BAD_REQUEST);
     };
     let client_ip = extract_client_ip(&headers, addr);
-    if !check_rate_limit(&state, client_ip).await {
+    if !check_ticket_read_rate_limit(&state, client_ip).await {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     let signed = build_relay_ticket_action_msg(
@@ -1593,23 +2344,24 @@ async fn relay_ticket_status(
         &nonce,
         body.ts,
     );
-    verify_signed_relay_identity(&state, &body.identity_id, &signed, &sig).await?;
+    verify_signed_relay_identity_signature(&state, &body.identity_id, &signed, &sig).await?;
 
     let now = Instant::now();
-    let mut tickets = state.relay_tickets.write().await;
-    prune_expired_relay_tickets(&mut tickets, now);
-    let ticket = tickets
-        .get(&ticket_id.to_lowercase())
-        .ok_or(StatusCode::GONE)?;
+    let tickets = state.relay_tickets.read().await;
+    let ticket = tickets.tickets.get(&ticket_id).ok_or(StatusCode::GONE)?;
+    if ticket.expires_at <= now {
+        return Err(StatusCode::GONE);
+    }
     if ticket.initiator_id != body.identity_id.to_lowercase() {
         return Err(StatusCode::FORBIDDEN);
     }
+    let accepted = ticket.accepted;
+    drop(tickets);
+    idempotent_read_status(
+        remember_ticket_status_nonce(&state, identity_raw, ticket_raw, nonce, body.ts).await,
+    )?;
     Ok(Json(RelayTicketStatusResponse {
-        status: if ticket.accepted {
-            "accepted"
-        } else {
-            "offered"
-        },
+        status: if accepted { "accepted" } else { "offered" },
     }))
 }
 
@@ -1624,9 +2376,9 @@ async fn relay_ws(
     headers: HeaderMap,
     Path(ticket_id): Path<String>,
 ) -> impl IntoResponse {
-    if !validate_relay_ticket_id(&ticket_id) {
+    let Some(ticket_id) = canonical_relay_ticket_id(&ticket_id) else {
         return StatusCode::BAD_REQUEST.into_response();
-    }
+    };
     let token = headers
         .get("authorization")
         .and_then(|value| value.to_str().ok())
@@ -1643,15 +2395,19 @@ async fn relay_ws(
     if !check_rate_limit(&state, client_ip).await {
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
-    let role = match admit_relay_ticket_join(&state, &ticket_id, token, client_ip).await {
-        Ok(role) => role,
+    let reservation = match reserve_relay_ticket_join(&state, &ticket_id, token, client_ip).await {
+        Ok(reservation) => reservation,
         Err(status) => return status.into_response(),
     };
+    let watchdog_state = state.clone();
+    let watchdog_reservation = reservation.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(RELAY_UPGRADE_RESERVATION_TIMEOUT).await;
+        rollback_relay_ticket_reservation(&watchdog_state, &watchdog_reservation).await;
+    });
     ws.max_frame_size(1024 * 1024)
         .max_message_size(1024 * 1024)
-        .on_upgrade(move |socket| {
-            handle_relay_ws_guarded(socket, state, ticket_id, client_ip, role)
-        })
+        .on_upgrade(move |socket| handle_relay_ws_guarded(socket, state, reservation))
         .into_response()
 }
 
@@ -1664,12 +2420,23 @@ async fn legacy_relay_gone() -> StatusCode {
 }
 
 async fn handle_relay_ws_guarded(
-    socket: WebSocket,
+    mut socket: WebSocket,
     state: AppState,
-    session_id: String,
-    client_ip: IpAddr,
-    role: RelayRole,
+    reservation: RelayReservation,
 ) {
+    if commit_relay_ticket_reservation(&state, &reservation)
+        .await
+        .is_err()
+    {
+        // The watchdog may have released an abandoned reservation before this
+        // callback ran. Capacity was never overcommitted; close this late
+        // socket rather than consuming a second slot.
+        let _ = socket.send(Message::Close(None)).await;
+        return;
+    }
+    let session_id = reservation.ticket_id.clone();
+    let client_ip = reservation.client_ip;
+    let role = reservation.role;
     let cleanup_state = state.clone();
     let cleanup_session = session_id.clone();
     let result =
@@ -1771,22 +2538,28 @@ async fn handle_relay_ws(
     }
 }
 
-/// Peer1's main loop. Pre-bridge it just waits for peer2 (via
-/// `announce_rx`) or the idle timeout; inbound WS frames are
-/// dropped because there's no sink yet (matching protocol intent —
-/// peer1 should not transmit before peer2 attaches). Once peer2's
-/// inbox sender arrives, the same loop forwards inbound WS frames
-/// to it and drains `peer1_inbox_rx` to the WebSocket.
-///
-/// Pre-bridge byte accounting note: dropped pre-bridge bytes must
-/// NOT count against `RELAY_BANDWIDTH_CAP_BYTES`. Earlier logic did
-/// count them, which let a misbehaving peer1 silently burn the
-/// session's entire relay budget with junk frames before peer2 ever
-/// attached, so peer2's legitimate first Binary frame would
-/// immediately trip the cap and tear the bridge down. We now only
-/// accumulate bytes that are actually forwarded, and only after
-/// peer2 has joined (at which point `total_bytes` is the shared
-/// counter passed from the peer2 side of the bridge).
+fn enqueue_prebridge_frame(
+    frames: &mut VecDeque<Vec<u8>>,
+    buffered_bytes: &mut usize,
+    frame: Vec<u8>,
+    max_frames: usize,
+    max_bytes: usize,
+) -> Result<(), ()> {
+    if frames.len() >= max_frames
+        || buffered_bytes
+            .checked_add(frame.len())
+            .is_none_or(|total| total > max_bytes)
+    {
+        return Err(());
+    }
+    *buffered_bytes += frame.len();
+    frames.push_back(frame);
+    Ok(())
+}
+
+/// Peer1 buffers a bounded initial handshake FIFO until peer2 joins, then
+/// flushes it in order. This preserves the immediate eMule `OP_HELLO` sent by
+/// whichever authenticated role connects first.
 async fn run_peer1_loop(
     mut socket: WebSocket,
     mut peer1_inbox_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
@@ -1801,6 +2574,8 @@ async fn run_peer1_loop(
     let mut announce_rx = Some(peer2_announce_rx);
     let mut peer2_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>> = None;
     let mut total_bytes: Option<Arc<AtomicUsize>> = None;
+    let mut prebridge_frames = VecDeque::<Vec<u8>>::new();
+    let mut prebridge_bytes = 0usize;
     let session_deadline = Instant::now() + RELAY_SESSION_TIMEOUT;
 
     loop {
@@ -1815,6 +2590,20 @@ async fn run_peer1_loop(
                     Ok((tx, counter)) => {
                         peer2_tx = Some(tx);
                         total_bytes = Some(counter);
+                        let Some(ref tx) = peer2_tx else { return };
+                        let Some(ref counter) = total_bytes else { return };
+                        while let Some(frame) = prebridge_frames.pop_front() {
+                            let new_total =
+                                counter.fetch_add(frame.len(), Ordering::Relaxed) + frame.len();
+                            if new_total > RELAY_BANDWIDTH_CAP_BYTES {
+                                info!("relay session {} bandwidth cap reached flushing pre-bridge frames", &session_id[..8.min(session_id.len())]);
+                                return;
+                            }
+                            if tx.send(frame).await.is_err() {
+                                return;
+                            }
+                        }
+                        prebridge_bytes = 0;
                     }
                     Err(_) => {
                         // Sender was dropped (peer2 join handler aborted before sending).
@@ -1822,13 +2611,14 @@ async fn run_peer1_loop(
                     }
                 }
             }
-            msg = socket.recv() => {
+            // Stop reading while a bounded pre-bridge queue is full. This
+            // applies WebSocket/TCP backpressure instead of silently losing
+            // handshake frames.
+            msg = socket.recv(), if peer2_tx.is_some()
+                || (prebridge_frames.len() < MAX_PREBRIDGE_RELAY_FRAMES
+                    && prebridge_bytes < MAX_PREBRIDGE_RELAY_BYTES) => {
                 match msg {
                     Some(Ok(Message::Binary(data))) => {
-                        // Only count (and forward) bytes once peer2 is
-                        // attached; pre-bridge frames are dropped with
-                        // zero cap impact so a noisy peer1 can't
-                        // starve the session before peer2 joins.
                         if let (Some(ref tx), Some(ref counter)) = (&peer2_tx, &total_bytes) {
                             let new_total =
                                 counter.fetch_add(data.len(), Ordering::Relaxed) + data.len();
@@ -1839,8 +2629,17 @@ async fn run_peer1_loop(
                             if tx.send(data.to_vec()).await.is_err() {
                                 break;
                             }
+                        } else if enqueue_prebridge_frame(
+                            &mut prebridge_frames,
+                            &mut prebridge_bytes,
+                            data.to_vec(),
+                            MAX_PREBRIDGE_RELAY_FRAMES,
+                            MAX_PREBRIDGE_RELAY_BYTES,
+                        )
+                        .is_err() {
+                            info!("relay session {} exceeded pre-bridge buffer", &session_id[..8.min(session_id.len())]);
+                            break;
                         }
-                        // else: pre-bridge, drop silently.
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     _ => {}
@@ -2012,6 +2811,10 @@ async fn sweep_expired(state: AppState) {
             let mut limits = state.rate_limits.write().await;
             limits.retain(|_, entry| now.duration_since(entry.window_start) < RATE_WINDOW * 2);
         }
+        {
+            let mut limits = state.ticket_read_rate_limits.write().await;
+            limits.retain(|_, entry| now.duration_since(entry.window_start) < RATE_WINDOW * 2);
+        }
 
         // Sweep the punch-specific rate-limit map on the same cadence
         // as the general one so the per-IP entries don't pile up after
@@ -2023,7 +2826,15 @@ async fn sweep_expired(state: AppState) {
 
         {
             let mut replay = state.replay_cache.write().await;
-            replay.retain(|_, seen_at| now.duration_since(*seen_at) < REPLAY_CACHE_TTL);
+            replay.prune_expired(now);
+        }
+        {
+            let mut nonces = state.poll_read_nonces.write().await;
+            nonces.prune_expired(now);
+        }
+        {
+            let mut nonces = state.status_read_nonces.write().await;
+            nonces.prune_expired(now);
         }
 
         // Sweep expired punch requests
@@ -2039,9 +2850,9 @@ async fn sweep_expired(state: AppState) {
 
         {
             let mut tickets = state.relay_tickets.write().await;
-            let before = tickets.len();
+            let before = tickets.tickets.len();
             prune_expired_relay_tickets(&mut tickets, now);
-            let removed = before - tickets.len();
+            let removed = before - tickets.tickets.len();
             if removed > 0 {
                 debug!("swept {removed} expired relay tickets");
             }
@@ -2105,17 +2916,21 @@ async fn main() {
     let state = AppState {
         store: Arc::new(RwLock::new(HashMap::new())),
         rate_limits: Arc::new(RwLock::new(HashMap::new())),
+        ticket_read_rate_limits: Arc::new(RwLock::new(HashMap::new())),
         punch_rate_limits: Arc::new(RwLock::new(HashMap::new())),
         punch_requests: Arc::new(RwLock::new(HashMap::new())),
         relay_sessions: Arc::new(RwLock::new(HashMap::new())),
         relay_ip_counts: Arc::new(RwLock::new(HashMap::new())),
-        relay_tickets: Arc::new(RwLock::new(HashMap::new())),
+        next_relay_reservation_id: Arc::new(AtomicU64::new(1)),
+        relay_tickets: Arc::new(RwLock::new(RelayTicketStore::default())),
         relay_token_key: {
             let mut key = [0u8; 32];
             OsRng.fill_bytes(&mut key);
             key
         },
-        replay_cache: Arc::new(RwLock::new(HashMap::new())),
+        replay_cache: Arc::new(RwLock::new(ReplayCache::default())),
+        poll_read_nonces: Arc::new(RwLock::new(ScopedNonceCache::new())),
+        status_read_nonces: Arc::new(RwLock::new(ScopedNonceCache::new())),
         started_at: Instant::now(),
     };
 
@@ -2128,7 +2943,8 @@ async fn main() {
         .route("/punch", post(punch_register))
         .route("/punch/{id}", get(punch_poll))
         .route("/v2/relay-tickets/offer", post(relay_ticket_offer))
-        .route("/v2/relay-tickets/poll", post(relay_ticket_poll))
+        .route("/v2/relay-tickets/poll", post(relay_ticket_poll_v2))
+        .route("/v3/relay-tickets/poll", post(relay_ticket_poll_v3))
         .route(
             "/v2/relay-tickets/{ticket_id}/accept",
             post(relay_ticket_accept),
@@ -2219,13 +3035,17 @@ mod relay_ticket_tests {
         AppState {
             store: Arc::new(RwLock::new(HashMap::new())),
             rate_limits: Arc::new(RwLock::new(HashMap::new())),
+            ticket_read_rate_limits: Arc::new(RwLock::new(HashMap::new())),
             punch_rate_limits: Arc::new(RwLock::new(HashMap::new())),
             punch_requests: Arc::new(RwLock::new(HashMap::new())),
             relay_sessions: Arc::new(RwLock::new(HashMap::new())),
             relay_ip_counts: Arc::new(RwLock::new(HashMap::new())),
-            relay_tickets: Arc::new(RwLock::new(HashMap::new())),
+            next_relay_reservation_id: Arc::new(AtomicU64::new(1)),
+            relay_tickets: Arc::new(RwLock::new(RelayTicketStore::default())),
             relay_token_key: [0x5a; 32],
-            replay_cache: Arc::new(RwLock::new(HashMap::new())),
+            replay_cache: Arc::new(RwLock::new(ReplayCache::default())),
+            poll_read_nonces: Arc::new(RwLock::new(ScopedNonceCache::new())),
+            status_read_nonces: Arc::new(RwLock::new(ScopedNonceCache::new())),
             started_at: Instant::now(),
         }
     }
@@ -2247,11 +3067,409 @@ mod relay_ticket_tests {
                 responder_token_hash: relay_token_hash(&responder_token),
                 initiator_joined: false,
                 responder_joined: false,
+                initiator_reservation: None,
+                responder_reservation: None,
                 accepted: true,
                 expires_at,
             },
         );
         (initiator_token, responder_token)
+    }
+
+    fn ticket_for_test(responder_id: &str, accepted: bool) -> RelayTicket {
+        ticket_with_parties(&"11".repeat(32), responder_id, accepted)
+    }
+
+    fn ticket_with_parties(initiator_id: &str, responder_id: &str, accepted: bool) -> RelayTicket {
+        RelayTicket {
+            initiator_id: initiator_id.to_owned(),
+            responder_id: responder_id.to_owned(),
+            purpose: "friend".to_string(),
+            initiator_token_hash: [0u8; 32],
+            responder_token_hash: [0u8; 32],
+            initiator_joined: false,
+            responder_joined: false,
+            initiator_reservation: None,
+            responder_reservation: None,
+            accepted,
+            expires_at: Instant::now() + Duration::from_secs(30),
+        }
+    }
+
+    #[test]
+    fn relay_ticket_operation_codes_are_stable() {
+        assert_eq!(OP_RELAY_TICKET_OFFER, 0x07);
+        assert_eq!(OP_RELAY_TICKET_POLL, 0x08);
+        assert_eq!(OP_RELAY_TICKET_ACCEPT, 0x09);
+        assert_eq!(OP_RELAY_TICKET_STATUS, 0x0a);
+        assert_eq!(OP_RELAY_TICKET_POLL_V3, 0x0b);
+    }
+
+    #[test]
+    fn v2_and_v3_poll_signatures_are_unambiguous() {
+        let responder = [1u8; 32];
+        let nonce = [2u8; 16];
+        let v2 = build_relay_ticket_poll_v2_msg(&responder, &nonce, 3);
+        let v3 = build_relay_ticket_poll_v3_msg(&responder, &[[4u8; 32]], None, &nonce, 3);
+        assert_ne!(v2, v3);
+    }
+
+    #[test]
+    fn concurrent_v3_pages_share_timestamp_without_nonce_conflict() {
+        let responder = [1u8; 32];
+        let nonce = [2u8; 16];
+        let timestamp = 42;
+        let page_a =
+            build_relay_ticket_poll_v3_msg(&responder, &[[3u8; 32]], None, &nonce, timestamp);
+        let page_b =
+            build_relay_ticket_poll_v3_msg(&responder, &[[4u8; 32]], None, &nonce, timestamp);
+        assert_ne!(page_a, page_b, "candidate pages remain separately signed");
+
+        let mut cache = ScopedNonceCache::new();
+        let now = Instant::now();
+        assert_eq!(
+            admit_idempotent_read_nonce(
+                &mut cache,
+                responder,
+                nonce,
+                timestamp,
+                now,
+                POLL_READ_NONCE_TTL,
+                MAX_POLL_READ_NONCES,
+            ),
+            IdempotentReadAdmission::New
+        );
+        assert_eq!(
+            admit_idempotent_read_nonce(
+                &mut cache,
+                responder,
+                nonce,
+                timestamp,
+                now,
+                POLL_READ_NONCE_TTL,
+                MAX_POLL_READ_NONCES,
+            ),
+            IdempotentReadAdmission::Idempotent
+        );
+    }
+
+    #[tokio::test]
+    async fn ticket_read_budget_is_isolated_from_general_requests() {
+        let state = test_state();
+        let ip: IpAddr = "8.8.8.8".parse().unwrap();
+        for _ in 0..MAX_REQUESTS_PER_MINUTE {
+            assert!(check_rate_limit(&state, ip).await);
+        }
+        assert!(!check_rate_limit(&state, ip).await);
+        assert!(check_ticket_read_rate_limit(&state, ip).await);
+    }
+
+    #[test]
+    fn replay_cache_fails_closed_without_evicting_fresh_entries() {
+        let now = Instant::now();
+        let mut cache = ReplayCache::default();
+        assert_eq!(
+            admit_replay_key(&mut cache, [1; 32], now, 2),
+            ReplayCacheAdmission::Remembered
+        );
+        assert_eq!(
+            admit_replay_key(&mut cache, [2; 32], now, 2),
+            ReplayCacheAdmission::Remembered
+        );
+        assert_eq!(
+            admit_replay_key(&mut cache, [3; 32], now, 2),
+            ReplayCacheAdmission::Full
+        );
+        assert!(cache.entries.contains_key(&[1; 32]));
+        assert!(cache.entries.contains_key(&[2; 32]));
+        assert!(!cache.entries.contains_key(&[3; 32]));
+        assert_eq!(
+            replay_cache_status(ReplayCacheAdmission::Full),
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        );
+        assert_eq!(
+            replay_cache_status(ReplayCacheAdmission::Replay),
+            Err(StatusCode::CONFLICT)
+        );
+    }
+
+    #[test]
+    fn idempotent_read_nonce_is_bounded_per_scope() {
+        let now = Instant::now();
+        let mut cache = ScopedNonceCache::new();
+        assert_eq!(
+            admit_idempotent_read_nonce(
+                &mut cache,
+                [1; 32],
+                [2; 16],
+                10,
+                now,
+                Duration::from_secs(60),
+                1,
+            ),
+            IdempotentReadAdmission::New
+        );
+        assert_eq!(
+            admit_idempotent_read_nonce(
+                &mut cache,
+                [1; 32],
+                [2; 16],
+                10,
+                now,
+                Duration::from_secs(60),
+                1,
+            ),
+            IdempotentReadAdmission::Idempotent
+        );
+        assert_eq!(
+            admit_idempotent_read_nonce(
+                &mut cache,
+                [1; 32],
+                [3; 16],
+                11,
+                now,
+                Duration::from_secs(60),
+                1,
+            ),
+            IdempotentReadAdmission::NonceConflict
+        );
+        assert_eq!(
+            admit_idempotent_read_nonce(
+                &mut cache,
+                [4; 32],
+                [5; 16],
+                10,
+                now,
+                Duration::from_secs(60),
+                1,
+            ),
+            IdempotentReadAdmission::Full
+        );
+        assert_eq!(
+            admit_idempotent_read_nonce(
+                &mut cache,
+                [1; 32],
+                [2; 16],
+                9,
+                now,
+                Duration::from_secs(60),
+                1,
+            ),
+            IdempotentReadAdmission::Replay
+        );
+        assert_eq!(
+            idempotent_read_status(IdempotentReadAdmission::Replay),
+            Err(StatusCode::CONFLICT)
+        );
+    }
+
+    #[test]
+    fn accepted_ticket_capacity_does_not_count_pending_offers() {
+        let responder_id = "22".repeat(32);
+        let mut tickets = RelayTicketStore::default();
+        for index in 0..(MAX_ACCEPTED_RELAY_TICKETS_PER_RESPONDER * 2) {
+            tickets.insert(
+                format!("{:064x}", index + 100),
+                ticket_for_test(&responder_id, false),
+            );
+        }
+        assert!(
+            responder_has_accepted_ticket_capacity(&tickets, &responder_id),
+            "unaccepted offers must not consume friend-acceptance capacity"
+        );
+
+        for index in 0..MAX_ACCEPTED_RELAY_TICKETS_PER_RESPONDER {
+            tickets.insert(
+                format!("{index:064x}"),
+                ticket_for_test(&responder_id, true),
+            );
+        }
+        assert!(!responder_has_accepted_ticket_capacity(
+            &tickets,
+            &responder_id
+        ));
+
+        tickets.remove(&format!("{:064x}", 0));
+        assert!(responder_has_accepted_ticket_capacity(
+            &tickets,
+            &responder_id
+        ));
+    }
+
+    #[test]
+    fn ticket_capacity_counts_accepted_and_offered_tickets() {
+        let initiator_id = "33".repeat(32);
+        let mut tickets = RelayTicketStore::default();
+        for index in 0..MAX_PENDING_RELAY_TICKETS_PER_INITIATOR {
+            tickets.insert(
+                format!("{index:064x}"),
+                ticket_with_parties(&initiator_id, &format!("{:064x}", index + 100), index == 0),
+            );
+        }
+        assert!(!initiator_has_ticket_capacity(&tickets, &initiator_id));
+        assert!(
+            tickets
+                .by_responder
+                .get(&format!("{:064x}", 100))
+                .is_some_and(|by_initiator| by_initiator.contains_key(&initiator_id)),
+            "accepted/offered pair occupancy is indexed"
+        );
+    }
+
+    #[test]
+    fn ticket_expiry_queue_removes_all_admission_indexes() {
+        let initiator_id = "55".repeat(32);
+        let responder_id = "66".repeat(32);
+        let mut tickets = RelayTicketStore::default();
+        let mut expired = ticket_with_parties(&initiator_id, &responder_id, true);
+        expired.expires_at = Instant::now() - Duration::from_secs(1);
+        tickets.insert("77".repeat(32), expired);
+
+        prune_expired_relay_tickets(&mut tickets, Instant::now());
+        assert!(tickets.tickets.is_empty());
+        assert!(tickets.by_responder.is_empty());
+        assert!(tickets.initiator_counts.is_empty());
+        assert!(tickets.accepted_responder_counts.is_empty());
+    }
+
+    #[test]
+    fn poll_filters_unknown_offers_before_pagination() {
+        let responder_id = "22".repeat(32);
+        let mut tickets = RelayTicketStore::default();
+
+        for index in 0..(MAX_RELAY_TICKET_POLL_RESULTS * 2) {
+            let unknown_id = format!("{:064x}", index + 10_000);
+            tickets.insert(
+                format!("{:064x}", index + 1000),
+                ticket_with_parties(&unknown_id, &responder_id, false),
+            );
+        }
+        let mut candidates = HashSet::new();
+        for index in 0..(MAX_RELAY_TICKET_POLL_RESULTS + 1) {
+            let friend_id = format!("{:064x}", index + 20_000);
+            candidates.insert(friend_id.clone());
+            tickets.insert(
+                format!("{index:064x}"),
+                ticket_with_parties(&friend_id, &responder_id, false),
+            );
+        }
+
+        let (first_page, cursor) =
+            relay_ticket_poll_page(&tickets, &responder_id, &candidates, None, Instant::now());
+        assert_eq!(first_page.len(), MAX_RELAY_TICKET_POLL_RESULTS);
+        assert!(first_page
+            .iter()
+            .all(|item| candidates.contains(&item.initiator_id)));
+        let cursor = cursor.expect("the seventeenth matching friend offer is paginated");
+        let (second_page, final_cursor) = relay_ticket_poll_page(
+            &tickets,
+            &responder_id,
+            &candidates,
+            Some(&cursor),
+            Instant::now(),
+        );
+        assert_eq!(second_page.len(), 1);
+        assert!(candidates.contains(&second_page[0].initiator_id));
+        assert_eq!(final_cursor, None);
+    }
+
+    #[test]
+    fn legacy_v2_poll_rotates_deterministically_past_first_page() {
+        let responder_id = "22".repeat(32);
+        let mut tickets = RelayTicketStore::default();
+        let mut expected = HashSet::new();
+        for index in 0..(MAX_LEGACY_RELAY_TICKET_POLL_RESULTS + 1) {
+            let initiator_id = format!("{:064x}", index + 30_000);
+            expected.insert(initiator_id.clone());
+            tickets.insert(
+                format!("{:064x}", index + 40_000),
+                ticket_with_parties(&initiator_id, &responder_id, false),
+            );
+        }
+
+        let first = relay_ticket_poll_v2_page(&mut tickets, &responder_id, Instant::now());
+        let second = relay_ticket_poll_v2_page(&mut tickets, &responder_id, Instant::now());
+        let seen: HashSet<String> = first
+            .iter()
+            .chain(second.iter())
+            .map(|ticket| ticket.initiator_id.clone())
+            .collect();
+        assert!(expected.is_subset(&seen));
+    }
+
+    #[test]
+    fn prebridge_frames_are_bounded_and_fifo() {
+        let mut frames = VecDeque::new();
+        let mut buffered_bytes = 0;
+        enqueue_prebridge_frame(&mut frames, &mut buffered_bytes, b"hello".to_vec(), 2, 8).unwrap();
+        enqueue_prebridge_frame(&mut frames, &mut buffered_bytes, b"yo".to_vec(), 2, 8).unwrap();
+        assert_eq!(buffered_bytes, 7);
+        assert_eq!(frames.pop_front(), Some(b"hello".to_vec()));
+        assert_eq!(frames.pop_front(), Some(b"yo".to_vec()));
+        assert!(enqueue_prebridge_frame(
+            &mut frames,
+            &mut buffered_bytes,
+            b"123456789".to_vec(),
+            2,
+            8
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn ticket_id_canonicalization_preserves_token_derivation_and_admission() {
+        let state = test_state();
+        let lower = "ab".repeat(32);
+        let upper = lower.to_ascii_uppercase();
+        let (initiator_token, _) =
+            insert_ticket(&state, &lower, Instant::now() + Duration::from_secs(30)).await;
+
+        assert_eq!(
+            issue_relay_role_token(&state, &lower, RelayRole::Initiator),
+            issue_relay_role_token(&state, &upper, RelayRole::Initiator)
+        );
+        assert_eq!(
+            admit_relay_ticket_join(&state, &upper, &initiator_token, "8.8.8.8".parse().unwrap())
+                .await,
+            Ok(RelayRole::Initiator)
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_upgrade_reservation_rolls_back_or_commits_atomically() {
+        let state = test_state();
+        let ticket_id = "ac".repeat(32);
+        let (initiator_token, _) =
+            insert_ticket(&state, &ticket_id, Instant::now() + Duration::from_secs(30)).await;
+        let client_ip: IpAddr = "8.8.4.4".parse().unwrap();
+
+        let reservation =
+            reserve_relay_ticket_join(&state, &ticket_id, &initiator_token, client_ip)
+                .await
+                .unwrap();
+        assert_eq!(state.relay_ip_counts.read().await.get(&client_ip), Some(&1));
+        rollback_relay_ticket_reservation(&state, &reservation).await;
+        assert!(state.relay_ip_counts.read().await.is_empty());
+        assert_eq!(
+            state
+                .relay_tickets
+                .read()
+                .await
+                .tickets
+                .get(&ticket_id)
+                .unwrap()
+                .initiator_reservation,
+            None
+        );
+
+        let reservation =
+            reserve_relay_ticket_join(&state, &ticket_id, &initiator_token, client_ip)
+                .await
+                .unwrap();
+        commit_relay_ticket_reservation(&state, &reservation)
+            .await
+            .unwrap();
+        assert_eq!(state.relay_ip_counts.read().await.get(&client_ip), Some(&1));
     }
 
     #[tokio::test]
@@ -2302,6 +3520,6 @@ mod relay_ticket_tests {
                 .unwrap_err(),
             StatusCode::GONE
         );
-        assert!(state.relay_tickets.read().await.is_empty());
+        assert!(state.relay_tickets.read().await.tickets.is_empty());
     }
 }

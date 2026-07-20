@@ -10,6 +10,7 @@
     importIpfilterFile,
     type IpFilterStats,
     type IpFilterEntry,
+    type IpFilterApplyResult,
   } from '$lib/api/security';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
@@ -34,6 +35,17 @@
   let customUrl = $state('');
   let urlFetching = $state(false);
   let showUrlForm = $state(false);
+
+  function ipFilterApplyMessage(result: IpFilterApplyResult): string {
+    switch (result.outcome) {
+      case 'applied':
+        return m.security_ipfilter_applied({ entries: result.entryCount });
+      case 'failed':
+        return m.security_ipfilter_live_reload_failed({ entries: result.entryCount });
+      default:
+        return m.security_ipfilter_live_reload_deferred({ entries: result.entryCount });
+    }
+  }
 
   let showAddForm = $state(false);
   let newStartIp = $state('');
@@ -284,9 +296,9 @@
     downloading = true;
     error = null;
     try {
-      const msg = await downloadAndLoadIpfilter();
+      const result = await downloadAndLoadIpfilter();
       if (unmounted) return;
-      flash(msg);
+      flash(ipFilterApplyMessage(result));
       await syncIpFilterSettingsCache();
       await loadStats();
     } catch (e: unknown) {
@@ -307,9 +319,9 @@
         filters: [{ name: 'IP Filter', extensions: ['dat', 'txt'] }],
       });
       if (selected) {
-        const msg = await importIpfilterFile(selected as string);
+        const result = await importIpfilterFile(selected as string);
         if (unmounted) return;
-        flash(msg);
+        flash(ipFilterApplyMessage(result));
         await syncIpFilterSettingsCache();
         await loadStats();
       }
@@ -339,9 +351,9 @@
     urlFetching = true;
     error = null;
     try {
-      const msg = await updateIpfilterFromUrl(trimmed);
+      const result = await updateIpfilterFromUrl(trimmed);
       if (unmounted) return;
-      flash(msg);
+      flash(ipFilterApplyMessage(result));
       await syncIpFilterSettingsCache();
       await loadStats();
       // Collapse the form on success — saves a click and signals

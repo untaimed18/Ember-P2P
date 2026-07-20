@@ -149,7 +149,10 @@ impl UploadSpeedSense {
                 }
                 .max(1.0);
                 self.initial_ping_ms = recent;
-                debug!("USS: New lowest baseline RTT: {:.1}ms", self.initial_ping_ms);
+                debug!(
+                    "USS: New lowest baseline RTT: {:.1}ms",
+                    self.initial_ping_ms
+                );
             }
         }
     }
@@ -172,7 +175,10 @@ impl UploadSpeedSense {
         }
 
         if self.ping_history.len() < 3 {
-            return Some(self.current_limit.clamp(self.min_upload, self.effective_max()));
+            return Some(
+                self.current_limit
+                    .clamp(self.min_upload, self.effective_max()),
+            );
         }
 
         let current_ping = self.compute_median();
