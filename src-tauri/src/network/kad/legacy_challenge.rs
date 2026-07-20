@@ -70,12 +70,7 @@ impl LegacyChallengeTracker {
 
     /// eMule IsLegacyChallenge. On match, removes the entry and returns the
     /// contact id that should be marked verified.
-    pub fn take_match(
-        &mut self,
-        challenge_id: &KadId,
-        ip: Ipv4Addr,
-        opcode: u8,
-    ) -> Option<KadId> {
+    pub fn take_match(&mut self, challenge_id: &KadId, ip: Ipv4Addr, opcode: u8) -> Option<KadId> {
         self.expire();
         let mut wrong_answer = false;
         let mut found: Option<usize> = None;
@@ -93,9 +88,7 @@ impl LegacyChallengeTracker {
             return Some(contact_id);
         }
         if wrong_answer {
-            tracing::debug!(
-                "Kad legacy challenge: wrong answer from {ip} (opcode 0x{opcode:02X})"
-            );
+            tracing::debug!("Kad legacy challenge: wrong answer from {ip} (opcode 0x{opcode:02X})");
         }
         None
     }

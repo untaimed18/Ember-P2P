@@ -679,6 +679,7 @@
             class="search-input"
             bind:value={searchQuery}
             placeholder={m.common_search() + '…'}
+            aria-label={m.common_search()}
           />
           {#if searchQuery}
             <button class="search-clear" onclick={() => { searchQuery = ''; }} title={m.friends_clear_search()} aria-label={m.friends_clear_search()}>&times;</button>
@@ -704,6 +705,7 @@
           spellcheck="false"
           class="hash-input"
           onkeydown={addFormKeydown}
+          aria-label={m.friends_hash_placeholder()}
         />
         <input
           type="text"
@@ -712,6 +714,7 @@
           maxlength="64"
           class="nick-input"
           onkeydown={addFormKeydown}
+          aria-label={m.friends_nickname_placeholder()}
         />
         <button onclick={handleAdd} disabled={!newHash.trim() || adding}>{adding ? m.friends_adding() : m.common_add()}</button>
       </div>
@@ -780,6 +783,7 @@
                 maxlength="64"
                 placeholder={m.friends_nickname_edit_placeholder()}
                 use:autoFocus
+                aria-label={m.friends_nickname_edit_placeholder()}
               />
             {:else}
               <button class="nick-btn" onclick={() => startEdit(f)} title={m.friends_edit_nickname_title()}>

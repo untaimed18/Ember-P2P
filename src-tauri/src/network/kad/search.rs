@@ -1170,10 +1170,7 @@ impl SearchManager {
         // `download_source_searches` / `pending_source_searches` cannot be
         // overwritten when a second transfer looks up the same hash. FindNode
         // / FindBuddy are still safe to coalesce (no per-caller result map).
-        matches!(
-            search_type,
-            SearchType::FindNode | SearchType::FindBuddy
-        )
+        matches!(search_type, SearchType::FindNode | SearchType::FindBuddy)
     }
 
     fn search_importance(search_type: SearchType) -> u8 {
@@ -1287,10 +1284,8 @@ impl SearchManager {
                         if self.target_map.get(&old_key) == Some(&id) {
                             self.target_map.remove(&old_key);
                         }
-                        if state.search_type.accepts_search_results() && !state.results.is_empty()
-                        {
-                            preserved_results
-                                .insert(state.id, std::mem::take(&mut state.results));
+                        if state.search_type.accepts_search_results() && !state.results.is_empty() {
+                            preserved_results.insert(state.id, std::mem::take(&mut state.results));
                         }
                         released_in_use.extend(state.in_use_ids);
                         evicted_ids.push(id);
@@ -1361,11 +1356,7 @@ impl SearchManager {
     /// target, allow up to `KADEMLIA_FIND_NODE` (11). Oversized responses
     /// must be dropped for that search, not truncated — and must not borrow
     /// a higher expected count from a different same-target search.
-    pub fn max_accepted_response_count_for(
-        &self,
-        id: &SearchId,
-        from_id: Option<&KadId>,
-    ) -> u8 {
+    pub fn max_accepted_response_count_for(&self, id: &SearchId, from_id: Option<&KadId>) -> u8 {
         let Some(search) = self.active.get(id).filter(|s| !s.completed) else {
             return 0;
         };
@@ -1958,8 +1949,7 @@ mod tests {
     fn max_accepted_uses_matched_search_not_max_across_target() {
         let target = kad_id(17);
         let mut manager = SearchManager::new();
-        let (keyword_sid, ..) =
-            manager.start_search(target, SearchType::FindKeyword, Vec::new());
+        let (keyword_sid, ..) = manager.start_search(target, SearchType::FindKeyword, Vec::new());
         let (node_sid, ..) = manager.start_search(target, SearchType::FindNode, Vec::new());
         assert_ne!(keyword_sid, SearchId(0));
         assert_ne!(node_sid, SearchId(0));

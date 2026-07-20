@@ -86,6 +86,215 @@ async fn reconcile_shared_files_best_effort(
     }
 }
 
+pub(crate) fn fresh_part_hash_key(hash: &str) -> Option<[u8; 16]> {
+    let bytes = hex::decode(hash).ok()?;
+    if bytes.len() != 16 {
+        return None;
+    }
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&bytes);
+    Some(key)
+}
+
+pub(crate) fn fresh_part_hash_handoff(
+    hash: &str,
+    part_hashes: Vec<[u8; 16]>,
+) -> Option<([u8; 16], Vec<[u8; 16]>)> {
+    let file_hash = fresh_part_hash_key(hash)?;
+    (!part_hashes.is_empty()).then_some((file_hash, part_hashes))
+}
+
+pub(crate) async fn cache_fresh_part_hash_handoff(
+    fresh_part_hashes: &Arc<RwLock<std::collections::HashMap<[u8; 16], Vec<[u8; 16]>>>>,
+    finalized: bool,
+    handoff: Option<([u8; 16], Vec<[u8; 16]>)>,
+) {
+    if finalized {
+        if let Some((file_hash, part_hashes)) = handoff {
+            fresh_part_hashes
+                .write()
+                .await
+                .insert(file_hash, part_hashes);
+        }
+    }
+}
+
+fn fresh_part_hashes_exclusively_under_roots(
+    files: &[FileInfo],
+    roots: &[String],
+) -> HashSet<[u8; 16]> {
+    let removed_hashes = files
+        .iter()
+        .filter(|file| {
+            roots
+                .iter()
+                .any(|root| crate::security::path_matches_dir(&file.path, root))
+        })
+        .filter_map(|file| fresh_part_hash_key(&file.hash))
+        .collect::<HashSet<_>>();
+    let retained_hashes = files
+        .iter()
+        .filter(|file| {
+            !roots
+                .iter()
+                .any(|root| crate::security::path_matches_dir(&file.path, root))
+        })
+        .filter_map(|file| fresh_part_hash_key(&file.hash))
+        .collect::<HashSet<_>>();
+    removed_hashes
+        .difference(&retained_hashes)
+        .copied()
+        .collect()
+}
+
+fn unreferenced_fresh_part_hashes(
+    files: &[FileInfo],
+    candidates: &HashSet<[u8; 16]>,
+) -> HashSet<[u8; 16]> {
+    let referenced = files
+        .iter()
+        .filter_map(|file| fresh_part_hash_key(&file.hash))
+        .collect::<HashSet<_>>();
+    candidates.difference(&referenced).copied().collect()
+}
+
+fn fresh_part_hashes_removed_by_reload(
+    before: &[FileInfo],
+    after: &[FileInfo],
+    folders: &[String],
+) -> HashSet<[u8; 16]> {
+    let candidates = before
+        .iter()
+        .filter(|file| file_in_shared_folders(&file.path, folders))
+        .filter_map(|file| fresh_part_hash_key(&file.hash))
+        .collect::<HashSet<_>>();
+    unreferenced_fresh_part_hashes(after, &candidates)
+}
+
+async fn discard_fresh_part_hashes(
+    fresh_part_hashes: &Arc<RwLock<std::collections::HashMap<[u8; 16], Vec<[u8; 16]>>>>,
+    hashes: &HashSet<[u8; 16]>,
+) {
+    if hashes.is_empty() {
+        return;
+    }
+    fresh_part_hashes
+        .write()
+        .await
+        .retain(|hash, _| !hashes.contains(hash));
+}
+
+fn effective_shared_root_changes(
+    removed_roots: &[String],
+    added_roots: &[String],
+    active_roots: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let removed = removed_roots
+        .iter()
+        .filter(|root| !file_in_shared_folders(root, active_roots))
+        .cloned()
+        .collect();
+    let added = added_roots
+        .iter()
+        .filter(|root| file_in_shared_folders(root, active_roots))
+        .cloned()
+        .collect();
+    (removed, added)
+}
+
+/// Apply a `shared_folders` change made through the generic Settings command.
+/// The explicit add/remove commands have equivalent logic, but Settings can
+/// replace the entire root list in one save and must revoke removed roots
+/// before any fallible network publication work.
+pub(crate) async fn reconcile_shared_folder_roots(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    removed_roots: &[String],
+    added_roots: &[String],
+) {
+    // The upload listener consults this list before serving an index row, so
+    // update it before waiting for a scan. This is the immediate revocation
+    // boundary even while a long-running discovery pass still owns
+    // `scan_coordination`.
+    let immediate_active_roots = state.config.read().await.settings.shared_folders.clone();
+    *state.upload_shared_folders.write().await = immediate_active_roots;
+
+    // Scans persist their resume cursors while holding scan_coordination and
+    // then settings_save_lock. Take those locks in that same order here, and
+    // snapshot Settings only after acquiring scan_coordination so a later
+    // settings save cannot leave the watcher/index on an obsolete root list.
+    let scan_coordination_guard = state.scan_coordination.lock().await;
+    let settings_save_guard = state.settings_save_lock.lock().await;
+    let active_roots = state.config.read().await.settings.shared_folders.clone();
+    let (effective_removed_roots, effective_added_roots) =
+        effective_shared_root_changes(removed_roots, added_roots, &active_roots);
+    *state.upload_shared_folders.write().await = active_roots.clone();
+
+    let (removed_row_count, removed_hashes) = if effective_removed_roots.is_empty() {
+        (0, HashSet::new())
+    } else {
+        {
+            let flags = state.hash_cancel_flags.read().await;
+            for (scan_key, flag) in flags.iter() {
+                if effective_removed_roots
+                    .iter()
+                    .any(|root| scan_can_write_under(scan_key, root))
+                {
+                    flag.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let mut index = state.local_index.write().await;
+        let removed_files = index.remove_files_outside_folders(&active_roots);
+        let candidates = removed_files
+            .iter()
+            .filter_map(|file| fresh_part_hash_key(&file.hash))
+            .collect::<HashSet<_>>();
+        let hashes = unreferenced_fresh_part_hashes(index.all_files(), &candidates);
+        (removed_files.len(), hashes)
+    };
+
+    if let Some(watcher) = state.shared_folder_watcher.as_ref() {
+        watcher.sync_paths(&active_roots);
+    }
+    {
+        let config = state.config.read().await;
+        sync_asset_protocol_scope(app, &config);
+    }
+    drop(settings_save_guard);
+    drop(scan_coordination_guard);
+
+    if removed_row_count > 0 {
+        discard_fresh_part_hashes(&state.fresh_part_hashes, &removed_hashes).await;
+        refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
+    }
+
+    // Do this after local revocation. A saturated or stopped network task may
+    // defer publication changes, but must never keep a removed root visible
+    // in the local upload/index state.
+    reconcile_shared_files_best_effort(&state.network_tx).await;
+
+    if !effective_added_roots.is_empty() {
+        // A full reload shares the established bounded discovery/hash path and
+        // guarantees every newly-added root is picked up without duplicating
+        // the per-folder scan machinery here.
+        let state_ref = app.state::<AppState>();
+        if let Err(e) = reload_shared_files(app.clone(), state_ref).await {
+            warn!("Failed to schedule discovery for newly configured shared folders: {e}");
+        }
+    }
+
+    let _ = app.emit(
+        "shared-files-changed",
+        serde_json::json!({
+            "removed_folders": effective_removed_roots,
+            "added_folders": effective_added_roots,
+            "phase": "settings-roots-reconciled",
+        }),
+    );
+}
+
 async fn persist_shared_states(
     network_tx: &tokio::sync::mpsc::Sender<NetworkCommand>,
     hashes: &[String],
@@ -351,7 +560,10 @@ fn parse_single_range(range: Option<&str>, length: u64) -> Result<Option<(u64, u
     }
     if start.is_empty() {
         let suffix = end.parse::<u64>().map_err(|_| ())?.min(length);
-        return Ok(Some((length.saturating_sub(suffix), length.saturating_sub(1))));
+        return Ok(Some((
+            length.saturating_sub(suffix),
+            length.saturating_sub(1),
+        )));
     }
     let start = start.parse::<u64>().map_err(|_| ())?;
     if start >= length {
@@ -421,10 +633,8 @@ pub(crate) async fn serve_media_request(
         // Cap each response so `bytes=0-` and range-less requests cannot turn a
         // multi-gigabyte video into one allocation. Media engines issue follow-up
         // byte ranges after a valid 206 response.
-        let end = requested_end.min(
-            start
-                .saturating_add(MAX_MEDIA_RESPONSE_BYTES.saturating_sub(1)),
-        );
+        let end =
+            requested_end.min(start.saturating_add(MAX_MEDIA_RESPONSE_BYTES.saturating_sub(1)));
         let partial = start != 0 || end != length - 1;
         let bytes_len = end.saturating_sub(start).saturating_add(1);
         let mut body = vec![0; bytes_len as usize];
@@ -454,7 +664,10 @@ pub(crate) async fn serve_media_request(
         } else {
             tauri::http::StatusCode::OK
         })
-        .header(tauri::http::header::CONTENT_TYPE, media_content_type(&canonical))
+        .header(
+            tauri::http::header::CONTENT_TYPE,
+            media_content_type(&canonical),
+        )
         .header(tauri::http::header::ACCEPT_RANGES, "bytes")
         .header(tauri::http::header::CONTENT_LENGTH, body.len().to_string());
     if partial {
@@ -556,8 +769,7 @@ fn apply_folder_defaults_to_new_files(
         folder_priorities
             .iter()
             .filter(|(folder, priority)| {
-                !priority.is_empty()
-                    && crate::security::path_matches_dir(path, folder)
+                !priority.is_empty() && crate::security::path_matches_dir(path, folder)
             })
             .max_by_key(|(folder, _)| folder.len())
             .map(|(_, priority)| priority.clone())
@@ -665,9 +877,10 @@ pub(crate) async fn persist_scan_cursors(
     for (folder, cursor) in updates {
         match cursor {
             Some(value) => {
-                settings
-                    .shared_folder_scan_cursors
-                    .insert(crate::search::index::normalize_path_key(folder), value.clone());
+                settings.shared_folder_scan_cursors.insert(
+                    crate::search::index::normalize_path_key(folder),
+                    value.clone(),
+                );
             }
             None => {
                 settings
@@ -954,11 +1167,7 @@ pub async fn add_shared_folder(
                 cfg.settings.pending_file_priorities.clone(),
             )
         };
-        apply_folder_defaults_to_new_files(
-            &mut discovered,
-            &mut files_to_hash,
-            &folder_priorities,
-        );
+        apply_folder_defaults_to_new_files(&mut discovered, &mut files_to_hash, &folder_priorities);
         apply_pending_intents(
             &mut discovered,
             &mut files_to_hash,
@@ -1064,30 +1273,29 @@ pub async fn add_shared_folder(
                         let cfg = config.read().await;
                         file_in_shared_folders(&updated_file.path, &cfg.settings.shared_folders)
                     };
-                    // Hand the part hashes already computed above off to the
-                    // network task's `SharedFilesChanged` handler so it
-                    // doesn't re-read this file from disk just to recompute
-                    // the same values for known.met.
-                    if still_shared && !part_hashes.is_empty() {
-                        if let Ok(hash_bytes) = hex::decode(&updated_file.hash) {
-                            if hash_bytes.len() == 16 {
-                                let mut fh = [0u8; 16];
-                                fh.copy_from_slice(&hash_bytes);
-                                fresh_part_hashes.write().await.insert(fh, part_hashes);
-                            }
-                        }
-                    }
-                    {
+                    // Retain the handoff only after its completed index row
+                    // is committed. A cancelled folder scan drops its pending
+                    // row, and caching first would leave no later
+                    // reconciliation path to drain these part hashes.
+                    let fresh_handoff = still_shared
+                        .then(|| fresh_part_hash_handoff(&updated_file.hash, part_hashes))
+                        .flatten();
+                    let finalized = {
                         let mut index = local_index.write().await;
                         if !cancel_flag.load(Ordering::Relaxed) && still_shared {
                             // Preserve share/priority changes made while this
                             // pending row was hashing. If it was removed by a
                             // concurrent unshare/cancel, do not resurrect it.
-                            let _ = index.finalize_pending_hash(&file_temp_id, updated_file.clone());
+                            index
+                                .finalize_pending_hash(&file_temp_id, updated_file.clone())
+                                .is_some()
                         } else {
                             index.remove_file_by_id(&file_temp_id);
+                            false
                         }
-                    }
+                    };
+                    cache_fresh_part_hash_handoff(&fresh_part_hashes, finalized, fresh_handoff)
+                        .await;
 
                     if !cancel_flag.load(Ordering::Relaxed) && still_shared {
                         hashed_count += 1;
@@ -1150,7 +1358,9 @@ pub async fn add_shared_folder(
             cursor_update.insert(canonical_str.clone(), discovery_next_cursor);
             let app_state = app.state::<AppState>();
             if let Err(error) = persist_scan_cursors(&app_state, &cursor_update).await {
-                warn!("Shared-folder page was indexed but its resume cursor was not saved: {error}");
+                warn!(
+                    "Shared-folder page was indexed but its resume cursor was not saved: {error}"
+                );
             }
         }
         refresh_file_cache(&local_index, &file_cache).await;
@@ -1289,15 +1499,15 @@ pub async fn remove_shared_folder(
         new_settings
             .folder_priorities
             .retain(|folder, _| !paths_equal_ignore_case(folder, &canonical_path));
-        new_settings.pending_share_states.retain(|path, _| {
-            !crate::security::path_matches_dir(path, &canonical_path)
-        });
-        new_settings.pending_file_priorities.retain(|path, _| {
-            !crate::security::path_matches_dir(path, &canonical_path)
-        });
-        new_settings.shared_folder_scan_cursors.retain(|folder, _| {
-            !paths_equal_ignore_case(folder, &canonical_path)
-        });
+        new_settings
+            .pending_share_states
+            .retain(|path, _| !crate::security::path_matches_dir(path, &canonical_path));
+        new_settings
+            .pending_file_priorities
+            .retain(|path, _| !crate::security::path_matches_dir(path, &canonical_path));
+        new_settings
+            .shared_folder_scan_cursors
+            .retain(|folder, _| !paths_equal_ignore_case(folder, &canonical_path));
         new_settings.settings_revision = config.settings.settings_revision.saturating_add(1);
         config
             .prepare_save_settings(&new_settings)
@@ -1322,15 +1532,18 @@ pub async fn remove_shared_folder(
             .settings
             .folder_priorities
             .retain(|folder, _| !paths_equal_ignore_case(folder, &canonical_path));
-        config.settings.pending_share_states.retain(|path, _| {
-            !crate::security::path_matches_dir(path, &canonical_path)
-        });
-        config.settings.pending_file_priorities.retain(|path, _| {
-            !crate::security::path_matches_dir(path, &canonical_path)
-        });
-        config.settings.shared_folder_scan_cursors.retain(|folder, _| {
-            !paths_equal_ignore_case(folder, &canonical_path)
-        });
+        config
+            .settings
+            .pending_share_states
+            .retain(|path, _| !crate::security::path_matches_dir(path, &canonical_path));
+        config
+            .settings
+            .pending_file_priorities
+            .retain(|path, _| !crate::security::path_matches_dir(path, &canonical_path));
+        config
+            .settings
+            .shared_folder_scan_cursors
+            .retain(|folder, _| !paths_equal_ignore_case(folder, &canonical_path));
         config.settings.settings_revision = config.settings.settings_revision.saturating_add(1);
     }
     drop(settings_save_guard);
@@ -1344,10 +1557,16 @@ pub async fn remove_shared_folder(
     // accessible while removal waits for its final index cleanup. Once the
     // existing generation yields, remove any rows it raced to add.
     let scan_coordination_guard = state.scan_coordination.lock().await;
-    {
+    let removed_hashes = {
         let mut index = state.local_index.write().await;
+        let hashes = fresh_part_hashes_exclusively_under_roots(
+            index.all_files(),
+            std::slice::from_ref(&canonical_path),
+        );
         index.remove_files_by_path_prefix(&canonical_path);
-    }
+        hashes
+    };
+    discard_fresh_part_hashes(&state.fresh_part_hashes, &removed_hashes).await;
     refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
     drop(scan_coordination_guard);
 
@@ -1593,12 +1812,9 @@ pub async fn set_folder_priority(
             .map(|(_, hash)| hash.clone())
             .filter(|hash| !hash.is_empty())
             .collect::<Vec<_>>();
-        if let Err(error) = persist_upload_priorities(
-            &state.network_tx,
-            &hashes,
-            priority_str_to_u8(&priority),
-        )
-        .await
+        if let Err(error) =
+            persist_upload_priorities(&state.network_tx, &hashes, priority_str_to_u8(&priority))
+                .await
         {
             rollback_index_mutation(&state, index_snapshot).await;
             return Err(error);
@@ -1615,8 +1831,7 @@ pub async fn set_folder_priority(
         result.map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))
     });
     if let Err(error) = config_result {
-        let rollback_result =
-            persist_priority_snapshot(&state.network_tx, &index_snapshot).await;
+        let rollback_result = persist_priority_snapshot(&state.network_tx, &index_snapshot).await;
         rollback_index_mutation(&state, index_snapshot).await;
         return match rollback_result {
             Ok(()) => Err(error),
@@ -1668,23 +1883,16 @@ pub async fn set_file_priority(
     }
     refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
     if let Some(hash) = file_hash.filter(|h| !h.is_empty()) {
-        if let Err(e) = persist_upload_priorities(
-            &state.network_tx,
-            &[hash],
-            priority_str_to_u8(&priority),
-        )
-        .await
+        if let Err(e) =
+            persist_upload_priorities(&state.network_tx, &[hash], priority_str_to_u8(&priority))
+                .await
         {
             rollback_index_mutation(&state, snapshot).await;
             return Err(e);
         }
     } else {
-        if let Err(e) = persist_pending_intents(
-            &state,
-            &[],
-            &[(file_path.clone(), priority.clone())],
-        )
-        .await
+        if let Err(e) =
+            persist_pending_intents(&state, &[], &[(file_path.clone(), priority.clone())]).await
         {
             rollback_index_mutation(&state, snapshot).await;
             return Err(e);
@@ -1739,12 +1947,9 @@ pub async fn batch_set_priority(
     };
     if count > 0 {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        if let Err(e) = persist_upload_priorities(
-            &state.network_tx,
-            &hashes,
-            priority_str_to_u8(&priority),
-        )
-        .await
+        if let Err(e) =
+            persist_upload_priorities(&state.network_tx, &hashes, priority_str_to_u8(&priority))
+                .await
         {
             rollback_index_mutation(&state, snapshot).await;
             return Err(e);
@@ -1882,33 +2087,35 @@ pub async fn reload_shared_files(
         scanning.fetch_add(1, Ordering::Relaxed);
         let _scan_guard = ScanGuard(scanning.clone());
 
-        let (mut discovered, discovery_truncated, discovery_cursor_updates):
-            (Vec<FileInfo>, bool, std::collections::HashMap<String, Option<String>>) =
-            match tokio::task::spawn_blocking(move || {
-                let mut files = Vec::new();
-                let mut truncated = false;
-                let mut cursor_updates = std::collections::HashMap::new();
-                for folder in &discovery_folders {
-                    let key = crate::search::index::normalize_path_key(folder);
-                    let result = FileIndexer::discover_directory_page(
-                        folder,
-                        discovery_cursors.get(&key).map(String::as_str),
-                    );
-                    truncated |= result.truncated;
-                    cursor_updates.insert(folder.clone(), result.next_cursor);
-                    files.extend(result.files);
-                }
-                (files, truncated, cursor_updates)
-            })
-            .await
-            {
-                Ok(result) => result,
-                Err(e) => {
-                    tracing::error!("Reload discovery failed: {e}");
-                    remove_cancel_flag_if_current(&cancel_flags, &reload_key, &cancel_flag).await;
-                    return;
-                }
-            };
+        let (mut discovered, discovery_truncated, discovery_cursor_updates): (
+            Vec<FileInfo>,
+            bool,
+            std::collections::HashMap<String, Option<String>>,
+        ) = match tokio::task::spawn_blocking(move || {
+            let mut files = Vec::new();
+            let mut truncated = false;
+            let mut cursor_updates = std::collections::HashMap::new();
+            for folder in &discovery_folders {
+                let key = crate::search::index::normalize_path_key(folder);
+                let result = FileIndexer::discover_directory_page(
+                    folder,
+                    discovery_cursors.get(&key).map(String::as_str),
+                );
+                truncated |= result.truncated;
+                cursor_updates.insert(folder.clone(), result.next_cursor);
+                files.extend(result.files);
+            }
+            (files, truncated, cursor_updates)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::error!("Reload discovery failed: {e}");
+                remove_cancel_flag_if_current(&cancel_flags, &reload_key, &cancel_flag).await;
+                return;
+            }
+        };
         if discovery_truncated {
             warn!(
                 "Reload discovery reached the per-folder file cap; retaining existing entries not seen in this partial scan"
@@ -1957,11 +2164,7 @@ pub async fn reload_shared_files(
                 cfg.settings.pending_file_priorities.clone(),
             )
         };
-        apply_folder_defaults_to_new_files(
-            &mut discovered,
-            &mut files_to_hash,
-            &folder_priorities,
-        );
+        apply_folder_defaults_to_new_files(&mut discovered, &mut files_to_hash, &folder_priorities);
         apply_pending_intents(
             &mut discovered,
             &mut files_to_hash,
@@ -1969,10 +2172,22 @@ pub async fn reload_shared_files(
             &pending_file_priorities,
         );
 
-        {
+        let removed_fresh_hashes = {
             let mut index = local_index.write().await;
+            let before = (!discovery_truncated).then(|| index.all_files().to_vec());
             index.reconcile_files_for_folders(&reloaded_folders, discovered, !discovery_truncated);
-        }
+            before
+                .as_deref()
+                .map(|before| {
+                    fresh_part_hashes_removed_by_reload(
+                        before,
+                        index.all_files(),
+                        &reloaded_folders,
+                    )
+                })
+                .unwrap_or_default()
+        };
+        discard_fresh_part_hashes(&fresh_part_hashes, &removed_fresh_hashes).await;
         refresh_file_cache(&local_index, &file_cache).await;
 
         let _ = app.emit(
@@ -2050,29 +2265,27 @@ pub async fn reload_shared_files(
                         let cfg = config.read().await;
                         file_in_shared_folders(&updated_file.path, &cfg.settings.shared_folders)
                     };
-                    // Hand the part hashes already computed above off to the
-                    // network task's `SharedFilesChanged` handler so it
-                    // doesn't re-read this file from disk just to recompute
-                    // the same values for known.met.
-                    if still_shared && !part_hashes.is_empty() {
-                        if let Ok(hash_bytes) = hex::decode(&updated_file.hash) {
-                            if hash_bytes.len() == 16 {
-                                let mut fh = [0u8; 16];
-                                fh.copy_from_slice(&hash_bytes);
-                                fresh_part_hashes.write().await.insert(fh, part_hashes);
-                            }
-                        }
-                    }
-                    {
+                    // Keep the computed hashes only if this scan commits the
+                    // completed row. Cancellation removes the pending row, so
+                    // an earlier cache insert would be orphaned.
+                    let fresh_handoff = still_shared
+                        .then(|| fresh_part_hash_handoff(&updated_file.hash, part_hashes))
+                        .flatten();
+                    let finalized = {
                         let mut index = local_index.write().await;
                         if !cancel_flag.load(Ordering::Relaxed) && still_shared {
                             // The current pending row is authoritative for
                             // user-controlled share state and priority.
-                            let _ = index.finalize_pending_hash(&file_temp_id, updated_file.clone());
+                            index
+                                .finalize_pending_hash(&file_temp_id, updated_file.clone())
+                                .is_some()
                         } else {
                             index.remove_file_by_id(&file_temp_id);
+                            false
                         }
-                    }
+                    };
+                    cache_fresh_part_hash_handoff(&fresh_part_hashes, finalized, fresh_handoff)
+                        .await;
 
                     if !cancel_flag.load(Ordering::Relaxed) && still_shared {
                         hashed_count += 1;
@@ -2198,9 +2411,7 @@ pub async fn get_scan_status(state: tauri::State<'_, AppState>) -> Result<bool, 
 }
 
 #[tauri::command]
-pub async fn get_library_scan_truncated(
-    state: tauri::State<'_, AppState>,
-) -> Result<bool, String> {
+pub async fn get_library_scan_truncated(state: tauri::State<'_, AppState>) -> Result<bool, String> {
     Ok(state.library_scan_truncated.load(Ordering::Relaxed))
 }
 
@@ -2332,7 +2543,10 @@ pub async fn share_file(
             "shared-files-changed",
             serde_json::json!({ "shared": mutation.changed_paths }),
         );
-        info!("Shared {} file path(s) from {}", mutation.changed_paths, file_path);
+        info!(
+            "Shared {} file path(s) from {}",
+            mutation.changed_paths, file_path
+        );
     }
     Ok(())
 }
@@ -2417,15 +2631,16 @@ pub async fn delete_shared_file(
                     "File is not within a shared or download folder",
                 ));
             }
-            let indexed_canonical = std::path::Path::new(&indexed_path)
-                .canonicalize()
-                .map_err(|e| {
-                    coded_ctx(
-                        "sharing_file_not_in_index",
-                        "Indexed file can no longer be resolved",
-                        e,
-                    )
-                })?;
+            let indexed_canonical =
+                std::path::Path::new(&indexed_path)
+                    .canonicalize()
+                    .map_err(|e| {
+                        coded_ctx(
+                            "sharing_file_not_in_index",
+                            "Indexed file can no longer be resolved",
+                            e,
+                        )
+                    })?;
             if canonical != indexed_canonical {
                 return Err(coded(
                     "sharing_file_not_in_index",
@@ -2441,12 +2656,20 @@ pub async fn delete_shared_file(
     delete_file_with_retry(&canonical, 6, 250).await?;
 
     let canonical_str = canonical.to_string_lossy().to_string();
-    let removed = {
+    let (removed, removed_hashes) = {
         let mut index = state.local_index.write().await;
-        index.remove_file_by_path(&canonical_str).or_else(|| {
-            index.remove_file_by_path(&file_path)
-        })
+        let removed = index
+            .remove_file_by_path(&canonical_str)
+            .or_else(|| index.remove_file_by_path(&file_path));
+        let hashes = removed
+            .as_ref()
+            .and_then(|file| fresh_part_hash_key(&file.hash))
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let hashes = unreferenced_fresh_part_hashes(index.all_files(), &hashes);
+        (removed, hashes)
     };
+    discard_fresh_part_hashes(&state.fresh_part_hashes, &removed_hashes).await;
     refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
 
     reconcile_shared_files_best_effort(&state.network_tx).await;
@@ -2458,7 +2681,11 @@ pub async fn delete_shared_file(
     info!(
         "Deleted shared file {}{}{}",
         canonical.display(),
-        if removed.is_none() { " (index race)" } else { "" },
+        if removed.is_none() {
+            " (index race)"
+        } else {
+            ""
+        },
         file_hash
             .filter(|hash| !hash.is_empty())
             .map(|hash| format!(" ({hash})"))
@@ -2544,16 +2771,23 @@ pub async fn remove_missing_files(
     .await
     .map_err(|e| coded_ctx("sharing_scan_task_failed", "Scan task failed", e))?;
 
-    let mut removed = 0u32;
-    {
+    let (removed, removed_hashes) = {
+        let mut removed = 0u32;
+        let mut removed_hashes = HashSet::new();
         let mut index = state.local_index.write().await;
         for path in &really_missing {
-            if index.remove_file_by_path(path).is_some() {
+            if let Some(file) = index.remove_file_by_path(path) {
                 removed += 1;
+                if let Some(hash) = fresh_part_hash_key(&file.hash) {
+                    removed_hashes.insert(hash);
+                }
             }
         }
-    }
+        let removed_hashes = unreferenced_fresh_part_hashes(index.all_files(), &removed_hashes);
+        (removed, removed_hashes)
+    };
     if removed > 0 {
+        discard_fresh_part_hashes(&state.fresh_part_hashes, &removed_hashes).await;
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
         reconcile_shared_files_best_effort(&state.network_tx).await;
         let _ = app.emit(
@@ -2730,4 +2964,128 @@ pub async fn open_shared_folder(
     })
     .await
     .map_err(|e| coded_ctx("sharing_task_failed", "Task failed", e))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn indexed_file(path: &str, hash: &str) -> FileInfo {
+        FileInfo {
+            id: hash.to_string(),
+            name: "file.bin".to_string(),
+            path: path.to_string(),
+            size: 1,
+            hash: hash.to_string(),
+            aich_hash: String::new(),
+            extension: "bin".to_string(),
+            modified_at: 0,
+            priority: "normal".to_string(),
+            requests: 0,
+            accepted: 0,
+            bytes_transferred: 0,
+            alltime_requests: 0,
+            alltime_accepted: 0,
+            alltime_transferred: 0,
+            complete_sources: 0,
+            folder: String::new(),
+            shared: true,
+            shared_kad: false,
+            shared_ed2k: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_finalization_does_not_cache_fresh_handoff() {
+        let fresh_part_hashes = Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let hash = "11".repeat(16);
+        let handoff = fresh_part_hash_handoff(&hash, vec![[0xA1; 16]]);
+
+        cache_fresh_part_hash_handoff(&fresh_part_hashes, false, handoff).await;
+
+        assert!(fresh_part_hashes.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn folder_removal_discards_fresh_part_hash_handoffs() {
+        let removed_hash = [0x11; 16];
+        let retained_hash = [0x22; 16];
+        let fresh_part_hashes = Arc::new(RwLock::new(std::collections::HashMap::from([
+            (removed_hash, vec![[0xA1; 16]]),
+            (retained_hash, vec![[0xB2; 16]]),
+        ])));
+        let removed = HashSet::from([removed_hash]);
+
+        discard_fresh_part_hashes(&fresh_part_hashes, &removed).await;
+
+        let fresh = fresh_part_hashes.read().await;
+        assert!(!fresh.contains_key(&removed_hash));
+        assert_eq!(fresh.get(&retained_hash), Some(&vec![[0xB2; 16]]));
+    }
+
+    #[test]
+    fn folder_removal_keeps_handoff_still_referenced_by_another_root() {
+        let duplicate_hash = "11".repeat(16);
+        let removed_only_hash = "22".repeat(16);
+        let files = vec![
+            indexed_file("/shares/removed/duplicate.bin", &duplicate_hash),
+            indexed_file("/shares/retained/duplicate.bin", &duplicate_hash),
+            indexed_file("/shares/removed/only.bin", &removed_only_hash),
+        ];
+        let roots = vec!["/shares/removed".to_string()];
+
+        let discard = fresh_part_hashes_exclusively_under_roots(&files, &roots);
+
+        assert!(!discard.contains(&fresh_part_hash_key(&duplicate_hash).unwrap()));
+        assert!(discard.contains(&fresh_part_hash_key(&removed_only_hash).unwrap()));
+    }
+
+    #[test]
+    fn file_removal_keeps_handoff_still_referenced_by_duplicate() {
+        let duplicate_hash = "11".repeat(16);
+        let removed_only_hash = "22".repeat(16);
+        let candidates = HashSet::from([
+            fresh_part_hash_key(&duplicate_hash).unwrap(),
+            fresh_part_hash_key(&removed_only_hash).unwrap(),
+        ]);
+        let remaining = vec![indexed_file(
+            "/shares/retained/duplicate.bin",
+            &duplicate_hash,
+        )];
+
+        let discard = unreferenced_fresh_part_hashes(&remaining, &candidates);
+
+        assert!(!discard.contains(&fresh_part_hash_key(&duplicate_hash).unwrap()));
+        assert!(discard.contains(&fresh_part_hash_key(&removed_only_hash).unwrap()));
+    }
+
+    #[test]
+    fn reload_pruning_discards_only_hashes_no_longer_indexed() {
+        let duplicate_hash = "11".repeat(16);
+        let removed_only_hash = "22".repeat(16);
+        let before = vec![
+            indexed_file("/shares/reload/duplicate.bin", &duplicate_hash),
+            indexed_file("/shares/reload/gone.bin", &removed_only_hash),
+        ];
+        let after = vec![indexed_file("/shares/other/duplicate.bin", &duplicate_hash)];
+        let folders = vec!["/shares/reload".to_string()];
+
+        let discard = fresh_part_hashes_removed_by_reload(&before, &after, &folders);
+
+        assert!(!discard.contains(&fresh_part_hash_key(&duplicate_hash).unwrap()));
+        assert!(discard.contains(&fresh_part_hash_key(&removed_only_hash).unwrap()));
+    }
+
+    #[test]
+    fn delayed_root_reconciliation_keeps_root_readded_by_newer_save() {
+        let removed = vec!["/shares/readded".to_string()];
+        let added = Vec::new();
+        let active = vec!["/shares/readded".to_string()];
+
+        let (effective_removed, effective_added) =
+            effective_shared_root_changes(&removed, &added, &active);
+
+        assert!(effective_removed.is_empty());
+        assert!(effective_added.is_empty());
+    }
 }

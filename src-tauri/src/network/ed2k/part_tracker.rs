@@ -521,7 +521,10 @@ impl PartTracker {
         // locked. A delayed older writer checks this value before replacing
         // the file, so it cannot overwrite a newer snapshot that was taken
         // concurrently by another source worker.
-        let generation = self.save_generation.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+        let generation = self
+            .save_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
         SaveSnapshot {
             met_path: self.met_path.clone(),
             file_size: self.file_size,

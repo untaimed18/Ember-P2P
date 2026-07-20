@@ -19,6 +19,7 @@ use crate::network::ember::crypto;
 /// so the caller can immediately send packets before the loop consumes them.
 pub struct FriendSessionHandle {
     pub outbound_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    pub session_id: u64,
 }
 
 /// Establishes a persistent outbound friend session. Performs the full
@@ -234,6 +235,7 @@ pub async fn run_friend_session_over_transport(
                 );
                 return Ok(FriendSessionHandle {
                     outbound_tx: existing.tx.clone(),
+                    session_id: existing.session_id(),
                 });
             }
         }
@@ -328,13 +330,15 @@ pub async fn run_friend_session_over_transport(
                 );
                 return Ok(FriendSessionHandle {
                     outbound_tx: existing.tx.clone(),
+                    session_id: existing.session_id(),
                 });
             }
-            Some(_stale) => {
+            Some(stale) => {
                 debug!(
                     "Friend session slot for {} held by a stale entry; evicting and claiming it",
                     hex::encode(peer_ember_hash)
                 );
+                stale.close();
             }
             None => {}
         }
@@ -379,12 +383,16 @@ pub async fn run_friend_session_over_transport(
         })
         .await;
 
-    let handle = FriendSessionHandle { outbound_tx };
+    let handle = FriendSessionHandle {
+        outbound_tx,
+        session_id: ember_session_handle.session_id(),
+    };
 
     let session_ember_sessions = ember_sessions.clone();
     let session_ember_session_handle = ember_session_handle.clone();
     let session_ul_event_tx = ul_event_tx.clone();
     let session_friend_hashes = friend_hashes.clone();
+    let mut session_shutdown = ember_session_handle.subscribe_shutdown();
     tokio::spawn(async move {
         const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(90);
         // L8: dead-peer detector. The eMule wire protocol has no
@@ -433,6 +441,16 @@ pub async fn run_friend_session_over_transport(
         loop {
             let keepalive = tokio::time::sleep_until(last_activity + KEEPALIVE_INTERVAL);
             tokio::select! {
+                changed = session_shutdown.changed() => {
+                    if changed.is_err() || *session_shutdown.borrow() {
+                        info!(
+                            "Friend session to {} ({}) was explicitly closed",
+                            addr,
+                            hex::encode(peer_ember_hash)
+                        );
+                        break;
+                    }
+                }
                 result = pkt_rx.recv() => {
                     let result = match result {
                         Some(r) => r,
@@ -486,6 +504,7 @@ pub async fn run_friend_session_over_transport(
                                         transfer_id: String::new(),
                                         kind: UploadEventKind::EmberBrowseResponse {
                                             ember_hash: peer_ember_hash,
+                                    session_id: session_ember_session_handle.session_id(),
                                             entries,
                                         },
                                     }).await;
@@ -597,6 +616,7 @@ pub async fn run_friend_session_over_transport(
                 transfer_id: String::new(),
                 kind: UploadEventKind::EmberFriendDisconnected {
                     ember_hash: peer_ember_hash,
+                    session_id: session_ember_session_handle.session_id(),
                 },
             })
             .await;
@@ -901,19 +921,33 @@ async fn relay_friend(
     )
     .await?;
 
-    // The responder polls independently. Ticket expiry is 90 seconds; wait
-    // less than that so a transient failure can create a clean new offer.
-    for _ in 0..45 {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        match crate::network::rendezvous::friend_relay_ticket_accepted(
-            rendezvous_url,
-            &our_ember_hash,
-            &offer.ticket_id,
-            secret_key,
+    // The responder polls independently. Keep this a total deadline rather
+    // than 45 request iterations: a stalled status request must not extend
+    // the capability's useful lifetime indefinitely.
+    let deadline = tokio::time::Instant::now()
+        + crate::network::rendezvous::FRIEND_RELAY_TICKET_INITIATOR_WAIT;
+    let mut status_retry_delay = std::time::Duration::from_secs(1);
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        tokio::time::sleep(remaining.min(status_retry_delay)).await;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let status_timeout =
+            remaining.min(crate::network::rendezvous::FRIEND_RELAY_TICKET_ACTION_TIMEOUT);
+        match tokio::time::timeout(
+            status_timeout,
+            crate::network::rendezvous::friend_relay_ticket_accepted(
+                rendezvous_url,
+                &our_ember_hash,
+                &offer.ticket_id,
+                secret_key,
+            ),
         )
         .await
         {
-            Ok(true) => {
+            Ok(Ok(true)) => {
                 return crate::network::ember::relay::connect_server_relay(
                     rendezvous_url,
                     &offer.ticket_id,
@@ -921,11 +955,22 @@ async fn relay_friend(
                 )
                 .await;
             }
-            Ok(false) => {}
-            Err(e) => {
+            Ok(Ok(false)) => {}
+            Ok(Err(e)) => {
+                if crate::network::rendezvous::is_transient_relay_ticket_read_error(&e) {
+                    status_retry_delay =
+                        (status_retry_delay * 2).min(std::time::Duration::from_secs(5));
+                    continue;
+                }
                 return Err(format!("friend relay ticket status failed: {e}"));
             }
+            Err(_) => {
+                status_retry_delay =
+                    (status_retry_delay * 2).min(std::time::Duration::from_secs(5));
+                continue;
+            }
         }
+        status_retry_delay = std::time::Duration::from_secs(1);
     }
     Err("friend relay ticket was not accepted before timeout".to_string())
 }

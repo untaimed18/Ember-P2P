@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::{self, Read as _, Seek, SeekFrom, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use flate2::write::ZlibEncoder;
@@ -45,8 +46,12 @@ use crate::types::TransferDirection;
 #[derive(Clone)]
 pub struct EmberSessionHandle {
     pub tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    session_id: u64,
     last_activity: Arc<std::sync::atomic::AtomicI64>,
+    shutdown: tokio::sync::watch::Sender<bool>,
 }
+
+static NEXT_EMBER_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// How stale a session's last confirmed inbound activity may be before
 /// [`EmberSessionHandle::is_fresh`] stops trusting it. Deliberately well
@@ -62,12 +67,32 @@ const EMBER_SESSION_FRESH_SECS: i64 = 180;
 
 impl EmberSessionHandle {
     pub fn new(tx: tokio::sync::mpsc::Sender<Vec<u8>>) -> Self {
+        let (shutdown, _) = tokio::sync::watch::channel(false);
         Self {
             tx,
+            session_id: NEXT_EMBER_SESSION_ID.fetch_add(1, Ordering::Relaxed),
             last_activity: Arc::new(std::sync::atomic::AtomicI64::new(
                 chrono::Utc::now().timestamp(),
             )),
+            shutdown,
         }
+    }
+
+    /// Opaque generation for binding request/response correlation to this
+    /// exact TCP session. It is never sent over the wire.
+    pub fn session_id(&self) -> u64 {
+        self.session_id
+    }
+
+    /// Tell the session owner to stop its reader/writer loop and drop the
+    /// underlying socket. Removing this handle from `EmberSessionMap` alone
+    /// is insufficient because the owner task retains its own sender clone.
+    pub fn close(&self) {
+        let _ = self.shutdown.send(true);
+    }
+
+    pub fn subscribe_shutdown(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.shutdown.subscribe()
     }
 
     /// Record confirmed inbound activity from the peer (any received
@@ -117,6 +142,7 @@ pub async fn evict_stale_ember_session(sessions: &EmberSessionMap, hash: &[u8; 1
     let mut sessions = sessions.write().await;
     if let Some(handle) = sessions.get(hash) {
         if !handle.is_fresh() {
+            handle.close();
             sessions.remove(hash);
             return true;
         }
@@ -983,7 +1009,9 @@ pub enum UploadEventKind {
     /// us in this session — that alone increments Statistics "Completed
     /// Uploads", matching hash-verified download completion. Partial
     /// sessions still dismiss the transfer row and credit byte totals.
-    Completed { full_file: bool },
+    Completed {
+        full_file: bool,
+    },
     Failed {
         error: String,
     },
@@ -1036,10 +1064,30 @@ pub enum UploadEventKind {
     /// Incoming Ember browse response from a friend (outbound session).
     EmberBrowseResponse {
         ember_hash: [u8; 16],
+        session_id: u64,
         entries: Vec<(String, u64, String)>,
+    },
+    /// An on-demand browse dial established a new friend session. The network
+    /// loop binds the opaque session ID to the queued request before sending
+    /// the wire packet, so a reply from a retired session can never complete
+    /// this request.
+    EmberBrowseSessionReady {
+        ember_hash: [u8; 16],
+        request_id: String,
+        session_id: u64,
+        tx: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    /// The matching on-demand browse dial failed. Routed through the network
+    /// loop to remove its placeholder request atomically with replying.
+    EmberBrowseSessionFailed {
+        ember_hash: [u8; 16],
+        request_id: String,
+        error: String,
+        tx: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     EmberFriendDisconnected {
         ember_hash: [u8; 16],
+        session_id: u64,
     },
     /// A friend session was just established from the *outbound* dial side
     /// (`friend_connect::run_friend_session_over_transport`, the single
@@ -1226,8 +1274,7 @@ struct UploadHandler {
     /// Identities currently being dialed for HighID AddUpNextClient push-grants.
     push_grant_in_flight: Arc<tokio::sync::Mutex<std::collections::HashSet<QueueIdentity>>>,
     /// Per-identity backoff after a failed HighID push dial.
-    push_grant_backoff:
-        Arc<tokio::sync::Mutex<HashMap<QueueIdentity, std::time::Instant>>>,
+    push_grant_backoff: Arc<tokio::sync::Mutex<HashMap<QueueIdentity, std::time::Instant>>>,
     /// Count of concurrent outbound HighID push-grant dials.
     push_grant_dials: Arc<std::sync::atomic::AtomicUsize>,
     /// Per-slot smoothed upload rates for dynamic slot decisions.
@@ -3250,9 +3297,7 @@ impl UploadHandler {
                 self.push_grant_dials
                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 self.push_grant_in_flight.lock().await.remove(&identity);
-                debug!(
-                    "AddUpNextClient: dropping dial to {peer_addr}: per-IP limit reached"
-                );
+                debug!("AddUpNextClient: dropping dial to {peer_addr}: per-IP limit reached");
                 return;
             }
             *count += 1;
@@ -3284,8 +3329,7 @@ impl UploadHandler {
             debug!("AddUpNextClient dial to {peer_addr} failed before grant: {e}");
             self.push_grant_backoff.lock().await.insert(
                 identity,
-                std::time::Instant::now()
-                    + std::time::Duration::from_secs(PUSH_GRANT_BACKOFF_SECS),
+                std::time::Instant::now() + std::time::Duration::from_secs(PUSH_GRANT_BACKOFF_SECS),
             );
         }
         // Soft Ok(()) before grant (ban / AntiLeech / etc.) keeps seniority.
@@ -3422,8 +3466,12 @@ impl UploadHandler {
             // Outbound EmuleInfo: send ours, then read the peer's answer. A
             // non-EmuleInfo packet here (peer jumped straight to a file request)
             // is captured as `first_packet` and replayed by the serve loop.
-            let emule_payload =
-                build_emule_info(self.advertised_udp_port(), obf_enabled, Some(&self.ember_hash), None);
+            let emule_payload = build_emule_info(
+                self.advertised_udp_port(),
+                obf_enabled,
+                Some(&self.ember_hash),
+                None,
+            );
             write_packet_async(&mut writer, OP_EMULEPROT, OP_EMULEINFO, &emule_payload).await?;
             let mut first_packet: Option<(u8, u8, Vec<u8>)> = None;
             if let Ok(Ok((eproto, eopcode, epayload))) = tokio::time::timeout(
@@ -4260,9 +4308,9 @@ impl UploadHandler {
             let divert_file: Option<[u8; 16]> = {
                 let idx = reconnect_index();
                 let guard = idx.read().unwrap_or_else(|e| e.into_inner());
-                guard.get(&peer_v4).and_then(|entries| {
-                    path_b_divert_file(entries, peer_user_hash)
-                })
+                guard
+                    .get(&peer_v4)
+                    .and_then(|entries| path_b_divert_file(entries, peer_user_hash))
             };
             if let Some(file_hash) = divert_file {
                 info!(
@@ -4429,11 +4477,8 @@ impl UploadHandler {
             // site passed `None`, which silently disabled Ember
             // identity verification on every upload session.
             let nickname = self.nickname_snapshot().await;
-            let payload = build_ember_hello(
-                &self.ember_hash,
-                &nickname,
-                Some(&self.ed25519_public_key),
-            );
+            let payload =
+                build_ember_hello(&self.ember_hash, &nickname, Some(&self.ed25519_public_key));
             if write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_HELLO, &payload)
                 .await
                 .is_ok()
@@ -4629,6 +4674,11 @@ impl UploadHandler {
         // liveness timestamp `EmberSessionHandle::is_fresh()` checks against
         // fresh for as long as this session is actually receiving traffic.
         let mut ember_session_handle: Option<EmberSessionHandle> = None;
+        // Becomes active only after this connection has proven ownership of a
+        // friend slot. A caller that retires the slot (for example, cancelling
+        // an in-flight browse) wakes the select below so this socket closes
+        // immediately instead of waiting for the passive timeout.
+        let mut ember_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>> = None;
 
         // Now handle file requests in a loop
         let mut current_file_hash: Option<[u8; 16]> = None;
@@ -4692,18 +4742,10 @@ impl UploadHandler {
         if let Some(fh) = push_grant_file_hash {
             let dynamic_slots = self.compute_dynamic_slot_count();
             if !slot_guard.try_activate(dynamic_slots) {
-                anyhow::bail!(
-                    "push-grant session {peer_addr}: no free upload slot after dial"
-                );
+                anyhow::bail!("push-grant session {peer_addr}: no free upload slot after dial");
             }
             current_file_hash = Some(fh);
-            write_packet_async(
-                &mut writer,
-                OP_EDONKEYHEADER,
-                OP_ACCEPTUPLOADREQ,
-                &[],
-            )
-            .await?;
+            write_packet_async(&mut writer, OP_EDONKEYHEADER, OP_ACCEPTUPLOADREQ, &[]).await?;
             if let Some(flag) = push_grant_accepted.as_ref() {
                 flag.store(true, std::sync::atomic::Ordering::Relaxed);
             }
@@ -5056,6 +5098,19 @@ impl UploadHandler {
                 };
                 let timeout_dur = std::time::Duration::from_secs(wait_secs);
                 let read_result = tokio::select! {
+                    _ = async {
+                        match ember_shutdown_rx.as_mut() {
+                            Some(rx) => {
+                                if !*rx.borrow() {
+                                    let _ = rx.changed().await;
+                                }
+                            }
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => {
+                        info!("Closing retired Ember friend session from {peer_addr}");
+                        break;
+                    }
                     r = tokio::time::timeout(timeout_dur, pkt_rx.recv()) => r,
                     Some(outbound_data) = outbound_rx.recv() => {
                         if writer.write_all(&outbound_data).await.is_ok() {
@@ -7527,12 +7582,16 @@ impl UploadHandler {
 
                         match hashset_result {
                             Ok(Some(hashes)) => {
-                                let mut resp = Vec::with_capacity(16 + 2 + hashes.len() * 16);
-                                resp.extend_from_slice(&req_hash);
-                                resp.extend_from_slice(&(hashes.len() as u16).to_le_bytes());
-                                for h in &hashes {
-                                    resp.extend_from_slice(h);
-                                }
+                                let Some(resp) =
+                                    encode_legacy_hashset_response(&req_hash, &hashes)
+                                else {
+                                    warn!(
+                                        "Refusing legacy HashSet for {}: {} hashes exceed u16 wire count",
+                                        file.name,
+                                        hashes.len()
+                                    );
+                                    continue;
+                                };
                                 write_packet_async(
                                     &mut writer,
                                     OP_EDONKEYHEADER,
@@ -7605,8 +7664,6 @@ impl UploadHandler {
                                     Ok::<_, anyhow::Error>((md4, aich))
                                 }).await??;
 
-                                let mut resp = Vec::new();
-                                local_ident.write_identifier(&mut resp);
                                 let md4_section = md4_hashes
                                     .as_ref()
                                     .filter(|h| !h.is_empty());
@@ -7616,32 +7673,17 @@ impl UploadHandler {
                                     }
                                     _ => None,
                                 };
-                                let mut resp_options = 0u8;
-                                if md4_section.is_some() {
-                                    resp_options |= 0x01;
-                                }
-                                if aich_section.is_some() {
-                                    resp_options |= 0x02;
-                                }
-                                resp.push(resp_options);
-                                // Emit body sections iff the matching option bits
-                                // are set — peers parse by options, so an empty
-                                // Some([]) must not write a zero-count MD4 block
-                                // that shifts the AICH section.
-                                if let Some(hashes) = md4_section {
-                                    resp.extend_from_slice(&file_ident.md4_hash);
-                                    resp.extend_from_slice(&(hashes.len() as u16).to_le_bytes());
-                                    for h in hashes {
-                                        resp.extend_from_slice(h);
-                                    }
-                                }
-                                if let Some((root, hashes)) = aich_section {
-                                    resp.extend_from_slice(&root);
-                                    resp.extend_from_slice(&(hashes.len() as u16).to_le_bytes());
-                                    for h in hashes {
-                                        resp.extend_from_slice(h);
-                                    }
-                                }
+                                let Some(resp) = encode_hashset2_response(
+                                    &local_ident,
+                                    md4_section.map(Vec::as_slice),
+                                    aich_section.map(|(root, hashes)| (root, hashes.as_slice())),
+                                ) else {
+                                    warn!(
+                                        "Refusing HashSet2 for {}: a requested hash section exceeds u16 wire count",
+                                        file.name
+                                    );
+                                    continue;
+                                };
                                 write_packet_async(
                                     &mut writer,
                                     OP_EMULEPROT,
@@ -8390,11 +8432,15 @@ impl UploadHandler {
                                     // fresh, actually-verified inbound
                                     // session isn't blocked from claiming
                                     // the slot.
-                                    if sessions.get(&eh).is_some_and(|h| !h.is_fresh()) {
+                                    if let Some(stale) =
+                                        sessions.get(&eh).filter(|handle| !handle.is_fresh())
+                                    {
+                                        stale.close();
                                         sessions.remove(&eh);
                                     }
                                     if !sessions.contains_key(&eh) {
                                         let handle = EmberSessionHandle::new(outbound_tx.clone());
+                                        ember_shutdown_rx = Some(handle.subscribe_shutdown());
                                         ember_session_handle = Some(handle.clone());
                                         sessions.insert(eh, handle);
                                         owns_ember_slot = true;
@@ -8526,7 +8572,7 @@ impl UploadHandler {
 
                 (OP_EMULEPROT, OP_EMBER_BROWSE_RES) if is_ember_friend && owns_ember_slot && ember_auth_state.is_verified() => {
                     if let Some(h) = &ember_session_handle { h.touch(); }
-                    if let Some(eh) = peer_ember_hash {
+                    if let (Some(eh), Some(session)) = (peer_ember_hash, ember_session_handle.as_ref()) {
                         if !self.friend_hashes.read().await.contains(&eh) {
                             debug!("Ignoring browse response from removed friend {}", hex::encode(eh));
                         } else {
@@ -8535,6 +8581,7 @@ impl UploadHandler {
                                 transfer_id: String::new(),
                                 kind: UploadEventKind::EmberBrowseResponse {
                                     ember_hash: eh,
+                                    session_id: session.session_id(),
                                     entries,
                                 },
                             }).await;
@@ -8562,13 +8609,28 @@ impl UploadHandler {
         reader_task.abort();
         let _ = reader_task.await;
 
-        if let (true, Some(eh)) = (owns_ember_slot, peer_ember_hash) {
-            self.ember_sessions.write().await.remove(&eh);
+        if let (true, Some(eh), Some(session)) = (
+            owns_ember_slot,
+            peer_ember_hash,
+            ember_session_handle.as_ref(),
+        ) {
+            let session_id = session.session_id();
+            let mut sessions = self.ember_sessions.write().await;
+            let remove_current = sessions
+                .get(&eh)
+                .is_some_and(|current| current.tx.same_channel(&session.tx));
+            if remove_current {
+                sessions.remove(&eh);
+            }
+            drop(sessions);
             let _ = self
                 .upload_event_tx
                 .send(UploadEvent {
                     transfer_id: String::new(),
-                    kind: UploadEventKind::EmberFriendDisconnected { ember_hash: eh },
+                    kind: UploadEventKind::EmberFriendDisconnected {
+                        ember_hash: eh,
+                        session_id,
+                    },
                 })
                 .await;
         }
@@ -8699,7 +8761,10 @@ impl UploadHandler {
     /// while parked in the token bucket (tight limits can otherwise stall
     /// teardown for many seconds after Disconnect).
     async fn acquire_upload_bandwidth(&self, bytes: u64) -> anyhow::Result<()> {
-        if self.network_disconnected.load(std::sync::atomic::Ordering::Relaxed) {
+        if self
+            .network_disconnected
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             anyhow::bail!("network disconnected");
         }
         tokio::select! {
@@ -8748,6 +8813,61 @@ fn parse_aich_root_hash(hex_str: &str) -> Option<[u8; 20]> {
     let mut out = [0u8; 20];
     out.copy_from_slice(&bytes);
     Some(out)
+}
+
+fn encode_legacy_hashset_response(file_hash: &[u8; 16], hashes: &[[u8; 16]]) -> Option<Vec<u8>> {
+    let count = u16::try_from(hashes.len()).ok()?;
+    let mut response = Vec::with_capacity(16 + 2 + hashes.len() * 16);
+    response.extend_from_slice(file_hash);
+    response.extend_from_slice(&count.to_le_bytes());
+    for hash in hashes {
+        response.extend_from_slice(hash);
+    }
+    Some(response)
+}
+
+fn encode_hashset2_response(
+    identifier: &FileIdentifier,
+    md4_hashes: Option<&[[u8; 16]]>,
+    aich_section: Option<([u8; 20], &[[u8; 20]])>,
+) -> Option<Vec<u8>> {
+    // Reject the full answer when a requested section cannot be represented:
+    // omitting it silently would make a peer treat the reply as complete,
+    // while serializing `as u16` would wrap the count and corrupt framing.
+    let md4_count = match md4_hashes {
+        Some(hashes) => Some(u16::try_from(hashes.len()).ok()?),
+        None => None,
+    };
+    let aich_count = match aich_section.as_ref() {
+        Some((_, hashes)) => Some(u16::try_from(hashes.len()).ok()?),
+        None => None,
+    };
+
+    let mut response = Vec::new();
+    identifier.write_identifier(&mut response);
+    let mut options = 0u8;
+    if md4_count.is_some() {
+        options |= 0x01;
+    }
+    if aich_count.is_some() {
+        options |= 0x02;
+    }
+    response.push(options);
+    if let (Some(hashes), Some(count)) = (md4_hashes, md4_count) {
+        response.extend_from_slice(&identifier.md4_hash);
+        response.extend_from_slice(&count.to_le_bytes());
+        for hash in hashes {
+            response.extend_from_slice(hash);
+        }
+    }
+    if let (Some((root, hashes)), Some(count)) = (aich_section, aich_count) {
+        response.extend_from_slice(&root);
+        response.extend_from_slice(&count.to_le_bytes());
+        for hash in hashes {
+            response.extend_from_slice(hash);
+        }
+    }
+    Some(response)
 }
 
 fn compute_aich_part_hashes(path: &std::path::Path) -> anyhow::Result<Vec<[u8; 20]>> {
@@ -8985,6 +9105,28 @@ mod scoring_tests {
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             4662,
         ))
+    }
+
+    #[test]
+    fn hashset_encoders_refuse_counts_that_do_not_fit_u16() {
+        let md4_hashes = vec![[0x11; 16]; u16::MAX as usize + 1];
+        let aich_hashes = vec![[0x22; 20]; u16::MAX as usize + 1];
+        let file_hash = [0x33; 16];
+        let identifier = FileIdentifier {
+            md4_hash: file_hash,
+            file_size: Some(1),
+            aich_hash: None,
+        };
+
+        assert!(encode_legacy_hashset_response(&file_hash, &md4_hashes).is_none());
+        assert!(
+            encode_hashset2_response(&identifier, Some(&md4_hashes), None).is_none(),
+            "HashSet2 MD4 section must not wrap its count"
+        );
+        assert!(
+            encode_hashset2_response(&identifier, None, Some(([0x44; 20], &aich_hashes))).is_none(),
+            "HashSet2 AICH section must not wrap its count"
+        );
     }
 
     /// `unshared_purge_hashes` is the decision core of the periodic
@@ -9363,8 +9505,14 @@ mod scoring_tests {
         // CombinedFilePrioAndCredit beats the average (eMule AddClientToQueue).
         assert!(soft_zone_should_admit(false, 100.0, 50.0));
         assert!(!soft_zone_should_admit(false, 10.0, 50.0));
-        assert!(soft_zone_should_admit(true, 0.0, 999.0), "verified friend bypasses soft zone");
-        assert!(soft_zone_should_admit(false, 50.0, 50.0), "equal combined is admitted");
+        assert!(
+            soft_zone_should_admit(true, 0.0, 999.0),
+            "verified friend bypasses soft zone"
+        );
+        assert!(
+            soft_zone_should_admit(false, 50.0, 50.0),
+            "equal combined is admitted"
+        );
     }
 
     #[test]
@@ -9376,10 +9524,16 @@ mod scoring_tests {
         let peer_ip = u32::from_be_bytes([10, 0, 0, 1]);
         let low = combined_file_prio_and_credit(&cm, &idx, &user, [0u8; 16], peer_ip, None, false);
         // Unknown file → prio 7 → combined = 10 * ratio * 7
-        assert!(low > 0.0, "combined must be wait-independent and non-zero for credited peers");
+        assert!(
+            low > 0.0,
+            "combined must be wait-independent and non-zero for credited peers"
+        );
         let ratio = cm.get_score_ratio(&user, peer_ip);
         let expected = 10.0 * ratio * 7.0;
-        assert!((low - expected).abs() < 0.01, "got {low}, expected ~{expected}");
+        assert!(
+            (low - expected).abs() < 0.01,
+            "got {low}, expected ~{expected}"
+        );
     }
 
     #[test]
@@ -9401,10 +9555,7 @@ mod scoring_tests {
         // while another known-hash entry exists at this IP.
         assert_eq!(path_b_divert_file(&normalized, user_b), None);
         let unknown_only = vec![(file_b, None)];
-        assert_eq!(
-            path_b_divert_file(&unknown_only, [0u8; 16]),
-            Some(file_b)
-        );
+        assert_eq!(path_b_divert_file(&unknown_only, [0u8; 16]), Some(file_b));
     }
 
     #[test]
@@ -9691,6 +9842,20 @@ mod ember_session_handle_tests {
 
         handle.touch();
         assert!(handle.is_fresh(), "touch() must reset staleness");
+    }
+
+    #[tokio::test]
+    async fn close_notifies_the_session_owner() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let handle = EmberSessionHandle::new(tx);
+        let mut shutdown = handle.subscribe_shutdown();
+
+        handle.close();
+        shutdown
+            .changed()
+            .await
+            .expect("shutdown sender stays alive");
+        assert!(*shutdown.borrow());
     }
 
     #[tokio::test]

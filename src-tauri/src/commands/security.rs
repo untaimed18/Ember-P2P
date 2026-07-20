@@ -1,8 +1,9 @@
 use std::io::{Cursor, Read};
 use std::net::Ipv4Addr;
+use std::path::PathBuf;
 
 use tokio::sync::oneshot;
-use tracing::info;
+use tracing::{info, warn};
 use zip::ZipArchive;
 
 use crate::app_state::AppState;
@@ -13,6 +14,29 @@ use crate::network::NetworkCommand;
 const CMD_TIMEOUT: std::time::Duration = CMD_REPLY_TIMEOUT;
 const DEFAULT_IPFILTER_ARCHIVE_URL: &str = "https://upd.emule-security.org/ipfilter.zip";
 const MAX_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
+
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IpFilterApplyOutcome {
+    Applied,
+    Deferred,
+    Failed,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IpFilterApplyResult {
+    pub outcome: IpFilterApplyOutcome,
+    pub entry_count: usize,
+}
+
+fn ipfilter_outcome_from_ack(ack: Option<Result<(), String>>) -> IpFilterApplyOutcome {
+    match ack {
+        Some(Ok(())) => IpFilterApplyOutcome::Applied,
+        Some(Err(_)) => IpFilterApplyOutcome::Failed,
+        None => IpFilterApplyOutcome::Deferred,
+    }
+}
 
 async fn persist_ip_filter_enabled(
     state: &tauri::State<'_, AppState>,
@@ -57,6 +81,51 @@ async fn restore_settings_after_send_failure(
     .map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?;
     state.config.write().await.settings = previous_settings;
     Ok(())
+}
+
+async fn apply_ipfilter_reload(
+    state: &tauri::State<'_, AppState>,
+    path: PathBuf,
+) -> IpFilterApplyOutcome {
+    let (tx, rx) = oneshot::channel();
+    if let Err(error) = state
+        .network_tx
+        .try_send(NetworkCommand::ReloadIpFilter { path, tx: Some(tx) })
+    {
+        warn!("IP filter reload was not queued: {error}");
+        return IpFilterApplyOutcome::Deferred;
+    }
+
+    let ack = match tokio::time::timeout(CMD_TIMEOUT, rx).await {
+        Ok(Ok(ack)) => ack,
+        Ok(Err(_)) | Err(_) => {
+            warn!("IP filter reload outcome was not confirmed before timeout");
+            return ipfilter_outcome_from_ack(None);
+        }
+    };
+    match ipfilter_outcome_from_ack(Some(ack)) {
+        IpFilterApplyOutcome::Applied => {
+            // The settings write above made this sticky; this queue send is
+            // intentionally best-effort because a saturated network task can
+            // still apply the enabled flag on restart.
+            if let Err(error) = bounded_send(
+                &state.network_tx,
+                NetworkCommand::SetIpFilterEnabled { enabled: true },
+            )
+            .await
+            {
+                warn!("IP filter reloaded, but enabling it live was deferred: {error}");
+                IpFilterApplyOutcome::Deferred
+            } else {
+                IpFilterApplyOutcome::Applied
+            }
+        }
+        IpFilterApplyOutcome::Failed => {
+            warn!("IP filter reload failed");
+            IpFilterApplyOutcome::Failed
+        }
+        IpFilterApplyOutcome::Deferred => unreachable!("ack is always present"),
+    }
 }
 
 fn extract_ipfilter_from_zip(zip_bytes: &[u8]) -> Result<Vec<u8>, String> {
@@ -154,6 +223,27 @@ fn extract_ipfilter_from_zip(zip_bytes: &[u8]) -> Result<Vec<u8>, String> {
         ));
     }
     Ok(extracted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn structured_ipfilter_outcome_requires_confirmed_reload() {
+        assert_eq!(
+            ipfilter_outcome_from_ack(Some(Ok(()))),
+            IpFilterApplyOutcome::Applied
+        );
+        assert_eq!(
+            ipfilter_outcome_from_ack(Some(Err("load failed".into()))),
+            IpFilterApplyOutcome::Failed
+        );
+        assert_eq!(
+            ipfilter_outcome_from_ack(None),
+            IpFilterApplyOutcome::Deferred
+        );
+    }
 }
 
 #[tauri::command]
@@ -376,7 +466,7 @@ pub async fn set_block_private_ips(
 pub async fn download_and_load_ipfilter(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
-) -> Result<String, String> {
+) -> Result<IpFilterApplyResult, String> {
     info!("Downloading ipfilter.zip from {DEFAULT_IPFILTER_ARCHIVE_URL}");
 
     let response = crate::security::fetch_pinned_get(DEFAULT_IPFILTER_ARCHIVE_URL)
@@ -478,31 +568,13 @@ pub async fn download_and_load_ipfilter(
             })?;
     }
 
-    let byte_count = extracted.len();
-    let previous_settings = persist_ip_filter_enabled(&state).await?;
-    let apply_result = async {
-        bounded_send(
-            &state.network_tx,
-            NetworkCommand::ReloadIpFilter { path: filter_path },
-        )
-        .await?;
-        bounded_send(
-            &state.network_tx,
-            NetworkCommand::SetIpFilterEnabled { enabled: true },
-        )
-        .await
-    }
-    .await;
-    if let Err(error) = apply_result {
-        restore_settings_after_send_failure(&state, previous_settings).await?;
-        return Err(error);
-    }
-
-    let msg = format!(
-        "Downloaded, extracted, and loaded ipfilter.dat ({byte_count} bytes, {entry_count} entries) — filter is now active"
-    );
-    info!("{msg}");
-    Ok(msg)
+    persist_ip_filter_enabled(&state).await?;
+    let outcome = apply_ipfilter_reload(&state, filter_path).await;
+    info!("Downloaded ipfilter.dat with {entry_count} entries ({outcome:?})");
+    Ok(IpFilterApplyResult {
+        outcome,
+        entry_count,
+    })
 }
 
 /// Download and load an ipfilter from a user-supplied URL.
@@ -521,7 +593,7 @@ pub async fn update_ipfilter_from_url(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     url: String,
-) -> Result<String, String> {
+) -> Result<IpFilterApplyResult, String> {
     info!("Updating IP filter from a user-supplied URL");
 
     const MAX_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
@@ -627,32 +699,15 @@ pub async fn update_ipfilter_from_url(
             })?;
     }
 
-    let byte_count = filter_bytes.len();
-    let previous_settings = persist_ip_filter_enabled(&state).await?;
-    let apply_result = async {
-        bounded_send(
-            &state.network_tx,
-            NetworkCommand::ReloadIpFilter { path: filter_path },
-        )
-        .await?;
-        bounded_send(
-            &state.network_tx,
-            NetworkCommand::SetIpFilterEnabled { enabled: true },
-        )
-        .await
-    }
-    .await;
-    if let Err(error) = apply_result {
-        restore_settings_after_send_failure(&state, previous_settings).await?;
-        return Err(error);
-    }
-
-    let extracted_note = if is_zip { " (extracted from zip)" } else { "" };
-    let msg = format!(
-        "Downloaded and loaded ipfilter.dat from {url}{extracted_note} ({byte_count} bytes, {entry_count} entries) — filter is now active"
+    persist_ip_filter_enabled(&state).await?;
+    let outcome = apply_ipfilter_reload(&state, filter_path).await;
+    info!(
+        "Downloaded IP filter from custom URL (zip={is_zip}, entries={entry_count}, outcome={outcome:?})"
     );
-    info!("{msg}");
-    Ok(msg)
+    Ok(IpFilterApplyResult {
+        outcome,
+        entry_count,
+    })
 }
 
 #[tauri::command]
@@ -660,7 +715,7 @@ pub async fn import_ipfilter_file(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     file_path: String,
-) -> Result<String, String> {
+) -> Result<IpFilterApplyResult, String> {
     // Match the cap used by `add_shared_folder` / `validate_settings`
     // so a degenerate frontend caller can't pass a multi-megabyte
     // string into IPC. The blocking canonicalize / read paths below
@@ -872,28 +927,13 @@ pub async fn import_ipfilter_file(
         }
         (path, entry_count)
     };
-    let previous_settings = persist_ip_filter_enabled(&state).await?;
-    let apply_result = async {
-        bounded_send(
-            &state.network_tx,
-            NetworkCommand::ReloadIpFilter { path: load_path },
-        )
-        .await?;
-        bounded_send(
-            &state.network_tx,
-            NetworkCommand::SetIpFilterEnabled { enabled: true },
-        )
-        .await
-    }
-    .await;
-    if let Err(error) = apply_result {
-        restore_settings_after_send_failure(&state, previous_settings).await?;
-        return Err(error);
-    }
-
-    Ok(format!(
-        "Imported and loaded IP filter ({entry_count} entries) — filter is now active"
-    ))
+    persist_ip_filter_enabled(&state).await?;
+    let outcome = apply_ipfilter_reload(&state, load_path).await;
+    info!("Imported IP filter with {entry_count} entries ({outcome:?})");
+    Ok(IpFilterApplyResult {
+        outcome,
+        entry_count,
+    })
 }
 
 // ----- Anti-leech client filter commands -----------------------------

@@ -26,8 +26,13 @@ fn pending_queue_path(app: &AppHandle) -> std::path::PathBuf {
 }
 
 fn persist_pending_queue(app: &AppHandle, entries: &[PendingDeepLink]) -> Result<(), String> {
-    let data = serde_json::to_vec(entries)
-        .map_err(|e| coded_ctx("deeplink_queue_serialize_failed", "Deep-link queue error", e))?;
+    let data = serde_json::to_vec(entries).map_err(|e| {
+        coded_ctx(
+            "deeplink_queue_serialize_failed",
+            "Deep-link queue error",
+            e,
+        )
+    })?;
     crate::security::atomic_write(&pending_queue_path(app), &data, false)
         .map_err(|e| coded_ctx("deeplink_queue_save_failed", "Deep-link queue error", e))
 }
@@ -91,7 +96,10 @@ pub fn dispatch_deep_links(app: &AppHandle, payloads: Vec<String>) {
             }
             let sequence = NEXT_PENDING_ID.fetch_add(1, Ordering::Relaxed);
             pending.push(PendingDeepLink {
-                id: format!("{:x}-{sequence:x}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()),
+                id: format!(
+                    "{:x}-{sequence:x}",
+                    chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+                ),
                 payload: p,
             });
         }
@@ -145,12 +153,21 @@ pub async fn ack_pending_deep_link(
     id: String,
 ) -> Result<(), String> {
     let mut pending = state.pending_deep_links.lock();
-    let before = pending.len();
-    pending.retain(|entry| entry.id != id);
-    if pending.len() == before {
+    let updated: Vec<PendingDeepLink> = pending
+        .iter()
+        .filter(|entry| entry.id != id)
+        .cloned()
+        .collect();
+    if updated.len() == pending.len() {
         return Ok(());
     }
-    persist_pending_queue(&app, &pending)
+    // The durable file is the source of truth across a process restart.
+    // Persist the post-ack snapshot before changing the in-memory queue so a
+    // failed write leaves this entry eligible for a safe acknowledgement
+    // retry rather than silently losing it.
+    persist_pending_queue(&app, &updated)?;
+    *pending = updated;
+    Ok(())
 }
 
 /// Load a collection from a path supplied by the OS file association.

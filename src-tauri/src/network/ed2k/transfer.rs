@@ -1972,9 +1972,7 @@ impl Ed2kDownload {
                     }
                 }
                 // Ember-only; gated on `peer_is_ember` + PoP (see upload.rs).
-                (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE)
-                    if peer_is_ember && ember_auth_verified =>
-                {
+                (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE) if peer_is_ember && ember_auth_verified => {
                     self.sx_overhead.record_download((6 + payload.len()) as u64);
                     if epx_packets_received >= crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION
                     {

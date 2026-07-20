@@ -923,8 +923,8 @@ fn apply_existing_contact_update(
     // eMule legacy Kad2 restriction: contacts with version >= 0.46c and
     // < 0.49a-beta that have already received a HELLO packet are limited
     // to timer-refresh-only updates (prevents value hijacking of legacy nodes).
-    let is_legacy_kad2 = existing.version >= KADEMLIA_VERSION1_46C
-        && existing.version < KADEMLIA_VERSION6_49ABETA;
+    let is_legacy_kad2 =
+        existing.version >= KADEMLIA_VERSION1_46C && existing.version < KADEMLIA_VERSION6_49ABETA;
     if is_legacy_kad2 && existing.received_hello {
         let same_values = existing.ip == contact.ip
             && existing.tcp_port == contact.tcp_port

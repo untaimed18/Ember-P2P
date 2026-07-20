@@ -1,5 +1,14 @@
 <script lang="ts">
-  import { getSettings, updateSettings, downloadNodesDat, downloadIpfilter, openEmberWebsite } from '$lib/api/settings';
+  import {
+    getSettings,
+    updateSettings,
+    downloadNodesDat,
+    downloadIpfilter,
+    openEmberWebsite,
+    type UpdateSettingsResult,
+    type NodesDatDownloadResult,
+    type IpFilterDownloadResult,
+  } from '$lib/api/settings';
   import { setAppSettings, appSettings } from '$lib/stores/settings';
   import { get } from 'svelte/store';
   import { getSpamStats, resetSpamFilter, clearDownloadHistory, getDownloadHistoryStats } from '$lib/api/search';
@@ -12,6 +21,7 @@
   import type { AntiLeechSnapshot } from '$lib/types';
   import { invoke } from '@tauri-apps/api/core';
   import { goto } from '$app/navigation';
+  import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { relaunch } from '@tauri-apps/plugin-process';
   import type { AppSettings, SpamStats, DownloadHistoryStats } from '$lib/types';
   import { onMount, untrack } from 'svelte';
@@ -36,6 +46,51 @@
   import { updater, checkForUpdates, installUpdate, restartToUpdate } from '$lib/stores/updater';
 
   const appVersion = import.meta.env.VITE_APP_VERSION;
+
+  function updateSettingsOutcomeMessage(result: UpdateSettingsResult): string {
+    switch (result.outcome) {
+      case 'restart_required':
+        return m.settings_save_restart_required();
+      case 'deferred':
+        return m.settings_save_live_apply_deferred();
+      default:
+        return m.settings_save_success();
+    }
+  }
+
+  function nodesDownloadOutcomeMessage(result: NodesDatDownloadResult): string {
+    return result.outcome === 'applied' && result.appliedCount !== undefined
+      ? m.settings_nodes_downloaded_applied({
+          parsed: result.parsedCount,
+          applied: result.appliedCount,
+          bytes: result.byteCount,
+        })
+      : m.settings_nodes_downloaded_deferred({
+          parsed: result.parsedCount,
+          bytes: result.byteCount,
+        });
+  }
+
+  function ipFilterDownloadOutcomeMessage(result: IpFilterDownloadResult): string {
+    switch (result.outcome) {
+      case 'applied':
+        return m.settings_ipfilter_downloaded_applied({
+            entries: result.entryCount,
+            bytes: result.byteCount,
+          });
+      case 'failed':
+        return m.settings_ipfilter_downloaded_failed({
+            entries: result.entryCount,
+            bytes: result.byteCount,
+          });
+      default:
+        return m.settings_ipfilter_downloaded_deferred({
+            entries: result.entryCount,
+            bytes: result.byteCount,
+          });
+    }
+  }
+
   // Download progress percent for the About card, when a content length is known.
   let aboutPercent = $derived(
     $updater.total && $updater.total > 0
@@ -89,6 +144,7 @@
   let loadError: string | null = $state(null);
   let downloadingNodes = $state(false);
   let nodesResult: string | null = $state(null);
+  let nodesResultWarning = $state(false);
   let nodesError: string | null = $state(null);
 
   // Restart-prompt state. Populated by `handleSave` when a save changes
@@ -194,6 +250,7 @@
   }
   let downloadingFilter = $state(false);
   let filterResult: string | null = $state(null);
+  let filterResultWarning = $state(false);
   let filterError: string | null = $state(null);
   let spamStats: SpamStats | null = $state(null);
   let spamStatsLoading = $state(false);
@@ -228,6 +285,54 @@
 
   let unmounted = false;
   onMount(() => {
+    let unlistenIpFilterReload: UnlistenFn | null = null;
+    let unlistenNodesBootstrap: UnlistenFn | null = null;
+    listen<{ outcome: 'applied' | 'failed'; entry_count: number; byte_count: number }>(
+      'ipfilter-reload-result',
+      (event) => {
+        if (unmounted) return;
+        const { outcome, entry_count, byte_count } = event.payload;
+        if (
+          (outcome !== 'applied' && outcome !== 'failed')
+          || !Number.isFinite(entry_count)
+          || !Number.isFinite(byte_count)
+        ) return;
+        showIpFilterDownloadOutcome({
+          outcome,
+          entryCount: entry_count,
+          byteCount: byte_count,
+        });
+      },
+    )
+      .then((fn) => {
+        if (unmounted) fn();
+        else unlistenIpFilterReload = fn;
+      })
+      .catch((e) => console.error('Failed to register IP-filter reload listener:', e));
+    listen<{ outcome: 'applied'; parsed_count: number; applied_count: number; byte_count: number }>(
+      'nodes-bootstrap-result',
+      (event) => {
+        if (unmounted) return;
+        const { parsed_count, applied_count, byte_count } = event.payload;
+        if (
+          !Number.isFinite(parsed_count)
+          || !Number.isFinite(applied_count)
+          || !Number.isFinite(byte_count)
+        ) return;
+        showNodesDownloadOutcome({
+          outcome: 'applied',
+          parsedCount: parsed_count,
+          appliedCount: applied_count,
+          byteCount: byte_count,
+        });
+      },
+    )
+      .then((fn) => {
+        if (unmounted) fn();
+        else unlistenNodesBootstrap = fn;
+      })
+      .catch((e) => console.error('Failed to register nodes bootstrap listener:', e));
+
     refreshSpamStats();
     refreshHistoryStats();
     getSettings()
@@ -257,7 +362,14 @@
     };
     window.addEventListener('beforeunload', handleBeforeUnload);
     window.addEventListener('keydown', handleKeyboardSave);
-    return () => { unmounted = true; window.removeEventListener('beforeunload', handleBeforeUnload); window.removeEventListener('keydown', handleKeyboardSave); for (const id of activeTimers) clearTimeout(id); };
+    return () => {
+      unmounted = true;
+      unlistenIpFilterReload?.();
+      unlistenNodesBootstrap?.();
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+      window.removeEventListener('keydown', handleKeyboardSave);
+      for (const id of activeTimers) clearTimeout(id);
+    };
   });
 
   const activeTimers = new Set<ReturnType<typeof setTimeout>>();
@@ -473,18 +585,17 @@
             friend_session_encryption: true,
           };
           try {
-            // updateSettings returns a status string, not AppSettings.
-            await updateSettings(candidate);
-            setAppSettings(candidate);
-            settings.settings_revision = candidate.settings_revision;
+            const result = await updateSettings(candidate);
+            setAppSettings(result.settings);
+            settings.settings_revision = result.settings.settings_revision;
             if (originalSettings) {
               const baseline = JSON.parse(originalSettings) as AppSettings;
-              baseline.friend_require_approval = candidate.friend_require_approval;
-              baseline.friend_online_notifications = candidate.friend_online_notifications;
-              baseline.friend_chat_disabled = candidate.friend_chat_disabled;
-              baseline.friend_browse_disabled = candidate.friend_browse_disabled;
+              baseline.friend_require_approval = result.settings.friend_require_approval;
+              baseline.friend_online_notifications = result.settings.friend_online_notifications;
+              baseline.friend_chat_disabled = result.settings.friend_chat_disabled;
+              baseline.friend_browse_disabled = result.settings.friend_browse_disabled;
               baseline.friend_session_encryption = true;
-              baseline.settings_revision = candidate.settings_revision;
+              baseline.settings_revision = result.settings.settings_revision;
               originalSettings = JSON.stringify(baseline);
             }
             break;
@@ -544,7 +655,7 @@
     draft.friend_session_encryption = true;
     settings.friend_session_encryption = true;
     try {
-      let result = '';
+      let result: UpdateSettingsResult | null = null;
       let saved: AppSettings | null = null;
       let latestBeforeSave: AppSettings | null = null;
 
@@ -560,7 +671,7 @@
         candidate.friend_session_encryption = true;
         try {
           result = await updateSettings(candidate);
-          saved = candidate;
+          saved = result.settings;
           break;
         } catch (e) {
           if (attempt === 0 && isSettingsRevisionConflict(e)) continue;
@@ -578,7 +689,7 @@
           throw e;
         }
       }
-      if (!saved || !latestBeforeSave) return;
+      if (!result || !saved || !latestBeforeSave) return;
 
       // Keep the process-wide settings cache in step with the just-saved
       // values so runtime consumers (friend online-notification toast, chat
@@ -593,10 +704,11 @@
       // its valid range and got silently clamped by `validateSettings`
       // above — surface that alongside the normal save result instead of
       // saving a different value than what was typed with no feedback.
+      const outcomeMessage = updateSettingsOutcomeMessage(result);
       const message = validation.adjusted
-        ? `${result} ${m.settings_values_adjusted()}`
-        : result;
-      const isWarn = result.toLowerCase().includes('restart') || validation.adjusted;
+        ? `${outcomeMessage} ${m.settings_values_adjusted()}`
+        : outcomeMessage;
+      const isWarn = result.outcome !== 'applied' || validation.adjusted;
       showSaveMsg(message, isWarn, isWarn ? 8000 : 3000);
 
       // Compare against the authoritative pre-save snapshot, so an unrelated
@@ -763,19 +875,47 @@
     }
   }
 
+  function showIpFilterDownloadOutcome(result: IpFilterDownloadResult) {
+    const message = ipFilterDownloadOutcomeMessage(result);
+    if (result.outcome === 'failed') {
+      filterResult = null;
+      filterResultWarning = false;
+      filterError = message;
+      trackedTimeout(() => (filterError = null), 5000);
+      return;
+    }
+    filterError = null;
+    filterResult = message;
+    filterResultWarning = result.outcome === 'deferred';
+    trackedTimeout(() => {
+      filterResult = null;
+      filterResultWarning = false;
+    }, 5000);
+  }
+
   async function handleDownloadFilter() {
     downloadingFilter = true;
     filterResult = null;
+    filterResultWarning = false;
     filterError = null;
     try {
-      filterResult = await downloadIpfilter();
-      trackedTimeout(() => (filterResult = null), 5000);
+      showIpFilterDownloadOutcome(await downloadIpfilter());
     } catch (e: unknown) {
       filterError = translateError(e, m.settings_download_failed());
       trackedTimeout(() => (filterError = null), 5000);
     } finally {
       downloadingFilter = false;
     }
+  }
+
+  function showNodesDownloadOutcome(result: NodesDatDownloadResult) {
+    nodesError = null;
+    nodesResult = nodesDownloadOutcomeMessage(result);
+    nodesResultWarning = result.outcome !== 'applied';
+    trackedTimeout(() => {
+      nodesResult = null;
+      nodesResultWarning = false;
+    }, 5000);
   }
 
   // Anti-leech filter state — loaded lazily when the Security section
@@ -978,10 +1118,10 @@
   async function handleDownloadNodes() {
     downloadingNodes = true;
     nodesResult = null;
+    nodesResultWarning = false;
     nodesError = null;
     try {
-      nodesResult = await downloadNodesDat();
-      trackedTimeout(() => (nodesResult = null), 5000);
+      showNodesDownloadOutcome(await downloadNodesDat());
     } catch (e: unknown) {
       nodesError = translateError(e, m.settings_download_failed());
       trackedTimeout(() => (nodesError = null), 5000);
@@ -1728,7 +1868,9 @@
               <button class="action-btn" onclick={handleDownloadNodes} disabled={downloadingNodes}>
                 {downloadingNodes ? m.settings_downloading() : m.settings_download_nodes_btn()}
               </button>
-              {#if nodesResult}<span class="feedback success">{nodesResult}</span>{/if}
+              {#if nodesResult}
+                <span class:warning={nodesResultWarning} class:success={!nodesResultWarning} class="feedback">{nodesResult}</span>
+              {/if}
               {#if nodesError}<span class="feedback error">{nodesError}</span>{/if}
             </div>
             <span class="hint">{m.settings_nodes_hint()}</span>
@@ -1811,7 +1953,9 @@
                 <button class="action-btn" onclick={handleDownloadFilter} disabled={downloadingFilter}>
                   {downloadingFilter ? m.settings_downloading() : m.settings_download_ipfilter_btn()}
                 </button>
-                {#if filterResult}<span class="feedback success">{filterResult}</span>{/if}
+                {#if filterResult}
+                  <span class:warning={filterResultWarning} class:success={!filterResultWarning} class="feedback">{filterResult}</span>
+                {/if}
                 {#if filterError}<span class="feedback error">{filterError}</span>{/if}
               </div>
             </div>

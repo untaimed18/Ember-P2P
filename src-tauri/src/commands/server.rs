@@ -33,8 +33,8 @@ pub async fn fetch_server_met_bytes(url: &str) -> Result<Vec<u8>, String> {
         let mut body = Vec::new();
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk =
-                chunk.map_err(|e| coded_ctx("response_read_failed", "Failed to read response", e))?;
+            let chunk = chunk
+                .map_err(|e| coded_ctx("response_read_failed", "Failed to read response", e))?;
             body.extend_from_slice(&chunk);
             if body.len() > MAX_RESPONSE_BYTES {
                 return Err(coded("response_too_large", "Response too large"));

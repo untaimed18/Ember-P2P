@@ -115,17 +115,16 @@ pub async fn load_collection(
 /// authorization, so use the same bounded parser as OS file-association opens
 /// instead of the raw IPC command's shared/download-root policy.
 #[tauri::command]
-pub async fn pick_and_load_collection(
-    app: tauri::AppHandle,
-) -> Result<Option<Collection>, String> {
+pub async fn pick_and_load_collection(app: tauri::AppHandle) -> Result<Option<Collection>, String> {
     let selected = tokio::task::spawn_blocking(move || {
         app.dialog()
             .file()
             .add_filter("eMule Collection", &["emulecollection", "txt"])
             .blocking_pick_file()
             .map(|file| {
-                file.into_path()
-                    .map_err(|e| coded_ctx("collections_invalid_path", "Invalid collection path", e))
+                file.into_path().map_err(|e| {
+                    coded_ctx("collections_invalid_path", "Invalid collection path", e)
+                })
             })
             .transpose()
     })
@@ -134,11 +133,9 @@ pub async fn pick_and_load_collection(
     let Some(selected) = selected else {
         return Ok(None);
     };
-    crate::commands::deeplink::open_collection_file(
-        selected.to_string_lossy().into_owned(),
-    )
-    .await
-    .map(Some)
+    crate::commands::deeplink::open_collection_file(selected.to_string_lossy().into_owned())
+        .await
+        .map(Some)
 }
 
 async fn create_collection_internal(
@@ -321,7 +318,11 @@ pub async fn create_collection_with_dialog(
     binary: bool,
 ) -> Result<Option<String>, String> {
     let extension = if binary { "emulecollection" } else { "txt" };
-    let filter_name = if binary { "eMule Collection" } else { "ED2K Links" };
+    let filter_name = if binary {
+        "eMule Collection"
+    } else {
+        "ED2K Links"
+    };
     let safe_name = crate::security::sanitize_filename(&name);
     let default_name = format!("{safe_name}.{extension}");
     let selected = tokio::task::spawn_blocking(move || {
@@ -331,8 +332,9 @@ pub async fn create_collection_with_dialog(
             .set_file_name(default_name)
             .blocking_save_file()
             .map(|file| {
-                file.into_path()
-                    .map_err(|e| coded_ctx("collections_invalid_output_path", "Invalid output path", e))
+                file.into_path().map_err(|e| {
+                    coded_ctx("collections_invalid_output_path", "Invalid output path", e)
+                })
             })
             .transpose()
     })

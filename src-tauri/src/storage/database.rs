@@ -1254,8 +1254,7 @@ impl Database {
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, Option<String>>(4)?,
-                    row.get::<_, Option<i64>>(5)?
-                        .map(|v| v.max(0) as u64),
+                    row.get::<_, Option<i64>>(5)?.map(|v| v.max(0) as u64),
                 ))
             })?
             .filter_map(|r| match r {
@@ -1334,8 +1333,16 @@ impl Database {
             let mut stmt = tx.prepare(
                 "INSERT INTO credits (user_hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state, ember_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
             )?;
-            for (hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state, ember_hash) in
-                credits
+            for (
+                hash,
+                uploaded,
+                downloaded,
+                last_seen,
+                public_key,
+                ident_ip,
+                ident_state,
+                ember_hash,
+            ) in credits
             {
                 stmt.execute(params![
                     &hash[..],
@@ -1490,8 +1497,16 @@ impl Database {
             let mut stmt = tx.prepare(
                 "INSERT INTO credits (user_hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state, ember_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
             )?;
-            for (hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state, ember_hash) in
-                credits
+            for (
+                hash,
+                uploaded,
+                downloaded,
+                last_seen,
+                public_key,
+                ident_ip,
+                ident_state,
+                ember_hash,
+            ) in credits
             {
                 stmt.execute(params![
                     &hash[..],
@@ -2327,13 +2342,18 @@ mod tests {
             .lock()
             .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
             .expect("auto_vacuum");
-        assert_eq!(auto_vacuum, 2, "INCREMENTAL auto_vacuum expected on fresh DB");
+        assert_eq!(
+            auto_vacuum, 2,
+            "INCREMENTAL auto_vacuum expected on fresh DB"
+        );
         let version: i64 = db
             .conn
             .lock()
-            .query_row("SELECT COALESCE(MAX(version), 0) FROM schema_version", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                [],
+                |r| r.get(0),
+            )
             .expect("version");
         assert_eq!(version, 21);
         drop(db);

@@ -46,11 +46,12 @@ fn keyword_entry_has_min_content(tags: &[KadTag]) -> bool {
         return false;
     }
     let has_filename = tags.iter().any(|t| {
-        matches!(&t.name, TagName::Id(TAG_FILENAME)) && matches!(&t.value, TagValue::String(s) if !s.is_empty())
+        matches!(&t.name, TagName::Id(TAG_FILENAME))
+            && matches!(&t.value, TagValue::String(s) if !s.is_empty())
     });
-    let has_filesize = tags
-        .iter()
-        .any(|t| matches!(&t.name, TagName::Id(TAG_FILESIZE)) && t.as_uint().map_or(false, |v| v > 0));
+    let has_filesize = tags.iter().any(|t| {
+        matches!(&t.name, TagName::Id(TAG_FILESIZE)) && t.as_uint().map_or(false, |v| v > 0)
+    });
     has_filename && has_filesize
 }
 

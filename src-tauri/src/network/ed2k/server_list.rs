@@ -1451,9 +1451,7 @@ mod tests {
     #[test]
     fn get_next_server_skips_failed_high_for_healthy_normal() {
         let mut list = high_then_normal_list();
-        let security = list
-            .get_next_server()
-            .expect("fixture list has servers");
+        let security = list.get_next_server().expect("fixture list has servers");
         assert_eq!(security.name, "High Priority");
         let sec_ip = security.ip.clone();
         let sec_port = security.port;
@@ -1503,7 +1501,10 @@ mod tests {
 
         // While cooling down, High must not be returned.
         let during = list.get_next_server().unwrap();
-        assert_ne!((during.ip.as_str(), during.port), (sec_ip.as_str(), sec_port));
+        assert_ne!(
+            (during.ip.as_str(), during.port),
+            (sec_ip.as_str(), sec_port)
+        );
 
         list.clear_connect_cooldowns();
         // After an explicit Connect clears cooldowns, High is eligible again

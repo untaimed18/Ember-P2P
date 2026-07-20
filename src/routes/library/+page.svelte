@@ -30,7 +30,10 @@
   import { getStatistics, type TransferStats } from '$lib/api/statistics';
   import { formatEd2kLink, formatEd2kLinks, buildEd2kLink } from '$lib/api/search';
   import { pickAndLoadCollection, createCollectionWithDialog, downloadCollectionFiles, type Collection, type CollectionFile } from '$lib/api/collections';
-  import { incomingCollection } from '$lib/stores/collection';
+  import {
+    incomingCollection,
+    markIncomingCollectionPresented,
+  } from '$lib/stores/collection';
   import { toastSuccess, toastError, toastWarning } from '$lib/stores/toast';
   import { networkStats } from '$lib/stores/network';
   import { formatSize, copyToClipboard as writeClipboard } from '$lib/utils';
@@ -2055,21 +2058,16 @@
     }
   }
 
-  // A collection opened from the OS (double-clicked .emulecollection) is
-  // parsed by the deep-link handler, which stashes it in `incomingCollection`
-  // and routes us to this page. Consume it via an effect rather than only in
-  // onMount: when we are ALREADY on /library, navigating to the current route
-  // does not remount the component, so onMount would never fire again and the
-  // collection would be dropped. The effect runs on mount and on every later
-  // set, then clears the store so a future navigation doesn't re-open a stale
-  // collection. Resetting the store re-runs the effect with `null`, which is a
-  // no-op (no infinite loop).
+  // A collection opened from the OS is handed over in FIFO order. Consume it
+  // in an effect so an already-mounted Library page presents later links too.
+  // The handoff is marked complete only after the modal state is installed;
+  // that resolves the deep-link handler's acknowledgement gate.
   $effect(() => {
     const incoming = $incomingCollection;
     if (incoming) {
       loadedCollection = incoming;
       collectionsOpen = true;
-      incomingCollection.set(null);
+      markIncomingCollectionPresented();
     }
   });
 
