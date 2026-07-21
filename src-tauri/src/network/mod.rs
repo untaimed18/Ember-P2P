@@ -210,18 +210,17 @@ fn spawn_udp_mapping_keepalive(
     packet_tx
 }
 
+/// The TCP counterpart of `advertised_udp_port` — the STUN-confirmed public
+/// TCP port (see `apply_tcp_mapping_keepalive`) when the twin-probe on the
+/// listen port has been stability-confirmed, otherwise the raw configured
+/// listener port. A UDP socket bound to the TCP port can only *observe* a
+/// candidate public port for the TCP listener, not prove it — hence the
+/// consecutive-observation gate before this ever overrides the setting.
 fn advertised_tcp_port(state: &NetworkState) -> u16 {
-    configured_tcp_port_for_advertising(state.tcp_port, None)
-}
-
-/// A UDP socket bound to the TCP port cannot establish the public endpoint of
-/// the TCP listener. Keep its STUN result diagnostic-only: every TCP-bearing
-/// protocol surface must advertise the configured listener port.
-fn configured_tcp_port_for_advertising(
-    configured_tcp_port: u16,
-    _udp_stun_observed_port: Option<u16>,
-) -> u16 {
-    configured_tcp_port
+    state
+        .external_tcp_port
+        .filter(|p| *p != 0)
+        .unwrap_or(state.tcp_port)
 }
 
 /// UDP counterpart of `advertised_tcp_port` — the KAD-peer-voted or
@@ -278,6 +277,9 @@ fn revert_stun_advertise_to_settings(state: &mut NetworkState) {
             state.external_udp_port = state.firewall_checker.external_udp_port();
         }
     }
+    // Drop STUN TCP override always — unlike UDP there is no peer-voted
+    // fallback to preserve, so the configured listener port always wins.
+    state.external_tcp_port = None;
     state.stats.public_tcp_port = 0;
     state.stats.public_udp_port = 0;
     state.stats.stun_keepalive_active = false;
@@ -449,10 +451,71 @@ fn apply_udp_mapping_keepalive(
     true
 }
 
+/// Outcome of one twin-STUN TCP-port observation against the current TCP
+/// remap-candidate tracking state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TcpPortConfirmation {
+    /// Updated `stun_ka_tcp_candidate_port` (cleared once confirmed).
+    candidate_port: Option<u16>,
+    /// Updated `stun_ka_tcp_stable_hits` (reset once confirmed).
+    stable_hits: u8,
+    /// The port that should now be advertised, if this observation just
+    /// became trustworthy (immediately or via the stability streak).
+    confirmed_port: Option<u16>,
+}
+
+/// Decide whether a twin-STUN TCP-port reading (a UDP socket bound to the
+/// TCP listener's port number) should be trusted immediately, needs more
+/// consecutive confirmations, or should keep accumulating. A UDP-bound
+/// socket can only *observe* a candidate for the TCP listener's real
+/// external port, never prove it, so a reading is trusted immediately only
+/// when directly corroborated — 1:1 (matches the configured listener port,
+/// i.e. no remap happened) or it matches the already STUN-confirmed public
+/// UDP port (`stun_sourced_udp_port`, not the shared `external_udp_port`,
+/// which can hold a KAD Pong/FirewallUdp peer vote that never passed STUN's
+/// own stability gate). Otherwise it must repeat identically for two
+/// consecutive cycles before being trusted — independent stability tracking
+/// from the *UDP* candidate/hits, which may already be >=2 for a completely
+/// different port.
+fn tcp_port_confirmation(
+    configured_tcp_port: u16,
+    stun_sourced_udp_port: Option<u16>,
+    candidate_port: Option<u16>,
+    stable_hits: u8,
+    observed_port: u16,
+) -> TcpPortConfirmation {
+    if observed_port == configured_tcp_port || stun_sourced_udp_port == Some(observed_port) {
+        return TcpPortConfirmation {
+            candidate_port: None,
+            stable_hits: 0,
+            confirmed_port: Some(observed_port),
+        };
+    }
+    let (next_candidate, next_hits) = match candidate_port {
+        Some(prev) if prev == observed_port => (Some(prev), stable_hits.saturating_add(1)),
+        _ => (Some(observed_port), 1),
+    };
+    if next_hits >= 2 {
+        TcpPortConfirmation {
+            candidate_port: None,
+            stable_hits: 0,
+            confirmed_port: Some(observed_port),
+        }
+    } else {
+        TcpPortConfirmation {
+            candidate_port: next_candidate,
+            stable_hits: next_hits,
+            confirmed_port: None,
+        }
+    }
+}
+
 /// Apply a TCP mapping keep-alive result. The twin-port STUN probe uses UDP,
-/// so it can only provide diagnostic information about a UDP mapping; it must
-/// never override the configured TCP listener port. Returns `true` when the
-/// TCP hold itself succeeds.
+/// so on its own it can only prove a *UDP* mapping, not the TCP listener's
+/// real public port — see `tcp_port_confirmation` for the trust gate.
+/// Returns `true` when the cycle contributed something useful (a successful
+/// hold and/or a confirmed public TCP mapping), so the caller can decide
+/// whether the overall keep-alive "Active" indicator should stay on.
 fn apply_tcp_mapping_keepalive(
     state: &mut NetworkState,
     hold_ok: bool,
@@ -464,30 +527,59 @@ fn apply_tcp_mapping_keepalive(
     }
     let hold_changed = state.stats.tcp_mapping_hold_ok != hold_ok;
     state.stats.tcp_mapping_hold_ok = hold_ok;
+    let mut changed = hold_changed;
+    let mut confirmed = false;
     if let Some(addr) = mapped {
-        debug!(
-            "TCP-port twin UDP STUN observed {addr}; retaining configured TCP port {}",
-            state.tcp_port
+        let result = tcp_port_confirmation(
+            state.tcp_port,
+            state.stun_sourced_udp_port,
+            state.stun_ka_tcp_candidate_port,
+            state.stun_ka_tcp_stable_hits,
+            addr.port(),
         );
-    }
-    // `public_tcp_port` is consumed by source-link generation. Report the
-    // configured listener port rather than a UDP-STUN-derived value.
-    state.stats.public_tcp_port = state.tcp_port;
-    update_publish_manager_state(state);
-    if hold_ok {
+        state.stun_ka_tcp_candidate_port = result.candidate_port;
+        state.stun_ka_tcp_stable_hits = result.stable_hits;
+        let Some(port) = result.confirmed_port else {
+            debug!("STUN keepalive: candidate public TCP mapping {addr} (awaiting confirm)");
+            // Deliberately do NOT surface this candidate via
+            // `stats.public_tcp_port` before it's confirmed — unlike the
+            // UDP tile (which is purely informational), this value is
+            // also consumed as "our actually-advertised TCP port" by ed2k
+            // link generation and Hello/publish, so showing an
+            // unconfirmed/possibly-flapping value here could hand out a
+            // port nothing is actually advertising to peers yet.
+            return false;
+        };
+        confirmed = true;
+        if state.external_tcp_port != Some(port) {
+            changed = true;
+        }
+        state.external_tcp_port = Some(port);
+        state.stats.public_tcp_port = port;
+        if let Some(ip) = ember::mapping_keepalive::ipv4_from_mapped(addr) {
+            if state.external_ip.is_none() {
+                set_external_ip(state, Some(ip));
+            }
+        }
+        update_publish_manager_state(state);
+    } else if hold_ok {
+        // TCP hold alone (no twin-STUN reading, e.g. same_port case) is
+        // still a successful keep-alive contribution. Same false->true
+        // transition logging rationale as the UDP 1:1 case above — this
+        // path is otherwise silent every cycle.
         if !state.stats.stun_keepalive_active {
             info!(
                 "STUN keepalive: TCP mapping hold confirmed (local port {})",
                 state.tcp_port
             );
         }
+        confirmed = true;
+    }
+    if confirmed {
         state.stats.stun_keepalive_active = true;
     }
-    if hold_changed {
-        info!(
-            "STUN keepalive: configured TCP port {} (hold_ok={hold_ok})",
-            state.tcp_port
-        );
+    if changed {
+        info!("STUN keepalive: public TCP mapping {mapped:?} hold_ok={hold_ok}");
         let _ = app.emit(
             "stun-keepalive",
             serde_json::json!({
@@ -497,7 +589,7 @@ fn apply_tcp_mapping_keepalive(
             }),
         );
     }
-    hold_ok
+    confirmed
 }
 
 /// Try to connect to a server, attempting the DH-encrypted connection first (for HighID),
@@ -2287,12 +2379,53 @@ mod tests {
     }
 
     #[test]
-    fn tcp_mapping_never_advertises_udp_stun_port() {
-        let observed_udp_mapping: Option<SocketAddr> = Some("203.0.113.42:51234".parse().unwrap());
-        assert_eq!(
-            configured_tcp_port_for_advertising(4662, observed_udp_mapping.map(|addr| addr.port())),
-            4662
-        );
+    fn tcp_port_confirmation_accepts_1to1_immediately() {
+        let result = tcp_port_confirmation(4662, None, None, 0, 4662);
+        assert_eq!(result.confirmed_port, Some(4662));
+        assert_eq!(result.candidate_port, None);
+        assert_eq!(result.stable_hits, 0);
+    }
+
+    #[test]
+    fn tcp_port_confirmation_accepts_stun_corroborated_udp_port_immediately() {
+        // The twin-STUN reading matches the already-confirmed public UDP
+        // port, so it's directly corroborated by a different signal (the
+        // UDP mapping keep-alive's own stability gate) and doesn't need its
+        // own two-hit streak.
+        let result = tcp_port_confirmation(4662, Some(51234), None, 0, 51234);
+        assert_eq!(result.confirmed_port, Some(51234));
+    }
+
+    #[test]
+    fn tcp_port_confirmation_requires_two_consecutive_hits_for_a_remap() {
+        // First observation of a genuine remap: becomes a candidate, not
+        // yet trusted — a lone UDP-socket reading can't prove the TCP
+        // listener's real external port.
+        let first = tcp_port_confirmation(4662, None, None, 0, 51234);
+        assert_eq!(first.confirmed_port, None);
+        assert_eq!(first.candidate_port, Some(51234));
+        assert_eq!(first.stable_hits, 1);
+
+        // Second identical observation confirms it.
+        let second =
+            tcp_port_confirmation(4662, None, first.candidate_port, first.stable_hits, 51234);
+        assert_eq!(second.confirmed_port, Some(51234));
+        assert_eq!(second.candidate_port, None);
+        assert_eq!(second.stable_hits, 0);
+    }
+
+    #[test]
+    fn tcp_port_confirmation_resets_candidate_on_flapping_port() {
+        let first = tcp_port_confirmation(4662, None, None, 0, 51234);
+        assert_eq!(first.candidate_port, Some(51234));
+
+        // A different port on the next cycle restarts the streak instead of
+        // ever being trusted from an inconsistent reading.
+        let flapped =
+            tcp_port_confirmation(4662, None, first.candidate_port, first.stable_hits, 60000);
+        assert_eq!(flapped.confirmed_port, None);
+        assert_eq!(flapped.candidate_port, Some(60000));
+        assert_eq!(flapped.stable_hits, 1);
     }
 
     #[test]
@@ -4278,6 +4411,11 @@ struct NetworkState {
     nodes_save_lock: Arc<tokio::sync::Mutex<()>>,
     external_ip: Option<Ipv4Addr>,
     external_udp_port: Option<u16>,
+    /// STUN-confirmed public TCP port (twin-probe on the listen port number),
+    /// once stability-confirmed by `apply_tcp_mapping_keepalive`. `None` when
+    /// unconfirmed or STUN keep-alive is off/suspended — advertising then
+    /// falls back to the configured listener port.
+    external_tcp_port: Option<u16>,
     /// Live Hello / publish TCP port (updated by mapping keep-alive).
     advertise_tcp_port: Arc<std::sync::atomic::AtomicU16>,
     /// Live Hello / publish UDP port (updated by mapping keep-alive).
@@ -7255,6 +7393,7 @@ pub async fn start_network(
         nodes_save_lock: Arc::new(tokio::sync::Mutex::new(())),
         external_ip: None,
         external_udp_port: None,
+        external_tcp_port: None,
         advertise_tcp_port: Arc::new(std::sync::atomic::AtomicU16::new(tcp_port)),
         advertise_udp_port: Arc::new(std::sync::atomic::AtomicU16::new(udp_port)),
         stun_keepalive_enabled: settings.stun_keepalive_enabled,
