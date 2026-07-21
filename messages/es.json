@@ -2138,6 +2138,7 @@
   "updater_error_body": "No se pudo completar la actualización: {detail}",
   "updater_retry": "Reintentar",
   "updater_dismiss_aria": "Descartar notificación de actualización",
+  "updater_no_staged_update": "No hay ninguna actualización preparada; es necesario volver a comprobar.",
   "statusbar_epx_status_active": "Activo",
   "statusbar_epx_status_idle": "Inactivo",
   "statusbar_epx_status_inactive": "Desconectado",

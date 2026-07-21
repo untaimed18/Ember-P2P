@@ -139,7 +139,11 @@
         pickRecent(recent[activeIndex]);
         return;
       }
-      if ((e.key === 'Delete' || e.key === 'Backspace') && activeIndex >= 0) {
+      // Only Delete removes the highlighted entry. Backspace must stay a
+      // plain text-editing key: `activeIndex` can be set by mere mouse hover,
+      // so treating Backspace as "remove entry" would silently destroy a
+      // saved search while the user is just fixing a typo.
+      if (e.key === 'Delete' && activeIndex >= 0) {
         e.preventDefault();
         removeRecent(recent[activeIndex]);
         return;
@@ -148,6 +152,13 @@
     if (e.key === 'Enter') {
       submit(value);
     }
+  }
+
+  function handleInput() {
+    // Typing means the user is editing the query, not navigating the recent
+    // list — drop any highlight (possibly left behind by mouse hover) so
+    // Delete can't unexpectedly remove a saved search.
+    activeIndex = -1;
   }
 
   function handleFocus() {
@@ -202,6 +213,7 @@
         {placeholder}
         maxlength={maxLength}
         onkeydown={handleKeydown}
+        oninput={handleInput}
         onfocus={handleFocus}
         onblur={handleBlur}
         aria-label={m.search_bar_aria()}

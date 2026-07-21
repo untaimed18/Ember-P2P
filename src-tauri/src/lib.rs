@@ -677,9 +677,22 @@ pub fn run() {
                         index.set_priority_under_folder_for_paths(folder, priority, &new_paths);
                     }
                     // An explicit priority selected while this path was
-                    // pending wins over its folder default.
+                    // pending wins over its folder default — but only for
+                    // paths that are actually pending in THIS pass. Applying
+                    // the map index-wide would override the priority just
+                    // restored from known.met for already-hashed files (a
+                    // stale intent would make the user's later choice
+                    // permanently un-stickable across restarts).
+                    let pending_priority_paths: std::collections::HashSet<String> = files_to_hash
+                        .iter()
+                        .map(|f| crate::search::index::normalize_path_key(&f.path))
+                        .collect();
                     for (path, priority) in &pending_file_priorities {
-                        index.set_file_priority_by_path(path, priority);
+                        if pending_priority_paths
+                            .contains(&crate::search::index::normalize_path_key(path))
+                        {
+                            index.set_file_priority_by_path(path, priority);
+                        }
                     }
                 }
                 commands::sharing::refresh_file_cache(&index_clone, &csf).await;
@@ -883,6 +896,12 @@ pub fn run() {
                 startup_cancel_flags.write().await.remove("__startup__");
                 if !reconcile_shared_files(&net_tx).await {
                     tracing::warn!("Startup shared-file reconciliation failed");
+                } else if !was_cancelled {
+                    // known.met now owns everything hashed this pass — sweep
+                    // handed-off (or stale pre-fix) pending intents so they
+                    // can't re-apply share/priority flips on a later rehash.
+                    let app_state = startup_app.state::<AppState>();
+                    commands::sharing::prune_pending_intents_for_hashed(&app_state).await;
                 }
                 let _ = startup_app.emit("file-hash-progress", serde_json::json!({
                     "current": total_to_hash,

@@ -889,13 +889,29 @@ pub async fn update_settings(
     drop(_settings_save_guard);
 
     if !removed_shared_folders.is_empty() || !added_shared_folders.is_empty() {
-        crate::commands::sharing::reconcile_shared_folder_roots(
-            &app,
-            &state,
-            &removed_shared_folders,
-            &added_shared_folders,
-        )
-        .await;
+        // Revoke removed roots from the upload path immediately — the spawned
+        // reconcile repeats this, but the guarantee must hold before this
+        // command returns.
+        {
+            let active = state.config.read().await.settings.shared_folders.clone();
+            *state.upload_shared_folders.write().await = active;
+        }
+        // Reconcile in the background: it queues behind `scan_coordination`,
+        // which a first-run library hash pass can hold for hours. Blocking the
+        // command here froze the Settings save UI for that whole time (and a
+        // user retry then failed with `settings_stale_revision`). The task
+        // re-reads current config under the lock, so a later save is safe.
+        let reconcile_app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let state = reconcile_app.state::<AppState>();
+            crate::commands::sharing::reconcile_shared_folder_roots(
+                &reconcile_app,
+                &state,
+                &removed_shared_folders,
+                &added_shared_folders,
+            )
+            .await;
+        });
     }
 
     if runtime_update_deferred {

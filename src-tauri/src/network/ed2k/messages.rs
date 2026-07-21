@@ -2076,6 +2076,15 @@ pub fn parse_multipacket(
                 if extended_requests_ver == 0 {
                     continue;
                 }
+                // eMule's `ProcessExtendedInfo` tolerates the extended block
+                // being entirely absent at end-of-packet (its
+                // `GetLength() == GetPosition()` guard): some clients
+                // advertise ExtendedRequests in Hello but send a bare
+                // OP_REQUESTFILENAME as the last sub-op. Only a *partial*
+                // block is malformed.
+                if cursor.position() as usize >= payload.len() {
+                    continue;
+                }
                 let part_count = cursor.read_u16::<LittleEndian>()? as usize;
                 if part_count > MAX_REASK_PARTS {
                     return Err(io::Error::new(
@@ -2100,7 +2109,7 @@ pub fn parse_multipacket(
                 // the uploader can paint the peer's pre-existing parts.
                 req_part_status = Some((part_count as u16, payload[pos..end].to_vec()));
                 cursor.set_position(end as u64);
-                if extended_requests_ver >= 2 {
+                if extended_requests_ver >= 2 && (cursor.position() as usize) < payload.len() {
                     let _complete_sources = cursor.read_u16::<LittleEndian>()?;
                 }
             }

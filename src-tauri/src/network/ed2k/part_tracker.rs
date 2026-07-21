@@ -43,17 +43,28 @@ const TAGTYPE_BLOB: u8 = 0x07;
 /// compared with an unusable .part.met).
 const MAX_GAP_ENTRIES: usize = 8192;
 
+static SAVE_PATH_GUARDS: OnceLock<
+    parking_lot::Mutex<std::collections::HashMap<PathBuf, Arc<parking_lot::Mutex<()>>>>,
+> = OnceLock::new();
+
 fn save_path_guard(path: &Path) -> Arc<parking_lot::Mutex<()>> {
-    static GUARDS: OnceLock<
-        parking_lot::Mutex<std::collections::HashMap<PathBuf, Arc<parking_lot::Mutex<()>>>>,
-    > = OnceLock::new();
-    let mut guards = GUARDS
+    let mut guards = SAVE_PATH_GUARDS
         .get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
         .lock();
     guards
         .entry(path.to_path_buf())
         .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
         .clone()
+}
+
+/// Drop the per-path guard once its `.part.met` is deleted, or the map grows
+/// by one entry per download for the process lifetime. Safe even with a
+/// stale queued snapshot still holding the old Arc: the `save_generation`
+/// bump in `delete_met` makes it bail before writing.
+fn evict_save_path_guard(path: &Path) {
+    if let Some(guards) = SAVE_PATH_GUARDS.get() {
+        guards.lock().remove(path);
+    }
 }
 
 /// Byte-level gap list matching eMule's CPartFile::m_gaplist.
@@ -909,8 +920,11 @@ impl PartTracker {
     pub fn delete_met(&self) {
         self.save_generation.fetch_add(1, Ordering::AcqRel);
         let path_guard = save_path_guard(&self.met_path);
-        let _guard = path_guard.lock();
-        let _ = std::fs::remove_file(&self.met_path);
+        {
+            let _guard = path_guard.lock();
+            let _ = std::fs::remove_file(&self.met_path);
+        }
+        evict_save_path_guard(&self.met_path);
     }
 }
 

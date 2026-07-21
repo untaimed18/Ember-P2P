@@ -2138,6 +2138,7 @@
   "updater_error_body": "Couldn't complete the update: {detail}",
   "updater_retry": "Retry",
   "updater_dismiss_aria": "Dismiss update notification",
+  "updater_no_staged_update": "No staged update is available; checking again is required.",
   "statusbar_epx_status_active": "Active",
   "statusbar_epx_status_idle": "Idle",
   "statusbar_epx_status_inactive": "Offline",
