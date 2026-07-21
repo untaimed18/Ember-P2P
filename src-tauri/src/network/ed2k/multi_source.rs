@@ -3901,7 +3901,18 @@ async fn download_parts_from_source(
         if let Some(sm) = &source_mgr {
             if let std::net::IpAddr::V4(v4) = addr.ip() {
                 let mut sm = sm.write().await;
-                sm.register_source(*file_hash, v4, addr.port());
+                // Adopted inbound stream: addr.port() is the peer's ephemeral
+                // outbound port. Keep it for identity lookups only; register
+                // the Hello listening port as dialable when the peer is HighID.
+                sm.register_inbound_callback_ports(
+                    *file_hash,
+                    v4,
+                    addr.port(),
+                    es.peer_caps.tcp_port,
+                    es.peer_user_hash,
+                    0,
+                    es.peer_caps.is_high_id(),
+                );
             }
         }
         connection_is_obfuscated = es.emule_info_done;
@@ -4313,12 +4324,14 @@ async fn download_parts_from_source(
                         if let Some(sm) = &source_mgr {
                             let mut sm = sm.write().await;
                             if let std::net::IpAddr::V4(v4) = addr.ip() {
-                                sm.register_source_full(
+                                sm.register_observed_peer_ports(
                                     *file_hash,
                                     v4,
                                     addr.port(),
+                                    hello_caps.tcp_port,
                                     peer_udp,
                                     peer_user_hash,
+                                    hello_caps.is_high_id(),
                                 );
                             }
                         }
@@ -4622,12 +4635,14 @@ async fn download_parts_from_source(
                     if let Some(sm) = &source_mgr {
                         let mut sm = sm.write().await;
                         if let std::net::IpAddr::V4(v4) = addr.ip() {
-                            sm.register_source_full(
+                            sm.register_observed_peer_ports(
                                 *file_hash,
                                 v4,
                                 addr.port(),
+                                hello_caps.tcp_port,
                                 peer_udp,
                                 peer_user_hash,
+                                hello_caps.is_high_id(),
                             );
                         }
                     }
@@ -5186,12 +5201,14 @@ async fn download_parts_from_source(
                 if let Some(sm) = &source_mgr {
                     let mut sm = sm.write().await;
                     if let std::net::IpAddr::V4(v4) = addr.ip() {
-                        sm.register_source_full(
+                        sm.register_observed_peer_ports(
                             *file_hash,
                             v4,
                             addr.port(),
+                            hello_caps.tcp_port,
                             peer_udp,
                             peer_user_hash,
+                            hello_caps.is_high_id(),
                         );
                     }
                 }

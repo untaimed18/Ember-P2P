@@ -27,6 +27,11 @@ pub(crate) fn sx_answer_source_eligible(e: &SourceEntry, exclude_ip: Ipv4Addr, n
     if now.saturating_sub(e.last_seen) >= SOURCE_EXPIRY_SECS {
         return false;
     }
+    // Inbound callback / push-grant source ports are session-only — never
+    // forward them in SX (peers cannot dial an ephemeral outbound port).
+    if e.not_for_reconnect {
+        return false;
+    }
     if e.client_id != 0 {
         e.server_ip != 0 && e.server_port != 0
     } else {
@@ -791,6 +796,14 @@ pub struct SourceEntry {
     pub last_sx_sent: i64,
     /// When we last sent OP_CALLBACKREQUEST for this LowID source (0 = never)
     pub last_callback_at: i64,
+    /// Inbound TCP source port from a callback / push-grant adoption — the
+    /// peer's ephemeral outbound port for this session, not its listening
+    /// port. Kept in-memory for live identity lookups (`get_user_hash_by_addr`)
+    /// so UI coalescing still works, but never returned by `get_sources`,
+    /// persisted to `sources.met`, or advertised via SX. Without this flag,
+    /// each relaunch re-seeded every prior session's ephemeral ports and the
+    /// per-download source total climbed by ~2 per close/reopen.
+    pub not_for_reconnect: bool,
 }
 
 /// Tracks known sources (peers) per file hash for source exchange responses.
@@ -864,6 +877,111 @@ impl SourceManager {
         );
     }
 
+    /// Register an inbound callback / push-grant connection's ephemeral TCP
+    /// source port for live identity lookups only. The port is not dialable
+    /// after this session ends — see `SourceEntry::not_for_reconnect`.
+    pub fn register_live_session_port(
+        &mut self,
+        file_hash: [u8; 16],
+        ip: Ipv4Addr,
+        tcp_port: u16,
+        user_hash: [u8; 16],
+        connect_options: u8,
+    ) {
+        self.register_source_full_server_ex(
+            file_hash,
+            ip,
+            tcp_port,
+            0,
+            0,
+            0,
+            user_hash,
+            connect_options,
+            true,
+        );
+    }
+
+    /// Register ports learned from an inbound callback / Path-B push-grant:
+    /// always keep the ephemeral connection port as a live-session row, and
+    /// when the peer is HighID also record its Hello listening port as the
+    /// reconnectable address (so resume can dial it after a restart).
+    pub fn register_inbound_callback_ports(
+        &mut self,
+        file_hash: [u8; 16],
+        ip: Ipv4Addr,
+        ephemeral_port: u16,
+        listening_port: u16,
+        user_hash: [u8; 16],
+        connect_options: u8,
+        peer_is_highid: bool,
+    ) {
+        if ephemeral_port > 0 {
+            self.register_live_session_port(
+                file_hash,
+                ip,
+                ephemeral_port,
+                user_hash,
+                connect_options,
+            );
+        }
+        // LowID peers are not directly dialable — their Hello listening port
+        // must not become a HighID reconnect row or resume will waste slots
+        // dialing a firewalled address. HighID push-grants need the listening
+        // port or filtering ephemerals would leave zero dialable endpoints.
+        // When Hello listening equals the inbound connection port (rare),
+        // treat that single port as dialable for HighID rather than leaving
+        // only a session-only row.
+        if peer_is_highid && listening_port > 0 {
+            if listening_port != ephemeral_port {
+                self.register_source_full_opts(
+                    file_hash,
+                    ip,
+                    listening_port,
+                    0,
+                    user_hash,
+                    connect_options,
+                );
+            } else if ephemeral_port > 0 {
+                // Same port: clear the session flag by registering as
+                // reconnectable (ordinary register does not clear sticky
+                // session flags on merge, so replace via direct update).
+                if let Some(entries) = self.sources.get_mut(&file_hash) {
+                    if let Some(e) = entries
+                        .iter_mut()
+                        .find(|e| e.ip == ip && e.tcp_port == ephemeral_port)
+                    {
+                        e.not_for_reconnect = false;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Register ports observed during an EmuleInfo exchange. Always refreshes
+    /// the connection's TCP port (sticky `not_for_reconnect` if it was an
+    /// inbound session port). When Hello advertised a distinct listening
+    /// port and the peer is HighID (or this was an ordinary outbound dial),
+    /// also attach the UDP/identity on the listening port so reconnect/UDP
+    /// reask use the dialable endpoint. Never invents a HighID dialable row
+    /// for a LowID peer — that undoes `register_inbound_callback_ports`.
+    pub fn register_observed_peer_ports(
+        &mut self,
+        file_hash: [u8; 16],
+        ip: Ipv4Addr,
+        connection_port: u16,
+        listening_port: u16,
+        udp_port: u16,
+        user_hash: [u8; 16],
+        peer_is_highid: bool,
+    ) {
+        if connection_port > 0 {
+            self.register_source_full(file_hash, ip, connection_port, udp_port, user_hash);
+        }
+        if peer_is_highid && listening_port > 0 && listening_port != connection_port {
+            self.register_source_full(file_hash, ip, listening_port, udp_port, user_hash);
+        }
+    }
+
     pub fn register_source_full_server(
         &mut self,
         file_hash: [u8; 16],
@@ -874,6 +992,31 @@ impl SourceManager {
         server_port: u16,
         user_hash: [u8; 16],
         connect_options: u8,
+    ) {
+        self.register_source_full_server_ex(
+            file_hash,
+            ip,
+            tcp_port,
+            udp_port,
+            server_ip,
+            server_port,
+            user_hash,
+            connect_options,
+            false,
+        );
+    }
+
+    fn register_source_full_server_ex(
+        &mut self,
+        file_hash: [u8; 16],
+        ip: Ipv4Addr,
+        tcp_port: u16,
+        udp_port: u16,
+        server_ip: u32,
+        server_port: u16,
+        user_hash: [u8; 16],
+        connect_options: u8,
+        not_for_reconnect: bool,
     ) {
         let now = chrono::Utc::now().timestamp();
         let entries = self.sources.entry(file_hash).or_default();
@@ -905,6 +1048,14 @@ impl SourceManager {
             }
             if existing.connect_options == 0 && connect_options != 0 {
                 existing.connect_options = connect_options;
+            }
+            // Sticky: once a port is known to be an inbound session port,
+            // never "promote" it to reconnectable via a later EmuleInfo /
+            // SX register on the same (ip, port). The reverse (marking a
+            // previously-dialable row as session-only) is allowed when the
+            // inbound adopt path reuses a colliding key.
+            if not_for_reconnect {
+                existing.not_for_reconnect = true;
             }
             return;
         }
@@ -946,6 +1097,7 @@ impl SourceManager {
             last_asked: 0,
             last_sx_sent: 0,
             last_callback_at: 0,
+            not_for_reconnect,
         });
 
         if self.sources.len() > MAX_TRACKED_FILES {
@@ -1153,7 +1305,9 @@ impl SourceManager {
                 entries
                     .iter()
                     .filter(|e| {
-                        now.saturating_sub(e.last_seen) < SOURCE_EXPIRY_SECS && e.udp_port > 0
+                        now.saturating_sub(e.last_seen) < SOURCE_EXPIRY_SECS
+                            && e.udp_port > 0
+                            && !e.not_for_reconnect
                     })
                     .map(|e| (e.ip, e.tcp_port, e.udp_port))
                     .collect()
@@ -1177,6 +1331,7 @@ impl SourceManager {
                     .filter(|e| {
                         now.saturating_sub(e.last_seen) < SOURCE_EXPIRY_SECS
                             && e.udp_port > 0
+                            && !e.not_for_reconnect
                             && (now - e.last_asked) >= reask_interval
                     })
                     .map(|e| (e.ip, e.tcp_port, e.udp_port))
@@ -1225,22 +1380,119 @@ impl SourceManager {
     }
 
     /// Return non-expired HighID sources for a file (directly connectable).
+    ///
+    /// Excludes inbound session ports (`not_for_reconnect`) and collapses
+    /// multiple reconnectable rows that share a user hash to a single preferred
+    /// endpoint (UDP-capable / newest `last_seen`). Matches eMule's
+    /// `CUpDownClient::Compare` identity model so resume seeding cannot treat
+    /// listening + ephemeral variants as distinct sources.
     pub fn get_sources(&self, file_hash: &[u8; 16]) -> Vec<(Ipv4Addr, u16)> {
         let now = chrono::Utc::now().timestamp();
+        let Some(entries) = self.sources.get(file_hash) else {
+            return Vec::new();
+        };
+
+        let mut best_by_hash: HashMap<[u8; 16], &SourceEntry> = HashMap::new();
+        let mut anonymous: Vec<(Ipv4Addr, u16)> = Vec::new();
+
+        for e in entries.iter().filter(|e| {
+            now.saturating_sub(e.last_seen) < SOURCE_EXPIRY_SECS
+                && e.client_id == 0
+                && !e.ip.is_unspecified()
+                && !e.not_for_reconnect
+        }) {
+            if e.user_hash == [0u8; 16] {
+                anonymous.push((e.ip, e.tcp_port));
+                continue;
+            }
+            match best_by_hash.get(&e.user_hash) {
+                None => {
+                    best_by_hash.insert(e.user_hash, e);
+                }
+                Some(prev) => {
+                    if Self::prefer_reconnect_entry(e, prev) {
+                        best_by_hash.insert(e.user_hash, e);
+                    }
+                }
+            }
+        }
+
+        let mut out: Vec<(Ipv4Addr, u16)> = best_by_hash
+            .values()
+            .map(|e| (e.ip, e.tcp_port))
+            .collect();
+        out.extend(anonymous);
+        out
+    }
+
+    /// Return true when `(ip, port)` is an inbound session-only port that
+    /// must not be re-seeded as a reconnectable dial target.
+    pub fn is_session_only_port(&self, file_hash: &[u8; 16], ip: Ipv4Addr, port: u16) -> bool {
         self.sources
             .get(file_hash)
-            .map(|entries| {
+            .and_then(|entries| {
                 entries
                     .iter()
-                    .filter(|e| {
-                        now.saturating_sub(e.last_seen) < SOURCE_EXPIRY_SECS
-                            && e.client_id == 0
-                            && !e.ip.is_unspecified()
-                    })
-                    .map(|e| (e.ip, e.tcp_port))
-                    .collect()
+                    .find(|e| e.ip == ip && e.tcp_port == port)
             })
-            .unwrap_or_default()
+            .map(|e| e.not_for_reconnect)
+            .unwrap_or(false)
+    }
+
+    /// Map a PFS dial/reask candidate to a reconnectable endpoint.
+    ///
+    /// Ordinary listening ports pass through unchanged. Inbound session-only
+    /// (ephemeral callback) ports are remapped to the peer's preferred
+    /// HighID dialable address when known; otherwise `None` so callers skip
+    /// the undialable ephemeral instead of wasting a TCP slot.
+    pub fn remap_dial_target(
+        &self,
+        file_hash: &[u8; 16],
+        ip: Ipv4Addr,
+        port: u16,
+    ) -> Option<(Ipv4Addr, u16)> {
+        if !self.is_session_only_port(file_hash, ip, port) {
+            return Some((ip, port));
+        }
+        let user_hash = self
+            .get_user_hash(file_hash, ip, port)
+            .or_else(|| self.find_user_hash_by_addr(ip, port))?;
+        if user_hash == [0u8; 16] {
+            return None;
+        }
+        // Prefer the same hash-deduped dialable set resume uses.
+        for (dip, dport) in self.get_sources(file_hash) {
+            if self.get_user_hash(file_hash, dip, dport) == Some(user_hash) {
+                return Some((dip, dport));
+            }
+        }
+        None
+    }
+
+    /// Prefer the better dialable endpoint when two rows share a user hash.
+    /// On the same IP with different ports (listening vs ephemeral leftover),
+    /// prefer the non-ephemeral-range port (IANA dynamic/private ≥ 49152) so
+    /// a legacy row that attached UDP to an inbound connection port doesn't
+    /// beat the real listening port. Then prefer UDP-capable, then newer
+    /// `last_seen`.
+    fn prefer_reconnect_entry(candidate: &SourceEntry, current: &SourceEntry) -> bool {
+        const EPHEMERAL_START: u16 = 49152;
+        if candidate.ip == current.ip && candidate.tcp_port != current.tcp_port {
+            let cand_eph = candidate.tcp_port >= EPHEMERAL_START;
+            let cur_eph = current.tcp_port >= EPHEMERAL_START;
+            match (cand_eph, cur_eph) {
+                (false, true) => return true,
+                (true, false) => return false,
+                _ => {}
+            }
+        }
+        let cand_udp = candidate.udp_port > 0;
+        let cur_udp = current.udp_port > 0;
+        match (cand_udp, cur_udp) {
+            (true, false) => true,
+            (false, true) => false,
+            _ => candidate.last_seen >= current.last_seen,
+        }
     }
 
     /// Look up a stored user hash for a specific source by IP:port.
@@ -1319,13 +1571,24 @@ impl SourceManager {
                 .iter()
                 .filter(|e| {
                     e.user_hash != [0u8; 16]
+                        && !e.not_for_reconnect
                         && now.saturating_sub(e.last_seen) < SOURCE_EXPIRY_SECS * 6
                 })
                 .collect();
             if keep.is_empty() {
                 continue;
             }
-            keep.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+            // Defense-in-depth for older sessions that may still have
+            // listening + ephemeral variants both marked reconnectable:
+            // persist at most one dialable endpoint per user hash.
+            keep.sort_by(|a, b| {
+                b.last_seen.cmp(&a.last_seen).then_with(|| {
+                    (b.udp_port > 0)
+                        .cmp(&(a.udp_port > 0))
+                })
+            });
+            let mut seen_hash = std::collections::HashSet::new();
+            keep.retain(|e| seen_hash.insert(e.user_hash));
             keep.truncate(PERSIST_PER_FILE);
             file_records.push((fh, keep));
         }
@@ -1476,11 +1739,61 @@ impl SourceManager {
                     last_asked: 0,
                     last_sx_sent: 0,
                     last_callback_at: 0,
+                    not_for_reconnect: false,
                 });
                 loaded += 1;
             }
         }
+        // Collapse legacy dual-port rows that older builds persisted for the
+        // same peer (listening + ephemeral both reconnectable). Keep the
+        // preferred dialable endpoint; mark the rest session-only so they
+        // age out and never re-seed resume.
+        self.collapse_legacy_reconnect_duplicates();
         Ok(loaded)
+    }
+
+    /// After loading `sources.met`, mark surplus HighID rows that share a
+    /// user hash as `not_for_reconnect` so resume cannot re-immortalize them.
+    fn collapse_legacy_reconnect_duplicates(&mut self) {
+        for entries in self.sources.values_mut() {
+            let mut best_idx: HashMap<[u8; 16], usize> = HashMap::new();
+            for (i, e) in entries.iter().enumerate() {
+                if e.not_for_reconnect
+                    || e.client_id != 0
+                    || e.ip.is_unspecified()
+                    || e.user_hash == [0u8; 16]
+                {
+                    continue;
+                }
+                match best_idx.get(&e.user_hash).copied() {
+                    None => {
+                        best_idx.insert(e.user_hash, i);
+                    }
+                    Some(prev_i) => {
+                        let prefer_new = {
+                            let cand = &entries[i];
+                            let prev = &entries[prev_i];
+                            Self::prefer_reconnect_entry(cand, prev)
+                        };
+                        if prefer_new {
+                            best_idx.insert(e.user_hash, i);
+                        }
+                    }
+                }
+            }
+            for (i, e) in entries.iter_mut().enumerate() {
+                if e.not_for_reconnect
+                    || e.client_id != 0
+                    || e.ip.is_unspecified()
+                    || e.user_hash == [0u8; 16]
+                {
+                    continue;
+                }
+                if best_idx.get(&e.user_hash).copied() != Some(i) {
+                    e.not_for_reconnect = true;
+                }
+            }
+        }
     }
 
     /// Register a LowID source (behind NAT, needs server callback to reach).
@@ -1539,6 +1852,7 @@ impl SourceManager {
             last_asked: 0,
             last_sx_sent: 0,
             last_callback_at: 0,
+            not_for_reconnect: false,
         });
     }
 
@@ -1991,8 +2305,12 @@ mod tests {
         // LowID row from the server source list: client_id set, hash unknown.
         sm.register_lowid_source(hash, 5, listening_port, srv_ip, srv_port, [0u8; 16], 0);
         // Live callback connection lands on the ephemeral port, hash known.
-        sm.register_source_full_opts(hash, real_ip, ephemeral_port, 0, peer_hash, 0);
+        sm.register_live_session_port(hash, real_ip, ephemeral_port, peer_hash, 0);
         assert_eq!(sm.source_count(&hash), 2, "before linking: counted twice");
+        assert!(
+            sm.get_sources(&hash).is_empty(),
+            "ephemeral session port must not be dialable"
+        );
 
         sm.link_lowid_callback_identity(srv_ip, srv_port, listening_port, peer_hash);
 
@@ -2227,6 +2545,291 @@ mod tests {
         let mut sm = SourceManager::new();
         let loaded = sm.load_from_disk(&path).unwrap();
         assert_eq!(loaded, 0, "loopback source must be filtered out on load");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn get_sources_skips_not_for_reconnect_and_dedupes_by_hash() {
+        let hash = [0xA1; 16];
+        let peer = [0xB2; 16];
+        let ip = Ipv4Addr::new(9, 9, 9, 9);
+        let mut sm = SourceManager::new();
+
+        sm.register_source_full_opts(hash, ip, 4662, 4672, peer, 0);
+        sm.register_live_session_port(hash, ip, 51000, peer, 0);
+        // Legacy dual reconnectable rows (same hash, different ports) must
+        // collapse to the UDP-capable listening port.
+        sm.register_source_full_opts(hash, ip, 52000, 0, peer, 0);
+
+        let dialable = sm.get_sources(&hash);
+        assert_eq!(dialable, vec![(ip, 4662)]);
+        assert_eq!(sm.source_count(&hash), 1);
+    }
+
+    #[test]
+    fn save_to_disk_omits_ephemeral_session_ports() {
+        let dir = std::env::temp_dir().join(format!("ember_sources_ephem_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sources_ephem.met");
+
+        let hash = [0xC3; 16];
+        let peer = [0xD4; 16];
+        let ip = Ipv4Addr::new(11, 22, 33, 44);
+        let mut sm = SourceManager::new();
+        sm.register_source_full_opts(hash, ip, 4662, 4672, peer, 1);
+        sm.register_live_session_port(hash, ip, 51000, peer, 1);
+
+        let written = sm.save_to_disk(&path).unwrap();
+        assert_eq!(written, 1, "only the listening port should be persisted");
+
+        let mut sm2 = SourceManager::new();
+        sm2.load_from_disk(&path).unwrap();
+        assert_eq!(sm2.get_sources(&hash), vec![(ip, 4662)]);
+        assert!(
+            sm2.sources
+                .get(&hash)
+                .unwrap()
+                .iter()
+                .all(|e| e.tcp_port != 51000),
+            "ephemeral port must not be reloaded"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn register_inbound_callback_ports_highid_keeps_listening_dialable() {
+        let hash = [0xE5; 16];
+        let peer = [0xF6; 16];
+        let ip = Ipv4Addr::new(55, 66, 77, 88);
+        let mut sm = SourceManager::new();
+        sm.register_inbound_callback_ports(hash, ip, 51000, 4662, peer, 0, true);
+
+        assert_eq!(sm.get_sources(&hash), vec![(ip, 4662)]);
+        let ephemeral = sm
+            .sources
+            .get(&hash)
+            .unwrap()
+            .iter()
+            .find(|e| e.tcp_port == 51000)
+            .unwrap();
+        assert!(ephemeral.not_for_reconnect);
+        assert_eq!(sm.source_count(&hash), 1);
+    }
+
+    #[test]
+    fn register_inbound_callback_ports_lowid_does_not_invent_dialable() {
+        let hash = [0x17; 16];
+        let peer = [0x28; 16];
+        let ip = Ipv4Addr::new(1, 2, 3, 4);
+        let mut sm = SourceManager::new();
+        sm.register_inbound_callback_ports(hash, ip, 51000, 4662, peer, 0, false);
+
+        assert!(
+            sm.get_sources(&hash).is_empty(),
+            "LowID listening port must not become a HighID reconnect row"
+        );
+    }
+
+    #[test]
+    fn emuleinfo_register_does_not_promote_session_port() {
+        let hash = [0x39; 16];
+        let peer = [0x4A; 16];
+        let ip = Ipv4Addr::new(5, 6, 7, 8);
+        let mut sm = SourceManager::new();
+        sm.register_live_session_port(hash, ip, 51000, peer, 0);
+        // EmuleInfo path historically called register_source_full on addr.port().
+        sm.register_source_full(hash, ip, 51000, 4672, peer);
+
+        let entry = sm
+            .sources
+            .get(&hash)
+            .unwrap()
+            .iter()
+            .find(|e| e.tcp_port == 51000)
+            .unwrap();
+        assert!(
+            entry.not_for_reconnect,
+            "session flag must stay sticky across EmuleInfo register"
+        );
+        assert_eq!(entry.udp_port, 4672);
+        assert!(sm.get_sources(&hash).is_empty());
+    }
+
+    #[test]
+    fn observed_ports_lowid_does_not_invent_dialable_listening() {
+        let hash = [0x39; 16];
+        let peer = [0x4B; 16];
+        let ip = Ipv4Addr::new(5, 6, 7, 9);
+        let mut sm = SourceManager::new();
+        sm.register_inbound_callback_ports(hash, ip, 51000, 4662, peer, 0, false);
+        sm.register_observed_peer_ports(hash, ip, 51000, 4662, 4672, peer, false);
+        assert!(
+            sm.get_sources(&hash).is_empty(),
+            "LowID EmuleInfo must not invent a HighID dialable listening port"
+        );
+    }
+
+    #[test]
+    fn observed_ports_highid_attaches_udp_to_listening() {
+        let hash = [0x39; 16];
+        let peer = [0x4C; 16];
+        let ip = Ipv4Addr::new(5, 6, 7, 10);
+        let mut sm = SourceManager::new();
+        sm.register_inbound_callback_ports(hash, ip, 51000, 4662, peer, 0, true);
+        sm.register_observed_peer_ports(hash, ip, 51000, 4662, 4672, peer, true);
+        assert_eq!(sm.get_sources(&hash), vec![(ip, 4662)]);
+        let listening = sm
+            .sources
+            .get(&hash)
+            .unwrap()
+            .iter()
+            .find(|e| e.tcp_port == 4662)
+            .unwrap();
+        assert_eq!(listening.udp_port, 4672);
+        assert!(!listening.not_for_reconnect);
+    }
+
+    #[test]
+    fn sx_answer_excludes_ephemeral_session_ports() {
+        let hash = [0x5B; 16];
+        let peer = [0x6C; 16];
+        let ip = Ipv4Addr::new(9, 8, 7, 6);
+        let mut sm = SourceManager::new();
+        sm.register_source_full_opts(hash, ip, 4662, 0, peer, 0);
+        sm.register_live_session_port(hash, ip, 51000, peer, 0);
+
+        let now = chrono::Utc::now().timestamp();
+        let entries = sm.sources.get(&hash).unwrap();
+        let ephemeral = entries.iter().find(|e| e.tcp_port == 51000).unwrap();
+        let listening = entries.iter().find(|e| e.tcp_port == 4662).unwrap();
+        assert!(!sx_answer_source_eligible(
+            ephemeral,
+            Ipv4Addr::new(1, 1, 1, 1),
+            now
+        ));
+        assert!(sx_answer_source_eligible(
+            listening,
+            Ipv4Addr::new(1, 1, 1, 1),
+            now
+        ));
+    }
+
+    #[test]
+    fn load_collapses_legacy_dual_reconnect_ports() {
+        let dir = std::env::temp_dir().join(format!("ember_sources_dual_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sources_dual.met");
+
+        let hash = [0x7D; 16];
+        let peer = [0x8E; 16];
+        let now = chrono::Utc::now().timestamp();
+
+        // Hand-write a pre-fix sources.met with two reconnectable HighID
+        // rows for the same peer (listening + ephemeral).
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"ESRC");
+        buf.push(1);
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&hash);
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        for (tcp, udp) in [(4662u16, 4672u16), (51000u16, 0u16)] {
+            buf.extend_from_slice(&[20, 21, 22, 23]); // ip
+            buf.extend_from_slice(&tcp.to_le_bytes());
+            buf.extend_from_slice(&udp.to_le_bytes());
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            buf.extend_from_slice(&0u16.to_le_bytes());
+            buf.extend_from_slice(&peer);
+            buf.push(0);
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            buf.extend_from_slice(&now.to_le_bytes());
+        }
+        std::fs::write(&path, &buf).unwrap();
+
+        let mut sm = SourceManager::new();
+        sm.load_from_disk(&path).unwrap();
+        assert_eq!(
+            sm.get_sources(&hash),
+            vec![(Ipv4Addr::new(20, 21, 22, 23), 4662)]
+        );
+        let ephemeral = sm
+            .sources
+            .get(&hash)
+            .unwrap()
+            .iter()
+            .find(|e| e.tcp_port == 51000)
+            .expect("legacy ephemeral row retained for identity lookups");
+        assert!(
+            ephemeral.not_for_reconnect,
+            "surplus legacy port marked session-only"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn remap_dial_target_skips_lowid_session_and_rewrites_highid() {
+        let hash = [0x22; 16];
+        let peer = [0xAB; 16];
+        let ip = Ipv4Addr::new(30, 31, 32, 33);
+        let mut sm = SourceManager::new();
+
+        // LowID: session ephemeral only → no dial target.
+        sm.register_inbound_callback_ports(hash, ip, 51000, 4662, peer, 0, false);
+        assert_eq!(sm.remap_dial_target(&hash, ip, 51000), None);
+        assert_eq!(sm.remap_dial_target(&hash, ip, 4662), Some((ip, 4662))); // not session
+
+        // HighID: ephemeral remaps to listening.
+        let peer2 = [0xCD; 16];
+        let ip2 = Ipv4Addr::new(40, 41, 42, 43);
+        sm.register_inbound_callback_ports(hash, ip2, 52000, 4662, peer2, 0, true);
+        assert_eq!(sm.remap_dial_target(&hash, ip2, 52000), Some((ip2, 4662)));
+        assert_eq!(sm.remap_dial_target(&hash, ip2, 4662), Some((ip2, 4662)));
+    }
+
+    #[test]
+    fn load_prefers_listening_over_ephemeral_even_when_ephemeral_has_udp() {
+        // Legacy EmuleInfo attached UDP to the inbound connection port. Collapse
+        // must still keep the listening port dialable.
+        let dir = std::env::temp_dir().join(format!("ember_sources_udp_eph_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sources_udp_eph.met");
+
+        let hash = [0x9F; 16];
+        let peer = [0xA0; 16];
+        let now = chrono::Utc::now().timestamp();
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"ESRC");
+        buf.push(1);
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&hash);
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        // listening without UDP, ephemeral WITH UDP (legacy shape)
+        for (tcp, udp) in [(4662u16, 0u16), (51000u16, 4672u16)] {
+            buf.extend_from_slice(&[20, 21, 22, 24]);
+            buf.extend_from_slice(&tcp.to_le_bytes());
+            buf.extend_from_slice(&udp.to_le_bytes());
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            buf.extend_from_slice(&0u16.to_le_bytes());
+            buf.extend_from_slice(&peer);
+            buf.push(0);
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            buf.extend_from_slice(&now.to_le_bytes());
+        }
+        std::fs::write(&path, &buf).unwrap();
+
+        let mut sm = SourceManager::new();
+        sm.load_from_disk(&path).unwrap();
+        assert_eq!(
+            sm.get_sources(&hash),
+            vec![(Ipv4Addr::new(20, 21, 22, 24), 4662)],
+            "listening port must win even when ephemeral carried UDP"
+        );
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);

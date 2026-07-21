@@ -18213,25 +18213,30 @@ pub async fn start_network(
                                     .map_or(0, |uh| state.reputation.score(&uh))
                             },
                         );
+                        let file_hash = pfs.file_hash;
+                        let live: Vec<(String, u16)> = ready
+                            .into_iter()
+                            .filter_map(|(ip, port)| sm_guard.remap_dial_target(&file_hash, ip, port))
+                            .filter(|(ip, port)| {
+                                !state.dead_sources.is_dead_source_for_file(
+                                    &file_hash,
+                                    u32::from(*ip),
+                                    *port,
+                                )
+                            })
+                            .filter(|(ip, port)| {
+                                let addr = SocketAddr::new((*ip).into(), *port);
+                                !a4af_snap.is_swap_candidate(addr, &file_hash)
+                            })
+                            .map(|(ip, port)| (ip.to_string(), port))
+                            .collect();
                         drop(sm_guard);
-                        if !ready.is_empty() {
-                            let live: Vec<(String, u16)> = ready.into_iter()
-                                .filter(|(ip, port)| {
-                                    !state.dead_sources.is_dead_source_for_file(&pfs.file_hash, u32::from(*ip), *port)
-                                })
-                                .filter(|(ip, port)| {
-                                    let addr = SocketAddr::new((*ip).into(), *port);
-                                    !a4af_snap.is_swap_candidate(addr, &pfs.file_hash)
-                                })
-                                .map(|(ip, port)| (ip.to_string(), port))
-                                .collect();
-                            if !live.is_empty() {
-                                debug!(
-                                    "Persistent source list has {} sources ready for reask for {}",
-                                    live.len(), tid
-                                );
-                                started_from_persistent.push(tid.clone());
-                            }
+                        if !live.is_empty() {
+                            debug!(
+                                "Persistent source list has {} sources ready for reask for {}",
+                                live.len(), tid
+                            );
+                            started_from_persistent.push(tid.clone());
                         }
                     }
                 }
@@ -18291,6 +18296,9 @@ pub async fn start_network(
                                         .map_or(0, |uh| state.reputation.score(&uh))
                                 },
                             ).into_iter()
+                                .filter_map(|(ip, port)| {
+                                    sm_guard2.remap_dial_target(&hash_bytes, ip, port)
+                                })
                                 .filter(|(ip, port)| !state.dead_sources.is_dead_source_for_file(&hash_bytes, u32::from(*ip), *port))
                                 .filter(|(ip, port)| {
                                     let addr = SocketAddr::new((*ip).into(), *port);
@@ -18923,18 +18931,43 @@ pub async fn start_network(
                         if let Some(pfs) = state.per_file_sources.get_mut(tid) {
                             let udp_due = pfs.sources_needing_udp_reask();
                             let mut pfs_sent = 0usize;
-                            for (ip, tcp_port, udp_port) in &udp_due {
-                                if sent_this_tick.contains(&(*ip, *tcp_port)) {
+                            for (orig_ip, orig_tcp, orig_udp) in &udp_due {
+                                // Skip inbound session-only TCP ports — their
+                                // UDP pairing (if any) was attached to an
+                                // ephemeral connection, not a dialable peer.
+                                let Some((ip, tcp_port)) =
+                                    sm.remap_dial_target(&pfs.file_hash, *orig_ip, *orig_tcp)
+                                else {
+                                    // Still clear the due timer on the
+                                    // ephemeral row so we don't spin every
+                                    // 5s trying to reask an undialable port.
+                                    pfs.mark_udp_reask_sent(*orig_ip, *orig_tcp);
+                                    continue;
+                                };
+                                let udp_port = sm
+                                    .get_udp_sources(&pfs.file_hash)
+                                    .into_iter()
+                                    .find(|(uip, utcp, _)| *uip == ip && *utcp == tcp_port)
+                                    .map(|(_, _, u)| u)
+                                    .unwrap_or(*orig_udp);
+                                if udp_port == 0 {
+                                    pfs.mark_udp_reask_sent(*orig_ip, *orig_tcp);
+                                    continue;
+                                }
+                                if sent_this_tick.contains(&(ip, tcp_port)) {
                                     // Already pinged via SourceManager this tick.
+                                    pfs.mark_udp_reask_sent(*orig_ip, *orig_tcp);
                                     continue;
                                 }
-                                if state.dead_sources.is_dead_source_for_file(&pfs.file_hash, u32::from(*ip), *tcp_port) {
+                                if state.dead_sources.is_dead_source_for_file(&pfs.file_hash, u32::from(ip), tcp_port) {
+                                    pfs.mark_udp_reask_sent(*orig_ip, *orig_tcp);
                                     continue;
                                 }
-                                if sm.can_request_sources_for(&pfs.file_hash, *ip, *tcp_port) {
+                                if sm.can_request_sources_for(&pfs.file_hash, ip, tcp_port) {
+                                    pfs.mark_udp_reask_sent(*orig_ip, *orig_tcp);
                                     continue;
                                 }
-                                let addr = SocketAddr::new((*ip).into(), *udp_port);
+                                let addr = SocketAddr::new(ip.into(), udp_port);
                                 let mut pkt = vec![OP_EMULEPROT, ed2k::messages::OP_REASKFILEPING];
                                 pkt.extend_from_slice(&reask_payload);
                                 // Bump last_asked so this entry isn't "due" again
@@ -18942,12 +18975,16 @@ pub async fn start_network(
                                 // this the 5s timer pings the same peer every tick
                                 // forever. Marked optimistically under the lock; the
                                 // send happens after the lock is released below.
-                                pfs.mark_udp_reask_sent(*ip, *tcp_port);
+                                pfs.mark_udp_reask_sent(*orig_ip, *orig_tcp);
+                                if (ip, tcp_port) != (*orig_ip, *orig_tcp) {
+                                    pfs.mark_udp_reask_sent(ip, tcp_port);
+                                }
                                 state.pending_udp_reasks.insert(
-                                    (*ip, *udp_port),
+                                    (ip, udp_port),
                                     (pfs.file_hash, chrono::Utc::now().timestamp()),
                                 );
                                 to_send.push((addr, pkt));
+                                sent_this_tick.insert((ip, tcp_port));
                                 pfs_sent += 1;
                             }
                             if pfs_sent > 0 {
@@ -19640,17 +19677,32 @@ pub async fn start_network(
                                     break;
                                 }
                             }
-                            let (moved_user_hash, moved_connect_options) = {
+                            let (moved_user_hash, moved_connect_options, moved_session_only) = {
                                 let sm = source_manager.read().await;
                                 (
                                     sm.get_user_hash(&swap.from_file, v4, port),
-                                    sm.get_connect_options(&swap.from_file, v4, port).unwrap_or(0),
+                                    sm.get_connect_options(&swap.from_file, v4, port)
+                                        .unwrap_or(0),
+                                    sm.is_session_only_port(&swap.from_file, v4, port),
                                 )
                             };
                             {
                                 let mut sm = source_manager.write().await;
                                 sm.remove_source(&swap.from_file, &v4, port);
-                                if let Some(user_hash) = moved_user_hash {
+                                // Preserve inbound session-only ports across
+                                // A4AF moves — registering them as ordinary
+                                // reconnectable HighID rows would reintroduce
+                                // the ephemeral-port duplication this swap
+                                // path was otherwise undoing.
+                                if moved_session_only {
+                                    sm.register_live_session_port(
+                                        swap.to_file,
+                                        v4,
+                                        port,
+                                        moved_user_hash.unwrap_or([0u8; 16]),
+                                        moved_connect_options,
+                                    );
+                                } else if let Some(user_hash) = moved_user_hash {
                                     sm.register_source_full_opts(
                                         swap.to_file,
                                         v4,
@@ -22423,13 +22475,17 @@ pub async fn start_network(
                                     cb_peer_user_hash,
                                 );
                             }
-                            sm.register_source_full_opts(
+                            // Ephemeral inbound port = live-session only.
+                            // HighID Path-B also registers the Hello listening
+                            // port as the reconnectable dial address.
+                            sm.register_inbound_callback_ports(
                                 cb_file_hash,
                                 cb_peer_ip,
                                 cb_peer_port,
-                                0,
+                                cb_peer_hello_port,
                                 cb_peer_user_hash,
                                 0,
+                                cb_peer_caps.is_high_id(),
                             );
                         }
                         let matching_tids = {
@@ -22437,9 +22493,28 @@ pub async fn start_network(
                             matching_active_transfer_ids_for_hash(&state, &mgr, &hash_hex)
                         };
                         let uh = if cb_peer_user_hash != [0u8; 16] { Some(cb_peer_user_hash) } else { None };
+                        // Adopted streams must keep the ephemeral connection
+                        // port in `DownloadSource` — that is the live TCP
+                        // remote port the worker keys UI/PFS rows on. Metadata
+                        // fallback inject (no live stream) prefers the Hello
+                        // listening port for HighID so we never seed a dial
+                        // of an undialable ephemeral address.
                         let download_source = DownloadSource {
                             peer_ip: cb_peer_ip.to_string(),
                             peer_port: cb_peer_port,
+                            available_parts: Vec::new(),
+                            peer_user_hash: uh,
+                            peer_connect_options: None,
+                        };
+                        let inject_source = DownloadSource {
+                            peer_ip: cb_peer_ip.to_string(),
+                            peer_port: if cb_peer_caps.is_high_id()
+                                && cb_peer_hello_port > 0
+                            {
+                                cb_peer_hello_port
+                            } else {
+                                cb_peer_port
+                            },
                             available_parts: Vec::new(),
                             peer_user_hash: uh,
                             peer_connect_options: None,
@@ -22611,13 +22686,13 @@ pub async fn start_network(
                                 &mut state,
                                 cb_file_hash,
                                 &matching_tids,
-                                &download_source,
+                                &inject_source,
                                 0,
                             );
                             if stats.injected > 0 {
                                 info!(
                                     "Injected LowID callback peer {}:{} (metadata-only fallback) into {} active download(s) for {}",
-                                    download_source.peer_ip, download_source.peer_port, stats.injected, hash_hex,
+                                    inject_source.peer_ip, inject_source.peer_port, stats.injected, hash_hex,
                                 );
                             } else {
                                 debug!("No active download accepts callback peer for {hash_hex}");
@@ -31224,6 +31299,11 @@ async fn handle_command_inner(
                     for (ip, port, udp_port) in pfs_dialable {
                         if validated_extras.len() >= MAX_SEED_EXTRA_SOURCES {
                             break;
+                        }
+                        // Do not re-immortalize inbound callback/push-grant
+                        // ephemeral ports as reconnectable HighID rows.
+                        if sm.is_session_only_port(&hash_bytes, ip, port) {
+                            continue;
                         }
                         if !is_source_admissible(&state, ip, port, None) {
                             continue;

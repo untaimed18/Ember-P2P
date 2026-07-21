@@ -841,7 +841,17 @@ impl Ed2kDownload {
         if let Some(sm) = &self.source_manager {
             if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
                 let mut sm = sm.write().await;
-                sm.register_source(self.file_hash, v4, self.source_addr.port());
+                // Callback path: source_addr.port() is ephemeral. Keep it as a
+                // live-session row; register Hello listening port when HighID.
+                sm.register_inbound_callback_ports(
+                    self.file_hash,
+                    v4,
+                    self.source_addr.port(),
+                    peer_caps.tcp_port,
+                    peer_user_hash,
+                    0,
+                    peer_caps.is_high_id(),
+                );
             }
         }
 
@@ -1041,12 +1051,14 @@ impl Ed2kDownload {
                     if let Some(sm) = &self.source_manager {
                         let mut sm = sm.write().await;
                         if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
-                            sm.register_source_full(
+                            sm.register_observed_peer_ports(
                                 self.file_hash,
                                 v4,
                                 self.source_addr.port(),
+                                peer_caps.tcp_port,
                                 peer_udp,
                                 peer_user_hash,
+                                peer_caps.is_high_id(),
                             );
                         }
                     }
@@ -1088,12 +1100,14 @@ impl Ed2kDownload {
                     if let Some(sm) = &self.source_manager {
                         let mut sm = sm.write().await;
                         if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
-                            sm.register_source_full(
+                            sm.register_observed_peer_ports(
                                 self.file_hash,
                                 v4,
                                 self.source_addr.port(),
+                                peer_caps.tcp_port,
                                 peer_udp,
                                 peer_user_hash,
+                                peer_caps.is_high_id(),
                             );
                         }
                     }
@@ -1278,12 +1292,14 @@ impl Ed2kDownload {
                         if let Some(sm) = &self.source_manager {
                             let mut sm = sm.write().await;
                             if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
-                                sm.register_source_full(
+                                sm.register_observed_peer_ports(
                                     self.file_hash,
                                     v4,
                                     self.source_addr.port(),
+                                    peer_caps.tcp_port,
                                     peer_udp,
                                     peer_user_hash,
+                                    peer_caps.is_high_id(),
                                 );
                             }
                         }
@@ -1849,12 +1865,14 @@ impl Ed2kDownload {
                         if let Some(sm) = &self.source_manager {
                             let mut sm = sm.write().await;
                             if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
-                                sm.register_source_full(
+                                sm.register_observed_peer_ports(
                                     self.file_hash,
                                     v4,
                                     self.source_addr.port(),
+                                    peer_caps.tcp_port,
                                     peer_udp,
                                     peer_user_hash,
+                                    peer_caps.is_high_id(),
                                 );
                             }
                         }
