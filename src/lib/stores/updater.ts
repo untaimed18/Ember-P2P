@@ -1,6 +1,7 @@
 import { writable } from 'svelte/store';
 import { check, type Update } from '@tauri-apps/plugin-updater';
 import { relaunch } from '@tauri-apps/plugin-process';
+import * as m from '$lib/paraglide/messages';
 
 // Shared auto-update state. Both the corner `UpdateNotice` banner and the
 // Settings → About card read and drive this single store, so a check started
@@ -237,7 +238,7 @@ export async function installUpdate(): Promise<void> {
     updater.update((s) => ({
       ...s,
       phase: 'error',
-      error: 'No staged update is available; checking again is required.',
+      error: m.updater_no_staged_update(),
     }));
     return;
   }

@@ -1679,8 +1679,12 @@
 
     if (typing) return;
 
-    // Ignore shortcuts while a modal is open.
-    if (createCollectionOpen || confirmOpen || stopConfirmVisible || collectionsOpen) return;
+    // Ignore shortcuts while a modal is open. `collectionsOpen` deliberately
+    // isn't part of this guard: the collection panel is an inline collapsible
+    // (the file table stays visible and interactive below it), not a modal,
+    // and it has no keyboard handling of its own that these shortcuts could
+    // conflict with.
+    if (createCollectionOpen || confirmOpen || stopConfirmVisible) return;
 
     // Ctrl/Cmd+A selects all visible. Merge into the existing selection
     // (matching `toggleCheckAll`) rather than replacing it — selections are

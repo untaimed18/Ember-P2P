@@ -501,11 +501,21 @@ struct RelayTicket {
 /// lock. Polling looks up only the caller's signed candidates via
 /// `by_responder`,
 /// never scans/sorts every pending offer.
+/// Legacy v2 rotation cursor plus the time it was last advanced, so stale
+/// entries (responders that stopped polling mid-rotation) can be swept.
+struct LegacyV2Cursor {
+    last_initiator_id: String,
+    touched_at: Instant,
+}
+
 #[derive(Default)]
 struct RelayTicketStore {
     tickets: HashMap<String, RelayTicket>,
     by_responder: HashMap<String, BTreeMap<String, String>>,
-    legacy_v2_cursors: HashMap<String, String>,
+    legacy_v2_cursors: HashMap<String, LegacyV2Cursor>,
+    /// Throttles the `legacy_v2_cursors` sweep so per-request prunes don't
+    /// rescan the whole cursor map every time.
+    legacy_v2_cursor_next_sweep: Option<Instant>,
     initiator_counts: HashMap<String, usize>,
     accepted_responder_counts: HashMap<String, usize>,
     expirations: VecDeque<(Instant, String)>,
@@ -572,13 +582,41 @@ impl RelayTicketStore {
                 .expirations
                 .pop_front()
                 .expect("front was checked above");
-            if self
-                .tickets
-                .get(&ticket_id)
-                .is_some_and(|ticket| ticket.expires_at <= now)
-            {
-                self.remove(&ticket_id);
+            let Some(ticket) = self.tickets.get(&ticket_id) else {
+                continue;
+            };
+            if ticket.expires_at > now {
+                continue;
             }
+            if ticket.initiator_reservation.is_some() || ticket.responder_reservation.is_some() {
+                // A pre-upgrade capacity reservation is outstanding. Removing
+                // the ticket now would strand its `relay_ip_counts` increment
+                // forever, because `rollback_relay_ticket_reservation` bails
+                // out when the ticket is gone and never decrements the count.
+                // Retain the ticket until the reservation watchdog window has
+                // passed (commit or rollback clears the reservation within
+                // `RELAY_UPGRADE_RESERVATION_TIMEOUT`), then let a later
+                // sweep remove it.
+                self.expirations
+                    .push_back((now + RELAY_UPGRADE_RESERVATION_TIMEOUT, ticket_id));
+                continue;
+            }
+            self.remove(&ticket_id);
+        }
+
+        // Legacy v2 cursors have no removal path of their own when a
+        // responder stops polling, so they would otherwise accumulate one
+        // entry per responder identity forever. A cursor untouched for a
+        // full ticket TTL cannot point past any still-live ticket (every
+        // ticket it could have referenced has expired), so dropping it only
+        // restarts that responder's rotation at the first page.
+        if self
+            .legacy_v2_cursor_next_sweep
+            .map_or(true, |at| at <= now)
+        {
+            self.legacy_v2_cursors
+                .retain(|_, cursor| now.saturating_duration_since(cursor.touched_at) < RELAY_TICKET_TTL);
+            self.legacy_v2_cursor_next_sweep = Some(now + SWEEP_INTERVAL);
         }
     }
 
@@ -1397,7 +1435,10 @@ fn relay_ticket_poll_v2_page(
     responder_id: &str,
     now: Instant,
 ) -> Vec<RelayTicketPollItem> {
-    let cursor = tickets.legacy_v2_cursors.get(responder_id).cloned();
+    let cursor = tickets
+        .legacy_v2_cursors
+        .get(responder_id)
+        .map(|cursor| cursor.last_initiator_id.clone());
     let mut selected: Vec<(String, String)> = Vec::new();
     if let Some(by_initiator) = tickets.by_responder.get(responder_id) {
         if let Some(cursor) = cursor.as_ref() {
@@ -1448,9 +1489,13 @@ fn relay_ticket_poll_v2_page(
 
     match selected.last() {
         Some((initiator_id, _)) => {
-            tickets
-                .legacy_v2_cursors
-                .insert(responder_id.to_owned(), initiator_id.clone());
+            tickets.legacy_v2_cursors.insert(
+                responder_id.to_owned(),
+                LegacyV2Cursor {
+                    last_initiator_id: initiator_id.clone(),
+                    touched_at: now,
+                },
+            );
         }
         None => {
             tickets.legacy_v2_cursors.remove(responder_id);
@@ -1496,6 +1541,12 @@ async fn reserve_relay_ticket_join(
         .tickets
         .get_mut(&ticket_id)
         .ok_or(StatusCode::GONE)?;
+    if ticket.expires_at <= now {
+        // The prune above retains an expired ticket only while a pre-upgrade
+        // reservation is outstanding (so its rollback can still release the
+        // per-IP count). That retention must not admit new joins past expiry.
+        return Err(StatusCode::GONE);
+    }
     if !ticket.accepted {
         return Err(StatusCode::FORBIDDEN);
     }
@@ -3521,5 +3572,76 @@ mod relay_ticket_tests {
             StatusCode::GONE
         );
         assert!(state.relay_tickets.read().await.tickets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prune_retains_reserved_ticket_until_rollback_releases_capacity() {
+        let state = test_state();
+        let ticket_id = "ba".repeat(32);
+        let (initiator_token, _) =
+            insert_ticket(&state, &ticket_id, Instant::now() + Duration::from_secs(30)).await;
+        let client_ip: IpAddr = "9.9.9.9".parse().unwrap();
+
+        let reservation =
+            reserve_relay_ticket_join(&state, &ticket_id, &initiator_token, client_ip)
+                .await
+                .unwrap();
+        assert_eq!(state.relay_ip_counts.read().await.get(&client_ip), Some(&1));
+
+        // The ticket expires while the pre-upgrade reservation is still
+        // outstanding. Pruning must retain it so the reservation's rollback
+        // can still find the ticket and release the per-IP count.
+        let after_expiry = Instant::now() + Duration::from_secs(31);
+        {
+            let mut tickets = state.relay_tickets.write().await;
+            prune_expired_relay_tickets(&mut tickets, after_expiry);
+            assert!(
+                tickets.tickets.contains_key(&ticket_id),
+                "expired ticket with an outstanding reservation must be retained"
+            );
+        }
+
+        rollback_relay_ticket_reservation(&state, &reservation).await;
+        assert!(
+            state.relay_ip_counts.read().await.is_empty(),
+            "rollback must release the reserved per-IP count"
+        );
+
+        // Once the watchdog window has passed and the reservation is gone,
+        // the next sweep removes the ticket and all its indexes.
+        let after_watchdog =
+            after_expiry + RELAY_UPGRADE_RESERVATION_TIMEOUT + Duration::from_secs(1);
+        let mut tickets = state.relay_tickets.write().await;
+        prune_expired_relay_tickets(&mut tickets, after_watchdog);
+        assert!(tickets.tickets.is_empty());
+        assert!(tickets.by_responder.is_empty());
+        assert!(tickets.expirations.is_empty());
+    }
+
+    #[test]
+    fn legacy_v2_cursors_are_swept_after_ticket_ttl() {
+        let responder_id = "22".repeat(32);
+        let mut tickets = RelayTicketStore::default();
+        for index in 0..(MAX_LEGACY_RELAY_TICKET_POLL_RESULTS + 1) {
+            tickets.insert(
+                format!("{:064x}", index + 40_000),
+                ticket_with_parties(&format!("{:064x}", index + 30_000), &responder_id, false),
+            );
+        }
+
+        let now = Instant::now();
+        let page = relay_ticket_poll_v2_page(&mut tickets, &responder_id, now);
+        assert!(!page.is_empty());
+        assert!(tickets.legacy_v2_cursors.contains_key(&responder_id));
+
+        // A freshly touched cursor survives a sweep.
+        tickets.prune_expired(now);
+        assert!(tickets.legacy_v2_cursors.contains_key(&responder_id));
+
+        // A cursor untouched for a full ticket TTL is dropped even though the
+        // responder never issued the empty-result poll that used to be the
+        // only removal path.
+        tickets.prune_expired(now + RELAY_TICKET_TTL);
+        assert!(tickets.legacy_v2_cursors.is_empty());
     }
 }

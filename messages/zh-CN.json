@@ -2054,6 +2054,7 @@
   "updater_error_body": "无法完成更新：{detail}",
   "updater_retry": "重试",
   "updater_dismiss_aria": "关闭更新通知",
+  "updater_no_staged_update": "没有已暂存的更新；需要重新检查更新。",
   "statusbar_epx_status_active": "活跃",
   "statusbar_epx_status_idle": "空闲",
   "statusbar_epx_status_inactive": "离线",

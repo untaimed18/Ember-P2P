@@ -20,6 +20,10 @@ pub struct ShareMutation {
     pub hashes: Vec<String>,
     pub changed_paths: usize,
     pub pending_paths: Vec<String>,
+    /// Paths of *hashed* rows that were flipped. Used to clear any stale
+    /// pending intent recorded for the same path while the file was hashing,
+    /// so the intent cannot resurrect an old share state on a later rehash.
+    pub hashed_paths: Vec<String>,
 }
 
 /// Windows filesystems are (by default) case-insensitive; indexing a path that
@@ -582,8 +586,11 @@ impl LocalIndex {
                 mutation.changed_paths += 1;
                 if file.hash.is_empty() {
                     mutation.pending_paths.push(file.path.clone());
-                } else if !mutation.hashes.contains(&file.hash) {
-                    mutation.hashes.push(file.hash.clone());
+                } else {
+                    mutation.hashed_paths.push(file.path.clone());
+                    if !mutation.hashes.contains(&file.hash) {
+                        mutation.hashes.push(file.hash.clone());
+                    }
                 }
             }
         }
@@ -616,8 +623,11 @@ impl LocalIndex {
                 mutation.changed_paths += 1;
                 if file.hash.is_empty() {
                     mutation.pending_paths.push(file.path.clone());
-                } else if !mutation.hashes.contains(&file.hash) {
-                    mutation.hashes.push(file.hash.clone());
+                } else {
+                    mutation.hashed_paths.push(file.path.clone());
+                    if !mutation.hashes.contains(&file.hash) {
+                        mutation.hashes.push(file.hash.clone());
+                    }
                 }
             }
         }
@@ -656,8 +666,11 @@ impl LocalIndex {
                 mutation.changed_paths += 1;
                 if file.hash.is_empty() {
                     mutation.pending_paths.push(file.path.clone());
-                } else if !mutation.hashes.contains(&file.hash) {
-                    mutation.hashes.push(file.hash.clone());
+                } else {
+                    mutation.hashed_paths.push(file.path.clone());
+                    if !mutation.hashes.contains(&file.hash) {
+                        mutation.hashes.push(file.hash.clone());
+                    }
                 }
             }
         }
@@ -914,6 +927,43 @@ mod local_index_tests {
         assert_eq!(mutation.hashes, vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]);
         assert!(!index.get_by_path("A/copy.bin").unwrap().shared);
         assert!(!index.get_by_path("B/copy.bin").unwrap().shared);
+    }
+
+    #[test]
+    fn share_mutation_reports_hashed_paths_for_intent_cleanup() {
+        // Every flipped *hashed* row must surface its path so a stale
+        // pending intent recorded for the same path (while the file was
+        // hashing) is cleared and cannot resurrect an old share state on a
+        // later rehash. Pending rows go to pending_paths instead.
+        let mut index = LocalIndex::new();
+        let mut pending = file("A/pending.bin", "", true, "normal");
+        pending.id = "pending:A/pending.bin".to_string();
+        index.add_files(vec![
+            file(
+                "A/hashed.bin",
+                "cccccccccccccccccccccccccccccccc",
+                true,
+                "normal",
+            ),
+            file(
+                "B/hashed.bin",
+                "cccccccccccccccccccccccccccccccc",
+                true,
+                "normal",
+            ),
+            pending,
+        ]);
+
+        let mutation = index.set_shared_by_paths(
+            &["A/hashed.bin".to_string(), "A/pending.bin".to_string()],
+            false,
+        );
+
+        assert_eq!(mutation.changed_paths, 3);
+        let mut hashed_paths = mutation.hashed_paths.clone();
+        hashed_paths.sort();
+        assert_eq!(hashed_paths, vec!["A/hashed.bin", "B/hashed.bin"]);
+        assert_eq!(mutation.pending_paths, vec!["A/pending.bin"]);
     }
 
     #[test]

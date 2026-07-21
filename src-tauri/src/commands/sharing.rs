@@ -219,6 +219,23 @@ pub(crate) async fn reconcile_shared_folder_roots(
     let immediate_active_roots = state.config.read().await.settings.shared_folders.clone();
     *state.upload_shared_folders.write().await = immediate_active_roots;
 
+    // Signal per-folder scans under removed roots BEFORE queueing on
+    // `scan_coordination`, mirroring `remove_shared_folder`. Signaled only
+    // after the lock, the flags could never shorten the wait for a running
+    // scan of a root that is being removed. Broad startup/reload generations
+    // are deliberately left running (see `scan_can_write_under`).
+    if !removed_roots.is_empty() {
+        let flags = state.hash_cancel_flags.read().await;
+        for (scan_key, flag) in flags.iter() {
+            if removed_roots
+                .iter()
+                .any(|root| scan_can_write_under(scan_key, root))
+            {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
     // Scans persist their resume cursors while holding scan_coordination and
     // then settings_save_lock. Take those locks in that same order here, and
     // snapshot Settings only after acquiring scan_coordination so a later
@@ -456,7 +473,15 @@ async fn persist_share_mutation(
         .cloned()
         .map(|path| (path, shared))
         .collect::<Vec<_>>();
-    if let Err(e) = persist_pending_intents(state, &pending_updates, &[]).await {
+    if let Err(e) = persist_pending_intents(
+        state,
+        &pending_updates,
+        &[],
+        &mutation.hashed_paths,
+        &[],
+    )
+    .await
+    {
         // The known.met half already committed. Compensate it before rolling
         // back the optimistic index so a failed config write cannot leave the
         // next restart with the opposite share state.
@@ -814,8 +839,14 @@ async fn persist_pending_intents(
     state: &AppState,
     share_updates: &[(String, bool)],
     priority_updates: &[(String, String)],
+    share_removals: &[String],
+    priority_removals: &[String],
 ) -> Result<(), String> {
-    if share_updates.is_empty() && priority_updates.is_empty() {
+    if share_updates.is_empty()
+        && priority_updates.is_empty()
+        && share_removals.is_empty()
+        && priority_removals.is_empty()
+    {
         return Ok(());
     }
     let _settings_save_guard = state.settings_save_lock.lock().await;
@@ -834,7 +865,33 @@ async fn persist_pending_intents(
             priority.clone(),
         );
     }
-    settings.settings_revision = settings.settings_revision.saturating_add(1);
+    // A pending intent is a one-shot handoff for a file that was still
+    // hashing. Once the file is hashed (or an explicit change is applied to
+    // the hashed row), known.met owns the state and the intent must die —
+    // a stale entry would re-apply on the next rehash and silently flip a
+    // share/priority the user has since changed.
+    let mut removed_any = false;
+    for path in share_removals {
+        removed_any |= settings
+            .pending_share_states
+            .remove(&crate::search::index::normalize_path_key(path))
+            .is_some();
+    }
+    for path in priority_removals {
+        removed_any |= settings
+            .pending_file_priorities
+            .remove(&crate::search::index::normalize_path_key(path))
+            .is_some();
+    }
+    if share_updates.is_empty() && priority_updates.is_empty() && !removed_any {
+        return Ok(());
+    }
+    // Only user-driven updates bump the visible settings revision; internal
+    // intent cleanup must not make an open Settings form spuriously stale
+    // (same rationale as `persist_scan_cursors`).
+    if !share_updates.is_empty() || !priority_updates.is_empty() {
+        settings.settings_revision = settings.settings_revision.saturating_add(1);
+    }
     let save_data = {
         let config = state.config.read().await;
         config
@@ -850,6 +907,65 @@ async fn persist_pending_intents(
     .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?;
     state.config.write().await.settings = settings;
     Ok(())
+}
+
+/// Sweep pending share/priority intents whose files are now hashed. A pending
+/// intent is a one-shot handoff from "user changed a file that was still
+/// hashing" to the hash-completion path; once the row is hashed, known.met
+/// owns the state. Entries left behind (pre-fix builds, crashes between
+/// finalize and cleanup) would re-apply on the next rehash and silently flip
+/// share/priority choices the user has since changed. Called after every
+/// completed hash pass. Entries whose path has no hashed index row are kept —
+/// they may belong to genuinely pending files in a later scan page.
+pub(crate) async fn prune_pending_intents_for_hashed(state: &AppState) {
+    let hashed_keys: HashSet<String> = {
+        let index = state.local_index.read().await;
+        index
+            .all_files()
+            .iter()
+            .filter(|f| !f.hash.is_empty())
+            .map(|f| crate::search::index::normalize_path_key(&f.path))
+            .collect()
+    };
+    if hashed_keys.is_empty() {
+        return;
+    }
+    let (share_stale, priority_stale) = {
+        let config = state.config.read().await;
+        (
+            config
+                .settings
+                .pending_share_states
+                .keys()
+                .filter(|key| hashed_keys.contains(*key))
+                .cloned()
+                .collect::<Vec<_>>(),
+            config
+                .settings
+                .pending_file_priorities
+                .keys()
+                .filter(|key| hashed_keys.contains(*key))
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+    };
+    if share_stale.is_empty() && priority_stale.is_empty() {
+        return;
+    }
+    if let Err(e) =
+        persist_pending_intents(state, &[], &[], &share_stale, &priority_stale).await
+    {
+        warn!(
+            "Failed to prune {} stale pending intents: {e}",
+            share_stale.len() + priority_stale.len()
+        );
+    } else {
+        info!(
+            "Pruned {} pending share and {} pending priority intents for hashed files",
+            share_stale.len(),
+            priority_stale.len()
+        );
+    }
 }
 
 /// Persist completed shared-folder discovery pages. Cursors are advanced only
@@ -1378,6 +1494,13 @@ pub async fn add_shared_folder(
         }
 
         reconcile_shared_files_best_effort(&network_tx).await;
+        if !was_cancelled {
+            // known.met now owns the state of everything hashed this pass —
+            // sweep any pending intents that were handed off (or left stale
+            // by an earlier build/crash) so they can't re-apply on a rehash.
+            let app_state = app.state::<AppState>();
+            prune_pending_intents_for_hashed(&app_state).await;
+        }
         remove_cancel_flag_if_current(&cancel_flags, &cancel_key, &cancel_flag).await;
 
         let from_known = total_files.saturating_sub(total_to_hash);
@@ -1881,9 +2004,24 @@ pub async fn set_file_priority(
             rollback_index_mutation(&state, snapshot).await;
             return Err(e);
         }
-    } else {
+        // known.met now owns this priority — drop any intent recorded for the
+        // path while it was still hashing, or a later rehash would revert the
+        // user's choice. Best-effort: a stale entry is also swept by the
+        // post-scan prune.
         if let Err(e) =
-            persist_pending_intents(&state, &[], &[(file_path.clone(), priority.clone())]).await
+            persist_pending_intents(&state, &[], &[], &[], &[file_path.clone()]).await
+        {
+            warn!("Failed to clear pending priority intent for {file_path}: {e}");
+        }
+    } else {
+        if let Err(e) = persist_pending_intents(
+            &state,
+            &[],
+            &[(file_path.clone(), priority.clone())],
+            &[],
+            &[],
+        )
+        .await
         {
             rollback_index_mutation(&state, snapshot).await;
             return Err(e);
@@ -1918,11 +2056,13 @@ pub async fn batch_set_priority(
             &priority,
         ));
     }
-    let (snapshot, count, hashes) = {
+    let (snapshot, count, hashes, pending_updates, hashed_paths) = {
         let mut index = state.local_index.write().await;
         let snapshot = index.all_files().to_vec();
         let mut n = 0u32;
         let mut hashes = Vec::new();
+        let mut pending_updates: Vec<(String, String)> = Vec::new();
+        let mut hashed_paths: Vec<String> = Vec::new();
         for path in &file_paths {
             let changed_paths = index.set_file_priority_by_path_count(path, &priority);
             if changed_paths > 0 {
@@ -1930,17 +2070,29 @@ pub async fn batch_set_priority(
                 if let Some(f) = index.get_by_path(path) {
                     if !f.hash.is_empty() {
                         hashes.push(f.hash.clone());
+                        hashed_paths.push(path.clone());
+                    } else {
+                        // Still hashing: record the choice as a pending
+                        // intent so it survives a restart, mirroring
+                        // `set_file_priority`.
+                        pending_updates.push((path.clone(), priority.clone()));
                     }
                 }
             }
         }
-        (snapshot, n, hashes)
+        (snapshot, n, hashes, pending_updates, hashed_paths)
     };
     if count > 0 {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
         if let Err(e) =
             persist_upload_priorities(&state.network_tx, &hashes, priority_str_to_u8(&priority))
                 .await
+        {
+            rollback_index_mutation(&state, snapshot).await;
+            return Err(e);
+        }
+        if let Err(e) =
+            persist_pending_intents(&state, &[], &pending_updates, &[], &hashed_paths).await
         {
             rollback_index_mutation(&state, snapshot).await;
             return Err(e);
@@ -2367,6 +2519,11 @@ pub async fn reload_shared_files(
         }
 
         reconcile_shared_files_best_effort(&network_tx).await;
+        if !was_cancelled {
+            // Same post-pass intent sweep as the folder-add scan above.
+            let app_state = app.state::<AppState>();
+            prune_pending_intents_for_hashed(&app_state).await;
+        }
         remove_cancel_flag_if_current(&cancel_flags, &reload_key, &cancel_flag).await;
 
         let from_known = total_files.saturating_sub(total_to_hash);
