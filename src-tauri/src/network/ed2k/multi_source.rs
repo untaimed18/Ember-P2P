@@ -4455,6 +4455,12 @@ async fn download_parts_from_source(
     // the dispatcher doesn't get repeated address-update events for
     // the same peer.
     let mut friend_seen_emitted = false;
+    // Mirrors `friend_seen_emitted`: guards `EmberPeerDiscovered` so a
+    // peer whose PoP completes mid-loop doesn't get double-fed into the
+    // mesh (once from the "PoP just succeeded" handler, once more from
+    // the later unconditional post-loop gate once its condition is also
+    // satisfied).
+    let mut mesh_discovered_emitted = false;
     let mut friend_request_sent = false;
     // FIFO of non-AUTH packets captured by `perform_ember_auth_buffered`
     // while it waited for CHALLENGE / RESPONSE frames. The uploader's
@@ -4883,6 +4889,29 @@ async fn download_parts_from_source(
                                         "Ember auth: source {} at {} verified via PoP ({} deferred packet(s) queued for replay)",
                                         _src_idx, addr, auth_deferred.len()
                                     );
+                                    // Feed the mesh now that PoP has
+                                    // verified this peer (see the gate
+                                    // comment where this is normally
+                                    // emitted right after the initial
+                                    // handshake).
+                                    if hello_caps.is_ember && !mesh_discovered_emitted {
+                                        if let std::net::IpAddr::V4(v4) = addr.ip() {
+                                            let peer_tcp = addr.port();
+                                            if peer_tcp > 0
+                                                && !crate::security::is_special_use_v4(v4)
+                                            {
+                                                if let Some(ref etx) = event_tx {
+                                                    let _ = etx
+                                                        .send(DownloadEvent::EmberPeerDiscovered {
+                                                            ip: v4,
+                                                            tcp_port: peer_tcp,
+                                                        })
+                                                        .await;
+                                                    mesh_discovered_emitted = true;
+                                                }
+                                            }
+                                        }
+                                    }
                                     // PoP done — if this peer's
                                     // ember_hash is in our friend
                                     // set, emit FriendSeen so the
@@ -5016,7 +5045,12 @@ async fn download_parts_from_source(
             );
         }
     }
-    if hello_caps.is_ember {
+    // Only feed the peer-discovery mesh once PoP has actually verified this
+    // peer's Ember identity, not merely on a self-declared `is_ember` flag
+    // from an unauthenticated OP_EMBER_HELLO (see the symmetric fix in
+    // `transfer.rs`). The `ember_auth_verified = true` sites below emit
+    // the same event once PoP completes later in the session.
+    if hello_caps.is_ember && ember_auth_verified && !mesh_discovered_emitted {
         if let std::net::IpAddr::V4(v4) = addr.ip() {
             let peer_tcp = addr.port();
             if peer_tcp > 0 && !crate::security::is_special_use_v4(v4) {
@@ -5027,6 +5061,7 @@ async fn download_parts_from_source(
                             tcp_port: peer_tcp,
                         })
                         .await;
+                    mesh_discovered_emitted = true;
                 }
             }
         }
@@ -5515,6 +5550,28 @@ async fn download_parts_from_source(
                                     "Ember auth: source {} at {} verified via PoP during file-status-wait ({} deferred packet(s) queued for replay)",
                                     _src_idx, addr, auth_deferred.len()
                                 );
+                                // Feed the mesh now that PoP has verified
+                                // this peer (see the gate comment where
+                                // this is normally emitted right after
+                                // the initial handshake).
+                                if hello_caps.is_ember && !mesh_discovered_emitted {
+                                    if let std::net::IpAddr::V4(v4) = addr.ip() {
+                                        let peer_tcp = addr.port();
+                                        if peer_tcp > 0
+                                            && !crate::security::is_special_use_v4(v4)
+                                        {
+                                            if let Some(ref etx) = event_tx {
+                                                let _ = etx
+                                                    .send(DownloadEvent::EmberPeerDiscovered {
+                                                        ip: v4,
+                                                        tcp_port: peer_tcp,
+                                                    })
+                                                    .await;
+                                                mesh_discovered_emitted = true;
+                                            }
+                                        }
+                                    }
+                                }
                                 if initial_epx_sent_generation.is_none() {
                                     let sent_gen = ember_payload_generation
                                         .load(std::sync::atomic::Ordering::Relaxed);

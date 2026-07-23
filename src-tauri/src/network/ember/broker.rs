@@ -110,6 +110,14 @@ pub struct RelayCandidate {
     pub ember_hash: Option<[u8; 16]>,
     pub last_seen: Instant,
     pub relay_sessions: u32,
+    /// Signed expiry of the ERAT this candidate was admitted with
+    /// (`RelayAttestation::expires_at_unix`). `pick_relay_candidate` checks
+    /// this directly instead of relying solely on the age-based prune
+    /// window: `RELAY_CANDIDATE_PRUNE_MAX_AGE` bounds the *maximum* ERAT
+    /// TTL, but a short-TTL attestation can cryptographically expire well
+    /// before that window elapses, and the candidate would otherwise stay
+    /// pickable (and fail relay admission) until the age prune caught up.
+    pub expires_at_unix: u64,
 }
 
 /// Execute a QUIC hole-punch connect to the given remote address.
@@ -430,13 +438,17 @@ impl ConnectionBroker {
         }
     }
 
-    /// Add a relay-capable peer discovered via EPX.
+    /// Add a relay-capable peer discovered via EPX. `expires_at_unix` must
+    /// come from the verified `RelayAttestation` this candidate was
+    /// admitted with (see `verify_relay_attestation` at the call site) —
+    /// it is the caller's job to have already checked the signature.
     pub fn add_relay_candidate(
         &mut self,
         ip: Ipv4Addr,
         port: u16,
         attestation_hash: [u8; 32],
         ember_hash: Option<[u8; 16]>,
+        expires_at_unix: u64,
     ) {
         if let Some(existing) = self
             .relay_candidates
@@ -446,6 +458,7 @@ impl ConnectionBroker {
             existing.attestation_hash = attestation_hash;
             existing.ember_hash = ember_hash;
             existing.last_seen = Instant::now();
+            existing.expires_at_unix = expires_at_unix;
             return;
         }
         const MAX_RELAY_CANDIDATES: usize = 50;
@@ -468,14 +481,29 @@ impl ConnectionBroker {
             ember_hash,
             last_seen: Instant::now(),
             relay_sessions: 0,
+            expires_at_unix,
         });
     }
 
     /// Pick the best available relay candidate (fewest sessions, most recent).
+    ///
+    /// Filters on both the age-based `RELAY_CANDIDATE_PICK_MAX_AGE` window
+    /// *and* the candidate's own signed `expires_at_unix` — the age window
+    /// alone is only an upper bound (aligned to the max ERAT TTL); a
+    /// short-TTL attestation can expire well before it, and picking an
+    /// already-expired candidate just wastes a relay attempt that the
+    /// peer's own `accepts_attestation_hash` will reject anyway.
     fn pick_relay_candidate(&self) -> Option<&RelayCandidate> {
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         self.relay_candidates
             .iter()
-            .filter(|c| c.last_seen.elapsed() < RELAY_CANDIDATE_PICK_MAX_AGE)
+            .filter(|c| {
+                c.last_seen.elapsed() < RELAY_CANDIDATE_PICK_MAX_AGE
+                    && c.expires_at_unix > now_unix
+            })
             .min_by_key(|c| (c.relay_sessions, c.last_seen.elapsed().as_secs()))
     }
 
@@ -506,9 +534,16 @@ impl ConnectionBroker {
             }
         }
 
-        // Prune stale relay candidates (aligned with ERAT max TTL).
-        self.relay_candidates
-            .retain(|c| c.last_seen.elapsed() < RELAY_CANDIDATE_PRUNE_MAX_AGE);
+        // Prune stale relay candidates (aligned with ERAT max TTL) and any
+        // whose own signed expiry has already passed, even if still within
+        // the age window (a short-TTL ERAT expires before the max-age bound).
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.relay_candidates.retain(|c| {
+            c.last_seen.elapsed() < RELAY_CANDIDATE_PRUNE_MAX_AGE && c.expires_at_unix > now_unix
+        });
 
         // Prune old cooldowns
         self.cooldowns
@@ -650,17 +685,25 @@ mod tests {
         }
     }
 
+    fn unix_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
     #[test]
     fn relay_candidate_management() {
         let (tx, _rx) = mpsc::channel(16);
         let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
+        let future_expiry = unix_now() + 600;
 
-        broker.add_relay_candidate(Ipv4Addr::new(1, 1, 1, 1), 4662, [1u8; 32], None);
-        broker.add_relay_candidate(Ipv4Addr::new(2, 2, 2, 2), 4663, [2u8; 32], None);
+        broker.add_relay_candidate(Ipv4Addr::new(1, 1, 1, 1), 4662, [1u8; 32], None, future_expiry);
+        broker.add_relay_candidate(Ipv4Addr::new(2, 2, 2, 2), 4663, [2u8; 32], None, future_expiry);
         assert_eq!(broker.relay_candidate_count(), 2);
 
         // Duplicate is deduplicated
-        broker.add_relay_candidate(Ipv4Addr::new(1, 1, 1, 1), 4662, [3u8; 32], None);
+        broker.add_relay_candidate(Ipv4Addr::new(1, 1, 1, 1), 4662, [3u8; 32], None, future_expiry);
         assert_eq!(broker.relay_candidate_count(), 2);
         assert_eq!(
             broker
@@ -673,6 +716,38 @@ mod tests {
 
         let picked = broker.pick_relay_candidate();
         assert!(picked.is_some());
+    }
+
+    /// A candidate whose signed `expires_at_unix` has already passed must
+    /// never be picked, even though it's well within the age-based
+    /// `RELAY_CANDIDATE_PICK_MAX_AGE` window — the age window is only an
+    /// upper bound (aligned to the max ERAT TTL), not a substitute for
+    /// checking the attestation's own shorter-lived expiry.
+    #[test]
+    fn pick_relay_candidate_skips_expired_attestation() {
+        let (tx, _rx) = mpsc::channel(16);
+        let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
+
+        broker.add_relay_candidate(
+            Ipv4Addr::new(9, 9, 9, 9),
+            4662,
+            [9u8; 32],
+            None,
+            unix_now().saturating_sub(1),
+        );
+        assert_eq!(broker.relay_candidate_count(), 1);
+        assert!(broker.pick_relay_candidate().is_none());
+
+        // A fresh, unexpired candidate is still pickable.
+        broker.add_relay_candidate(
+            Ipv4Addr::new(8, 8, 8, 8),
+            4662,
+            [8u8; 32],
+            None,
+            unix_now() + 600,
+        );
+        let picked = broker.pick_relay_candidate();
+        assert_eq!(picked.map(|c| c.ip), Some(Ipv4Addr::new(8, 8, 8, 8)));
     }
 
     #[tokio::test]

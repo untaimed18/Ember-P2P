@@ -944,6 +944,12 @@ impl Ed2kDownload {
         // session so the dispatcher doesn't get repeated address-
         // update events for the same peer.
         let mut friend_seen_emitted = false;
+        // Mirrors `friend_seen_emitted`: guards `EmberPeerDiscovered` so a
+        // peer whose PoP completes mid-loop doesn't get double-fed into
+        // the mesh (once from the "PoP just succeeded" handler, once more
+        // from the later unconditional post-loop gate once its condition
+        // is also satisfied).
+        let mut mesh_discovered_emitted = false;
         let mut friend_request_sent = false;
         // FIFO of non-AUTH packets captured by
         // `perform_ember_auth_buffered` while it waited for CHALLENGE /
@@ -1041,8 +1047,15 @@ impl Ed2kDownload {
                 peer_supports_aich = peer_caps.supports_aich;
                 peer_extended_requests_ver = peer_caps.extended_requests_ver;
                 peer_secure_ident_level = peer_caps.secure_ident_level;
-                peer_is_ember = peer_caps.is_ember;
-                peer_ember_hash = peer_caps.ember_hash;
+                // `is_ember` / `ember_hash` are sourced exclusively from
+                // `OP_EMBER_HELLO` / `OP_EMBER_HELLOANSWER` — `parse_emule_info`
+                // never sets either field (see `messages.rs`). `peer_caps` is
+                // re-derived from `initial_caps` on every EmuleInfo packet, so
+                // assigning from it here used to clobber a `peer_is_ember =
+                // true` / `peer_ember_hash = Some(..)` that an earlier
+                // OP_EMBER_HELLO had already established, silently disabling
+                // EPX and friend detection for the rest of the session
+                // whenever EmuleInfo arrived after Hello (the common case).
                 client_software_label = client_software_from_caps(&peer_caps);
                 if !peer_caps.peer_name.is_empty() {
                     peer_name_label = peer_caps.peer_name.clone();
@@ -1090,8 +1103,15 @@ impl Ed2kDownload {
                 peer_supports_aich = peer_caps.supports_aich;
                 peer_extended_requests_ver = peer_caps.extended_requests_ver;
                 peer_secure_ident_level = peer_caps.secure_ident_level;
-                peer_is_ember = peer_caps.is_ember;
-                peer_ember_hash = peer_caps.ember_hash;
+                // `is_ember` / `ember_hash` are sourced exclusively from
+                // `OP_EMBER_HELLO` / `OP_EMBER_HELLOANSWER` — `parse_emule_info`
+                // never sets either field (see `messages.rs`). `peer_caps` is
+                // re-derived from `initial_caps` on every EmuleInfo packet, so
+                // assigning from it here used to clobber a `peer_is_ember =
+                // true` / `peer_ember_hash = Some(..)` that an earlier
+                // OP_EMBER_HELLO had already established, silently disabling
+                // EPX and friend detection for the rest of the session
+                // whenever EmuleInfo arrived after Hello (the common case).
                 client_software_label = client_software_from_caps(&peer_caps);
                 if !peer_caps.peer_name.is_empty() {
                     peer_name_label = peer_caps.peer_name.clone();
@@ -1282,8 +1302,11 @@ impl Ed2kDownload {
                     peer_supports_aich = peer_caps.supports_aich;
                     peer_extended_requests_ver = peer_caps.extended_requests_ver;
                     peer_secure_ident_level = peer_caps.secure_ident_level;
-                    peer_is_ember = peer_caps.is_ember;
-                    peer_ember_hash = peer_caps.ember_hash;
+                    // `is_ember` / `ember_hash` come from `OP_EMBER_HELLO` /
+                    // `OP_EMBER_HELLOANSWER` only — see the identical
+                    // rationale above (`parse_emule_info` never sets either
+                    // field, so assigning from `peer_caps` here would
+                    // clobber an already-established Ember identity).
                     client_software_label = client_software_from_caps(&peer_caps);
                     if !peer_caps.peer_name.is_empty() {
                         peer_name_label = peer_caps.peer_name.clone();
@@ -1543,6 +1566,29 @@ impl Ed2kDownload {
                                             self.source_addr,
                                             auth_deferred.len()
                                         );
+                                        // Feed the mesh now that PoP has
+                                        // verified this peer (see the
+                                        // gate comment above where this
+                                        // was previously emitted
+                                        // unconditionally on `is_ember`).
+                                        if !mesh_discovered_emitted {
+                                            if let std::net::IpAddr::V4(v4) =
+                                                self.source_addr.ip()
+                                            {
+                                                let peer_tcp = self.source_addr.port();
+                                                if peer_tcp > 0
+                                                    && !crate::security::is_special_use_v4(v4)
+                                                {
+                                                    let _ = event_tx
+                                                        .send(DownloadEvent::EmberPeerDiscovered {
+                                                            ip: v4,
+                                                            tcp_port: peer_tcp,
+                                                        })
+                                                        .await;
+                                                    mesh_discovered_emitted = true;
+                                                }
+                                            }
+                                        }
                                         // Pre-control PoP runs before
                                         // `peer_is_friend` is bound,
                                         // so re-check `friend_hashes`
@@ -1656,7 +1702,17 @@ impl Ed2kDownload {
                 initial_epx_sent_generation = Some(sent_gen);
             }
         }
-        if peer_is_ember {
+        // Only feed the peer-discovery mesh once PoP has actually verified
+        // this peer's Ember identity, not merely on a self-declared
+        // `is_ember` flag from an unauthenticated OP_EMBER_HELLO. Before
+        // this gate, any peer could get itself broadcast into every other
+        // Ember node's mesh (and thus dialed) just by claiming `is_ember`,
+        // without ever proving key possession — a cheap amplification/
+        // pollution vector. The `ember_auth_verified = true` sites below
+        // emit the same event once PoP completes later in the session, so
+        // legitimate peers are still discovered — just not before they've
+        // proven it.
+        if peer_is_ember && ember_auth_verified && !mesh_discovered_emitted {
             if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
                 let peer_tcp = self.source_addr.port();
                 if peer_tcp > 0 && !crate::security::is_special_use_v4(v4) {
@@ -1666,6 +1722,7 @@ impl Ed2kDownload {
                             tcp_port: peer_tcp,
                         })
                         .await;
+                    mesh_discovered_emitted = true;
                 }
             }
         }
@@ -1855,8 +1912,11 @@ impl Ed2kDownload {
                     merge_caps(&mut peer_caps, parse_emule_info(&payload));
                     let peer_udp = peer_caps.udp_port;
                     peer_supports_large_files = peer_caps.supports_large_files;
-                    peer_is_ember = peer_caps.is_ember;
-                    peer_ember_hash = peer_caps.ember_hash;
+                    // `is_ember` / `ember_hash` come from `OP_EMBER_HELLO` /
+                    // `OP_EMBER_HELLOANSWER` only — see the identical
+                    // rationale above (`parse_emule_info` never sets either
+                    // field, so assigning from `peer_caps` here would
+                    // clobber an already-established Ember identity).
                     client_software_label = client_software_from_caps(&peer_caps);
                     if !peer_caps.peer_name.is_empty() {
                         peer_name_label = peer_caps.peer_name.clone();
@@ -2164,6 +2224,29 @@ impl Ed2kDownload {
                                             self.source_addr,
                                             auth_deferred.len()
                                         );
+                                        // Feed the mesh now that PoP has
+                                        // verified this peer (see the
+                                        // gate comment where this is
+                                        // normally emitted right after
+                                        // the initial handshake).
+                                        if !mesh_discovered_emitted {
+                                            if let std::net::IpAddr::V4(v4) =
+                                                self.source_addr.ip()
+                                            {
+                                                let peer_tcp = self.source_addr.port();
+                                                if peer_tcp > 0
+                                                    && !crate::security::is_special_use_v4(v4)
+                                                {
+                                                    let _ = event_tx
+                                                        .send(DownloadEvent::EmberPeerDiscovered {
+                                                            ip: v4,
+                                                            tcp_port: peer_tcp,
+                                                        })
+                                                        .await;
+                                                    mesh_discovered_emitted = true;
+                                                }
+                                            }
+                                        }
                                         if initial_epx_sent_generation.is_none() {
                                             let sent_gen = self
                                                 .ember_payload_generation

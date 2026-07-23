@@ -724,6 +724,52 @@ fn prune_stale_ember_peers_at(
     map.retain(|_, ts| now.duration_since(*ts) < KNOWN_EMBER_PEER_TTL);
 }
 
+/// Rolling window for the UDP EPX rate limit. Chosen to match the TCP EPX
+/// re-send cadence (`EPX_RESEND_INTERVAL` in transfer.rs/upload.rs/
+/// multi_source.rs) so a well-behaved peer requesting a fresh exchange
+/// roughly once per rebuild cycle never trips it.
+const EPX_UDP_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+/// Hard cap on `NetworkState::ember_udp_epx_rate` size, bounding memory
+/// under a flood of distinct source addresses.
+const MAX_EMBER_UDP_EPX_RATE_ENTRIES: usize = 2000;
+
+/// Returns `true` if `addr` is still under `ember::MAX_EPX_PACKETS_PER_CONNECTION`
+/// accepted `ExchangeData` packets within the current `EPX_UDP_RATE_WINDOW`,
+/// and records this acceptance. TCP EPX gets this cap for free from
+/// `MAX_EPX_PACKETS_PER_CONNECTION` resetting whenever the TCP connection
+/// closes; a Noise_IK UDP session has no such natural connection boundary,
+/// so an authenticated peer could otherwise send unlimited `ExchangeData`
+/// packets bounded only by `MAX_EPX_TOTAL_SOURCES` per packet.
+fn check_and_record_udp_epx_rate(
+    map: &mut HashMap<SocketAddr, (u32, std::time::Instant)>,
+    addr: SocketAddr,
+) -> bool {
+    let now = std::time::Instant::now();
+    if let Some((count, window_start)) = map.get_mut(&addr) {
+        if now.duration_since(*window_start) >= EPX_UDP_RATE_WINDOW {
+            *count = 1;
+            *window_start = now;
+            return true;
+        }
+        if *count >= ember::MAX_EPX_PACKETS_PER_CONNECTION as u32 {
+            return false;
+        }
+        *count += 1;
+        return true;
+    }
+    if map.len() >= MAX_EMBER_UDP_EPX_RATE_ENTRIES {
+        if let Some(oldest_key) = map
+            .iter()
+            .min_by_key(|(_, (_, ts))| *ts)
+            .map(|(k, _)| *k)
+        {
+            map.remove(&oldest_key);
+        }
+    }
+    map.insert(addr, (1, now));
+    true
+}
+
 /// Insert or refresh an Ember Noise pubkey for `(ip, port)`. Mirrors
 /// `record_known_ember_peer`'s LRU-by-timestamp eviction policy at the
 /// `MAX_KNOWN_EMBER_NOISE_KEYS` cap.
@@ -861,6 +907,7 @@ async fn handle_epx_sources(
     state: &mut NetworkState,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
+    local_index: &Arc<RwLock<LocalIndex>>,
     entries: &[([u8; 16], Vec<(Ipv4Addr, u16, u16, u8)>)],
     aich_roots: &[([u8; 16], [u8; 20])],
     ember_peers: &[(Ipv4Addr, u16)],
@@ -898,6 +945,7 @@ async fn handle_epx_sources(
                 attestation.relay_port,
                 hash,
                 relay_ember_hash,
+                attestation.expires_at_unix,
             );
         }
     }
@@ -1041,14 +1089,31 @@ async fn handle_epx_sources(
             );
             continue;
         }
-        let matches_trusted = state
-            .aich_hash_sets
-            .iter()
-            .any(|hs| hs.root_hash == *aich_root);
+        // L-EPX-AICH: `aich_hash_sets` is a flat list of recovery trees for
+        // *all* of our own locally-known files with no ed2k-hash binding —
+        // checking only `root_hash` membership let a peer pair a real root
+        // belonging to an unrelated file we happen to have locally with an
+        // arbitrary `file_hash`, poisoning that download's trusted AICH
+        // master (recovery-DoS: every genuine block then fails to verify
+        // against the wrong tree). Require the match to be specific to
+        // *this* ed2k hash: only trust the EPX root when our own local
+        // index's record for this exact file already carries the same
+        // AICH root (populated once we've hashed/verified the file
+        // ourselves — see the `aich_root_map` seeding in the EPX-rebuild
+        // timer). Anything else is deferred, never pinned.
+        let hash_hex = hex::encode(file_hash);
+        let matches_trusted = {
+            let index = local_index.read().await;
+            index.get_by_hash(&hash_hex).is_some_and(|fi| {
+                hex::decode(&fi.aich_hash)
+                    .ok()
+                    .is_some_and(|b| b.len() == 20 && b == aich_root)
+            })
+        };
         if matches_trusted {
             state.aich_root_map.insert(*file_hash, *aich_root);
             tracing::debug!(
-                "EPX: pinned AICH root {} for file {} (matches known hashset)",
+                "EPX: pinned AICH root {} for file {} (matches our own local index record for this hash)",
                 hex::encode(aich_root),
                 hex::encode(file_hash)
             );
@@ -5144,6 +5209,15 @@ struct NetworkState {
     /// cache (one ping per peer) instead of re-pinging the same freshest
     /// few every cycle. Only consulted while the table is still sparse.
     ember_kad_bridge_attempted: HashSet<(Ipv4Addr, u16)>,
+    /// Per-peer rate limit for UDP EPX `ExchangeData` ingestion —
+    /// `(accepted_count_in_window, window_start)`. Unlike TCP EPX, which
+    /// resets `MAX_EPX_PACKETS_PER_CONNECTION` naturally when the TCP
+    /// connection closes, an authenticated Noise_IK UDP session has no
+    /// "connection" to bound the count, so a single IK-authenticated peer
+    /// could otherwise send unlimited `ExchangeData` packets. Bounded by
+    /// `MAX_EMBER_UDP_EPX_RATE_ENTRIES` with LRU-by-window-start eviction,
+    /// mirroring `known_ember_peers`.
+    ember_udp_epx_rate: HashMap<SocketAddr, (u32, std::time::Instant)>,
     /// Diagnostic counters surfaced via `get_ember_diagnostics`. Increment
     /// from inside `network/mod.rs` (EPX events, peer-count snapshots) or
     /// from `ConnectionBroker::stats()` for broker-owned counters.
@@ -8328,6 +8402,7 @@ pub async fn start_network(
         known_ember_peers: HashMap::new(),
         ember_noise_keys: HashMap::new(),
         ember_kad_bridge_attempted: HashSet::new(),
+        ember_udp_epx_rate: HashMap::new(),
         ember_diagnostics: EmberDiagnostics::default(),
         antileech: shared_antileech.clone(),
         aich_root_map: HashMap::new(),
@@ -10205,6 +10280,7 @@ pub async fn start_network(
                                     &mut state,
                                     &transfer_manager,
                                     &source_manager,
+                                    &local_index,
                                     &shared_ember_payload,
                                 ).await;
                             }
@@ -10262,6 +10338,7 @@ pub async fn start_network(
                                         &mut state,
                                         &transfer_manager,
                                         &source_manager,
+                                        &local_index,
                                         &shared_ember_payload,
                                     ).await;
                                 }
@@ -11203,7 +11280,7 @@ pub async fn start_network(
                 }
                 // Inject Ember Peer Exchange sources into matching active downloads
                 if let DownloadEvent::EmberSources { ref transfer_id, ref entries, ref aich_roots, ref ember_peers, ref relay_attestations } = event {
-                    handle_epx_sources(&mut state, &transfer_manager, &source_manager, entries, aich_roots, ember_peers, relay_attestations, &format!("download {transfer_id}")).await;
+                    handle_epx_sources(&mut state, &transfer_manager, &source_manager, &local_index, entries, aich_roots, ember_peers, relay_attestations, &format!("download {transfer_id}")).await;
                 }
 
                 if let DownloadEvent::EmberPeerDiscovered { ip, tcp_port } = event {
@@ -11983,7 +12060,7 @@ pub async fn start_network(
 
                 // Inject Ember Peer Exchange sources from upload-side peers
                 if let UploadEventKind::EmberSources { ref entries, ref aich_roots, ref ember_peers, ref relay_attestations } = event.kind {
-                    handle_epx_sources(&mut state, &transfer_manager, &source_manager, entries, aich_roots, ember_peers, relay_attestations, "upload").await;
+                    handle_epx_sources(&mut state, &transfer_manager, &source_manager, &local_index, entries, aich_roots, ember_peers, relay_attestations, "upload").await;
                 }
 
                 if let UploadEventKind::EmberPeerDiscovered { ip, tcp_port } = event.kind {
@@ -26150,6 +26227,7 @@ fn ember_udp_recv_allowed(state: &mut NetworkState, from: SocketAddr) -> bool {
 /// while processing one packet must never tear down the whole network event
 /// loop (which would be a remote DoS), so we catch it, log it, and let the
 /// loop continue with the next event.
+#[allow(clippy::too_many_arguments)]
 async fn handle_ember_native_udp(
     socket: &UdpSocket,
     data: &[u8],
@@ -26157,6 +26235,7 @@ async fn handle_ember_native_udp(
     state: &mut NetworkState,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
+    local_index: &Arc<RwLock<LocalIndex>>,
     shared_ember_payload: &ember::SharedEmberPayload,
 ) {
     if let Err(p) = std::panic::AssertUnwindSafe(handle_ember_native_udp_inner(
@@ -26166,6 +26245,7 @@ async fn handle_ember_native_udp(
         state,
         transfer_manager,
         source_manager,
+        local_index,
         shared_ember_payload,
     ))
     .catch_unwind()
@@ -26178,6 +26258,7 @@ async fn handle_ember_native_udp(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_ember_native_udp_inner(
     socket: &UdpSocket,
     data: &[u8],
@@ -26185,6 +26266,7 @@ async fn handle_ember_native_udp_inner(
     state: &mut NetworkState,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
+    local_index: &Arc<RwLock<LocalIndex>>,
     shared_ember_payload: &ember::SharedEmberPayload,
 ) {
     use ember::transport::EmberControlMessage;
@@ -26249,6 +26331,27 @@ async fn handle_ember_native_udp_inner(
             // of `shared_ember_payload` ends before we touch
             // `state.ember_transport` mutably.
             let payload_arc = shared_ember_payload.read().await.clone();
+            // `MAX_EPX_PAYLOAD` (64KB, ember/mod.rs) is sized for the TCP
+            // EPX path, which has no per-datagram ceiling. UDP EPX shares
+            // the same builder output but must fit inside a single Ember
+            // UDP datagram (`MAX_EMBER_DATAGRAM_BYTES`) after the 2-byte
+            // control header and Noise AEAD/framing overhead — there is no
+            // fragmentation here. A realistic EPX body (many files/
+            // sources/peers/ERAT) routinely exceeds that budget; sending
+            // it as-is used to look like a successful reply while
+            // `process_incoming` silently dropped the oversized datagram,
+            // undecrypted, on the peer's side. Skip the send (log only)
+            // rather than transmit something we know can't arrive.
+            const EPX_UDP_OVERHEAD_BUDGET: usize = 64;
+            let epx_udp_budget =
+                ember::transport::MAX_EMBER_DATAGRAM_BYTES.saturating_sub(EPX_UDP_OVERHEAD_BUDGET);
+            if payload_arc.len() > epx_udp_budget {
+                debug!(
+                    "ember-udp: EPX payload too large for a single UDP datagram ({} bytes > {epx_udp_budget} budget); skipping ExchangeData reply to {from}",
+                    payload_arc.len(),
+                );
+                return;
+            }
             let msg = EmberControlMessage::ExchangeData {
                 payload: (*payload_arc).clone(),
             }
@@ -26279,6 +26382,14 @@ async fn handle_ember_native_udp_inner(
                 );
                 return;
             }
+            if !check_and_record_udp_epx_rate(&mut state.ember_udp_epx_rate, from) {
+                debug!(
+                    "ember-udp: rate-limiting EPX ExchangeData from {from} ({} per {:?} window)",
+                    ember::MAX_EPX_PACKETS_PER_CONNECTION,
+                    EPX_UDP_RATE_WINDOW,
+                );
+                return;
+            }
             state.ember_diagnostics.ember_exchange_received = state
                 .ember_diagnostics
                 .ember_exchange_received
@@ -26300,6 +26411,7 @@ async fn handle_ember_native_udp_inner(
                         state,
                         transfer_manager,
                         source_manager,
+                        local_index,
                         &entries,
                         &aich_roots,
                         &ember_peers,
@@ -27884,6 +27996,7 @@ async fn handle_udp_packet_inner(
                     state,
                     transfer_manager,
                     source_manager,
+                    local_index,
                     shared_ember_payload,
                 )
                 .await;

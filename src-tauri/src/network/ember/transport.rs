@@ -55,7 +55,12 @@ const REPLAY_WINDOW_BITS: u64 = 64;
 /// Largest Ember UDP datagram we will parse. Valid Noise handshake and
 /// transport packets are far smaller than this; the cap prevents an oversized
 /// UDP datagram from driving proportional allocation during handshake parsing.
-const MAX_EMBER_DATAGRAM_BYTES: usize = 4096;
+///
+/// `pub(crate)` so send-side callers (the EPX `ExchangeData` reply in
+/// `network/mod.rs`) can size-check a plaintext payload against the same
+/// cap this module enforces on receive, instead of duplicating the magic
+/// number and risking drift.
+pub(crate) const MAX_EMBER_DATAGRAM_BYTES: usize = 4096;
 
 /// An established encrypted session with a remote peer.
 ///

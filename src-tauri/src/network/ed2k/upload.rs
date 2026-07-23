@@ -4577,7 +4577,12 @@ impl UploadHandler {
         // peer harvest our source/mesh hints, and peers that PoP-gate
         // ingest would drop the packet anyway.
         let mut epx_sent_after_pop = false;
-        if hello_caps.is_ember {
+        // Only feed the peer-discovery mesh once PoP has actually verified
+        // this peer's Ember identity, not merely on a self-declared
+        // `is_ember` flag from an unauthenticated OP_EMBER_HELLO — mirrors
+        // the EPX-send gate immediately above. The `OP_EMBER_AUTH_RESPONSE`
+        // handler below emits the same event once PoP completes.
+        if hello_caps.is_ember && ember_auth_state.is_verified() {
             if let std::net::IpAddr::V4(v4) = peer_addr.ip() {
                 if hello_caps.tcp_port > 0 && !crate::security::is_special_use_v4(v4) {
                     let _ = self
@@ -5997,6 +6002,29 @@ impl UploadHandler {
                         let rank = if let Some(pos) =
                             queue.iter().position(|e| e.identity == queue_identity)
                         {
+                            // `queue_identity` is keyed on the peer's bare,
+                            // wire-visible `user_hash` (unauthenticated —
+                            // no cryptographic binding). A *different*
+                            // TCP session — this peer reconnecting, or an
+                            // entirely different peer claiming the same
+                            // hash — can reclaim this same entry. Detect
+                            // that by comparing the stored `current_addr`
+                            // (cleared to `None` on disconnect) against
+                            // this session's address *before* overwriting
+                            // it: a mismatch (or `None`) means the entry's
+                            // `is_friend_slot`/`ember_verified` — which
+                            // encode "this session proved PoP" — belong to
+                            // a session that is not the one in front of us
+                            // now, and must not be inherited. Without this,
+                            // any subsequent connection claiming a
+                            // once-verified `user_hash` would get friend-
+                            // slot priority and Ember credit-ratio scoring
+                            // without ever proving key possession itself.
+                            let same_session = queue[pos].current_addr == Some(peer_addr);
+                            if !same_session {
+                                queue[pos].is_friend_slot = false;
+                                queue[pos].ember_verified = false;
+                            }
                             queue[pos].current_addr = Some(peer_addr);
                             queue[pos].last_ip = Some(peer_addr.ip());
                             queue[pos].udp_port = hello_caps.udp_port;
@@ -6009,15 +6037,21 @@ impl UploadHandler {
                             // If the peer has since completed PoP, upgrade
                             // an existing queue entry's friend-slot flag
                             // (it may have been added while auth was still
-                            // pending). Never downgrade: if the entry is
-                            // already marked is_friend_slot from a prior
-                            // verified state on the same session, leave it.
+                            // pending). Never downgrade within the same
+                            // session: if the entry is already marked
+                            // is_friend_slot from a prior verified state on
+                            // the same session, leave it — but a session
+                            // change already reset it to `false` above, so
+                            // this can only re-arm from this session's own
+                            // live verification state.
                             if is_verified_friend {
                                 queue[pos].is_friend_slot = true;
                             }
                             let ember_verified = ember_auth_state.is_verified();
                             queue[pos].ember_verified |= ember_verified;
-                            if queue[pos].ember_pubkey.is_none() {
+                            if !same_session {
+                                queue[pos].ember_pubkey = hello_caps.ember_pubkey;
+                            } else if queue[pos].ember_pubkey.is_none() {
                                 queue[pos].ember_pubkey = hello_caps.ember_pubkey;
                             }
                             let my_score = score_queue_entry(
@@ -7338,6 +7372,34 @@ impl UploadHandler {
                             if let Some(entry) =
                                 queue.iter_mut().find(|e| e.identity == queue_identity)
                             {
+                                // This re-admission site assumed the found
+                                // entry always belongs to *this* session
+                                // (re-queuing itself after its own active
+                                // slot ended), but `queue_identity` is
+                                // still just the bare, unauthenticated
+                                // `user_hash`: while this session was
+                                // actively uploading, its own queue row was
+                                // removed (see the grant path above), which
+                                // leaves a window for an unrelated
+                                // connection claiming the same `user_hash`
+                                // to push a *fresh, unverified* row for
+                                // that identity. If this session's active
+                                // slot then rotates out (byte/time cap or
+                                // score-based preemption) and lands here,
+                                // it would find that other connection's row
+                                // and hand it this session's own
+                                // `is_friend_slot`/`ember_verified` state —
+                                // exactly the cross-session flag leak fixed
+                                // above at the initial queue-insertion site,
+                                // just reachable via a different path. Same
+                                // fix: only trust/preserve the row's
+                                // existing flags if it's still addressed to
+                                // this session.
+                                let same_session = entry.current_addr == Some(peer_addr);
+                                if !same_session {
+                                    entry.is_friend_slot = false;
+                                    entry.ember_verified = false;
+                                }
                                 entry.current_addr = Some(peer_addr);
                                 entry.last_ip = Some(peer_addr.ip());
                                 entry.udp_port = hello_caps.udp_port;
@@ -7354,14 +7416,18 @@ impl UploadHandler {
                                 // the Ember verification snapshot. As
                                 // with `is_friend_slot` we only
                                 // upgrade (NotStarted → Verified)
-                                // here, never downgrade — once a
-                                // peer has completed PoP on a
-                                // session the queue entry keeps
-                                // that fact through re-admission.
+                                // here, never downgrade within the
+                                // same session — once a peer has
+                                // completed PoP on a session the
+                                // queue entry keeps that fact through
+                                // re-admission (a session change
+                                // already reset it to `false` above).
                                 if ember_auth_state.is_verified() {
                                     entry.ember_verified = true;
                                 }
-                                if entry.ember_pubkey.is_none() {
+                                if !same_session {
+                                    entry.ember_pubkey = hello_caps.ember_pubkey;
+                                } else if entry.ember_pubkey.is_none() {
                                     entry.ember_pubkey = hello_caps.ember_pubkey;
                                 }
                                 true
@@ -8380,6 +8446,28 @@ impl UploadHandler {
                     match outcome {
                         Ok(()) => {
                             info!("Ember auth (responder): peer {peer_addr} verified (proof of possession)");
+                            // Feed the mesh now that PoP has verified this
+                            // peer (see the gate comment above the
+                            // now-dead-at-connect-time `is_ember`-only
+                            // emit near the top of this function).
+                            if hello_caps.is_ember {
+                                if let std::net::IpAddr::V4(v4) = peer_addr.ip() {
+                                    if hello_caps.tcp_port > 0
+                                        && !crate::security::is_special_use_v4(v4)
+                                    {
+                                        let _ = self
+                                            .upload_event_tx
+                                            .send(UploadEvent {
+                                                transfer_id: String::new(),
+                                                kind: UploadEventKind::EmberPeerDiscovered {
+                                                    ip: v4,
+                                                    tcp_port: hello_caps.tcp_port,
+                                                },
+                                            })
+                                            .await;
+                                    }
+                                }
+                            }
                             // First EPX push after PoP — mirrors download
                             // paths that only share sources once the peer
                             // has proven possession of its Ember identity.

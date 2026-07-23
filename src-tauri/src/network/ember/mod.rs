@@ -139,6 +139,22 @@ pub fn build_exchange_payload_with_relay_attestations(
     peers: &[EmberPeer],
     relay_attestations: &[RelayAttestation],
 ) -> Vec<u8> {
+    // Reserve room for the ERAT trailer *before* packing files/peers so a
+    // busy node with many file/source entries can't starve its own relay
+    // advertisement. Previously files were packed all the way to
+    // `MAX_EPX_PAYLOAD - 2` (leaving headroom only for the peer count) and
+    // `append_relay_attestations` silently dropped the *entire* trailer if
+    // it didn't fit afterward — a peer could advertise
+    // `SOURCE_FLAG_RELAY_CAPABLE` while its ERAT never made it onto the
+    // wire, and the broker only ever admits a relay candidate via a
+    // verified trailer, never the flag alone.
+    let attestation_count = relay_attestations.len().min(MAX_RELAY_ATTESTATIONS);
+    let attestations_reserve = if attestation_count == 0 {
+        0
+    } else {
+        4 + 1 + 2 + attestation_count * RELAY_ATTESTATION_FIXED_SIZE
+    };
+
     let file_count = entries.len().min(MAX_EPX_FILES);
     let mut buf = Vec::with_capacity(3 + file_count * V3_FILE_ENTRY_HEADER_SIZE);
     buf.write_u8(EPX_VERSION).unwrap();
@@ -151,7 +167,7 @@ pub fn build_exchange_payload_with_relay_attestations(
         let aich_size = if entry.aich_root.is_some() { 20 } else { 0 };
         let entry_size = V3_FILE_ENTRY_HEADER_SIZE + aich_size + src_count * V3_SOURCE_ENTRY_SIZE;
 
-        if buf.len() + entry_size > MAX_EPX_PAYLOAD - 2 {
+        if buf.len() + entry_size > MAX_EPX_PAYLOAD - 2 - attestations_reserve {
             break;
         }
 
@@ -182,10 +198,10 @@ pub fn build_exchange_payload_with_relay_attestations(
     buf[file_count_pos] = (files_written & 0xFF) as u8;
     buf[file_count_pos + 1] = ((files_written >> 8) & 0xFF) as u8;
 
-    // Peer discovery section
+    // Peer discovery section — also reserve the ERAT trailer's space.
     let peer_count = peers.len().min(MAX_EPX_PEERS);
     let peers_size = 2 + peer_count * 6;
-    if buf.len() + peers_size <= MAX_EPX_PAYLOAD {
+    if buf.len() + peers_size + attestations_reserve <= MAX_EPX_PAYLOAD {
         buf.write_u16::<LittleEndian>(peer_count as u16).unwrap();
         for peer in peers.iter().take(peer_count) {
             buf.write_all(&peer.ip.octets()).unwrap();
@@ -194,7 +210,7 @@ pub fn build_exchange_payload_with_relay_attestations(
     } else {
         if peer_count > 0 {
             tracing::debug!(
-                "EPX builder: dropping {peer_count} peer(s) — payload already at {}B, size cap is {MAX_EPX_PAYLOAD}B",
+                "EPX builder: dropping {peer_count} peer(s) — payload already at {}B, size cap is {MAX_EPX_PAYLOAD}B (reserving {attestations_reserve}B for ERAT)",
                 buf.len()
             );
         }
@@ -284,17 +300,35 @@ pub fn verify_relay_attestation(attestation: &RelayAttestation, now_unix: u64) -
 }
 
 fn append_relay_attestations(buf: &mut Vec<u8>, attestations: &[RelayAttestation]) {
-    let count = attestations.len().min(MAX_RELAY_ATTESTATIONS);
+    let mut count = attestations.len().min(MAX_RELAY_ATTESTATIONS);
     if count == 0 {
         return;
     }
-    let trailer_size = 4 + 1 + 2 + count * RELAY_ATTESTATION_FIXED_SIZE;
-    if buf.len() + trailer_size > MAX_EPX_PAYLOAD {
+    // Callers (`build_exchange_payload_with_relay_attestations`) reserve
+    // trailer space before packing files/peers, so this should always
+    // fit. Shrink to whatever *does* fit instead of dropping the whole
+    // trailer as a defensive fallback — e.g. if a caller ever builds a
+    // payload directly without going through the reservation path. A
+    // partial trailer (fewer attestations) is strictly better than an
+    // empty one: each one still verifies independently on the wire.
+    while count > 0 && buf.len() + 4 + 1 + 2 + count * RELAY_ATTESTATION_FIXED_SIZE > MAX_EPX_PAYLOAD
+    {
+        count -= 1;
+    }
+    if count == 0 {
         tracing::debug!(
-            "EPX builder: dropping {count} relay attestation(s) — payload already at {}B, trailer needs {trailer_size}B more, cap is {MAX_EPX_PAYLOAD}B",
+            "EPX builder: dropping all {} relay attestation(s) — payload already at {}B, cap is {MAX_EPX_PAYLOAD}B",
+            attestations.len(),
             buf.len()
         );
         return;
+    }
+    if count < attestations.len().min(MAX_RELAY_ATTESTATIONS) {
+        tracing::debug!(
+            "EPX builder: truncating relay attestations from {} to {count} — payload already at {}B, cap is {MAX_EPX_PAYLOAD}B",
+            attestations.len().min(MAX_RELAY_ATTESTATIONS),
+            buf.len()
+        );
     }
     buf.extend_from_slice(RELAY_ATTESTATION_MAGIC);
     buf.write_u8(RELAY_ATTESTATION_TRAILER_VERSION).unwrap();
@@ -329,16 +363,16 @@ pub fn parse_exchange_payload(data: &[u8]) -> anyhow::Result<ExchangeResult> {
 
     let mut cursor = Cursor::new(data);
     let version = cursor.read_u8()?;
-    // L14: reject `version=0` explicitly. The previous match
-    // collapsed `version=0` into the v2 branch (because the only
-    // hardcoded branch was `if version >= 3`), which was
-    // accidental forward-compat — v0 was never a deployed wire
-    // format. A peer that sends `version=0` is either a buggy
-    // implementation we don't want to interop with or a probe
-    // looking for parsers that fall through; either way, refusing
-    // it is honest and removes one ambiguous code path.
-    if version == 0 {
-        anyhow::bail!("EPX version 0 is reserved and not a supported wire format");
+    // L14 (extended): reject anything outside the deployed {2,3,4} range
+    // explicitly. The previous check only rejected `version == 0`; `1` fell
+    // through the same "no hardcoded branch" gap into the v2 layout via
+    // the `if version >= 3 { v3 } else { v2 }` split below — the exact
+    // ambiguous-fallthrough pattern the v0 fix was meant to eliminate, just
+    // one version number over. Version `1` was never a deployed wire
+    // format any more than `0` was, so treat it the same way: a peer
+    // sending it is either buggy or probing for a forgiving parser.
+    if version < 2 {
+        anyhow::bail!("EPX version {version} is reserved and not a supported wire format");
     }
     if version > EPX_VERSION {
         anyhow::bail!("unsupported EPX version {version} (we support up to {EPX_VERSION})");
@@ -869,6 +903,23 @@ mod tests {
         let mut payload = build_exchange_payload(&[], &[]);
         payload[0] = 99;
         assert!(parse_exchange_payload(&payload).is_err());
+    }
+
+    /// Versions `0` and `1` were never deployed wire formats. Both must be
+    /// hard-rejected rather than falling through into the v2 layout parser
+    /// (the ambiguous-fallthrough bug the `version < 2` check exists to
+    /// close — see the comment at the call site).
+    #[test]
+    fn rejects_reserved_low_versions() {
+        for bad_version in [0u8, 1u8] {
+            let mut payload = build_exchange_payload(&[], &[]);
+            payload[0] = bad_version;
+            let err = parse_exchange_payload(&payload).unwrap_err().to_string();
+            assert!(
+                err.contains("reserved"),
+                "version {bad_version} should be rejected as reserved, got: {err}"
+            );
+        }
     }
 
     #[test]
