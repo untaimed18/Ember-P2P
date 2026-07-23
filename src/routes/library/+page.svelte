@@ -137,7 +137,6 @@
       toastSuccess(m.library_collection_loaded({ name: loadedCollection.name, count: loadedCollection.files.length }));
     } catch (e: unknown) {
       toastError(toErr(e));
-      loadedCollection = null;
     } finally {
       collectionLoading = false;
     }
@@ -421,8 +420,11 @@
   async function handleRemoveMissing() {
     if (missingPathSet.size === 0) return;
     try {
+      // The materialized path set is capped at 10,000, but confirmation
+      // authorizes the loop below to remove every missing index row.
+      const count = Math.max(missingTotalCount, missingPathSet.size);
       const confirmed = await askConfirm(
-        missingPathSet.size === 1 ? m.library_confirm_remove_missing_one() : m.library_confirm_remove_missing_other({ count: missingPathSet.size }),
+        count === 1 ? m.library_confirm_remove_missing_one() : m.library_confirm_remove_missing_other({ count }),
         m.library_remove_missing_title(),
       );
       if (!confirmed) return;
@@ -1040,12 +1042,16 @@
         targets,
         (paths) => batchSetPriority(paths, priority),
       );
-      await refresh();
       toastSuccess(count === 1
         ? m.library_set_priority_one({ priority: priorityLabel(priority) })
         : m.library_set_priority_other({ priority: priorityLabel(priority), count }));
     } catch (e: unknown) { error = toErr(e); }
-    finally { bulkBusy = false; }
+    finally {
+      // Earlier batches may have committed before a later IPC batch failed.
+      // Always reconcile the table with the backend, not only on full success.
+      await refresh();
+      bulkBusy = false;
+    }
   }
 
   async function bulkShare() {
@@ -1061,10 +1067,12 @@
     bulkBusy = true;
     try {
       const count = await runBulkBatches(targets, batchShare);
-      await refresh();
       toastSuccess(count === 1 ? m.library_shared_one() : m.library_shared_other({ count }));
     } catch (e: unknown) { error = toErr(e); }
-    finally { bulkBusy = false; }
+    finally {
+      await refresh();
+      bulkBusy = false;
+    }
   }
 
   async function bulkUnshare() {
@@ -1080,10 +1088,12 @@
     bulkBusy = true;
     try {
       const count = await runBulkBatches(targets, batchUnshare);
-      await refresh();
       toastSuccess(count === 1 ? m.library_unshared_one() : m.library_unshared_other({ count }));
     } catch (e: unknown) { error = toErr(e); }
-    finally { bulkBusy = false; }
+    finally {
+      await refresh();
+      bulkBusy = false;
+    }
   }
 
   async function bulkDelete() {
@@ -1275,14 +1285,16 @@
   }
 
   let topFiles = $derived.by(() => {
-    const seen = new Set<string>();
-    return files
-      .filter((f) => {
-        const hash = f.hash.trim().toLowerCase();
-        if (!hash || seen.has(hash) || topValueFor(f) <= 0) return false;
-        seen.add(hash);
-        return true;
-      })
+    const bestByHash = new Map<string, FileInfo>();
+    for (const file of files) {
+      const hash = file.hash.trim().toLowerCase();
+      if (!hash || topValueFor(file) <= 0) continue;
+      const existing = bestByHash.get(hash);
+      if (!existing || topValueFor(file) > topValueFor(existing)) {
+        bestByHash.set(hash, file);
+      }
+    }
+    return [...bestByHash.values()]
       .sort((a, b) => topValueFor(b) - topValueFor(a))
       .slice(0, TOP_PANEL_SIZE);
   });
@@ -1778,8 +1790,15 @@
           // already-checked row doesn't uncheck it — the old `toggleCheck`
           // call flipped each row, turning a reverse pass into a deselect.
           const nextChecked = new Set(checkedPaths);
-          if (currentIdx >= 0) nextChecked.add(sortedFiles[currentIdx].path);
-          nextChecked.add(next.path);
+          if (currentIdx >= 0) {
+            const lo = Math.min(currentIdx, nextIdx);
+            const hi = Math.max(currentIdx, nextIdx);
+            for (let i = lo; i <= hi; i++) {
+              nextChecked.add(sortedFiles[i].path);
+            }
+          } else {
+            nextChecked.add(next.path);
+          }
           checkedPaths = nextChecked;
           lastClickedPath = next.path;
         }

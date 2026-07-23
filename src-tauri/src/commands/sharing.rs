@@ -585,6 +585,9 @@ fn parse_single_range(range: Option<&str>, length: u64) -> Result<Option<(u64, u
     }
     if start.is_empty() {
         let suffix = end.parse::<u64>().map_err(|_| ())?.min(length);
+        if suffix == 0 {
+            return Err(());
+        }
         return Ok(Some((
             length.saturating_sub(suffix),
             length.saturating_sub(1),
@@ -3135,6 +3138,7 @@ mod tests {
             size: 1,
             hash: hash.to_string(),
             aich_hash: String::new(),
+            ember_file_hash: String::new(),
             extension: "bin".to_string(),
             modified_at: 0,
             priority: "normal".to_string(),
@@ -3244,5 +3248,14 @@ mod tests {
 
         assert!(effective_removed.is_empty());
         assert!(effective_added.is_empty());
+    }
+
+    #[test]
+    fn zero_length_suffix_media_range_is_rejected() {
+        assert_eq!(parse_single_range(Some("bytes=-0"), 1024), Err(()));
+        assert_eq!(
+            parse_single_range(Some("bytes=-1"), 1024),
+            Ok(Some((1023, 1023)))
+        );
     }
 }

@@ -397,21 +397,25 @@ fn read_tag(cursor: &mut Cursor<&Vec<u8>>) -> anyhow::Result<(u8, TagValue)> {
         }
         let mut name_buf = vec![0u8; name_len];
         cursor.read_exact(&mut name_buf)?;
-        // Only the compact (0x80-flagged) form above encodes a genuine
-        // reserved FT_* id. This long-form branch carries an actual name
-        // *string* — even when that string happens to be exactly one
-        // byte, treating its raw byte value as if it were a compact-form
-        // id would let a hand-crafted collection redefine FT_FILENAME /
-        // FT_AICH_HASH (or any other reserved id) via an unrelated
-        // custom-named tag, silently overriding the displayed name/hash
-        // with an attacker-chosen value. No security impact — this only
-        // affects how the *local* viewer displays an imported collection,
-        // and hashes are independently verified against real downloaded
-        // bytes elsewhere — but there's no reason to keep the ambiguity,
-        // so long-form names always resolve to "unknown" here regardless
-        // of their length.
-        let _ = name_buf;
-        0
+        // Older Ember writers encoded reserved numeric FT_* ids as a
+        // one-byte long-form name. Accept that standards-compatible legacy
+        // representation so collections created by affected releases remain
+        // recoverable; arbitrary string names still resolve to unknown.
+        match name_buf.as_slice() {
+            [id] if matches!(
+                *id,
+                FT_FILENAME
+                    | FT_FILESIZE
+                    | FT_FILEHASH
+                    | FT_AICH_HASH
+                    | FT_COLLECTIONAUTHOR
+                    | FT_COLLECTIONAUTHORKEY
+            ) =>
+            {
+                *id
+            }
+            _ => 0,
+        }
     };
 
     let real_type = tag_type & 0x7F;
@@ -515,9 +519,13 @@ fn read_tag(cursor: &mut Cursor<&Vec<u8>>) -> anyhow::Result<(u8, TagValue)> {
 }
 
 fn write_string_tag(buf: &mut Vec<u8>, name_id: u8, value: &str) -> anyhow::Result<()> {
-    buf.write_u8(TAG_STRING)?;
-    buf.write_u16::<LittleEndian>(1)?;
-    buf.push(name_id);
+    // Reserved FT_* ids use eMule's compact-tag form: the high bit on the
+    // type byte followed directly by the one-byte id.  The reader
+    // intentionally treats long-form names as custom strings, so writing a
+    // one-byte long-form "name" here made every Ember-authored field unknown
+    // when the collection was loaded again.
+    buf.write_u8(TAG_STRING | 0x80)?;
+    buf.write_u8(name_id)?;
     // Truncate at a UTF-8 char boundary, not an arbitrary byte offset — a
     // raw byte-slice cut can land mid-codepoint, and `read_tag` decodes
     // this value back with `from_utf8_lossy`, which would render the
@@ -538,25 +546,86 @@ fn write_string_tag(buf: &mut Vec<u8>, name_id: u8, value: &str) -> anyhow::Resu
 }
 
 fn write_u32_tag(buf: &mut Vec<u8>, name_id: u8, value: u32) -> anyhow::Result<()> {
-    buf.write_u8(TAG_UINT32)?;
-    buf.write_u16::<LittleEndian>(1)?;
-    buf.push(name_id);
+    buf.write_u8(TAG_UINT32 | 0x80)?;
+    buf.write_u8(name_id)?;
     buf.write_u32::<LittleEndian>(value)?;
     Ok(())
 }
 
 fn write_u64_tag(buf: &mut Vec<u8>, name_id: u8, value: u64) -> anyhow::Result<()> {
-    buf.write_u8(0x0B)?; // TAGTYPE_UINT64
-    buf.write_u16::<LittleEndian>(1)?;
-    buf.push(name_id);
+    buf.write_u8(0x0B | 0x80)?; // TAGTYPE_UINT64, compact FT_* id
+    buf.write_u8(name_id)?;
     buf.write_u64::<LittleEndian>(value)?;
     Ok(())
 }
 
 fn write_hash_tag(buf: &mut Vec<u8>, name_id: u8, hash: &[u8]) -> anyhow::Result<()> {
-    buf.write_u8(TAG_HASH)?;
-    buf.write_u16::<LittleEndian>(1)?;
-    buf.push(name_id);
+    buf.write_u8(TAG_HASH | 0x80)?;
+    buf.write_u8(name_id)?;
     buf.write_all(hash)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn binary_collection_round_trips_all_fields() {
+        let collection = Collection {
+            name: "Ember favorites 🔥".to_string(),
+            author: "Test Author".to_string(),
+            files: vec![
+                CollectionFile {
+                    name: "small song.mp3".to_string(),
+                    size: 1_234_567,
+                    hash: "00112233445566778899aabbccddeeff".to_string(),
+                    aich_hash: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                },
+                CollectionFile {
+                    name: "large video.mkv".to_string(),
+                    size: u32::MAX as u64 + 42,
+                    hash: "ffeeddccbbaa99887766554433221100".to_string(),
+                    aich_hash: String::new(),
+                },
+            ],
+        };
+        let path = std::env::temp_dir().join(format!(
+            "ember_collection_roundtrip_{}_{}.emulecollection",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default(),
+        ));
+
+        collection.save_binary(&path).expect("save collection");
+        let loaded = Collection::load(&path).expect("load collection");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(loaded.name, collection.name);
+        assert_eq!(loaded.author, collection.author);
+        assert_eq!(loaded.files.len(), collection.files.len());
+        for (actual, expected) in loaded.files.iter().zip(&collection.files) {
+            assert_eq!(actual.name, expected.name);
+            assert_eq!(actual.size, expected.size);
+            assert_eq!(actual.hash, expected.hash);
+            assert_eq!(actual.aich_hash, expected.aich_hash);
+        }
+    }
+
+    #[test]
+    fn reader_accepts_legacy_one_byte_long_form_ids() {
+        let mut encoded = Vec::new();
+        encoded.write_u8(TAG_STRING).unwrap();
+        encoded.write_u16::<LittleEndian>(1).unwrap();
+        encoded.write_u8(FT_FILENAME).unwrap();
+        encoded.write_u16::<LittleEndian>(4).unwrap();
+        encoded.write_all(b"name").unwrap();
+
+        let mut cursor = Cursor::new(&encoded);
+        let (id, value) = read_tag(&mut cursor).expect("read legacy tag");
+        assert_eq!(id, FT_FILENAME);
+        assert!(matches!(value, TagValue::String(ref value) if value == "name"));
+    }
 }

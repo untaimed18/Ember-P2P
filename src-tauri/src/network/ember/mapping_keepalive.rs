@@ -7,16 +7,15 @@
 //! - **UDP (KAD socket):** periodic STUN Binding requests from the shared KAD
 //!   UDP socket (replies routed by the network loop).
 //! - **TCP listen port:** outbound TCP connect with SO_REUSEADDR from the
-//!   same local TCP port (holds the TCP mapping), plus a twin STUN probe on a
-//!   UDP socket bound to that same port number to learn the public port when
-//!   the NAT remaps.
+//!   same local TCP port (holds the TCP mapping), plus STUN-over-TCP from that
+//!   same local endpoint to authoritatively learn the public TCP port.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpSocket, UdpSocket};
+use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tracing::{debug, info, warn};
 
 use super::nat::{
@@ -34,64 +33,78 @@ const TCP_HOLD_TARGETS: &[(&str, u16)] = &[
     ("cp.cloudflare.com", 80),
 ];
 
-/// One STUN Binding exchange on a dedicated UDP socket bound to `local_port`.
-pub async fn stun_mapped_addr_on_port(local_port: u16) -> Option<SocketAddr> {
-    let bind_addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, local_port));
-    let socket = match UdpSocket::bind(bind_addr).await {
-        Ok(s) => s,
-        Err(e) => {
-            debug!("TCP-port twin STUN bind {local_port} failed: {e}");
-            return None;
-        }
-    };
+/// STUN endpoints known to accept plain STUN over TCP. Keep this separate from
+/// `DEFAULT_STUN_SERVERS`: several high-quality UDP reflectors (notably
+/// Google's public servers) do not listen for TCP on the same endpoint.
+const TCP_STUN_SERVERS: &[&str] = &[
+    "turn.cloudflare.com:3478",
+    "stun.nextcloud.com:3478",
+    "stun.freeswitch.org:3478",
+    "global.stun.twilio.com:3478",
+];
 
-    for server in DEFAULT_STUN_SERVERS.iter().take(3) {
-        match stun_exchange_owned(&socket, server).await {
+/// Discover the TCP server-reflexive endpoint using a real TCP STUN
+/// transaction sourced from Ember's TCP listener port.
+pub async fn tcp_stun_mapped_addr_on_port(local_port: u16) -> Option<SocketAddr> {
+    for server in TCP_STUN_SERVERS {
+        match tcp_stun_exchange(local_port, server).await {
             Ok(addr) => {
-                debug!("TCP-port twin STUN {local_port} -> {addr} via {server}");
+                debug!("TCP STUN {local_port} -> {addr} via {server}");
                 return Some(addr);
             }
-            Err(e) => debug!("TCP-port twin STUN {server} failed: {e}"),
+            Err(e) => debug!("TCP STUN {server} failed: {e}"),
         }
     }
     None
 }
 
-async fn stun_exchange_owned(socket: &UdpSocket, server: &str) -> Result<SocketAddr, String> {
+async fn tcp_stun_exchange(local_port: u16, server: &str) -> Result<SocketAddr, String> {
     let server_addr: SocketAddr = tokio::net::lookup_host(server)
         .await
         .map_err(|e| format!("DNS {server}: {e}"))?
         .find(|a| a.is_ipv4())
         .ok_or_else(|| format!("No IPv4 for {server}"))?;
 
+    let tcp = TcpSocket::new_v4().map_err(|e| format!("socket: {e}"))?;
+    tcp.set_reuseaddr(true)
+        .map_err(|e| format!("reuseaddr: {e}"))?;
+    tcp.bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, local_port)))
+        .map_err(|e| format!("bind {local_port}: {e}"))?;
+    let mut stream = tokio::time::timeout(STUN_TIMEOUT, tcp.connect(server_addr))
+        .await
+        .map_err(|_| "connect timeout".to_string())?
+        .map_err(|e| format!("connect: {e}"))?;
+
     let txn_id: [u8; 12] = rand::random();
     let request = build_binding_request(&txn_id);
-    socket
-        .send_to(&request, server_addr)
+    tokio::time::timeout(STUN_TIMEOUT, stream.write_all(&request))
         .await
-        .map_err(|e| format!("send: {e}"))?;
+        .map_err(|_| "write timeout".to_string())?
+        .map_err(|e| format!("write: {e}"))?;
 
-    let deadline = tokio::time::Instant::now() + STUN_TIMEOUT;
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err("timeout".into());
-        }
-        let mut buf = [0u8; 512];
-        match tokio::time::timeout(remaining, socket.recv_from(&mut buf)).await {
-            Ok(Ok((n, from))) => {
-                if from != server_addr {
-                    continue;
-                }
-                if !is_stun_binding_response(&buf[..n]) {
-                    continue;
-                }
-                return parse_binding_response(&buf[..n], &txn_id);
-            }
-            Ok(Err(e)) => return Err(format!("recv: {e}")),
-            Err(_) => return Err("timeout".into()),
-        }
+    // STUN's 20-byte header carries the payload length. TCP may split a
+    // response arbitrarily, so read the header and declared body exactly
+    // instead of assuming one read equals one message.
+    let mut header = [0u8; 20];
+    tokio::time::timeout(STUN_TIMEOUT, stream.read_exact(&mut header))
+        .await
+        .map_err(|_| "response header timeout".to_string())?
+        .map_err(|e| format!("read header: {e}"))?;
+    let body_len = u16::from_be_bytes([header[2], header[3]]) as usize;
+    if body_len % 4 != 0 {
+        return Err(format!("invalid STUN body length {body_len}"));
     }
+    let mut response = Vec::with_capacity(20 + body_len);
+    response.extend_from_slice(&header);
+    response.resize(20 + body_len, 0);
+    tokio::time::timeout(STUN_TIMEOUT, stream.read_exact(&mut response[20..]))
+        .await
+        .map_err(|_| "response body timeout".to_string())?
+        .map_err(|e| format!("read body: {e}"))?;
+    if !is_stun_binding_response(&response) {
+        return Err("not a STUN Binding response".to_string());
+    }
+    parse_binding_response(&response, &txn_id)
 }
 
 /// Build a STUN Binding request for the shared KAD socket keep-alive path.
@@ -165,24 +178,24 @@ pub(crate) async fn stun_keepalive_with_replies(
     }
 }
 
-/// Hold the TCP NAT mapping by connecting from our listen port to a public
-/// HTTP endpoint (NATMAP-style). Uses SO_REUSEADDR so this can coexist with
-/// the upload TcpListener.
-pub async fn hold_tcp_mapping_once(local_port: u16) -> bool {
+/// Open an HTTP connection from the TCP listen port and retain it while the
+/// TCP STUN transaction runs. Uses SO_REUSEADDR so the listener, hold, and
+/// STUN connection can coexist as distinct TCP 4-tuples.
+async fn open_tcp_mapping_hold(local_port: u16) -> Option<TcpStream> {
     for &(host, port) in TCP_HOLD_TARGETS {
         match tcp_hold_connect(local_port, host, port).await {
-            Ok(()) => {
+            Ok(stream) => {
                 debug!("TCP mapping hold ok via {host}:{port} from local {local_port}");
-                return true;
+                return Some(stream);
             }
             Err(e) => debug!("TCP mapping hold {host}:{port} failed: {e}"),
         }
     }
     warn!("TCP mapping hold failed for all targets (port {local_port})");
-    false
+    None
 }
 
-async fn tcp_hold_connect(local_port: u16, host: &str, port: u16) -> Result<(), String> {
+async fn tcp_hold_connect(local_port: u16, host: &str, port: u16) -> Result<TcpStream, String> {
     let mut addrs = tokio::net::lookup_host((host, port))
         .await
         .map_err(|e| format!("DNS {host}: {e}"))?
@@ -202,27 +215,29 @@ async fn tcp_hold_connect(local_port: u16, host: &str, port: u16) -> Result<(), 
         .map_err(|e| format!("connect: {e}"))?;
 
     let req = format!(
-        "HEAD / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: Ember\r\n\r\n"
+        "HEAD / HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\nUser-Agent: Ember\r\n\r\n"
     );
-    let _ = tokio::time::timeout(Duration::from_secs(5), stream.write_all(req.as_bytes())).await;
-    let mut buf = [0u8; 64];
-    let _ = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await;
-    let _ = stream.shutdown().await;
-    Ok(())
+    tokio::time::timeout(Duration::from_secs(5), stream.write_all(req.as_bytes()))
+        .await
+        .map_err(|_| "HTTP hold write timeout".to_string())?
+        .map_err(|e| format!("HTTP hold write: {e}"))?;
+    Ok(stream)
 }
 
-/// Background cycle: TCP hold + twin STUN on `tcp_port`.
+/// Background cycle: TCP hold + TCP STUN on `tcp_port`.
 pub async fn tcp_mapping_cycle(local_tcp_port: u16) -> (bool, Option<SocketAddr>) {
-    let hold_ok = hold_tcp_mapping_once(local_tcp_port).await;
+    let hold_stream = open_tcp_mapping_hold(local_tcp_port).await;
+    let hold_ok = hold_stream.is_some();
     if hold_ok {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    let mapped = stun_mapped_addr_on_port(local_tcp_port).await;
+    let mapped = tcp_stun_mapped_addr_on_port(local_tcp_port).await;
     if let Some(addr) = mapped {
         info!(
             "TCP-port mapping discovered: local {local_tcp_port} -> public {addr} (hold={hold_ok})"
         );
     }
+    drop(hold_stream);
     (hold_ok, mapped)
 }
 
@@ -245,5 +260,14 @@ mod tests {
         assert_eq!(u16::from_be_bytes([req[0], req[1]]), 0x0001);
         assert!(!server.is_empty());
         assert_eq!(txn.len(), 12);
+    }
+
+    #[test]
+    fn tcp_stun_servers_exclude_known_udp_only_endpoints() {
+        assert!(!TCP_STUN_SERVERS.is_empty());
+        assert!(TCP_STUN_SERVERS
+            .iter()
+            .all(|server| !server.contains(".l.google.com")));
+        assert!(!TCP_STUN_SERVERS.contains(&"stun.cloudflare.com:3478"));
     }
 }

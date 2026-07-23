@@ -167,8 +167,11 @@ impl LocalIndex {
         // When multiple shares have the same MD4 (e.g. the user re-added
         // the same file from two folders), pick a deterministic winner
         // rather than `indices.first()` (which depends on insertion order).
-        // Preference order: highest upload priority first, then shortest
-        // path so results don't flip between runs as folders rescan.
+        // Preference order: a currently shared copy first, then highest upload
+        // priority, then shortest path so results don't flip between runs as
+        // folders rescan. A transient duplicate-state mismatch must never make
+        // the upload resolver pick an unshared row and reject a hash that still
+        // has another explicitly shared physical copy.
         let indices = self.hash_map.get(hash)?;
         let mut best: Option<&FileInfo> = None;
         for &idx in indices {
@@ -180,8 +183,10 @@ impl LocalIndex {
                 Some(prev) => {
                     let p_prev = crate::network::ed2k::upload::priority_weight(&prev.priority);
                     let p_cand = crate::network::ed2k::upload::priority_weight(&candidate.priority);
-                    if p_cand > p_prev
-                        || (p_cand == p_prev && candidate.path.len() < prev.path.len())
+                    if (candidate.shared && !prev.shared)
+                        || (candidate.shared == prev.shared
+                            && (p_cand > p_prev
+                                || (p_cand == p_prev && candidate.path.len() < prev.path.len())))
                     {
                         candidate
                     } else {
@@ -395,12 +400,15 @@ impl LocalIndex {
         }
     }
 
-    /// Session + all-time request/accept counters when peers ask for / get a slot for this file.
+    /// Session request/accept counters when peers ask for / get a slot for
+    /// this file. All-time counters advance only when the authoritative
+    /// known.met record accepted the same update.
     pub fn apply_upload_share_deltas(
         &mut self,
         hash_hex: &str,
         inc_requests: u32,
         inc_accepted: u32,
+        persist_alltime: bool,
     ) {
         if inc_requests == 0 && inc_accepted == 0 {
             return;
@@ -410,8 +418,10 @@ impl LocalIndex {
                 if let Some(file) = self.files.get_mut(idx) {
                     file.requests = file.requests.saturating_add(inc_requests);
                     file.accepted = file.accepted.saturating_add(inc_accepted);
-                    file.alltime_requests = file.alltime_requests.saturating_add(inc_requests);
-                    file.alltime_accepted = file.alltime_accepted.saturating_add(inc_accepted);
+                    if persist_alltime {
+                        file.alltime_requests = file.alltime_requests.saturating_add(inc_requests);
+                        file.alltime_accepted = file.alltime_accepted.saturating_add(inc_accepted);
+                    }
                 }
             }
         }
@@ -884,6 +894,7 @@ mod local_index_tests {
             size: 1,
             hash: hash.to_string(),
             aich_hash: String::new(),
+            ember_file_hash: String::new(),
             extension: "bin".to_string(),
             modified_at: 0,
             priority: priority.to_string(),
@@ -990,6 +1001,41 @@ mod local_index_tests {
         );
         assert_eq!(index.get_by_path("A/copy.bin").unwrap().priority, "high");
         assert_eq!(index.get_by_path("B/copy.bin").unwrap().priority, "high");
+    }
+
+    #[test]
+    fn hash_lookup_prefers_a_shared_duplicate() {
+        let hash = "abababababababababababababababab";
+        let mut index = LocalIndex::new();
+        index.add_files(vec![
+            file("A/x.bin", hash, false, "release"),
+            file("B/longer-shared-copy.bin", hash, true, "verylow"),
+        ]);
+
+        let resolved = index.get_by_hash(hash).expect("hash should resolve");
+        assert!(resolved.shared);
+        assert_eq!(resolved.path, "B/longer-shared-copy.bin");
+    }
+
+    #[test]
+    fn unpersisted_share_interest_only_updates_session_counters() {
+        let hash = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+        let mut index = LocalIndex::new();
+        index.add_file(file("A/file.bin", hash, true, "normal"));
+
+        index.apply_upload_share_deltas(hash, 2, 1, false);
+        let session_only = index.get_by_hash(hash).unwrap();
+        assert_eq!(session_only.requests, 2);
+        assert_eq!(session_only.accepted, 1);
+        assert_eq!(session_only.alltime_requests, 0);
+        assert_eq!(session_only.alltime_accepted, 0);
+
+        index.apply_upload_share_deltas(hash, 3, 2, true);
+        let persisted = index.get_by_hash(hash).unwrap();
+        assert_eq!(persisted.requests, 5);
+        assert_eq!(persisted.accepted, 3);
+        assert_eq!(persisted.alltime_requests, 3);
+        assert_eq!(persisted.alltime_accepted, 2);
     }
 
     #[test]

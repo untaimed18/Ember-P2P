@@ -210,18 +210,15 @@ fn spawn_udp_mapping_keepalive(
     packet_tx
 }
 
+/// The TCP counterpart of `advertised_udp_port` — the STUN-over-TCP-confirmed
+/// public TCP port (see `apply_tcp_mapping_keepalive`) when the probe sourced
+/// from the listen port has been stability-confirmed, otherwise the raw
+/// configured listener port.
 fn advertised_tcp_port(state: &NetworkState) -> u16 {
-    configured_tcp_port_for_advertising(state.tcp_port, None)
-}
-
-/// A UDP socket bound to the TCP port cannot establish the public endpoint of
-/// the TCP listener. Keep its STUN result diagnostic-only: every TCP-bearing
-/// protocol surface must advertise the configured listener port.
-fn configured_tcp_port_for_advertising(
-    configured_tcp_port: u16,
-    _udp_stun_observed_port: Option<u16>,
-) -> u16 {
-    configured_tcp_port
+    state
+        .external_tcp_port
+        .filter(|port| *port != 0)
+        .unwrap_or(state.tcp_port)
 }
 
 /// UDP counterpart of `advertised_tcp_port` — the KAD-peer-voted or
@@ -278,6 +275,7 @@ fn revert_stun_advertise_to_settings(state: &mut NetworkState) {
             state.external_udp_port = state.firewall_checker.external_udp_port();
         }
     }
+    state.external_tcp_port = None;
     state.stats.public_tcp_port = 0;
     state.stats.public_udp_port = 0;
     state.stats.stun_keepalive_active = false;
@@ -449,10 +447,61 @@ fn apply_udp_mapping_keepalive(
     true
 }
 
-/// Apply a TCP mapping keep-alive result. The twin-port STUN probe uses UDP,
-/// so it can only provide diagnostic information about a UDP mapping; it must
-/// never override the configured TCP listener port. Returns `true` when the
-/// TCP hold itself succeeds.
+/// Outcome of one TCP STUN observation against the current TCP
+/// remap-candidate tracking state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TcpPortConfirmation {
+    /// Updated `stun_ka_tcp_candidate_port` (cleared once confirmed).
+    candidate_port: Option<u16>,
+    /// Updated `stun_ka_tcp_stable_hits` (reset once confirmed).
+    stable_hits: u8,
+    /// The port that should now be advertised, if this observation just
+    /// became trustworthy (immediately or via the stability streak).
+    confirmed_port: Option<u16>,
+}
+
+/// Decide whether a TCP STUN reading should be trusted immediately, needs
+/// another consecutive confirmation, or should keep accumulating. A 1:1
+/// result is safe immediately; a remapped result must repeat once to avoid
+/// advertising a transient/flapping mapping. UDP observations are
+/// intentionally excluded because TCP and UDP NAT mappings are independent.
+fn tcp_port_confirmation(
+    configured_tcp_port: u16,
+    candidate_port: Option<u16>,
+    stable_hits: u8,
+    observed_port: u16,
+) -> TcpPortConfirmation {
+    if observed_port == configured_tcp_port {
+        return TcpPortConfirmation {
+            candidate_port: None,
+            stable_hits: 0,
+            confirmed_port: Some(observed_port),
+        };
+    }
+    let (next_candidate, next_hits) = match candidate_port {
+        Some(prev) if prev == observed_port => (Some(prev), stable_hits.saturating_add(1)),
+        _ => (Some(observed_port), 1),
+    };
+    if next_hits >= 2 {
+        TcpPortConfirmation {
+            candidate_port: None,
+            stable_hits: 0,
+            confirmed_port: Some(observed_port),
+        }
+    } else {
+        TcpPortConfirmation {
+            candidate_port: next_candidate,
+            stable_hits: next_hits,
+            confirmed_port: None,
+        }
+    }
+}
+
+/// Apply a TCP mapping keep-alive result discovered with STUN over TCP from
+/// the listener's local port.
+/// Returns `true` when the cycle contributed something useful (a successful
+/// hold and/or a confirmed public TCP mapping), so the caller can decide
+/// whether the overall keep-alive "Active" indicator should stay on.
 fn apply_tcp_mapping_keepalive(
     state: &mut NetworkState,
     hold_ok: bool,
@@ -464,30 +513,50 @@ fn apply_tcp_mapping_keepalive(
     }
     let hold_changed = state.stats.tcp_mapping_hold_ok != hold_ok;
     state.stats.tcp_mapping_hold_ok = hold_ok;
+    let mut changed = hold_changed;
+    let mut confirmed = hold_ok;
     if let Some(addr) = mapped {
-        debug!(
-            "TCP-port twin UDP STUN observed {addr}; retaining configured TCP port {}",
-            state.tcp_port
+        let result = tcp_port_confirmation(
+            state.tcp_port,
+            state.stun_ka_tcp_candidate_port,
+            state.stun_ka_tcp_stable_hits,
+            addr.port(),
         );
-    }
-    // `public_tcp_port` is consumed by source-link generation. Report the
-    // configured listener port rather than a UDP-STUN-derived value.
-    state.stats.public_tcp_port = state.tcp_port;
-    update_publish_manager_state(state);
-    if hold_ok {
+        state.stun_ka_tcp_candidate_port = result.candidate_port;
+        state.stun_ka_tcp_stable_hits = result.stable_hits;
+        if let Some(port) = result.confirmed_port {
+            confirmed = true;
+            if state.external_tcp_port != Some(port) {
+                changed = true;
+            }
+            state.external_tcp_port = Some(port);
+            state.stats.public_tcp_port = port;
+            if let Some(ip) = ember::mapping_keepalive::ipv4_from_mapped(addr) {
+                if state.external_ip.is_none() {
+                    set_external_ip(state, Some(ip));
+                }
+            }
+            update_publish_manager_state(state);
+        } else {
+            debug!("STUN keepalive: candidate public TCP mapping {addr} (awaiting confirm)");
+        }
+    } else if hold_ok {
+        // TCP hold alone (TCP STUN unavailable) is still a successful
+        // keep-alive contribution. Same false->true
+        // transition logging rationale as the UDP 1:1 case above — this
+        // path is otherwise silent every cycle.
         if !state.stats.stun_keepalive_active {
             info!(
                 "STUN keepalive: TCP mapping hold confirmed (local port {})",
                 state.tcp_port
             );
         }
+    }
+    if confirmed {
         state.stats.stun_keepalive_active = true;
     }
-    if hold_changed {
-        info!(
-            "STUN keepalive: configured TCP port {} (hold_ok={hold_ok})",
-            state.tcp_port
-        );
+    if changed {
+        info!("STUN keepalive: public TCP mapping {mapped:?} hold_ok={hold_ok}");
         let _ = app.emit(
             "stun-keepalive",
             serde_json::json!({
@@ -497,7 +566,7 @@ fn apply_tcp_mapping_keepalive(
             }),
         );
     }
-    hold_ok
+    confirmed
 }
 
 /// Try to connect to a server, attempting the DH-encrypted connection first (for HighID),
@@ -2325,12 +2394,42 @@ mod tests {
     }
 
     #[test]
-    fn tcp_mapping_never_advertises_udp_stun_port() {
-        let observed_udp_mapping: Option<SocketAddr> = Some("203.0.113.42:51234".parse().unwrap());
-        assert_eq!(
-            configured_tcp_port_for_advertising(4662, observed_udp_mapping.map(|addr| addr.port())),
-            4662
-        );
+    fn tcp_port_confirmation_accepts_1to1_immediately() {
+        let result = tcp_port_confirmation(4662, None, 0, 4662);
+        assert_eq!(result.confirmed_port, Some(4662));
+        assert_eq!(result.candidate_port, None);
+        assert_eq!(result.stable_hits, 0);
+    }
+
+    #[test]
+    fn tcp_port_confirmation_requires_two_consecutive_hits_for_a_remap() {
+        // First observation of a genuine remap becomes a candidate so one
+        // transient TCP mapping cannot immediately change advertised state.
+        let first = tcp_port_confirmation(4662, None, 0, 51234);
+        assert_eq!(first.confirmed_port, None);
+        assert_eq!(first.candidate_port, Some(51234));
+        assert_eq!(first.stable_hits, 1);
+
+        // Second identical observation confirms it.
+        let second =
+            tcp_port_confirmation(4662, first.candidate_port, first.stable_hits, 51234);
+        assert_eq!(second.confirmed_port, Some(51234));
+        assert_eq!(second.candidate_port, None);
+        assert_eq!(second.stable_hits, 0);
+    }
+
+    #[test]
+    fn tcp_port_confirmation_resets_candidate_on_flapping_port() {
+        let first = tcp_port_confirmation(4662, None, 0, 51234);
+        assert_eq!(first.candidate_port, Some(51234));
+
+        // A different port on the next cycle restarts the streak instead of
+        // ever being trusted from an inconsistent reading.
+        let flapped =
+            tcp_port_confirmation(4662, first.candidate_port, first.stable_hits, 60000);
+        assert_eq!(flapped.confirmed_port, None);
+        assert_eq!(flapped.candidate_port, Some(60000));
+        assert_eq!(flapped.stable_hits, 1);
     }
 
     #[test]
@@ -4666,6 +4765,11 @@ struct NetworkState {
     nodes_save_lock: Arc<tokio::sync::Mutex<()>>,
     external_ip: Option<Ipv4Addr>,
     external_udp_port: Option<u16>,
+    /// STUN-over-TCP-confirmed public TCP port (probe from the listen port),
+    /// once stability-confirmed by `apply_tcp_mapping_keepalive`. `None` when
+    /// unconfirmed or STUN keep-alive is off/suspended — advertising then
+    /// falls back to the configured listener port.
+    external_tcp_port: Option<u16>,
     /// Live Hello / publish TCP port (updated by mapping keep-alive).
     advertise_tcp_port: Arc<std::sync::atomic::AtomicU16>,
     /// Live Hello / publish UDP port (updated by mapping keep-alive).
@@ -4680,9 +4784,8 @@ struct NetworkState {
     /// Consecutive identical candidate observations (need 2 before advertise).
     stun_ka_stable_hits: u8,
     /// Same stability tracking as `stun_ka_candidate_port` /
-    /// `stun_ka_stable_hits`, but for the *TCP* twin-STUN reading — kept
-    /// separate so a stable UDP mapping cannot rubber-stamp an unrelated,
-    /// unconfirmed TCP port.
+    /// `stun_ka_stable_hits`, but for STUN over TCP. Kept separate because
+    /// TCP and UDP NAT mappings are independent.
     stun_ka_tcp_candidate_port: Option<u16>,
     stun_ka_tcp_stable_hits: u8,
     /// Public UDP port last stably advertised by STUN keep-alive (if any).
@@ -8098,6 +8201,7 @@ pub async fn start_network(
         nodes_save_lock: Arc::new(tokio::sync::Mutex::new(())),
         external_ip: None,
         external_udp_port: None,
+        external_tcp_port: None,
         advertise_tcp_port: Arc::new(std::sync::atomic::AtomicU16::new(tcp_port)),
         advertise_udp_port: Arc::new(std::sync::atomic::AtomicU16::new(udp_port)),
         stun_keepalive_enabled: settings.stun_keepalive_enabled,
@@ -10387,7 +10491,7 @@ pub async fn start_network(
                             t.transferred,
                         ))
                     };
-                    if let Some((peer_id, file_hash, file_name, file_size, transferred)) = completed_snapshot {
+                    if let Some((peer_id, file_hash, file_name, file_size, _transferred)) = completed_snapshot {
                         if let Some((ip_str, port_str)) = peer_id.split_once(':') {
                             if let (Ok(ip), Ok(port)) = (ip_str.parse::<Ipv4Addr>(), port_str.parse::<u16>()) {
                                 state.dead_sources.remove(0, u32::from(ip), port);
@@ -10500,10 +10604,27 @@ pub async fn start_network(
                                         ember_hex
                                     },
                                     modified_at: now,
+                                    // The dropped `_transferred` field on the
+                                    // completed-download snapshot is this
+                                    // transfer's *downloaded* byte count, not
+                                    // anything uploaded. Seeding
+                                    // all_time_transferred with it (as this code
+                                    // used to) credited every freshly-downloaded,
+                                    // auto-shared file with a full-file-size
+                                    // "upload" the moment it finished
+                                    // downloading, even with zero real uploads —
+                                    // inflating the Library's Top Uploads panel
+                                    // for every completed download. Only ever
+                                    // preserve a pre-existing record's real
+                                    // upload total (e.g. re-downloading
+                                    // previously-shared content); a genuinely new
+                                    // hash starts at 0 and accumulates only
+                                    // through real upload events (see
+                                    // `add_all_time_transferred`).
                                     all_time_transferred: existing
                                         .as_ref()
-                                        .map(|record| record.all_time_transferred.max(transferred))
-                                        .unwrap_or(transferred),
+                                        .map(|record| record.all_time_transferred)
+                                        .unwrap_or(0),
                                     all_time_requested: existing
                                         .as_ref()
                                         .map(|record| record.all_time_requested)
@@ -10515,7 +10636,11 @@ pub async fn start_network(
                                     upload_priority: existing
                                         .as_ref()
                                         .map(|record| record.upload_priority)
-                                        .unwrap_or(0),
+                                        .unwrap_or_else(|| {
+                                            crate::storage::known_files::priority_str_to_u8(
+                                                "normal",
+                                            )
+                                        }),
                                     last_publish_src: existing
                                         .as_ref()
                                         .map(|record| record.last_publish_src)
@@ -11804,18 +11929,24 @@ pub async fn start_network(
                             if bytes.len() == 16 {
                                 let mut fh = [0u8; 16];
                                 fh.copy_from_slice(&bytes);
-                                if !known_files.bump_share_interest(
+                                let persisted_alltime = known_files.bump_share_interest(
                                     &fh,
                                     inc_requests,
                                     inc_accepted,
-                                ) {
+                                );
+                                if !persisted_alltime {
                                     warn!(
                                         "Upload interest for {file_hash} has no known.met record"
                                     );
                                 }
                                 {
                                     let mut idx = local_index.write().await;
-                                    idx.apply_upload_share_deltas(file_hash, inc_requests, inc_accepted);
+                                    idx.apply_upload_share_deltas(
+                                        file_hash,
+                                        inc_requests,
+                                        inc_accepted,
+                                        persisted_alltime,
+                                    );
                                 }
                                 // Target-update only the matching rows in the
                                 // cached snapshot rather than cloning the
@@ -11830,8 +11961,14 @@ pub async fn start_network(
                                         if f.hash == *file_hash {
                                             f.requests = f.requests.saturating_add(inc_requests);
                                             f.accepted = f.accepted.saturating_add(inc_accepted);
-                                            f.alltime_requests = f.alltime_requests.saturating_add(inc_requests);
-                                            f.alltime_accepted = f.alltime_accepted.saturating_add(inc_accepted);
+                                            if persisted_alltime {
+                                                f.alltime_requests = f
+                                                    .alltime_requests
+                                                    .saturating_add(inc_requests);
+                                                f.alltime_accepted = f
+                                                    .alltime_accepted
+                                                    .saturating_add(inc_accepted);
+                                            }
                                         }
                                     }
                                 }
@@ -17109,11 +17246,13 @@ pub async fn start_network(
                                     .map(|ip| u32::from_le_bytes(ip.octets()))
                                     .unwrap_or(0);
                                 // The active broker-event receiver prevents a
-                                // whole-struct borrow here. TCP always uses
-                                // the configured listener port; a twin UDP
-                                // STUN observation is never a TCP advertise
-                                // override.
-                                let greet_tcp_port = state.tcp_port;
+                                // whole-struct borrow here. Inline the same
+                                // STUN-over-TCP-confirmed fallback used by
+                                // `advertised_tcp_port`.
+                                let greet_tcp_port = state
+                                    .external_tcp_port
+                                    .filter(|port| *port != 0)
+                                    .unwrap_or(state.tcp_port);
                                 // Same STUN-aware fallback as TCP above (via
                                 // `advertised_udp_port`, inlined for the same
                                 // borrow-conflict reason as `greet_tcp_port`).
@@ -23019,8 +23158,9 @@ pub async fn start_network(
                 }
                 next_mapping_ka_at = now
                     + ember::mapping_keepalive::MAPPING_KEEPALIVE_INTERVAL;
-                // Skip twin-UDP STUN on tcp_port when it equals the KAD UDP port
-                // (socket collision); UDP keepalive on the KAD socket still runs.
+                // Probe UDP and TCP independently. Equal numeric port values do
+                // not conflict because each transport has its own socket
+                // namespace.
                 state.mapping_ka_generation = state.mapping_ka_generation.wrapping_add(1);
                 mapping_ka_cycle_success = false;
                 let gen = state.mapping_ka_generation;
@@ -23035,16 +23175,9 @@ pub async fn start_network(
                 tcp_map_ka_in_flight = true;
                 let tcp_port = state.tcp_port;
                 let tx = tcp_map_ka_result_tx.clone();
-                // When TCP port == UDP port, twin STUN cannot bind; still
-                // attempt TCP hold, and reuse UDP mapping for TCP advertise.
-                let same_port = state.tcp_port == state.udp_port;
                 tokio::spawn(async move {
-                    let (hold_ok, mapped) = if same_port {
-                        let hold = ember::mapping_keepalive::hold_tcp_mapping_once(tcp_port).await;
-                        (hold, None)
-                    } else {
-                        ember::mapping_keepalive::tcp_mapping_cycle(tcp_port).await
-                    };
+                    let (hold_ok, mapped) =
+                        ember::mapping_keepalive::tcp_mapping_cycle(tcp_port).await;
                     let _ = tx.send(TcpMappingKeepaliveResult {
                         generation: gen,
                         hold_ok,

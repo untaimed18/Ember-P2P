@@ -29,6 +29,9 @@
   let pendingPlay = $state(false);
   let lastPlayId = -1;
   let lastStopToken: number | null = null;
+  let reloadId = $state(0);
+  let retryPath: string | null = null;
+  let retryPlayId = 0;
 
   function stopMedia(el: HTMLAudioElement | HTMLVideoElement | null) {
     if (!el) return;
@@ -56,11 +59,17 @@
   // playback whenever the parent re-rendered autoplay state.
   $effect(() => {
     const filePath = path;
+    // Explicit retries bump this without changing the selected path.
+    const reload = reloadId;
+    void reload;
+    const retryRequested = untrack(
+      () => retryPath === filePath && retryPlayId === playId,
+    );
     let cancelled = false;
 
     src = '';
     loadError = null;
-    pendingPlay = false;
+    pendingPlay = retryRequested;
 
     void (async () => {
       try {
@@ -73,6 +82,10 @@
         // WebView2. `convertFileSrc` produces that platform-correct URL while
         // the Rust protocol still validates the canonical path per request.
         src = convertFileSrc(canonical, 'ember-media');
+        if (retryRequested) {
+          retryPath = null;
+          retryPlayId = 0;
+        }
       } catch (e: unknown) {
         if (cancelled) return;
         loadError = translateError(e, m.library_media_playback_error());
@@ -95,6 +108,19 @@
     if (!target || target !== path || id <= 0 || id === lastPlayId) return;
     lastPlayId = id;
     pendingPlay = true;
+    if (loadError) {
+      if (src) {
+        // A media-element error leaves the validated URL intact. Re-rendering
+        // the element is enough to retry the same file.
+        loadError = null;
+      } else {
+        // Path resolution itself failed, so repeat that asynchronous step too.
+        retryPath = path;
+        retryPlayId = id;
+        reloadId += 1;
+      }
+      return;
+    }
     untrack(() => {
       if (mediaEl && src) seekAndPlay(mediaEl);
     });
