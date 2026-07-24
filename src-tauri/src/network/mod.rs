@@ -2574,7 +2574,7 @@ mod tests {
         let friend = [0xC3; 16];
         let sessions: upload_server::EmberSessionMap = Arc::new(RwLock::new(HashMap::new()));
         let (first_tx, _first_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
-        let first = upload_server::EmberSessionHandle::new(first_tx);
+        let first = upload_server::EmberSessionHandle::new(first_tx, [0u8; 32]);
         let first_id = first.session_id();
         let mut first_shutdown = first.subscribe_shutdown();
         sessions.write().await.insert(friend, first);
@@ -2595,7 +2595,7 @@ mod tests {
         // cancellation cannot close the retired session a second time.
         assert!(!retire_ember_session(&sessions, friend, first_id).await);
         let (second_tx, _second_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
-        let second = upload_server::EmberSessionHandle::new(second_tx);
+        let second = upload_server::EmberSessionHandle::new(second_tx, [0u8; 32]);
         let second_id = second.session_id();
         sessions.write().await.insert(friend, second);
         assert_ne!(first_id, second_id);
@@ -34783,39 +34783,59 @@ async fn handle_command_inner(
                 // Falling through to the reconnect branch instead gives
                 // the message a real chance of delivery.
                 if let Some(sender) = sessions.get(&friend_eh).filter(|h| h.is_fresh()) {
-                    let msg_bytes = message.as_bytes();
-                    let mut packet = Vec::with_capacity(6 + msg_bytes.len());
-                    packet.push(OP_EMULEPROT);
-                    let size = (1 + msg_bytes.len()) as u32;
-                    packet.extend_from_slice(&size.to_le_bytes());
-                    packet.push(ed2k::messages::OP_EMBER_CHAT_MSG);
-                    packet.extend_from_slice(msg_bytes);
-                    match sender.tx.try_send(packet) {
-                        Ok(()) => {
-                            let hash_hex = hex::encode(friend_eh);
-                            let db2 = db.clone();
-                            let msg2 = message.clone();
-                            tokio::task::spawn_blocking(move || {
-                                if let Err(e) = db2.insert_chat_message(&hash_hex, "sent", &msg2) {
-                                    tracing::warn!("Failed to persist sent chat message: {e}");
+                    // Every friend session's `EmberSessionHandle` carries
+                    // the peer's PoP-verified Ed25519 pubkey (see its doc
+                    // comment), so encryption is always possible for a
+                    // live session — there is no plaintext-fallback path.
+                    let peer_pubkey = sender.peer_ember_pubkey();
+                    match crate::network::ember::crypto::encrypt_chat_for_peer(
+                        &ed25519_secret_key,
+                        &peer_pubkey,
+                        message.as_bytes(),
+                    ) {
+                        None => {
+                            // Can only happen if the peer's already-PoP-verified
+                            // pubkey somehow isn't a valid curve point, which
+                            // `perform_ember_auth` should have ruled out —
+                            // treat as an internal error rather than ever
+                            // silently sending plaintext.
+                            let _ = tx.send(Err("Failed to encrypt chat message".into()));
+                        }
+                        Some(envelope) => {
+                            let mut packet = Vec::with_capacity(6 + envelope.len());
+                            packet.push(OP_EMULEPROT);
+                            let size = (1 + envelope.len()) as u32;
+                            packet.extend_from_slice(&size.to_le_bytes());
+                            packet.push(ed2k::messages::OP_EMBER_CHAT_MSG);
+                            packet.extend_from_slice(&envelope);
+                            match sender.tx.try_send(packet) {
+                                Ok(()) => {
+                                    let hash_hex = hex::encode(friend_eh);
+                                    let db2 = db.clone();
+                                    let msg2 = message.clone();
+                                    tokio::task::spawn_blocking(move || {
+                                        if let Err(e) = db2.insert_chat_message(&hash_hex, "sent", &msg2) {
+                                            tracing::warn!("Failed to persist sent chat message: {e}");
+                                        }
+                                    });
+                                    let _ = app_handle.emit(
+                                        "ember:chat-message",
+                                        serde_json::json!({
+                                            "user_hash": hex::encode(friend_eh),
+                                            "message": message,
+                                            "direction": "sent",
+                                            "timestamp": chrono::Utc::now().timestamp(),
+                                        }),
+                                    );
+                                    let _ = tx.send(Ok(()));
                                 }
-                            });
-                            let _ = app_handle.emit(
-                                "ember:chat-message",
-                                serde_json::json!({
-                                    "user_hash": hex::encode(friend_eh),
-                                    "message": message,
-                                    "direction": "sent",
-                                    "timestamp": chrono::Utc::now().timestamp(),
-                                }),
-                            );
-                            let _ = tx.send(Ok(()));
-                        }
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                            let _ = tx.send(Err("Connection channel full".into()));
-                        }
-                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                            let _ = tx.send(Err("Connection to friend closed".into()));
+                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                    let _ = tx.send(Err("Connection channel full".into()));
+                                }
+                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                    let _ = tx.send(Err("Connection to friend closed".into()));
+                                }
+                            }
                         }
                     }
                 } else {
@@ -34887,15 +34907,24 @@ async fn handle_command_inner(
                                     .await
                                     {
                                         Ok(handle) => {
-                                            let msg_bytes = msg.as_bytes();
-                                            let mut packet =
-                                                Vec::with_capacity(6 + msg_bytes.len());
-                                            packet.push(OP_EMULEPROT);
-                                            let size = (1 + msg_bytes.len()) as u32;
-                                            packet.extend_from_slice(&size.to_le_bytes());
-                                            packet.push(ed2k::messages::OP_EMBER_CHAT_MSG);
-                                            packet.extend_from_slice(msg_bytes);
-                                            if handle.outbound_tx.try_send(packet).is_ok() {
+                                            let encrypted = crate::network::ember::crypto::encrypt_chat_for_peer(
+                                                &ed25519_secret_key,
+                                                &handle.peer_ember_pubkey,
+                                                msg.as_bytes(),
+                                            );
+                                            let sent_ok = if let Some(envelope) = encrypted {
+                                                let mut packet =
+                                                    Vec::with_capacity(6 + envelope.len());
+                                                packet.push(OP_EMULEPROT);
+                                                let size = (1 + envelope.len()) as u32;
+                                                packet.extend_from_slice(&size.to_le_bytes());
+                                                packet.push(ed2k::messages::OP_EMBER_CHAT_MSG);
+                                                packet.extend_from_slice(&envelope);
+                                                handle.outbound_tx.try_send(packet).is_ok()
+                                            } else {
+                                                false
+                                            };
+                                            if sent_ok {
                                                 let hash_hex = hex::encode(friend_eh);
                                                 let msg_for_db = msg.clone();
                                                 let db_for_msg = db3.clone();
@@ -35021,15 +35050,24 @@ async fn handle_command_inner(
                                         .await
                                         {
                                             Ok(handle) => {
-                                                let msg_bytes = msg.as_bytes();
-                                                let mut packet =
-                                                    Vec::with_capacity(6 + msg_bytes.len());
-                                                packet.push(OP_EMULEPROT);
-                                                let size = (1 + msg_bytes.len()) as u32;
-                                                packet.extend_from_slice(&size.to_le_bytes());
-                                                packet.push(ed2k::messages::OP_EMBER_CHAT_MSG);
-                                                packet.extend_from_slice(msg_bytes);
-                                                if handle.outbound_tx.try_send(packet).is_ok() {
+                                                let encrypted = crate::network::ember::crypto::encrypt_chat_for_peer(
+                                                    &ed25519_secret_key,
+                                                    &handle.peer_ember_pubkey,
+                                                    msg.as_bytes(),
+                                                );
+                                                let sent_ok = if let Some(envelope) = encrypted {
+                                                    let mut packet =
+                                                        Vec::with_capacity(6 + envelope.len());
+                                                    packet.push(OP_EMULEPROT);
+                                                    let size = (1 + envelope.len()) as u32;
+                                                    packet.extend_from_slice(&size.to_le_bytes());
+                                                    packet.push(ed2k::messages::OP_EMBER_CHAT_MSG);
+                                                    packet.extend_from_slice(&envelope);
+                                                    handle.outbound_tx.try_send(packet).is_ok()
+                                                } else {
+                                                    false
+                                                };
+                                                if sent_ok {
                                                     let hash_hex = hex::encode(friend_eh);
                                                     let msg_for_db = msg.clone();
                                                     let db_for_msg = db3.clone();

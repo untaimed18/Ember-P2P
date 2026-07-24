@@ -104,6 +104,17 @@ notify-debouncer-mini = { version = "0.7", default-features = false }
 # strings) — saves ~250 KiB binary and ~50 ms startup compile time.
 regex = { version = "1", default-features = false, features = ["std", "perf"] }
 lofty = "0.24"
+# Friend-chat E2E encryption (`network::ember::crypto`): converts our
+# existing Ed25519 identity keys to X25519 for ECDH, then HKDF-stretches
+# the shared secret into an AEAD key. Pinned to the same `curve25519-dalek`
+# major version `ed25519-dalek` already pulls in (v4) so we don't link two
+# copies of the curve arithmetic.
+curve25519-dalek = "4"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+# 0.12 (not the newer 0.13) to stay on the `digest` 0.10 family that our
+# `sha2` version already uses — 0.13 upgrades to `digest` 0.11 and would
+# pull in a second, incompatible hashing stack.
+hkdf = "0.12"
 
 [profile.release]
 strip = true

@@ -14,12 +14,18 @@ use super::ember_auth::{sign_auth_nonce, verify_auth_nonce};
 use super::messages::*;
 use super::upload::{EmberSessionHandle, EmberSessionMap, UploadEvent, UploadEventKind};
 use crate::network::ember::crypto;
+use crate::network::ember::crypto::{decrypt_chat_payload, MAX_CHAT_WIRE_LEN};
 
 /// Result from a successfully established friend session: the outbound sender
 /// so the caller can immediately send packets before the loop consumes them.
 pub struct FriendSessionHandle {
     pub outbound_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     pub session_id: u64,
+    /// The friend's PoP-verified Ed25519 identity public key for this
+    /// session — see `EmberSessionHandle::peer_ember_pubkey`. Callers use
+    /// this together with their own Ed25519 secret to encrypt outbound
+    /// `OP_EMBER_CHAT_MSG` payloads via `ember::crypto::encrypt_chat_for_peer`.
+    pub peer_ember_pubkey: [u8; 32],
 }
 
 /// Establishes a persistent outbound friend session. Performs the full
@@ -236,6 +242,7 @@ pub async fn run_friend_session_over_transport(
                 return Ok(FriendSessionHandle {
                     outbound_tx: existing.tx.clone(),
                     session_id: existing.session_id(),
+                    peer_ember_pubkey: existing.peer_ember_pubkey(),
                 });
             }
         }
@@ -319,7 +326,7 @@ pub async fn run_friend_session_over_transport(
     // duplicate request from the racing connection too) — return
     // the winner's handle instead and drop this socket cleanly.
     let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
-    let ember_session_handle = EmberSessionHandle::new(outbound_tx.clone());
+    let ember_session_handle = EmberSessionHandle::new(outbound_tx.clone(), peer_pk);
     {
         let mut sessions = ember_sessions.write().await;
         match sessions.get(&peer_ember_hash) {
@@ -331,6 +338,7 @@ pub async fn run_friend_session_over_transport(
                 return Ok(FriendSessionHandle {
                     outbound_tx: existing.tx.clone(),
                     session_id: existing.session_id(),
+                    peer_ember_pubkey: existing.peer_ember_pubkey(),
                 });
             }
             Some(stale) => {
@@ -386,6 +394,7 @@ pub async fn run_friend_session_over_transport(
     let handle = FriendSessionHandle {
         outbound_tx,
         session_id: ember_session_handle.session_id(),
+        peer_ember_pubkey: peer_pk,
     };
 
     let session_ember_sessions = ember_sessions.clone();
@@ -393,6 +402,13 @@ pub async fn run_friend_session_over_transport(
     let session_ul_event_tx = ul_event_tx.clone();
     let session_friend_hashes = friend_hashes.clone();
     let mut session_shutdown = ember_session_handle.subscribe_shutdown();
+    // `ember_pop_verified` (true, or we'd have bailed above) implies
+    // `our_have_keys`, so this can't panic; `ed25519_secret_key` is
+    // `Option<[u8; 32]>` (`Copy`), so unwrapping a copy here doesn't
+    // disturb the original binding used earlier.
+    let session_our_ed25519_secret =
+        ed25519_secret_key.expect("ember_pop_verified implies our_have_keys");
+    let session_peer_ember_pubkey = peer_pk;
     tokio::spawn(async move {
         const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(90);
         // L8: dead-peer detector. The eMule wire protocol has no
@@ -478,13 +494,17 @@ pub async fn run_friend_session_over_transport(
                             session_ember_session_handle.touch();
                             match (proto, opcode) {
                                 (OP_EMULEPROT, OP_EMBER_CHAT_MSG) => {
-                                    if payload.len() <= 4096 {
-                                        if let Ok(msg) = std::str::from_utf8(&payload) {
+                                    if payload.len() <= MAX_CHAT_WIRE_LEN {
+                                        if let Some(msg) = decrypt_chat_payload(
+                                            &session_our_ed25519_secret,
+                                            &session_peer_ember_pubkey,
+                                            &payload,
+                                        ) {
                                             let _ = session_ul_event_tx.send(UploadEvent {
                                                 transfer_id: String::new(),
                                                 kind: UploadEventKind::EmberChatMessage {
                                                     ember_hash: peer_ember_hash,
-                                                    message: msg.to_string(),
+                                                    message: msg,
                                                 },
                                             }).await;
                                         }
@@ -1214,7 +1234,7 @@ mod tests {
         // dial starts — simulating a previous session whose connection
         // died silently without a clean teardown.
         let (dead_tx, dead_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
-        let stale_handle = EmberSessionHandle::new(dead_tx);
+        let stale_handle = EmberSessionHandle::new(dead_tx, [0u8; 32]);
         // Comfortably past `EMBER_SESSION_FRESH_SECS` (180s; private to
         // `upload.rs`) without depending on that exact constant here.
         stale_handle.backdate_for_test(3600);

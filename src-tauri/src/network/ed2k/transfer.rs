@@ -2317,14 +2317,20 @@ impl Ed2kDownload {
                     }
                 }
                 (OP_EMULEPROT, OP_EMBER_CHAT_MSG)
-                    if is_ember_friend && ember_auth_verified && payload.len() <= 4096 =>
+                    if is_ember_friend
+                        && ember_auth_verified
+                        && payload.len() <= crate::network::ember::crypto::MAX_CHAT_WIRE_LEN =>
                 {
-                    if let Some(eh) = peer_ember_hash {
-                        if let Ok(msg) = std::str::from_utf8(&payload) {
+                    if let (Some(eh), Some(pk)) = (peer_ember_hash, peer_ember_pubkey) {
+                        if let Some(msg) = crate::network::ember::crypto::decrypt_chat_payload(
+                            &self.ed25519_secret_key,
+                            &pk,
+                            &payload,
+                        ) {
                             let _ = event_tx
                                 .send(DownloadEvent::EmberChatMessage {
                                     ember_hash: eh,
-                                    message: msg.to_string(),
+                                    message: msg,
                                 })
                                 .await;
                         }
@@ -3852,14 +3858,20 @@ impl Ed2kDownload {
                             }
                         }
                         (OP_EMULEPROT, OP_EMBER_CHAT_MSG)
-                            if is_ember_friend && ember_auth_verified && payload.len() <= 4096 =>
+                            if is_ember_friend
+                                && ember_auth_verified
+                                && payload.len() <= crate::network::ember::crypto::MAX_CHAT_WIRE_LEN =>
                         {
-                            if let Some(eh) = peer_ember_hash {
-                                if let Ok(msg) = std::str::from_utf8(&payload) {
+                            if let (Some(eh), Some(pk)) = (peer_ember_hash, peer_ember_pubkey) {
+                                if let Some(msg) = crate::network::ember::crypto::decrypt_chat_payload(
+                                    &self.ed25519_secret_key,
+                                    &pk,
+                                    &payload,
+                                ) {
                                     let _ = event_tx
                                         .send(DownloadEvent::EmberChatMessage {
                                             ember_hash: eh,
-                                            message: msg.to_string(),
+                                            message: msg,
                                         })
                                         .await;
                                 }

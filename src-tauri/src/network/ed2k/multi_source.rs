@@ -7744,14 +7744,22 @@ async fn download_parts_from_source(
                     // our friend and spoofed browse results are the two
                     // visible attacks here.
                     (OP_EMULEPROT, OP_EMBER_CHAT_MSG)
-                        if is_ember_friend && ember_auth_verified && payload.len() <= 4096 =>
+                        if is_ember_friend
+                            && ember_auth_verified
+                            && payload.len() <= crate::network::ember::crypto::MAX_CHAT_WIRE_LEN =>
                     {
-                        if let (Some(eh), Some(ref etx)) = (peer_ember_hash, &event_tx) {
-                            if let Ok(msg) = std::str::from_utf8(&payload) {
+                        if let (Some(eh), Some(ref etx), Some(pk)) =
+                            (peer_ember_hash, &event_tx, hello_caps.ember_pubkey)
+                        {
+                            if let Some(msg) = crate::network::ember::crypto::decrypt_chat_payload(
+                                &ed25519_secret_key,
+                                &pk,
+                                &payload,
+                            ) {
                                 let _ = etx
                                     .send(DownloadEvent::EmberChatMessage {
                                         ember_hash: eh,
-                                        message: msg.to_string(),
+                                        message: msg,
                                     })
                                     .await;
                             }

@@ -49,6 +49,15 @@ pub struct EmberSessionHandle {
     session_id: u64,
     last_activity: Arc<std::sync::atomic::AtomicI64>,
     shutdown: tokio::sync::watch::Sender<bool>,
+    /// The peer's Ed25519 identity public key, as proven by the Ed25519
+    /// proof-of-possession challenge-response that gates creation of
+    /// every `EmberSessionHandle` (see the inbound `OP_EMBER_AUTH_RESPONSE`
+    /// handler and `friend_connect::run_friend_session_over_transport`,
+    /// the two call sites that construct one). Chat encryption
+    /// (`ember::crypto::{encrypt,decrypt}_chat_*`) derives its AEAD key
+    /// from this — reusing the same identity key already bound to
+    /// `ember_hash` rather than negotiating or persisting a separate one.
+    peer_ember_pubkey: [u8; 32],
 }
 
 static NEXT_EMBER_SESSION_ID: AtomicU64 = AtomicU64::new(1);
@@ -66,7 +75,7 @@ static NEXT_EMBER_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 const EMBER_SESSION_FRESH_SECS: i64 = 180;
 
 impl EmberSessionHandle {
-    pub fn new(tx: tokio::sync::mpsc::Sender<Vec<u8>>) -> Self {
+    pub fn new(tx: tokio::sync::mpsc::Sender<Vec<u8>>, peer_ember_pubkey: [u8; 32]) -> Self {
         let (shutdown, _) = tokio::sync::watch::channel(false);
         Self {
             tx,
@@ -75,7 +84,14 @@ impl EmberSessionHandle {
                 chrono::Utc::now().timestamp(),
             )),
             shutdown,
+            peer_ember_pubkey,
         }
+    }
+
+    /// The peer's PoP-verified Ed25519 identity public key for this
+    /// session. See the field doc for why this is trustworthy.
+    pub fn peer_ember_pubkey(&self) -> [u8; 32] {
+        self.peer_ember_pubkey
     }
 
     /// Opaque generation for binding request/response correlation to this
@@ -8511,7 +8527,13 @@ impl UploadHandler {
                             // session-open comment for the full
                             // rationale).
                             if !owns_ember_slot && is_ember_friend {
-                                if let Some(eh) = peer_ember_hash {
+                                // `hello_caps.ember_pubkey` is guaranteed
+                                // `Some` here: PoP just succeeded above,
+                                // which requires a pubkey to verify the
+                                // peer's signature against.
+                                if let (Some(eh), Some(pk)) =
+                                    (peer_ember_hash, hello_caps.ember_pubkey)
+                                {
                                     let mut sessions = self.ember_sessions.write().await;
                                     // A pre-existing entry might just be a
                                     // stale leftover from a connection that
@@ -8527,7 +8549,8 @@ impl UploadHandler {
                                         sessions.remove(&eh);
                                     }
                                     if !sessions.contains_key(&eh) {
-                                        let handle = EmberSessionHandle::new(outbound_tx.clone());
+                                        let handle =
+                                            EmberSessionHandle::new(outbound_tx.clone(), pk);
                                         ember_shutdown_rx = Some(handle.subscribe_shutdown());
                                         ember_session_handle = Some(handle.clone());
                                         sessions.insert(eh, handle);
@@ -8628,15 +8651,24 @@ impl UploadHandler {
                     if let Some(eh) = peer_ember_hash {
                         if !self.friend_hashes.read().await.contains(&eh) {
                             debug!("Ignoring chat from removed friend {}", hex::encode(eh));
-                        } else if payload.len() <= 4096 {
-                            if let Ok(msg) = std::str::from_utf8(&payload) {
-                                let _ = self.upload_event_tx.send(UploadEvent {
-                                    transfer_id: String::new(),
-                                    kind: UploadEventKind::EmberChatMessage {
-                                        ember_hash: eh,
-                                        message: msg.to_string(),
-                                    },
-                                }).await;
+                        } else if payload.len() <= crate::network::ember::crypto::MAX_CHAT_WIRE_LEN {
+                            // `hello_caps.ember_pubkey` is guaranteed
+                            // `Some` here: `ember_auth_state.is_verified()`
+                            // requires it for PoP.
+                            if let Some(pk) = hello_caps.ember_pubkey {
+                                if let Some(msg) = crate::network::ember::crypto::decrypt_chat_payload(
+                                    &self.ed25519_secret_key,
+                                    &pk,
+                                    &payload,
+                                ) {
+                                    let _ = self.upload_event_tx.send(UploadEvent {
+                                        transfer_id: String::new(),
+                                        kind: UploadEventKind::EmberChatMessage {
+                                            ember_hash: eh,
+                                            message: msg,
+                                        },
+                                    }).await;
+                                }
                             }
                         }
                     }
@@ -9911,7 +9943,7 @@ mod ember_session_handle_tests {
     #[tokio::test]
     async fn fresh_handle_reports_fresh_until_backdated() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
-        let handle = EmberSessionHandle::new(tx);
+        let handle = EmberSessionHandle::new(tx, [0u8; 32]);
         assert!(handle.is_fresh(), "a just-created handle must be fresh");
 
         handle.backdate_for_test(EMBER_SESSION_FRESH_SECS + 1);
@@ -9924,7 +9956,7 @@ mod ember_session_handle_tests {
     #[tokio::test]
     async fn touch_refreshes_a_backdated_handle() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
-        let handle = EmberSessionHandle::new(tx);
+        let handle = EmberSessionHandle::new(tx, [0u8; 32]);
         handle.backdate_for_test(EMBER_SESSION_FRESH_SECS + 1);
         assert!(!handle.is_fresh());
 
@@ -9935,7 +9967,7 @@ mod ember_session_handle_tests {
     #[tokio::test]
     async fn close_notifies_the_session_owner() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
-        let handle = EmberSessionHandle::new(tx);
+        let handle = EmberSessionHandle::new(tx, [0u8; 32]);
         let mut shutdown = handle.subscribe_shutdown();
 
         handle.close();
@@ -9953,11 +9985,11 @@ mod ember_session_handle_tests {
         let fresh_hash = [0xBB; 16];
 
         let (stale_tx, _stale_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
-        let stale_handle = EmberSessionHandle::new(stale_tx);
+        let stale_handle = EmberSessionHandle::new(stale_tx, [0u8; 32]);
         stale_handle.backdate_for_test(EMBER_SESSION_FRESH_SECS + 1);
 
         let (fresh_tx, _fresh_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
-        let fresh_handle = EmberSessionHandle::new(fresh_tx);
+        let fresh_handle = EmberSessionHandle::new(fresh_tx, [0u8; 32]);
 
         {
             let mut map = sessions.write().await;

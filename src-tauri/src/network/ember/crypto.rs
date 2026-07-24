@@ -1,4 +1,13 @@
+use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::{Key as ChaChaKey, XChaCha20Poly1305, XNonce};
+use curve25519_dalek::edwards::CompressedEdwardsY;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use hkdf::Hkdf;
+use rand::rngs::OsRng;
+use rand::RngCore;
+use sha2::{Digest, Sha256, Sha512};
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
+use zeroize::Zeroize;
 
 /// Derive a 16-byte Ember node ID from an Ed25519 public key.
 ///
@@ -118,6 +127,230 @@ pub fn blake3_hash_file_path(path: &std::path::Path) -> anyhow::Result<[u8; 32]>
         hasher.update(&buf[..n]);
     }
     Ok(hasher.finalize())
+}
+
+// --- Friend-chat end-to-end encryption -------------------------------
+//
+// Friend chat (`OP_EMBER_CHAT_MSG`) is encrypted with an AEAD key derived
+// from an X25519 Diffie-Hellman exchange between the two friends'
+// long-term Ed25519 identity keys — the same keys that already back
+// `ember_hash` and proof-of-possession, converted to their X25519
+// (Montgomery) form via the standard birational map between the two
+// curve representations (the same technique libsodium's
+// `crypto_sign_ed25519_{sk,pk}_to_curve25519` use). We deliberately reuse
+// this identity key rather than minting a separate chat keypair: every
+// friend session already requires both sides to have proven possession
+// of it (`perform_ember_auth`), so there is no additional trust bootstrap
+// needed, and no extra key to advertise, persist, or rotate.
+//
+// This gives confidentiality and integrity against anyone relaying or
+// observing the TCP session (including a malicious/compromised
+// rendezvous or relay hop — see `broker.rs`), but it is a *static* DH,
+// not a ratcheting protocol: it does not provide forward secrecy against
+// a future compromise of either party's long-term Ed25519 secret key.
+// That tradeoff matches what's achievable without a persistent
+// session/ratchet state store, and is a strict improvement over today's
+// plaintext-on-the-wire chat.
+
+/// Version tag for the friend-chat AEAD envelope (`version || nonce ||
+/// ciphertext‖tag`). Bumped whenever the wire format, algorithm, or KDF
+/// context changes, so old and new builds can never silently misinterpret
+/// each other's bytes — see [`decrypt_chat_message`].
+pub const CHAT_ENVELOPE_VERSION: u8 = 1;
+
+/// XChaCha20-Poly1305 nonce length in bytes.
+const CHAT_NONCE_LEN: usize = 24;
+/// Poly1305 authentication tag length in bytes.
+const CHAT_TAG_LEN: usize = 16;
+
+/// Fixed per-message overhead `encrypt_chat_message` adds on top of the
+/// plaintext (`version(1) + nonce(24) + tag(16)`). Any caller enforcing a
+/// wire-size cap on `OP_EMBER_CHAT_MSG` payloads must add this to the
+/// plaintext limit, or legitimate encrypted messages at the plaintext cap
+/// will be rejected as oversized.
+pub const CHAT_ENVELOPE_OVERHEAD: usize = 1 + CHAT_NONCE_LEN + CHAT_TAG_LEN;
+
+/// HKDF "info" context binding the derived key to this exact purpose, so
+/// the same raw X25519 DH output can never be reused (even accidentally)
+/// as a key for some other protocol layered on the same identity keys.
+const CHAT_KEY_INFO: &[u8] = b"ember-friend-chat-v1";
+
+/// Derive the X25519 secret scalar corresponding to an Ed25519 signing
+/// key's seed, per the standard Ed25519-to-X25519 conversion: hash the
+/// 32-byte seed with SHA-512 and take the low 32 bytes (clamping is
+/// applied later, at scalar-multiplication time, by `x25519-dalek`
+/// itself). This is the exact same scalar Ed25519 uses internally to
+/// compute the Edwards public key from the seed — X25519 and Ed25519
+/// operate over the same underlying group, just with different point
+/// encodings (Montgomery vs. Edwards).
+fn ed25519_seed_to_x25519_scalar(seed: &[u8; 32]) -> [u8; 32] {
+    let mut hash = Sha512::digest(seed);
+    let mut scalar = [0u8; 32];
+    scalar.copy_from_slice(&hash[..32]);
+    hash.zeroize();
+    scalar
+}
+
+/// Convert an Ed25519 public key (Edwards form) to its X25519
+/// (Montgomery form) equivalent via the standard birational map between
+/// the two curve representations.
+///
+/// Returns `None` if `ed25519_pubkey` isn't a strictly-valid, canonically
+/// encoded Ed25519 point — we first run it through
+/// [`VerifyingKey::from_bytes`] (the same strict check
+/// [`verify_ember_hash_binding`] and every Ed25519 signature verification
+/// in this codebase relies on) rather than only the more permissive
+/// `curve25519-dalek` decompression, which accepts some non-canonical
+/// encodings that reduce mod p. Callers must treat `None` as "cannot
+/// derive a chat key with this peer" rather than panicking or falling
+/// back to an insecure default.
+fn ed25519_pubkey_to_x25519(ed25519_pubkey: &[u8; 32]) -> Option<X25519PublicKey> {
+    VerifyingKey::from_bytes(ed25519_pubkey).ok()?;
+    let point = CompressedEdwardsY(*ed25519_pubkey).decompress()?;
+    Some(X25519PublicKey::from(point.to_montgomery().to_bytes()))
+}
+
+/// Derive the symmetric AEAD key used to encrypt/decrypt friend-chat
+/// messages exchanged with `peer_ed25519_pubkey`, from our own Ed25519
+/// identity seed.
+///
+/// Both sides of a friend session compute this independently (each using
+/// their own secret and the other's already PoP-verified public key) and
+/// arrive at the same 32-byte key, via X25519 Diffie-Hellman stretched
+/// through HKDF-SHA256.
+///
+/// Returns `None` if `peer_ed25519_pubkey` isn't a valid curve point, or
+/// if the DH exchange was non-contributory (see
+/// [`x25519_dalek::SharedSecret::was_contributory`] — this rejects
+/// degenerate/low-order peer keys that could otherwise force a
+/// predictable shared secret).
+pub fn derive_chat_key(
+    our_ed25519_seed: &[u8; 32],
+    peer_ed25519_pubkey: &[u8; 32],
+) -> Option<[u8; 32]> {
+    let their_x25519_pub = ed25519_pubkey_to_x25519(peer_ed25519_pubkey)?;
+    let mut our_scalar = ed25519_seed_to_x25519_scalar(our_ed25519_seed);
+    let our_secret = X25519StaticSecret::from(our_scalar);
+    our_scalar.zeroize();
+    let shared = our_secret.diffie_hellman(&their_x25519_pub);
+    if !shared.was_contributory() {
+        return None;
+    }
+    let hk = Hkdf::<Sha256>::new(None, shared.as_bytes());
+    let mut key = [0u8; 32];
+    // 32 bytes is always a valid HKDF-SHA256 output length (max is
+    // 255 * 32), so `expand` cannot fail here.
+    hk.expand(CHAT_KEY_INFO, &mut key)
+        .expect("32-byte OKM is within HKDF-SHA256's output range");
+    Some(key)
+}
+
+/// Encrypt a friend-chat plaintext with a fresh random nonce.
+///
+/// Wire layout: `version(1) || nonce(24) || ciphertext‖tag`.
+pub fn encrypt_chat_message(key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
+    let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(key));
+    let mut nonce_bytes = [0u8; CHAT_NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = XNonce::from_slice(&nonce_bytes);
+    // A 32-byte key and a 24-byte random nonce make encryption failure
+    // impossible for XChaCha20-Poly1305 at chat-message sizes (there's no
+    // realistic way to hit its ~256 GiB per-nonce plaintext limit here).
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext)
+        .expect("XChaCha20-Poly1305 encryption cannot fail for chat-sized plaintext");
+    let mut out = Vec::with_capacity(1 + CHAT_NONCE_LEN + ciphertext.len());
+    out.push(CHAT_ENVELOPE_VERSION);
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ciphertext);
+    out
+}
+
+/// Decrypt a friend-chat envelope produced by [`encrypt_chat_message`].
+///
+/// Returns `None` on any malformed input, unrecognised version byte, or
+/// AEAD authentication failure. Callers must treat `None` as "could not
+/// decrypt" and must never fall back to displaying the raw envelope bytes
+/// as if they were plaintext — the only safe legacy fallback is to
+/// re-attempt parsing the *original, un-decrypted* wire payload as
+/// plain UTF-8 (for interop with a peer that hasn't upgraded yet).
+pub fn decrypt_chat_message(key: &[u8; 32], envelope: &[u8]) -> Option<Vec<u8>> {
+    if envelope.len() < CHAT_ENVELOPE_OVERHEAD || envelope[0] != CHAT_ENVELOPE_VERSION {
+        return None;
+    }
+    let nonce = XNonce::from_slice(&envelope[1..1 + CHAT_NONCE_LEN]);
+    let ciphertext = &envelope[1 + CHAT_NONCE_LEN..];
+    let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(key));
+    cipher.decrypt(nonce, ciphertext).ok()
+}
+
+/// Convenience wrapper: derive the shared key for `peer_ed25519_pubkey`
+/// and encrypt `plaintext` in one call. Returns `None` only if key
+/// derivation fails (see [`derive_chat_key`]) — this should not happen in
+/// practice for any peer that has already passed `perform_ember_auth`,
+/// since that requires the same pubkey to be a valid, non-degenerate
+/// curve point.
+pub fn encrypt_chat_for_peer(
+    our_ed25519_seed: &[u8; 32],
+    peer_ed25519_pubkey: &[u8; 32],
+    plaintext: &[u8],
+) -> Option<Vec<u8>> {
+    let key = derive_chat_key(our_ed25519_seed, peer_ed25519_pubkey)?;
+    Some(encrypt_chat_message(&key, plaintext))
+}
+
+/// Convenience wrapper: derive the shared key for `peer_ed25519_pubkey`
+/// and decrypt `envelope` in one call.
+pub fn decrypt_chat_from_peer(
+    our_ed25519_seed: &[u8; 32],
+    peer_ed25519_pubkey: &[u8; 32],
+    envelope: &[u8],
+) -> Option<Vec<u8>> {
+    let key = derive_chat_key(our_ed25519_seed, peer_ed25519_pubkey)?;
+    decrypt_chat_message(&key, envelope)
+}
+
+/// Maximum on-wire size for an `OP_EMBER_CHAT_MSG` payload: the plaintext
+/// UTF-8 size cap enforced client-side (see
+/// `commands::peers::send_chat_message`'s 4096-byte limit) plus the fixed
+/// AEAD envelope overhead `encrypt_chat_message` adds. Every
+/// `OP_EMBER_CHAT_MSG` receive site must check incoming payloads against
+/// this constant rather than the plaintext-only 4096 the wire format used
+/// pre-encryption, or legitimate encrypted messages at the plaintext cap
+/// get silently dropped as "too large".
+pub const MAX_CHAT_WIRE_LEN: usize = 4096 + CHAT_ENVELOPE_OVERHEAD;
+
+/// Decode an inbound `OP_EMBER_CHAT_MSG` payload for display.
+///
+/// Returns `None` if the payload fails to decrypt or the plaintext isn't
+/// valid UTF-8 — callers must drop the packet in that case, not display
+/// anything.
+///
+/// Deliberately has **no legacy-plaintext fallback**. An earlier version
+/// of this function fell back to treating any payload that failed to
+/// decrypt as legacy plain UTF-8 text, reasoning that AEAD authentication
+/// makes a *legitimate* legacy message and *ciphertext* unambiguous. That
+/// reasoning covered the accidental-collision case but missed the actual
+/// threat: `perform_ember_auth`'s proof-of-possession authenticates a
+/// peer once, at session setup, not per-packet, so anyone on-path for the
+/// remainder of an already-established session — a compromised
+/// rendezvous/relay hop (see `broker.rs`), or a TCP/Wi-Fi MITM on a
+/// direct connection — can inject an arbitrary `OP_EMBER_CHAT_MSG` packet
+/// of their own choosing. Since both sides of this protocol always
+/// encrypt (there is no plaintext-send path — see `encrypt_chat_for_peer`
+/// and its call sites), any payload that fails to decrypt here is never
+/// legitimate, and a fallback would let that attacker's arbitrary
+/// ASCII/UTF-8 bytes be silently displayed as a genuine message from the
+/// PoP-verified friend. Dropping instead closes that hole; the cost is
+/// that a friend still running a pre-encryption build simply can't
+/// exchange chat with an upgraded one until they update too.
+pub fn decrypt_chat_payload(
+    our_ed25519_seed: &[u8; 32],
+    peer_ed25519_pubkey: &[u8; 32],
+    payload: &[u8],
+) -> Option<String> {
+    let plaintext = decrypt_chat_from_peer(our_ed25519_seed, peer_ed25519_pubkey, payload)?;
+    String::from_utf8(plaintext).ok()
 }
 
 #[cfg(test)]
@@ -245,5 +478,175 @@ mod tests {
         let incremental = hasher.finalize();
 
         assert_eq!(oneshot, incremental);
+    }
+
+    fn gen_seed() -> [u8; 32] {
+        SigningKey::generate(&mut OsRng).to_bytes()
+    }
+
+    #[test]
+    fn chat_key_derivation_is_symmetric() {
+        let alice_seed = gen_seed();
+        let bob_seed = gen_seed();
+        let alice_pub = signing_key_from_bytes(&alice_seed).verifying_key().to_bytes();
+        let bob_pub = signing_key_from_bytes(&bob_seed).verifying_key().to_bytes();
+
+        let alice_key = derive_chat_key(&alice_seed, &bob_pub).expect("valid peer key");
+        let bob_key = derive_chat_key(&bob_seed, &alice_pub).expect("valid peer key");
+        assert_eq!(
+            alice_key, bob_key,
+            "both sides must derive the same shared chat key"
+        );
+    }
+
+    #[test]
+    fn chat_key_derivation_differs_per_peer_pair() {
+        let alice_seed = gen_seed();
+        let bob_pub = signing_key_from_bytes(&gen_seed()).verifying_key().to_bytes();
+        let carol_pub = signing_key_from_bytes(&gen_seed()).verifying_key().to_bytes();
+
+        let key_with_bob = derive_chat_key(&alice_seed, &bob_pub).unwrap();
+        let key_with_carol = derive_chat_key(&alice_seed, &carol_pub).unwrap();
+        assert_ne!(key_with_bob, key_with_carol);
+    }
+
+    #[test]
+    fn chat_key_derivation_rejects_invalid_peer_pubkey() {
+        let our_seed = gen_seed();
+        // y=2 (sign bit clear) does not correspond to any point on the
+        // Edwards curve — confirmed by brute-force scan, since not every
+        // byte pattern with the high bit clear is actually rejected by
+        // decompression (e.g. all-0xFF bytes *does* decode, just to a
+        // non-canonically-encoded but otherwise valid point).
+        let mut bad_pubkey = [0u8; 32];
+        bad_pubkey[0] = 2;
+        assert!(derive_chat_key(&our_seed, &bad_pubkey).is_none());
+    }
+
+    #[test]
+    fn chat_message_round_trip() {
+        let key = [0x42u8; 32];
+        let plaintext = b"hey, want to grab lunch later?";
+        let envelope = encrypt_chat_message(&key, plaintext);
+        let decrypted = decrypt_chat_message(&key, &envelope).expect("must decrypt");
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn chat_message_envelope_has_expected_overhead() {
+        let key = [0x11u8; 32];
+        let plaintext = b"short";
+        let envelope = encrypt_chat_message(&key, plaintext);
+        assert_eq!(envelope.len(), plaintext.len() + CHAT_ENVELOPE_OVERHEAD);
+        assert_eq!(envelope[0], CHAT_ENVELOPE_VERSION);
+    }
+
+    #[test]
+    fn chat_message_nonces_are_not_reused() {
+        let key = [0x77u8; 32];
+        let a = encrypt_chat_message(&key, b"same message");
+        let b = encrypt_chat_message(&key, b"same message");
+        assert_ne!(
+            a, b,
+            "two encryptions of the same plaintext must differ (random nonce)"
+        );
+    }
+
+    #[test]
+    fn chat_message_decrypt_rejects_wrong_key() {
+        let key_a = [0x01u8; 32];
+        let key_b = [0x02u8; 32];
+        let envelope = encrypt_chat_message(&key_a, b"secret");
+        assert!(decrypt_chat_message(&key_b, &envelope).is_none());
+    }
+
+    #[test]
+    fn chat_message_decrypt_rejects_tampered_ciphertext() {
+        let key = [0x03u8; 32];
+        let mut envelope = encrypt_chat_message(&key, b"do not tamper with me");
+        let last = envelope.len() - 1;
+        envelope[last] ^= 0xFF;
+        assert!(decrypt_chat_message(&key, &envelope).is_none());
+    }
+
+    #[test]
+    fn chat_message_decrypt_rejects_truncated_envelope() {
+        let key = [0x04u8; 32];
+        let envelope = encrypt_chat_message(&key, b"hello");
+        assert!(decrypt_chat_message(&key, &envelope[..envelope.len() - 1]).is_none());
+        assert!(decrypt_chat_message(&key, &[]).is_none());
+    }
+
+    #[test]
+    fn chat_message_decrypt_rejects_unknown_version() {
+        let key = [0x05u8; 32];
+        let mut envelope = encrypt_chat_message(&key, b"hello");
+        envelope[0] = 0x02;
+        assert!(decrypt_chat_message(&key, &envelope).is_none());
+    }
+
+    #[test]
+    fn chat_message_decrypt_rejects_legacy_plaintext_payload() {
+        // A pre-upgrade peer's raw UTF-8 chat payload must never be
+        // misinterpreted as a valid encrypted envelope.
+        let key = [0x06u8; 32];
+        let legacy_payload = b"hello from an old client";
+        assert!(decrypt_chat_message(&key, legacy_payload).is_none());
+    }
+
+    #[test]
+    fn decrypt_chat_payload_decrypts_valid_envelope() {
+        let alice_seed = gen_seed();
+        let bob_seed = gen_seed();
+        let alice_pub = signing_key_from_bytes(&alice_seed).verifying_key().to_bytes();
+        let bob_pub = signing_key_from_bytes(&bob_seed).verifying_key().to_bytes();
+
+        let envelope = encrypt_chat_for_peer(&alice_seed, &bob_pub, b"encrypted hello").unwrap();
+        let decoded = decrypt_chat_payload(&bob_seed, &alice_pub, &envelope).unwrap();
+        assert_eq!(decoded, "encrypted hello");
+    }
+
+    #[test]
+    fn decrypt_chat_payload_has_no_legacy_plaintext_fallback() {
+        // Regression test for the integrity gap a security review caught:
+        // a bare/attacker-forged UTF-8 payload with no valid envelope
+        // must be dropped (`None`), never displayed as if it were a
+        // genuine message from the PoP-verified peer. PoP only
+        // authenticates the peer once at session setup, not per packet,
+        // so an on-path attacker (malicious relay hop, TCP MITM) can
+        // inject arbitrary bytes into an already-established session at
+        // any time — accepting a plaintext fallback here would let them
+        // forge chat messages.
+        let our_seed = gen_seed();
+        let peer_pub = signing_key_from_bytes(&gen_seed()).verifying_key().to_bytes();
+        let forged = b"pretend this is from the real friend";
+        assert!(decrypt_chat_payload(&our_seed, &peer_pub, forged).is_none());
+    }
+
+    #[test]
+    fn decrypt_chat_payload_rejects_wrong_recipient() {
+        let alice_seed = gen_seed();
+        let bob_seed = gen_seed();
+        let mallory_seed = gen_seed();
+        let alice_pub = signing_key_from_bytes(&alice_seed).verifying_key().to_bytes();
+        let mallory_pub = signing_key_from_bytes(&mallory_seed).verifying_key().to_bytes();
+
+        // Encrypted for Mallory, not Bob: Bob must not be able to decrypt
+        // it, and it must be dropped outright (no plaintext fallback).
+        let envelope =
+            encrypt_chat_for_peer(&alice_seed, &mallory_pub, b"for mallory only").unwrap();
+        assert!(decrypt_chat_payload(&bob_seed, &alice_pub, &envelope).is_none());
+    }
+
+    #[test]
+    fn encrypt_decrypt_for_peer_round_trip() {
+        let alice_seed = gen_seed();
+        let bob_seed = gen_seed();
+        let alice_pub = signing_key_from_bytes(&alice_seed).verifying_key().to_bytes();
+        let bob_pub = signing_key_from_bytes(&bob_seed).verifying_key().to_bytes();
+
+        let envelope = encrypt_chat_for_peer(&alice_seed, &bob_pub, b"ping").unwrap();
+        let decrypted = decrypt_chat_from_peer(&bob_seed, &alice_pub, &envelope).unwrap();
+        assert_eq!(decrypted, b"ping");
     }
 }
