@@ -329,6 +329,9 @@ export function translateError(input: unknown, fallback?: string): string {
       return m.error_already_friend();
     case 'SelfAdd':
       return m.error_self_add();
+    case 'ChatEncryptFailed':
+    case 'Failed to encrypt chat message':
+      return m.error_chat_encrypt_failed();
     default:
       // Tier 3: unknown plain string — surface as-is.
       return raw;

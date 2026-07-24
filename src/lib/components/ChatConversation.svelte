@@ -417,6 +417,13 @@
           <span>{m.chat_offline_label()}</span>
         </span>
       {/if}
+      <span class="conv-status encrypted" title={m.chat_encrypted_title()} aria-label={m.chat_encrypted_aria()}>
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="3.5" y="7" width="9" height="6.5" rx="1.5"/>
+          <path d="M5.5 7V5.5a2.5 2.5 0 0 1 5 0V7"/>
+        </svg>
+        <span>{m.chat_encrypted_label()}</span>
+      </span>
     </div>
   </div>
 
@@ -574,6 +581,11 @@
   .conv-status.offline {
     background: var(--bg-tertiary);
     color: var(--text-muted);
+  }
+
+  .conv-status.encrypted {
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    color: var(--accent);
   }
 
   .conv-messages {

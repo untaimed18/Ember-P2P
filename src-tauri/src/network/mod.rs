@@ -34799,7 +34799,7 @@ async fn handle_command_inner(
                             // `perform_ember_auth` should have ruled out —
                             // treat as an internal error rather than ever
                             // silently sending plaintext.
-                            let _ = tx.send(Err("Failed to encrypt chat message".into()));
+                            let _ = tx.send(Err("ChatEncryptFailed".into()));
                         }
                         Some(envelope) => {
                             let mut packet = Vec::with_capacity(6 + envelope.len());
@@ -34907,50 +34907,55 @@ async fn handle_command_inner(
                                     .await
                                     {
                                         Ok(handle) => {
-                                            let encrypted = crate::network::ember::crypto::encrypt_chat_for_peer(
+                                            match crate::network::ember::crypto::encrypt_chat_for_peer(
                                                 &ed25519_secret_key,
                                                 &handle.peer_ember_pubkey,
                                                 msg.as_bytes(),
-                                            );
-                                            let sent_ok = if let Some(envelope) = encrypted {
-                                                let mut packet =
-                                                    Vec::with_capacity(6 + envelope.len());
-                                                packet.push(OP_EMULEPROT);
-                                                let size = (1 + envelope.len()) as u32;
-                                                packet.extend_from_slice(&size.to_le_bytes());
-                                                packet.push(ed2k::messages::OP_EMBER_CHAT_MSG);
-                                                packet.extend_from_slice(&envelope);
-                                                handle.outbound_tx.try_send(packet).is_ok()
-                                            } else {
-                                                false
-                                            };
-                                            if sent_ok {
-                                                let hash_hex = hex::encode(friend_eh);
-                                                let msg_for_db = msg.clone();
-                                                let db_for_msg = db3.clone();
-                                                tokio::task::spawn_blocking(move || {
-                                                    if let Err(e) = db_for_msg.insert_chat_message(
-                                                        &hash_hex,
-                                                        "sent",
-                                                        &msg_for_db,
-                                                    ) {
-                                                        tracing::warn!("Failed to persist sent chat message: {e}");
+                                            ) {
+                                                None => {
+                                                    let _ = tx.send(Err("ChatEncryptFailed".into()));
+                                                }
+                                                Some(envelope) => {
+                                                    let mut packet =
+                                                        Vec::with_capacity(6 + envelope.len());
+                                                    packet.push(OP_EMULEPROT);
+                                                    let size = (1 + envelope.len()) as u32;
+                                                    packet.extend_from_slice(&size.to_le_bytes());
+                                                    packet.push(ed2k::messages::OP_EMBER_CHAT_MSG);
+                                                    packet.extend_from_slice(&envelope);
+                                                    if handle.outbound_tx.try_send(packet).is_ok() {
+                                                        let hash_hex = hex::encode(friend_eh);
+                                                        let msg_for_db = msg.clone();
+                                                        let db_for_msg = db3.clone();
+                                                        tokio::task::spawn_blocking(move || {
+                                                            if let Err(e) = db_for_msg
+                                                                .insert_chat_message(
+                                                                    &hash_hex,
+                                                                    "sent",
+                                                                    &msg_for_db,
+                                                                )
+                                                            {
+                                                                tracing::warn!(
+                                                                    "Failed to persist sent chat message: {e}"
+                                                                );
+                                                            }
+                                                        });
+                                                        let _ = app2.emit(
+                                                            "ember:chat-message",
+                                                            serde_json::json!({
+                                                                "user_hash": hex::encode(friend_eh),
+                                                                "message": msg,
+                                                                "direction": "sent",
+                                                                "timestamp": chrono::Utc::now().timestamp(),
+                                                            }),
+                                                        );
+                                                        let _ = tx.send(Ok(()));
+                                                    } else {
+                                                        let _ = tx.send(Err(
+                                                            "Failed to send on new connection".into(),
+                                                        ));
                                                     }
-                                                });
-                                                let _ = app2.emit(
-                                                    "ember:chat-message",
-                                                    serde_json::json!({
-                                                        "user_hash": hex::encode(friend_eh),
-                                                        "message": msg,
-                                                        "direction": "sent",
-                                                        "timestamp": chrono::Utc::now().timestamp(),
-                                                    }),
-                                                );
-                                                let _ = tx.send(Ok(()));
-                                            } else {
-                                                let _ = tx.send(Err(
-                                                    "Failed to send on new connection".into(),
-                                                ));
+                                                }
                                             }
                                         }
                                         Err(e) => {
@@ -35050,55 +35055,63 @@ async fn handle_command_inner(
                                         .await
                                         {
                                             Ok(handle) => {
-                                                let encrypted = crate::network::ember::crypto::encrypt_chat_for_peer(
+                                                match crate::network::ember::crypto::encrypt_chat_for_peer(
                                                     &ed25519_secret_key,
                                                     &handle.peer_ember_pubkey,
                                                     msg.as_bytes(),
-                                                );
-                                                let sent_ok = if let Some(envelope) = encrypted {
-                                                    let mut packet =
-                                                        Vec::with_capacity(6 + envelope.len());
-                                                    packet.push(OP_EMULEPROT);
-                                                    let size = (1 + envelope.len()) as u32;
-                                                    packet.extend_from_slice(&size.to_le_bytes());
-                                                    packet.push(ed2k::messages::OP_EMBER_CHAT_MSG);
-                                                    packet.extend_from_slice(&envelope);
-                                                    handle.outbound_tx.try_send(packet).is_ok()
-                                                } else {
-                                                    false
-                                                };
-                                                if sent_ok {
-                                                    let hash_hex = hex::encode(friend_eh);
-                                                    let msg_for_db = msg.clone();
-                                                    let db_for_msg = db3.clone();
-                                                    tokio::task::spawn_blocking(move || {
-                                                        if let Err(e) = db_for_msg
-                                                            .insert_chat_message(
-                                                                &hash_hex,
-                                                                "sent",
-                                                                &msg_for_db,
-                                                            )
+                                                ) {
+                                                    None => {
+                                                        let _ = tx.send(Err("ChatEncryptFailed".into()));
+                                                    }
+                                                    Some(envelope) => {
+                                                        let mut packet =
+                                                            Vec::with_capacity(6 + envelope.len());
+                                                        packet.push(OP_EMULEPROT);
+                                                        let size = (1 + envelope.len()) as u32;
+                                                        packet.extend_from_slice(&size.to_le_bytes());
+                                                        packet.push(ed2k::messages::OP_EMBER_CHAT_MSG);
+                                                        packet.extend_from_slice(&envelope);
+                                                        if handle.outbound_tx.try_send(packet).is_ok()
                                                         {
-                                                            tracing::warn!("Failed to persist sent chat message: {e}");
+                                                            let hash_hex = hex::encode(friend_eh);
+                                                            let msg_for_db = msg.clone();
+                                                            let db_for_msg = db3.clone();
+                                                            tokio::task::spawn_blocking(move || {
+                                                                if let Err(e) = db_for_msg
+                                                                    .insert_chat_message(
+                                                                        &hash_hex,
+                                                                        "sent",
+                                                                        &msg_for_db,
+                                                                    )
+                                                                {
+                                                                    tracing::warn!(
+                                                                        "Failed to persist sent chat message: {e}"
+                                                                    );
+                                                                }
+                                                            });
+                                                            let _ = app2.emit(
+                                                                "ember:chat-message",
+                                                                serde_json::json!({
+                                                                    "user_hash": hex::encode(friend_eh),
+                                                                    "message": msg,
+                                                                    "direction": "sent",
+                                                                    "timestamp": chrono::Utc::now().timestamp(),
+                                                                }),
+                                                            );
+                                                            let _ = app2.emit(
+                                                                "ember:friend-online",
+                                                                serde_json::json!({
+                                                                    "user_hash": hex::encode(friend_eh),
+                                                                }),
+                                                            );
+                                                            let _ = tx.send(Ok(()));
+                                                        } else {
+                                                            let _ = tx.send(Err(
+                                                                "Failed to send on new connection"
+                                                                    .into(),
+                                                            ));
                                                         }
-                                                    });
-                                                    let _ = app2.emit("ember:chat-message", serde_json::json!({
-                                                    "user_hash": hex::encode(friend_eh),
-                                                    "message": msg,
-                                                    "direction": "sent",
-                                                    "timestamp": chrono::Utc::now().timestamp(),
-                                                }));
-                                                    let _ = app2.emit(
-                                                        "ember:friend-online",
-                                                        serde_json::json!({
-                                                            "user_hash": hex::encode(friend_eh),
-                                                        }),
-                                                    );
-                                                    let _ = tx.send(Ok(()));
-                                                } else {
-                                                    let _ = tx.send(Err(
-                                                        "Failed to send on new connection".into(),
-                                                    ));
+                                                    }
                                                 }
                                             }
                                             Err(e) => {
