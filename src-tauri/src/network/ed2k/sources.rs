@@ -256,6 +256,43 @@ impl PerFileSourceList {
             .any(|s| s.ip == ip && s.tcp_port == tcp_port)
     }
 
+    /// Relocate an identified peer to a fresh dial endpoint and reset
+    /// failure/cooldown state so active downloads can re-try promptly.
+    /// Returns true when this peer was already listed (so callers can inject).
+    pub fn relocate_user_hash(
+        &mut self,
+        user_hash: [u8; 16],
+        new_ip: Ipv4Addr,
+        new_port: u16,
+    ) -> bool {
+        if user_hash == [0u8; 16] || new_port == 0 || new_ip.is_unspecified() {
+            return false;
+        }
+        let known = self
+            .sources
+            .iter()
+            .any(|s| s.source_user_hash == Some(user_hash));
+        if !known {
+            return false;
+        }
+        self.add_source_with_identity(new_ip, new_port, 0, Some(user_hash));
+        if let Some(existing) = self
+            .sources
+            .iter_mut()
+            .find(|s| s.source_user_hash == Some(user_hash))
+        {
+            existing.ip = new_ip;
+            existing.tcp_port = new_port;
+            existing.state = DownloadSourceState::New;
+            existing.fail_count = 0;
+            existing.state_changed = Instant::now();
+            // Arm an immediate reask so the worker does not wait FILEREASKTIME.
+            existing.arm_callback_reask();
+            return true;
+        }
+        false
+    }
+
     pub fn add_source_full(&mut self, ip: Ipv4Addr, tcp_port: u16, udp_port: u16) -> bool {
         self.add_source_with_identity(ip, tcp_port, udp_port, None)
     }
@@ -285,9 +322,19 @@ impl PerFileSourceList {
                 if udp_port > 0 {
                     existing.udp_port = udp_port;
                 }
-                if !ip.is_unspecified() && existing.ip.is_unspecified() {
+                // HighID peers often change listen port across relaunch.
+                // When we already know who they are, move the dial target
+                // instead of freezing on the stale IP:port.
+                if !ip.is_unspecified()
+                    && (existing.ip.is_unspecified()
+                        || existing.ip != ip
+                        || existing.tcp_port != tcp_port)
+                {
                     existing.ip = ip;
                     existing.tcp_port = tcp_port;
+                    existing.state = DownloadSourceState::New;
+                    existing.fail_count = 0;
+                    existing.state_changed = Instant::now();
                 }
                 return false;
             }
@@ -1162,6 +1209,99 @@ impl SourceManager {
             }
         }
         ips
+    }
+
+    /// Move every reconnectable source row for `user_hash` to `new_ip:new_port`.
+    ///
+    /// Returns `(file_hash, old_ip, old_port)` for each relocated row so callers
+    /// can clear dead-source cooldowns and inject the new endpoint into active
+    /// downloads. Session-only (`not_for_reconnect`) rows are left alone.
+    pub fn relocate_user_hash(
+        &mut self,
+        user_hash: [u8; 16],
+        new_ip: Ipv4Addr,
+        new_port: u16,
+    ) -> Vec<([u8; 16], Ipv4Addr, u16)> {
+        if user_hash == [0u8; 16] || new_port == 0 || new_ip.is_unspecified() {
+            return Vec::new();
+        }
+        let now = chrono::Utc::now().timestamp();
+        let mut relocated = Vec::new();
+        let file_hashes: Vec<[u8; 16]> = self.sources.keys().copied().collect();
+        for file_hash in file_hashes {
+            let mut saw_user = false;
+            let mut old_endpoints = Vec::new();
+            let mut connect_options = 0u8;
+            let mut udp_port = 0u16;
+            // Scope the mutable borrow of `entries` so
+            // `register_source_full_opts` can re-enter `self.sources`.
+            let already_at_new = {
+                let Some(entries) = self.sources.get_mut(&file_hash) else {
+                    continue;
+                };
+                entries.retain(|e| {
+                    if e.user_hash != user_hash || e.not_for_reconnect {
+                        return true;
+                    }
+                    saw_user = true;
+                    if connect_options == 0 {
+                        connect_options = e.connect_options;
+                    }
+                    if udp_port == 0 {
+                        udp_port = e.udp_port;
+                    }
+                    if e.ip == new_ip && e.tcp_port == new_port {
+                        return true;
+                    }
+                    old_endpoints.push((e.ip, e.tcp_port));
+                    false
+                });
+                if !saw_user {
+                    continue;
+                }
+                let at_new = entries
+                    .iter()
+                    .any(|e| e.ip == new_ip && e.tcp_port == new_port);
+                if at_new {
+                    if let Some(existing) = entries
+                        .iter_mut()
+                        .find(|e| e.ip == new_ip && e.tcp_port == new_port)
+                    {
+                        existing.last_seen = now;
+                        if existing.user_hash == [0u8; 16] {
+                            existing.user_hash = user_hash;
+                        }
+                        existing.not_for_reconnect = false;
+                        if existing.udp_port == 0 && udp_port > 0 {
+                            existing.udp_port = udp_port;
+                        }
+                        if existing.connect_options == 0 && connect_options != 0 {
+                            existing.connect_options = connect_options;
+                        }
+                    }
+                }
+                at_new
+            };
+
+            if !already_at_new {
+                self.register_source_full_opts(
+                    file_hash,
+                    new_ip,
+                    new_port,
+                    udp_port,
+                    user_hash,
+                    connect_options,
+                );
+            }
+            if old_endpoints.is_empty() {
+                relocated.push((file_hash, new_ip, new_port));
+            } else {
+                for (old_ip, old_port) in old_endpoints {
+                    relocated.push((file_hash, old_ip, old_port));
+                }
+            }
+        }
+        relocated
     }
 
     pub fn build_answer_sources2_versioned(
@@ -2559,6 +2699,23 @@ mod tests {
         let dialable = sm.get_sources(&hash);
         assert_eq!(dialable, vec![(ip, 4662)]);
         assert_eq!(sm.source_count(&hash), 1);
+    }
+
+    #[test]
+    fn relocate_user_hash_moves_endpoint_and_reports_old() {
+        let file_hash = [0xE1; 16];
+        let peer = [0xE2; 16];
+        let old_ip = Ipv4Addr::new(10, 0, 0, 1);
+        let new_ip = Ipv4Addr::new(10, 0, 0, 2);
+        let mut sm = SourceManager::new();
+        sm.register_source_full_opts(file_hash, old_ip, 4662, 4672, peer, 1);
+
+        let relocated = sm.relocate_user_hash(peer, new_ip, 4663);
+        assert_eq!(relocated, vec![(file_hash, old_ip, 4662)]);
+        assert_eq!(sm.get_sources(&file_hash), vec![(new_ip, 4663)]);
+        // Idempotent: already at new endpoint reports the current address.
+        let again = sm.relocate_user_hash(peer, new_ip, 4663);
+        assert_eq!(again, vec![(file_hash, new_ip, 4663)]);
     }
 
     #[test]

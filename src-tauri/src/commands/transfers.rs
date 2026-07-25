@@ -185,6 +185,7 @@ pub(crate) async fn start_promoted_downloads(state: &AppState, promoted: &[Trans
                 expected_aich: transfer.expected_aich.clone(),
                 transfer_id: transfer.id.clone(),
                 control,
+                friend_ember_hash: None,
                 discovery_only: false,
             },
         )
@@ -442,6 +443,12 @@ pub async fn start_download(
     // Optional Ember content BLAKE3 hex from search results / library.
     ember_file_hash: Option<String>,
     expected_aich: Option<String>,
+    // Set when this download was started from a friend's browse listing.
+    // 32-char hex Ember hash. Lets the network task register the primary
+    // seed into `SourceManager` *with identity* immediately instead of
+    // waiting for a Hello handshake to bind it — see the field doc on
+    // `NetworkCommand::StartDownload::friend_ember_hash`.
+    friend_ember_hash: Option<String>,
 ) -> Result<StartDownloadResponse, String> {
     let _download_admission = state.download_admission.lock().await;
     let file_name = crate::security::sanitize_filename(&file_name);
@@ -449,6 +456,19 @@ pub async fn start_download(
     if file_hash.len() != 32 || hex::decode(&file_hash).is_err() {
         return Err(coded("transfers_invalid_file_hash", "Invalid file hash"));
     }
+    // Best-effort: a malformed value here shouldn't fail the whole download
+    // (it only affects up-front identity-seeding, not correctness), so we
+    // log and fall back to `None` instead of rejecting the request.
+    let friend_ember_hash = friend_ember_hash.filter(|h| !h.is_empty()).and_then(|h| {
+        let bytes = hex::decode(&h).ok()?;
+        if bytes.len() != 16 {
+            tracing::warn!("start_download: ignoring malformed friend_ember_hash");
+            return None;
+        }
+        let mut arr = [0u8; 16];
+        arr.copy_from_slice(&bytes);
+        Some(arr)
+    });
     let expected_aich = crate::security::parse_expected_aich(expected_aich.as_deref())
         .map_err(|message| coded("transfers_invalid_expected_aich", message))?;
 
@@ -636,6 +656,7 @@ pub async fn start_download(
             transfer_id: transfer_id.clone(),
             control,
             discovery_only,
+            friend_ember_hash,
         },
     )
     .await

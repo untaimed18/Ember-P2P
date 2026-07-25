@@ -42,6 +42,15 @@ export async function startDownload(
   /** Optional Ember content BLAKE3 hex for download completion verify. */
   emberFileHash?: string,
   expectedAich?: string,
+  /**
+   * Set when this download was started from a friend's browse listing
+   * (their Ember hash, 32-char hex). Lets the backend register the
+   * primary seed into its source manager with identity up front, so a
+   * friend download that never completes a single handshake before both
+   * peers restart can still be relocated once rendezvous finds the
+   * friend again.
+   */
+  friendEmberHash?: string,
 ): Promise<StartDownloadResponse> {
   // A source address identifies a peer, not the file. Never let a source-bearing
   // result bypass the mandatory content hash used to identify and verify it.
@@ -57,6 +66,7 @@ export async function startDownload(
     extraSources: extraSources ?? null,
     emberFileHash: emberFileHash?.trim() ? emberFileHash.trim() : null,
     expectedAich: validatedExpectedAich(expectedAich),
+    friendEmberHash: friendEmberHash ?? null,
   });
 }
 

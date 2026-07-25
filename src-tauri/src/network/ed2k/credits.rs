@@ -110,9 +110,19 @@ impl IdentState {
 /// even an older build that didn't know about the format would safely load
 /// nothing from a v1 file rather than misparsing it.
 const CLIENTS_MET_MAGIC: u32 = 0xE3B2_0001;
-/// Layout version that follows the magic. Bump only if the per-record fields
-/// change again.
-const CLIENTS_MET_VERSION: u8 = 1;
+/// Layout version that follows the magic.
+///
+/// v1: user_hash, uploaded, downloaded, last_seen, ident_ip, ident_state,
+/// public_key.
+///
+/// v2 (current): appends a per-record Ember-identity trailer after the
+/// public key — a presence byte followed by 16 bytes of `ember_hash` when
+/// set. This survives the eD2K user_hash ↔ Ember identity binding
+/// (`set_ember_hash`) across restarts, which is what lets friend rendezvous
+/// discovery relocate `sources.met` rows before a fresh HELLO re-binds it
+/// in-memory (see `reseed_friend_endpoint` in `network/mod.rs`). Readers
+/// stay backward compatible with v1 files (no trailer to read).
+const CLIENTS_MET_VERSION: u8 = 2;
 
 pub const CRYPT_CIP_REMOTECLIENT: u8 = 10;
 pub const CRYPT_CIP_LOCALCLIENT: u8 = 20;
@@ -775,6 +785,18 @@ impl CreditManager {
         record.ember_hash = Some(ember_hash);
     }
 
+    /// Reverse of [`Self::set_ember_hash`]: find the eD2K `user_hash` we last
+    /// bound to this Ember identity. Used to relocate download sources when
+    /// friend discovery learns a fresh IP:port.
+    pub fn find_user_hash_by_ember(&self, ember_hash: &[u8; 16]) -> Option<[u8; 16]> {
+        if *ember_hash == [0u8; 16] {
+            return None;
+        }
+        self.credits.iter().find_map(|(user_hash, record)| {
+            (record.ember_hash.as_ref() == Some(ember_hash)).then_some(*user_hash)
+        })
+    }
+
     pub fn set_ident_state(&mut self, user_hash: [u8; 16], state: IdentState) {
         let record = self.get_or_create(user_hash);
         // eMule Verified(): on first-time crypto verification, reset pre-existing
@@ -1007,10 +1029,14 @@ impl CreditManager {
     /// count and load nothing rather than misparsing — see `load_from_file`.
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::new();
+        // Keep a record even with zero credits when it carries an Ember
+        // identity binding — that binding is what lets friend rendezvous
+        // discovery relocate download sources on a fresh launch, before any
+        // upload/download has happened this session.
         let records: Vec<_> = self
             .credits
             .values()
-            .filter(|r| r.uploaded > 0 || r.downloaded > 0)
+            .filter(|r| r.uploaded > 0 || r.downloaded > 0 || r.ember_hash.is_some())
             .collect();
         buf.extend_from_slice(&CLIENTS_MET_MAGIC.to_le_bytes());
         buf.push(CLIENTS_MET_VERSION);
@@ -1024,6 +1050,14 @@ impl CreditManager {
             buf.push(r.ident_state.to_u8());
             buf.extend_from_slice(&(r.public_key.len() as u16).to_le_bytes());
             buf.extend_from_slice(&r.public_key);
+            // v2 trailer.
+            match r.ember_hash {
+                Some(eh) => {
+                    buf.push(1);
+                    buf.extend_from_slice(&eh);
+                }
+                None => buf.push(0),
+            }
         }
         buf
     }
@@ -1046,6 +1080,10 @@ impl CreditManager {
         // read the two extra per-record fields (ident_ip + ident_state).
         let versioned =
             u32::from_le_bytes([data[0], data[1], data[2], data[3]]) == CLIENTS_MET_MAGIC;
+        // v1 had no Ember-identity trailer; v2 appends one per record (see
+        // `CLIENTS_MET_VERSION` doc comment). `versioned` alone doesn't
+        // distinguish the two, so check the version byte directly.
+        let has_ember_trailer = versioned && data.len() > 4 && data[4] >= 2;
         let (count, mut offset) = if versioned {
             if data.len() < 9 {
                 return Ok(0);
@@ -1121,6 +1159,26 @@ impl CreditManager {
             } else {
                 break;
             };
+            let ember_hash = if has_ember_trailer {
+                if offset >= data.len() {
+                    break;
+                }
+                let has_hash = data[offset] == 1;
+                offset += 1;
+                if has_hash {
+                    if offset + 16 > data.len() {
+                        break;
+                    }
+                    let mut eh = [0u8; 16];
+                    eh.copy_from_slice(&data[offset..offset + 16]);
+                    offset += 16;
+                    Some(eh)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             let record = CreditRecord {
                 user_hash,
                 uploaded,
@@ -1129,7 +1187,7 @@ impl CreditManager {
                 public_key,
                 ident_state,
                 ident_ip,
-                ember_hash: None,
+                ember_hash,
             };
             self.credits.insert(user_hash, record);
             loaded += 1;
@@ -1848,6 +1906,53 @@ mod tests {
         assert_eq!(rec.downloaded, 8192);
         assert_eq!(rec.last_seen, 1_700_000_123);
         assert_eq!(rec.public_key, vec![0xAB; 12]);
+    }
+
+    /// The v2 Ember-identity binding (`ember_hash`) must survive a
+    /// serialize → load round-trip, including for a record that has zero
+    /// credits — this is what lets friend rendezvous discovery relocate
+    /// download sources for a friend on a fresh launch, before any
+    /// upload/download has happened this session (see
+    /// `reseed_friend_endpoint` in `network/mod.rs`).
+    #[test]
+    fn clients_met_v2_roundtrip_preserves_ember_hash_even_with_zero_credits() {
+        let mut cm = CreditManager::new();
+        let bound_hash = [0x11u8; 16];
+        let unbound_hash = [0x22u8; 16];
+        let ember_id = [0x99u8; 16];
+        cm.set_ember_hash(bound_hash, ember_id);
+        // Zero credits — would have been dropped entirely under the old
+        // "uploaded > 0 || downloaded > 0" filter.
+        assert_eq!(cm.get_or_create(bound_hash).uploaded, 0);
+        // A record with no Ember binding and zero credits must still be
+        // dropped, same as before.
+        let _ = cm.get_or_create(unbound_hash);
+
+        let bytes = cm.serialize();
+        assert_eq!(bytes[4], CLIENTS_MET_VERSION);
+
+        let path = std::env::temp_dir().join(format!(
+            "ember_clients_met_v2_ember_hash_{}_{}.met",
+            std::process::id(),
+            unique_nanos(),
+        ));
+        std::fs::write(&path, &bytes).expect("write temp clients.met");
+
+        let mut loaded = CreditManager::new();
+        let n = loaded
+            .load_from_file(&path)
+            .expect("load v2 clients.met");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(n, 1, "only the ember-bound record should be persisted");
+        let rec = loaded.get_record(&bound_hash).expect("record must load");
+        assert_eq!(rec.ember_hash, Some(ember_id));
+        assert_eq!(
+            loaded.find_user_hash_by_ember(&ember_id),
+            Some(bound_hash),
+            "reverse lookup must work after a restart"
+        );
+        assert!(loaded.get_record(&unbound_hash).is_none());
     }
 
     /// A pre-v1 (legacy) clients.met — count-prefixed, no ident fields — must

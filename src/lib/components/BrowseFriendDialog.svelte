@@ -23,6 +23,7 @@
   let { open = $bindable(), friendHash, friendName, friendLastIp, friendLastPort, onclose }: Props = $props();
 
   let files: BrowseFileEntry[] = $state([]);
+  let filterQuery = $state('');
   let loading = $state(false);
   let error: string | null = $state(null);
   let unlisten: UnlistenFn | null = null;
@@ -42,6 +43,24 @@
   let expectedBrowseGen = 0;
   let expectedRequestId = '';
 
+  let filteredFiles = $derived.by(() => {
+    const q = filterQuery.trim().toLowerCase();
+    if (!q) return files;
+    return files.filter((file) => {
+      const name = file.name.toLowerCase();
+      const hash = file.hash.toLowerCase();
+      return name.includes(q) || hash.includes(q);
+    });
+  });
+
+  let hasUsableFriendAddress = $derived(
+    Boolean(
+      friendLastIp?.trim() &&
+        friendLastIp.trim() !== '0.0.0.0' &&
+        friendLastPort > 0,
+    ),
+  );
+
   $effect(() => {
     if (open && friendHash) {
       // Capture the generation BEFORE awaiting so we can detect a
@@ -53,6 +72,18 @@
       // session's state.
       const gen = ++listenerGen;
       const hash = friendHash;
+      // Clear previous session synchronously so reopen never paints
+      // the prior friend's file list (or allows downloads from it)
+      // while listeners are still being registered.
+      loading = true;
+      error = null;
+      downloadError = null;
+      downloadNote = null;
+      listenerWarning = null;
+      files = [];
+      filterQuery = '';
+      downloadedHashes = new Set();
+      downloadingHashes = new Set();
       (async () => {
         const ok = await setupListener(gen, hash);
         if (!ok || gen !== listenerGen || !open) return;
@@ -68,6 +99,14 @@
       expectedBrowseGen = 0;
       expectedRequestId = '';
       loading = false;
+      files = [];
+      filterQuery = '';
+      error = null;
+      downloadError = null;
+      downloadNote = null;
+      listenerWarning = null;
+      downloadedHashes = new Set();
+      downloadingHashes = new Set();
       clearTimeout(browseTimeout);
       if (unlisten) { unlisten(); unlisten = null; }
       if (unlistenError) { unlistenError(); unlistenError = null; }
@@ -110,6 +149,7 @@
         // separate (subsequent) request and shouldn't replace the
         // result we just rendered.
         currentBrowseGen = 0;
+        requestAnimationFrame(() => filterInputEl?.focus());
       });
     } catch (e) {
       console.warn('BrowseFriendDialog: failed to register browse-result listener', e);
@@ -144,10 +184,9 @@
       });
     } catch (e) {
       console.warn('BrowseFriendDialog: failed to register browse-error listener', e);
-      // result-listener succeeded but error-listener failed: still
-      // usable for the happy path, but we won't surface backend
-      // browse failures. Set a soft warning rather than block.
-      error = m.browse_error_notifications_unavailable();
+      // Soft warning only — result listener is still live. Kept separate
+      // from `error` so requestBrowse() does not wipe it immediately.
+      listenerWarning = m.browse_error_notifications_unavailable();
       // Returning true: the result listener is live and the caller
       // can still request browse. We just won't see backend errors
       // until the next dialog open.
@@ -162,7 +201,10 @@
     loading = true;
     error = null;
     downloadError = null;
+    downloadNote = null;
     downloadedHashes = new Set();
+    downloadingHashes = new Set();
+    filterQuery = '';
     files = [];
     clearTimeout(browseTimeout);
     // Open a fresh browse generation so the listeners above will
@@ -200,6 +242,8 @@
   }
 
   let downloadError: string | null = $state(null);
+  let downloadNote: string | null = $state(null);
+  let listenerWarning: string | null = $state(null);
   let downloadedHashes: Set<string> = $state(new Set());
   // Tracks hashes with a `startDownload` call currently in flight. The
   // `downloadedHashes` guard alone only prevents a re-click AFTER the first
@@ -212,18 +256,24 @@
     if (downloadedHashes.has(file.hash) || downloadingHashes.has(file.hash)) return;
     downloadError = null;
     downloadingHashes = new Set(downloadingHashes).add(file.hash);
+    const peerIp = hasUsableFriendAddress ? friendLastIp.trim() : '';
+    const peerPort = hasUsableFriendAddress ? friendLastPort : 0;
     try {
       await startDownload(
         file.hash,
         file.name,
         file.size,
-        friendLastIp,
-        friendLastPort,
+        peerIp,
+        peerPort,
         undefined,
         undefined,
         file.aich_hash,
+        friendHash,
       );
       downloadedHashes = new Set(downloadedHashes).add(file.hash);
+      if (!hasUsableFriendAddress) {
+        downloadNote = m.browse_download_discovery_note();
+      }
     } catch (e: unknown) {
       downloadError = translateError(e, m.browse_download_failed());
     } finally {
@@ -243,6 +293,7 @@
 
   let modalEl: HTMLDivElement | undefined = $state(undefined);
   let dialogRootEl: HTMLDivElement | undefined = $state(undefined);
+  let filterInputEl: HTMLInputElement | undefined = $state(undefined);
   let returnFocusEl: HTMLElement | null = null;
 
   $effect(() => {
@@ -293,7 +344,12 @@
       onkeydown={handleKeydown}
     >
       <div class="browse-header">
-        <h3 id="browse-title-{instanceId}">{m.browse_title_prefix()} <bdi dir="auto">{friendName || friendHash.slice(0, 8) + '\u2026'}</bdi></h3>
+        <div class="browse-header-text">
+          <h3 id="browse-title-{instanceId}">{m.browse_title_prefix()}</h3>
+          <p class="browse-subtitle">
+            <bdi dir="auto">{friendName || friendHash.slice(0, 8) + '\u2026'}</bdi>
+          </p>
+        </div>
         <button class="browse-close" onclick={onclose} title={m.common_close()} aria-label={m.common_close()}>
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
             <line x1="4" y1="4" x2="12" y2="12"/><line x1="12" y1="4" x2="4" y2="12"/>
@@ -309,62 +365,117 @@
         {:else if files.length === 0}
           <div class="browse-status">{m.browse_no_files()}</div>
         {:else}
-          {#if downloadError}
-            <div class="browse-error" style="margin-bottom: 8px" role="alert">{downloadError}</div>
+          <div class="browse-toolbar">
+            <div class="browse-filter">
+              <span class="browse-filter-icon" aria-hidden="true">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+                  <circle cx="7" cy="7" r="4.5"/><line x1="10.5" y1="10.5" x2="13.5" y2="13.5"/>
+                </svg>
+              </span>
+              <input
+                bind:this={filterInputEl}
+                class="browse-filter-input"
+                type="search"
+                bind:value={filterQuery}
+                placeholder={m.browse_filter_placeholder()}
+                aria-label={m.browse_filter_placeholder()}
+              />
+              {#if filterQuery.trim()}
+                <button
+                  type="button"
+                  class="browse-filter-clear"
+                  onclick={() => {
+                    filterQuery = '';
+                    filterInputEl?.focus();
+                  }}
+                  title={m.common_clear()}
+                  aria-label={m.common_clear()}
+                >×</button>
+              {/if}
+            </div>
+            <div class="browse-count">
+              {#if filterQuery.trim()}
+                {m.browse_count_filtered({ filtered: filteredFiles.length, total: files.length })}
+              {:else if files.length === 1}
+                {m.browse_count_one()}
+              {:else}
+                {m.browse_count_other({ count: files.length })}
+              {/if}
+            </div>
+          </div>
+
+          {#if listenerWarning}
+            <div class="browse-banner browse-banner-note" role="status">{listenerWarning}</div>
           {/if}
-          <div class="browse-count">
-            {files.length === 1 ? m.browse_count_one() : m.browse_count_other({ count: files.length })}
-          </div>
-          <div class="browse-table-wrap">
-            <table class="browse-table">
-              <thead>
-                <tr>
-                  <th class="col-name">{m.browse_col_name()}</th>
-                  <th class="col-size">{m.browse_col_size()}</th>
-                  <th class="col-action"></th>
-                </tr>
-              </thead>
-              <tbody>
-                {#each files as file (file.hash)}
+          {#if downloadError}
+            <div class="browse-banner browse-banner-error" role="alert">{downloadError}</div>
+          {/if}
+          {#if downloadNote}
+            <div class="browse-banner browse-banner-note" role="status">{downloadNote}</div>
+          {/if}
+
+          {#if filteredFiles.length === 0}
+            <div class="browse-status browse-status-compact">{m.browse_no_match()}</div>
+          {:else}
+            <div class="browse-table-wrap">
+              <table class="browse-table">
+                <thead>
                   <tr>
-                    <!--
-                      M14: file names come from the remote peer and
-                      can contain RTL/LTR override characters that
-                      reorder neighbouring elements ("Trojan Source"
-                      style spoof). `<bdi>` isolates each name's
-                      bidi influence to the cell, so a malicious
-                      name can't reverse the size column or action
-                      button next to it. The text itself is still
-                      rendered exactly as written.
-                    -->
-                    <td class="col-name" title={file.name}><bdi dir="auto">{file.name}</bdi></td>
-                    <td class="col-size">{formatSize(file.size)}</td>
-                    <td class="col-action">
-                      {#if downloadedHashes.has(file.hash)}
-                        <span class="dl-done" title={m.browse_queued()} aria-label={m.browse_queued()}>
-                          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                            <polyline points="3 8 7 12 13 4"/>
-                          </svg>
-                        </span>
-                      {:else}
-                        <button
-                          class="dl-btn"
-                          onclick={() => downloadFile(file)}
-                          disabled={downloadingHashes.has(file.hash)}
-                          title={m.browse_download()}
-                          aria-label={m.browse_download()}
-                        >
-                          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                            <path d="M8 2v9M4 8l4 4 4-4"/><line x1="3" y1="14" x2="13" y2="14"/>
-                          </svg>
-                        </button>
-                      {/if}
-                    </td>
+                    <th class="col-name">{m.browse_col_name()}</th>
+                    <th class="col-size">{m.browse_col_size()}</th>
+                    <th class="col-action">{m.browse_col_action()}</th>
                   </tr>
-                {/each}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody>
+                  {#each filteredFiles as file (file.hash)}
+                    <tr>
+                      <!--
+                        M14: file names come from the remote peer and
+                        can contain RTL/LTR override characters that
+                        reorder neighbouring elements ("Trojan Source"
+                        style spoof). `<bdi>` isolates each name's
+                        bidi influence to the cell, so a malicious
+                        name can't reverse the size column or action
+                        button next to it. The text itself is still
+                        rendered exactly as written.
+                      -->
+                      <td class="col-name" title={file.name}><bdi dir="auto">{file.name}</bdi></td>
+                      <td class="col-size">{formatSize(file.size)}</td>
+                      <td class="col-action">
+                        {#if downloadedHashes.has(file.hash)}
+                          <span class="dl-done" title={m.browse_queued()} aria-label={m.browse_queued()}>
+                            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                              <polyline points="3 8 7 12 13 4"/>
+                            </svg>
+                            <span>{m.browse_queued()}</span>
+                          </span>
+                        {:else}
+                          <button
+                            type="button"
+                            class="dl-btn"
+                            onclick={() => downloadFile(file)}
+                            disabled={downloadingHashes.has(file.hash)}
+                            title={m.browse_download()}
+                            aria-label={m.browse_download()}
+                          >
+                            {#if downloadingHashes.has(file.hash)}
+                              <span class="dl-spinner" aria-hidden="true"></span>
+                              <span>{m.browse_downloading()}</span>
+                            {:else}
+                              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                <path d="M8 2v9M4 8l4 4 4-4"/><line x1="3" y1="14" x2="13" y2="14"/>
+                              </svg>
+                              <span>{m.browse_download()}</span>
+                            {/if}
+                          </button>
+                        {/if}
+                      </td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+            </div>
+          {/if}
         {/if}
       </div>
     </div>
@@ -390,8 +501,8 @@
     top: 50%;
     left: 50%;
     transform: translate(-50%, -50%);
-    width: 640px;
-    max-width: 90vw;
+    width: 760px;
+    max-width: 94vw;
     max-height: 80vh;
     background: var(--bg-primary);
     border: 1px solid var(--border);
@@ -417,11 +528,16 @@
 
   .browse-header {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: space-between;
+    gap: 12px;
     padding: 16px 20px;
     border-bottom: 1px solid var(--border);
     flex-shrink: 0;
+  }
+
+  .browse-header-text {
+    min-width: 0;
   }
 
   .browse-header h3 {
@@ -429,6 +545,15 @@
     font-size: 15px;
     font-weight: 600;
     color: var(--text-primary);
+  }
+
+  .browse-subtitle {
+    margin: 4px 0 0;
+    font-size: 13px;
+    color: var(--text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .browse-close {
@@ -442,6 +567,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
+    flex-shrink: 0;
   }
 
   .browse-close:hover {
@@ -456,8 +582,12 @@
 
   .browse-body {
     flex: 1;
-    overflow-y: auto;
+    min-height: 0;
+    overflow: hidden;
     padding: 16px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
   }
 
   .browse-status,
@@ -467,17 +597,105 @@
     font-size: 13px;
   }
 
+  .browse-status-compact {
+    padding: 24px 16px;
+  }
+
   .browse-status { color: var(--text-muted); }
   .browse-error { color: var(--danger); }
+
+  .browse-toolbar {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+
+  .browse-filter {
+    position: relative;
+    display: flex;
+    align-items: center;
+  }
+
+  .browse-filter-icon {
+    position: absolute;
+    left: 10px;
+    color: var(--text-muted);
+    display: flex;
+    pointer-events: none;
+  }
+
+  .browse-filter-icon svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  .browse-filter-input {
+    width: 100%;
+    padding: 8px 32px 8px 32px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-input);
+    color: var(--text-primary);
+    font-size: 13px;
+    font-family: inherit;
+  }
+
+  .browse-filter-input:focus {
+    border-color: var(--accent);
+    outline: none;
+  }
+
+  .browse-filter-clear {
+    position: absolute;
+    right: 6px;
+    width: 22px;
+    height: 22px;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 16px;
+    line-height: 1;
+  }
+
+  .browse-filter-clear:hover {
+    color: var(--text-primary);
+    background: var(--bg-hover);
+  }
 
   .browse-count {
     font-size: 12px;
     color: var(--text-muted);
-    margin-bottom: 10px;
+  }
+
+  .browse-banner {
+    font-size: 12px;
+    padding: 8px 10px;
+    border-radius: var(--radius-md);
+    flex-shrink: 0;
+  }
+
+  .browse-banner-error {
+    color: var(--danger);
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
+  }
+
+  .browse-banner-note {
+    color: var(--text-muted);
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
   }
 
   .browse-table-wrap {
-    overflow-x: auto;
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
   }
 
   .browse-table {
@@ -487,85 +705,114 @@
   }
 
   .browse-table th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
     text-align: left;
     font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 0.5px;
     color: var(--text-muted);
-    padding: 6px 8px;
+    padding: 8px 10px;
     border-bottom: 1px solid var(--border);
     font-weight: 600;
+    background: var(--bg-primary);
   }
 
   .browse-table td {
-    padding: 8px 8px;
+    padding: 8px 10px;
     border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
     color: var(--text-primary);
+    vertical-align: middle;
+  }
+
+  .browse-table tbody tr:hover td {
+    background: color-mix(in srgb, var(--bg-hover) 70%, transparent);
   }
 
   .col-name {
-    max-width: 350px;
+    max-width: 0;
+    width: 100%;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
   .col-size {
-    width: 90px;
+    width: 96px;
     white-space: nowrap;
     color: var(--text-muted);
   }
 
   .col-action {
-    width: 40px;
-    text-align: center;
+    width: 132px;
+    text-align: right;
+    white-space: nowrap;
   }
 
   .dl-btn {
-    width: 28px;
-    height: 28px;
-    border: none;
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--text-muted);
+    min-height: 30px;
+    padding: 0 10px;
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+    border-radius: var(--radius-md);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--accent);
     cursor: pointer;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    transition: background var(--transition-fast), color var(--transition-fast);
+    gap: 6px;
+    font-size: 12px;
+    font-weight: 600;
+    font-family: inherit;
+    transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
   }
 
-  .dl-btn:hover {
-    background: var(--accent-dim);
-    color: var(--accent);
+  .dl-btn:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--accent) 22%, transparent);
+    border-color: var(--accent);
   }
 
   .dl-btn:disabled {
-    opacity: 0.5;
+    opacity: 0.7;
     cursor: default;
-  }
-
-  .dl-btn:disabled:hover {
-    background: transparent;
-    color: var(--text-muted);
   }
 
   .dl-btn svg {
     width: 14px;
     height: 14px;
+    flex-shrink: 0;
+  }
+
+  .dl-spinner {
+    width: 12px;
+    height: 12px;
+    border: 2px solid color-mix(in srgb, var(--accent) 30%, transparent);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: browse-spin 0.7s linear infinite;
+    flex-shrink: 0;
+  }
+
+  @keyframes browse-spin {
+    to { transform: rotate(360deg); }
   }
 
   .dl-done {
-    width: 28px;
-    height: 28px;
+    min-height: 30px;
+    padding: 0 10px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
+    gap: 6px;
     color: var(--success);
+    font-size: 12px;
+    font-weight: 600;
   }
 
   .dl-done svg {
     width: 14px;
     height: 14px;
+    flex-shrink: 0;
   }
 </style>

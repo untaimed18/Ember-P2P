@@ -552,6 +552,7 @@ pub async fn download_collection_files(
                     expected_aich: expected_aich.clone(),
                     transfer_id: transfer_id.clone(),
                     control: control.clone(),
+                    friend_ember_hash: None,
                     discovery_only: false,
                 },
             )
@@ -602,6 +603,7 @@ pub async fn download_collection_files(
                     transfer_id: transfer_id.clone(),
                     control,
                     discovery_only: true,
+                    friend_ember_hash: None,
                 },
             )
             .await

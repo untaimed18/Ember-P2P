@@ -1298,6 +1298,21 @@ pub enum UploadEventKind {
     /// happened to touch `online_friends` for that friend.
     EmberFriendConnected {
         ember_hash: [u8; 16],
+        /// Peer's eD2K user hash from the session Hello (may be zero if
+        /// unavailable). Used to bind Ember identity → download sources.
+        peer_user_hash: [u8; 16],
+        /// Dialable IPv4 for file-transfer reconnect (Hello listen port
+        /// preferred over the ephemeral connection port).
+        ip: std::net::Ipv4Addr,
+        port: u16,
+    },
+    /// Fresh friend endpoint from rendezvous (before/without a full
+    /// session). Used to relocate download sources when we already know
+    /// the peer's eD2K user_hash from a prior HELLO binding.
+    FriendEndpointDiscovered {
+        ember_hash: [u8; 16],
+        ip: std::net::Ipv4Addr,
+        port: u16,
     },
     /// Outbound friend-search lookup failed *before* a session was
     /// ever established (rendezvous returned None / Err, or the
@@ -5088,6 +5103,15 @@ impl UploadHandler {
                     }
                     drop(sessions);
 
+                    // Prefer the Hello listen port over the ephemeral inbound
+                    // socket port so this gets recorded as a dialable
+                    // download-source endpoint (see the outbound-side
+                    // counterpart in `friend_connect.rs`).
+                    let friend_port = if hello_caps.tcp_port > 0 {
+                        hello_caps.tcp_port
+                    } else {
+                        peer_addr.port()
+                    };
                     let _ = self
                         .upload_event_tx
                         .send(UploadEvent {
@@ -5095,7 +5119,7 @@ impl UploadHandler {
                             kind: UploadEventKind::FriendSeen {
                                 ember_hash: eh,
                                 ip: peer_addr.ip(),
-                                port: peer_addr.port(),
+                                port: friend_port,
                             },
                         })
                         .await;
@@ -9103,12 +9127,20 @@ impl UploadHandler {
                             // otherwise be able to poison both.
                             if is_friend {
                                 if let Some(eh) = peer_ember_hash {
+                                    // See the comment on the other `FriendSeen`
+                                    // emission in this file for why we prefer the
+                                    // Hello listen port here.
+                                    let friend_port = if hello_caps.tcp_port > 0 {
+                                        hello_caps.tcp_port
+                                    } else {
+                                        peer_addr.port()
+                                    };
                                     let _ = self.upload_event_tx.send(UploadEvent {
                                         transfer_id: String::new(),
                                         kind: UploadEventKind::FriendSeen {
                                             ember_hash: eh,
                                             ip: peer_addr.ip(),
-                                            port: peer_addr.port(),
+                                            port: friend_port,
                                         },
                                     }).await;
                                 }

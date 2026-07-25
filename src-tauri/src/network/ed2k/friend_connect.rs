@@ -305,15 +305,29 @@ pub async fn run_friend_session_over_transport(
 
     info!("Friend session handshake with {} complete (hash={}, binding_verified={ember_hash_binding_verified})", addr, hex::encode(peer_ember_hash));
 
+    let peer_user_hash = _peer_user_hash;
+    let listen_port = if hello_caps.tcp_port > 0 {
+        hello_caps.tcp_port
+    } else {
+        addr.port()
+    };
+    let peer_v4 = match addr.ip() {
+        std::net::IpAddr::V4(v4) => v4,
+        _ => std::net::Ipv4Addr::UNSPECIFIED,
+    };
     // Tell the network task this friend is reachable now, not just once
     // they happen to send us a chat/browse message. See the variant's doc
     // comment for why the UI-only `ember:friend-online` emits already at
-    // every caller's success branch aren't enough on their own.
+    // every caller's success branch aren't enough on their own. Include
+    // the dialable endpoint so incomplete downloads can relocate sources.
     let _ = ul_event_tx
         .send(UploadEvent {
             transfer_id: String::new(),
             kind: UploadEventKind::EmberFriendConnected {
                 ember_hash: peer_ember_hash,
+                peer_user_hash,
+                ip: peer_v4,
+                port: listen_port,
             },
         })
         .await;
@@ -1240,7 +1254,7 @@ mod tests {
         assert!(
             matches!(
                 event.kind,
-                UploadEventKind::EmberFriendConnected { ember_hash } if ember_hash == peer_ember_hash
+                UploadEventKind::EmberFriendConnected { ember_hash, .. } if ember_hash == peer_ember_hash
             ),
             "expected the first event to be EmberFriendConnected for the peer's hash"
         );
@@ -1382,7 +1396,7 @@ mod tests {
         assert!(
             matches!(
                 event.kind,
-                UploadEventKind::EmberFriendConnected { ember_hash } if ember_hash == peer_ember_hash
+                UploadEventKind::EmberFriendConnected { ember_hash, .. } if ember_hash == peer_ember_hash
             ),
             "expected EmberFriendConnected once the fresh session actually completes"
         );

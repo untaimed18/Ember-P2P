@@ -778,6 +778,128 @@ fn matching_active_transfer_ids_for_hash(
         .collect()
 }
 
+/// After friend discovery learns a fresh dialable endpoint, relocate any
+/// download sources already known for that peer and inject them into
+/// active incomplete downloads. Closes the gap where `sources.met` still
+/// holds a pre-relaunch IP:port while chat/browse already found the peer.
+async fn reseed_friend_endpoint(
+    state: &mut NetworkState,
+    source_manager: &Arc<RwLock<ed2k::sources::SourceManager>>,
+    credit_manager: &Arc<RwLock<CreditManager>>,
+    transfer_manager: &Arc<RwLock<TransferManager>>,
+    ember_hash: [u8; 16],
+    peer_user_hash: Option<[u8; 16]>,
+    ip: std::net::Ipv4Addr,
+    port: u16,
+) {
+    if port == 0 || ip.is_unspecified() || crate::security::is_bogus_v4(ip) {
+        return;
+    }
+    if state.ip_filter.is_blocked(ip) || state.banned_ips.contains(&ip) {
+        return;
+    }
+
+    // Prefer an explicit Hello user_hash; otherwise use the credit binding
+    // learned from a prior HELLO+hash↔pubkey check this session.
+    let user_hash = match peer_user_hash.filter(|h| *h != [0u8; 16]) {
+        Some(uh) => {
+            credit_manager
+                .write()
+                .await
+                .set_ember_hash(uh, ember_hash);
+            uh
+        }
+        None => match credit_manager
+            .read()
+            .await
+            .find_user_hash_by_ember(&ember_hash)
+        {
+            Some(uh) => uh,
+            None => {
+                debug!(
+                    "Friend endpoint reseed for {}:{} skipped — no eD2K user_hash bound to {}",
+                    ip,
+                    port,
+                    hex::encode(ember_hash)
+                );
+                return;
+            }
+        },
+    };
+
+    let relocated = {
+        let mut sm = source_manager.write().await;
+        sm.relocate_user_hash(user_hash, ip, port)
+    };
+    if relocated.is_empty() {
+        debug!(
+            "Friend endpoint {}:{} for {} — no sources.met rows to relocate",
+            ip,
+            port,
+            hex::encode(ember_hash)
+        );
+        return;
+    }
+
+    let mut file_hashes = std::collections::HashSet::new();
+    for (file_hash, old_ip, old_port) in &relocated {
+        file_hashes.insert(*file_hash);
+        state
+            .dead_sources
+            .remove(0, u32::from(*old_ip), *old_port);
+        state
+            .dead_sources
+            .remove_for_file(file_hash, u32::from(*old_ip), *old_port);
+        state.dead_sources.remove(0, u32::from(ip), port);
+        state
+            .dead_sources
+            .remove_for_file(file_hash, u32::from(ip), port);
+    }
+
+    let mgr = transfer_manager.read().await;
+    let mut total_injected = 0usize;
+    for file_hash in file_hashes {
+        let hash_hex = hex::encode(file_hash);
+        let matching_ids = matching_active_transfer_ids_for_hash(state, &mgr, &hash_hex);
+        for tid in &matching_ids {
+            if let Some(pfs) = state.per_file_sources.get_mut(tid) {
+                let _ = pfs.relocate_user_hash(user_hash, ip, port);
+            }
+        }
+        if matching_ids.is_empty() {
+            continue;
+        }
+        let ds = ed2k::multi_source::DownloadSource {
+            peer_ip: ip.to_string(),
+            peer_port: port,
+            available_parts: Vec::new(),
+            peer_user_hash: Some(user_hash),
+            peer_connect_options: source_manager
+                .read()
+                .await
+                .get_connect_options(&file_hash, ip, port),
+        };
+        let stats = inject_source_into_active_transfers(state, file_hash, &matching_ids, &ds, 0);
+        total_injected += stats.injected;
+    }
+    if total_injected > 0 {
+        info!(
+            "Reseeded friend {} at {}:{} into {} active download source injection(s)",
+            hex::encode(ember_hash),
+            ip,
+            port,
+            total_injected
+        );
+    } else {
+        info!(
+            "Relocated friend {} sources to {}:{} (no live transfer inject)",
+            hex::encode(ember_hash),
+            ip,
+            port
+        );
+    }
+}
+
 /// How long an Ember peer entry is considered fresh in `known_ember_peers`
 /// before `prune_stale_ember_peers` evicts it. 24h gives enough headroom
 /// that a peer who briefly went offline (NAT renewal, brief uptime gap)
@@ -2430,6 +2552,19 @@ fn spawn_rendezvous_friend_lookup(
                     port
                 );
                 let addr = std::net::SocketAddr::new(ip.into(), port);
+                // Relocate download sources ASAP — do not wait for a full
+                // friend session / FriendSeen. Best-effort when we already
+                // know their eD2K user_hash from a prior HELLO binding.
+                let _ = ultx_fc
+                    .send(upload_server::UploadEvent {
+                        transfer_id: String::new(),
+                        kind: upload_server::UploadEventKind::FriendEndpointDiscovered {
+                            ember_hash: target_hash,
+                            ip,
+                            port,
+                        },
+                    })
+                    .await;
 
                 // Fast path: a persistent session for this peer is
                 // already alive (e.g. an inbound `FriendSeen` path
@@ -3997,6 +4132,20 @@ pub enum NetworkCommand {
         /// without starting `MultiSourceDownload` workers. Used for
         /// queued / add-paused downloads so sources are ready at promote.
         discovery_only: bool,
+        /// Set when the frontend started this download from a friend's
+        /// browse listing. Resolved (best-effort, via
+        /// `CreditManager::find_user_hash_by_ember`) to the peer's eD2K
+        /// `user_hash` so the primary seed is registered into
+        /// `SourceManager` *with identity* up front — without this, a
+        /// friend download that never completes even one Hello handshake
+        /// (e.g. both peers restart before it connects) leaves nothing for
+        /// `reseed_friend_endpoint` to relocate when rendezvous later finds
+        /// the friend at a new address. `None` for every other caller
+        /// (resumed/promoted downloads, collections, generic search
+        /// results) — those either already have an identity-linked
+        /// `sources.met` row from a prior session or aren't friend sources
+        /// at all.
+        friend_ember_hash: Option<[u8; 16]>,
     },
     AnnounceFiles {
         files: Vec<FileInfo>,
@@ -11611,6 +11760,7 @@ pub async fn start_network(
                                     transfer_id: t.id.clone(),
                                     control,
                                     discovery_only: false,
+                                    friend_ember_hash: None,
                                 },
                                 &mut state,
                                 &local_index,
@@ -11830,6 +11980,23 @@ pub async fn start_network(
                     let h2 = hash_hex.clone();
                     let ip2 = ip_str.clone();
                     let _ = tokio::task::spawn_blocking(move || db2.update_friend_address(&h2, &ip2, port));
+                    // `FriendSeen` now carries the peer's Hello listen port
+                    // (not the connection's ephemeral socket port — see the
+                    // emission sites in multi_source.rs/transfer.rs), so it's
+                    // safe to reseed download sources from it too.
+                    if let std::net::IpAddr::V4(v4) = ip {
+                        reseed_friend_endpoint(
+                            &mut state,
+                            &source_manager,
+                            &credit_manager,
+                            &transfer_manager,
+                            friend_eh,
+                            None,
+                            v4,
+                            port,
+                        )
+                        .await;
+                    }
                     let _ = app_handle.emit("ember:friend-online", serde_json::json!({
                         "user_hash": hash_hex,
                         "ip": ip_str,
@@ -12327,6 +12494,7 @@ pub async fn start_network(
                             transfer_id: t.id.clone(),
                             control,
                             discovery_only: false,
+                            friend_ember_hash: None,
                         },
                         &mut state,
                         &local_index,
@@ -12543,44 +12711,136 @@ pub async fn start_network(
                     }
                 }
 
-                if let UploadEventKind::EmberFriendConnected { ember_hash } = event.kind {
-                    // Outbound session just came up. Mirror the inbound-activity
-                    // block above: mark online (if not already) and notify the
-                    // UI. `friend_hashes` re-check guards the same removal race
-                    // documented on the `FriendSeen` handlers.
-                    if !state.online_friends.contains_key(&ember_hash) && friend_hashes.read().await.contains(&ember_hash) {
-                        state.online_friends.insert(ember_hash, chrono::Utc::now().timestamp());
-                        let _ = app_handle.emit("ember:friend-online", serde_json::json!({
-                            "user_hash": hex::encode(ember_hash),
-                        }));
+                match &event.kind {
+                    UploadEventKind::EmberFriendConnected {
+                        ember_hash,
+                        peer_user_hash,
+                        ip,
+                        port,
+                    } => {
+                        // Outbound session just came up. Mirror the inbound-activity
+                        // block above: mark online (if not already) and notify the
+                        // UI. `friend_hashes` re-check guards the same removal race
+                        // documented on the `FriendSeen` handlers.
+                        let still_friend = friend_hashes.read().await.contains(ember_hash);
+                        if still_friend && !state.online_friends.contains_key(ember_hash) {
+                            state
+                                .online_friends
+                                .insert(*ember_hash, chrono::Utc::now().timestamp());
+                            let _ = app_handle.emit(
+                                "ember:friend-online",
+                                serde_json::json!({
+                                    "user_hash": hex::encode(ember_hash),
+                                }),
+                            );
+                        }
+                        if still_friend && !ip.is_unspecified() && *port > 0 {
+                            let hash_hex = hex::encode(ember_hash);
+                            let ip_str = ip.to_string();
+                            let db2 = db.clone();
+                            let h2 = hash_hex;
+                            let ip2 = ip_str;
+                            let port = *port;
+                            let _ = tokio::task::spawn_blocking(move || {
+                                db2.update_friend_address(&h2, &ip2, port)
+                            });
+                            reseed_friend_endpoint(
+                                &mut state,
+                                &source_manager,
+                                &credit_manager,
+                                &transfer_manager,
+                                *ember_hash,
+                                Some(*peer_user_hash),
+                                *ip,
+                                port,
+                            )
+                            .await;
+                        }
                     }
-                }
-
-                if let UploadEventKind::FriendSeen { ember_hash, ip, port } = event.kind {
-                    // Gate on current membership: FriendSeen fires post-PoP for a
-                    // peer that was a friend at emit time, but a concurrent
-                    // removal can still race it. Without this a just-removed
-                    // friend could be resurrected as "online" in the UI until the
-                    // 5-minute sweep.
-                    if friend_hashes.read().await.contains(&ember_hash) {
-                        let hash_hex = hex::encode(ember_hash);
-                        let now = chrono::Utc::now().timestamp();
-                        state.online_friends.insert(ember_hash, now);
-                        // Mirror the download-side FriendSeen handler: clear any
-                        // reconnect backoff so a later disconnect can re-dial
-                        // promptly instead of waiting out the cooldown.
-                        state.friend_reconnect_last.remove(&ember_hash);
-                        let ip_str = match ip { std::net::IpAddr::V4(v4) => v4.to_string(), std::net::IpAddr::V6(v6) => v6.to_string() };
-                        let db2 = db.clone();
-                        let h2 = hash_hex.clone();
-                        let ip2 = ip_str.clone();
-                        let _ = tokio::task::spawn_blocking(move || db2.update_friend_address(&h2, &ip2, port));
-                        let _ = app_handle.emit("ember:friend-online", serde_json::json!({
-                            "user_hash": hash_hex,
-                            "ip": ip_str,
-                            "port": port,
-                        }));
+                    UploadEventKind::FriendEndpointDiscovered {
+                        ember_hash,
+                        ip,
+                        port,
+                    } => {
+                        if friend_hashes.read().await.contains(ember_hash) {
+                            let hash_hex = hex::encode(ember_hash);
+                            let ip_str = ip.to_string();
+                            let db2 = db.clone();
+                            let h2 = hash_hex;
+                            let ip2 = ip_str;
+                            let port = *port;
+                            let _ = tokio::task::spawn_blocking(move || {
+                                db2.update_friend_address(&h2, &ip2, port)
+                            });
+                            reseed_friend_endpoint(
+                                &mut state,
+                                &source_manager,
+                                &credit_manager,
+                                &transfer_manager,
+                                *ember_hash,
+                                None,
+                                *ip,
+                                port,
+                            )
+                            .await;
+                        }
                     }
+                    UploadEventKind::FriendSeen {
+                        ember_hash,
+                        ip,
+                        port,
+                    } => {
+                        // Gate on current membership: FriendSeen fires post-PoP for a
+                        // peer that was a friend at emit time, but a concurrent
+                        // removal can still race it. Without this a just-removed
+                        // friend could be resurrected as "online" in the UI until the
+                        // 5-minute sweep.
+                        if friend_hashes.read().await.contains(ember_hash) {
+                            let hash_hex = hex::encode(ember_hash);
+                            let now = chrono::Utc::now().timestamp();
+                            state.online_friends.insert(*ember_hash, now);
+                            // Mirror the download-side FriendSeen handler: clear any
+                            // reconnect backoff so a later disconnect can re-dial
+                            // promptly instead of waiting out the cooldown.
+                            state.friend_reconnect_last.remove(ember_hash);
+                            let ip_str = match ip {
+                                std::net::IpAddr::V4(v4) => v4.to_string(),
+                                std::net::IpAddr::V6(v6) => v6.to_string(),
+                            };
+                            let db2 = db.clone();
+                            let h2 = hash_hex.clone();
+                            let ip2 = ip_str.clone();
+                            let port = *port;
+                            let _ = tokio::task::spawn_blocking(move || {
+                                db2.update_friend_address(&h2, &ip2, port)
+                            });
+                            // `FriendSeen` now carries the peer's Hello listen
+                            // port (see the emission sites in upload.rs), so
+                            // it's safe to reseed download sources from it too.
+                            if let std::net::IpAddr::V4(v4) = ip {
+                                reseed_friend_endpoint(
+                                    &mut state,
+                                    &source_manager,
+                                    &credit_manager,
+                                    &transfer_manager,
+                                    *ember_hash,
+                                    None,
+                                    *v4,
+                                    port,
+                                )
+                                .await;
+                            }
+                            let _ = app_handle.emit(
+                                "ember:friend-online",
+                                serde_json::json!({
+                                    "user_hash": hash_hex,
+                                    "ip": ip_str,
+                                    "port": port,
+                                }),
+                            );
+                        }
+                    }
+                    _ => {}
                 }
 
                 if let UploadEventKind::EmberFriendRequest { ember_hash: req_hash, pubkey, ref nickname, ref peer_ip, peer_port, verified } = event.kind {
@@ -13127,6 +13387,7 @@ pub async fn start_network(
                             transfer_id: t.id.clone(),
                             control,
                             discovery_only: false,
+                            friend_ember_hash: None,
                         },
                         &mut state,
                         &local_index,
@@ -31698,6 +31959,7 @@ async fn handle_command_inner(
             transfer_id,
             control,
             discovery_only,
+            friend_ember_hash,
         } => {
             // Seed expected BLAKE3 from search/UI so verify does not depend
             // solely on having processed an Ember keyword hit this session.
@@ -31726,6 +31988,26 @@ async fn handle_command_inner(
             }
 
             let has_source = !peer_ip.is_empty() && peer_ip != "0.0.0.0" && peer_port > 0;
+            // Best-effort: a friend-browse download almost always implies an
+            // active friend session, so this binding is usually already
+            // known this session (see `EmberFriendConnected` /
+            // `reseed_friend_endpoint`) or persisted from a prior one.
+            // `None` here just means the primary seed gets registered
+            // anonymously, same as before this field existed.
+            //
+            // Require current friend membership before trusting this
+            // caller-supplied hash: `start_download` is a Tauri IPC command,
+            // so a compromised/malicious renderer script could otherwise
+            // pass an arbitrary `ember_hash` to bind our own choice of
+            // `peer_ip`/`peer_port` into a *real* friend's (or any other
+            // previously-seen peer's) `sources.met` identity — poisoning
+            // future `reseed_friend_endpoint` relocations for that peer.
+            let friend_peer_user_hash = match friend_ember_hash {
+                Some(eh) if friend_hashes.read().await.contains(&eh) => {
+                    credit_manager.read().await.find_user_hash_by_ember(&eh)
+                }
+                _ => None,
+            };
 
             let publish_file_name = file_name.clone();
             let publish_ext = std::path::Path::new(&file_name)
@@ -31799,7 +32081,25 @@ async fn handle_command_inner(
                     let mut sm = source_manager.write().await;
                     if primary_ok {
                         if let std::net::IpAddr::V4(v4) = source_addr.ip() {
-                            sm.register_source(hash_bytes, v4, source_addr.port());
+                            match friend_peer_user_hash {
+                                // Register with identity up front so a friend
+                                // download that restarts before completing even
+                                // one Hello handshake still has a `sources.met`
+                                // row `reseed_friend_endpoint` can relocate.
+                                Some(uh) => {
+                                    sm.register_source_full_opts(
+                                        hash_bytes,
+                                        v4,
+                                        source_addr.port(),
+                                        0,
+                                        uh,
+                                        0,
+                                    );
+                                }
+                                None => {
+                                    sm.register_source(hash_bytes, v4, source_addr.port());
+                                }
+                            }
                         }
                     }
                     for (parsed_ip, extra_port, _) in &validated_extras {
@@ -37046,6 +37346,7 @@ async fn handle_upload_event(
         | UploadEventKind::EmberBrowseSessionFailed { .. }
         | UploadEventKind::EmberFriendDisconnected { .. }
         | UploadEventKind::EmberFriendConnected { .. }
+        | UploadEventKind::FriendEndpointDiscovered { .. }
         | UploadEventKind::EmberFriendSearchFailed { .. }
         | UploadEventKind::PeerAutoBanned { .. }
         | UploadEventKind::EmberFriendRequest { .. } => {

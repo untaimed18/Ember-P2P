@@ -1894,11 +1894,21 @@ impl Ed2kDownload {
                                                 (&self.friend_hashes, peer_ember_hash)
                                             {
                                                 if fh_arc.read().await.contains(&eh) {
+                                                    // Prefer the Hello listen port over
+                                                    // the ephemeral socket port so this
+                                                    // is a dialable download-source
+                                                    // endpoint.
+                                                    let friend_port = if initial_caps.tcp_port > 0
+                                                    {
+                                                        initial_caps.tcp_port
+                                                    } else {
+                                                        self.source_addr.port()
+                                                    };
                                                     let _ = event_tx
                                                         .send(DownloadEvent::FriendSeen {
                                                             ember_hash: eh,
                                                             ip: self.source_addr.ip(),
-                                                            port: self.source_addr.port(),
+                                                            port: friend_port,
                                                         })
                                                         .await;
                                                     friend_seen_emitted = true;
@@ -2619,11 +2629,18 @@ impl Ed2kDownload {
                                             if let (true, Some(eh)) =
                                                 (peer_is_friend, peer_ember_hash)
                                             {
+                                                // See the comment on the other
+                                                // `FriendSeen` emission in this file.
+                                                let friend_port = if initial_caps.tcp_port > 0 {
+                                                    initial_caps.tcp_port
+                                                } else {
+                                                    self.source_addr.port()
+                                                };
                                                 let _ = event_tx
                                                     .send(DownloadEvent::FriendSeen {
                                                         ember_hash: eh,
                                                         ip: self.source_addr.ip(),
-                                                        port: self.source_addr.port(),
+                                                        port: friend_port,
                                                     })
                                                     .await;
                                                 friend_seen_emitted = true;
