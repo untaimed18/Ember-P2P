@@ -656,14 +656,20 @@ pub fn parse_ed2k_link(link: String) -> Result<Ed2kLinkInfo, String> {
             MAX_ED2K_LINK_LEN,
         ));
     }
-    hash::parse_ed2k_link(&link)
+    hash::parse_ed2k_link_strict(&link)
         .map(|(name, size, hash, aich)| Ed2kLinkInfo {
             name,
             size,
             hash,
             aich,
         })
-        .ok_or_else(|| coded("search_invalid_ed2k_link", "Invalid ed2k link format"))
+        .map_err(|error| {
+            coded_ctx(
+                "search_invalid_ed2k_link",
+                "Invalid ed2k link format",
+                error,
+            )
+        })
 }
 
 /// Build an ed2k link with optional AICH and/or our own endpoint as a source,

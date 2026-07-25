@@ -444,7 +444,7 @@ pub enum DownloadEvent {
     /// Incoming Ember browse response from a friend on a download connection.
     EmberBrowseResponse {
         ember_hash: [u8; 16],
-        entries: Vec<(String, u64, String)>,
+        entries: Vec<(String, u64, String, Option<String>)>,
     },
     /// The .part file has been created on disk, signalling the network loop to
     /// offer this partial to the server and publish to KAD so other peers can
@@ -792,6 +792,113 @@ mod tests {
         contents.sort();
         assert_eq!(contents, [b"first".to_vec(), b"second".to_vec()]);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn approved_completion_uses_identity_checked_hard_link() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-approved-hard-link-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let root = base.join("root");
+        let data = base.join("data");
+        let temp = root.join("Temp");
+        let downloads = root.join("Downloads");
+        std::fs::create_dir_all(&temp).unwrap();
+        std::fs::create_dir_all(&downloads).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let part = temp.join("source.part");
+        let target = downloads.join("finished.bin");
+        std::fs::write(&part, b"verified bytes").unwrap();
+        let root_string = root.to_string_lossy().into_owned();
+        crate::security::filesystem::initialize_approved_roots(
+            &data,
+            std::slice::from_ref(&root_string),
+        )
+        .unwrap();
+        let (_, opened) = crate::security::filesystem::open_existing_approved(
+            &part,
+            std::slice::from_ref(&root_string),
+            false,
+        )
+        .unwrap();
+        let source_identity = crate::security::filesystem::opened_file_identity(&opened).unwrap();
+        drop(opened);
+
+        let final_path =
+            move_part_to_final_approved(&part, &target, &root, &source_identity).unwrap();
+        let (_, final_file) = crate::security::filesystem::open_existing_approved(
+            &final_path,
+            std::slice::from_ref(&root_string),
+            false,
+        )
+        .unwrap();
+        #[cfg(any(target_os = "linux", target_os = "android", windows))]
+        assert_eq!(
+            crate::security::filesystem::opened_file_identity(&final_file).unwrap(),
+            source_identity,
+            "same-volume completion must publish a hard link to the verified source"
+        );
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+        assert_ne!(
+            crate::security::filesystem::opened_file_identity(&final_file).unwrap(),
+            source_identity,
+            "platforms without an atomic handle-link API must use the copy fallback"
+        );
+        assert!(!part.exists());
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"verified bytes");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn approved_completion_copy_fallback_preserves_identity_checks() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-approved-copy-fallback-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let root = base.join("root");
+        let data = base.join("data");
+        let temp = root.join("Temp");
+        let downloads = root.join("Downloads");
+        std::fs::create_dir_all(&temp).unwrap();
+        std::fs::create_dir_all(&downloads).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let part = temp.join("source.part");
+        let target = downloads.join("finished.bin");
+        std::fs::write(&part, b"fallback bytes").unwrap();
+        let root_string = root.to_string_lossy().into_owned();
+        crate::security::filesystem::initialize_approved_roots(
+            &data,
+            std::slice::from_ref(&root_string),
+        )
+        .unwrap();
+        let (_, opened) = crate::security::filesystem::open_existing_approved(
+            &part,
+            std::slice::from_ref(&root_string),
+            false,
+        )
+        .unwrap();
+        let source_identity = crate::security::filesystem::opened_file_identity(&opened).unwrap();
+        drop(opened);
+        let allowed = [root_string];
+        let final_path =
+            move_part_to_final_with_roots(&part, &target, &allowed, Some(&source_identity), false)
+                .unwrap();
+        let (_, final_file) =
+            crate::security::filesystem::open_existing_approved(&final_path, &allowed, false)
+                .unwrap();
+        assert_ne!(
+            crate::security::filesystem::opened_file_identity(&final_file).unwrap(),
+            source_identity,
+            "forced fallback must be a separately created copy"
+        );
+        assert!(!part.exists());
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"fallback bytes");
+        let _ = std::fs::remove_dir_all(base);
     }
 }
 
@@ -3073,10 +3180,25 @@ impl Ed2kDownload {
         // Ensure download directories exist:
         //   <download_dir>/Temp/     -- .part files during download
         //   <download_dir>/Downloads/ -- completed files
-        let temp_dir = self.download_dir.join("Temp");
-        let completed_dir = self.download_dir.join("Downloads");
-        tokio::fs::create_dir_all(&temp_dir).await?;
-        tokio::fs::create_dir_all(&completed_dir).await?;
+        let allowed_roots = vec![self.download_dir.to_string_lossy().into_owned()];
+        let temp_dir = {
+            let root = self.download_dir.clone();
+            let allowed = allowed_roots.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::security::filesystem::prepare_approved_subdir(&root, "Temp", &allowed)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("temp dir task failed: {e}"))??
+        };
+        let completed_dir = {
+            let root = self.download_dir.clone();
+            let allowed = allowed_roots.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::security::filesystem::prepare_approved_subdir(&root, "Downloads", &allowed)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("downloads dir task failed: {e}"))??
+        };
 
         let safe_name = crate::security::sanitize_filename(&self.file_name);
         let part_path = temp_dir.join(format!("{}.part", self.transfer_id));
@@ -3139,6 +3261,7 @@ impl Ed2kDownload {
                     },
                     truncate_existing: !resuming,
                 },
+                allowed_roots.clone(),
             )
             .await
             .map_err(|e| anyhow::anyhow!("open part file: {e}"))?
@@ -4436,51 +4559,76 @@ impl Ed2kDownload {
         // Temp-file write.
         let expected_hash = hex::encode(self.file_hash);
         let verify_path = part_path.clone();
+        let verify_root = self.download_dir.clone();
+        let expected_aich = self.expected_aich_master;
         let ember_expected = self.ember_file_hash;
-        let verified_ok =
-            match tokio::task::spawn_blocking(move || {
-                let ed2k = super::hash::ed2k_hash_file(&verify_path)?;
-                if ed2k != expected_hash {
-                    anyhow::bail!("ed2k mismatch: expected={expected_hash} got={ed2k}");
-                }
-                if ember_expected != [0u8; 32] {
-                    let got = crate::network::ember::crypto::blake3_hash_file_path(&verify_path)?;
-                    if got != ember_expected {
-                        anyhow::bail!(
-                            "ember blake3 mismatch: expected={} got={}",
-                            hex::encode(ember_expected),
-                            hex::encode(got)
-                        );
-                    }
-                }
-                Ok(())
-            })
-            .await
-            {
-                Ok(Ok(())) => {
-                    info!(
-                        "Download complete and verified from disk: {}",
-                        self.file_name
-                    );
-                    true
-                }
-                Ok(Err(e)) => {
-                    warn!(
-                        "Download hash verification failed for {}: {e}",
-                        self.file_name
-                    );
-                    false
-                }
-                Err(e) => {
-                    warn!(
-                        "Hash verification task failed for {}: {e} — treating as failed",
-                        self.file_name
-                    );
-                    false
-                }
+        let verified_result = match tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Seek, SeekFrom};
+            let allowed = vec![verify_root.to_string_lossy().into_owned()];
+            let (_, mut file) =
+                crate::security::filesystem::open_existing_approved(&verify_path, &allowed, false)?;
+            let identity = crate::security::filesystem::opened_file_identity(&file)?;
+            let hash = super::hash::ed2k_hash_open_file(&mut file)?;
+            let aich = if expected_aich.is_some() {
+                Some(super::aich::AICHRecoveryHashSet::build_from_open_file(&mut file)?.root_hash)
+            } else {
+                None
             };
+            if ember_expected != [0u8; 32] {
+                file.seek(SeekFrom::Start(0))?;
+                let mut hasher = crate::network::ember::crypto::Blake3FileHasher::new();
+                let mut buf = vec![0u8; 1024 * 1024];
+                loop {
+                    let n = file.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    hasher.update(&buf[..n]);
+                }
+                let got = hasher.finalize();
+                if got != ember_expected {
+                    anyhow::bail!(
+                        "ember blake3 mismatch: expected={} got={}",
+                        hex::encode(ember_expected),
+                        hex::encode(got)
+                    );
+                }
+            }
+            Ok::<_, anyhow::Error>((hash, identity, aich))
+        })
+        .await
+        {
+            Ok(Ok((actual_hash, identity, actual_aich))) if actual_hash == expected_hash => {
+                info!(
+                    "Download complete and verified from disk: {}",
+                    self.file_name
+                );
+                Some((identity, actual_aich))
+            }
+            Ok(Ok((actual_hash, _, _))) => {
+                warn!(
+                    "Download hash mismatch for {}: expected={}, got={}",
+                    self.file_name, expected_hash, actual_hash
+                );
+                None
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    "Could not verify hash for {}: {e} — treating as failed",
+                    self.file_name
+                );
+                None
+            }
+            Err(e) => {
+                warn!(
+                    "Hash verification task failed for {}: {e} — treating as failed",
+                    self.file_name
+                );
+                None
+            }
+        };
 
-        if !verified_ok {
+        let Some((verified_identity, actual_aich)) = verified_result else {
             for i in 0..tracker.part_count {
                 tracker.mark_incomplete(i);
             }
@@ -4492,15 +4640,10 @@ impl Ed2kDownload {
             anyhow::bail!(
                 "Final hash verification failed — .part and .part.met preserved for retry"
             );
-        }
+        };
         if let Some(expected_aich) = self.expected_aich_master {
-            let aich_path = part_path.clone();
-            let actual = tokio::task::spawn_blocking(move || {
-                super::aich::AICHRecoveryHashSet::build_from_file(&aich_path)
-                    .map(|set| set.root_hash)
-            })
-            .await
-            .map_err(|error| anyhow::anyhow!("AICH verification task failed: {error}"))??;
+            let actual = actual_aich
+                .ok_or_else(|| anyhow::anyhow!("AICH verification did not produce a root"))?;
             if actual != expected_aich {
                 anyhow::bail!(
                     "Expected AICH hash mismatch: expected {}, got {}",
@@ -4519,13 +4662,14 @@ impl Ed2kDownload {
             let pp = part_path.clone();
             let fp = final_path.clone();
             let root = self.download_dir.clone();
-            let actual_final =
-                tokio::task::spawn_blocking(move || move_part_to_final_approved(&pp, &fp, &root))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
+            let actual_final = tokio::task::spawn_blocking(move || {
+                move_part_to_final_approved(&pp, &fp, &root, &verified_identity)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
             *completed_path_out = Some(actual_final.to_string_lossy().into_owned());
         }
-        tracker.delete_met();
+        tracker.delete_met(&[self.download_dir.to_string_lossy().into_owned()]);
 
         Ok(())
     }
@@ -4609,54 +4753,95 @@ pub(super) async fn finalize_zero_ed2k_file(
             hex::encode(super::hash::empty_ed2k_file_md4())
         );
     }
-    let temp_dir = download_dir.join("Temp");
-    let completed_dir = download_dir.join("Downloads");
-    tokio::fs::create_dir_all(&temp_dir).await?;
-    tokio::fs::create_dir_all(&completed_dir).await?;
+    let allowed = vec![download_dir.to_string_lossy().into_owned()];
+    let temp_dir = {
+        let root = download_dir.to_path_buf();
+        let allowed = allowed.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::security::filesystem::prepare_approved_subdir(&root, "Temp", &allowed)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("temp dir task failed: {error}"))??
+    };
+    let completed_dir = {
+        let root = download_dir.to_path_buf();
+        let allowed = allowed.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::security::filesystem::prepare_approved_subdir(&root, "Downloads", &allowed)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("downloads dir task failed: {error}"))??
+    };
     let safe_name = crate::security::sanitize_filename(file_name);
     let part_path = temp_dir.join(format!("{transfer_id}.part"));
     let final_path = completed_dir.join(&safe_name);
-    let allowed = vec![download_dir.to_string_lossy().into_owned()];
     for stale in [&part_path, &part_path.with_extension("part.met")] {
-        if stale.exists() {
-            let verified = crate::security::filesystem::verify_existing_path(stale, &allowed)?;
-            std::fs::remove_file(verified)?;
+        if let Err(error) = crate::security::filesystem::remove_approved_file(stale, &allowed) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error.into());
+            }
         }
     }
     {
         let part = part_path.clone();
+        let allowed = allowed.clone();
         tokio::task::spawn_blocking(move || {
-            let file = crate::security::filesystem::create_new_nofollow(&part)?;
+            let parent = part.parent().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "part has no parent")
+            })?;
+            let name = part.file_name().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "part has no file name")
+            })?;
+            let (_path, file) =
+                crate::security::filesystem::create_new_in_approved_parent(parent, name, &allowed)?;
             file.sync_all()
         })
         .await
         .map_err(|error| anyhow::anyhow!("zero-byte create task failed: {error}"))??;
     }
     let verify_path = part_path.clone();
+    let verify_allowed = allowed.clone();
     let expected = hex::encode(file_hash);
-    let ok = tokio::task::spawn_blocking(move || {
-        super::hash::ed2k_hash_file(&verify_path).map(|h| h == expected)
+    let verified_identity = tokio::task::spawn_blocking(move || {
+        let (_, mut file) = crate::security::filesystem::open_existing_approved(
+            &verify_path,
+            &verify_allowed,
+            false,
+        )?;
+        let identity = crate::security::filesystem::opened_file_identity(&file)?;
+        let hash = super::hash::ed2k_hash_open_file(&mut file)?;
+        Ok::<_, anyhow::Error>((hash == expected).then_some(identity))
     })
     .await
-    .map_err(|e| anyhow::anyhow!("hash task: {e}"))??;
-    if !ok {
-        anyhow::bail!("zero-byte file ed2k hash verification failed");
-    }
+    .map_err(|e| anyhow::anyhow!("hash task: {e}"))??
+    .ok_or_else(|| anyhow::anyhow!("zero-byte file ed2k hash verification failed"))?;
     let pp = part_path.clone();
     let fp = final_path.clone();
     let root = download_dir.to_path_buf();
-    let actual_final =
-        tokio::task::spawn_blocking(move || move_part_to_final_approved(&pp, &fp, &root))
-            .await
-            .map_err(|e| anyhow::anyhow!("rename task: {e}"))??;
+    let actual_final = tokio::task::spawn_blocking(move || {
+        move_part_to_final_approved(&pp, &fp, &root, &verified_identity)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("rename task: {e}"))??;
     Ok(actual_final)
 }
 
 /// Move (or copy+delete) a `.part` file to its final destination, deduplicating
 /// the filename if the target already exists.  Returns the actual final path.
+#[cfg(test)]
 pub(crate) fn move_part_to_final(
     part_path: &std::path::Path,
     target: &std::path::Path,
+) -> anyhow::Result<std::path::PathBuf> {
+    move_part_to_final_with_roots(part_path, target, &[], None, true)
+}
+
+fn move_part_to_final_with_roots(
+    part_path: &std::path::Path,
+    target: &std::path::Path,
+    allowed_roots: &[String],
+    expected_source_identity: Option<&crate::security::filesystem::ObjectIdentity>,
+    allow_hard_link: bool,
 ) -> anyhow::Result<std::path::PathBuf> {
     // `exists()` followed by `rename()` is not an atomic name claim. On
     // Windows the loser fails despite having a complete .part; on Unix,
@@ -4666,24 +4851,60 @@ pub(crate) fn move_part_to_final(
     // create+copy, which is also collision-safe.
     for suffix in 0..=10_000u32 {
         let final_path = dedup_candidate(target, suffix);
-        match std::fs::hard_link(part_path, &final_path) {
+        if allow_hard_link {
+            let link_result = if allowed_roots.is_empty() {
+                std::fs::hard_link(part_path, &final_path).map(|()| final_path.clone())
+            } else if let Some(expected) = expected_source_identity {
+                crate::security::filesystem::hard_link_approved(
+                    part_path,
+                    &final_path,
+                    allowed_roots,
+                    expected,
+                )
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "approved hard-link completion requires a pinned source identity",
+                ))
+            };
+            match link_result {
+                Ok(linked_path) => {
+                    remove_completed_part_best_effort(
+                        part_path,
+                        &linked_path,
+                        "linked",
+                        allowed_roots,
+                        expected_source_identity,
+                    );
+                    return Ok(linked_path);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists || final_path.exists() => {
+                    continue;
+                }
+                Err(e) if hard_link_fallback_allowed(&e) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        match copy_exclusive(
+            part_path,
+            &final_path,
+            allowed_roots,
+            expected_source_identity,
+        ) {
             Ok(()) => {
-                remove_completed_part_best_effort(part_path, &final_path, "linked");
+                remove_completed_part_best_effort(
+                    part_path,
+                    &final_path,
+                    "copied",
+                    allowed_roots,
+                    expected_source_identity,
+                );
                 return Ok(final_path);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists || final_path.exists() => {
                 continue;
             }
-            Err(_) => match copy_exclusive(part_path, &final_path) {
-                Ok(()) => {
-                    remove_completed_part_best_effort(part_path, &final_path, "copied");
-                    return Ok(final_path);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists || final_path.exists() => {
-                    continue;
-                }
-                Err(e) => return Err(e.into()),
-            },
+            Err(e) => return Err(e.into()),
         }
     }
     anyhow::bail!(
@@ -4700,11 +4921,51 @@ pub(crate) fn move_part_to_final_approved(
     part_path: &std::path::Path,
     target: &std::path::Path,
     download_root: &std::path::Path,
+    expected_source_identity: &crate::security::filesystem::ObjectIdentity,
 ) -> anyhow::Result<std::path::PathBuf> {
     let allowed = vec![download_root.to_string_lossy().into_owned()];
     let verified_part = crate::security::filesystem::verify_existing_path(part_path, &allowed)?;
     let verified_target = crate::security::filesystem::verify_output_path(target, &allowed)?;
-    move_part_to_final(&verified_part, &verified_target)
+    move_part_to_final_with_roots(
+        &verified_part,
+        &verified_target,
+        &allowed,
+        Some(expected_source_identity),
+        true,
+    )
+}
+
+fn hard_link_fallback_allowed(error: &std::io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::CrossesDevices | std::io::ErrorKind::Unsupported
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        return matches!(
+            error.raw_os_error(),
+            Some(libc::EXDEV)
+                | Some(libc::EOPNOTSUPP)
+                | Some(libc::ENOSYS)
+                | Some(libc::EPERM)
+                | Some(libc::EMLINK)
+        );
+    }
+    #[cfg(windows)]
+    {
+        // ERROR_NOT_SAME_DEVICE, ERROR_INVALID_FUNCTION,
+        // ERROR_ACCESS_DENIED, ERROR_NOT_SUPPORTED, ERROR_INVALID_PARAMETER,
+        // ERROR_TOO_MANY_LINKS. Native handle-relative hard linking may be
+        // unavailable on a filesystem even when exclusive create+copy works.
+        return matches!(
+            error.raw_os_error(),
+            Some(17) | Some(1) | Some(5) | Some(50) | Some(87) | Some(1142)
+        );
+    }
+    #[allow(unreachable_code)]
+    false
 }
 
 fn dedup_candidate(base: &std::path::Path, suffix: u32) -> std::path::PathBuf {
@@ -4724,24 +4985,71 @@ fn dedup_candidate(base: &std::path::Path, suffix: u32) -> std::path::PathBuf {
 fn copy_exclusive(
     source_path: &std::path::Path,
     destination_path: &std::path::Path,
+    allowed_roots: &[String],
+    expected_source_identity: Option<&crate::security::filesystem::ObjectIdentity>,
 ) -> std::io::Result<()> {
     use std::io::Write;
 
-    let mut source = std::fs::File::open(source_path)?;
-    let mut destination = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination_path)?;
+    let mut source = if allowed_roots.is_empty() {
+        std::fs::File::open(source_path)?
+    } else {
+        crate::security::filesystem::open_existing_approved(source_path, allowed_roots, false)?.1
+    };
+    if let Some(expected) = expected_source_identity {
+        if &crate::security::filesystem::opened_file_identity(&source)? != expected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "verified part file changed before completion copy",
+            ));
+        }
+    }
+    let mut destination = if allowed_roots.is_empty() {
+        crate::security::filesystem::create_new_nofollow(destination_path)?
+    } else {
+        let (_verified, file) = crate::security::filesystem::create_new_verified_output(
+            destination_path,
+            allowed_roots,
+        )?;
+        file
+    };
+    let destination_identity = crate::security::filesystem::opened_file_identity(&destination)?;
     if let Err(e) = std::io::copy(&mut source, &mut destination)
         .and_then(|_| destination.flush())
         .and_then(|_| destination.sync_all())
     {
         drop(destination);
-        let _ = std::fs::remove_file(destination_path);
+        if allowed_roots.is_empty() {
+            let _ = std::fs::remove_file(destination_path);
+        } else {
+            let _ = crate::security::filesystem::remove_approved_file_if_identity(
+                destination_path,
+                allowed_roots,
+                &destination_identity,
+            );
+        }
         return Err(e);
     }
     if let Ok(metadata) = source.metadata() {
-        let _ = std::fs::set_permissions(destination_path, metadata.permissions());
+        let _ = destination.set_permissions(metadata.permissions());
+    }
+    if !allowed_roots.is_empty() {
+        let path_identity = crate::security::filesystem::open_existing_approved(
+            destination_path,
+            allowed_roots,
+            false,
+        )
+        .and_then(|(_, file)| crate::security::filesystem::opened_file_identity(&file));
+        if !matches!(path_identity, Ok(ref identity) if identity == &destination_identity) {
+            let _ = crate::security::filesystem::remove_approved_file_if_identity(
+                destination_path,
+                allowed_roots,
+                &destination_identity,
+            );
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "completed copy destination changed identity before publication",
+            ));
+        }
     }
     Ok(())
 }
@@ -4750,11 +5058,24 @@ fn remove_completed_part_best_effort(
     part_path: &std::path::Path,
     final_path: &std::path::Path,
     method: &str,
+    allowed_roots: &[String],
+    expected_source_identity: Option<&crate::security::filesystem::ObjectIdentity>,
 ) {
     // The download is complete once the final path exists. If an upload still
     // has the .part open on Windows, leave the harmless orphan for the startup
     // sweep instead of marking valid downloaded bytes as failed.
-    if let Err(e) = std::fs::remove_file(part_path) {
+    let removed = if allowed_roots.is_empty() {
+        std::fs::remove_file(part_path)
+    } else if let Some(expected) = expected_source_identity {
+        crate::security::filesystem::remove_approved_file_if_identity(
+            part_path,
+            allowed_roots,
+            expected,
+        )
+    } else {
+        crate::security::filesystem::remove_approved_file(part_path, allowed_roots)
+    };
+    if let Err(e) = removed {
         tracing::warn!(
             "Completed-file move: {method} {} -> {} but failed to remove the source .part: {}. \
              Orphan will be cleaned by the next startup sweep.",

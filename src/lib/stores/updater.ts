@@ -22,6 +22,8 @@ export interface UpdaterState {
   phase: UpdaterPhase;
   /** Version string of the available/installed update (null when none). */
   version: string | null;
+  /** Signed updater security epoch for this update (null when none/unknown). */
+  securityEpoch: number | null;
   /** Release notes (manifest `body`), if provided. */
   notes: string | null;
   /** Release date (manifest `date`), if provided. */
@@ -32,12 +34,13 @@ export interface UpdaterState {
   total: number | null;
   /** Human-readable error from the last failed check/download. */
   error: string | null;
-  /** Set when the user dismisses the banner for the current version. */
+  /** Set when the user dismisses the banner for this epoch/version identity. */
   dismissed: boolean;
 }
 
 interface SecureUpdateInfo {
   version: string;
+  securityEpoch: number;
   notes: string | null;
   date: string | null;
 }
@@ -50,6 +53,7 @@ type SecureUpdateProgress =
 const INITIAL: UpdaterState = {
   phase: 'idle',
   version: null,
+  securityEpoch: null,
   notes: null,
   date: null,
   downloaded: 0,
@@ -76,7 +80,13 @@ const FREQUENCY_MS: Record<UpdateCheckFrequency, number> = {
 // from Settings → About also updates it, since that makes an automatic
 // check redundant until the configured interval elapses again.
 const LAST_CHECK_STORAGE_KEY = 'ember.updater.lastCheckedAt';
-const DISMISSED_VERSION_STORAGE_KEY = 'ember.updater.dismissedVersion';
+const DISMISSED_UPDATE_STORAGE_KEY = 'ember.updater.dismissedUpdate';
+const LEGACY_DISMISSED_VERSION_STORAGE_KEY = 'ember.updater.dismissedVersion';
+
+interface DismissedUpdateIdentity {
+  securityEpoch: number;
+  version: string;
+}
 
 function readLastCheckedAt(): number {
   try {
@@ -99,17 +109,52 @@ function recordCheckedNow(): void {
   }
 }
 
-function readDismissedVersion(): string | null {
+function normalizeSecurityEpoch(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : null;
+}
+
+function readDismissedUpdate(): DismissedUpdateIdentity | null {
   try {
-    return localStorage.getItem(DISMISSED_VERSION_STORAGE_KEY);
+    const raw = localStorage.getItem(DISMISSED_UPDATE_STORAGE_KEY);
+    if (raw !== null) {
+      try {
+        const parsed = JSON.parse(raw) as Partial<DismissedUpdateIdentity>;
+        const securityEpoch = normalizeSecurityEpoch(parsed.securityEpoch);
+        if (securityEpoch !== null && typeof parsed.version === 'string' && parsed.version) {
+          return { securityEpoch, version: parsed.version };
+        }
+      } catch {
+        // Ignore a corrupt new-format value and try the legacy key below.
+      }
+    }
+
+    // Version-only dismissals predate epoch-aware updates. Model them as
+    // epoch 0 so they can still hide a legacy epoch-0 result, but can never
+    // suppress a newer security epoch that reuses an equal/lower version.
+    const legacyVersion = localStorage.getItem(LEGACY_DISMISSED_VERSION_STORAGE_KEY);
+    return legacyVersion ? { securityEpoch: 0, version: legacyVersion } : null;
   } catch {
     return null;
   }
 }
 
-function recordDismissedVersion(version: string): void {
+function isUpdateDismissed(securityEpoch: number | null, version: string): boolean {
+  if (securityEpoch === null) return false;
+  const dismissed = readDismissedUpdate();
+  return dismissed?.securityEpoch === securityEpoch && dismissed.version === version;
+}
+
+function recordDismissedUpdate(securityEpoch: number, version: string): void {
   try {
-    localStorage.setItem(DISMISSED_VERSION_STORAGE_KEY, version);
+    localStorage.setItem(
+      DISMISSED_UPDATE_STORAGE_KEY,
+      JSON.stringify({ securityEpoch, version } satisfies DismissedUpdateIdentity),
+    );
+    // The tuple is now authoritative. Removing the old key prevents a future
+    // storage fallback from reviving a stale version-only dismissal.
+    localStorage.removeItem(LEGACY_DISMISSED_VERSION_STORAGE_KEY);
   } catch {
     // In-memory dismissal still works for this session.
   }
@@ -185,15 +230,19 @@ export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<
     if (found) {
       await disposePending();
       pending = true;
+      const securityEpoch = normalizeSecurityEpoch(found.securityEpoch);
       updater.set({
         phase: 'available',
         version: found.version,
+        securityEpoch,
         notes: found.notes,
         date: found.date,
         downloaded: 0,
         total: null,
         error: null,
-        dismissed: readDismissedVersion() === found.version,
+        // Unknown/malformed epoch metadata must fail visible, never reuse a
+        // potentially stale dismissal identity.
+        dismissed: isUpdateDismissed(securityEpoch, found.version),
       });
       return true;
     }
@@ -303,10 +352,12 @@ export async function retryUpdate(): Promise<void> {
   }
 }
 
-/** Hide the banner for the current version without cancelling anything. */
+/** Hide the banner for the current epoch/version without cancelling anything. */
 export function dismissNotice(): void {
   updater.update((s) => {
-    if (s.version) recordDismissedVersion(s.version);
+    if (s.version && s.securityEpoch !== null) {
+      recordDismissedUpdate(s.securityEpoch, s.version);
+    }
     return { ...s, dismissed: true };
   });
 }

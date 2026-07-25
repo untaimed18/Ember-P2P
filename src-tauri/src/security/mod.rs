@@ -754,45 +754,158 @@ pub fn restrict_file_permissions_checked(path: &Path) -> std::io::Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        let path_str = path.to_string_lossy().to_string();
-        use std::os::windows::process::CommandExt;
-        let user = whoami()?;
-        let run_icacls = |args: &[&str]| -> std::io::Result<()> {
-            let output = std::process::Command::new("icacls")
-                .arg(&path_str)
-                .args(args)
-                .creation_flags(0x08000000) // CREATE_NO_WINDOW
-                .output()?;
-            if output.status.success() {
-                Ok(())
-            } else {
-                Err(std::io::Error::other(format!(
-                    "icacls failed for {}: {}",
-                    path.display(),
-                    String::from_utf8_lossy(&output.stderr).trim()
-                )))
-            }
-        };
+        restrict_windows_acl_atomic(path)?;
+    }
+    Ok(())
+}
 
-        // Bootstrap access before reading metadata. The previous faulty ACL
-        // operation may have left an existing file with no usable ACEs; the
-        // owner can still repair its DACL even when ordinary file access is
-        // denied.
-        let bootstrap_grant = format!("{user}:F");
-        run_icacls(&["/grant:r", bootstrap_grant.as_str(), "/q"])?;
-
-        let grant = if std::fs::metadata(path)?.is_dir() {
-            format!("{user}:(OI)(CI)F")
+/// Restrict an already-opened object, avoiding a second pathname lookup after
+/// filesystem policy has validated the handle.
+pub fn restrict_open_file_permissions_checked(
+    file: &std::fs::File,
+    is_dir: bool,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(if is_dir {
+            0o700
         } else {
-            bootstrap_grant
+            0o600
+        }))?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+        use windows_sys::Win32::Security::Authorization::{SetSecurityInfo, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::{
+            DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
         };
+        let acl = current_user_only_acl(is_dir)?;
+        let status = unsafe {
+            SetSecurityInfo(
+                file.as_raw_handle().cast(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                acl.as_ptr().cast(),
+                std::ptr::null(),
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(std::io::Error::from_raw_os_error(status as i32));
+        }
+    }
+    Ok(())
+}
 
-        // Remove inherited ACEs, then re-assert the explicit grant.
-        // Combining `/inheritance:r` and `/grant:r` in one invocation left
-        // some existing Windows files with an empty DACL, locking out the
-        // current user.
-        run_icacls(&["/inheritance:r", "/q"])?;
-        run_icacls(&["/grant:r", grant.as_str(), "/q"])?;
+#[cfg(target_os = "windows")]
+fn current_user_only_acl(is_dir: bool) -> std::io::Result<Vec<u8>> {
+    use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_ALL};
+    use windows_sys::Win32::Security::{
+        AddAccessAllowedAceEx, GetLengthSid, GetTokenInformation, InitializeAcl, TokenUser, ACL,
+        ACL_REVISION, CONTAINER_INHERIT_ACE, OBJECT_INHERIT_ACE, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut needed = 0u32;
+        let _ = GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+        if needed == 0 {
+            let err = std::io::Error::last_os_error();
+            let _ = CloseHandle(token);
+            return Err(err);
+        }
+        let mut buffer = vec![0u8; needed as usize];
+        if GetTokenInformation(
+            token,
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        ) == 0
+        {
+            let err = std::io::Error::last_os_error();
+            let _ = CloseHandle(token);
+            return Err(err);
+        }
+        let token_user = &*(buffer.as_ptr() as *const TOKEN_USER);
+        let sid = token_user.User.Sid;
+        let sid_len = GetLengthSid(sid);
+        let acl_bytes = std::mem::size_of::<ACL>()
+            .saturating_add(8)
+            .saturating_add(sid_len as usize)
+            .saturating_add(64);
+        let mut acl_buf = vec![0u8; acl_bytes];
+        if InitializeAcl(acl_buf.as_mut_ptr().cast(), acl_bytes as u32, ACL_REVISION) == 0 {
+            let err = std::io::Error::last_os_error();
+            let _ = CloseHandle(token);
+            return Err(err);
+        }
+        let ace_flags = if is_dir {
+            OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+        } else {
+            0
+        };
+        if AddAccessAllowedAceEx(
+            acl_buf.as_mut_ptr().cast(),
+            ACL_REVISION,
+            ace_flags,
+            GENERIC_ALL,
+            sid,
+        ) == 0
+        {
+            let err = std::io::Error::last_os_error();
+            let _ = CloseHandle(token);
+            return Err(err);
+        }
+        let _ = CloseHandle(token);
+        Ok(acl_buf)
+    }
+}
+
+/// Apply a protected, current-user-only DACL in a single `SetNamedSecurityInfo`
+/// call so inheritance removal and the explicit grant cannot leave an empty
+/// DACL if the process dies mid-update.
+#[cfg(target_os = "windows")]
+fn restrict_windows_acl_atomic(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::Security::Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+
+    let is_dir = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta.is_dir(),
+        // Empty DACLs make ordinary metadata fail; still attempt ACL repair.
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => false,
+        Err(error) => return Err(error),
+    };
+
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    let acl_buf = current_user_only_acl(is_dir)?;
+
+    unsafe {
+        let status = SetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            acl_buf.as_ptr().cast(),
+            std::ptr::null(),
+        );
+        if status != ERROR_SUCCESS {
+            return Err(std::io::Error::from_raw_os_error(status as i32));
+        }
     }
     Ok(())
 }
@@ -950,22 +1063,18 @@ pub fn write_file_restricted(path: &Path, data: &[u8]) -> std::io::Result<()> {
     atomic_write(path, data, true)
 }
 
-#[cfg(target_os = "windows")]
-fn whoami() -> std::io::Result<String> {
-    use std::os::windows::process::CommandExt;
-    let output = std::process::Command::new("whoami")
-        .creation_flags(0x08000000)
-        .output()?;
-    if !output.status.success() {
-        return Err(std::io::Error::other("whoami failed"));
+/// Normalize and validate a trusted AICH master (40 hex chars). Empty input
+/// yields `None`; malformed non-empty input is an error so callers fail closed.
+pub fn parse_expected_aich(value: Option<&str>) -> Result<Option<String>, &'static str> {
+    let Some(raw) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let normalized = raw.to_ascii_lowercase();
+    if normalized.len() == 40 && normalized.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(Some(normalized))
+    } else {
+        Err("Expected AICH must be a 40-character hexadecimal SHA-1 root")
     }
-    let user = String::from_utf8(output.stdout)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    let user = user.trim();
-    if user.is_empty() {
-        return Err(std::io::Error::other("whoami returned an empty account"));
-    }
-    Ok(user.to_string())
 }
 
 /// Clean up log files older than the given number of days.

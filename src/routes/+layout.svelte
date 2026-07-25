@@ -38,6 +38,7 @@
   import { page } from '$app/stores';
   import { fly } from 'svelte/transition';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+  import { inertBackground, trapTabKey } from '$lib/a11y';
 
   // Sync `<html lang>` to the active Paraglide locale on every
   // mount. Paraglide's strategy chain (localStorage →
@@ -58,8 +59,12 @@
   let policyResetReason = $state<string | null>(null);
   let policyResetPending = $state(false);
   let policyResetError = $state('');
+  let policyResetOverlayEl: HTMLDivElement | undefined = $state(undefined);
+  let policyResetDialogEl: HTMLDivElement | undefined = $state(undefined);
+  let policyResetAckBtn: HTMLButtonElement | undefined = $state(undefined);
 
   async function acknowledgePolicyReset() {
+    if (policyResetPending) return;
     policyResetPending = true;
     policyResetError = '';
     try {
@@ -71,6 +76,28 @@
       policyResetPending = false;
     }
   }
+
+  function handlePolicyResetKeydown(e: KeyboardEvent) {
+    // Blocking gate: Escape must not dismiss. Tab stays inside the dialog.
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+    trapTabKey(e, policyResetDialogEl);
+  }
+
+  $effect(() => {
+    if (!policyResetReason || !policyResetOverlayEl) return;
+    return inertBackground(policyResetOverlayEl);
+  });
+
+  $effect(() => {
+    if (!policyResetReason) return;
+    requestAnimationFrame(() => {
+      policyResetAckBtn?.focus();
+    });
+  });
 
   async function onWizardComplete(updated: AppSettings) {
     setAppSettings(updated);
@@ -238,9 +265,18 @@
           stopTransferPoll = startTransferPoll();
           initialized = true;
           try {
-            const migrated = await takePendingDownloadOverflowNotice();
-            if (mounted && migrated > 0) {
-              toastWarning(`${migrated} older queued download(s) exceeded the safety budget and were quarantined. No files were deleted.`);
+            // Only consume once we know the shell is still alive. The backend
+            // command acknowledges+returns the count atomically — there is no
+            // peek — so always surface the toast after a successful take.
+            if (mounted) {
+              const migrated = await takePendingDownloadOverflowNotice();
+              if (migrated > 0) {
+                toastWarning(
+                  migrated === 1
+                    ? m.layout_download_overflow_notice_one()
+                    : m.layout_download_overflow_notice_other({ count: migrated }),
+                );
+              }
             }
           } catch (e) {
             console.error('Failed to read pending-download migration notice:', e);
@@ -435,19 +471,32 @@
 />
 
 {#if policyResetReason}
-  <div class="policy-reset-backdrop" role="presentation">
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+  <div
+    class="policy-reset-backdrop"
+    bind:this={policyResetOverlayEl}
+    role="presentation"
+  >
     <div
       class="policy-reset-dialog"
+      bind:this={policyResetDialogEl}
       role="alertdialog"
       aria-modal="true"
+      aria-busy={policyResetPending}
       aria-labelledby="policy-reset-title"
       aria-describedby="policy-reset-description"
+      tabindex="-1"
+      onkeydown={handlePolicyResetKeydown}
     >
       <h2 id="policy-reset-title">{m.layout_policy_reset_title()}</h2>
       <p id="policy-reset-description">{m.layout_policy_reset_body()}</p>
       <p class="policy-reset-reason">{policyResetReason}</p>
       {#if policyResetError}<p class="policy-reset-error">{policyResetError}</p>{/if}
-      <button disabled={policyResetPending} onclick={acknowledgePolicyReset}>
+      <button
+        bind:this={policyResetAckBtn}
+        aria-disabled={policyResetPending}
+        onclick={acknowledgePolicyReset}
+      >
         {policyResetPending
           ? m.layout_policy_reset_working()
           : m.layout_policy_reset_acknowledge()}
@@ -543,6 +592,11 @@
 
   .policy-reset-dialog button {
     margin-top: 12px;
+  }
+
+  .policy-reset-dialog button[aria-disabled='true'] {
+    cursor: wait;
+    opacity: 0.65;
   }
 
   .init-loading {

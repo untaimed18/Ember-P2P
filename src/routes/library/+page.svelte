@@ -2056,8 +2056,23 @@
     if (uniquePaths.length === 0) return;
 
     // OS drag/drop paths are visible to the renderer and therefore are not
-    // filesystem authorization. Re-open the trusted native picker so the user
-    // explicitly confirms the folder without restoring raw-path IPC authority.
+    // filesystem authorization. Explain that, show the dropped name(s), then
+    // open the trusted native picker so the user explicitly confirms a folder
+    // without restoring raw-path IPC authority.
+    const displayNames = uniquePaths.map((p) => {
+      const trimmed = p.replace(/[\\/]+$/, '');
+      const parts = trimmed.split(/[/\\]/);
+      return parts[parts.length - 1] || trimmed;
+    });
+    const summary = displayNames.slice(0, 3).join(', ')
+      + (displayNames.length > 3 ? '…' : '');
+    const confirmed = await askConfirm(
+      uniquePaths.length === 1
+        ? m.library_drop_confirm_one({ name: displayNames[0] })
+        : m.library_drop_confirm_other({ count: uniquePaths.length, summary }),
+      m.library_drop_confirm_title(),
+    );
+    if (!confirmed || !mounted) return;
     await handleAddFolder();
   }
 

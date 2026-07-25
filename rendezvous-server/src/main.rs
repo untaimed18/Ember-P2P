@@ -143,6 +143,56 @@ const OP_RELAY_MAILBOX_POLL: u8 = 0x0f;
 const OP_PUNCH_REGISTER_V3: u8 = 0x10;
 const OP_PUNCH_POLL_V3: u8 = 0x11;
 const OP_PUNCH_ACK_V3: u8 = 0x12;
+/// Version 4 is the first IP-family-bound rendezvous protocol.  It uses a
+/// separate domain, operation range, and route namespace so rolling deploys
+/// can never interpret a v4 signature as a legacy v3 signature (or vice versa).
+const RDV_V4_DOMAIN: &[u8] = b"ember-rdv-v4";
+const OP_IDENTITY_LOOKUP_V4: u8 = 0x20;
+const OP_CAPABILITY_REGISTER_V4: u8 = 0x21;
+const OP_CAPABILITY_LOOKUP_V4: u8 = 0x22;
+const OP_PUNCH_REGISTER_V4: u8 = 0x23;
+const OP_PUNCH_POLL_V4: u8 = 0x24;
+const OP_PUNCH_ACK_V4: u8 = 0x25;
+
+/// Canonical signed-IP encoding: `4 || ipv4` or `6 || ipv6`.
+const SIGNED_IP_V4: u8 = 4;
+const SIGNED_IP_V6: u8 = 6;
+
+fn encode_signed_ip(ip: IpAddr) -> Vec<u8> {
+    match ip {
+        IpAddr::V4(v4) => {
+            let mut out = Vec::with_capacity(5);
+            out.push(SIGNED_IP_V4);
+            out.extend_from_slice(&v4.octets());
+            out
+        }
+        IpAddr::V6(v6) => {
+            let mut out = Vec::with_capacity(17);
+            out.push(SIGNED_IP_V6);
+            out.extend_from_slice(&v6.octets());
+            out
+        }
+    }
+}
+
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
+        IpAddr::V4(_) => ip,
+    }
+}
+
+fn parse_routable_ip(s: &str) -> Option<IpAddr> {
+    let ip = canonical_ip(s.parse::<IpAddr>().ok()?);
+    match ip {
+        IpAddr::V4(v4) if is_routable_public_v4(v4) => Some(ip),
+        // Presence and punch stay IPv4-only until clients verify IPv6 end-to-end.
+        IpAddr::V4(_) | IpAddr::V6(_) => None,
+    }
+}
 
 /// Maximum allowed clock skew between the client and server timestamps
 /// in a signed request. 5 minutes covers normal NTP-skewed clients
@@ -296,7 +346,7 @@ fn build_relay_ticket_action_msg(
     m
 }
 
-fn build_capability_register_msg(
+fn build_capability_register_v3_msg(
     capability: &[u8; 32],
     epoch: i64,
     port: u16,
@@ -318,7 +368,48 @@ fn build_capability_register_msg(
     m
 }
 
-fn build_capability_lookup_msg(
+fn build_capability_register_v4_msg(
+    capability: &[u8; 32],
+    epoch: i64,
+    port: u16,
+    signed_ip: &[u8],
+    pubkey: &[u8; 32],
+    peer_pubkey: &[u8; 32],
+    ts: i64,
+) -> Vec<u8> {
+    let mut m =
+        Vec::with_capacity(RDV_V4_DOMAIN.len() + 1 + 32 + 8 + 2 + signed_ip.len() + 32 + 32 + 8);
+    m.extend_from_slice(RDV_V4_DOMAIN);
+    m.push(OP_CAPABILITY_REGISTER_V4);
+    m.extend_from_slice(capability);
+    m.extend_from_slice(&epoch.to_le_bytes());
+    m.extend_from_slice(&port.to_le_bytes());
+    m.extend_from_slice(signed_ip);
+    m.extend_from_slice(pubkey);
+    m.extend_from_slice(peer_pubkey);
+    m.extend_from_slice(&ts.to_le_bytes());
+    m
+}
+
+fn build_identity_lookup_v4_msg(
+    target_id: &[u8; 32],
+    requester_id: &[u8; 32],
+    requester_pubkey: &[u8; 32],
+    nonce: &[u8; 16],
+    ts: i64,
+) -> Vec<u8> {
+    let mut m = Vec::with_capacity(RDV_V4_DOMAIN.len() + 1 + 32 + 32 + 32 + 16 + 8);
+    m.extend_from_slice(RDV_V4_DOMAIN);
+    m.push(OP_IDENTITY_LOOKUP_V4);
+    m.extend_from_slice(target_id);
+    m.extend_from_slice(requester_id);
+    m.extend_from_slice(requester_pubkey);
+    m.extend_from_slice(nonce);
+    m.extend_from_slice(&ts.to_le_bytes());
+    m
+}
+
+fn build_capability_lookup_v3_msg(
     capability: &[u8; 32],
     epoch: i64,
     requester_id: &[u8; 32],
@@ -329,6 +420,26 @@ fn build_capability_lookup_msg(
     let mut m = Vec::with_capacity(RDV_DOMAIN.len() + 1 + 32 + 8 + 32 + 32 + 16 + 8);
     m.extend_from_slice(RDV_DOMAIN);
     m.push(OP_CAPABILITY_LOOKUP);
+    m.extend_from_slice(capability);
+    m.extend_from_slice(&epoch.to_le_bytes());
+    m.extend_from_slice(requester_id);
+    m.extend_from_slice(requester_pubkey);
+    m.extend_from_slice(nonce);
+    m.extend_from_slice(&ts.to_le_bytes());
+    m
+}
+
+fn build_capability_lookup_v4_msg(
+    capability: &[u8; 32],
+    epoch: i64,
+    requester_id: &[u8; 32],
+    requester_pubkey: &[u8; 32],
+    nonce: &[u8; 16],
+    ts: i64,
+) -> Vec<u8> {
+    let mut m = Vec::with_capacity(RDV_V4_DOMAIN.len() + 1 + 32 + 8 + 32 + 32 + 16 + 8);
+    m.extend_from_slice(RDV_V4_DOMAIN);
+    m.push(OP_CAPABILITY_LOOKUP_V4);
     m.extend_from_slice(capability);
     m.extend_from_slice(&epoch.to_le_bytes());
     m.extend_from_slice(requester_id);
@@ -397,6 +508,33 @@ fn build_punch_register_v3_msg(
     message
 }
 
+fn build_punch_register_v4_msg(
+    from_id: &[u8; 32],
+    target_id: &[u8; 32],
+    capability: &[u8; 32],
+    epoch: i64,
+    port: u16,
+    signed_ip: &[u8],
+    nat_type: u8,
+    nonce: &[u8; 16],
+    ts: i64,
+) -> Vec<u8> {
+    let mut message =
+        Vec::with_capacity(RDV_V4_DOMAIN.len() + 1 + 32 * 3 + 8 + 2 + signed_ip.len() + 1 + 16 + 8);
+    message.extend_from_slice(RDV_V4_DOMAIN);
+    message.push(OP_PUNCH_REGISTER_V4);
+    message.extend_from_slice(from_id);
+    message.extend_from_slice(target_id);
+    message.extend_from_slice(capability);
+    message.extend_from_slice(&epoch.to_le_bytes());
+    message.extend_from_slice(&port.to_le_bytes());
+    message.extend_from_slice(signed_ip);
+    message.push(nat_type);
+    message.extend_from_slice(nonce);
+    message.extend_from_slice(&ts.to_le_bytes());
+    message
+}
+
 fn build_punch_poll_v3_msg(target_id: &[u8; 32], nonce: &[u8; 16], ts: i64) -> Vec<u8> {
     let mut message = Vec::with_capacity(RDV_DOMAIN.len() + 1 + 32 + 16 + 8);
     message.extend_from_slice(RDV_DOMAIN);
@@ -418,6 +556,36 @@ fn build_punch_ack_v3_msg(
     let mut message = Vec::with_capacity(RDV_DOMAIN.len() + 1 + 32 * 3 + 8 + 16 + 8);
     message.extend_from_slice(RDV_DOMAIN);
     message.push(OP_PUNCH_ACK_V3);
+    message.extend_from_slice(target_id);
+    message.extend_from_slice(capability);
+    message.extend_from_slice(&epoch.to_le_bytes());
+    message.extend_from_slice(punch_id);
+    message.extend_from_slice(nonce);
+    message.extend_from_slice(&ts.to_le_bytes());
+    message
+}
+
+fn build_punch_poll_v4_msg(target_id: &[u8; 32], nonce: &[u8; 16], ts: i64) -> Vec<u8> {
+    let mut message = Vec::with_capacity(RDV_V4_DOMAIN.len() + 1 + 32 + 16 + 8);
+    message.extend_from_slice(RDV_V4_DOMAIN);
+    message.push(OP_PUNCH_POLL_V4);
+    message.extend_from_slice(target_id);
+    message.extend_from_slice(nonce);
+    message.extend_from_slice(&ts.to_le_bytes());
+    message
+}
+
+fn build_punch_ack_v4_msg(
+    target_id: &[u8; 32],
+    capability: &[u8; 32],
+    epoch: i64,
+    punch_id: &[u8; 32],
+    nonce: &[u8; 16],
+    ts: i64,
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(RDV_V4_DOMAIN.len() + 1 + 32 * 3 + 8 + 16 + 8);
+    message.extend_from_slice(RDV_V4_DOMAIN);
+    message.push(OP_PUNCH_ACK_V4);
     message.extend_from_slice(target_id);
     message.extend_from_slice(capability);
     message.extend_from_slice(&epoch.to_le_bytes());
@@ -548,11 +716,30 @@ const MAX_ACCEPTED_RELAY_TICKETS_PER_RESPONDER: usize = 8;
 /// eight keep the complete JSON response below the client's 8 KiB cap.
 const MAX_RELAY_MAILBOX_RESULTS: usize = 8;
 /// Bound work per poll while advancing a persistent round-robin cursor.
-const MAX_RELAY_MAILBOX_SCAN_PER_POLL: usize = 64;
+/// Walks only the pending-offer index, so accepted tickets cannot consume budget.
+const MAX_RELAY_MAILBOX_SCAN_PER_POLL: usize = 512;
+/// How long a punched entry stays leased to one poller before re-entering the queue.
+const PUNCH_LEASE: Duration = Duration::from_secs(5);
 const POLL_READ_NONCE_TTL: Duration = Duration::from_secs(10 * 60);
 const STATUS_READ_NONCE_TTL: Duration = RELAY_TICKET_TTL;
 const MAX_POLL_READ_NONCES: usize = 100_000;
 const MAX_STATUS_READ_NONCES: usize = MAX_RELAY_TICKETS;
+const MAX_LEGACY_IDENTITY_LOOKUPS_PER_MINUTE: u64 = 10;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RendezvousVersion {
+    LegacyV3,
+    IpBoundV4,
+}
+
+impl RendezvousVersion {
+    fn wire_value(self) -> u8 {
+        match self {
+            Self::LegacyV3 => 3,
+            Self::IpBoundV4 => 4,
+        }
+    }
+}
 
 #[derive(Clone)]
 struct PresenceEntry {
@@ -576,8 +763,8 @@ struct PairwisePresenceEntry {
     peer_pubkey: [u8; 32],
     pubkey: [u8; 32],
     epoch: i64,
-    ts: i64,
-    sig: [u8; 64],
+    legacy_proof: Option<(i64, [u8; 64])>,
+    v4_proof: Option<(i64, [u8; 64])>,
 }
 
 fn capability_allows_peer(
@@ -606,6 +793,15 @@ struct PunchEntry {
     capability: [u8; 32],
     epoch: i64,
     created_at: Instant,
+    /// Set while a poller holds this entry; expired leases return to the queue.
+    leased_until: Option<Instant>,
+    proof_version: RendezvousVersion,
+    /// Present only for v4. Legacy v3 deliberately preserves its original
+    /// response shape and relies on the server-observed source address.
+    register_nonce: Option<[u8; 16]>,
+    register_ts: Option<i64>,
+    register_sig: Option<[u8; 64]>,
+    from_pubkey: Option<[u8; 32]>,
 }
 
 /// Tracks a relay session: two WebSocket halves bridged together.
@@ -737,6 +933,8 @@ struct RelayTicket {
 struct RelayTicketStore {
     tickets: HashMap<String, RelayTicket>,
     by_responder: HashMap<String, BTreeMap<String, String>>,
+    /// Pending (unaccepted) offers only — mailbox rotation never scans accepted slots.
+    pending_by_responder: HashMap<String, BTreeMap<String, String>>,
     mailbox_cursors: HashMap<String, String>,
     initiator_counts: HashMap<String, usize>,
     accepted_responder_counts: HashMap<String, usize>,
@@ -772,6 +970,12 @@ impl RelayTicketStore {
             .entry(ticket.responder_id.clone())
             .or_default()
             .insert(ticket.initiator_id.clone(), ticket_id.clone());
+        if !ticket.accepted {
+            self.pending_by_responder
+                .entry(ticket.responder_id.clone())
+                .or_default()
+                .insert(ticket.initiator_id.clone(), ticket_id.clone());
+        }
         *self
             .initiator_counts
             .entry(ticket.initiator_id.clone())
@@ -799,6 +1003,17 @@ impl RelayTicketStore {
             if by_initiator.is_empty() {
                 self.by_responder.remove(&ticket.responder_id);
                 self.mailbox_cursors.remove(&ticket.responder_id);
+            }
+        }
+        if let Some(pending) = self.pending_by_responder.get_mut(&ticket.responder_id) {
+            if pending
+                .get(&ticket.initiator_id)
+                .is_some_and(|id| id == ticket_id)
+            {
+                pending.remove(&ticket.initiator_id);
+            }
+            if pending.is_empty() {
+                self.pending_by_responder.remove(&ticket.responder_id);
             }
         }
         if let Some(count) = self.initiator_counts.get_mut(&ticket.initiator_id) {
@@ -859,15 +1074,23 @@ impl RelayTicketStore {
             return false;
         }
         ticket.accepted = true;
+        let responder_id = ticket.responder_id.clone();
+        let initiator_id = ticket.initiator_id.clone();
         *self
             .accepted_responder_counts
-            .entry(ticket.responder_id.clone())
+            .entry(responder_id.clone())
             .or_insert(0) += 1;
+        if let Some(pending) = self.pending_by_responder.get_mut(&responder_id) {
+            pending.remove(&initiator_id);
+            if pending.is_empty() {
+                self.pending_by_responder.remove(&responder_id);
+            }
+        }
         true
     }
 
     fn mailbox_page_ids(&mut self, responder_id: &str, now: Instant) -> Vec<String> {
-        let Some(by_initiator) = self.by_responder.get(responder_id) else {
+        let Some(by_initiator) = self.pending_by_responder.get(responder_id) else {
             self.mailbox_cursors.remove(responder_id);
             return Vec::new();
         };
@@ -1024,6 +1247,11 @@ struct AppState {
     /// endpoints — earlier this map was shared, and a single LowID
     /// peer's punch retries could 429 lookup/register for the same IP.
     rate_limits: Arc<RwLock<HashMap<IpAddr, RateEntry>>>,
+    /// Temporary unauthenticated v3 identity oracle budget. It must not share
+    /// counters with authenticated registration/lookup traffic: otherwise a
+    /// normal rollout registration burst can consume the tighter legacy cap
+    /// before an old client performs its first identity lookup.
+    legacy_identity_rate_limits: Arc<RwLock<HashMap<IpAddr, RateEntry>>>,
     /// Separate per-IP budget for authenticated relay ticket poll/status
     /// reads. This prevents normal fallback traffic from consuming punch or
     /// general API capacity.
@@ -1106,6 +1334,11 @@ struct CapabilityRegisterRequest {
     peer_pubkey: String,
     ts: i64,
     sig: String,
+    /// During v4 rollout the client includes the exact v3 registration proof
+    /// in the same request. The server verifies and stores both under one
+    /// logical/rate-limited admission, avoiding a second mutation request.
+    #[serde(default)]
+    legacy_sig: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1129,6 +1362,8 @@ struct CapabilityLookupResponse {
     pubkey: String,
     ts: i64,
     sig: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proof_version: Option<u8>,
 }
 
 #[derive(Deserialize)]
@@ -1305,8 +1540,11 @@ fn proxy_config() -> &'static ProxyConfig {
     CONFIG.get_or_init(ProxyConfig::from_env)
 }
 
-fn extract_client_ip(headers: &HeaderMap, addr: SocketAddr) -> IpAddr {
-    let config = proxy_config();
+fn extract_client_ip_with_config(
+    config: &ProxyConfig,
+    headers: &HeaderMap,
+    addr: SocketAddr,
+) -> IpAddr {
     // A forwarded address has authority only when both controls agree:
     // deployment explicitly selected Fly mode, and the immediate TCP peer is
     // in the operator-configured proxy allowlist. This prevents a public
@@ -1321,6 +1559,10 @@ fn extract_client_ip(headers: &HeaderMap, addr: SocketAddr) -> IpAddr {
         }
     }
     addr.ip()
+}
+
+fn extract_client_ip(headers: &HeaderMap, addr: SocketAddr) -> IpAddr {
+    extract_client_ip_with_config(proxy_config(), headers, addr)
 }
 
 async fn check_rate_limit_bucket(
@@ -1368,6 +1610,7 @@ async fn check_ticket_read_rate_limit(state: &AppState, ip: IpAddr) -> bool {
     .await
 }
 
+#[cfg(test)]
 fn admit_replay_key(
     cache: &mut ReplayCache,
     key: [u8; 32],
@@ -1389,9 +1632,42 @@ fn admit_replay_key(
     ReplayCacheAdmission::Remembered
 }
 
+fn admit_replay_keys(
+    cache: &mut ReplayCache,
+    keys: &[[u8; 32]],
+    now: Instant,
+    max_entries: usize,
+) -> ReplayCacheAdmission {
+    cache.prune_expired(now);
+    for (index, key) in keys.iter().enumerate() {
+        if cache.entries.contains_key(key) || keys[..index].contains(key) {
+            return ReplayCacheAdmission::Replay;
+        }
+    }
+    if keys.len() > max_entries.saturating_sub(cache.entries.len()) {
+        return ReplayCacheAdmission::Full;
+    }
+    let expires_at = now + REPLAY_CACHE_TTL;
+    for key in keys {
+        cache.entries.insert(*key, expires_at);
+        cache.expirations.push_back((expires_at, *key));
+    }
+    ReplayCacheAdmission::Remembered
+}
+
 async fn remember_signed_request(state: &AppState, key: [u8; 32]) -> ReplayCacheAdmission {
     let mut cache = state.replay_cache.write().await;
-    admit_replay_key(&mut cache, key, Instant::now(), MAX_REPLAY_CACHE_ENTRIES)
+    admit_replay_keys(
+        &mut cache,
+        std::slice::from_ref(&key),
+        Instant::now(),
+        MAX_REPLAY_CACHE_ENTRIES,
+    )
+}
+
+async fn remember_signed_requests(state: &AppState, keys: &[[u8; 32]]) -> ReplayCacheAdmission {
+    let mut cache = state.replay_cache.write().await;
+    admit_replay_keys(&mut cache, keys, Instant::now(), MAX_REPLAY_CACHE_ENTRIES)
 }
 
 fn admit_idempotent_read_nonce<K: Eq + Hash + Copy>(
@@ -1981,7 +2257,15 @@ async fn legacy_presence_lookup_gone() -> StatusCode {
     StatusCode::GONE
 }
 
-async fn identity_lookup(
+async fn protocol_v4() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "version": 4,
+        "domain": "ember-rdv-v4",
+        "legacy_v3_rollout": true,
+    }))
+}
+
+async fn legacy_identity_lookup(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
@@ -1991,7 +2275,15 @@ async fn identity_lookup(
         return Err(StatusCode::BAD_REQUEST);
     }
     let client_ip = extract_client_ip(&headers, addr);
-    if !check_rate_limit(&state, client_ip).await {
+    // Temporary rolling-deploy oracle: deliberately much tighter than the
+    // authenticated v4 API and isolated in its own counter bucket.
+    if !check_rate_limit_bucket(
+        &state.legacy_identity_rate_limits,
+        client_ip,
+        MAX_LEGACY_IDENTITY_LOOKUPS_PER_MINUTE,
+    )
+    .await
+    {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     let store = state.store.read().await;
@@ -2004,11 +2296,100 @@ async fn identity_lookup(
     }))
 }
 
-async fn capability_register(
+#[derive(Deserialize)]
+struct IdentityLookupRequest {
+    target_id: String,
+    requester_id: String,
+    requester_pubkey: String,
+    nonce: String,
+    ts: i64,
+    sig: String,
+}
+
+async fn identity_lookup_v4(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<IdentityLookupRequest>,
+) -> Result<Json<IdentityResponse>, StatusCode> {
+    if !validate_hex_id(&body.target_id)
+        || !validate_hex_id(&body.requester_id)
+        || !timestamp_fresh(body.ts)
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let (Some(target_raw), Some(requester_raw), Some(requester_pubkey), Some(nonce), Some(sig)) = (
+        decode_hex_id(&body.target_id),
+        decode_hex_id(&body.requester_id),
+        decode_hex_pubkey(&body.requester_pubkey),
+        decode_hex_nonce(&body.nonce),
+        decode_hex_sig(&body.sig),
+    ) else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    if !pubkey_matches_id(&requester_pubkey, &body.requester_id) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let client_ip = extract_client_ip(&headers, addr);
+    if !check_rate_limit(&state, client_ip).await {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    let requester_registered = state
+        .store
+        .read()
+        .await
+        .get(&body.requester_id.to_lowercase())
+        .is_some_and(|entry| entry.expires_at > Instant::now() && entry.pubkey == requester_pubkey);
+    if !requester_registered {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let signed = build_identity_lookup_v4_msg(
+        &target_raw,
+        &requester_raw,
+        &requester_pubkey,
+        &nonce,
+        body.ts,
+    );
+    if !ed25519_verify(&requester_pubkey, &signed, &sig) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    replay_cache_status(
+        remember_signed_request(&state, signed_request_replay_key(&signed, &sig)).await,
+    )?;
+    let store = state.store.read().await;
+    let entry = store
+        .get(&body.target_id.to_lowercase())
+        .filter(|entry| entry.expires_at > Instant::now())
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(IdentityResponse {
+        pubkey: hex::encode(entry.pubkey),
+    }))
+}
+
+async fn capability_register_v3(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<CapabilityRegisterRequest>,
+) -> StatusCode {
+    capability_register_impl(state, addr, headers, body, RendezvousVersion::LegacyV3).await
+}
+
+async fn capability_register_v4(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<CapabilityRegisterRequest>,
+) -> StatusCode {
+    capability_register_impl(state, addr, headers, body, RendezvousVersion::IpBoundV4).await
+}
+
+async fn capability_register_impl(
+    state: AppState,
+    addr: SocketAddr,
+    headers: HeaderMap,
+    body: CapabilityRegisterRequest,
+    version: RendezvousVersion,
 ) -> StatusCode {
     if !validate_hex_id(&body.capability)
         || body.port == 0
@@ -2031,12 +2412,24 @@ async fn capability_register(
     let Ok(ip) = body.ip.parse::<IpAddr>() else {
         return StatusCode::BAD_REQUEST;
     };
-    if !match ip {
-        IpAddr::V4(v4) => is_routable_public_v4(v4),
-        IpAddr::V6(v6) => is_routable_public_v6(v6),
-    } {
+    // Fail closed on IPv6 until clients verify the full signed encoding end-to-end.
+    let IpAddr::V4(v4) = ip else {
+        return StatusCode::BAD_REQUEST;
+    };
+    if !is_routable_public_v4(v4) {
         return StatusCode::BAD_REQUEST;
     }
+    let legacy_sig = match (version, body.legacy_sig.as_deref()) {
+        (RendezvousVersion::LegacyV3, None) => None,
+        (RendezvousVersion::LegacyV3, Some(_)) => return StatusCode::BAD_REQUEST,
+        (RendezvousVersion::IpBoundV4, None) => None,
+        (RendezvousVersion::IpBoundV4, Some(value)) => {
+            let Some(signature) = decode_hex_sig(value) else {
+                return StatusCode::BAD_REQUEST;
+            };
+            Some(signature)
+        }
+    };
     let client_ip = extract_client_ip(&headers, addr);
     if !check_rate_limit(&state, client_ip).await {
         return StatusCode::TOO_MANY_REQUESTS;
@@ -2051,25 +2444,50 @@ async fn capability_register(
     if !owner_is_registered {
         return StatusCode::FORBIDDEN;
     }
-    let signed_ip4 = match ip {
-        IpAddr::V4(v4) => v4.octets(),
-        IpAddr::V6(_) => [0; 4],
+    let signed = match version {
+        RendezvousVersion::LegacyV3 => build_capability_register_v3_msg(
+            &capability,
+            body.epoch,
+            body.port,
+            v4.octets(),
+            &pubkey,
+            &peer_pubkey,
+            body.ts,
+        ),
+        RendezvousVersion::IpBoundV4 => build_capability_register_v4_msg(
+            &capability,
+            body.epoch,
+            body.port,
+            &encode_signed_ip(ip),
+            &pubkey,
+            &peer_pubkey,
+            body.ts,
+        ),
     };
-    let signed = build_capability_register_msg(
-        &capability,
-        body.epoch,
-        body.port,
-        signed_ip4,
-        &pubkey,
-        &peer_pubkey,
-        body.ts,
-    );
     if !ed25519_verify(&pubkey, &signed, &sig) {
         return StatusCode::FORBIDDEN;
     }
-    if let Err(status) = replay_cache_status(
-        remember_signed_request(&state, signed_request_replay_key(&signed, &sig)).await,
-    ) {
+    let legacy_signed = legacy_sig.map(|_| {
+        build_capability_register_v3_msg(
+            &capability,
+            body.epoch,
+            body.port,
+            v4.octets(),
+            &pubkey,
+            &peer_pubkey,
+            body.ts,
+        )
+    });
+    if let (Some(legacy_sig), Some(legacy_signed)) = (legacy_sig, legacy_signed.as_ref()) {
+        if !ed25519_verify(&pubkey, legacy_signed, &legacy_sig) {
+            return StatusCode::FORBIDDEN;
+        }
+    }
+    let mut replay_keys = vec![signed_request_replay_key(&signed, &sig)];
+    if let (Some(legacy_sig), Some(legacy_signed)) = (legacy_sig, legacy_signed.as_ref()) {
+        replay_keys.push(signed_request_replay_key(legacy_signed, &legacy_sig));
+    }
+    if let Err(status) = replay_cache_status(remember_signed_requests(&state, &replay_keys).await) {
         return status;
     }
     let mut capabilities = state.capability_store.write().await;
@@ -2080,27 +2498,68 @@ async fn capability_register(
             return StatusCode::SERVICE_UNAVAILABLE;
         }
     }
-    capabilities.insert(
-        key,
-        PairwisePresenceEntry {
-            ip,
-            port: body.port,
-            expires_at: Instant::now() + ENTRY_TTL,
-            peer_pubkey,
-            pubkey,
-            epoch: body.epoch,
-            ts: body.ts,
-            sig,
-        },
-    );
+    let matching = capabilities.get(&key).is_some_and(|entry| {
+        entry.ip == ip
+            && entry.port == body.port
+            && entry.peer_pubkey == peer_pubkey
+            && entry.pubkey == pubkey
+            && entry.epoch == body.epoch
+    });
+    if !matching {
+        capabilities.insert(
+            key.clone(),
+            PairwisePresenceEntry {
+                ip,
+                port: body.port,
+                expires_at: Instant::now() + ENTRY_TTL,
+                peer_pubkey,
+                pubkey,
+                epoch: body.epoch,
+                legacy_proof: None,
+                v4_proof: None,
+            },
+        );
+    }
+    let entry = capabilities
+        .get_mut(&key)
+        .expect("matching or inserted capability remains while lock is held");
+    entry.expires_at = Instant::now() + ENTRY_TTL;
+    match version {
+        RendezvousVersion::LegacyV3 => entry.legacy_proof = Some((body.ts, sig)),
+        RendezvousVersion::IpBoundV4 => {
+            entry.v4_proof = Some((body.ts, sig));
+            if let Some(legacy_sig) = legacy_sig {
+                entry.legacy_proof = Some((body.ts, legacy_sig));
+            }
+        }
+    }
     StatusCode::OK
 }
 
-async fn capability_lookup(
+async fn capability_lookup_v3(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<CapabilityLookupRequest>,
+) -> Result<Json<CapabilityLookupResponse>, StatusCode> {
+    capability_lookup_impl(state, addr, headers, body, RendezvousVersion::LegacyV3).await
+}
+
+async fn capability_lookup_v4(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<CapabilityLookupRequest>,
+) -> Result<Json<CapabilityLookupResponse>, StatusCode> {
+    capability_lookup_impl(state, addr, headers, body, RendezvousVersion::IpBoundV4).await
+}
+
+async fn capability_lookup_impl(
+    state: AppState,
+    addr: SocketAddr,
+    headers: HeaderMap,
+    body: CapabilityLookupRequest,
+    version: RendezvousVersion,
 ) -> Result<Json<CapabilityLookupResponse>, StatusCode> {
     if !validate_hex_id(&body.capability)
         || !validate_hex_id(&body.requester_id)
@@ -2133,14 +2592,24 @@ async fn capability_lookup(
     if !requester_registered {
         return Err(StatusCode::FORBIDDEN);
     }
-    let signed = build_capability_lookup_msg(
-        &capability,
-        body.epoch,
-        &requester_raw,
-        &requester_pubkey,
-        &nonce,
-        body.ts,
-    );
+    let signed = match version {
+        RendezvousVersion::LegacyV3 => build_capability_lookup_v3_msg(
+            &capability,
+            body.epoch,
+            &requester_raw,
+            &requester_pubkey,
+            &nonce,
+            body.ts,
+        ),
+        RendezvousVersion::IpBoundV4 => build_capability_lookup_v4_msg(
+            &capability,
+            body.epoch,
+            &requester_raw,
+            &requester_pubkey,
+            &nonce,
+            body.ts,
+        ),
+    };
     if !ed25519_verify(&requester_pubkey, &signed, &sig) {
         return Err(StatusCode::FORBIDDEN);
     }
@@ -2154,6 +2623,21 @@ async fn capability_lookup(
             capability_allows_peer(entry, &requester_pubkey, body.epoch, Instant::now())
         })
         .ok_or(StatusCode::NOT_FOUND)?;
+    let (proof_version, proof) = match version {
+        RendezvousVersion::LegacyV3 => (
+            RendezvousVersion::LegacyV3,
+            entry.legacy_proof.ok_or(StatusCode::NOT_FOUND)?,
+        ),
+        RendezvousVersion::IpBoundV4 => entry
+            .v4_proof
+            .map(|proof| (RendezvousVersion::IpBoundV4, proof))
+            .or_else(|| {
+                entry
+                    .legacy_proof
+                    .map(|proof| (RendezvousVersion::LegacyV3, proof))
+            })
+            .ok_or(StatusCode::NOT_FOUND)?,
+    };
     Ok(Json(CapabilityLookupResponse {
         acknowledged: true,
         capability: body.capability.to_lowercase(),
@@ -2161,8 +2645,10 @@ async fn capability_lookup(
         ip: entry.ip.to_string(),
         port: entry.port,
         pubkey: hex::encode(entry.pubkey),
-        ts: entry.ts,
-        sig: hex::encode(entry.sig),
+        ts: proof.0,
+        sig: hex::encode(proof.1),
+        proof_version: (version == RendezvousVersion::IpBoundV4)
+            .then(|| proof_version.wire_value()),
     }))
 }
 
@@ -2228,6 +2714,10 @@ struct CapabilityPunchRequest {
     capability: String,
     epoch: i64,
     port: u16,
+    /// V4 initiator-claimed, signature-bound dial address. Legacy v3 omits it
+    /// and uses the server-observed address exactly as before.
+    #[serde(default)]
+    ip: Option<String>,
     nat_type: u8,
     ts: i64,
     nonce: String,
@@ -2262,10 +2752,24 @@ struct PunchResponse {
     nat_type: u8,
     capability: String,
     epoch: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proof_version: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    register_ts: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    register_nonce: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    register_sig: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    from_pubkey: Option<String>,
 }
 
 fn prune_expired_punches(punches: &mut HashMap<(String, String), PunchEntry>, now: Instant) {
     punches.retain(|_, entry| now.duration_since(entry.created_at) < PUNCH_TTL);
+}
+
+fn punch_available(entry: &PunchEntry, now: Instant) -> bool {
+    entry.leased_until.map_or(true, |until| until <= now)
 }
 
 async fn legacy_punch_gone() -> StatusCode {
@@ -2277,6 +2781,25 @@ async fn punch_register_v3(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<CapabilityPunchRequest>,
+) -> StatusCode {
+    punch_register_impl(state, addr, headers, body, RendezvousVersion::LegacyV3).await
+}
+
+async fn punch_register_v4(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<CapabilityPunchRequest>,
+) -> StatusCode {
+    punch_register_impl(state, addr, headers, body, RendezvousVersion::IpBoundV4).await
+}
+
+async fn punch_register_impl(
+    state: AppState,
+    addr: SocketAddr,
+    headers: HeaderMap,
+    body: CapabilityPunchRequest,
+    version: RendezvousVersion,
 ) -> StatusCode {
     if !validate_hex_id(&body.from_id)
         || !validate_hex_id(&body.target_id)
@@ -2295,20 +2818,51 @@ async fn punch_register_v3(
     ) else {
         return StatusCode::BAD_REQUEST;
     };
-    let client_ip = extract_client_ip(&headers, addr);
-    if !check_rate_limit_bucket(&state.punch_rate_limits, client_ip, MAX_PUNCH_PER_MINUTE).await {
+    // `extract_client_ip` returns a forwarded address only in the explicit
+    // trusted-Fly-proxy mode and only when the immediate hop is allowlisted.
+    // Canonicalizing mapped IPv4 makes the signed/body comparison independent
+    // of the listener/proxy's textual address family representation.
+    let observed_ip = canonical_ip(extract_client_ip(&headers, addr));
+    if !check_rate_limit_bucket(&state.punch_rate_limits, observed_ip, MAX_PUNCH_PER_MINUTE).await {
         return StatusCode::TOO_MANY_REQUESTS;
     }
-    let signed = build_punch_register_v3_msg(
-        &from_raw,
-        &target_raw,
-        &capability,
-        body.epoch,
-        body.port,
-        body.nat_type,
-        &nonce,
-        body.ts,
-    );
+    let dial_ip = match version {
+        RendezvousVersion::LegacyV3 => observed_ip,
+        RendezvousVersion::IpBoundV4 => {
+            let Some(claimed_ip) = body.ip.as_deref().and_then(parse_routable_ip) else {
+                return StatusCode::BAD_REQUEST;
+            };
+            if claimed_ip != observed_ip {
+                return StatusCode::FORBIDDEN;
+            }
+            // Persist only the server-observed (or explicitly trusted-proxy)
+            // address. Equality above ensures this is the signed address too.
+            observed_ip
+        }
+    };
+    let signed = match version {
+        RendezvousVersion::LegacyV3 => build_punch_register_v3_msg(
+            &from_raw,
+            &target_raw,
+            &capability,
+            body.epoch,
+            body.port,
+            body.nat_type,
+            &nonce,
+            body.ts,
+        ),
+        RendezvousVersion::IpBoundV4 => build_punch_register_v4_msg(
+            &from_raw,
+            &target_raw,
+            &capability,
+            body.epoch,
+            body.port,
+            &encode_signed_ip(dial_ip),
+            body.nat_type,
+            &nonce,
+            body.ts,
+        ),
+    };
     if let Err(status) = verify_signed_relay_identity(&state, &body.from_id, &signed, &sig).await {
         return status;
     }
@@ -2363,12 +2917,18 @@ async fn punch_register_v3(
         PunchEntry {
             punch_id: random_relay_secret_hex(),
             from_id: from,
-            from_ip: client_ip,
+            from_ip: dial_ip,
             from_port: body.port,
             nat_type: body.nat_type,
             capability,
             epoch: body.epoch,
             created_at: now,
+            leased_until: None,
+            proof_version: version,
+            register_nonce: (version == RendezvousVersion::IpBoundV4).then_some(nonce),
+            register_ts: (version == RendezvousVersion::IpBoundV4).then_some(body.ts),
+            register_sig: (version == RendezvousVersion::IpBoundV4).then_some(sig),
+            from_pubkey: (version == RendezvousVersion::IpBoundV4).then_some(from_pubkey),
         },
     );
     StatusCode::OK
@@ -2379,6 +2939,25 @@ async fn punch_poll_v3(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<CapabilityPunchPollRequest>,
+) -> Result<Json<PunchResponse>, StatusCode> {
+    punch_poll_impl(state, addr, headers, body, RendezvousVersion::LegacyV3).await
+}
+
+async fn punch_poll_v4(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<CapabilityPunchPollRequest>,
+) -> Result<Json<PunchResponse>, StatusCode> {
+    punch_poll_impl(state, addr, headers, body, RendezvousVersion::IpBoundV4).await
+}
+
+async fn punch_poll_impl(
+    state: AppState,
+    addr: SocketAddr,
+    headers: HeaderMap,
+    body: CapabilityPunchPollRequest,
+    version: RendezvousVersion,
 ) -> Result<Json<PunchResponse>, StatusCode> {
     if !validate_hex_id(&body.target_id) || !timestamp_fresh(body.ts) {
         return Err(StatusCode::BAD_REQUEST);
@@ -2394,25 +2973,57 @@ async fn punch_poll_v3(
     if !check_rate_limit(&state, client_ip).await {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
-    let signed = build_punch_poll_v3_msg(&target_raw, &nonce, body.ts);
+    let signed = match version {
+        RendezvousVersion::LegacyV3 => build_punch_poll_v3_msg(&target_raw, &nonce, body.ts),
+        RendezvousVersion::IpBoundV4 => build_punch_poll_v4_msg(&target_raw, &nonce, body.ts),
+    };
     verify_signed_relay_identity(&state, &body.target_id, &signed, &sig).await?;
     let target = body.target_id.to_lowercase();
+    let now = Instant::now();
     let mut punches = state.punch_requests.write().await;
-    prune_expired_punches(&mut punches, Instant::now());
-    let entry = punches
+    prune_expired_punches(&mut punches, now);
+    let key = punches
         .iter()
-        .filter(|((candidate, _), _)| candidate == &target)
+        .filter(|((candidate, _), entry)| candidate == &target && punch_available(entry, now))
         .min_by_key(|(_, entry)| entry.created_at)
-        .map(|(_, entry)| entry.clone())
+        .map(|(key, _)| key.clone())
+        .or_else(|| {
+            // Idempotent re-poll: if every entry is still leased to us, refresh
+            // the oldest lease rather than 404 mid-handshake.
+            punches
+                .iter()
+                .filter(|((candidate, _), _)| candidate == &target)
+                .min_by_key(|(_, entry)| entry.created_at)
+                .map(|(key, _)| key.clone())
+        })
         .ok_or(StatusCode::NOT_FOUND)?;
+    let entry = punches.get_mut(&key).ok_or(StatusCode::NOT_FOUND)?;
+    entry.leased_until = Some(now + PUNCH_LEASE);
     Ok(Json(PunchResponse {
-        punch_id: entry.punch_id,
-        from_id: entry.from_id,
+        punch_id: entry.punch_id.clone(),
+        from_id: entry.from_id.clone(),
         ip: entry.from_ip.to_string(),
         port: entry.from_port,
         nat_type: entry.nat_type,
         capability: hex::encode(entry.capability),
         epoch: entry.epoch,
+        proof_version: (version == RendezvousVersion::IpBoundV4)
+            .then(|| entry.proof_version.wire_value()),
+        register_ts: (version == RendezvousVersion::IpBoundV4)
+            .then_some(entry.register_ts)
+            .flatten(),
+        register_nonce: (version == RendezvousVersion::IpBoundV4)
+            .then_some(entry.register_nonce)
+            .flatten()
+            .map(hex::encode),
+        register_sig: (version == RendezvousVersion::IpBoundV4)
+            .then_some(entry.register_sig)
+            .flatten()
+            .map(hex::encode),
+        from_pubkey: (version == RendezvousVersion::IpBoundV4)
+            .then_some(entry.from_pubkey)
+            .flatten()
+            .map(hex::encode),
     }))
 }
 
@@ -2421,6 +3032,25 @@ async fn punch_ack_v3(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<CapabilityPunchAckRequest>,
+) -> StatusCode {
+    punch_ack_impl(state, addr, headers, body, RendezvousVersion::LegacyV3).await
+}
+
+async fn punch_ack_v4(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<CapabilityPunchAckRequest>,
+) -> StatusCode {
+    punch_ack_impl(state, addr, headers, body, RendezvousVersion::IpBoundV4).await
+}
+
+async fn punch_ack_impl(
+    state: AppState,
+    addr: SocketAddr,
+    headers: HeaderMap,
+    body: CapabilityPunchAckRequest,
+    version: RendezvousVersion,
 ) -> StatusCode {
     if !validate_hex_id(&body.target_id)
         || !validate_hex_id(&body.capability)
@@ -2442,14 +3072,24 @@ async fn punch_ack_v3(
     if !check_rate_limit(&state, client_ip).await {
         return StatusCode::TOO_MANY_REQUESTS;
     }
-    let signed = build_punch_ack_v3_msg(
-        &target_raw,
-        &capability,
-        body.epoch,
-        &punch_raw,
-        &nonce,
-        body.ts,
-    );
+    let signed = match version {
+        RendezvousVersion::LegacyV3 => build_punch_ack_v3_msg(
+            &target_raw,
+            &capability,
+            body.epoch,
+            &punch_raw,
+            &nonce,
+            body.ts,
+        ),
+        RendezvousVersion::IpBoundV4 => build_punch_ack_v4_msg(
+            &target_raw,
+            &capability,
+            body.epoch,
+            &punch_raw,
+            &nonce,
+            body.ts,
+        ),
+    };
     if let Err(status) = verify_signed_relay_identity(&state, &body.target_id, &signed, &sig).await
     {
         return status;
@@ -3264,6 +3904,10 @@ async fn sweep_expired(state: AppState) {
             limits.retain(|_, entry| now.duration_since(entry.window_start) < RATE_WINDOW * 2);
         }
         {
+            let mut limits = state.legacy_identity_rate_limits.write().await;
+            limits.retain(|_, entry| now.duration_since(entry.window_start) < RATE_WINDOW * 2);
+        }
+        {
             let mut limits = state.ticket_read_rate_limits.write().await;
             limits.retain(|_, entry| now.duration_since(entry.window_start) < RATE_WINDOW * 2);
         }
@@ -3375,6 +4019,7 @@ async fn main() {
         store: Arc::new(RwLock::new(HashMap::new())),
         capability_store: Arc::new(RwLock::new(HashMap::new())),
         rate_limits: Arc::new(RwLock::new(HashMap::new())),
+        legacy_identity_rate_limits: Arc::new(RwLock::new(HashMap::new())),
         ticket_read_rate_limits: Arc::new(RwLock::new(HashMap::new())),
         punch_rate_limits: Arc::new(RwLock::new(HashMap::new())),
         punch_requests: Arc::new(RwLock::new(HashMap::new())),
@@ -3401,9 +4046,13 @@ async fn main() {
         .route("/register", post(register))
         .route("/lookup/{id}", get(legacy_presence_lookup_gone))
         .route("/unregister", delete(unregister))
-        .route("/v3/identity/{id}", get(identity_lookup))
-        .route("/v3/presence/register", post(capability_register))
-        .route("/v3/presence/lookup", post(capability_lookup))
+        .route("/v3/identity/{id}", get(legacy_identity_lookup))
+        .route("/v3/presence/register", post(capability_register_v3))
+        .route("/v3/presence/lookup", post(capability_lookup_v3))
+        .route("/v4/protocol", get(protocol_v4))
+        .route("/v4/identity/lookup", post(identity_lookup_v4))
+        .route("/v4/presence/register", post(capability_register_v4))
+        .route("/v4/presence/lookup", post(capability_lookup_v4))
         .route("/punch", post(legacy_punch_gone))
         .route("/punch/{id}", get(legacy_punch_gone))
         .route("/v2/punch/register", post(legacy_punch_gone))
@@ -3412,6 +4061,9 @@ async fn main() {
         .route("/v3/punch/register", post(punch_register_v3))
         .route("/v3/punch/poll", post(punch_poll_v3))
         .route("/v3/punch/ack", post(punch_ack_v3))
+        .route("/v4/punch/register", post(punch_register_v4))
+        .route("/v4/punch/poll", post(punch_poll_v4))
+        .route("/v4/punch/ack", post(punch_ack_v4))
         .route("/v2/relay-tickets/offer", post(legacy_punch_gone))
         .route("/v2/relay-tickets/poll", post(legacy_punch_gone))
         .route("/v3/relay-tickets/poll", post(legacy_punch_gone))
@@ -3581,6 +4233,7 @@ mod relay_ticket_tests {
             store: Arc::new(RwLock::new(HashMap::new())),
             capability_store: Arc::new(RwLock::new(HashMap::new())),
             rate_limits: Arc::new(RwLock::new(HashMap::new())),
+            legacy_identity_rate_limits: Arc::new(RwLock::new(HashMap::new())),
             ticket_read_rate_limits: Arc::new(RwLock::new(HashMap::new())),
             punch_rate_limits: Arc::new(RwLock::new(HashMap::new())),
             punch_requests: Arc::new(RwLock::new(HashMap::new())),
@@ -3630,8 +4283,8 @@ mod relay_ticket_tests {
             peer_pubkey: authorized,
             pubkey: [0x22; 32],
             epoch: 7,
-            ts: now_unix_secs(),
-            sig: [0; 64],
+            legacy_proof: None,
+            v4_proof: Some((now_unix_secs(), [0; 64])),
         };
         assert!(capability_allows_peer(
             &entry,
@@ -3655,7 +4308,7 @@ mod relay_ticket_tests {
         let capability = [0xA7; 32];
         let epoch = now_unix_secs().div_euclid(15 * 60);
         let register_ts = now_unix_secs();
-        let register_message = build_capability_register_msg(
+        let legacy_register_message = build_capability_register_v3_msg(
             &capability,
             epoch,
             4662,
@@ -3664,7 +4317,16 @@ mod relay_ticket_tests {
             &alice_pubkey,
             register_ts,
         );
-        let register_status = capability_register(
+        let register_message = build_capability_register_v4_msg(
+            &capability,
+            epoch,
+            4662,
+            &encode_signed_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4))),
+            &bob_pubkey,
+            &alice_pubkey,
+            register_ts,
+        );
+        let register_status = capability_register_v4(
             State(state.clone()),
             ConnectInfo("8.8.8.8:1000".parse().unwrap()),
             HeaderMap::new(),
@@ -3677,6 +4339,7 @@ mod relay_ticket_tests {
                 peer_pubkey: hex::encode(alice_pubkey),
                 ts: register_ts,
                 sig: hex::encode(bob.sign(&register_message).to_bytes()),
+                legacy_sig: Some(hex::encode(bob.sign(&legacy_register_message).to_bytes())),
             }),
         )
         .await;
@@ -3685,7 +4348,7 @@ mod relay_ticket_tests {
         let nonce = [0x19; 16];
         let lookup_ts = now_unix_secs();
         let alice_raw = decode_hex_id(&alice_id).unwrap();
-        let lookup_message = build_capability_lookup_msg(
+        let lookup_message = build_capability_lookup_v4_msg(
             &capability,
             epoch,
             &alice_raw,
@@ -3693,14 +4356,14 @@ mod relay_ticket_tests {
             &nonce,
             lookup_ts,
         );
-        let response = capability_lookup(
-            State(state),
+        let response = capability_lookup_v4(
+            State(state.clone()),
             ConnectInfo("1.1.1.1:2000".parse().unwrap()),
             HeaderMap::new(),
             Json(CapabilityLookupRequest {
                 capability: hex::encode(capability),
                 epoch,
-                requester_id: alice_id,
+                requester_id: alice_id.clone(),
                 requester_pubkey: hex::encode(alice_pubkey),
                 nonce: hex::encode(nonce),
                 ts: lookup_ts,
@@ -3711,6 +4374,215 @@ mod relay_ticket_tests {
         .expect("authorized capability lookup");
         assert!(response.0.acknowledged);
         assert_eq!(response.0.ip, "8.8.4.4");
+        assert_eq!(response.0.proof_version, Some(4));
+
+        let legacy_nonce = [0x1A; 16];
+        let legacy_ts = now_unix_secs();
+        let legacy_lookup_message = build_capability_lookup_v3_msg(
+            &capability,
+            epoch,
+            &alice_raw,
+            &alice_pubkey,
+            &legacy_nonce,
+            legacy_ts,
+        );
+        let legacy_response = capability_lookup_v3(
+            State(state),
+            ConnectInfo("1.1.1.1:2002".parse().unwrap()),
+            HeaderMap::new(),
+            Json(CapabilityLookupRequest {
+                capability: hex::encode(capability),
+                epoch,
+                requester_id: alice_id,
+                requester_pubkey: hex::encode(alice_pubkey),
+                nonce: hex::encode(legacy_nonce),
+                ts: legacy_ts,
+                sig: hex::encode(alice.sign(&legacy_lookup_message).to_bytes()),
+            }),
+        )
+        .await
+        .expect("old client can verify the mirrored legacy proof");
+        assert_eq!(legacy_response.0.proof_version, None);
+    }
+
+    #[tokio::test]
+    async fn old_client_payloads_work_on_new_server_legacy_routes() {
+        let state = test_state();
+        let (alice, alice_id, alice_pubkey) = insert_test_identity(&state, 31).await;
+        let (bob, bob_id, bob_pubkey) = insert_test_identity(&state, 32).await;
+        let identity = legacy_identity_lookup(
+            State(state.clone()),
+            ConnectInfo("9.9.9.9:9000".parse().unwrap()),
+            HeaderMap::new(),
+            Path(bob_id),
+        )
+        .await
+        .expect("temporary legacy identity route supports old clients");
+        assert_eq!(identity.0.pubkey, hex::encode(bob_pubkey));
+        let capability = [0xB7; 32];
+        let epoch = now_unix_secs().div_euclid(15 * 60);
+        let register_ts = now_unix_secs();
+        let register_message = build_capability_register_v3_msg(
+            &capability,
+            epoch,
+            4662,
+            [8, 8, 4, 4],
+            &bob_pubkey,
+            &alice_pubkey,
+            register_ts,
+        );
+        let status = capability_register_v3(
+            State(state.clone()),
+            ConnectInfo("8.8.8.8:1000".parse().unwrap()),
+            HeaderMap::new(),
+            Json(CapabilityRegisterRequest {
+                capability: hex::encode(capability),
+                epoch,
+                port: 4662,
+                ip: "8.8.4.4".to_string(),
+                pubkey: hex::encode(bob_pubkey),
+                peer_pubkey: hex::encode(alice_pubkey),
+                ts: register_ts,
+                sig: hex::encode(bob.sign(&register_message).to_bytes()),
+                legacy_sig: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let nonce = [0x29; 16];
+        let lookup_ts = now_unix_secs();
+        let alice_raw = decode_hex_id(&alice_id).unwrap();
+        let lookup_message = build_capability_lookup_v3_msg(
+            &capability,
+            epoch,
+            &alice_raw,
+            &alice_pubkey,
+            &nonce,
+            lookup_ts,
+        );
+        let response = capability_lookup_v3(
+            State(state.clone()),
+            ConnectInfo("1.1.1.1:2000".parse().unwrap()),
+            HeaderMap::new(),
+            Json(CapabilityLookupRequest {
+                capability: hex::encode(capability),
+                epoch,
+                requester_id: alice_id.clone(),
+                requester_pubkey: hex::encode(alice_pubkey),
+                nonce: hex::encode(nonce),
+                ts: lookup_ts,
+                sig: hex::encode(alice.sign(&lookup_message).to_bytes()),
+            }),
+        )
+        .await
+        .expect("legacy lookup remains available during rollout");
+        assert_eq!(response.0.ip, "8.8.4.4");
+        assert_eq!(response.0.proof_version, None);
+
+        let v4_nonce = [0x2A; 16];
+        let v4_ts = now_unix_secs();
+        let v4_lookup_message = build_capability_lookup_v4_msg(
+            &capability,
+            epoch,
+            &alice_raw,
+            &alice_pubkey,
+            &v4_nonce,
+            v4_ts,
+        );
+        let v4_response = capability_lookup_v4(
+            State(state),
+            ConnectInfo("1.1.1.1:2001".parse().unwrap()),
+            HeaderMap::new(),
+            Json(CapabilityLookupRequest {
+                capability: hex::encode(capability),
+                epoch,
+                requester_id: alice_id,
+                requester_pubkey: hex::encode(alice_pubkey),
+                nonce: hex::encode(v4_nonce),
+                ts: v4_ts,
+                sig: hex::encode(alice.sign(&v4_lookup_message).to_bytes()),
+            }),
+        )
+        .await
+        .expect("new client can consume an explicitly legacy presence proof");
+        assert_eq!(v4_response.0.proof_version, Some(3));
+    }
+
+    #[test]
+    fn signed_payload_version_vectors_have_distinct_domains_and_opcodes() {
+        let legacy = build_capability_register_v3_msg(
+            &[1; 32],
+            7,
+            4662,
+            [8, 8, 4, 4],
+            &[2; 32],
+            &[3; 32],
+            9,
+        );
+        let v4 = build_capability_register_v4_msg(
+            &[1; 32],
+            7,
+            4662,
+            &[SIGNED_IP_V4, 8, 8, 4, 4],
+            &[2; 32],
+            &[3; 32],
+            9,
+        );
+        assert_eq!(&legacy[..RDV_DOMAIN.len()], RDV_DOMAIN);
+        assert_eq!(legacy[RDV_DOMAIN.len()], OP_CAPABILITY_REGISTER);
+        assert_eq!(&v4[..RDV_V4_DOMAIN.len()], RDV_V4_DOMAIN);
+        assert_eq!(v4[RDV_V4_DOMAIN.len()], OP_CAPABILITY_REGISTER_V4);
+        assert_eq!(legacy.len() + 1, v4.len());
+        assert_ne!(legacy, v4);
+    }
+
+    #[test]
+    fn v4_punch_registration_matches_desktop_transcript_vector() {
+        let transcript = build_punch_register_v4_msg(
+            &[0x11; 32],
+            &[0x22; 32],
+            &[0x33; 32],
+            0x0102_0304_0506_0708,
+            0x1234,
+            &[SIGNED_IP_V4, 8, 8, 4, 4],
+            5,
+            &[0x44; 16],
+            0x1112_1314_1516_1718,
+        );
+        assert_eq!(
+            hex::encode(transcript),
+            "656d6265722d7264762d76342311111111111111111111111111111111111111111111111111111111111111112222222222222222222222222222222222222222222222222222222222222222333333333333333333333333333333333333333333333333333333333333333308070605040302013412040808040405444444444444444444444444444444441817161514131211"
+        );
+    }
+
+    #[test]
+    fn legacy_punch_response_shape_omits_all_v4_proof_fields() {
+        let value = serde_json::to_value(PunchResponse {
+            punch_id: "11".repeat(32),
+            from_id: "22".repeat(32),
+            ip: "8.8.8.8".to_string(),
+            port: 4662,
+            nat_type: 1,
+            capability: "33".repeat(32),
+            epoch: 7,
+            proof_version: None,
+            register_ts: None,
+            register_nonce: None,
+            register_sig: None,
+            from_pubkey: None,
+        })
+        .unwrap();
+        let object = value.as_object().unwrap();
+        for field in [
+            "proof_version",
+            "register_ts",
+            "register_nonce",
+            "register_sig",
+            "from_pubkey",
+        ] {
+            assert!(!object.contains_key(field));
+        }
     }
 
     async fn insert_ticket(
@@ -3774,6 +4646,12 @@ mod relay_ticket_tests {
         assert_eq!(OP_PUNCH_REGISTER_V3, 0x10);
         assert_eq!(OP_PUNCH_POLL_V3, 0x11);
         assert_eq!(OP_PUNCH_ACK_V3, 0x12);
+        assert_eq!(OP_IDENTITY_LOOKUP_V4, 0x20);
+        assert_eq!(OP_CAPABILITY_REGISTER_V4, 0x21);
+        assert_eq!(OP_CAPABILITY_LOOKUP_V4, 0x22);
+        assert_eq!(OP_PUNCH_REGISTER_V4, 0x23);
+        assert_eq!(OP_PUNCH_POLL_V4, 0x24);
+        assert_eq!(OP_PUNCH_ACK_V4, 0x25);
     }
 
     #[test]
@@ -3823,6 +4701,164 @@ mod relay_ticket_tests {
         }
         assert!(!check_rate_limit(&state, ip).await);
         assert!(check_ticket_read_rate_limit(&state, ip).await);
+    }
+
+    #[tokio::test]
+    async fn legacy_identity_budget_is_isolated_from_rollout_traffic() {
+        let state = test_state();
+        let (_, target_id, target_pubkey) = insert_test_identity(&state, 44).await;
+        let addr: SocketAddr = "8.8.8.8:4000".parse().unwrap();
+        for _ in 0..MAX_REQUESTS_PER_MINUTE {
+            assert!(check_rate_limit(&state, addr.ip()).await);
+        }
+        assert!(!check_rate_limit(&state, addr.ip()).await);
+
+        // A legacy client with nine registered friends can arrive here after
+        // ten general mutations. Its independent identity budget must still
+        // permit the full bounded compatibility window.
+        for _ in 0..MAX_LEGACY_IDENTITY_LOOKUPS_PER_MINUTE {
+            let response = legacy_identity_lookup(
+                State(state.clone()),
+                ConnectInfo(addr),
+                HeaderMap::new(),
+                Path(target_id.clone()),
+            )
+            .await
+            .expect("legacy identity budget is independent");
+            assert_eq!(response.0.pubkey, hex::encode(target_pubkey));
+        }
+        let denied = legacy_identity_lookup(
+            State(state.clone()),
+            ConnectInfo(addr),
+            HeaderMap::new(),
+            Path(target_id),
+        )
+        .await;
+        assert!(matches!(denied, Err(StatusCode::TOO_MANY_REQUESTS)));
+        assert_eq!(
+            state
+                .rate_limits
+                .read()
+                .await
+                .get(&addr.ip())
+                .unwrap()
+                .count,
+            MAX_REQUESTS_PER_MINUTE + 1,
+            "legacy reads must not alter the general counter"
+        );
+    }
+
+    #[tokio::test]
+    async fn thirty_v4_rollout_registrations_charge_once_and_store_both_proofs() {
+        let state = test_state();
+        let (peer, _peer_id, peer_pubkey) = insert_test_identity(&state, 45).await;
+        let (owner, _owner_id, owner_pubkey) = insert_test_identity(&state, 46).await;
+        let epoch = now_unix_secs().div_euclid(15 * 60);
+        let ts = now_unix_secs();
+        let addr: SocketAddr = "8.8.8.8:5000".parse().unwrap();
+
+        for index in 0..30u32 {
+            let mut capability = [0xC3; 32];
+            capability[..4].copy_from_slice(&index.to_le_bytes());
+            let v4 = build_capability_register_v4_msg(
+                &capability,
+                epoch,
+                4662,
+                &encode_signed_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4))),
+                &owner_pubkey,
+                &peer_pubkey,
+                ts,
+            );
+            let legacy = build_capability_register_v3_msg(
+                &capability,
+                epoch,
+                4662,
+                [8, 8, 4, 4],
+                &owner_pubkey,
+                &peer_pubkey,
+                ts,
+            );
+            assert_eq!(
+                capability_register_v4(
+                    State(state.clone()),
+                    ConnectInfo(addr),
+                    HeaderMap::new(),
+                    Json(CapabilityRegisterRequest {
+                        capability: hex::encode(capability),
+                        epoch,
+                        port: 4662,
+                        ip: "8.8.4.4".to_string(),
+                        pubkey: hex::encode(owner_pubkey),
+                        peer_pubkey: hex::encode(peer_pubkey),
+                        ts,
+                        sig: hex::encode(owner.sign(&v4).to_bytes()),
+                        legacy_sig: Some(hex::encode(owner.sign(&legacy).to_bytes())),
+                    }),
+                )
+                .await,
+                StatusCode::OK
+            );
+            let capabilities = state.capability_store.read().await;
+            let stored = capabilities.get(&hex::encode(capability)).unwrap();
+            assert!(stored.v4_proof.is_some());
+            assert!(stored.legacy_proof.is_some());
+        }
+
+        assert_eq!(
+            state
+                .rate_limits
+                .read()
+                .await
+                .get(&addr.ip())
+                .unwrap()
+                .count,
+            30,
+            "bundled v4+v3 proofs are one logical admission each"
+        );
+
+        // A standalone old-client v3 registration still consumes one general
+        // admission; bundling does not create a free legacy route.
+        let capability = [0xD4; 32];
+        let legacy = build_capability_register_v3_msg(
+            &capability,
+            epoch,
+            4662,
+            [8, 8, 4, 4],
+            &owner_pubkey,
+            &peer_pubkey,
+            ts,
+        );
+        assert_eq!(
+            capability_register_v3(
+                State(state.clone()),
+                ConnectInfo(addr),
+                HeaderMap::new(),
+                Json(CapabilityRegisterRequest {
+                    capability: hex::encode(capability),
+                    epoch,
+                    port: 4662,
+                    ip: "8.8.4.4".to_string(),
+                    pubkey: hex::encode(owner_pubkey),
+                    peer_pubkey: hex::encode(peer_pubkey),
+                    ts,
+                    sig: hex::encode(owner.sign(&legacy).to_bytes()),
+                    legacy_sig: None,
+                }),
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            state
+                .rate_limits
+                .read()
+                .await
+                .get(&addr.ip())
+                .unwrap()
+                .count,
+            31
+        );
+        drop(peer);
     }
 
     #[test]
@@ -3979,6 +5015,123 @@ mod relay_ticket_tests {
     }
 
     #[test]
+    fn accepted_tickets_do_not_consume_mailbox_scan_budget() {
+        let responder_id = "aa".repeat(32);
+        let mut tickets = RelayTicketStore::default();
+        for index in 0..MAX_ACCEPTED_RELAY_TICKETS_PER_RESPONDER {
+            tickets.insert(
+                format!("{:064x}", index + 1),
+                ticket_with_parties(&format!("{index:064x}"), &responder_id, true),
+            );
+        }
+        // Lexicographically after the accepted initiator ids above.
+        tickets.insert(
+            format!("{:064x}", 200),
+            ticket_with_parties(&"f0".repeat(32), &responder_id, false),
+        );
+        let page = tickets.mailbox_page_ids(&responder_id, Instant::now());
+        assert_eq!(
+            page,
+            vec![format!("{:064x}", 200)],
+            "accepted pair slots must not hide live pending offers"
+        );
+        assert!(tickets.pending_by_responder.get(&responder_id).is_some());
+    }
+
+    #[test]
+    fn punch_lease_hides_entry_until_expiry() {
+        let now = Instant::now();
+        let entry = PunchEntry {
+            punch_id: "11".repeat(32),
+            from_id: "22".repeat(32),
+            from_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)),
+            from_port: 4662,
+            nat_type: 1,
+            capability: [3; 32],
+            epoch: 1,
+            created_at: now,
+            leased_until: Some(now + PUNCH_LEASE),
+            proof_version: RendezvousVersion::IpBoundV4,
+            register_nonce: Some([4; 16]),
+            register_ts: Some(1),
+            register_sig: Some([5; 64]),
+            from_pubkey: Some([6; 32]),
+        };
+        assert!(!punch_available(&entry, now));
+        assert!(punch_available(
+            &entry,
+            now + PUNCH_LEASE + Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn punch_lease_prefers_unleased_over_leased_head() {
+        let now = Instant::now();
+        let mut punches = HashMap::new();
+        punches.insert(
+            ("tt".repeat(32), "aa".repeat(32)),
+            PunchEntry {
+                punch_id: "11".repeat(32),
+                from_id: "aa".repeat(32),
+                from_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+                from_port: 1,
+                nat_type: 1,
+                capability: [1; 32],
+                epoch: 1,
+                created_at: now,
+                leased_until: Some(now + PUNCH_LEASE),
+                proof_version: RendezvousVersion::IpBoundV4,
+                register_nonce: Some([1; 16]),
+                register_ts: Some(1),
+                register_sig: Some([1; 64]),
+                from_pubkey: Some([1; 32]),
+            },
+        );
+        punches.insert(
+            ("tt".repeat(32), "bb".repeat(32)),
+            PunchEntry {
+                punch_id: "22".repeat(32),
+                from_id: "bb".repeat(32),
+                from_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)),
+                from_port: 2,
+                nat_type: 1,
+                capability: [2; 32],
+                epoch: 1,
+                created_at: now + Duration::from_millis(1),
+                leased_until: None,
+                proof_version: RendezvousVersion::IpBoundV4,
+                register_nonce: Some([2; 16]),
+                register_ts: Some(1),
+                register_sig: Some([2; 64]),
+                from_pubkey: Some([2; 32]),
+            },
+        );
+        let target = "tt".repeat(32);
+        let chosen = punches
+            .iter()
+            .filter(|((candidate, _), entry)| candidate == &target && punch_available(entry, now))
+            .min_by_key(|(_, entry)| entry.created_at)
+            .map(|(_, entry)| entry.punch_id.clone());
+        assert_eq!(chosen.as_deref(), Some(&*"22".repeat(32)));
+    }
+
+    #[test]
+    fn signed_ip_encoding_binds_v4_and_rejects_raw_mismatch() {
+        let ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+        let encoded = encode_signed_ip(ip);
+        assert_eq!(encoded[0], SIGNED_IP_V4);
+        assert_eq!(&encoded[1..], &[198, 51, 100, 7]);
+        assert_ne!(encoded, ip.to_string().into_bytes());
+    }
+
+    #[test]
+    fn parse_routable_ip_rejects_ipv6_fail_closed() {
+        assert!(parse_routable_ip("8.8.8.8").is_some());
+        assert!(parse_routable_ip("2001:db8::1").is_none());
+        assert!(parse_routable_ip("10.0.0.1").is_none());
+    }
+
+    #[test]
     fn ticket_capacity_counts_accepted_and_offered_tickets() {
         let initiator_id = "33".repeat(32);
         let mut tickets = RelayTicketStore::default();
@@ -4010,6 +5163,7 @@ mod relay_ticket_tests {
         prune_expired_relay_tickets(&mut tickets, Instant::now());
         assert!(tickets.tickets.is_empty());
         assert!(tickets.by_responder.is_empty());
+        assert!(tickets.pending_by_responder.is_empty());
         assert!(tickets.initiator_counts.is_empty());
         assert!(tickets.accepted_responder_counts.is_empty());
     }
@@ -4229,7 +5383,7 @@ mod relay_ticket_tests {
     }
 
     #[tokio::test]
-    async fn signed_v3_capability_punch_is_non_destructive_until_ack() {
+    async fn signed_v4_capability_punch_binds_observed_ip_and_round_trips_proof() {
         use ed25519_dalek::Signer;
 
         fn identity(seed: u8) -> (ed25519_dalek::SigningKey, String, [u8; 32]) {
@@ -4267,25 +5421,30 @@ mod relay_ticket_tests {
                 peer_pubkey: from_key.verifying_key().to_bytes(),
                 pubkey: target_key.verifying_key().to_bytes(),
                 epoch,
-                ts: now_unix_secs(),
-                sig: [0; 64],
+                legacy_proof: None,
+                v4_proof: Some((now_unix_secs(), [0; 64])),
             },
         );
         let addr: SocketAddr = "8.8.8.8:40000".parse().unwrap();
         let ts = now_unix_secs();
-        let nonce = [1u8; 16];
-        let register_message = build_punch_register_v3_msg(
+
+        // A correctly signed claim for a different public address is still
+        // forbidden. The observed address (including a trusted proxy header
+        // when explicitly configured) is the sole v4 dial address authority.
+        let mismatch_nonce = [0xF0; 16];
+        let mismatch_message = build_punch_register_v4_msg(
             &from_raw,
             &target_raw,
             &capability,
             epoch,
             5000,
+            &encode_signed_ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))),
             1,
-            &nonce,
+            &mismatch_nonce,
             ts,
         );
         assert_eq!(
-            punch_register_v3(
+            punch_register_v4(
                 State(state.clone()),
                 ConnectInfo(addr),
                 HeaderMap::new(),
@@ -4295,6 +5454,42 @@ mod relay_ticket_tests {
                     capability: hex::encode(capability),
                     epoch,
                     port: 5000,
+                    ip: Some("1.1.1.1".to_string()),
+                    nat_type: 1,
+                    ts,
+                    nonce: hex::encode(mismatch_nonce),
+                    sig: hex::encode(from_key.sign(&mismatch_message).to_bytes()),
+                }),
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        assert!(state.punch_requests.read().await.is_empty());
+
+        let nonce = [1u8; 16];
+        let register_message = build_punch_register_v4_msg(
+            &from_raw,
+            &target_raw,
+            &capability,
+            epoch,
+            5000,
+            &encode_signed_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+            1,
+            &nonce,
+            ts,
+        );
+        assert_eq!(
+            punch_register_v4(
+                State(state.clone()),
+                ConnectInfo(addr),
+                HeaderMap::new(),
+                Json(CapabilityPunchRequest {
+                    from_id: from_id.clone(),
+                    target_id: target_id.clone(),
+                    capability: hex::encode(capability),
+                    epoch,
+                    port: 5000,
+                    ip: Some("8.8.8.8".to_string()),
                     nat_type: 1,
                     ts,
                     nonce: hex::encode(nonce),
@@ -4308,8 +5503,8 @@ mod relay_ticket_tests {
         let mut punch_id = String::new();
         for poll_nonce in [[2u8; 16], [3u8; 16]] {
             let poll_ts = now_unix_secs();
-            let poll_message = build_punch_poll_v3_msg(&target_raw, &poll_nonce, poll_ts);
-            let response = punch_poll_v3(
+            let poll_message = build_punch_poll_v4_msg(&target_raw, &poll_nonce, poll_ts);
+            let response = punch_poll_v4(
                 State(state.clone()),
                 ConnectInfo(addr),
                 HeaderMap::new(),
@@ -4324,6 +5519,43 @@ mod relay_ticket_tests {
             .unwrap()
             .0;
             if punch_id.is_empty() {
+                assert_eq!(response.proof_version, Some(4));
+                assert_eq!(response.ip, addr.ip().to_string());
+                let proof_nonce = decode_hex_nonce(
+                    response
+                        .register_nonce
+                        .as_deref()
+                        .expect("v4 response carries register nonce"),
+                )
+                .unwrap();
+                let proof_sig = decode_hex_sig(
+                    response
+                        .register_sig
+                        .as_deref()
+                        .expect("v4 response carries register signature"),
+                )
+                .unwrap();
+                let proof_pubkey = decode_hex_pubkey(
+                    response
+                        .from_pubkey
+                        .as_deref()
+                        .expect("v4 response carries initiator key"),
+                )
+                .unwrap();
+                let proof_message = build_punch_register_v4_msg(
+                    &from_raw,
+                    &target_raw,
+                    &capability,
+                    response.epoch,
+                    response.port,
+                    &encode_signed_ip(response.ip.parse().unwrap()),
+                    response.nat_type,
+                    &proof_nonce,
+                    response
+                        .register_ts
+                        .expect("v4 response carries register time"),
+                );
+                assert!(ed25519_verify(&proof_pubkey, &proof_message, &proof_sig));
                 punch_id = response.punch_id;
             } else {
                 assert_eq!(response.punch_id, punch_id);
@@ -4333,7 +5565,7 @@ mod relay_ticket_tests {
         let punch_raw = decode_hex_id(&punch_id).unwrap();
         let ack_nonce = [4u8; 16];
         let ack_ts = now_unix_secs();
-        let ack_message = build_punch_ack_v3_msg(
+        let ack_message = build_punch_ack_v4_msg(
             &target_raw,
             &capability,
             epoch,
@@ -4342,7 +5574,7 @@ mod relay_ticket_tests {
             ack_ts,
         );
         assert_eq!(
-            punch_ack_v3(
+            punch_ack_v4(
                 State(state.clone()),
                 ConnectInfo(addr),
                 HeaderMap::new(),
@@ -4360,6 +5592,34 @@ mod relay_ticket_tests {
             StatusCode::OK
         );
         assert!(state.punch_requests.read().await.is_empty());
+    }
+
+    #[test]
+    fn canonical_ip_treats_ipv4_mapped_observation_as_ipv4() {
+        let mapped: IpAddr = "::ffff:8.8.8.8".parse().unwrap();
+        assert_eq!(canonical_ip(mapped), IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+    }
+
+    #[test]
+    fn forwarded_punch_observation_requires_explicit_trusted_proxy_hop() {
+        let mut headers = HeaderMap::new();
+        headers.insert("fly-client-ip", "8.8.8.8".parse().unwrap());
+        let trusted = ProxyConfig {
+            mode: ProxyMode::Fly,
+            trusted_hops: vec![TrustedProxyNet::parse("10.0.0.0/8").unwrap()],
+        };
+        let trusted_addr: SocketAddr = "10.1.2.3:443".parse().unwrap();
+        assert_eq!(
+            extract_client_ip_with_config(&trusted, &headers, trusted_addr),
+            "8.8.8.8".parse::<IpAddr>().unwrap()
+        );
+
+        let untrusted_addr: SocketAddr = "9.9.9.9:443".parse().unwrap();
+        assert_eq!(
+            extract_client_ip_with_config(&trusted, &headers, untrusted_addr),
+            untrusted_addr.ip(),
+            "a public client cannot self-assert Fly-Client-IP"
+        );
     }
 
     #[test]

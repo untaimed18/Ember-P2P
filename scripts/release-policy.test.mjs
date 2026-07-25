@@ -16,11 +16,15 @@ import test from "node:test";
 import { hardenManifest } from "./harden-update-manifest.mjs";
 import {
   verifyReleasePolicy,
+  verifySecurityEpoch,
   verifyVersions,
   verifyWorkflow,
 } from "./verify-release-policy.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const packageVersion = JSON.parse(
+  readFileSync(join(root, "package.json"), "utf8"),
+).version;
 const policyFiles = [
   "package.json",
   "package-lock.json",
@@ -28,6 +32,7 @@ const policyFiles = [
   "src-tauri/Cargo.toml",
   "src-tauri/Cargo.lock",
   ".github/workflows/release.yml",
+  "src-tauri/src/commands/updater.rs",
 ];
 
 function policyFixture() {
@@ -40,10 +45,57 @@ function policyFixture() {
   return fixture;
 }
 
+function writeManifestFixture(fixture, platformUrl) {
+  const artifactPath = join(fixture, "Ember_1.2.3_x64-setup.nsis.zip");
+  const artifact = Buffer.from("safe local updater fixture");
+  writeFileSync(artifactPath, artifact);
+  const manifestPath = join(fixture, "latest.json");
+  writeFileSync(
+    manifestPath,
+    `${JSON.stringify({
+      version: "1.2.3",
+      notes: "fixture",
+      pub_date: "2026-07-24T00:00:00Z",
+      platforms: {
+        "windows-x86_64-nsis": {
+          url: platformUrl,
+          signature: "signed-artifact-fixture",
+        },
+      },
+    })}\n`,
+  );
+  return { artifactPath, artifact, manifestPath };
+}
+
 test("repository release versions and workflow policy agree", () => {
-  const result = verifyReleasePolicy({ root, tag: "v1.2.3", requireTag: true });
-  assert.equal(result.version, "1.2.3");
+  const result = verifyReleasePolicy({
+    root,
+    tag: `v${packageVersion}`,
+    requireTag: true,
+  });
+  assert.equal(result.version, packageVersion);
+  assert.equal(result.securityEpoch, 1);
   assert.ok(result.actions > 0);
+});
+
+test("security epoch stays aligned between workflow and updater", () => {
+  assert.equal(verifySecurityEpoch({ root }), 1);
+
+  const fixture = policyFixture();
+  try {
+    const updaterPath = join(fixture, "src-tauri/src/commands/updater.rs");
+    const updater = readFileSync(updaterPath, "utf8").replace(
+      /const CURRENT_SECURITY_EPOCH:\s*u64\s*=\s*\d+\s*;/,
+      "const CURRENT_SECURITY_EPOCH: u64 = 9;",
+    );
+    writeFileSync(updaterPath, updater);
+    assert.throws(
+      () => verifySecurityEpoch({ root: fixture }),
+      /security epoch mismatch/,
+    );
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
 });
 
 test("version policy rejects stale package-lock root metadata", () => {
@@ -54,7 +106,12 @@ test("version policy rejects stale package-lock root metadata", () => {
     lock.packages[""].version = "0.0.1";
     writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
     assert.throws(
-      () => verifyVersions({ root: fixture, tag: "v1.2.3", requireTag: true }),
+      () =>
+        verifyVersions({
+          root: fixture,
+          tag: `v${packageVersion}`,
+          requireTag: true,
+        }),
       /package-lock\.json root package/,
     );
   } finally {
@@ -83,25 +140,11 @@ test("workflow policy rejects mutable action references", () => {
 test("manifest hardening binds target, size, hash, and security epoch", () => {
   const fixture = mkdtempSync(join(tmpdir(), "ember-update-manifest-"));
   try {
-    const artifactPath = join(fixture, "Ember_1.2.3_x64-setup.nsis.zip");
-    const artifact = Buffer.from("safe local updater fixture");
-    writeFileSync(artifactPath, artifact);
-    const manifestPath = join(fixture, "latest.json");
-    writeFileSync(
-      manifestPath,
-      `${JSON.stringify({
-        version: "1.2.3",
-        notes: "fixture",
-        pub_date: "2026-07-24T00:00:00Z",
-        platforms: {
-          "windows-x86_64-nsis": {
-            url: `https://example.invalid/${encodeURIComponent(
-              "Ember_1.2.3_x64-setup.nsis.zip",
-            )}`,
-            signature: "signed-artifact-fixture",
-          },
-        },
-      })}\n`,
+    const { artifactPath, artifact, manifestPath } = writeManifestFixture(
+      fixture,
+      `https://example.invalid/${encodeURIComponent(
+        "Ember_1.2.3_x64-setup.nsis.zip",
+      )}`,
     );
 
     const hardened = hardenManifest({
@@ -119,5 +162,32 @@ test("manifest hardening binds target, size, hash, and security epoch", () => {
     );
   } finally {
     rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test("manifest hardening rejects unsafe artifact URLs", () => {
+  for (const platformUrl of [
+    `http://example.invalid/${encodeURIComponent("Ember_1.2.3_x64-setup.nsis.zip")}`,
+    `https://user:pass@example.invalid/${encodeURIComponent("Ember_1.2.3_x64-setup.nsis.zip")}`,
+    `https://example.invalid/${encodeURIComponent("Ember_1.2.3_x64-setup.nsis.zip")}#frag`,
+  ]) {
+    const fixture = mkdtempSync(join(tmpdir(), "ember-update-manifest-unsafe-"));
+    try {
+      const { artifactPath, manifestPath } = writeManifestFixture(
+        fixture,
+        platformUrl,
+      );
+      assert.throws(
+        () =>
+          hardenManifest({
+            manifestPath,
+            artifactPaths: [artifactPath],
+            securityEpoch: 1,
+          }),
+        /unsafe artifact URL/,
+      );
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
   }
 });

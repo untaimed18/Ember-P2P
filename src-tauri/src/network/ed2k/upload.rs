@@ -228,14 +228,30 @@ impl EmberSessionHandle {
 
 pub type EmberSessionMap = Arc<RwLock<HashMap<[u8; 16], EmberSessionHandle>>>;
 
-fn friend_privileges_allowed(
-    secure_v2_authenticated: bool,
-    live_friend_member: bool,
-    owns_canonical_slot: bool,
-) -> bool {
-    secure_v2_authenticated && live_friend_member && owns_canonical_slot
+/// Friend chat/browse authorization on a live secure-v2 stream.
+///
+/// Deliberately **does not** require owning the canonical `ember_sessions`
+/// outbound-routing slot: simultaneous mutual dials leave one connection as
+/// the map winner and the other as a non-canonical inbound, and both must
+/// still accept chat/browse.  Slot ownership only controls which `tx` Send
+/// paths reuse for outbound packets.
+///
+/// Friend **upload-queue priority** uses [`live_secure_friend_member`] and is
+/// likewise restricted to secure-v2 sessions — stock eMule file sockets cannot
+/// be authenticated without restoring the retired legacy PoP signing oracle.
+fn friend_privileges_allowed(secure_v2_authenticated: bool, live_friend_member: bool) -> bool {
+    secure_v2_authenticated && live_friend_member
 }
 
+/// True when this peer may receive friend-slot upload priority / verified
+/// Ember scoring on **this** TCP session.
+///
+/// Requires secure friend-stream v2 on the session. Ordinary eMule download
+/// connections from a known friend hash intentionally return `false`: there is
+/// no cryptographically bound live proof on those sockets without re-enabling
+/// legacy PoP, and outbound file dials learn the peer Ember hash only after
+/// the TCP discriminator (too late for Noise IK). UI copy documents that
+/// priority applies only to authenticated Ember secure friend sessions.
 async fn live_secure_friend_member(
     friend_hashes: &Arc<RwLock<std::collections::HashSet<[u8; 16]>>>,
     peer_ember_hash: Option<[u8; 16]>,
@@ -248,6 +264,16 @@ async fn live_secure_friend_member(
         Some(hash) => friend_hashes.read().await.contains(&hash),
         None => false,
     }
+}
+
+/// Configured-server IPs may use reserved admission slots **only** for the
+/// short HighID port-test protocol.  Long-lived upload/friend sessions that
+/// entered via that reserve must be rejected once ordinary capacity is full.
+fn allow_long_lived_session_under_admission(
+    from_configured_server_ip: bool,
+    total_connections: usize,
+) -> bool {
+    !from_configured_server_ip || total_connections <= MAX_TOTAL_CONNECTIONS
 }
 
 /// Remove `hash`'s entry from `sessions` if present but stale (see
@@ -776,8 +802,10 @@ const MAX_CONNECTIONS_PER_IP: usize = 3;
 const MAX_QUEUE_ENTRIES_PER_IP: usize = 3;
 /// Maximum total concurrent TCP connections to the upload server
 const MAX_TOTAL_CONNECTIONS: usize = 100;
-/// Trusted configured-server port tests can still enter while ordinary
-/// pre-auth capacity is saturated.
+/// Extra accept slots reserved so the configured eD2K server can still complete
+/// its short HighID port-test while ordinary capacity is saturated.  Long-lived
+/// sessions from that IP that only fit because of this reserve are rejected in
+/// [`allow_long_lived_session_under_admission`].
 const RESERVED_PORT_TEST_CONNECTIONS: usize = 4;
 /// Maximum number of peers waiting in the upload queue
 const MAX_UPLOAD_QUEUE_SIZE: usize = 500;
@@ -1093,10 +1121,12 @@ fn queue_entry_from_hello(
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct ResolvedUploadFile {
     name: String,
     path: PathBuf,
+    opened: std::fs::File,
+    allowed_roots: Vec<String>,
     size: u64,
     aich_hash_hex: String,
     is_partial: bool,
@@ -1220,12 +1250,16 @@ pub enum UploadEventKind {
     /// Incoming Ember browse request from a friend.
     EmberBrowseRequest {
         ember_hash: [u8; 16],
+        session_id: u64,
+        reply_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+        supports_ebr1: bool,
     },
     /// Incoming Ember browse response from a friend (outbound session).
+    /// Each entry is `(ed2k_hash_hex, size, name, optional_aich_hash_hex)`.
     EmberBrowseResponse {
         ember_hash: [u8; 16],
         session_id: u64,
-        entries: Vec<(String, u64, String)>,
+        entries: Vec<(String, u64, String, Option<String>)>,
     },
     /// An on-demand browse dial established a new friend session. The network
     /// loop binds the opaque session ID to the queued request before sending
@@ -2873,8 +2907,13 @@ impl UploadHandler {
                 // pool so it never stalls a Tokio worker. Fail closed (reject) on a
                 // join error.
                 let path_for_check = path.clone();
-                let verified_path = tokio::task::spawn_blocking(move || {
-                    crate::security::filesystem::verify_existing_path(&path_for_check, &allowed)
+                let allowed_for_open = allowed.clone();
+                let (verified_path, opened) = tokio::task::spawn_blocking(move || {
+                    crate::security::filesystem::open_existing_approved(
+                        &path_for_check,
+                        &allowed_for_open,
+                        false,
+                    )
                 })
                 .await
                 .ok()
@@ -2882,6 +2921,8 @@ impl UploadHandler {
                 return Some(ResolvedUploadFile {
                     name: file.name,
                     path: verified_path,
+                    opened,
+                    allowed_roots: allowed,
                     size: file.size,
                     aich_hash_hex: file.aich_hash,
                     is_partial,
@@ -2913,8 +2954,13 @@ impl UploadHandler {
             return None;
         }
         let allowed = vec![self.download_folder.to_string_lossy().into_owned()];
-        let verified_part = tokio::task::spawn_blocking(move || {
-            crate::security::filesystem::verify_existing_path(&part_path, &allowed)
+        let allowed_for_open = allowed.clone();
+        let (verified_part, opened) = tokio::task::spawn_blocking(move || {
+            crate::security::filesystem::open_existing_approved(
+                &part_path,
+                &allowed_for_open,
+                false,
+            )
         })
         .await
         .ok()
@@ -2923,6 +2969,8 @@ impl UploadHandler {
         Some(ResolvedUploadFile {
             name: transfer.file_name,
             path: verified_part,
+            opened,
+            allowed_roots: allowed,
             size: transfer.total_size,
             aich_hash_hex: String::new(),
             is_partial: true,
@@ -4321,6 +4369,30 @@ impl UploadHandler {
             hello_caps.ember_pubkey = Some(peer.ed25519_public_key);
         }
 
+        // Reserved admission for the configured eD2K server IP exists only so
+        // the short HighID port-test can enter while ordinary capacity is full.
+        // Any long-lived session (this point is past the port-test early return)
+        // that only fit because of that reserve must be rejected.
+        {
+            let from_configured_server_ip = {
+                let server_addr = self.shared_server_addr.read().await;
+                server_addr
+                    .map(|a| a.ip() == peer_addr.ip())
+                    .unwrap_or(false)
+            };
+            let total = self
+                .total_connections
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if !allow_long_lived_session_under_admission(from_configured_server_ip, total) {
+                info!(
+                    "Rejecting long-lived connection from configured server IP {peer_addr}: \
+                     reserved capacity is only for the short HighID port-test protocol \
+                     (connections={total}, ordinary_max={MAX_TOTAL_CONNECTIONS})"
+                );
+                return Ok(());
+            }
+        }
+
         let peer_source_exchange_ver = hello_caps.source_exchange_ver.max(1);
         let peer_secure_ident_level = hello_caps.secure_ident_level;
         let peer_compression_ver = hello_caps.compression_ver;
@@ -4992,20 +5064,33 @@ impl UploadHandler {
             if let (Some(eh), Some(pk)) = (peer_ember_hash, hello_caps.ember_pubkey) {
                 // Register every authenticated v2 connection for immediate
                 // revocation, even when another connection already owns the
-                // canonical outbound-routing slot.
+                // canonical outbound-routing slot.  Chat/browse authorization
+                // on this socket does not require owns_ember_slot.
                 let handle = EmberSessionHandle::new_secure(outbound_tx.clone(), pk, eh);
                 ember_shutdown_rx = Some(handle.subscribe_shutdown());
                 ember_session_handle = Some(handle.clone());
 
                 if is_friend {
                     let mut sessions = self.ember_sessions.write().await;
-                    if let Some(stale) = sessions.get(&eh).filter(|existing| !existing.is_fresh()) {
-                        stale.close();
-                        sessions.remove(&eh);
-                    }
-                    if !sessions.contains_key(&eh) {
-                        sessions.insert(eh, handle);
-                        owns_ember_slot = true;
+                    match sessions.get(&eh) {
+                        Some(existing)
+                            if existing.is_fresh()
+                                && existing.is_secure_v2()
+                                && existing.peer_ember_pubkey() == pk =>
+                        {
+                            // Keep the existing canonical outbound router;
+                            // this inbound remains authorized for chat/browse.
+                            owns_ember_slot = false;
+                        }
+                        Some(stale_or_mismatched) => {
+                            stale_or_mismatched.close();
+                            sessions.insert(eh, handle);
+                            owns_ember_slot = true;
+                        }
+                        None => {
+                            sessions.insert(eh, handle);
+                            owns_ember_slot = true;
+                        }
                     }
                     drop(sessions);
 
@@ -5285,9 +5370,24 @@ impl UploadHandler {
                         if !owns_ember_slot {
                             if let Some(handle) = ember_session_handle.as_ref().cloned() {
                                 let mut sessions = self.ember_sessions.write().await;
-                                if !sessions.contains_key(&eh) {
-                                    sessions.insert(eh, handle);
-                                    owns_ember_slot = true;
+                                match sessions.get(&eh) {
+                                    Some(existing)
+                                        if existing.is_fresh()
+                                            && existing.is_secure_v2()
+                                            && existing.peer_ember_pubkey()
+                                                == handle.peer_ember_pubkey() =>
+                                    {
+                                        owns_ember_slot = false;
+                                    }
+                                    Some(other) => {
+                                        other.close();
+                                        sessions.insert(eh, handle);
+                                        owns_ember_slot = true;
+                                    }
+                                    None => {
+                                        sessions.insert(eh, handle);
+                                        owns_ember_slot = true;
+                                    }
                                 }
                             }
                         }
@@ -6935,6 +7035,8 @@ impl UploadHandler {
                         }
                     };
                     let file_path = resolved.path;
+                    let resolved_allowed_roots = resolved.allowed_roots;
+                    let mut resolved_opened = Some(resolved.opened);
 
                     // Refresh-or-reuse the cached `PartTracker` for the
                     // current file. Rebuilt after PART_TRACKER_REFRESH so
@@ -6943,9 +7045,7 @@ impl UploadHandler {
                     // a bounded delay. Outside of that window we reuse the
                     // parsed tracker across batches and blocks — the old
                     // code re-read `.part.met` on every OP_REQUESTPARTS.
-                    let is_partial_serve =
-                        file_path.extension().map(|e| e == "part").unwrap_or(false)
-                        && total_size > 0;
+                    let is_partial_serve = resolved.is_partial && total_size > 0;
                     if !is_partial_serve {
                         cached_part_tracker = None;
                     } else {
@@ -7006,12 +7106,13 @@ impl UploadHandler {
                     // download's rename) unchanged.
                     if is_partial_serve {
                         cached_serve_file = None;
-                    } else if cached_serve_file
-                        .as_ref()
-                        .map(|(p, _)| p != &file_path)
-                        .unwrap_or(false)
-                    {
-                        cached_serve_file = None;
+                    } else {
+                        // Every request batch receives a newly policy-validated
+                        // handle. Replace any older cached handle so a pathname
+                        // replacement cannot keep an obsolete object serving
+                        // after the next authorization check.
+                        cached_serve_file =
+                            resolved_opened.take().map(|file| (file_path.clone(), file));
                     }
 
                     // Batch credit and slot-rate accumulators. The old code
@@ -7134,18 +7235,27 @@ impl UploadHandler {
                         // session instead of `File::open` per block — saves
                         // one open + one close syscall + one FD cycle per
                         // ~180 KiB on the hot path.
-                        let taken_file = cached_serve_file.take().map(|(_, f)| f);
+                        let taken_file = if is_partial_serve {
+                            resolved_opened.take()
+                        } else {
+                            cached_serve_file.take().map(|(_, f)| f)
+                        };
                         let fp_for_task = file_path.clone();
+                        let allowed_for_task = resolved_allowed_roots.clone();
                         let read_result = tokio::task::spawn_blocking(
                             move || -> anyhow::Result<(std::fs::File, Vec<u8>)> {
-                                let mut f = match taken_file {
+                                let f = match taken_file {
                                     Some(f) => f,
-                                    None => std::fs::File::open(&fp_for_task)?,
+                                    None => {
+                                        crate::security::filesystem::open_existing_approved(
+                                            &fp_for_task,
+                                            &allowed_for_task,
+                                            false,
+                                        )?
+                                        .1
+                                    }
                                 };
-                                f.seek(SeekFrom::Start(start))?;
-                                let mut buf = vec![0u8; len];
-                                f.read_exact(&mut buf)?;
-                                Ok((f, buf))
+                                read_upload_block(f, start, len)
                             },
                         )
                         .await?;
@@ -8040,8 +8150,10 @@ impl UploadHandler {
                     req_hash.copy_from_slice(&payload[..16]);
                     if let Some(file) = self.resolve_upload_file(&req_hash).await {
                         let path = file.path.clone();
+                        let file_name = file.name.clone();
                         let file_size = file.size;
                         let is_partial = file.is_partial;
+                        let mut opened = file.opened;
                         let hashset_result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Vec<[u8; 16]>>> {
                             if is_partial && file_size > 0 {
                                 let tracker = super::part_tracker::PartTracker::new(file_size, &path);
@@ -8052,7 +8164,7 @@ impl UploadHandler {
                                 }
                                 return Ok(None);
                             }
-                            Ok(Some(compute_part_hashes(&path)?))
+                            Ok(Some(compute_part_hashes(&mut opened)?))
                         })
                         .await?;
 
@@ -8063,7 +8175,7 @@ impl UploadHandler {
                                 else {
                                     warn!(
                                         "Refusing legacy HashSet for {}: {} hashes exceed u16 wire count",
-                                        file.name,
+                                        file_name,
                                         hashes.len()
                                     );
                                     continue;
@@ -8110,12 +8222,15 @@ impl UploadHandler {
                             let request_aich = (options & 0x02) != 0;
                             if request_md4 || request_aich {
                                 let path = file.path.clone();
+                                let file_name = file.name.clone();
+                                let file_size = file.size;
                                 let aich_root = local_ident.aich_hash;
                                 let is_partial = file.is_partial;
+                                let mut opened = file.opened;
                                 let (md4_hashes, aich_hashes) = tokio::task::spawn_blocking(move || {
                                     let md4 = if request_md4 {
                                         if is_partial {
-                                            let tracker = super::part_tracker::PartTracker::new(file.size, &path);
+                                            let tracker = super::part_tracker::PartTracker::new(file_size, &path);
                                             let cached = tracker.part_hashes();
                                             if cached.is_empty() {
                                                 None
@@ -8123,7 +8238,7 @@ impl UploadHandler {
                                                 Some(cached.to_vec())
                                             }
                                         } else {
-                                            Some(compute_part_hashes(&path)?)
+                                            Some(compute_part_hashes(&mut opened)?)
                                         }
                                     } else {
                                         None
@@ -8132,7 +8247,7 @@ impl UploadHandler {
                                         if is_partial {
                                             None
                                         } else {
-                                            Some(compute_aich_part_hashes(&path)?)
+                                            Some(compute_aich_part_hashes(&mut opened)?)
                                         }
                                     } else {
                                         None
@@ -8156,7 +8271,7 @@ impl UploadHandler {
                                 ) else {
                                     warn!(
                                         "Refusing HashSet2 for {}: a requested hash section exceeds u16 wire count",
-                                        file.name
+                                        file_name
                                     );
                                     continue;
                                 };
@@ -8980,90 +9095,63 @@ impl UploadHandler {
                     debug!("Ignoring retired Ember v1 auth response from {peer_addr}");
                 }
 
-                // The four privilege-bearing Ember friend opcodes below
-                // (CHAT, BROWSE_REQ, BROWSE_RES, KEEPALIVE) are gated on
-                // the composite `is_verified_ember_friend` flag: the
-                // peer must claim our friend's hash (`is_ember_friend`)
-                // AND have completed the Ed25519 proof-of-possession on
-                // THIS TCP session (`ember_auth_state.is_verified()`).
+                // Privilege-bearing Ember friend opcodes (CHAT, BROWSE_*) are
+                // gated on secure-v2 + live friend membership only.  Owning
+                // the canonical ember_sessions outbound slot is intentionally
+                // *not* required: simultaneous mutual dials leave one TCP
+                // connection as the map winner and the peer's messages arrive
+                // on the non-canonical inbound, which must still process them.
                 //
-                // Without the PoP clause a peer who has learned our
-                // friend's `ember_hash` on the wire (KAD publishes,
-                // EPX exchanges, public trackers, etc.) could ride the
-                // friend's identity on any upload session: inject chat
-                // that shows up in our Friends UI as from the friend,
-                // trigger browse events, silently hold the friend's
-                // ember slot via keepalives. Requiring fresh-nonce
-                // signature verification per session closes that
-                // window — a spoofer cannot produce a valid signature
-                // for a random nonce we issued here without also
-                // holding the friend's Ed25519 secret key.
-                //
-                // Check is re-evaluated per packet (not snapshotted at
-                // session open) because `ember_auth_state` advances
-                // asynchronously as the peer responds to our CHALLENGE
-                // — it's typically `NotStarted` when chat/browse
-                // requests first arrive and only flips to `Verified`
-                // a packet or two later.
-                // `owns_ember_slot` is required (not just `is_ember_friend
-                // && verified`) on every arm below that emits a
-                // user-facing `UploadEvent`. Two inbound TCP connections
-                // from the same friend can both complete the handshake +
-                // PoP concurrently — only one wins the `ember_sessions`
-                // slot claim in the `OP_EMBER_AUTH_RESPONSE` arm above,
-                // but without this guard the *losing* connection's reader
-                // loop kept processing chat/browse packets and emitting
-                // them to the UI/DB exactly as if it were the canonical
-                // session. If the peer's own session bookkeeping ever
-                // sends the same logical message down both of its
-                // connections (retry, redial-before-teardown, etc.) that
-                // showed up as a duplicated chat message or a spurious
-                // extra browse round trip. The losing connection now
-                // silently drops these opcodes (falling through to the
-                // `_` arm below) instead — it remains fully alive for
-                // ordinary eD2K file-serving, which is unrelated to
-                // friend-session ownership and must not be torn down.
+                // `owns_ember_slot` remains meaningful for outbound routing
+                // (which `tx` SendChatMessage / BrowseFriend reuse) and for
+                // avoiding duplicate map insertions — not for decrypt/auth.
                 (OP_EMULEPROT, OP_EMBER_CHAT_MSG)
-                    if friend_privileges_allowed(
-                        secure_v2_authenticated,
-                        is_ember_friend,
-                        owns_ember_slot,
-                    ) =>
+                    if friend_privileges_allowed(secure_v2_authenticated, is_ember_friend) =>
                 {
                     if let Some(eh) = peer_ember_hash {
                         if !self.friend_hashes.read().await.contains(&eh) {
                             debug!("Ignoring chat from removed friend {}", hex::encode(eh));
-                        } else if payload.len() <= crate::network::ember::crypto::MAX_CHAT_WIRE_LEN {
-                            // `hello_caps.ember_pubkey` is guaranteed
-                            // `Some` here: `ember_auth_state.is_verified()`
-                            // requires it for PoP.
-                            if let Some(pk) = hello_caps.ember_pubkey {
-                                if let Some(msg) = crate::network::ember::crypto::decrypt_chat_payload(
-                                    &self.ed25519_secret_key,
-                                    &pk,
-                                    &payload,
-                                ) {
-                                    let _ = self.upload_event_tx.send(UploadEvent {
+                        } else if payload.len() > crate::network::ember::crypto::MAX_CHAT_WIRE_LEN {
+                            // No ciphertext in logs.  A dedicated UploadEvent +
+                            // UI toast requires a network/mod.rs match arm.
+                            warn!(
+                                "Friend {} chat payload oversized ({} bytes); dropping",
+                                hex::encode(eh),
+                                payload.len()
+                            );
+                        } else if let Some(pk) = hello_caps.ember_pubkey {
+                            if let Some(msg) = crate::network::ember::crypto::decrypt_chat_payload(
+                                &self.ed25519_secret_key,
+                                &pk,
+                                &payload,
+                            ) {
+                                let _ = self
+                                    .upload_event_tx
+                                    .send(UploadEvent {
                                         transfer_id: String::new(),
                                         kind: UploadEventKind::EmberChatMessage {
                                             ember_hash: eh,
                                             message: msg,
                                         },
-                                    }).await;
-                                }
+                                    })
+                                    .await;
+                            } else {
+                                warn!(
+                                    "Friend {} chat decrypt failed (len={}); dropping ciphertext",
+                                    hex::encode(eh),
+                                    payload.len()
+                                );
                             }
                         }
                     }
                 }
 
                 (OP_EMULEPROT, OP_EMBER_BROWSE_REQ)
-                    if friend_privileges_allowed(
-                        secure_v2_authenticated,
-                        is_ember_friend,
-                        owns_ember_slot,
-                    ) =>
+                    if friend_privileges_allowed(secure_v2_authenticated, is_ember_friend) =>
                 {
-                    if let Some(eh) = peer_ember_hash {
+                    if let (Some(eh), Some(session)) =
+                        (peer_ember_hash, ember_session_handle.as_ref())
+                    {
                         if !self.friend_hashes.read().await.contains(&eh) {
                             debug!("Ignoring browse request from removed friend {}", hex::encode(eh));
                         } else {
@@ -9071,6 +9159,10 @@ impl UploadHandler {
                                 transfer_id: String::new(),
                                 kind: UploadEventKind::EmberBrowseRequest {
                                     ember_hash: eh,
+                                    session_id: session.session_id(),
+                                    reply_tx: outbound_tx.clone(),
+                                    supports_ebr1:
+                                        super::multi_source::browse_request_supports_v1(&payload),
                                 },
                             }).await;
                         }
@@ -9078,11 +9170,7 @@ impl UploadHandler {
                 }
 
                 (OP_EMULEPROT, OP_EMBER_BROWSE_RES)
-                    if friend_privileges_allowed(
-                        secure_v2_authenticated,
-                        is_ember_friend,
-                        owns_ember_slot,
-                    ) =>
+                    if friend_privileges_allowed(secure_v2_authenticated, is_ember_friend) =>
                 {
                     if let (Some(eh), Some(session)) = (peer_ember_hash, ember_session_handle.as_ref()) {
                         if !self.friend_hashes.read().await.contains(&eh) {
@@ -9380,9 +9468,20 @@ fn encode_hashset2_response(
     Some(response)
 }
 
-fn compute_aich_part_hashes(path: &std::path::Path) -> anyhow::Result<Vec<[u8; 20]>> {
-    let hs = crate::network::ed2k::aich::AICHRecoveryHashSet::build_from_file(path)?;
+fn compute_aich_part_hashes(file: &mut std::fs::File) -> anyhow::Result<Vec<[u8; 20]>> {
+    let hs = crate::network::ed2k::aich::AICHRecoveryHashSet::build_from_open_file(file)?;
     Ok(hs.part_hashes())
+}
+
+fn read_upload_block(
+    mut file: std::fs::File,
+    start: u64,
+    len: usize,
+) -> anyhow::Result<(std::fs::File, Vec<u8>)> {
+    file.seek(SeekFrom::Start(start))?;
+    let mut buf = vec![0u8; len];
+    file.read_exact(&mut buf)?;
+    Ok((file, buf))
 }
 
 fn parse_request_parts_32(payload: &[u8]) -> anyhow::Result<Vec<(u64, u64)>> {
@@ -9407,11 +9506,11 @@ fn parse_request_parts_32(payload: &[u8]) -> anyhow::Result<Vec<(u64, u64)>> {
     Ok(offsets)
 }
 
-fn compute_part_hashes(path: &std::path::Path) -> anyhow::Result<Vec<[u8; 16]>> {
+fn compute_part_hashes(file: &mut std::fs::File) -> anyhow::Result<Vec<[u8; 16]>> {
     use digest::Digest;
     use md4::Md4;
 
-    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(0))?;
     let file_size = file.metadata()?.len();
     let num_parts = ((file_size + PARTSIZE - 1) / PARTSIZE) as usize;
 
@@ -10449,11 +10548,38 @@ mod ember_session_handle_tests {
         // PoP transcript, neither supplies the v2-authenticated bit consumed
         // by authorization.
         assert!(!crate::network::ed2k::LEGACY_FRIEND_AUTH_ENABLED);
-        assert!(!friend_privileges_allowed(false, true, true));
-        assert!(!friend_privileges_allowed(false, true, true));
-        assert!(!friend_privileges_allowed(true, false, true));
-        assert!(!friend_privileges_allowed(true, true, false));
-        assert!(friend_privileges_allowed(true, true, true));
+        assert!(!friend_privileges_allowed(false, true));
+        assert!(!friend_privileges_allowed(true, false));
+        // Canonical outbound-slot ownership is not part of chat/browse auth.
+        assert!(friend_privileges_allowed(true, true));
+    }
+
+    #[test]
+    fn friend_priority_requires_secure_v2_not_hash_claim_alone() {
+        // Document the intentional architecture: stock eMule file sockets
+        // never set secure_v2_authenticated, so live_secure_friend_member
+        // (and thus friend-slot priority) stays false without restoring
+        // legacy PoP.
+        assert!(
+            !friend_privileges_allowed(false, true),
+            "hash membership without secure-v2 must not authorize friend privileges"
+        );
+    }
+
+    #[test]
+    fn reserved_port_test_admission_rejects_long_lived_over_capacity() {
+        assert!(allow_long_lived_session_under_admission(
+            false,
+            MAX_TOTAL_CONNECTIONS + RESERVED_PORT_TEST_CONNECTIONS
+        ));
+        assert!(allow_long_lived_session_under_admission(
+            true,
+            MAX_TOTAL_CONNECTIONS
+        ));
+        assert!(!allow_long_lived_session_under_admission(
+            true,
+            MAX_TOTAL_CONNECTIONS + 1
+        ));
     }
 
     #[tokio::test]
@@ -10504,5 +10630,44 @@ mod ember_session_handle_tests {
         assert_eq!(protocol, OP_EMULEPROT);
         assert_eq!(opcode, OP_PORTTEST);
         assert_eq!(payload, [0x12]);
+    }
+
+    #[test]
+    fn upload_read_uses_pinned_handle_after_name_replacement() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-upload-pinned-read-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let root = base.join("root");
+        let data = base.join("data");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let shared = root.join("shared.bin");
+        let moved = root.join("shared-original.bin");
+        std::fs::write(&shared, b"verified").unwrap();
+        let root_string = root.to_string_lossy().into_owned();
+        crate::security::filesystem::initialize_approved_roots(
+            &data,
+            std::slice::from_ref(&root_string),
+        )
+        .unwrap();
+        let (_, opened) = crate::security::filesystem::open_existing_approved(
+            &shared,
+            std::slice::from_ref(&root_string),
+            false,
+        )
+        .unwrap();
+        std::fs::rename(&shared, &moved).unwrap();
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&base.join("private.bin"), &shared).unwrap();
+        #[cfg(not(unix))]
+        std::fs::write(&shared, b"attacker").unwrap();
+
+        let (_, bytes) = read_upload_block(opened, 0, 8).unwrap();
+        assert_eq!(bytes, b"verified");
+        let _ = std::fs::remove_dir_all(base);
     }
 }

@@ -85,6 +85,7 @@ pub fn recover_archive(
     file_name: &str,
     filled_ranges: &[(u64, u64)],
     output_dir: &Path,
+    allowed_roots: &[String],
     control: Option<&TransferControl>,
 ) -> anyhow::Result<PathBuf> {
     if filled_ranges.is_empty() {
@@ -124,9 +125,10 @@ pub fn recover_archive(
     if previous_end > input_size {
         anyhow::bail!("verified recovery range exceeds input size");
     }
-    crate::security::filesystem::ensure_not_reparse(output_dir)?;
-    let output_dir_identity = crate::security::filesystem::object_identity(output_dir)?;
-    let input_identity = crate::security::filesystem::object_identity(part_path)?;
+    let verified_output_dir =
+        crate::security::filesystem::verify_existing_path(output_dir, allowed_roots)?;
+    crate::security::filesystem::ensure_not_reparse(&verified_output_dir)?;
+    let output_dir_identity = crate::security::filesystem::object_identity(&verified_output_dir)?;
     let mut output = None;
     for _ in 0..32 {
         let output_name = format!(
@@ -134,9 +136,17 @@ pub fn recover_archive(
             uuid::Uuid::new_v4().simple(),
             safe_ext
         );
-        let output_path = output_dir.join(output_name);
-        match crate::security::filesystem::create_new_nofollow(&output_path) {
-            Ok(file) => {
+        if crate::security::filesystem::object_identity(&verified_output_dir)?
+            != output_dir_identity
+        {
+            anyhow::bail!("archive recovery output directory changed identity");
+        }
+        match crate::security::filesystem::create_new_in_approved_parent(
+            &verified_output_dir,
+            std::ffi::OsStr::new(&output_name),
+            allowed_roots,
+        ) {
+            Ok((output_path, file)) => {
                 output = Some((output_path, file));
                 break;
             }
@@ -146,13 +156,15 @@ pub fn recover_archive(
     }
     let (output_path, mut output_file) =
         output.ok_or_else(|| anyhow::anyhow!("could not allocate exclusive recovery output"))?;
-    if let Err(error) = crate::security::restrict_file_permissions_checked(&output_path) {
+    if let Err(error) = crate::security::restrict_open_file_permissions_checked(&output_file, false)
+    {
         drop(output_file);
-        let _ = std::fs::remove_file(&output_path);
+        let _ = crate::security::filesystem::remove_approved_file(&output_path, allowed_roots);
         return Err(error.into());
     }
 
-    let mut input = std::fs::File::open(part_path)?;
+    let (_, mut input) =
+        crate::security::filesystem::open_existing_approved(part_path, allowed_roots, false)?;
     let mut budget = RecoveryBudget::new();
     budget.check(control)?;
 
@@ -193,22 +205,22 @@ pub fn recover_archive(
         Ok(result) => result,
         Err(error) => {
             drop(output_file);
-            let _ = std::fs::remove_file(&output_path);
+            let _ = crate::security::filesystem::remove_approved_file(&output_path, allowed_roots);
             return Err(error);
         }
     };
 
     if result > 0 {
-        if crate::security::filesystem::object_identity(output_dir)? != output_dir_identity
-            || crate::security::filesystem::object_identity(part_path)? != input_identity
+        if crate::security::filesystem::object_identity(&verified_output_dir)?
+            != output_dir_identity
         {
             drop(output_file);
-            let _ = std::fs::remove_file(&output_path);
+            let _ = crate::security::filesystem::remove_approved_file(&output_path, allowed_roots);
             anyhow::bail!("archive recovery input/output root changed during recovery");
         }
         if let Err(error) = output_file.sync_all() {
             drop(output_file);
-            let _ = std::fs::remove_file(&output_path);
+            let _ = crate::security::filesystem::remove_approved_file(&output_path, allowed_roots);
             return Err(error.into());
         }
         info!(
@@ -221,7 +233,7 @@ pub fn recover_archive(
         Ok(output_path)
     } else {
         drop(output_file);
-        let _ = std::fs::remove_file(&output_path);
+        let _ = crate::security::filesystem::remove_approved_file(&output_path, allowed_roots);
         anyhow::bail!("no valid archive entries found in downloaded data");
     }
 }
@@ -1108,21 +1120,42 @@ mod tests {
         bytes
     }
 
-    #[test]
-    fn manual_zip_recovery_accepts_only_verified_range() {
+    fn approved_recovery_dir(label: &str) -> (std::path::PathBuf, Vec<String>, std::path::PathBuf) {
         let base = std::env::temp_dir().join(format!(
-            "ember-archive-test-{}-{}",
+            "ember-archive-{label}-{}-{}",
             std::process::id(),
             rand::random::<u64>()
         ));
-        std::fs::create_dir_all(&base).unwrap();
-        let part = base.join("input.part");
+        let root = base.join("root");
+        let data = base.join("data");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let root_s = root.to_string_lossy().into_owned();
+        crate::security::filesystem::initialize_approved_roots(
+            &data,
+            std::slice::from_ref(&root_s),
+        )
+        .unwrap();
+        (root, vec![root_s], base)
+    }
+
+    #[test]
+    fn manual_zip_recovery_accepts_only_verified_range() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let (root, allowed, base) = approved_recovery_dir("range");
+        let part = root.join("input.part");
         let bytes = stored_zip_entry();
         std::fs::write(&part, &bytes).unwrap();
 
-        let recovered =
-            recover_archive(&part, "sample.zip", &[(0, bytes.len() as u64)], &base, None)
-                .expect("recover verified entry");
+        let recovered = recover_archive(
+            &part,
+            "sample.zip",
+            &[(0, bytes.len() as u64)],
+            &root,
+            &allowed,
+            None,
+        )
+        .expect("recover verified entry");
         let archive = zip::ZipArchive::new(std::fs::File::open(&recovered).unwrap()).unwrap();
         assert_eq!(archive.len(), 1);
 
@@ -1130,7 +1163,8 @@ mod tests {
             &part,
             "sample.zip",
             &[(0, ZIP_LOCAL_HEADER_SIZE as u64)],
-            &base,
+            &root,
+            &allowed,
             None,
         );
         assert!(
@@ -1142,13 +1176,9 @@ mod tests {
 
     #[test]
     fn recovery_honors_cancellation() {
-        let base = std::env::temp_dir().join(format!(
-            "ember-archive-cancel-test-{}-{}",
-            std::process::id(),
-            rand::random::<u64>()
-        ));
-        std::fs::create_dir_all(&base).unwrap();
-        let part = base.join("input.part");
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let (root, allowed, base) = approved_recovery_dir("cancel");
+        let part = root.join("input.part");
         let bytes = stored_zip_entry();
         std::fs::write(&part, &bytes).unwrap();
         let control = TransferControl::new();
@@ -1157,7 +1187,8 @@ mod tests {
             &part,
             "sample.zip",
             &[(0, bytes.len() as u64)],
-            &base,
+            &root,
+            &allowed,
             Some(&control),
         )
         .is_err());

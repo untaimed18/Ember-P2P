@@ -25,6 +25,10 @@ enum MappingOwnership {
     Unknown,
 }
 
+fn mapping_may_be_replaced(ownership: MappingOwnership) -> bool {
+    ownership == MappingOwnership::EmberOwned
+}
+
 fn mapping_entry_is_ember_owned(
     entry: &igd_next::PortMappingEntry,
     protocol: igd_next::PortMappingProtocol,
@@ -153,18 +157,35 @@ impl UpnpMappings {
                 }
             }
             Err(igd_next::AddPortError::PortInUse) => {
-                match inspect_mapping(gateway, protocol, port, local_ip, label).await {
-                    MappingOwnership::EmberOwned => {}
+                let ownership = {
+                    let mut ownership =
+                        inspect_mapping(gateway, protocol, port, local_ip, label).await;
+                    // Some gateways flake on GenericPortMappingEntry; retry once
+                    // before deciding we cannot prove ownership.
+                    if ownership == MappingOwnership::Unknown {
+                        ownership = inspect_mapping(gateway, protocol, port, local_ip, label).await;
+                    }
+                    ownership
+                };
+                match ownership {
+                    MappingOwnership::EmberOwned if mapping_may_be_replaced(ownership) => {}
                     MappingOwnership::Foreign => {
                         info!("UPnP: refusing to replace foreign {proto} mapping on port {port}");
                         return false;
                     }
-                    MappingOwnership::Missing | MappingOwnership::Unknown => {
+                    MappingOwnership::Missing => {
                         debug!(
-                            "UPnP: port {port}/{proto} is reported in use but ownership cannot be proven"
+                            "UPnP: port {port}/{proto} reported in use but no current owned mapping was found"
                         );
                         return false;
                     }
+                    MappingOwnership::Unknown => {
+                        debug!(
+                            "UPnP: port {port}/{proto} is reported in use but current ownership cannot be proven"
+                        );
+                        return false;
+                    }
+                    MappingOwnership::EmberOwned => unreachable!("owned mapping is replaceable"),
                 }
                 if let Err(e) = gateway.remove_port(protocol, port).await {
                     debug!("UPnP: failed to remove owned {proto} mapping on port {port}: {e}");
@@ -556,6 +577,14 @@ mod tests {
             local_ip,
             "Ember P2P TCP"
         ));
+    }
+
+    #[test]
+    fn replacement_requires_positive_current_ownership() {
+        assert!(mapping_may_be_replaced(MappingOwnership::EmberOwned));
+        assert!(!mapping_may_be_replaced(MappingOwnership::Unknown));
+        assert!(!mapping_may_be_replaced(MappingOwnership::Foreign));
+        assert!(!mapping_may_be_replaced(MappingOwnership::Missing));
     }
 
     #[test]

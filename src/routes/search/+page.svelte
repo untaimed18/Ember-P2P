@@ -1497,7 +1497,8 @@
         peerIp,
         peerPort,
         extraSources,
-        result.file.ember_file_hash
+        result.file.ember_file_hash,
+        result.file.aich_hash,
       );
       addToast('success', res.already_queued ? m.search_already_in_queue() : m.search_download_queued());
     } catch (e: unknown) {
@@ -1811,7 +1812,8 @@
             peerIp,
             peerPort,
             extraSources,
-            result.file.ember_file_hash
+            result.file.ember_file_hash,
+            result.file.aich_hash,
           );
           if (res.already_queued) {
             alreadyQueued++;

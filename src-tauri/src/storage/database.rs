@@ -15,6 +15,7 @@ const MAX_PEERS_ROWS: i64 = 10_000;
 const MAX_DOWNLOAD_HISTORY_ROWS: i64 = 5_000;
 const CHAT_KEY_FILE: &str = "chat-history.key";
 const CHAT_CIPHERTEXT_PREFIX: &str = "EMBRCHAT1:";
+const CHAT_UNAVAILABLE_TEXT: &str = "[Message unavailable]";
 const CHAT_NONCE_LEN: usize = 24;
 const CHAT_AAD_DOMAIN: &[u8] = b"ember-chat-db-row-v1\0";
 
@@ -1316,6 +1317,41 @@ impl Database {
                     let direction_str: String = row.get(5)?;
                     let status_str: String = row.get(6)?;
                     let transferred_val = row.get::<_, i64>(10)?.max(0) as u64;
+                    let raw_aich: Option<String> = row.get(14)?;
+                    // SQL NULL is the only persisted representation of "no
+                    // pin". Empty/whitespace strings can be accepted as absent
+                    // at an IPC boundary, but they are never written by Ember;
+                    // seeing one in the database is corruption and must not
+                    // silently resume an AICH-required transfer unpinned.
+                    let (expected_aich, pin_corrupt) = match raw_aich.as_deref() {
+                        None => (None, false),
+                        Some(value) => match crate::security::parse_expected_aich(Some(value)) {
+                            Ok(Some(value)) => (Some(value), false),
+                            Ok(None) | Err(_) => (None, true),
+                        },
+                    };
+                    let mut status = match status_str.trim_matches('"') {
+                        "searching" => TransferStatus::Searching,
+                        "queued" => TransferStatus::Queued,
+                        "active" => TransferStatus::Active,
+                        "paused" => TransferStatus::Paused,
+                        "stopped" => TransferStatus::Stopped,
+                        "verifying" => TransferStatus::Verifying,
+                        "completing" => TransferStatus::Completing,
+                        "completed" => TransferStatus::Completed,
+                        "failed" => TransferStatus::Failed,
+                        "hashing" => TransferStatus::Hashing,
+                        "insufficient" => TransferStatus::Insufficient,
+                        "noneneeded" => TransferStatus::NoneNeeded,
+                        // A corrupted or future-version status string must
+                        // not silently resume as an active "searching"
+                        // transfer (which would kick off network activity on
+                        // load). Fall back to the inert Stopped state.
+                        _ => TransferStatus::Stopped,
+                    };
+                    if pin_corrupt {
+                        status = TransferStatus::Failed;
+                    }
                     Ok(Transfer {
                         id: row.get(0)?,
                         // Defense-in-depth: re-sanitize the persisted name on
@@ -1331,33 +1367,18 @@ impl Database {
                             "upload" => TransferDirection::Upload,
                             _ => TransferDirection::Download,
                         },
-                        status: match status_str.trim_matches('"') {
-                            "searching" => TransferStatus::Searching,
-                            "queued" => TransferStatus::Queued,
-                            "active" => TransferStatus::Active,
-                            "paused" => TransferStatus::Paused,
-                            "stopped" => TransferStatus::Stopped,
-                            "verifying" => TransferStatus::Verifying,
-                            "completing" => TransferStatus::Completing,
-                            "completed" => TransferStatus::Completed,
-                            "failed" => TransferStatus::Failed,
-                            "hashing" => TransferStatus::Hashing,
-                            "insufficient" => TransferStatus::Insufficient,
-                            "noneneeded" => TransferStatus::NoneNeeded,
-                            // A corrupted or future-version status string must
-                            // not silently resume as an active "searching"
-                            // transfer (which would kick off network activity on
-                            // load). Fall back to the inert Stopped state.
-                            _ => TransferStatus::Stopped,
-                        },
+                        status,
                         progress: row.get(7)?,
                         speed: row.get::<_, i64>(8)?.max(0) as u64,
                         total_size: row.get::<_, i64>(9)?.max(0) as u64,
                         transferred: transferred_val,
                         completed_size: transferred_val,
                         started_at: row.get(11)?,
-                        failure_reason: None,
-                        failure_kind: None,
+                        failure_reason: pin_corrupt.then(|| {
+                            "Persisted AICH pin was corrupt; cancel and re-add the AICH link"
+                                .to_string()
+                        }),
+                        failure_kind: pin_corrupt.then(|| "permanent".to_string()),
                         failure_stage: None,
                         priority: row
                             .get::<_, String>(12)
@@ -1382,13 +1403,7 @@ impl Database {
                         client_software: String::new(),
                         country_code: None,
                         user_hash: None,
-                        expected_aich: row
-                            .get::<_, Option<String>>(14)?
-                            .filter(|value| {
-                                value.len() == 40
-                                    && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-                            })
-                            .map(|value| value.to_ascii_lowercase()),
+                        expected_aich,
                         completed_path: None,
                         up_part_status: None,
                         up_part_count: None,
@@ -2561,19 +2576,32 @@ impl Database {
             })?;
             mapped.collect::<Result<Vec<_>, _>>()?
         };
-        rows.into_iter()
-            .map(|(id, direction, stored, timestamp, read)| {
-                let message = Self::decrypt_chat_body(
-                    &self.chat_key,
-                    id,
-                    friend_hash,
-                    &direction,
-                    timestamp,
-                    &stored,
-                )?;
-                Ok((id, direction, message, timestamp, read))
-            })
-            .collect()
+        let mut messages = Vec::with_capacity(rows.len());
+        for (id, direction, stored, timestamp, read) in rows {
+            match Self::decrypt_chat_body(
+                &self.chat_key,
+                id,
+                friend_hash,
+                &direction,
+                timestamp,
+                &stored,
+            ) {
+                Ok(message) => messages.push((id, direction, message, timestamp, read)),
+                Err(error) => {
+                    tracing::warn!(
+                        "Chat row {id} for friend {friend_hash} is unavailable; preserving its ciphertext for later recovery: {error}"
+                    );
+                    messages.push((
+                        id,
+                        direction,
+                        CHAT_UNAVAILABLE_TEXT.to_string(),
+                        timestamp,
+                        read,
+                    ));
+                }
+            }
+        }
+        Ok(messages)
     }
 
     pub fn mark_messages_read(&self, friend_hash: &str) -> anyhow::Result<()> {
@@ -2919,6 +2947,48 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_expected_aich_restores_as_failed_without_pin() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-aich-corrupt-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let db = Database::open_at(&path).unwrap();
+        {
+            let conn = db.conn.lock();
+            for (id, value) in [
+                ("transfer-empty-aich", ""),
+                ("transfer-space-aich", "   "),
+                ("transfer-bad-aich", "not-a-valid-aich"),
+            ] {
+                conn.execute(
+                    "INSERT INTO transfers (
+                        id, file_name, file_hash, peer_id, peer_name, direction, status,
+                        progress, speed, total_size, transferred, started_at, priority,
+                        category, expected_aich
+                     ) VALUES (?1, ?2, ?3, '', '', 'download', 'paused', 0, 0, 4, 0, 1, 'normal', '', ?4)",
+                    params![id, "file.bin", "11".repeat(16), value],
+                )
+                .unwrap();
+            }
+        }
+        let loaded = db.get_incomplete_downloads().unwrap();
+        assert_eq!(loaded.len(), 3);
+        for transfer in loaded {
+            assert!(transfer.expected_aich.is_none());
+            assert_eq!(transfer.status, TransferStatus::Failed);
+            assert!(transfer
+                .failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("AICH")));
+        }
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
     fn pending_restore_is_paginated_and_overflow_is_quarantined_without_deletion() {
         let path = std::env::temp_dir().join(format!(
             "ember-pending-budget-{}-{}.db",
@@ -3229,6 +3299,68 @@ mod tests {
         drop(db);
         let raw_db = std::fs::read(&path).unwrap();
         assert!(!raw_db.windows(canary.len()).any(|w| w == canary.as_bytes()));
+        remove_test_database(&path);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn wrong_chat_key_returns_placeholder_without_destroying_recoverable_ciphertext() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-chat-preserve-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ember.db");
+        let friend = "44".repeat(16);
+        let db = Database::open_at(&path).unwrap();
+        let good = db
+            .insert_chat_message(&friend, "received", "keep-me")
+            .unwrap();
+        let correct_key = *db.chat_key;
+        let stored_before: String = db
+            .conn
+            .lock()
+            .query_row(
+                "SELECT message FROM chat_messages WHERE id = ?1",
+                params![good],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(stored_before.starts_with(CHAT_CIPHERTEXT_PREFIX));
+        drop(db);
+
+        let wrong_key_db = Database {
+            conn: Mutex::new(Connection::open(&path).unwrap()),
+            chat_key: Zeroizing::new([0x5A; 32]),
+            corrupt_backup: None,
+        };
+        let unavailable = wrong_key_db.get_chat_messages(&friend, 10, None).unwrap();
+        assert_eq!(unavailable.len(), 1);
+        assert_eq!(unavailable[0].2, CHAT_UNAVAILABLE_TEXT);
+        assert!(!unavailable[0].2.contains(&stored_before));
+        let stored_after: String = wrong_key_db
+            .conn
+            .lock()
+            .query_row(
+                "SELECT message FROM chat_messages WHERE id = ?1",
+                params![good],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_after.as_bytes(), stored_before.as_bytes());
+        drop(wrong_key_db);
+
+        let recovered_db = Database {
+            conn: Mutex::new(Connection::open(&path).unwrap()),
+            chat_key: Zeroizing::new(correct_key),
+            corrupt_backup: None,
+        };
+        let recovered = recovered_db.get_chat_messages(&friend, 10, None).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].2, "keep-me");
+        drop(recovered_db);
+
         remove_test_database(&path);
         let _ = std::fs::remove_dir_all(dir);
     }

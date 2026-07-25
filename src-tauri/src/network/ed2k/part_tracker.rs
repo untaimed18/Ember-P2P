@@ -901,12 +901,13 @@ impl PartTracker {
         }
     }
 
-    pub fn delete_met(&self) {
+    pub fn delete_met(&self, allowed_roots: &[String]) {
         self.save_generation.fetch_add(1, Ordering::AcqRel);
         let path_guard = save_path_guard(&self.met_path);
         {
             let _guard = path_guard.lock();
-            let _ = std::fs::remove_file(&self.met_path);
+            let _ =
+                crate::security::filesystem::remove_approved_file(&self.met_path, allowed_roots);
         }
         evict_save_path_guard(&self.met_path);
     }

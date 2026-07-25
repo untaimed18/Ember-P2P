@@ -23,6 +23,11 @@
     alert = false,
     onconfirm,
     oncancel,
+    // When set, Escape and overlay click call this instead of `oncancel`.
+    // Use it to distinguish an accidental dismiss from an explicit Cancel /
+    // Reject button press (e.g. deep-link confirmations that must not
+    // durable-ack on Escape).
+    ondismiss,
   }: {
     open?: boolean;
     title?: string;
@@ -34,6 +39,7 @@
     alert?: boolean;
     onconfirm?: () => void;
     oncancel?: () => void;
+    ondismiss?: () => void;
   } = $props();
 
   let confirmBtn: HTMLButtonElement | undefined = $state(undefined);
@@ -70,8 +76,15 @@
     open = false;
   }
 
+  function handleDismiss() {
+    if (actionTaken) return;
+    actionTaken = true;
+    (ondismiss ?? oncancel)?.();
+    open = false;
+  }
+
   function handleKeydown(e: KeyboardEvent) {
-    if (e.key === 'Escape') handleCancel();
+    if (e.key === 'Escape') handleDismiss();
     if (e.key === 'Tab' && dialogEl) {
       const focusable = dialogEl.querySelectorAll<HTMLElement>(
         'button:not([disabled]), [tabindex]:not([tabindex="-1"])'
@@ -90,7 +103,7 @@
   }
 
   function handleOverlayClick(e: MouseEvent) {
-    if (e.target === e.currentTarget) handleCancel();
+    if (e.target === e.currentTarget) handleDismiss();
   }
 
   $effect(() => {

@@ -2,12 +2,22 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PolicyResetScope {
+    /// Clear persisted peer/IP ban rows.
+    pub reset_bans: bool,
+    /// Quarantine/recreate reputation.json when it fails validation.
+    pub reset_reputation: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SecurityPolicyStatus {
     pub loaded: bool,
     pub reset_required: bool,
     pub reason: Option<String>,
+    pub scope: PolicyResetScope,
 }
 
 /// Startup gate shared by the Tauri command layer and network task. When a
@@ -18,6 +28,7 @@ pub struct SecurityPolicyGate {
     loaded: AtomicBool,
     reset_required: AtomicBool,
     reason: parking_lot::RwLock<Option<String>>,
+    scope: parking_lot::RwLock<PolicyResetScope>,
     data_dir: PathBuf,
 }
 
@@ -27,15 +38,17 @@ impl SecurityPolicyGate {
             loaded: AtomicBool::new(true),
             reset_required: AtomicBool::new(false),
             reason: parking_lot::RwLock::new(None),
+            scope: parking_lot::RwLock::new(PolicyResetScope::default()),
             data_dir,
         }
     }
 
-    pub fn blocked(data_dir: PathBuf, reason: impl Into<String>) -> Self {
+    pub fn blocked(data_dir: PathBuf, reason: impl Into<String>, scope: PolicyResetScope) -> Self {
         Self {
             loaded: AtomicBool::new(false),
             reset_required: AtomicBool::new(true),
             reason: parking_lot::RwLock::new(Some(reason.into())),
+            scope: parking_lot::RwLock::new(scope),
             data_dir,
         }
     }
@@ -44,19 +57,24 @@ impl SecurityPolicyGate {
         self.loaded.load(Ordering::Acquire)
     }
 
+    pub fn reset_scope(&self) -> PolicyResetScope {
+        *self.scope.read()
+    }
+
     pub fn status(&self) -> SecurityPolicyStatus {
         SecurityPolicyStatus {
             loaded: self.is_loaded(),
             reset_required: self.reset_required.load(Ordering::Acquire),
             reason: self.reason.read().clone(),
+            scope: self.reset_scope(),
         }
     }
 
     /// Atomically claim and complete an explicit reset acknowledgement.
-    /// The reset closure is never invoked unless recovery is genuinely blocked.
+    /// The ban-reset closure is invoked only when the blocked scope includes bans.
     pub fn acknowledge_reset_if_required(
         &self,
-        reset_policy: impl FnOnce() -> std::io::Result<()>,
+        reset_bans: impl FnOnce() -> std::io::Result<()>,
     ) -> std::io::Result<()> {
         if self
             .reset_required
@@ -69,7 +87,7 @@ impl SecurityPolicyGate {
             ));
         }
 
-        let result = self.finish_reset(reset_policy);
+        let result = self.finish_reset(reset_bans);
         if result.is_err() {
             self.reset_required.store(true, Ordering::Release);
         }
@@ -78,23 +96,29 @@ impl SecurityPolicyGate {
 
     fn finish_reset(
         &self,
-        reset_policy: impl FnOnce() -> std::io::Result<()>,
+        reset_bans: impl FnOnce() -> std::io::Result<()>,
     ) -> std::io::Result<()> {
-        reset_policy()?;
-        let reputation = self.data_dir.join("reputation.json");
-        if reputation.exists()
-            && crate::network::ember::reputation::ReputationManager::load_checked(&reputation)
-                .is_err()
-        {
-            preserve_corrupt(&reputation)?;
-            crate::network::ember::reputation::ReputationManager::new()
-                .save(&reputation)
-                .map_err(std::io::Error::other)?;
+        let scope = self.reset_scope();
+        if scope.reset_bans {
+            reset_bans()?;
+        }
+        if scope.reset_reputation {
+            let reputation = self.data_dir.join("reputation.json");
+            if reputation.exists()
+                && crate::network::ember::reputation::ReputationManager::load_checked(&reputation)
+                    .is_err()
+            {
+                preserve_corrupt(&reputation)?;
+                crate::network::ember::reputation::ReputationManager::new()
+                    .save(&reputation)
+                    .map_err(std::io::Error::other)?;
+            }
         }
         let acknowledgement = serde_json::json!({
             "version": 1,
             "acknowledgedAt": chrono::Utc::now().timestamp(),
             "reason": self.reason.read().clone(),
+            "scope": scope,
         });
         let data = serde_json::to_vec_pretty(&acknowledgement)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -163,7 +187,14 @@ mod tests {
     #[test]
     fn blocked_gate_acknowledgement_resets_policy_and_releases_gate() {
         let dir = test_dir("blocked");
-        let gate = SecurityPolicyGate::blocked(dir.clone(), "corrupt bans");
+        let gate = SecurityPolicyGate::blocked(
+            dir.clone(),
+            "corrupt bans",
+            PolicyResetScope {
+                reset_bans: true,
+                reset_reputation: false,
+            },
+        );
         let bans = AtomicUsize::new(3);
 
         gate.acknowledge_reset_if_required(|| {
@@ -177,6 +208,28 @@ mod tests {
         assert!(status.loaded);
         assert!(!status.reset_required);
         assert!(dir.join("security_policy_reset.json").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reputation_only_scope_does_not_invoke_ban_reset() {
+        let dir = test_dir("reputation-only");
+        let gate = SecurityPolicyGate::blocked(
+            dir.clone(),
+            "corrupt reputation",
+            PolicyResetScope {
+                reset_bans: false,
+                reset_reputation: true,
+            },
+        );
+        let bans = AtomicUsize::new(3);
+        gate.acknowledge_reset_if_required(|| {
+            bans.store(0, AtomicOrdering::Release);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(bans.load(AtomicOrdering::Acquire), 3);
+        assert!(gate.is_loaded());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

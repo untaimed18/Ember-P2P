@@ -380,13 +380,16 @@ pub fn run() {
             let corrupt_backup = config.corrupt_backup.clone();
             let db_corrupt_backup = db.corrupt_backup.clone();
             let mut policy_failures = Vec::new();
+            let mut policy_scope = security::policy::PolicyResetScope::default();
             if db_corrupt_backup.is_some() {
+                policy_scope.reset_bans = true;
                 policy_failures.push(
                     "The policy database was corrupt and was replaced; prior bans cannot be trusted"
                         .to_string(),
                 );
             }
             if let Err(error) = db.validate_security_policy() {
+                policy_scope.reset_bans = true;
                 policy_failures.push(format!("Persisted ban policy could not be validated: {error}"));
             }
             if let Err(error) =
@@ -394,6 +397,7 @@ pub fn run() {
                     &data_dir.join("reputation.json"),
                 )
             {
+                policy_scope.reset_reputation = true;
                 policy_failures.push(error);
             }
             let security_policy = Arc::new(if policy_failures.is_empty() {
@@ -402,6 +406,7 @@ pub fn run() {
                 security::policy::SecurityPolicyGate::blocked(
                     data_dir.clone(),
                     policy_failures.join("; "),
+                    policy_scope,
                 )
             });
 

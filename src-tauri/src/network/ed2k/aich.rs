@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -509,8 +509,14 @@ impl AICHRecoveryHashSet {
     /// Build from a file, storing all leaf hashes.
     pub fn build_from_file(path: &Path) -> anyhow::Result<Self> {
         let mut file = std::fs::File::open(path)?;
+        Self::build_from_open_file(&mut file)
+    }
+
+    /// Build from an already policy-validated file handle.
+    pub fn build_from_open_file(file: &mut std::fs::File) -> anyhow::Result<Self> {
+        file.seek(SeekFrom::Start(0))?;
         let file_size = file.metadata()?.len();
-        let leaf_hashes = hash_leaves_from_reader(&mut file, file_size)?;
+        let leaf_hashes = hash_leaves_from_reader(file, file_size)?;
         let root_hash = hierarchical_root(&leaf_hashes, file_size);
         Ok(Self {
             root_hash,

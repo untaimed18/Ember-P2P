@@ -4,7 +4,7 @@
 // This cannot be changed without breaking eMule/KAD network compatibility.
 // AICH (SHA-1 Merkle tree) provides a secondary verification layer.
 
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -36,6 +36,21 @@ pub fn ed2k_known_met_part_hash_count(file_size: u64) -> usize {
 
 pub fn ed2k_hash_file_cancellable(path: &Path, cancelled: &AtomicBool) -> anyhow::Result<String> {
     let mut file = std::fs::File::open(path)?;
+    ed2k_hash_open_file_cancellable(&mut file, cancelled)
+}
+
+/// Hash an already-opened file. Callers that enforce filesystem policy use
+/// this to bind verification to the same object identity later finalized.
+pub fn ed2k_hash_open_file(file: &mut std::fs::File) -> anyhow::Result<String> {
+    static NEVER: AtomicBool = AtomicBool::new(false);
+    ed2k_hash_open_file_cancellable(file, &NEVER)
+}
+
+fn ed2k_hash_open_file_cancellable(
+    file: &mut std::fs::File,
+    cancelled: &AtomicBool,
+) -> anyhow::Result<String> {
+    file.seek(SeekFrom::Start(0))?;
     let file_size = file.metadata()?.len();
 
     if file_size == 0 {
@@ -444,7 +459,18 @@ fn aich_hex_to_base32(aich_hex: &str) -> Option<String> {
 /// Convert a base32 AICH segment back into 40-char hex. Returns `None` unless
 /// it decodes to exactly 20 bytes.
 fn aich_base32_to_hex(b32: &str) -> Option<String> {
-    let bytes = base32_decode(b32.trim())?;
+    let normalized = b32.trim();
+    // A 20-byte AICH root has exactly 32 unpadded RFC 4648 characters.
+    // Reject padding/trailing junk rather than allowing the decoder's
+    // stop-at-'=' behavior to hide a malformed deep-link segment.
+    if normalized.len() != 32
+        || !normalized
+            .bytes()
+            .all(|byte| byte.is_ascii_alphabetic() || matches!(byte, b'2'..=b'7'))
+    {
+        return None;
+    }
+    let bytes = base32_decode(normalized)?;
     if bytes.len() != 20 {
         return None;
     }
@@ -471,50 +497,57 @@ pub fn percent_decode_str(s: &str) -> String {
     String::from_utf8(result).unwrap_or_else(|_| s.to_string())
 }
 
-/// Parse an ed2k link, returning (name, size, hash, optional AICH hex).
+pub type ParsedEd2kLink = (String, u64, String, Option<String>);
+
+/// Strictly parse an ed2k link, distinguishing an absent AICH segment from a
+/// malformed or conflicting one.
 ///
 /// Trailing optional segments (`h=<base32 AICH>`, `sources,...`, `s=<url>`,
 /// etc.) are tolerated; only the AICH root is currently surfaced so imported
 /// links can carry recovery data.
-pub fn parse_ed2k_link(link: &str) -> Option<(String, u64, String, Option<String>)> {
+pub fn parse_ed2k_link_strict(link: &str) -> Result<ParsedEd2kLink, &'static str> {
     let trimmed = link.trim();
     if !trimmed.starts_with("ed2k://|file|") {
-        return None;
+        return Err("Not an ed2k file link");
     }
-    let inner = trimmed.strip_prefix("ed2k://|file|")?;
+    let inner = trimmed
+        .strip_prefix("ed2k://|file|")
+        .ok_or("Not an ed2k file link")?;
     let mut parts = inner.split('|');
-    let raw_name = parts.next()?;
+    let raw_name = parts.next().ok_or("Missing ed2k file name")?;
     if raw_name.len() > 4096 {
-        return None;
+        return Err("ed2k file name is too long");
     }
     let name = percent_decode_str(raw_name);
-    let size = parts.next()?.parse::<u64>().ok()?;
-    let hash = parts.next()?.to_lowercase();
+    let size = parts
+        .next()
+        .ok_or("Missing ed2k file size")?
+        .parse::<u64>()
+        .map_err(|_| "Invalid ed2k file size")?;
+    let hash = parts.next().ok_or("Missing ed2k file hash")?.to_lowercase();
     if hash.len() != 32 || hex::decode(&hash).is_err() {
-        return None;
+        return Err("Invalid ed2k file hash");
     }
     let mut aich: Option<String> = None;
     for seg in parts {
         if let Some(b32) = seg.strip_prefix("h=") {
-            if let Some(decoded) = aich_base32_to_hex(b32) {
-                match &aich {
-                    None => aich = Some(decoded),
-                    Some(existing) if *existing != decoded => {
-                        // A malformed/tampered link with disagreeing `h=`
-                        // segments used to silently keep whichever came
-                        // last with no indication anything was off. Keep
-                        // the first one seen and surface the conflict
-                        // instead of hiding it.
-                        tracing::debug!(
-                            "ed2k link has conflicting h= segments: keeping {existing}, ignoring {decoded}"
-                        );
-                    }
-                    Some(_) => {}
+            let decoded = aich_base32_to_hex(b32).ok_or("Invalid AICH h= segment in ed2k link")?;
+            match &aich {
+                None => aich = Some(decoded),
+                Some(existing) if *existing != decoded => {
+                    return Err("Conflicting AICH h= segments in ed2k link");
                 }
+                Some(_) => {}
             }
         }
     }
-    Some((name, size, hash, aich))
+    Ok((name, size, hash, aich))
+}
+
+/// Compatibility parser for collection imports. Invalid links (including
+/// malformed AICH-bearing links) are skipped rather than partially accepted.
+pub fn parse_ed2k_link(link: &str) -> Option<ParsedEd2kLink> {
+    parse_ed2k_link_strict(link).ok()
 }
 
 #[cfg(test)]
@@ -589,10 +622,26 @@ mod link_tests {
 
     #[test]
     fn parse_rejects_bad_base32_aich() {
-        // '1' and '0' are not in the base32 alphabet -> decode fails -> None.
         let link = format!("ed2k://|file|a.bin|9|{HASH}|h=10101010101010101010101010101010|/");
-        let (_, _, _, aich) = parse_ed2k_link(&link).expect("parse");
-        assert!(aich.is_none());
+        assert!(parse_ed2k_link_strict(&link).is_err());
+        assert!(parse_ed2k_link(&link).is_none());
+    }
+
+    #[test]
+    fn parse_rejects_empty_and_conflicting_aich_segments() {
+        let empty = format!("ed2k://|file|a.bin|9|{HASH}|h=|/");
+        assert!(parse_ed2k_link_strict(&empty).is_err());
+
+        let first = base32_encode(&[0x11; 20]);
+        let second = base32_encode(&[0x22; 20]);
+        let conflicting = format!("ed2k://|file|a.bin|9|{HASH}|h={first}|h={second}|/");
+        assert!(parse_ed2k_link_strict(&conflicting).is_err());
+
+        let repeated = format!("ed2k://|file|a.bin|9|{HASH}|h={first}|h={first}|/");
+        assert_eq!(
+            parse_ed2k_link_strict(&repeated).unwrap().3,
+            Some(hex::encode([0x11; 20]))
+        );
     }
 }
 

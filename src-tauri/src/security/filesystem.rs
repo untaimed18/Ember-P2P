@@ -8,11 +8,13 @@ use std::sync::{Arc, OnceLock};
 
 const ROOT_STATE_VERSION: u32 = 1;
 const ROOT_STATE_FILE: &str = "approved_roots.json";
+const ROOT_TRANSACTION_FILE: &str = "approved_roots.transaction.json";
 
 /// File-system identity captured without following the final path component.
 /// On Windows this is the volume serial + 64-bit file ID returned by
-/// `GetFileInformationByHandle`, together with the reparse attribute. On other
-/// platforms canonical containment remains the enforcement mechanism.
+/// `GetFileInformationByHandle`, together with the reparse attribute. On Unix
+/// this is `st_dev` + `st_ino` from `lstat` so replacing a root at the same
+/// path cannot retain a prior approval.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectIdentity {
     #[serde(default)]
@@ -39,6 +41,24 @@ struct PersistedRoots {
     roots: Vec<ApprovedRoot>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedRootTransaction {
+    version: u32,
+    configured_keys: Vec<String>,
+    previous: PersistedRoots,
+    next: PersistedRoots,
+}
+
+/// Prepared approved-root change. Callers may commit it before writing a
+/// second durable file and roll it back if that write fails.
+pub struct ApprovedRootUpdate {
+    registry: Arc<ApprovedRootRegistry>,
+    previous: HashMap<String, ApprovedRoot>,
+    next: HashMap<String, ApprovedRoot>,
+    configured_keys: Vec<String>,
+    committed: bool,
+}
+
 /// Registry of roots the user approved. A configured path is not sufficient:
 /// every use reopens the root without following its final component and checks
 /// that both the configured object and its canonical target still have the
@@ -55,9 +75,29 @@ fn global_slot() -> &'static parking_lot::RwLock<Option<Arc<ApprovedRootRegistry
     ROOT_REGISTRY.get_or_init(|| parking_lot::RwLock::new(None))
 }
 
+#[cfg(test)]
+static ROOT_REGISTRY_TEST_LOCK: OnceLock<parking_lot::Mutex<()>> = OnceLock::new();
+
+/// Serialize tests that replace the process-global approved-root registry.
+///
+/// Production initializes this registry once. Tests intentionally install
+/// isolated registries, so parallel test execution must not let one test
+/// replace another test's roots while an asynchronous file open is pending.
+#[cfg(test)]
+pub(crate) fn test_registry_lock() -> parking_lot::MutexGuard<'static, ()> {
+    ROOT_REGISTRY_TEST_LOCK
+        .get_or_init(|| parking_lot::Mutex::new(()))
+        .lock()
+}
+
 fn path_key(path: &Path) -> String {
-    let value = path.to_string_lossy().replace('\\', "/");
+    let mut value = path.to_string_lossy().replace('\\', "/");
     if cfg!(windows) {
+        if let Some(rest) = value.strip_prefix("//?/UNC/") {
+            value = format!("//{rest}");
+        } else if let Some(rest) = value.strip_prefix("//?/") {
+            value = rest.to_string();
+        }
         value.to_ascii_lowercase()
     } else {
         value
@@ -72,6 +112,17 @@ fn random_hex() -> String {
 
 fn io_other(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::Other, message.into())
+}
+
+fn configured_root_keys(configured_roots: &[String]) -> Vec<String> {
+    let mut keys: Vec<String> = configured_roots
+        .iter()
+        .filter(|root| !root.is_empty())
+        .map(|root| path_key(Path::new(root)))
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
 }
 
 impl ApprovedRoot {
@@ -109,27 +160,45 @@ impl ApprovedRoot {
 }
 
 impl ApprovedRootRegistry {
-    fn state_snapshot(&self) -> PersistedRoots {
+    fn snapshot_from(roots: &HashMap<String, ApprovedRoot>) -> PersistedRoots {
         PersistedRoots {
             version: ROOT_STATE_VERSION,
-            roots: self.roots.read().values().cloned().collect(),
+            roots: roots.values().cloned().collect(),
         }
     }
 
-    fn persist(&self) -> io::Result<()> {
-        let data = serde_json::to_vec_pretty(&self.state_snapshot())
+    fn persist_roots(&self, roots: &HashMap<String, ApprovedRoot>) -> io::Result<()> {
+        let data = serde_json::to_vec_pretty(&Self::snapshot_from(roots))
             .map_err(|error| io_other(format!("serialize approved roots: {error}")))?;
         crate::security::atomic_write(&self.state_path, &data, true)
     }
 
-    /// Replace the configured root set after an explicit settings action.
-    /// Existing roots must retain identity; only paths in `explicit_additions`
-    /// may create a new approval record.
-    pub fn update_roots(
+    fn transaction_path(&self) -> PathBuf {
+        self.state_path.with_file_name(ROOT_TRANSACTION_FILE)
+    }
+
+    fn persist_transaction(
+        &self,
+        previous: &HashMap<String, ApprovedRoot>,
+        next: &HashMap<String, ApprovedRoot>,
+        configured_keys: &[String],
+    ) -> io::Result<()> {
+        let transaction = PersistedRootTransaction {
+            version: ROOT_STATE_VERSION,
+            configured_keys: configured_keys.to_vec(),
+            previous: Self::snapshot_from(previous),
+            next: Self::snapshot_from(next),
+        };
+        let data = serde_json::to_vec_pretty(&transaction)
+            .map_err(|error| io_other(format!("serialize approved-root transaction: {error}")))?;
+        crate::security::atomic_write(&self.transaction_path(), &data, true)
+    }
+
+    fn build_next(
         &self,
         configured_roots: &[String],
         explicit_additions: &[String],
-    ) -> io::Result<()> {
+    ) -> io::Result<(HashMap<String, ApprovedRoot>, HashMap<String, ApprovedRoot>)> {
         let additions: HashSet<String> = explicit_additions
             .iter()
             .map(|root| path_key(Path::new(root)))
@@ -167,17 +236,46 @@ impl ApprovedRootRegistry {
                 // Still-offline root that had no capturable identity during
                 // the one-time migration. It remains unusable and unapproved.
             } else {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!(
-                        "configured root has no approved identity record: {}",
-                        configured_path.display()
-                    ),
-                ));
+                // Settings may have been persisted before approval succeeded.
+                // Keep the root absent so operations fail closed, but do not
+                // brick process startup — an explicit UI action must approve it.
+                tracing::warn!(
+                    "configured root has no approved identity record and will stay unusable until re-approved: {}",
+                    configured_path.display()
+                );
             }
         }
+        Ok((current, next))
+    }
+
+    /// Build, but do not persist or publish, a replacement root set.
+    pub fn prepare_update(
+        self: &Arc<Self>,
+        configured_roots: &[String],
+        explicit_additions: &[String],
+    ) -> io::Result<ApprovedRootUpdate> {
+        let (previous, next) = self.build_next(configured_roots, explicit_additions)?;
+        Ok(ApprovedRootUpdate {
+            registry: self.clone(),
+            previous,
+            next,
+            configured_keys: configured_root_keys(configured_roots),
+            committed: false,
+        })
+    }
+
+    /// Replace the configured root set after an explicit settings action.
+    /// Existing roots must retain identity; only paths in `explicit_additions`
+    /// may create a new approval record.
+    pub fn update_roots(
+        &self,
+        configured_roots: &[String],
+        explicit_additions: &[String],
+    ) -> io::Result<()> {
+        let (_, next) = self.build_next(configured_roots, explicit_additions)?;
+        self.persist_roots(&next)?;
         *self.roots.write() = next;
-        self.persist()
+        Ok(())
     }
 
     pub fn verify_root(&self, configured: &Path) -> io::Result<PathBuf> {
@@ -234,8 +332,16 @@ impl ApprovedRootRegistry {
         candidate: &Path,
         allowed_roots: &[String],
     ) -> io::Result<PathBuf> {
-        if candidate.exists() {
-            return self.verify_existing_path(candidate, allowed_roots);
+        match object_identity(candidate) {
+            Ok(identity) if identity.reparse_point => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "output final component is a symlink or reparse point",
+                ));
+            }
+            Ok(_) => return self.verify_existing_path(candidate, allowed_roots),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
         let parent = candidate
             .parent()
@@ -249,6 +355,48 @@ impl ApprovedRootRegistry {
     }
 }
 
+impl ApprovedRootUpdate {
+    /// Persist the prepared set before publishing it to readers. A persistence
+    /// failure leaves the exact prior in-memory set untouched.
+    pub fn commit(&mut self) -> io::Result<()> {
+        if self.committed {
+            return Ok(());
+        }
+        self.registry
+            .persist_transaction(&self.previous, &self.next, &self.configured_keys)?;
+        if let Err(error) = self.registry.persist_roots(&self.next) {
+            let _ = std::fs::remove_file(self.registry.transaction_path());
+            return Err(error);
+        }
+        *self.registry.roots.write() = self.next.clone();
+        self.committed = true;
+        Ok(())
+    }
+
+    /// Restore the exact root identities that existed before `commit`.
+    pub fn rollback(&mut self) -> io::Result<()> {
+        if !self.committed {
+            return Ok(());
+        }
+        self.registry.persist_roots(&self.previous)?;
+        *self.registry.roots.write() = self.previous.clone();
+        self.committed = false;
+        let _ = std::fs::remove_file(self.registry.transaction_path());
+        Ok(())
+    }
+
+    /// Mark the paired settings write complete. If journal cleanup fails, the
+    /// next startup recognizes that config already matches `next` and safely
+    /// finishes the transaction.
+    pub fn finish(&mut self) -> io::Result<()> {
+        match std::fs::remove_file(self.registry.transaction_path()) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+}
+
 /// Initialize the process registry. The first run migrates all current roots.
 /// Once state exists, an unknown configured root is not silently approved at
 /// startup; it must have been added by an explicit settings action.
@@ -257,8 +405,9 @@ pub fn initialize_approved_roots(
     configured_roots: &[String],
 ) -> io::Result<Arc<ApprovedRootRegistry>> {
     let state_path = data_dir.join(ROOT_STATE_FILE);
+    let transaction_path = data_dir.join(ROOT_TRANSACTION_FILE);
     let state_exists = state_path.exists();
-    let roots = if state_exists {
+    let mut roots: HashMap<String, ApprovedRoot> = if state_exists {
         let data = std::fs::read(&state_path)?;
         let persisted: PersistedRoots = serde_json::from_slice(&data)
             .map_err(|error| io_other(format!("parse approved roots: {error}")))?;
@@ -279,6 +428,42 @@ pub fn initialize_approved_roots(
     } else {
         HashMap::new()
     };
+
+    match std::fs::read(&transaction_path) {
+        Ok(data) => {
+            let transaction: PersistedRootTransaction = serde_json::from_slice(&data)
+                .map_err(|error| io_other(format!("parse approved-root transaction: {error}")))?;
+            if transaction.version != ROOT_STATE_VERSION
+                || transaction.previous.version != ROOT_STATE_VERSION
+                || transaction.next.version != ROOT_STATE_VERSION
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unsupported approved-root transaction version",
+                ));
+            }
+            let selected = if configured_root_keys(configured_roots) == transaction.configured_keys
+            {
+                transaction.next
+            } else {
+                transaction.previous
+            };
+            roots = selected
+                .roots
+                .into_iter()
+                .map(|root| (path_key(Path::new(&root.configured)), root))
+                .collect();
+            let data = serde_json::to_vec_pretty(&ApprovedRootRegistry::snapshot_from(&roots))
+                .map_err(|error| {
+                    io_other(format!("serialize recovered approved roots: {error}"))
+                })?;
+            crate::security::atomic_write(&state_path, &data, true)?;
+            let _ = std::fs::remove_file(&transaction_path);
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
     let registry = Arc::new(ApprovedRootRegistry {
         state_path,
         roots: parking_lot::RwLock::new(roots),
@@ -323,7 +508,7 @@ pub fn ensure_not_reparse(path: &Path) -> io::Result<()> {
 /// Open a new output without following a final reparse point.
 pub fn create_new_nofollow(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
+    options.read(true).write(true).create_new(true);
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
@@ -336,6 +521,947 @@ pub fn create_new_nofollow(path: &Path) -> io::Result<File> {
         options.custom_flags(libc::O_NOFOLLOW);
     }
     options.open(path)
+}
+
+fn single_path_component(name: &std::ffi::OsStr) -> io::Result<&std::ffi::OsStr> {
+    let as_path = Path::new(name);
+    if as_path.components().count() != 1
+        || as_path.components().next().is_none_or(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "file name must be a single path component",
+        ));
+    }
+    as_path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "file name must be a single path component",
+        )
+    })
+}
+
+#[cfg(unix)]
+fn object_identity_from_file(file: &File) -> io::Result<ObjectIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    Ok(ObjectIdentity {
+        volume_serial: metadata.dev(),
+        file_id: metadata.ino(),
+        attributes: 0,
+        reparse_point: false,
+    })
+}
+
+#[cfg(windows)]
+fn object_identity_from_file(file: &File) -> io::Result<ObjectIdentity> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT,
+    };
+
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let result = unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut info) };
+    if result == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(ObjectIdentity {
+        volume_serial: info.dwVolumeSerialNumber as u64,
+        file_id: ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
+        attributes: info.dwFileAttributes,
+        reparse_point: (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0,
+    })
+}
+
+pub fn opened_file_identity(file: &File) -> io::Result<ObjectIdentity> {
+    object_identity_from_file(file)
+}
+
+#[cfg(unix)]
+fn open_directory_nofollow(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn open_windows_path(path: &Path, desired_access: u32, directory: bool) -> io::Result<File> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{FromRawHandle, RawHandle};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    let mut flags = FILE_FLAG_OPEN_REPARSE_POINT;
+    if directory {
+        flags |= FILE_FLAG_BACKUP_SEMANTICS;
+    }
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            desired_access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            flags,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_handle(handle as RawHandle) })
+}
+
+#[cfg(windows)]
+fn create_windows_new_file(path: &Path) -> io::Result<File> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{FromRawHandle, RawHandle};
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, CREATE_NEW, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
+    };
+    const DELETE_ACCESS: u32 = 0x0001_0000;
+    const WRITE_DAC_ACCESS: u32 = 0x0004_0000;
+
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE | DELETE_ACCESS | WRITE_DAC_ACCESS,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            CREATE_NEW,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_handle(handle as RawHandle) })
+}
+
+#[cfg(windows)]
+fn delete_opened_file(file: &File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
+    };
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    if unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle().cast(),
+            FileDispositionInfo,
+            (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn open_directory_nofollow(path: &Path) -> io::Result<File> {
+    use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
+    open_windows_path(path, FILE_READ_ATTRIBUTES, true)
+}
+
+fn open_verified_directory(
+    path: &Path,
+    allowed_roots: &[String],
+) -> io::Result<(PathBuf, File, ObjectIdentity)> {
+    let verified = verify_existing_path(path, allowed_roots)?;
+    if !verified.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "approved path is not a directory",
+        ));
+    }
+    ensure_not_reparse(&verified)?;
+    let expected = object_identity(&verified)?;
+    let handle = open_directory_nofollow(&verified)?;
+    let opened = object_identity_from_file(&handle)?;
+    if opened != expected || opened.reparse_point || !handle.metadata()?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "approved directory changed while it was opened",
+        ));
+    }
+    Ok((verified, handle, opened))
+}
+
+fn verified_parent_handle(
+    parent: &Path,
+    allowed_roots: &[String],
+) -> io::Result<(PathBuf, File, ObjectIdentity)> {
+    open_verified_directory(parent, allowed_roots)
+}
+
+#[cfg(unix)]
+fn component_cstring(name: &std::ffi::OsStr) -> io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "file name contains NUL"))
+}
+
+#[cfg(unix)]
+fn openat_child(
+    parent: &File,
+    name: &std::ffi::OsStr,
+    flags: i32,
+    mode: libc::mode_t,
+) -> io::Result<File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let name = component_cstring(name)?;
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags, mode) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn link_opened_file_at(
+    source: &File,
+    destination_parent: &File,
+    name: &std::ffi::OsStr,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let destination_name = component_cstring(name)?;
+    let empty = c"";
+    if unsafe {
+        libc::linkat(
+            source.as_raw_fd(),
+            empty.as_ptr(),
+            destination_parent.as_raw_fd(),
+            destination_name.as_ptr(),
+            libc::AT_EMPTY_PATH,
+        )
+    } == 0
+    {
+        return Ok(());
+    }
+    let direct_error = io::Error::last_os_error();
+    if direct_error.kind() == io::ErrorKind::AlreadyExists {
+        return Err(direct_error);
+    }
+
+    // Normal users can be denied AT_EMPTY_PATH even for their own file.
+    // Following the procfs descriptor symlink still names the exact open file
+    // description, so it retains handle identity without reopening by path.
+    let proc_path = std::ffi::CString::new(format!("/proc/self/fd/{}", source.as_raw_fd()))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid source descriptor"))?;
+    if unsafe {
+        libc::linkat(
+            libc::AT_FDCWD,
+            proc_path.as_ptr(),
+            destination_parent.as_raw_fd(),
+            destination_name.as_ptr(),
+            libc::AT_SYMLINK_FOLLOW,
+        )
+    } == 0
+    {
+        return Ok(());
+    }
+    let proc_error = io::Error::last_os_error();
+    if proc_error.kind() == io::ErrorKind::NotFound {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "handle-relative hard links require AT_EMPTY_PATH or procfs",
+        ));
+    }
+    Err(proc_error)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn link_opened_file_at(
+    _source: &File,
+    _destination_parent: &File,
+    _name: &std::ffi::OsStr,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "this platform has no race-free open-handle hard-link API",
+    ))
+}
+
+#[cfg(windows)]
+fn final_path_from_file(file: &File) -> io::Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED, VOLUME_NAME_DOS,
+    };
+
+    let handle = file.as_raw_handle().cast();
+    let needed =
+        unsafe { GetFinalPathNameByHandleW(handle, std::ptr::null_mut(), 0, FILE_NAME_NORMALIZED) };
+    if needed == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut wide = vec![0u16; needed as usize + 1];
+    let written = unsafe {
+        GetFinalPathNameByHandleW(
+            handle,
+            wide.as_mut_ptr(),
+            wide.len() as u32,
+            FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+        )
+    };
+    if written == 0 || written as usize >= wide.len() {
+        return Err(io::Error::last_os_error());
+    }
+    wide.truncate(written as usize);
+    Ok(PathBuf::from(std::ffi::OsString::from_wide(&wide)))
+}
+
+#[cfg(windows)]
+fn opened_child_parent_matches(file: &File, verified_parent: &Path) -> io::Result<bool> {
+    let opened = final_path_from_file(file)?;
+    let Some(opened_parent) = opened.parent() else {
+        return Ok(false);
+    };
+    Ok(path_key(opened_parent) == path_key(verified_parent))
+}
+
+#[cfg(windows)]
+fn link_opened_file_at(
+    source: &File,
+    destination_parent: &File,
+    name: &std::ffi::OsStr,
+) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FileLinkInformation, NtSetInformationFile, FILE_LINK_INFORMATION, FILE_LINK_INFORMATION_0,
+    };
+    use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+    let wide: Vec<u16> = name.encode_wide().collect();
+    let name_bytes = wide
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .and_then(|length| u32::try_from(length).ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "hard-link name is too long"))?;
+    let header_len = std::mem::offset_of!(FILE_LINK_INFORMATION, FileName);
+    let total_len = header_len
+        .checked_add(name_bytes as usize)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "hard-link name is too long"))?;
+    let word_size = std::mem::size_of::<usize>();
+    let mut storage = vec![0usize; total_len.div_ceil(word_size)];
+    let info = storage.as_mut_ptr().cast::<FILE_LINK_INFORMATION>();
+    unsafe {
+        std::ptr::write(
+            info,
+            FILE_LINK_INFORMATION {
+                Anonymous: FILE_LINK_INFORMATION_0 {
+                    ReplaceIfExists: false,
+                },
+                RootDirectory: destination_parent.as_raw_handle().cast(),
+                FileNameLength: name_bytes,
+                FileName: [0],
+            },
+        );
+        std::ptr::copy_nonoverlapping(
+            wide.as_ptr(),
+            std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+            wide.len(),
+        );
+    }
+
+    let mut status_block = IO_STATUS_BLOCK::default();
+    let status = unsafe {
+        NtSetInformationFile(
+            source.as_raw_handle().cast(),
+            &mut status_block,
+            info.cast(),
+            u32::try_from(total_len).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "link buffer too large")
+            })?,
+            FileLinkInformation,
+        )
+    };
+    if status < 0 {
+        let os_error = unsafe { RtlNtStatusToDosError(status) };
+        return Err(io::Error::from_raw_os_error(os_error as i32));
+    }
+    Ok(())
+}
+
+/// Open an existing approved regular file and validate the opened object before
+/// returning it. No truncation or write occurs until this validation succeeds.
+pub fn open_existing_approved(
+    path: &Path,
+    allowed_roots: &[String],
+    writable: bool,
+) -> io::Result<(PathBuf, File)> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+    let name =
+        single_path_component(path.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "path has no file name")
+        })?)?;
+    let (verified_parent, parent_handle, parent_identity) =
+        verified_parent_handle(parent, allowed_roots)?;
+    let verified = verified_parent.join(name);
+    #[cfg(windows)]
+    let _ = &parent_handle;
+
+    #[cfg(unix)]
+    let file = {
+        let access = if writable {
+            libc::O_RDWR
+        } else {
+            libc::O_RDONLY
+        };
+        openat_child(
+            &parent_handle,
+            name,
+            access | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )?
+    };
+    #[cfg(windows)]
+    let file = {
+        use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+        let access = if writable {
+            GENERIC_READ | GENERIC_WRITE
+        } else {
+            GENERIC_READ
+        };
+        let file = open_windows_path(&verified, access, false)?;
+        if object_identity(&verified_parent)? != parent_identity
+            || !opened_child_parent_matches(&file, &verified_parent)?
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "opened file escaped or replaced its approved parent",
+            ));
+        }
+        file
+    };
+
+    let opened = object_identity_from_file(&file)?;
+    if opened.reparse_point || !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "approved final component is not a regular non-reparse file",
+        ));
+    }
+    Ok((verified, file))
+}
+
+fn split_verified_file_parent(
+    path: &Path,
+    allowed_roots: &[String],
+) -> io::Result<(PathBuf, File, ObjectIdentity, std::ffi::OsString)> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+    let name =
+        single_path_component(path.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "path has no file name")
+        })?)?;
+    let (verified_parent, parent_handle, parent_identity) =
+        verified_parent_handle(parent, allowed_roots)?;
+    Ok((
+        verified_parent,
+        parent_handle,
+        parent_identity,
+        name.to_os_string(),
+    ))
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HardLinkTestPoint {
+    SourcePinned,
+    DestinationLinked,
+}
+
+#[cfg(test)]
+struct HardLinkTestHook {
+    point: HardLinkTestPoint,
+    reached: std::sync::mpsc::SyncSender<()>,
+    resume: parking_lot::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+#[cfg(test)]
+fn hard_link_test_hook_slot(
+) -> &'static parking_lot::Mutex<Option<std::sync::Arc<HardLinkTestHook>>> {
+    static SLOT: OnceLock<parking_lot::Mutex<Option<std::sync::Arc<HardLinkTestHook>>>> =
+        OnceLock::new();
+    SLOT.get_or_init(|| parking_lot::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn install_hard_link_test_hook(
+    point: HardLinkTestPoint,
+) -> (
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::SyncSender<()>,
+) {
+    let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(0);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
+    let hook = std::sync::Arc::new(HardLinkTestHook {
+        point,
+        reached: reached_tx,
+        resume: parking_lot::Mutex::new(resume_rx),
+    });
+    let previous = hard_link_test_hook_slot().lock().replace(hook);
+    assert!(previous.is_none(), "hard-link test hook already installed");
+    (reached_rx, resume_tx)
+}
+
+#[cfg(test)]
+fn hard_link_test_pause(point: HardLinkTestPoint) {
+    let hook = {
+        let mut slot = hard_link_test_hook_slot().lock();
+        if slot.as_ref().is_some_and(|hook| hook.point == point) {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = hook {
+        let _ = hook.reached.send(());
+        let _ = hook.resume.lock().recv();
+    }
+}
+
+/// Create a hard link to the exact opened source object. The destination name
+/// is claimed exclusively and then reopened without following reparses; a
+/// path swap can therefore cause a clean failure but cannot publish a
+/// different object.
+pub fn hard_link_approved(
+    source_path: &Path,
+    destination_path: &Path,
+    allowed_roots: &[String],
+    expected_source: &ObjectIdentity,
+) -> io::Result<PathBuf> {
+    let (verified_source, source) = open_existing_approved(source_path, allowed_roots, false)?;
+    let source_identity = object_identity_from_file(&source)?;
+    if &source_identity != expected_source {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "approved hard-link source changed identity",
+        ));
+    }
+
+    let (destination_parent, destination_parent_handle, destination_parent_identity, name) =
+        split_verified_file_parent(destination_path, allowed_roots)?;
+    let destination = destination_parent.join(&name);
+
+    #[cfg(unix)]
+    {
+        let _ = (&verified_source, destination_parent_identity);
+        #[cfg(test)]
+        hard_link_test_pause(HardLinkTestPoint::SourcePinned);
+        link_opened_file_at(&source, &destination_parent_handle, &name)?;
+        #[cfg(test)]
+        hard_link_test_pause(HardLinkTestPoint::DestinationLinked);
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let linked_result = openat_child(
+            &destination_parent_handle,
+            &name,
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        );
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+        let linked_result = openat_child(
+            &destination_parent_handle,
+            &name,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        );
+        let linked = match linked_result {
+            Ok(linked) => linked,
+            Err(error) => {
+                // If the name still denotes our exact source object, remove
+                // only that identity. A replacement (including a symlink)
+                // fails the identity gate and is left untouched.
+                let _ =
+                    remove_approved_file_if_identity(&destination, allowed_roots, &source_identity);
+                return Err(error);
+            }
+        };
+        let linked_identity = object_identity_from_file(&linked)?;
+        if linked_identity != source_identity
+            || linked_identity.reparse_point
+            || !linked.metadata()?.is_file()
+        {
+            // The source handle was linked atomically, so an identity mismatch
+            // means the destination name was replaced after the link. Never
+            // unlink that replacement by pathname.
+            let _ = remove_approved_file_if_identity(&destination, allowed_roots, &source_identity);
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "hard-link destination did not bind the verified source",
+            ));
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
+        const DELETE_ACCESS: u32 = 0x0001_0000;
+        let link_source = open_windows_path(
+            &verified_source,
+            FILE_READ_ATTRIBUTES | DELETE_ACCESS,
+            false,
+        )?;
+        let link_source_identity = object_identity_from_file(&link_source)?;
+        let source_parent = verified_source
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "source has no parent"))?;
+        if link_source_identity != source_identity
+            || link_source_identity.reparse_point
+            || !link_source.metadata()?.is_file()
+            || !opened_child_parent_matches(&link_source, source_parent)?
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "approved hard-link source changed before handle pinning",
+            ));
+        }
+
+        #[cfg(test)]
+        hard_link_test_pause(HardLinkTestPoint::SourcePinned);
+        link_opened_file_at(&link_source, &destination_parent_handle, &name)?;
+        #[cfg(test)]
+        hard_link_test_pause(HardLinkTestPoint::DestinationLinked);
+
+        let linked =
+            match open_windows_path(&destination, FILE_READ_ATTRIBUTES | DELETE_ACCESS, false) {
+                Ok(linked) => linked,
+                Err(error) => {
+                    let _ = remove_approved_file_if_identity(
+                        &destination,
+                        allowed_roots,
+                        &source_identity,
+                    );
+                    return Err(error);
+                }
+            };
+        let linked_identity = object_identity_from_file(&linked)?;
+        if linked_identity != source_identity
+            || linked_identity.reparse_point
+            || !linked.metadata()?.is_file()
+        {
+            // A different identity can only be a replacement installed after
+            // the handle-relative link. It is not ours, so never delete it.
+            let _ = remove_approved_file_if_identity(&destination, allowed_roots, &source_identity);
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "hard-link destination did not bind the verified source",
+            ));
+        }
+        if object_identity(&destination_parent)? != destination_parent_identity
+            || !opened_child_parent_matches(&linked, &destination_parent)?
+        {
+            // `linked` is still the exact source object this call linked.
+            // Handle deletion therefore cannot target a path replacement.
+            delete_opened_file(&linked)?;
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "hard-link destination parent changed during publication",
+            ));
+        }
+    }
+
+    Ok(destination)
+}
+
+fn remove_approved_file_inner(
+    path: &Path,
+    allowed_roots: &[String],
+    expected: Option<&ObjectIdentity>,
+) -> io::Result<()> {
+    let (verified_parent, parent_handle, parent_identity, name) =
+        split_verified_file_parent(path, allowed_roots)?;
+    #[cfg(windows)]
+    let _ = &parent_handle;
+
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let opened = openat_child(
+            &parent_handle,
+            &name,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )?;
+        let opened_identity = object_identity_from_file(&opened)?;
+        if expected.is_some_and(|identity| identity != &opened_identity)
+            || opened_identity.reparse_point
+            || !opened.metadata()?.is_file()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "approved file changed before deletion",
+            ));
+        }
+        let original_name = component_cstring(&name)?;
+        let quarantine_component = format!(".ember-delete-{}", random_hex());
+        let quarantine_name = component_cstring(std::ffi::OsStr::new(&quarantine_component))?;
+        // POSIX has no portable unlink-by-file-descriptor. Atomically move the
+        // current final component to an unguessable name first, then verify
+        // that moved object before unlinking it. A swap at the original name
+        // can therefore move an unexpected object aside, but it cannot delete
+        // that unexpected object.
+        if unsafe {
+            libc::renameat(
+                parent_handle.as_raw_fd(),
+                original_name.as_ptr(),
+                parent_handle.as_raw_fd(),
+                quarantine_name.as_ptr(),
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let quarantined = openat_child(
+            &parent_handle,
+            std::ffi::OsStr::new(&quarantine_component),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )?;
+        if object_identity_from_file(&quarantined)? != opened_identity
+            || !quarantined.metadata()?.is_file()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "approved file changed during deletion quarantine",
+            ));
+        }
+        if unsafe { libc::unlinkat(parent_handle.as_raw_fd(), quarantine_name.as_ptr(), 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
+        const DELETE_ACCESS: u32 = 0x0001_0000;
+        let opened = open_windows_path(
+            &verified_parent.join(&name),
+            DELETE_ACCESS | FILE_READ_ATTRIBUTES,
+            false,
+        )?;
+        let opened_identity = object_identity_from_file(&opened)?;
+        if expected.is_some_and(|identity| identity != &opened_identity)
+            || opened_identity.reparse_point
+            || object_identity(&verified_parent)? != parent_identity
+            || !opened_child_parent_matches(&opened, &verified_parent)?
+            || !opened.metadata()?.is_file()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "approved file changed before deletion",
+            ));
+        }
+        delete_opened_file(&opened)
+    }
+}
+
+/// Verify `parent`, hold its directory handle, and create `parent/<name>`
+/// relative to that handle on Unix. Windows lacks a stable Win32
+/// handle-relative create primitive, so it validates both the opened file's
+/// final parent and the pinned parent before returning, without deleting by
+/// pathname on failure.
+pub fn create_new_in_approved_parent(
+    parent: &Path,
+    name: &std::ffi::OsStr,
+    allowed_roots: &[String],
+) -> io::Result<(PathBuf, File)> {
+    let file_name = single_path_component(name)?;
+    let (verified_parent, parent_handle, parent_identity) =
+        verified_parent_handle(parent, allowed_roots)?;
+    #[cfg(windows)]
+    let _ = &parent_handle;
+    let candidate = verified_parent.join(file_name);
+
+    #[cfg(unix)]
+    let file = openat_child(
+        &parent_handle,
+        file_name,
+        libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0o600,
+    )?;
+    #[cfg(windows)]
+    let file = create_windows_new_file(&candidate)?;
+
+    let opened = object_identity_from_file(&file)?;
+    if opened.reparse_point || !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "created output is not a regular non-reparse file",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        if object_identity(&verified_parent)? != parent_identity
+            || !opened_child_parent_matches(&file, &verified_parent)?
+        {
+            // Never clean up through `candidate`: a swapped parent could make
+            // pathname deletion target an unrelated file. Closing leaves at
+            // worst the empty, exclusively-created object for orphan cleanup.
+            let _ = delete_opened_file(&file);
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "approved parent changed during create",
+            ));
+        }
+    }
+    Ok((candidate, file))
+}
+
+/// Open an existing approved path for read/write, or create it under a pinned
+/// parent when absent. Existing files are opened and handle-validated before
+/// truncation.
+pub fn open_or_create_approved(
+    path: &Path,
+    allowed_roots: &[String],
+    truncate_existing: bool,
+) -> io::Result<(PathBuf, File)> {
+    match open_existing_approved(path, allowed_roots, true) {
+        Ok((verified, file)) => {
+            if truncate_existing {
+                file.set_len(0)?;
+            }
+            return Ok((verified, file));
+        }
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+        Err(_) => {}
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+    create_new_in_approved_parent(parent, name, allowed_roots)
+}
+
+/// Ensure `root/<name>` exists as a real directory inside an approved root.
+/// Unix creation is directory-handle-relative. Windows validates the opened
+/// directory's final parent before returning and performs no path cleanup if a
+/// parent swap is detected.
+pub fn prepare_approved_subdir(
+    root: &Path,
+    name: &str,
+    allowed_roots: &[String],
+) -> io::Result<PathBuf> {
+    let file_name = single_path_component(std::ffi::OsStr::new(name))?;
+    let (verified_root, root_handle, root_identity) = open_verified_directory(root, allowed_roots)?;
+    #[cfg(windows)]
+    let _ = &root_handle;
+    let candidate = verified_root.join(file_name);
+
+    #[cfg(unix)]
+    let open_child = || {
+        openat_child(
+            &root_handle,
+            file_name,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )
+    };
+    #[cfg(windows)]
+    let open_child = || {
+        use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
+        const DELETE_ACCESS: u32 = 0x0001_0000;
+        open_windows_path(&candidate, FILE_READ_ATTRIBUTES | DELETE_ACCESS, true)
+    };
+
+    let directory = match open_child() {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            #[cfg(unix)]
+            {
+                use std::os::fd::AsRawFd;
+                let name = component_cstring(file_name)?;
+                if unsafe { libc::mkdirat(root_handle.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            #[cfg(windows)]
+            std::fs::create_dir(&candidate)?;
+            open_child()?
+        }
+        Err(error) => return Err(error),
+    };
+    let opened = object_identity_from_file(&directory)?;
+    if opened.reparse_point || !directory.metadata()?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "approved subdirectory is not a real directory",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        if object_identity(&verified_root)? != root_identity
+            || !opened_child_parent_matches(&directory, &verified_root)?
+        {
+            let _ = delete_opened_file(&directory);
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "approved root changed during directory create/open",
+            ));
+        }
+    }
+    Ok(candidate)
+}
+
+/// Re-pin an output parent and create a new file without following a final
+/// reparse. Used by completion/copy paths after `verify_output_path`.
+pub fn create_new_verified_output(
+    verified_output: &Path,
+    allowed_roots: &[String],
+) -> io::Result<(PathBuf, File)> {
+    let parent = verified_output
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "output has no parent"))?;
+    let name = verified_output
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "output has no file name"))?;
+    create_new_in_approved_parent(parent, name, allowed_roots)
+}
+
+/// Remove a regular file without allowing a swapped pathname to redirect the
+/// deletion outside an approved directory handle.
+pub fn remove_approved_file(path: &Path, allowed_roots: &[String]) -> io::Result<()> {
+    remove_approved_file_inner(path, allowed_roots, None)
+}
+
+/// Remove only if the final component still names the exact object previously
+/// pinned by the caller. Used by delayed/retried cleanup paths.
+pub fn remove_approved_file_if_identity(
+    path: &Path,
+    allowed_roots: &[String],
+    expected: &ObjectIdentity,
+) -> io::Result<()> {
+    remove_approved_file_inner(path, allowed_roots, Some(expected))
 }
 
 /// Private, random, per-process directory beneath a pinned system temp root.
@@ -573,10 +1699,11 @@ pub fn object_identity(path: &Path) -> io::Result<ObjectIdentity> {
 
 #[cfg(not(windows))]
 pub fn object_identity(path: &Path) -> io::Result<ObjectIdentity> {
+    use std::os::unix::fs::MetadataExt;
     let metadata = std::fs::symlink_metadata(path)?;
     Ok(ObjectIdentity {
-        volume_serial: 0,
-        file_id: 0,
+        volume_serial: metadata.dev(),
+        file_id: metadata.ino(),
         attributes: 0,
         reparse_point: metadata.file_type().is_symlink(),
     })
@@ -680,6 +1807,397 @@ mod tests {
             "retargeted junction must not retain approval"
         );
         let _ = std::fs::remove_dir(&junction);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn unknown_configured_root_stays_unusable_without_bricking_update() {
+        let base = std::env::temp_dir().join(format!(
+            "ember-unapproved-root-{}-{}",
+            std::process::id(),
+            random_hex()
+        ));
+        let approved = base.join("approved");
+        let stranger = base.join("stranger");
+        std::fs::create_dir_all(&approved).unwrap();
+        std::fs::create_dir_all(&stranger).unwrap();
+        let registry = ApprovedRootRegistry {
+            state_path: base.join(ROOT_STATE_FILE),
+            roots: parking_lot::RwLock::new(HashMap::new()),
+        };
+        let approved_s = approved.to_string_lossy().into_owned();
+        registry
+            .update_roots(
+                std::slice::from_ref(&approved_s),
+                std::slice::from_ref(&approved_s),
+            )
+            .unwrap();
+        let stranger_s = stranger.to_string_lossy().into_owned();
+        let roots = [approved_s.clone(), stranger_s.clone()];
+        registry.update_roots(&roots, &[]).unwrap();
+        assert!(registry.verify_root(&approved).is_ok());
+        assert!(registry.verify_root(&stranger).is_err());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_directory_replace_invalidates_approved_root_identity() {
+        let base = std::env::temp_dir().join(format!(
+            "ember-inode-root-test-{}-{}",
+            std::process::id(),
+            random_hex()
+        ));
+        let root = base.join("approved");
+        std::fs::create_dir_all(&root).unwrap();
+        let registry = ApprovedRootRegistry {
+            state_path: base.join(ROOT_STATE_FILE),
+            roots: parking_lot::RwLock::new(HashMap::new()),
+        };
+        let configured = root.to_string_lossy().into_owned();
+        registry
+            .update_roots(
+                std::slice::from_ref(&configured),
+                std::slice::from_ref(&configured),
+            )
+            .unwrap();
+        assert!(registry.verify_root(&root).is_ok());
+        std::fs::remove_dir(&root).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        assert!(
+            registry.verify_root(&root).is_err(),
+            "replaced directory inode must not retain approval"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn create_new_in_approved_parent_rejects_outside_parent() {
+        let _registry_guard = test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-create-parent-test-{}-{}",
+            std::process::id(),
+            random_hex()
+        ));
+        let root = base.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let state_path = base.join(ROOT_STATE_FILE);
+        let registry = ApprovedRootRegistry {
+            state_path,
+            roots: parking_lot::RwLock::new(HashMap::new()),
+        };
+        let root_string = root.to_string_lossy().into_owned();
+        registry
+            .update_roots(
+                std::slice::from_ref(&root_string),
+                std::slice::from_ref(&root_string),
+            )
+            .unwrap();
+        *global_slot().write() = Some(Arc::new(registry));
+        let allowed = [root_string];
+        assert!(
+            create_new_in_approved_parent(&outside, std::ffi::OsStr::new("x.bin"), &allowed)
+                .is_err()
+        );
+        let (path, file) =
+            create_new_in_approved_parent(&root, std::ffi::OsStr::new("ok.bin"), &allowed).unwrap();
+        drop(file);
+        let canonical_root = root.canonicalize().unwrap();
+        assert!(
+            path.starts_with(&canonical_root),
+            "created {} must stay under {}",
+            path.display(),
+            canonical_root.display()
+        );
+        *global_slot().write() = None;
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn opened_file_handle_cannot_be_retargeted_before_truncate() {
+        use std::io::Write;
+
+        let _registry_guard = test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-open-handle-test-{}-{}",
+            std::process::id(),
+            random_hex()
+        ));
+        let root = base.join("root");
+        let data = base.join("data");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let target = root.join("target.part");
+        let moved = root.join("opened-object.part");
+        std::fs::write(&target, b"approved bytes").unwrap();
+        let root_string = root.to_string_lossy().into_owned();
+        initialize_approved_roots(&data, std::slice::from_ref(&root_string)).unwrap();
+        let allowed = [root_string];
+
+        let (_, mut opened) = open_existing_approved(&target, &allowed, true).unwrap();
+        std::fs::rename(&target, &moved).unwrap();
+        std::fs::write(&target, b"replacement must survive").unwrap();
+        opened.set_len(0).unwrap();
+        opened.write_all(b"opened").unwrap();
+
+        assert_eq!(std::fs::read(&moved).unwrap(), b"opened");
+        assert_eq!(std::fs::read(&target).unwrap(), b"replacement must survive");
+        *global_slot().write() = None;
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_symlink_is_rejected_before_open_or_delete() {
+        use std::os::unix::fs::symlink;
+
+        let _registry_guard = test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-final-symlink-test-{}-{}",
+            std::process::id(),
+            random_hex()
+        ));
+        let root = base.join("root");
+        let data = base.join("data");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let victim = root.join("victim.bin");
+        let candidate = root.join("candidate.part");
+        std::fs::write(&victim, b"must survive").unwrap();
+        symlink(&victim, &candidate).unwrap();
+        let root_string = root.to_string_lossy().into_owned();
+        initialize_approved_roots(&data, std::slice::from_ref(&root_string)).unwrap();
+        let allowed = [root_string];
+
+        assert!(open_or_create_approved(&candidate, &allowed, true).is_err());
+        assert!(remove_approved_file(&candidate, &allowed).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"must survive");
+
+        *global_slot().write() = None;
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_final_file_reparse_is_rejected_before_open_or_delete() {
+        use std::os::windows::fs::symlink_file;
+
+        let _registry_guard = test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-final-reparse-test-{}-{}",
+            std::process::id(),
+            random_hex()
+        ));
+        let root = base.join("root");
+        let data = base.join("data");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let victim = root.join("victim.bin");
+        let candidate = root.join("candidate.part");
+        std::fs::write(&victim, b"must survive").unwrap();
+        if let Err(error) = symlink_file(&victim, &candidate) {
+            // Windows requires Developer Mode or SeCreateSymbolicLinkPrivilege.
+            // Keep CI portable while exercising the path whenever available.
+            if error.kind() == io::ErrorKind::PermissionDenied || error.raw_os_error() == Some(1314)
+            {
+                let _ = std::fs::remove_dir_all(base);
+                return;
+            }
+            panic!("could not create final-component symlink: {error}");
+        }
+        let root_string = root.to_string_lossy().into_owned();
+        initialize_approved_roots(&data, std::slice::from_ref(&root_string)).unwrap();
+        let allowed = [root_string];
+
+        assert!(open_or_create_approved(&candidate, &allowed, true).is_err());
+        assert!(remove_approved_file(&candidate, &allowed).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"must survive");
+
+        *global_slot().write() = None;
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", windows))]
+    #[test]
+    fn hard_link_uses_pinned_source_after_name_replacement() {
+        let _registry_guard = test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-hard-link-source-race-{}-{}",
+            std::process::id(),
+            random_hex()
+        ));
+        let root = base.join("root");
+        let data = base.join("data");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let source = root.join("source.part");
+        let moved_source = root.join("source-opened.part");
+        let destination = root.join("finished.bin");
+        std::fs::write(&source, b"pinned source").unwrap();
+        let root_string = root.to_string_lossy().into_owned();
+        initialize_approved_roots(&data, std::slice::from_ref(&root_string)).unwrap();
+        let allowed = vec![root_string];
+        let (_, opened) = open_existing_approved(&source, &allowed, false).unwrap();
+        let expected = opened_file_identity(&opened).unwrap();
+        drop(opened);
+
+        let (reached, resume) = install_hard_link_test_hook(HardLinkTestPoint::SourcePinned);
+        let thread_source = source.clone();
+        let thread_destination = destination.clone();
+        let thread_allowed = allowed.clone();
+        let thread_expected = expected.clone();
+        let worker = std::thread::spawn(move || {
+            hard_link_approved(
+                &thread_source,
+                &thread_destination,
+                &thread_allowed,
+                &thread_expected,
+            )
+        });
+        reached
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("hard-link worker pinned its source handle");
+        std::fs::rename(&source, &moved_source).unwrap();
+        std::fs::write(&source, b"replacement source").unwrap();
+        resume.send(()).unwrap();
+
+        let linked_path = worker.join().unwrap().unwrap();
+        let (_, linked) = open_existing_approved(&linked_path, &allowed, false).unwrap();
+        assert_eq!(opened_file_identity(&linked).unwrap(), expected);
+        assert_eq!(std::fs::read(&linked_path).unwrap(), b"pinned source");
+        assert_eq!(std::fs::read(&source).unwrap(), b"replacement source");
+
+        *global_slot().write() = None;
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", windows))]
+    #[test]
+    fn hard_link_validation_never_deletes_destination_replacement() {
+        let _registry_guard = test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-hard-link-destination-race-{}-{}",
+            std::process::id(),
+            random_hex()
+        ));
+        let root = base.join("root");
+        let data = base.join("data");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let source = root.join("source.part");
+        let destination = root.join("finished.bin");
+        std::fs::write(&source, b"pinned source").unwrap();
+        let root_string = root.to_string_lossy().into_owned();
+        initialize_approved_roots(&data, std::slice::from_ref(&root_string)).unwrap();
+        let allowed = vec![root_string];
+        let (_, opened) = open_existing_approved(&source, &allowed, false).unwrap();
+        let expected = opened_file_identity(&opened).unwrap();
+        drop(opened);
+
+        let (reached, resume) = install_hard_link_test_hook(HardLinkTestPoint::DestinationLinked);
+        let thread_source = source.clone();
+        let thread_destination = destination.clone();
+        let thread_allowed = allowed.clone();
+        let worker = std::thread::spawn(move || {
+            hard_link_approved(
+                &thread_source,
+                &thread_destination,
+                &thread_allowed,
+                &expected,
+            )
+        });
+        reached
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("hard-link worker created the destination link");
+        std::fs::remove_file(&destination).unwrap();
+        std::fs::write(&destination, b"replacement must survive").unwrap();
+        resume.send(()).unwrap();
+
+        assert!(worker.join().unwrap().is_err());
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"replacement must survive"
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), b"pinned source");
+
+        *global_slot().write() = None;
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn identity_checked_cleanup_rejects_name_replacement() {
+        let _registry_guard = test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-cleanup-identity-test-{}-{}",
+            std::process::id(),
+            random_hex()
+        ));
+        let root = base.join("root");
+        let data = base.join("data");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let candidate = root.join("candidate.part");
+        let moved = root.join("candidate-original.part");
+        std::fs::write(&candidate, b"original").unwrap();
+        let root_string = root.to_string_lossy().into_owned();
+        initialize_approved_roots(&data, std::slice::from_ref(&root_string)).unwrap();
+        let allowed = [root_string];
+        let (_, opened) = open_existing_approved(&candidate, &allowed, false).unwrap();
+        let expected = opened_file_identity(&opened).unwrap();
+        drop(opened);
+
+        std::fs::rename(&candidate, &moved).unwrap();
+        std::fs::write(&candidate, b"replacement must survive").unwrap();
+        assert!(remove_approved_file_if_identity(&candidate, &allowed, &expected).is_err());
+        assert_eq!(
+            std::fs::read(&candidate).unwrap(),
+            b"replacement must survive"
+        );
+
+        *global_slot().write() = None;
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_parent_handle_create_ignores_later_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let _registry_guard = test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-openat-parent-test-{}-{}",
+            std::process::id(),
+            random_hex()
+        ));
+        let root = base.join("root");
+        let parent = root.join("parent");
+        let moved = root.join("parent-opened");
+        let outside = base.join("outside");
+        let data = base.join("data");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let root_string = root.to_string_lossy().into_owned();
+        initialize_approved_roots(&data, std::slice::from_ref(&root_string)).unwrap();
+        let allowed = [root_string];
+        let (_, parent_handle, _) = verified_parent_handle(&parent, &allowed).unwrap();
+
+        std::fs::rename(&parent, &moved).unwrap();
+        symlink(&outside, &parent).unwrap();
+        let created = openat_child(
+            &parent_handle,
+            std::ffi::OsStr::new("created.part"),
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+        .unwrap();
+        drop(created);
+
+        assert!(moved.join("created.part").exists());
+        assert!(!outside.join("created.part").exists());
+        *global_slot().write() = None;
         let _ = std::fs::remove_dir_all(base);
     }
 }

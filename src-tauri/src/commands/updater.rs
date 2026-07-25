@@ -75,6 +75,7 @@ struct SignedPlatform {
 #[serde(rename_all = "camelCase")]
 pub struct UpdateInfo {
     version: String,
+    security_epoch: u64,
     notes: Option<String>,
     date: Option<String>,
 }
@@ -135,6 +136,17 @@ struct EmbeddedUpdaterConfig {
     endpoint: Url,
     public_key: String,
 }
+
+#[derive(Debug)]
+struct SignedObservationPersistenceFailed;
+
+impl std::fmt::Display for SignedObservationPersistenceFailed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("failed to persist signed updater observation floor")
+    }
+}
+
+impl std::error::Error for SignedObservationPersistenceFailed {}
 
 #[derive(Deserialize)]
 struct EmbeddedConfig {
@@ -553,20 +565,28 @@ fn reject_rollback(
     Ok(())
 }
 
-fn rollback_state_after_check(
-    update_available: bool,
+/// Offer an update when the signed candidate is strictly newer than the running
+/// binary identity `(CURRENT_SECURITY_EPOCH, current_version)`.
+///
+/// Tuple ordering lets a higher `security_epoch` authorize a lower version
+/// number (emergency epoch bump). Anti-rollback is enforced separately by
+/// [`reject_rollback`] against the persisted observation floor.
+fn should_offer_update(
     current_epoch: u64,
     current_version: &Version,
-    stored: Option<&RollbackState>,
-) -> Result<Option<RollbackState>> {
-    if update_available {
-        return Ok(None);
+    candidate_epoch: u64,
+    candidate_version: &Version,
+) -> bool {
+    (candidate_epoch, candidate_version.clone()) > (current_epoch, current_version.clone())
+}
+
+/// After a signed manifest passes anti-rollback, the observed candidate becomes
+/// the new floor (it is already `>=` the previous floor).
+fn observed_rollback_state(observed_epoch: u64, observed_version: &Version) -> RollbackState {
+    RollbackState {
+        security_epoch: observed_epoch,
+        highest_version: observed_version.to_string(),
     }
-    let (security_epoch, highest_version) = rollback_floor(current_epoch, current_version, stored)?;
-    Ok(Some(RollbackState {
-        security_epoch,
-        highest_version: highest_version.to_string(),
-    }))
 }
 
 fn state_path(app: &AppHandle) -> Result<PathBuf> {
@@ -589,6 +609,56 @@ fn save_rollback_state(path: &Path, state: &RollbackState) -> Result<()> {
     let bytes = serde_json::to_vec(state).context("failed to serialize updater rollback state")?;
     crate::security::atomic_write(path, &bytes, true)
         .context("failed to persist updater rollback state")
+}
+
+fn rollback_state_identity(state: &RollbackState) -> Result<(u64, Version)> {
+    Ok((
+        state.security_epoch,
+        Version::parse(&state.highest_version).context("updater rollback state is corrupt")?,
+    ))
+}
+
+fn persist_observed_floor(
+    path: &Path,
+    current_epoch: u64,
+    current_version: &Version,
+    observed_epoch: u64,
+    observed_version: &Version,
+) -> Result<RollbackState> {
+    let stored = load_rollback_state(path)?;
+    reject_rollback(
+        current_epoch,
+        current_version,
+        stored.as_ref(),
+        observed_epoch,
+        observed_version,
+    )?;
+    let observed = observed_rollback_state(observed_epoch, observed_version);
+    save_rollback_state(path, &observed)
+        .map_err(|error| error.context(SignedObservationPersistenceFailed))?;
+    Ok(observed)
+}
+
+fn pending_meets_persisted_floor(path: &Path, candidate: &RollbackState) -> Result<bool> {
+    let Some(stored) = load_rollback_state(path)? else {
+        // A checked update is inseparable from its durable observation floor.
+        // Missing state must not silently make an old in-memory artifact valid.
+        return Ok(false);
+    };
+    Ok(rollback_state_identity(candidate)? >= rollback_state_identity(&stored)?)
+}
+
+fn retain_only_pending_at_floor(pending: &mut Option<PendingUpdate>) -> Result<()> {
+    let keep = match pending.as_ref() {
+        Some(update) => {
+            pending_meets_persisted_floor(&update.rollback_path, &update.candidate_state)?
+        }
+        None => true,
+    };
+    if !keep {
+        pending.take();
+    }
+    Ok(())
 }
 
 fn matching_platform(manifest: &SignedManifest, update: &Update) -> Result<SignedPlatform> {
@@ -645,11 +715,14 @@ async fn secure_check(app: &AppHandle) -> Result<Option<(UpdateInfo, PendingUpda
         validate_manifest(raw_json, &config.public_key)?;
     let current_version = app.package_info().version.clone();
     let rollback_path = state_path(app)?;
-    let rollback_state = load_rollback_state(&rollback_path)?;
-    reject_rollback(
+    // Ratchet immediately after the signed document is fully parsed and
+    // accepted. The plugin's deliberately independent second fetch is still
+    // fallible; delaying this write until after it allowed an older pending
+    // artifact to survive a failed re-fetch of a newer signed observation.
+    let candidate_state = persist_observed_floor(
+        &rollback_path,
         CURRENT_SECURITY_EPOCH,
         &current_version,
-        rollback_state.as_ref(),
         manifest.security_epoch,
         &manifest_version,
     )?;
@@ -658,18 +731,33 @@ async fn secure_check(app: &AppHandle) -> Result<Option<(UpdateInfo, PendingUpda
     // Update and installing it. It fetches only the already-vetted final URL,
     // with redirects/proxies disabled. Exact raw_json equality binds that
     // second fetch to the signed bytes and closes the double-fetch TOCTOU gap.
+    //
+    // Eligibility uses an epoch-aware comparator: the default plugin rule
+    // (`release.version > current`) would ignore security-epoch bumps that
+    // ship a lower version number.
     let final_host = manifest_response
         .final_url
         .host_str()
         .ok_or_else(|| anyhow!("vetted updater endpoint lost its host"))?
         .to_string();
     let final_addresses = manifest_response.final_addresses.clone();
+    let offer_epoch = manifest.security_epoch;
+    let offer_version = manifest_version.clone();
     let updater = app
         .updater_builder()
         .endpoints(vec![manifest_response.final_url.clone()])
         .context("failed to set updater endpoint")?
         .no_proxy()
         .timeout(METADATA_DEADLINE)
+        .version_comparator(move |current, release| {
+            release.version == offer_version
+                && should_offer_update(
+                    CURRENT_SECURITY_EPOCH,
+                    &current,
+                    offer_epoch,
+                    &offer_version,
+                )
+        })
         .configure_client(move |builder| {
             builder
                 .no_proxy()
@@ -684,32 +772,28 @@ async fn secure_check(app: &AppHandle) -> Result<Option<(UpdateInfo, PendingUpda
         .check()
         .await
         .context("Tauri updater check failed")?;
-    if let Some(state) = rollback_state_after_check(
-        update.is_some(),
-        CURRENT_SECURITY_EPOCH,
-        &current_version,
-        rollback_state.as_ref(),
-    )? {
-        save_rollback_state(&rollback_path, &state)?;
-    }
-    let Some(update) = update else {
-        return Ok(None);
+    let pending_parts = if let Some(update) = update {
+        if update.raw_json != verified_json {
+            bail!("Tauri updater metadata differed from the signed manifest");
+        }
+        if update.version != manifest.version
+            || update.current_version != current_version.to_string()
+        {
+            bail!("Tauri updater version differed from the signed manifest");
+        }
+        let platform = matching_platform(&manifest, &update)?;
+        Some((update, platform))
+    } else {
+        None
     };
 
-    if update.raw_json != verified_json {
-        bail!("Tauri updater metadata differed from the signed manifest");
-    }
-    if update.version != manifest.version || update.current_version != current_version.to_string() {
-        bail!("Tauri updater version differed from the signed manifest");
-    }
-    let platform = matching_platform(&manifest, &update)?;
-    let candidate_state = RollbackState {
-        security_epoch: manifest.security_epoch,
-        highest_version: manifest.version.clone(),
+    let Some((update, platform)) = pending_parts else {
+        return Ok(None);
     };
 
     let info = UpdateInfo {
         version: manifest.version,
+        security_epoch: manifest.security_epoch,
         notes: manifest.notes,
         date: manifest.pub_date,
     };
@@ -798,8 +882,34 @@ pub async fn secure_updater_check(
             *service.pending.lock().await = Some(pending);
             Ok(Some(info))
         }
-        Ok(None) => Ok(None),
-        Err(error) => Err(public_failure("check", error)),
+        Ok(None) => {
+            let mut pending = service.pending.lock().await;
+            if let Err(error) = retain_only_pending_at_floor(&mut pending) {
+                pending.take();
+                return Err(public_failure("check", error));
+            }
+            Ok(None)
+        }
+        Err(error) => {
+            let mut pending = service.pending.lock().await;
+            if error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<SignedObservationPersistenceFailed>()
+                    .is_some()
+            }) {
+                // We accepted a newer signed document but could not durably
+                // record it. Keeping any old artifact installable would fail
+                // open across the exact persistence failure the ratchet is
+                // intended to cover.
+                pending.take();
+            } else if let Err(state_error) = retain_only_pending_at_floor(&mut pending) {
+                tracing::warn!(
+                    "Secure updater could not validate pending state after failed check: {state_error:#}"
+                );
+                pending.take();
+            }
+            Err(public_failure("check", error))
+        }
     }
 }
 
@@ -813,16 +923,34 @@ pub async fn secure_updater_install(
     let Some(update) = pending.as_ref() else {
         return Err("No verified update is ready to install.".to_string());
     };
+    if !pending_meets_persisted_floor(&update.rollback_path, &update.candidate_state)
+        .map_err(|error| public_failure("install", error))?
+    {
+        pending.take();
+        return Err(
+            "The previously checked update is older than the signed security floor. Check for updates again."
+                .to_string(),
+        );
+    }
     let config = embedded_updater_config().map_err(|error| public_failure("install", error))?;
     let artifact = download_artifact(&update.platform, &config.public_key, &on_event)
         .await
         .map_err(|error| public_failure("install", error))?;
+    // Re-read after the long download as well. Another process may have
+    // observed a newer signed floor while this process was downloading.
+    if !pending_meets_persisted_floor(&update.rollback_path, &update.candidate_state)
+        .map_err(|error| public_failure("install", error))?
+    {
+        pending.take();
+        return Err(
+            "A newer signed update was observed while downloading. Check for updates again."
+                .to_string(),
+        );
+    }
     update
         .update
         .install(&artifact)
         .map_err(|error| public_failure("install", error.into()))?;
-    save_rollback_state(&update.rollback_path, &update.candidate_state)
-        .map_err(|error| public_failure("install", error))?;
     pending.take();
     Ok(())
 }
@@ -840,6 +968,21 @@ mod tests {
 RWQf6LRCGA9i59SLOFxz6NxvASXDJeRtuZykwQepbDEGt87ig1BNpWaVWuNrm73YiIiJbq71Wi+dP9eKL8OC351vwIasSSbXxwA=
 trusted comment: timestamp:1555779966\tfile:test
 QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfNQUaOAA==";
+
+    #[test]
+    fn update_info_serializes_security_epoch_for_frontend() {
+        let serialized = serde_json::to_value(UpdateInfo {
+            version: "2.0.0".to_string(),
+            security_epoch: 7,
+            notes: Some("Security release".to_string()),
+            date: Some("2026-07-25T00:00:00Z".to_string()),
+        })
+        .unwrap();
+
+        assert_eq!(serialized["version"], "2.0.0");
+        assert_eq!(serialized["securityEpoch"], 7);
+        assert!(serialized.get("security_epoch").is_none());
+    }
 
     async fn local_response(response: &'static str) -> Url {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -886,7 +1029,36 @@ QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfN
     }
 
     #[test]
-    fn available_candidate_does_not_raise_persisted_floor() {
+    fn epoch_aware_offer_allows_lower_version_on_epoch_bump() {
+        let current = Version::parse("1.2.3").unwrap();
+        assert!(should_offer_update(
+            1,
+            &current,
+            3,
+            &Version::parse("1.0.0").unwrap(),
+        ));
+        assert!(should_offer_update(
+            1,
+            &current,
+            1,
+            &Version::parse("1.2.4").unwrap(),
+        ));
+        assert!(!should_offer_update(
+            1,
+            &current,
+            1,
+            &Version::parse("1.2.3").unwrap(),
+        ));
+        assert!(!should_offer_update(
+            1,
+            &current,
+            1,
+            &Version::parse("1.2.2").unwrap(),
+        ));
+    }
+
+    #[test]
+    fn signed_observation_raises_persisted_floor() {
         let path = std::env::temp_dir().join(format!(
             "ember-updater-rollback-{}-{}.json",
             std::process::id(),
@@ -902,14 +1074,22 @@ QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfN
         };
         save_rollback_state(&path, &stored).unwrap();
 
-        let decision = rollback_state_after_check(true, 1, &current, Some(&stored)).unwrap();
-        assert_eq!(decision, None);
-        assert_eq!(load_rollback_state(&path).unwrap(), Some(stored.clone()));
+        let observed = Version::parse("1.5.0").unwrap();
+        reject_rollback(1, &current, Some(&stored), 1, &observed).unwrap();
+        let raised = observed_rollback_state(1, &observed);
+        save_rollback_state(&path, &raised).unwrap();
+        assert_eq!(load_rollback_state(&path).unwrap(), Some(raised.clone()));
+        assert!(reject_rollback(
+            1,
+            &current,
+            Some(&raised),
+            1,
+            &Version::parse("1.4.9").unwrap(),
+        )
+        .is_err());
 
-        let no_update = rollback_state_after_check(false, 1, &current, None)
-            .unwrap()
-            .unwrap();
-        assert_eq!(no_update, stored);
+        let up_to_date = observed_rollback_state(1, &current);
+        assert_eq!(up_to_date.highest_version, "1.2.3");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -919,6 +1099,71 @@ QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfN
             );
         }
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn newer_signed_observation_invalidates_pending_after_plugin_fetch_failure() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-updater-pending-floor-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let running = Version::parse("1.0.0").unwrap();
+        let pending_v2 = observed_rollback_state(1, &Version::parse("2.0.0").unwrap());
+        save_rollback_state(&path, &pending_v2).unwrap();
+        assert!(pending_meets_persisted_floor(&path, &pending_v2).unwrap());
+
+        // This is the exact state transition when the signed v3 fetch and
+        // validation succeed but the plugin's independent metadata fetch then
+        // fails: the observation is durable before that fallible fetch.
+        persist_observed_floor(&path, 1, &running, 1, &Version::parse("3.0.0").unwrap()).unwrap();
+        assert!(!pending_meets_persisted_floor(&path, &pending_v2).unwrap());
+        assert_eq!(
+            load_rollback_state(&path).unwrap().unwrap().highest_version,
+            "3.0.0"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn transient_check_failure_retains_same_floor_pending() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-updater-same-floor-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pending = observed_rollback_state(2, &Version::parse("2.5.0").unwrap());
+        save_rollback_state(&path, &pending).unwrap();
+        assert!(pending_meets_persisted_floor(&path, &pending).unwrap());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn verified_json_binding_rejects_mutated_manifest_document() {
+        let verified = serde_json::json!({
+            "version": "1.2.4",
+            "security_epoch": 1,
+            "notes": null,
+            "platforms": {
+                "windows-x86_64-nsis": {
+                    "target": "windows-x86_64-nsis",
+                    "url": "https://example.invalid/Ember_1.2.4_x64-setup.nsis.zip",
+                    "signature": "sig",
+                    "sha256": "a".repeat(64),
+                    "size": 12
+                }
+            }
+        });
+        let mut tampered = verified.clone();
+        tampered["notes"] = serde_json::json!("mutated after sign");
+        // secure_check binds the plugin re-fetch with exact Value equality.
+        assert_ne!(tampered, verified);
     }
 
     #[test]

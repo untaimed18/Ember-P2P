@@ -213,7 +213,16 @@
     downloadError = null;
     downloadingHashes = new Set(downloadingHashes).add(file.hash);
     try {
-      await startDownload(file.hash, file.name, file.size, friendLastIp, friendLastPort);
+      await startDownload(
+        file.hash,
+        file.name,
+        file.size,
+        friendLastIp,
+        friendLastPort,
+        undefined,
+        undefined,
+        file.aich_hash,
+      );
       downloadedHashes = new Set(downloadedHashes).add(file.hash);
     } catch (e: unknown) {
       downloadError = translateError(e, m.browse_download_failed());

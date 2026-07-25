@@ -443,6 +443,20 @@ pub async fn download_collection_files(
             control.pause();
         }
 
+        let expected_aich = match crate::security::parse_expected_aich(
+            (!file.aich_hash.is_empty()).then_some(file.aich_hash.as_str()),
+        ) {
+            Ok(value) => value,
+            Err(_) => {
+                failed_count += 1;
+                tracing::warn!(
+                    "Skipping collection entry '{}': malformed AICH pin",
+                    file.name
+                );
+                continue;
+            }
+        };
+
         let transfer = Transfer {
             id: transfer_id.clone(),
             file_name: safe_name.clone(),
@@ -485,8 +499,7 @@ pub async fn download_collection_files(
             client_software: String::new(),
             country_code: None,
             user_hash: None,
-            expected_aich: (!file.aich_hash.is_empty())
-                .then(|| file.aich_hash.to_ascii_lowercase()),
+            expected_aich: expected_aich.clone(),
             completed_path: None,
             up_part_status: None,
             up_part_count: None,
@@ -496,12 +509,10 @@ pub async fn download_collection_files(
         let (active_now, persisted_transfer) = {
             let mut mgr = state.transfer_manager.write().await;
             if let Some(existing_id) = mgr.pending_transfer_id_for_hash(&file.hash) {
-                let requested_pin =
-                    (!file.aich_hash.is_empty()).then(|| file.aich_hash.to_ascii_lowercase());
                 let existing_pin = mgr
                     .get_transfer(&existing_id)
                     .and_then(|transfer| transfer.expected_aich.clone());
-                if requested_pin.is_some() && existing_pin != requested_pin {
+                if expected_aich.is_some() && existing_pin != expected_aich {
                     failed_count += 1;
                 } else {
                     skipped_count += 1;
@@ -538,8 +549,7 @@ pub async fn download_collection_files(
                     // discovery for each.
                     extra_sources: Vec::new(),
                     ember_file_hash: String::new(),
-                    expected_aich: (!file.aich_hash.is_empty())
-                        .then(|| file.aich_hash.to_ascii_lowercase()),
+                    expected_aich: expected_aich.clone(),
                     transfer_id: transfer_id.clone(),
                     control: control.clone(),
                     discovery_only: false,
@@ -588,8 +598,7 @@ pub async fn download_collection_files(
                     peer_port: 0,
                     extra_sources: Vec::new(),
                     ember_file_hash: String::new(),
-                    expected_aich: (!file.aich_hash.is_empty())
-                        .then(|| file.aich_hash.to_ascii_lowercase()),
+                    expected_aich: expected_aich.clone(),
                     transfer_id: transfer_id.clone(),
                     control,
                     discovery_only: true,

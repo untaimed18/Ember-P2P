@@ -17,6 +17,12 @@ use super::upload::{EmberSessionHandle, EmberSessionMap, UploadEvent, UploadEven
 use crate::network::ember::crypto;
 use crate::network::ember::crypto::{decrypt_chat_payload, MAX_CHAT_WIRE_LEN};
 
+/// True when `existing` is safe to reuse as the canonical outbound router for
+/// a newly authenticated dial to the same friend identity.
+fn reusable_secure_friend_session(existing: &EmberSessionHandle, peer_pk: &[u8; 32]) -> bool {
+    existing.is_fresh() && existing.is_secure_v2() && existing.peer_ember_pubkey() == *peer_pk
+}
+
 /// Result from a successfully established friend session: the outbound sender
 /// so the caller can immediately send packets before the loop consumes them.
 pub struct FriendSessionHandle {
@@ -195,33 +201,34 @@ pub async fn run_friend_session_over_transport(
     hello_caps.ember_hash = Some(peer_ember_hash);
     hello_caps.ember_pubkey = Some(peer_pk);
 
-    // Early duplicate-session check. As soon as we know the peer's
-    // ember_hash (from `exchange_ember_hello` above) we can tell whether
-    // a session is already live for them, and bail out BEFORE the
-    // expensive Ed25519 challenge-response round trip and before we
-    // send `OP_EMBER_FRIEND_REQ`. Previously we did this check only
-    // after `perform_ember_auth` + FRIEND_REQ had both completed, which:
-    //   1. Wasted ~4 RTTs of auth on a connection we immediately drop.
-    //   2. Left the peer with a ghost `EmberFriendRequest` UploadEvent
-    //      whose sender's half-connection was already being closed, so
-    //      any accept from the UI raced a TCP RST and silently failed.
+    // Membership is authoritative before any session reuse or slot claim.
+    let is_friend = friend_hashes.read().await.contains(&peer_ember_hash);
+    if !is_friend {
+        anyhow::bail!(
+            "remote peer {} is not in our friend list",
+            hex::encode(peer_ember_hash)
+        );
+    }
+
+    // Early duplicate-session check. Prefer an existing fresh secure session
+    // with the *same* PoP-bound pubkey so a concurrent dial does not flap the
+    // outbound router. Authorization for chat/browse on the peer's inbound
+    // half no longer depends on who owns this map slot (see upload.rs).
     //
-    // We re-verify the slot is still empty when we finally claim it
-    // below (after auth), so no race window widens here.
+    // When we reuse, this new socket is deterministically closed by dropping
+    // the Noise halves below — the peer's matching inbound sees EOF.
     {
         let sessions = ember_sessions.read().await;
         if let Some(existing) = sessions.get(&peer_ember_hash) {
-            // A present-but-stale entry (peer gone silently unreachable;
-            // its own reader loop hasn't hit `STALL_TIMEOUT` yet — see
-            // `EmberSessionHandle`) must NOT short-circuit this dial: doing
-            // so would hand back a handle whose writes vanish, exactly the
-            // "blocked re-dial" this freshness check exists to prevent.
-            // Falling through here re-dials for real instead.
-            if existing.is_fresh() && existing.is_secure_v2() {
+            if reusable_secure_friend_session(existing, &peer_pk) {
                 info!(
-                    "Friend session for {} already exists after Ember-Hello; skipping duplicate handshake",
+                    "Friend session for {} already exists after secure handshake; reusing canonical outbound slot and closing duplicate dial",
                     hex::encode(peer_ember_hash)
                 );
+                // Explicitly shut down any half-open work on this dial's
+                // transport by dropping reader/writer at return.
+                drop(reader);
+                drop(writer);
                 return Ok(FriendSessionHandle {
                     outbound_tx: existing.tx.clone(),
                     session_id: existing.session_id(),
@@ -231,45 +238,42 @@ pub async fn run_friend_session_over_transport(
         }
     }
 
-    let is_friend = friend_hashes.read().await.contains(&peer_ember_hash);
-    if !is_friend {
-        anyhow::bail!(
-            "remote peer {} is not in our friend list",
-            hex::encode(peer_ember_hash)
-        );
-    }
-
     let ember_hash_binding_verified = true;
 
     // Reserve the session slot atomically BEFORE we send our friend
     // request. If another concurrent dial raced us and claimed the
     // slot in the window between the pre-auth check above and here,
-    // we must NOT send our own FRIEND_REQ (the peer would get a
-    // duplicate request from the racing connection too) — return
-    // the winner's handle instead and drop this socket cleanly.
+    // reuse that winner when it matches pubkey; otherwise supersede a
+    // stale or key-mismatched entry.
     let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
     let ember_session_handle =
         EmberSessionHandle::new_secure(outbound_tx.clone(), peer_pk, peer_ember_hash);
     {
         let mut sessions = ember_sessions.write().await;
         match sessions.get(&peer_ember_hash) {
-            Some(existing) if existing.is_fresh() && existing.is_secure_v2() => {
+            Some(existing) if reusable_secure_friend_session(existing, &peer_pk) => {
                 info!(
-                    "Friend session for {} already exists (post-auth race); skipping duplicate",
+                    "Friend session for {} already exists (post-handshake race); reusing winner and closing this dial",
                     hex::encode(peer_ember_hash)
                 );
-                return Ok(FriendSessionHandle {
+                let reused = FriendSessionHandle {
                     outbound_tx: existing.tx.clone(),
                     session_id: existing.session_id(),
                     peer_ember_pubkey: existing.peer_ember_pubkey(),
-                });
+                };
+                // Drop the secure registration for the unused handle by
+                // closing it so revocation index / shutdown stay consistent.
+                ember_session_handle.close();
+                drop(reader);
+                drop(writer);
+                return Ok(reused);
             }
-            Some(stale) => {
+            Some(stale_or_mismatched) => {
                 debug!(
-                    "Friend session slot for {} held by a stale entry; evicting and claiming it",
+                    "Friend session slot for {} held by a stale or key-mismatched entry; closing and claiming it",
                     hex::encode(peer_ember_hash)
                 );
-                stale.close();
+                stale_or_mismatched.close();
             }
             None => {}
         }
@@ -414,20 +418,36 @@ pub async fn run_friend_session_over_transport(
                             }
                             match (proto, opcode) {
                                 (OP_EMULEPROT, OP_EMBER_CHAT_MSG) => {
-                                    if payload.len() <= MAX_CHAT_WIRE_LEN {
-                                        if let Some(msg) = decrypt_chat_payload(
-                                            &session_our_ed25519_secret,
-                                            &session_peer_ember_pubkey,
-                                            &payload,
-                                        ) {
-                                            let _ = session_ul_event_tx.send(UploadEvent {
+                                    if payload.len() > MAX_CHAT_WIRE_LEN {
+                                        warn!(
+                                            "Friend {} chat payload oversized ({} bytes); dropping without decrypt",
+                                            hex::encode(peer_ember_hash),
+                                            payload.len()
+                                        );
+                                    } else if let Some(msg) = decrypt_chat_payload(
+                                        &session_our_ed25519_secret,
+                                        &session_peer_ember_pubkey,
+                                        &payload,
+                                    ) {
+                                        let _ = session_ul_event_tx
+                                            .send(UploadEvent {
                                                 transfer_id: String::new(),
                                                 kind: UploadEventKind::EmberChatMessage {
                                                     ember_hash: peer_ember_hash,
                                                     message: msg,
                                                 },
-                                            }).await;
-                                        }
+                                            })
+                                            .await;
+                                    } else {
+                                        // Never log or forward ciphertext.  A
+                                        // dedicated UploadEvent + UI toast needs
+                                        // a network/mod.rs match arm (owned by
+                                        // another agent).
+                                        warn!(
+                                            "Friend {} chat decrypt failed (len={}); dropping ciphertext",
+                                            hex::encode(peer_ember_hash),
+                                            payload.len()
+                                        );
                                     }
                                 }
                                 (OP_EMULEPROT, OP_EMBER_BROWSE_REQ) => {
@@ -435,6 +455,12 @@ pub async fn run_friend_session_over_transport(
                                         transfer_id: String::new(),
                                         kind: UploadEventKind::EmberBrowseRequest {
                                             ember_hash: peer_ember_hash,
+                                            session_id: session_ember_session_handle.session_id(),
+                                            reply_tx: session_ember_session_handle.tx.clone(),
+                                            supports_ebr1:
+                                                super::multi_source::browse_request_supports_v1(
+                                                    &payload,
+                                                ),
                                         },
                                     }).await;
                                 }
@@ -809,15 +835,23 @@ async fn punch_friend(
         .local_addr()
         .map(|a| a.port())
         .unwrap_or_else(|_| our_external_addr.port());
-    crate::network::ember::relay::register_punch(
+    // Bind the exact observed/canonical external IP into the signed register
+    // payload — port alone is insufficient after the rendezvous IP-binding change.
+    crate::network::ember::relay::register_punch_with_ip(
         rendezvous_url,
         &our_ember_hash,
         &friend_ember_hash,
         advertise_port,
         our_nat_type.as_u8(),
+        our_external_addr.ip(),
         secret_key,
+        &our_ember_hash,
     )
     .await?;
+
+    let our_pubkey = ed25519_dalek::SigningKey::from_bytes(secret_key)
+        .verifying_key()
+        .to_bytes();
 
     for _ in 0..FRIEND_PUNCH_POLL_ATTEMPTS {
         tokio::time::sleep(FRIEND_PUNCH_POLL_INTERVAL).await;
@@ -825,24 +859,45 @@ async fn punch_friend(
             .await
         {
             Ok(Some(info)) => {
-                let expected_capability = match crate::network::rendezvous::fetch_identity_pubkey(
-                    rendezvous_url,
-                    &friend_ember_hash,
-                )
-                .await?
-                .and_then(|pubkey| {
-                    let owner_pubkey = ed25519_dalek::SigningKey::from_bytes(secret_key)
-                        .verifying_key()
-                        .to_bytes();
-                    crate::network::ember::crypto::derive_pairwise_presence_capability(
+                // poll_punch already verifies the IP-bound register proof.
+                let expected_capability =
+                    match crate::network::rendezvous::fetch_identity_pubkey_authenticated(
+                        rendezvous_url,
+                        &friend_ember_hash,
+                        &our_ember_hash,
+                        &our_pubkey,
                         secret_key,
-                        &pubkey,
-                        &owner_pubkey,
-                        info.epoch,
                     )
-                }) {
+                    .await
+                    {
+                        Ok(Some(pubkey)) => {
+                            crate::network::ember::crypto::derive_pairwise_presence_capability(
+                                secret_key,
+                                &pubkey,
+                                &our_pubkey,
+                                info.epoch,
+                            )
+                        }
+                        Ok(None) => None,
+                        Err(error) => {
+                            debug!("Friend punch: identity lookup failed: {error}");
+                            None
+                        }
+                    };
+                let expected_capability = match expected_capability {
                     Some(capability) => capability,
-                    None => continue,
+                    None => {
+                        let _ = crate::network::ember::relay::ack_punch(
+                            rendezvous_url,
+                            &our_ember_hash,
+                            &info.punch_id,
+                            &info.capability,
+                            info.epoch,
+                            secret_key,
+                        )
+                        .await;
+                        continue;
+                    }
                 };
                 if info.from_id != crate::network::rendezvous::hashed_id(&friend_ember_hash)
                     || info.capability != expected_capability
@@ -908,6 +963,15 @@ async fn punch_friend(
                     }
                     Err(error) => {
                         debug!("Friend QUIC punch to {peer_addr} failed: {error}");
+                        let _ = crate::network::ember::relay::ack_punch(
+                            rendezvous_url,
+                            &our_ember_hash,
+                            &info.punch_id,
+                            &info.capability,
+                            info.epoch,
+                            secret_key,
+                        )
+                        .await;
                     }
                 }
             }
@@ -1321,6 +1385,133 @@ mod tests {
                 UploadEventKind::EmberFriendConnected { ember_hash } if ember_hash == peer_ember_hash
             ),
             "expected EmberFriendConnected once the fresh session actually completes"
+        );
+    }
+
+    #[test]
+    fn reusable_secure_session_requires_fresh_secure_matching_pubkey() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let pk = [0x42u8; 32];
+        let hash = [0x11u8; 16];
+        let secure = EmberSessionHandle::new_secure(tx.clone(), pk, hash);
+        assert!(reusable_secure_friend_session(&secure, &pk));
+        assert!(!reusable_secure_friend_session(&secure, &[0x43u8; 32]));
+
+        let (tx2, _rx2) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let legacy = EmberSessionHandle::new(tx2, pk);
+        assert!(
+            !reusable_secure_friend_session(&legacy, &pk),
+            "non-v2 handles must never be reused as secure friend sessions"
+        );
+
+        let (tx3, _rx3) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let stale = EmberSessionHandle::new_secure(tx3, pk, hash);
+        stale.backdate_for_test(3600);
+        assert!(!reusable_secure_friend_session(&stale, &pk));
+    }
+
+    #[tokio::test]
+    async fn early_reuse_rejects_missing_friend_membership() {
+        let our_sk = SigningKey::generate(&mut OsRng);
+        let our_pk_bytes = our_sk.verifying_key().to_bytes();
+        let our_sk_bytes = our_sk.to_bytes();
+        let our_ember_hash =
+            crate::network::ember::crypto::node_id_from_public_key(&our_sk.verifying_key());
+
+        let peer_sk = SigningKey::generate(&mut OsRng);
+        let peer_pk_bytes = peer_sk.verifying_key().to_bytes();
+        let peer_ember_hash =
+            crate::network::ember::crypto::node_id_from_public_key(&peer_sk.verifying_key());
+
+        let (client, server) = tokio::io::duplex(8192);
+        let (client_r, client_w) = tokio::io::split(client);
+        let (mut server_r, server_w) = tokio::io::split(server);
+
+        let ember_sessions: EmberSessionMap =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+        // Pre-seed a fresh secure session as if a prior dial already won.
+        let (existing_tx, _existing_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let existing = EmberSessionHandle::new_secure(existing_tx, peer_pk_bytes, peer_ember_hash);
+        ember_sessions
+            .write()
+            .await
+            .insert(peer_ember_hash, existing);
+
+        let (ul_tx, _ul_rx) = tokio::sync::mpsc::channel(16);
+        // Empty friend set — reuse must fail membership before returning the
+        // pre-seeded handle.
+        let friend_hashes = Arc::new(RwLock::new(std::collections::HashSet::new()));
+        let addr: SocketAddr = "127.0.0.1:4662".parse().unwrap();
+
+        let session_task = tokio::spawn(run_friend_session_over_transport(
+            Box::new(client_r),
+            Box::new(client_w),
+            addr,
+            peer_ember_hash,
+            [0x11; 16],
+            our_ember_hash,
+            "tester".to_string(),
+            0,
+            4662,
+            4672,
+            false,
+            ember_sessions,
+            ul_tx,
+            friend_hashes,
+            Some(our_pk_bytes),
+            Some(our_sk_bytes),
+        ));
+
+        let mock_peer = async {
+            let first = server_r.read_u8().await.unwrap();
+            let secure = super::secure_stream::accept_after_first(
+                Box::new(server_r),
+                Box::new(server_w),
+                first,
+                peer_ember_hash,
+                peer_pk_bytes,
+                peer_sk.to_bytes(),
+            )
+            .await
+            .unwrap();
+            let mut server_r = secure.reader;
+            let mut server_w = secure.writer;
+            let (proto, opcode, _) = read_packet_inner(&mut server_r).await.unwrap();
+            assert_eq!((proto, opcode), (OP_EDONKEYHEADER, OP_HELLO));
+            let hello_answer = build_hello_answer_with_buddy_opts(
+                &[0x22; 16],
+                0,
+                4662,
+                "peer",
+                None,
+                &HelloOptions::default_for_udp_port(4672),
+            );
+            write_packet(
+                &mut server_w,
+                OP_EDONKEYHEADER,
+                OP_HELLOANSWER,
+                &hello_answer,
+            )
+            .await
+            .unwrap();
+            let (proto, opcode, _) = read_packet_inner(&mut server_r).await.unwrap();
+            assert_eq!((proto, opcode), (OP_EMULEPROT, OP_EMULEINFO));
+            let answer = build_emule_info(4672, false, Some(&peer_ember_hash), None);
+            write_packet(&mut server_w, OP_EMULEPROT, OP_EMULEINFOANSWER, &answer)
+                .await
+                .unwrap();
+            // Dialer should bail on membership; keep the socket open briefly.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+
+        let (session_res, _) = tokio::join!(session_task, mock_peer);
+        let err = match session_res.expect("join") {
+            Ok(_) => panic!("non-friend must not reuse a secure session"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err}").contains("not in our friend list"),
+            "got {err}"
         );
     }
 }

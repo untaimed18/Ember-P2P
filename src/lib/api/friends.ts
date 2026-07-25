@@ -127,4 +127,6 @@ export interface BrowseFileEntry {
   hash: string;
   size: number;
   name: string;
+  /** Optional 40-char hex AICH root when the peer includes it. */
+  aich_hash?: string;
 }

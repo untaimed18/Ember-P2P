@@ -122,14 +122,21 @@ impl PartFileWriter {
     /// The worker is a `std::thread::spawn` (not `tokio::task::spawn_blocking`)
     /// so it doesn't compete for slots in the bounded blocking pool with
     /// short-lived tasks like hash verification or `.part.met` saves.
-    pub async fn open(path: PathBuf, mode: OpenMode) -> io::Result<Self> {
+    pub async fn open(
+        path: PathBuf,
+        mode: OpenMode,
+        allowed_roots: Vec<String>,
+    ) -> io::Result<Self> {
         // Open on a blocking thread because creating + sizing the file can
         // be slow on cold disks. After this returns the worker thread takes
         // ownership of the handle.
         let path_for_open = path.clone();
-        let file = tokio::task::spawn_blocking(move || open_file(&path_for_open, mode))
-            .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn_blocking: {e}")))??;
+        let file =
+            tokio::task::spawn_blocking(move || open_file(&path_for_open, mode, &allowed_roots))
+                .await
+                .map_err(|e| {
+                    io::Error::new(io::ErrorKind::Other, format!("spawn_blocking: {e}"))
+                })??;
 
         let (tx, mut rx) = mpsc::channel::<WriteOp>(WRITER_QUEUE_CAPACITY);
 
@@ -214,18 +221,17 @@ impl PartFileWriter {
     }
 }
 
-fn open_file(path: &Path, mode: OpenMode) -> io::Result<std::fs::File> {
+fn open_file(path: &Path, mode: OpenMode, allowed_roots: &[String]) -> io::Result<std::fs::File> {
     match mode {
         OpenMode::CreateOrOpen {
             set_len_to,
             truncate_existing,
         } => {
-            let mut opts = std::fs::OpenOptions::new();
-            opts.read(true).write(true).create(true);
-            if truncate_existing {
-                opts.truncate(true);
-            }
-            let f = opts.open(path)?;
+            let (_verified, f) = crate::security::filesystem::open_or_create_approved(
+                path,
+                allowed_roots,
+                truncate_existing,
+            )?;
             if let Some(len) = set_len_to {
                 if len > 0 {
                     let cur = f.metadata()?.len();
@@ -236,10 +242,11 @@ fn open_file(path: &Path, mode: OpenMode) -> io::Result<std::fs::File> {
             }
             Ok(f)
         }
-        OpenMode::OpenExisting => std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path),
+        OpenMode::OpenExisting => {
+            let (_, file) =
+                crate::security::filesystem::open_existing_approved(path, allowed_roots, true)?;
+            Ok(file)
+        }
     }
 }
 
@@ -293,26 +300,39 @@ fn writer_loop(mut file: std::fs::File, rx: &mut mpsc::Receiver<WriteOp>) {
 mod tests {
     use super::*;
 
-    fn temp_file(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "ember-pfw-test-{}-{}-{name}.bin",
+    fn approved_temp_file(name: &str) -> (PathBuf, Vec<String>, PathBuf) {
+        let base = std::env::temp_dir().join(format!(
+            "ember-pfw-root-{}-{}-{name}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
-        ))
+        ));
+        let root = base.join("root");
+        let data = base.join("data");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let root_s = root.to_string_lossy().into_owned();
+        crate::security::filesystem::initialize_approved_roots(
+            &data,
+            std::slice::from_ref(&root_s),
+        )
+        .unwrap();
+        (root.join(format!("{name}.bin")), vec![root_s], base)
     }
 
     #[tokio::test]
     async fn write_then_read_round_trip() {
-        let path = temp_file("rt");
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let (path, allowed, base) = approved_temp_file("rt");
         let writer = PartFileWriter::open(
             path.clone(),
             OpenMode::CreateOrOpen {
                 set_len_to: Some(1024),
                 truncate_existing: true,
             },
+            allowed,
         )
         .await
         .unwrap();
@@ -322,18 +342,20 @@ mod tests {
         assert!(buf.iter().all(|&b| b == 0xAB));
 
         drop(writer);
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[tokio::test]
     async fn hash_part_md4_matches_direct_md4() {
-        let path = temp_file("md4");
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let (path, allowed, base) = approved_temp_file("md4");
         let writer = PartFileWriter::open(
             path.clone(),
             OpenMode::CreateOrOpen {
                 set_len_to: Some(4096),
                 truncate_existing: true,
             },
+            allowed,
         )
         .await
         .unwrap();
@@ -349,18 +371,20 @@ mod tests {
         assert_eq!(hash, expected);
 
         drop(writer);
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[tokio::test]
     async fn concurrent_writes_serialize_correctly() {
-        let path = temp_file("concurrent");
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let (path, allowed, base) = approved_temp_file("concurrent");
         let writer = PartFileWriter::open(
             path.clone(),
             OpenMode::CreateOrOpen {
                 set_len_to: Some(1_000_000),
                 truncate_existing: true,
             },
+            allowed,
         )
         .await
         .unwrap();
@@ -383,6 +407,6 @@ mod tests {
         }
 
         drop(writer);
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(base);
     }
 }

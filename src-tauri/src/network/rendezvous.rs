@@ -1,4 +1,4 @@
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key as ChaChaKey, XChaCha20Poly1305, XNonce};
@@ -28,6 +28,75 @@ const OP_CAPABILITY_REGISTER: u8 = 0x0c;
 const OP_CAPABILITY_LOOKUP: u8 = 0x0d;
 const OP_RELAY_MAILBOX_OFFER: u8 = 0x0e;
 const OP_RELAY_MAILBOX_POLL: u8 = 0x0f;
+const RDV_V4_DOMAIN: &[u8] = b"ember-rdv-v4";
+const OP_IDENTITY_LOOKUP_V4: u8 = 0x20;
+const OP_CAPABILITY_REGISTER_V4: u8 = 0x21;
+const OP_CAPABILITY_LOOKUP_V4: u8 = 0x22;
+const SIGNED_IP_V4: u8 = 4;
+const SIGNED_IP_V6: u8 = 6;
+
+fn encode_signed_ip(ip: IpAddr) -> Vec<u8> {
+    match ip {
+        IpAddr::V4(v4) => {
+            let mut out = Vec::with_capacity(5);
+            out.push(SIGNED_IP_V4);
+            out.extend_from_slice(&v4.octets());
+            out
+        }
+        IpAddr::V6(v6) => {
+            let mut out = Vec::with_capacity(17);
+            out.push(SIGNED_IP_V6);
+            out.extend_from_slice(&v6.octets());
+            out
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RendezvousProtocol {
+    LegacyV3,
+    IpBoundV4,
+}
+
+fn explicit_version_unsupported(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::NOT_FOUND
+            | reqwest::StatusCode::METHOD_NOT_ALLOWED
+            | reqwest::StatusCode::GONE
+            | reqwest::StatusCode::NOT_IMPLEMENTED
+            | reqwest::StatusCode::UPGRADE_REQUIRED
+    )
+}
+
+pub(crate) async fn negotiate_protocol(base_url: &str) -> Result<RendezvousProtocol, String> {
+    require_https(base_url)?;
+    let response = client(base_url)
+        .await?
+        .get(format!("{}/v4/protocol", base_url.trim_end_matches('/')))
+        .send()
+        .await
+        .map_err(|error| format!("rendezvous protocol probe failed: {error}"))?;
+    if response.status().is_success() {
+        let body: serde_json::Value =
+            serde_json::from_slice(&read_bounded_bytes(response, MAX_RESPONSE_BYTES).await?)
+                .map_err(|error| format!("rendezvous protocol probe bad body: {error}"))?;
+        return if body["version"].as_u64() == Some(4) {
+            Ok(RendezvousProtocol::IpBoundV4)
+        } else {
+            Err("rendezvous protocol probe returned an unsupported version".to_string())
+        };
+    }
+    if explicit_version_unsupported(response.status()) {
+        debug!("Rendezvous: server explicitly lacks v4; using bounded legacy v3 compatibility");
+        Ok(RendezvousProtocol::LegacyV3)
+    } else {
+        Err(format!(
+            "rendezvous protocol probe returned {}",
+            response.status()
+        ))
+    }
+}
 /// The initiator gives the responder this total window to accept an offered
 /// ticket. The network loop polls frequently enough to leave multiple
 /// attempts inside this period, even when one request reaches its timeout.
@@ -122,7 +191,7 @@ fn sign_register(
 /// hashes to the id we asked for could only have been chosen by
 /// whoever controls the corresponding private key (or by brute-force
 /// preimage search, which SHA256/BLAKE3 make infeasible).
-fn pubkey_matches_id(pubkey: &[u8; 32], claimed_id: &str) -> bool {
+pub(crate) fn pubkey_matches_id(pubkey: &[u8; 32], claimed_id: &str) -> bool {
     let pk_blake = blake3::hash(pubkey);
     let ember_hash = &pk_blake.as_bytes()[..16];
     let mut sha = Sha256::new();
@@ -168,7 +237,7 @@ fn build_relay_ticket_action_msg(
     m
 }
 
-fn build_capability_register_msg(
+fn build_capability_register_v3_msg(
     capability: &[u8; 32],
     epoch: i64,
     port: u16,
@@ -190,7 +259,48 @@ fn build_capability_register_msg(
     m
 }
 
-fn build_capability_lookup_msg(
+fn build_capability_register_v4_msg(
+    capability: &[u8; 32],
+    epoch: i64,
+    port: u16,
+    signed_ip: &[u8],
+    pubkey: &[u8; 32],
+    peer_pubkey: &[u8; 32],
+    ts: i64,
+) -> Vec<u8> {
+    let mut m =
+        Vec::with_capacity(RDV_V4_DOMAIN.len() + 1 + 32 + 8 + 2 + signed_ip.len() + 32 + 32 + 8);
+    m.extend_from_slice(RDV_V4_DOMAIN);
+    m.push(OP_CAPABILITY_REGISTER_V4);
+    m.extend_from_slice(capability);
+    m.extend_from_slice(&epoch.to_le_bytes());
+    m.extend_from_slice(&port.to_le_bytes());
+    m.extend_from_slice(signed_ip);
+    m.extend_from_slice(pubkey);
+    m.extend_from_slice(peer_pubkey);
+    m.extend_from_slice(&ts.to_le_bytes());
+    m
+}
+
+fn build_identity_lookup_v4_msg(
+    target_id: &[u8; 32],
+    requester_id: &[u8; 32],
+    requester_pubkey: &[u8; 32],
+    nonce: &[u8; 16],
+    ts: i64,
+) -> Vec<u8> {
+    let mut m = Vec::with_capacity(RDV_V4_DOMAIN.len() + 1 + 32 + 32 + 32 + 16 + 8);
+    m.extend_from_slice(RDV_V4_DOMAIN);
+    m.push(OP_IDENTITY_LOOKUP_V4);
+    m.extend_from_slice(target_id);
+    m.extend_from_slice(requester_id);
+    m.extend_from_slice(requester_pubkey);
+    m.extend_from_slice(nonce);
+    m.extend_from_slice(&ts.to_le_bytes());
+    m
+}
+
+fn build_capability_lookup_v3_msg(
     capability: &[u8; 32],
     epoch: i64,
     requester_id: &[u8; 32],
@@ -201,6 +311,26 @@ fn build_capability_lookup_msg(
     let mut m = Vec::with_capacity(RDV_DOMAIN.len() + 1 + 32 + 8 + 32 + 32 + 16 + 8);
     m.extend_from_slice(RDV_DOMAIN);
     m.push(OP_CAPABILITY_LOOKUP);
+    m.extend_from_slice(capability);
+    m.extend_from_slice(&epoch.to_le_bytes());
+    m.extend_from_slice(requester_id);
+    m.extend_from_slice(requester_pubkey);
+    m.extend_from_slice(nonce);
+    m.extend_from_slice(&ts.to_le_bytes());
+    m
+}
+
+fn build_capability_lookup_v4_msg(
+    capability: &[u8; 32],
+    epoch: i64,
+    requester_id: &[u8; 32],
+    requester_pubkey: &[u8; 32],
+    nonce: &[u8; 16],
+    ts: i64,
+) -> Vec<u8> {
+    let mut m = Vec::with_capacity(RDV_V4_DOMAIN.len() + 1 + 32 + 8 + 32 + 32 + 16 + 8);
+    m.extend_from_slice(RDV_V4_DOMAIN);
+    m.push(OP_CAPABILITY_LOOKUP_V4);
     m.extend_from_slice(capability);
     m.extend_from_slice(&epoch.to_le_bytes());
     m.extend_from_slice(requester_id);
@@ -408,6 +538,7 @@ pub async fn register(
         // available; old/hash-only relationships simply fail closed until a
         // v2 identity exchange supplies that key.
         let epoch = crate::network::ember::crypto::pairwise_capability_epoch(ts);
+        let protocol = negotiate_protocol(base_url).await?;
         for (_, friend_pubkey) in friend_identities {
             let Some(capability) =
                 crate::network::ember::crypto::derive_pairwise_presence_capability(
@@ -428,6 +559,7 @@ pub async fn register(
                 pubkey,
                 friend_pubkey,
                 secret_key,
+                protocol,
             )
             .await
             {
@@ -441,15 +573,44 @@ pub async fn register(
     }
 }
 
-pub(crate) async fn fetch_identity_pubkey(
+/// Authenticated identity lookup. The unauthenticated GET oracle is gone.
+pub(crate) async fn fetch_identity_pubkey_authenticated(
     base_url: &str,
-    ember_hash: &[u8; 16],
+    target_ember_hash: &[u8; 16],
+    our_ember_hash: &[u8; 16],
+    our_pubkey: &[u8; 32],
+    our_secret_key: &[u8; 32],
 ) -> Result<Option<[u8; 32]>, String> {
-    let id = hashed_id(ember_hash);
-    let url = format!("{}/v3/identity/{id}", base_url.trim_end_matches('/'));
+    require_https(base_url)?;
+    match negotiate_protocol(base_url).await? {
+        RendezvousProtocol::LegacyV3 => {
+            return fetch_identity_pubkey(base_url, target_ember_hash).await;
+        }
+        RendezvousProtocol::IpBoundV4 => {}
+    }
+    let target_id = hashed_id(target_ember_hash);
+    let target_raw = sha256_id_raw(target_ember_hash);
+    let requester_id = hashed_id(our_ember_hash);
+    let requester_raw = sha256_id_raw(our_ember_hash);
+    let ts = current_timestamp();
+    let nonce = random_nonce();
+    let signed = build_identity_lookup_v4_msg(&target_raw, &requester_raw, our_pubkey, &nonce, ts);
+    use ed25519_dalek::Signer;
+    let sig = signing_key_from_secret(our_secret_key).sign(&signed);
     let resp = client(base_url)
         .await?
-        .get(url)
+        .post(format!(
+            "{}/v4/identity/lookup",
+            base_url.trim_end_matches('/')
+        ))
+        .json(&serde_json::json!({
+            "target_id": target_id,
+            "requester_id": requester_id,
+            "requester_pubkey": hex::encode(our_pubkey),
+            "nonce": hex::encode(nonce),
+            "ts": ts,
+            "sig": hex::encode(sig.to_bytes()),
+        }))
         .send()
         .await
         .map_err(|e| format!("rendezvous identity lookup failed: {e}"))?;
@@ -467,9 +628,48 @@ pub(crate) async fn fetch_identity_pubkey(
             .map_err(|e| format!("rendezvous identity lookup bad body: {e}"))?;
     let mut pubkey = [0u8; 32];
     if hex::decode_to_slice(body["pubkey"].as_str().unwrap_or_default(), &mut pubkey).is_err()
-        || !pubkey_matches_id(&pubkey, &id)
+        || !pubkey_matches_id(&pubkey, &target_id)
     {
         return Err("rendezvous identity lookup returned an invalid identity binding".to_string());
+    }
+    Ok(Some(pubkey))
+}
+
+/// Temporary legacy-v3 identity lookup used only after `/v4/protocol`
+/// explicitly reports unsupported. Callers must prefer
+/// [`fetch_identity_pubkey_authenticated`].
+pub(crate) async fn fetch_identity_pubkey(
+    base_url: &str,
+    ember_hash: &[u8; 16],
+) -> Result<Option<[u8; 32]>, String> {
+    require_https(base_url)?;
+    let id = hashed_id(ember_hash);
+    let response = client(base_url)
+        .await?
+        .get(format!(
+            "{}/v3/identity/{id}",
+            base_url.trim_end_matches('/')
+        ))
+        .send()
+        .await
+        .map_err(|error| format!("legacy rendezvous identity lookup failed: {error}"))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !response.status().is_success() {
+        return Err(format!(
+            "legacy rendezvous identity lookup returned {}",
+            response.status()
+        ));
+    }
+    let body: serde_json::Value =
+        serde_json::from_slice(&read_bounded_bytes(response, MAX_RESPONSE_BYTES).await?)
+            .map_err(|error| format!("legacy rendezvous identity lookup bad body: {error}"))?;
+    let mut pubkey = [0u8; 32];
+    if hex::decode_to_slice(body["pubkey"].as_str().unwrap_or_default(), &mut pubkey).is_err()
+        || !pubkey_matches_id(&pubkey, &id)
+    {
+        return Err("legacy rendezvous identity lookup returned invalid binding".to_string());
     }
     Ok(Some(pubkey))
 }
@@ -483,46 +683,86 @@ async fn register_pairwise_presence(
     pubkey: &[u8; 32],
     peer_pubkey: &[u8; 32],
     secret_key: &[u8; 32],
+    protocol: RendezvousProtocol,
 ) -> Result<(), String> {
     use ed25519_dalek::Signer;
     let ts = current_timestamp();
-    let signed = build_capability_register_msg(
-        capability,
-        epoch,
-        port,
-        external_ip.octets(),
-        pubkey,
-        peer_pubkey,
-        ts,
-    );
+    let (route, signed, legacy_sig) = match protocol {
+        RendezvousProtocol::LegacyV3 => (
+            "/v3/presence/register",
+            build_capability_register_v3_msg(
+                capability,
+                epoch,
+                port,
+                external_ip.octets(),
+                pubkey,
+                peer_pubkey,
+                ts,
+            ),
+            None,
+        ),
+        RendezvousProtocol::IpBoundV4 => {
+            // Carry the exact legacy proof in the authenticated v4 admission.
+            // The server stores both versions atomically while charging one
+            // logical registration, so old clients remain compatible without
+            // a second rate-limited HTTP mutation.
+            let legacy_signed = build_capability_register_v3_msg(
+                capability,
+                epoch,
+                port,
+                external_ip.octets(),
+                pubkey,
+                peer_pubkey,
+                ts,
+            );
+            (
+                "/v4/presence/register",
+                build_capability_register_v4_msg(
+                    capability,
+                    epoch,
+                    port,
+                    &encode_signed_ip(IpAddr::V4(external_ip)),
+                    pubkey,
+                    peer_pubkey,
+                    ts,
+                ),
+                Some(signing_key_from_secret(secret_key).sign(&legacy_signed)),
+            )
+        }
+    };
     let sig = signing_key_from_secret(secret_key).sign(&signed);
+    let mut body = serde_json::json!({
+        "capability": hex::encode(capability),
+        "epoch": epoch,
+        "port": port,
+        "ip": external_ip.to_string(),
+        "pubkey": hex::encode(pubkey),
+        "peer_pubkey": hex::encode(peer_pubkey),
+        "ts": ts,
+        "sig": hex::encode(sig.to_bytes()),
+    });
+    if let Some(legacy_sig) = legacy_sig {
+        body.as_object_mut()
+            .expect("presence body is an object")
+            .insert(
+                "legacy_sig".to_string(),
+                serde_json::Value::String(hex::encode(legacy_sig.to_bytes())),
+            );
+    }
     let resp = client(base_url)
         .await?
-        .post(format!(
-            "{}/v3/presence/register",
-            base_url.trim_end_matches('/')
-        ))
-        .json(&serde_json::json!({
-            "capability": hex::encode(capability),
-            "epoch": epoch,
-            "port": port,
-            "ip": external_ip.to_string(),
-            "pubkey": hex::encode(pubkey),
-            "peer_pubkey": hex::encode(peer_pubkey),
-            "ts": ts,
-            "sig": hex::encode(sig.to_bytes()),
-        }))
+        .post(format!("{}{}", base_url.trim_end_matches('/'), route,))
+        .json(&body)
         .send()
         .await
         .map_err(|e| format!("pairwise presence register failed: {e}"))?;
-    if resp.status().is_success() {
-        Ok(())
-    } else {
-        Err(format!(
+    if !resp.status().is_success() {
+        return Err(format!(
             "pairwise presence register returned {}",
             resp.status()
-        ))
+        ));
     }
+    Ok(())
 }
 
 /// Look up a friend on the rendezvous server.
@@ -569,12 +809,21 @@ pub async fn lookup(
     friend_hash: &[u8; 16],
 ) -> Result<Option<(Ipv4Addr, u16)>, String> {
     require_https(base_url)?;
-    let Some(friend_pubkey) = fetch_identity_pubkey(base_url, friend_hash).await? else {
+    let Some(friend_pubkey) = fetch_identity_pubkey_authenticated(
+        base_url,
+        friend_hash,
+        our_ember_hash,
+        our_pubkey,
+        our_secret_key,
+    )
+    .await?
+    else {
         return Ok(None);
     };
     let requester_id = hashed_id(our_ember_hash);
     let requester_raw = sha256_id_raw(our_ember_hash);
     let friend_id = hashed_id(friend_hash);
+    let protocol = negotiate_protocol(base_url).await?;
     let now = current_timestamp();
     let current_epoch = crate::network::ember::crypto::pairwise_capability_epoch(now);
     let mut successful: Option<(reqwest::Response, [u8; 32], i64)> = None;
@@ -589,16 +838,35 @@ pub async fn lookup(
         };
         let nonce = random_nonce();
         let ts = current_timestamp();
-        let signed =
-            build_capability_lookup_msg(&capability, epoch, &requester_raw, our_pubkey, &nonce, ts);
+        let (route, signed) = match protocol {
+            RendezvousProtocol::LegacyV3 => (
+                "/v3/presence/lookup",
+                build_capability_lookup_v3_msg(
+                    &capability,
+                    epoch,
+                    &requester_raw,
+                    our_pubkey,
+                    &nonce,
+                    ts,
+                ),
+            ),
+            RendezvousProtocol::IpBoundV4 => (
+                "/v4/presence/lookup",
+                build_capability_lookup_v4_msg(
+                    &capability,
+                    epoch,
+                    &requester_raw,
+                    our_pubkey,
+                    &nonce,
+                    ts,
+                ),
+            ),
+        };
         use ed25519_dalek::Signer;
         let sig = signing_key_from_secret(our_secret_key).sign(&signed);
         let resp = client(base_url)
             .await?
-            .post(format!(
-                "{}/v3/presence/lookup",
-                base_url.trim_end_matches('/')
-            ))
+            .post(format!("{}{}", base_url.trim_end_matches('/'), route,))
             .json(&serde_json::json!({
                 "capability": hex::encode(capability),
                 "epoch": epoch,
@@ -699,15 +967,40 @@ pub async fn lookup(
     }
 
     if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
-        let msg = build_capability_register_msg(
-            &capability,
-            epoch,
-            port,
-            ip.octets(),
-            &pubkey,
-            our_pubkey,
-            ts,
-        );
+        let proof_version = body["proof_version"]
+            .as_u64()
+            .and_then(|value| u8::try_from(value).ok())
+            .unwrap_or(match protocol {
+                RendezvousProtocol::LegacyV3 => 3,
+                RendezvousProtocol::IpBoundV4 => 0,
+            });
+        let msg = match proof_version {
+            3 => build_capability_register_v3_msg(
+                &capability,
+                epoch,
+                port,
+                ip.octets(),
+                &pubkey,
+                our_pubkey,
+                ts,
+            ),
+            4 => build_capability_register_v4_msg(
+                &capability,
+                epoch,
+                port,
+                &encode_signed_ip(IpAddr::V4(ip)),
+                &pubkey,
+                our_pubkey,
+                ts,
+            ),
+            _ => {
+                warn!(
+                    "Rendezvous: lookup for {}… returned unknown proof version",
+                    &friend_id[..8]
+                );
+                return Ok(None);
+            }
+        };
         if !ed25519_verify_lookup(&pubkey, &msg, &sig) {
             warn!(
                 "Rendezvous: lookup for {}… signature verification failed; refusing to connect (server may be compromised)",
@@ -1089,9 +1382,15 @@ pub async fn offer_friend_relay_ticket(
     let responder_id = hashed_id(responder_ember_hash);
     let initiator_raw = sha256_id_raw(initiator_ember_hash);
     let responder_raw = sha256_id_raw(responder_ember_hash);
-    let responder_pubkey = fetch_identity_pubkey(base_url, responder_ember_hash)
-        .await?
-        .ok_or_else(|| "relay responder has no registered v2 identity".to_string())?;
+    let responder_pubkey = fetch_identity_pubkey_authenticated(
+        base_url,
+        responder_ember_hash,
+        initiator_ember_hash,
+        initiator_pubkey,
+        secret_key,
+    )
+    .await?
+    .ok_or_else(|| "relay responder has no registered v2 identity".to_string())?;
     let ts = current_timestamp();
     let epoch = crate::network::ember::crypto::pairwise_capability_epoch(ts);
     let capability = crate::network::ember::crypto::derive_pairwise_presence_capability(
@@ -1373,6 +1672,61 @@ mod relay_ticket_tests {
         assert_eq!(OP_CAPABILITY_LOOKUP, 0x0d);
         assert_eq!(OP_RELAY_MAILBOX_OFFER, 0x0e);
         assert_eq!(OP_RELAY_MAILBOX_POLL, 0x0f);
+        assert_eq!(OP_IDENTITY_LOOKUP_V4, 0x20);
+        assert_eq!(OP_CAPABILITY_REGISTER_V4, 0x21);
+        assert_eq!(OP_CAPABILITY_LOOKUP_V4, 0x22);
+    }
+
+    #[test]
+    fn signed_ip_encoding_prefixes_family_tag() {
+        let v4 = encode_signed_ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)));
+        assert_eq!(v4, vec![SIGNED_IP_V4, 203, 0, 113, 10]);
+    }
+
+    #[test]
+    fn legacy_and_v4_presence_payload_vectors_are_unambiguous() {
+        let capability = [1; 32];
+        let pubkey = [2; 32];
+        let peer = [3; 32];
+        let legacy =
+            build_capability_register_v3_msg(&capability, 7, 4662, [8, 8, 4, 4], &pubkey, &peer, 9);
+        let v4 = build_capability_register_v4_msg(
+            &capability,
+            7,
+            4662,
+            &[SIGNED_IP_V4, 8, 8, 4, 4],
+            &pubkey,
+            &peer,
+            9,
+        );
+        assert_eq!(&legacy[..RDV_DOMAIN.len()], RDV_DOMAIN);
+        assert_eq!(legacy[RDV_DOMAIN.len()], OP_CAPABILITY_REGISTER);
+        assert_eq!(&v4[..RDV_V4_DOMAIN.len()], RDV_V4_DOMAIN);
+        assert_eq!(v4[RDV_V4_DOMAIN.len()], OP_CAPABILITY_REGISTER_V4);
+        assert_eq!(legacy.len() + 1, v4.len());
+        assert_ne!(legacy, v4);
+    }
+
+    #[test]
+    fn new_client_falls_back_only_for_explicit_unsupported_version() {
+        for status in [
+            reqwest::StatusCode::NOT_FOUND,
+            reqwest::StatusCode::METHOD_NOT_ALLOWED,
+            reqwest::StatusCode::GONE,
+            reqwest::StatusCode::NOT_IMPLEMENTED,
+            reqwest::StatusCode::UPGRADE_REQUIRED,
+        ] {
+            assert!(explicit_version_unsupported(status));
+        }
+        assert!(!explicit_version_unsupported(
+            reqwest::StatusCode::FORBIDDEN
+        ));
+        assert!(!explicit_version_unsupported(
+            reqwest::StatusCode::UNAUTHORIZED
+        ));
+        assert!(!explicit_version_unsupported(
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        ));
     }
 
     #[test]

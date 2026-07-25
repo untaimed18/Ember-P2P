@@ -69,8 +69,17 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
+/// Explicit v2 protocol rejection (wrong magic / status).  UI maps this to the
+/// "friend must upgrade Ember" copy — do **not** use for generic I/O or
+/// timeouts, which would mislabel RST/timeout as an upgrade problem.
 fn upgrade_required(message: impl std::fmt::Display) -> anyhow::Error {
     anyhow::anyhow!("{UPGRADE_REQUIRED_ERROR}: {message}")
+}
+
+/// Connectivity / crypto failure that is *not* an explicit "peer lacks v2"
+/// rejection.  Callers must not treat these as [`UPGRADE_REQUIRED_ERROR`].
+fn connect_failed(message: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::anyhow!("secure-stream connect failed: {message}")
 }
 
 async fn write_handshake_message<W: AsyncWrite + Unpin + ?Sized>(
@@ -133,14 +142,17 @@ pub async fn initiate(
         raw_writer.flush().await
     })
     .await
-    .map_err(|_| upgrade_required("peer did not accept the v2 preamble"))?
-    .map_err(|e| upgrade_required(format!("v2 preamble write failed: {e}")))?;
+    .map_err(|_| connect_failed("timed out writing the v2 preamble"))?
+    .map_err(|e| connect_failed(format!("v2 preamble write failed: {e}")))?;
 
     let mut ack = [0u8; ACK_LEN];
     tokio::time::timeout(HANDSHAKE_TIMEOUT, raw_reader.read_exact(&mut ack))
         .await
-        .map_err(|_| upgrade_required("peer did not answer the v2 preamble"))?
-        .map_err(|e| upgrade_required(format!("peer closed before the v2 acknowledgement: {e}")))?;
+        .map_err(|_| connect_failed("timed out waiting for the v2 acknowledgement"))?
+        .map_err(|e| connect_failed(format!("peer closed before the v2 acknowledgement: {e}")))?;
+    // Only an explicit non-v2 / rejection ACK is upgrade-required.  A truncated
+    // or garbage reply that still matches length is treated as protocol reject
+    // when the magic/status do not match; I/O failures above stay generic.
     if ack[..ACK_MAGIC.len()] != ACK_MAGIC || ack[ACK_MAGIC.len()] != 0 {
         return Err(upgrade_required(
             "peer rejected or does not support secure friend-stream v2",
@@ -148,16 +160,16 @@ pub async fn initiate(
     }
     let peer_ed25519_public_key: [u8; 32] = ack[ACK_MAGIC.len() + 1..]
         .try_into()
-        .map_err(|_| upgrade_required("malformed v2 acknowledgement"))?;
+        .map_err(|_| connect_failed("malformed v2 acknowledgement"))?;
     if !crypto::verify_ember_hash_binding(&peer_ed25519_public_key, &expected_peer_hash) {
-        return Err(upgrade_required(
+        return Err(connect_failed(
             "responder public key does not match the expected friend identity",
         ));
     }
 
     let local_private = crypto::ed25519_seed_to_x25519_private(&our_ed25519_secret_key);
     let remote_public = crypto::ed25519_public_to_x25519(&peer_ed25519_public_key)
-        .ok_or_else(|| upgrade_required("responder has an invalid identity key"))?;
+        .ok_or_else(|| connect_failed("responder has an invalid identity key"))?;
     let params: snow::params::NoiseParams = NOISE_PATTERN
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid secure-stream Noise pattern: {e}"))?;
@@ -167,33 +179,33 @@ pub async fn initiate(
         .remote_public_key(&remote_public)
         .prologue(&binding)
         .build_initiator()
-        .map_err(|e| upgrade_required(format!("could not initialize Noise IK: {e}")))?;
+        .map_err(|e| connect_failed(format!("could not initialize Noise IK: {e}")))?;
 
     let mut message_1 = [0u8; MAX_HANDSHAKE_MESSAGE];
     let message_1_len = handshake
         .write_message(&[], &mut message_1)
-        .map_err(|e| upgrade_required(format!("could not create Noise IK message 1: {e}")))?;
+        .map_err(|e| connect_failed(format!("could not create Noise IK message 1: {e}")))?;
     write_handshake_message(&mut *raw_writer, &message_1[..message_1_len])
         .await
-        .map_err(|e| upgrade_required(format!("Noise IK message 1 failed: {e}")))?;
+        .map_err(|e| connect_failed(format!("Noise IK message 1 failed: {e}")))?;
 
     let message_2 = read_handshake_message(&mut *raw_reader)
         .await
-        .map_err(|e| upgrade_required(format!("Noise IK message 2 failed: {e}")))?;
+        .map_err(|e| connect_failed(format!("Noise IK message 2 failed: {e}")))?;
     let mut payload = [0u8; MAX_HANDSHAKE_MESSAGE];
     handshake
         .read_message(&message_2, &mut payload)
-        .map_err(|e| upgrade_required(format!("Noise IK authentication failed: {e}")))?;
+        .map_err(|e| connect_failed(format!("Noise IK authentication failed: {e}")))?;
 
     let learned_remote = handshake
         .get_remote_static()
-        .ok_or_else(|| upgrade_required("Noise IK did not authenticate a responder static key"))?;
+        .ok_or_else(|| connect_failed("Noise IK did not authenticate a responder static key"))?;
     if learned_remote != remote_public {
-        return Err(upgrade_required("Noise IK responder identity mismatch"));
+        return Err(connect_failed("Noise IK responder identity mismatch"));
     }
     let transport = handshake
         .into_transport_mode()
-        .map_err(|e| upgrade_required(format!("could not enter Noise transport mode: {e}")))?;
+        .map_err(|e| connect_failed(format!("could not enter Noise transport mode: {e}")))?;
 
     Ok(spawn_record_layer(
         raw_reader,
@@ -559,5 +571,76 @@ mod tests {
         for marker in [0xE3u8, 0xC5, 0xD4] {
             assert!(!is_preamble_first_byte(marker));
         }
+    }
+
+    #[test]
+    fn upgrade_required_error_string_is_stable_for_ui() {
+        let err = upgrade_required("peer rejected or does not support secure friend-stream v2");
+        let text = format!("{err}");
+        assert!(text.starts_with(UPGRADE_REQUIRED_ERROR));
+        assert!(!format!("{}", connect_failed("timed out")).contains(UPGRADE_REQUIRED_ERROR));
+    }
+
+    #[tokio::test]
+    async fn non_v2_ack_maps_to_upgrade_required_not_generic_timeout() {
+        let (alice_key, alice_hash) = identity();
+        let (_, bob_hash) = identity();
+        let (alice_wire, bob_wire) = tokio::io::duplex(8192);
+        let (alice_r, alice_w) = tokio::io::split(alice_wire);
+        let (mut bob_r, mut bob_w) = tokio::io::split(bob_wire);
+
+        let responder = tokio::spawn(async move {
+            let mut preamble = [0u8; PREAMBLE_LEN];
+            bob_r.read_exact(&mut preamble).await.unwrap();
+            // Explicit non-v2 acknowledgement (wrong magic).
+            bob_w.write_all(&[0xE3; ACK_LEN]).await.unwrap();
+            bob_w.flush().await.unwrap();
+        });
+
+        let err = initiate(
+            Box::new(alice_r),
+            Box::new(alice_w),
+            alice_hash,
+            bob_hash,
+            alice_key.verifying_key().to_bytes(),
+            alice_key.to_bytes(),
+        )
+        .await
+        .err()
+        .expect("non-v2 ACK must fail");
+        let text = format!("{err}");
+        assert!(
+            text.contains(UPGRADE_REQUIRED_ERROR),
+            "explicit protocol reject must be upgrade-required, got {text}"
+        );
+        let _ = responder.await;
+    }
+
+    #[tokio::test]
+    async fn preamble_timeout_is_not_upgrade_required() {
+        let (alice_key, alice_hash) = identity();
+        let (_, bob_hash) = identity();
+        let (alice_wire, _bob_wire) = tokio::io::duplex(8192);
+        let (alice_r, alice_w) = tokio::io::split(alice_wire);
+        // Drop the peer side so the ACK read fails as a closed connection /
+        // timeout-class connect failure rather than an upgrade reject.
+        drop(_bob_wire);
+
+        let err = initiate(
+            Box::new(alice_r),
+            Box::new(alice_w),
+            alice_hash,
+            bob_hash,
+            alice_key.verifying_key().to_bytes(),
+            alice_key.to_bytes(),
+        )
+        .await
+        .err()
+        .expect("closed peer must fail");
+        let text = format!("{err}");
+        assert!(
+            !text.contains(UPGRADE_REQUIRED_ERROR),
+            "I/O failure must not be labeled upgrade-required, got {text}"
+        );
     }
 }

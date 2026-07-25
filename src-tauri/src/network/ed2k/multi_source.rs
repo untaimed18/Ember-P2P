@@ -1162,10 +1162,25 @@ impl MultiSourceDownload {
             self.sources.len()
         );
 
-        let temp_dir = self.download_dir.join("Temp");
-        let completed_dir = self.download_dir.join("Downloads");
-        tokio::fs::create_dir_all(&temp_dir).await?;
-        tokio::fs::create_dir_all(&completed_dir).await?;
+        let allowed_roots = vec![self.download_dir.to_string_lossy().into_owned()];
+        let temp_dir = {
+            let root = self.download_dir.clone();
+            let allowed = allowed_roots.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::security::filesystem::prepare_approved_subdir(&root, "Temp", &allowed)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("temp dir task failed: {e}"))??
+        };
+        let _completed_dir = {
+            let root = self.download_dir.clone();
+            let allowed = allowed_roots.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::security::filesystem::prepare_approved_subdir(&root, "Downloads", &allowed)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("downloads dir task failed: {e}"))??
+        };
 
         let part_path = temp_dir.join(format!("{}.part", self.transfer_id));
         let file_size = self.file_size;
@@ -1214,6 +1229,7 @@ impl MultiSourceDownload {
             let pp = part_path.clone();
             let fs = self.file_size;
             let tid = self.transfer_id.clone();
+            let allowed = allowed_roots.clone();
             tokio::task::spawn_blocking(move || -> std::io::Result<()> {
                 let existing_len = if pp.exists() {
                     std::fs::metadata(&pp)?.len()
@@ -1228,23 +1244,14 @@ impl MultiSourceDownload {
                              .part.met may be missing or corrupt"
                         );
                     }
-                    let f = std::fs::OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .read(true)
-                        .open(&pp)?;
-                    if fs > 0 && f.metadata()?.len() != fs {
-                        f.set_len(fs)?;
-                    }
-                } else {
-                    let f = std::fs::OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .truncate(true)
-                        .open(&pp)?;
-                    if fs > 0 {
-                        f.set_len(fs)?;
-                    }
+                }
+                let (_verified, f) = crate::security::filesystem::open_or_create_approved(
+                    &pp,
+                    &allowed,
+                    !resuming,
+                )?;
+                if fs > 0 && f.metadata()?.len() != fs {
+                    f.set_len(fs)?;
                 }
                 Ok(())
             })
@@ -1621,6 +1628,7 @@ impl MultiSourceDownload {
         let shared_part_file = super::write_coordinator::PartFileWriter::open(
             part_path.clone(),
             super::write_coordinator::OpenMode::OpenExisting,
+            allowed_roots.clone(),
         )
         .await
         .map_err(|e| anyhow::anyhow!("open part file: {e}"))?;
@@ -3436,14 +3444,39 @@ impl MultiSourceDownload {
             // the bytes currently on disk diverged from the verified state.
             let expected = hex::encode(self.file_hash);
             let verify_path = part_path.clone();
+            let verify_root = self.download_dir.clone();
+            let expected_aich = self.expected_aich_master;
             let ember_expected = self.ember_file_hash;
-            let verified_ok = match tokio::task::spawn_blocking(move || {
-                let ed2k = super::hash::ed2k_hash_file(&verify_path)?;
-                if ed2k != expected {
-                    anyhow::bail!("ed2k mismatch: expected={expected} got={ed2k}");
-                }
+            let verified_result = match tokio::task::spawn_blocking(move || {
+                use std::io::{Read, Seek, SeekFrom};
+                let allowed = vec![verify_root.to_string_lossy().into_owned()];
+                let (_, mut file) = crate::security::filesystem::open_existing_approved(
+                    &verify_path,
+                    &allowed,
+                    false,
+                )?;
+                let identity = crate::security::filesystem::opened_file_identity(&file)?;
+                let hash = super::hash::ed2k_hash_open_file(&mut file)?;
+                let aich = if expected_aich.is_some() {
+                    Some(
+                        super::aich::AICHRecoveryHashSet::build_from_open_file(&mut file)?
+                            .root_hash,
+                    )
+                } else {
+                    None
+                };
                 if ember_expected != [0u8; 32] {
-                    let got = crate::network::ember::crypto::blake3_hash_file_path(&verify_path)?;
+                    file.seek(SeekFrom::Start(0))?;
+                    let mut hasher = crate::network::ember::crypto::Blake3FileHasher::new();
+                    let mut buf = vec![0u8; 1024 * 1024];
+                    loop {
+                        let n = file.read(&mut buf)?;
+                        if n == 0 {
+                            break;
+                        }
+                        hasher.update(&buf[..n]);
+                    }
+                    let got = hasher.finalize();
                     if got != ember_expected {
                         anyhow::bail!(
                             "ember blake3 mismatch: expected={} got={}",
@@ -3452,42 +3485,45 @@ impl MultiSourceDownload {
                         );
                     }
                 }
-                Ok(())
+                Ok::<_, anyhow::Error>((hash, identity, aich))
             })
             .await
             {
-                Ok(Ok(())) => {
+                Ok(Ok((actual, identity, actual_aich))) if actual == expected => {
                     info!(
                         "Multi-source download complete and verified from disk: {}",
                         self.file_name
                     );
-                    true
+                    Some((identity, actual_aich))
+                }
+                Ok(Ok((actual, _, _))) => {
+                    warn!(
+                        "Multi-source download hash mismatch for {}: expected={}, got={}",
+                        self.file_name, expected, actual
+                    );
+                    None
                 }
                 Ok(Err(e)) => {
                     warn!(
                         "Multi-source download hash verification failed for {}: {e}",
                         self.file_name
                     );
-                    false
+                    None
                 }
                 Err(e) => {
                     warn!(
                         "Hash verification task failed for {}: {e} — treating as failed",
                         self.file_name
                     );
-                    false
+                    None
                 }
             };
 
-            if verified_ok {
+            if let Some((verified_identity, actual_aich)) = verified_result {
                 if let Some(expected_aich) = self.expected_aich_master {
-                    let aich_path = part_path.clone();
-                    let computed = tokio::task::spawn_blocking(move || {
-                        super::aich::AICHRecoveryHashSet::build_from_file(&aich_path)
-                            .map(|set| set.root_hash)
-                    })
-                    .await
-                    .map_err(|error| anyhow::anyhow!("AICH verification task failed: {error}"))??;
+                    let computed = actual_aich.ok_or_else(|| {
+                        anyhow::anyhow!("AICH verification did not produce a root")
+                    })?;
                     if computed != expected_aich {
                         anyhow::bail!(
                             "Expected AICH hash mismatch: expected {}, got {}",
@@ -3510,13 +3546,18 @@ impl MultiSourceDownload {
                 let fp = final_path.clone();
                 let root = self.download_dir.clone();
                 let actual_final = tokio::task::spawn_blocking(move || {
-                    super::transfer::move_part_to_final_approved(&pp, &fp, &root)
+                    super::transfer::move_part_to_final_approved(
+                        &pp,
+                        &fp,
+                        &root,
+                        &verified_identity,
+                    )
                 })
                 .await
                 .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
                 {
                     let t = tracker.read().await;
-                    t.delete_met();
+                    t.delete_met(&[self.download_dir.to_string_lossy().into_owned()]);
                 }
                 // `part_hashes` was fetched from a source via
                 // OP_HASHSETREQUEST(2) and cryptographically verified
@@ -6263,9 +6304,15 @@ async fn download_parts_from_source(
     let output = if let Some(shared) = shared_output {
         shared
     } else {
+        let allowed = part_path
+            .parent()
+            .and_then(|temp| temp.parent())
+            .map(|root| vec![root.to_string_lossy().into_owned()])
+            .unwrap_or_default();
         super::write_coordinator::PartFileWriter::open(
             part_path.to_path_buf(),
             super::write_coordinator::OpenMode::OpenExisting,
+            allowed,
         )
         .await
         .map_err(|e| anyhow::anyhow!("open part file: {e}"))?
@@ -9299,8 +9346,83 @@ mod tests {
 /// so a single oversized name can't wedge the layout either.
 const MAX_BROWSE_ENTRIES: usize = 1000;
 const MAX_BROWSE_NAME_BYTES: usize = 256;
+/// Ember browse-response v1 marker. Legacy payloads omit this and carry
+/// no AICH roots; v1 appends an optional per-entry AICH flag + 20 bytes.
+pub(crate) const BROWSE_RESPONSE_V1_MAGIC: &[u8; 4] = b"EBR1";
 
-pub(crate) fn parse_browse_response(data: &[u8]) -> Vec<(String, u64, String)> {
+pub(crate) fn browse_request_supports_v1(payload: &[u8]) -> bool {
+    payload == BROWSE_RESPONSE_V1_MAGIC
+}
+
+/// One browse listing row: `(ed2k_hash_hex, size, name, optional_aich_hex)`.
+pub(crate) type BrowseEntry = (String, u64, String, Option<String>);
+
+/// Encode a friend-browse answer. When `aich` is a valid 40-char hex root it
+/// is included; otherwise the flag is zero — never invent a pin.
+pub(crate) fn encode_browse_response_v1<'a, I>(entries: I) -> Vec<u8>
+where
+    I: IntoIterator<Item = (&'a [u8; 16], u64, &'a [u8], Option<&'a [u8; 20]>)>,
+{
+    let mut out = Vec::new();
+    out.extend_from_slice(BROWSE_RESPONSE_V1_MAGIC);
+    let count_offset = out.len();
+    out.extend_from_slice(&0u32.to_le_bytes());
+    let mut count = 0u32;
+    for (hash, size, name, aich) in entries {
+        if count as usize >= MAX_BROWSE_ENTRIES {
+            break;
+        }
+        out.extend_from_slice(hash);
+        out.extend_from_slice(&size.to_le_bytes());
+        let name_len = name.len().min(MAX_BROWSE_NAME_BYTES).min(u16::MAX as usize) as u16;
+        out.extend_from_slice(&name_len.to_le_bytes());
+        out.extend_from_slice(&name[..name_len as usize]);
+        match aich {
+            Some(root) => {
+                out.push(1);
+                out.extend_from_slice(root);
+            }
+            None => out.push(0),
+        }
+        count += 1;
+    }
+    out[count_offset..count_offset + 4].copy_from_slice(&count.to_le_bytes());
+    out
+}
+
+/// Exact legacy count-first response. It intentionally has no marker or AICH
+/// flag, so pre-EBR1 clients consume the same bytes they always did.
+pub(crate) fn encode_browse_response_legacy<'a, I>(entries: I) -> Vec<u8>
+where
+    I: IntoIterator<Item = (&'a [u8; 16], u64, &'a [u8])>,
+{
+    let mut out = Vec::new();
+    let count_offset = out.len();
+    out.extend_from_slice(&0u32.to_le_bytes());
+    let mut count = 0u32;
+    for (hash, size, name) in entries {
+        if count as usize >= MAX_BROWSE_ENTRIES {
+            break;
+        }
+        out.extend_from_slice(hash);
+        out.extend_from_slice(&size.to_le_bytes());
+        let name_len = name.len().min(u16::MAX as usize) as u16;
+        out.extend_from_slice(&name_len.to_le_bytes());
+        out.extend_from_slice(&name[..name_len as usize]);
+        count += 1;
+    }
+    out[count_offset..count_offset + 4].copy_from_slice(&count.to_le_bytes());
+    out
+}
+
+pub(crate) fn parse_browse_response(data: &[u8]) -> Vec<BrowseEntry> {
+    if data.starts_with(BROWSE_RESPONSE_V1_MAGIC) {
+        return parse_browse_response_v1(&data[BROWSE_RESPONSE_V1_MAGIC.len()..]);
+    }
+    parse_browse_response_legacy(data)
+}
+
+fn parse_browse_response_legacy(data: &[u8]) -> Vec<BrowseEntry> {
     let mut entries = Vec::new();
     if data.len() < 4 {
         return entries;
@@ -9320,13 +9442,111 @@ pub(crate) fn parse_browse_response(data: &[u8]) -> Vec<(String, u64, String)> {
         if pos + name_len > data.len() {
             break;
         }
-        // Truncate the *byte view* of the name before lossy decode,
-        // not the resulting String, so we never pay for decoding a
-        // multi-megabyte mojibake string.
         let name_byte_end = name_len.min(MAX_BROWSE_NAME_BYTES);
         let name = String::from_utf8_lossy(&data[pos..pos + name_byte_end]).to_string();
         pos += name_len;
-        entries.push((hash, size, name));
+        entries.push((hash, size, name, None));
     }
     entries
+}
+
+fn parse_browse_response_v1(data: &[u8]) -> Vec<BrowseEntry> {
+    let mut entries = Vec::new();
+    if data.len() < 4 {
+        return entries;
+    }
+    let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    let mut pos = 4;
+    for _ in 0..count.min(MAX_BROWSE_ENTRIES) {
+        if pos + 16 + 8 + 2 > data.len() {
+            break;
+        }
+        let hash = hex::encode(&data[pos..pos + 16]);
+        pos += 16;
+        let size = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap_or([0; 8]));
+        pos += 8;
+        let name_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+        pos += 2;
+        if pos + name_len > data.len() {
+            break;
+        }
+        let name_byte_end = name_len.min(MAX_BROWSE_NAME_BYTES);
+        let name = String::from_utf8_lossy(&data[pos..pos + name_byte_end]).to_string();
+        pos += name_len;
+        if pos >= data.len() {
+            break;
+        }
+        let aich_flag = data[pos];
+        pos += 1;
+        let aich = if aich_flag == 1 {
+            if pos + 20 > data.len() {
+                break;
+            }
+            let hex = hex::encode(&data[pos..pos + 20]);
+            pos += 20;
+            Some(hex)
+        } else {
+            None
+        };
+        entries.push((hash, size, name, aich));
+    }
+    entries
+}
+
+#[cfg(test)]
+mod browse_response_tests {
+    use super::*;
+
+    #[test]
+    fn browse_v1_round_trips_optional_aich() {
+        let hash = [0x11u8; 16];
+        let aich = [0xABu8; 20];
+        let encoded = encode_browse_response_v1([
+            (&hash, 42u64, b"song.mp3".as_slice(), Some(&aich)),
+            (&hash, 7u64, b"readme.txt".as_slice(), None),
+        ]);
+        assert!(encoded.starts_with(BROWSE_RESPONSE_V1_MAGIC));
+        let parsed = parse_browse_response(&encoded);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].0, hex::encode(hash));
+        assert_eq!(parsed[0].1, 42);
+        assert_eq!(parsed[0].2, "song.mp3");
+        assert_eq!(parsed[0].3.as_deref(), Some(hex::encode(aich).as_str()));
+        assert_eq!(parsed[1].3, None);
+    }
+
+    #[test]
+    fn browse_legacy_parser_leaves_aich_absent() {
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(&1u32.to_le_bytes());
+        legacy.extend_from_slice(&[0x22; 16]);
+        legacy.extend_from_slice(&9u64.to_le_bytes());
+        let name = b"old.bin";
+        legacy.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        legacy.extend_from_slice(name);
+        let parsed = parse_browse_response(&legacy);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].2, "old.bin");
+        assert_eq!(parsed[0].3, None);
+    }
+
+    #[test]
+    fn old_request_gets_exact_count_first_response() {
+        let hash = [0x22u8; 16];
+        let encoded = encode_browse_response_legacy([(&hash, 9u64, b"old.bin".as_slice())]);
+        assert_eq!(&encoded[..4], &1u32.to_le_bytes());
+        assert!(!encoded.starts_with(BROWSE_RESPONSE_V1_MAGIC));
+        assert_eq!(parse_browse_response(&encoded)[0].2, "old.bin");
+        assert!(!browse_request_supports_v1(&[]));
+    }
+
+    #[test]
+    fn new_request_marker_is_explicit_and_legacy_response_still_parses() {
+        assert!(browse_request_supports_v1(BROWSE_RESPONSE_V1_MAGIC));
+        let hash = [0x33u8; 16];
+        let legacy = encode_browse_response_legacy([(&hash, 10u64, b"old-peer.bin".as_slice())]);
+        let parsed = parse_browse_response(&legacy);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].3, None);
+    }
 }

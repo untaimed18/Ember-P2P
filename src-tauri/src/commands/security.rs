@@ -32,6 +32,8 @@ pub async fn acknowledge_security_policy_reset(
     let db = state.db.clone();
     let gate = state.security_policy.clone();
     tokio::task::spawn_blocking(move || {
+        // Ban rows are cleared only when the gate scope includes them;
+        // reputation-only acknowledgements never invoke this closure.
         gate.acknowledge_reset_if_required(|| {
             db.reset_security_policy()
                 .map_err(|error| std::io::Error::other(error.to_string()))

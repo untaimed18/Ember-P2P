@@ -60,6 +60,34 @@ pub struct IpFilterDownloadResult {
     pub byte_count: usize,
 }
 
+pub(crate) fn persist_with_root_transaction(
+    registry: std::sync::Arc<crate::security::filesystem::ApprovedRootRegistry>,
+    configured_roots: &[String],
+    explicit_additions: &[String],
+    persist_settings: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let mut update = registry
+        .prepare_update(configured_roots, explicit_additions)
+        .map_err(|error| anyhow::anyhow!("prepare approved roots: {error}"))?;
+    update
+        .commit()
+        .map_err(|error| anyhow::anyhow!("commit approved roots: {error}"))?;
+    if let Err(save_error) = persist_settings() {
+        if let Err(rollback_error) = update.rollback() {
+            return Err(anyhow::anyhow!(
+                "settings persistence failed: {save_error}; approved-root rollback also failed: {rollback_error}"
+            ));
+        }
+        return Err(save_error);
+    }
+    if let Err(error) = update.finish() {
+        tracing::warn!(
+            "Settings and approved roots committed, but transaction journal cleanup was deferred: {error}"
+        );
+    }
+    Ok(())
+}
+
 /// Fields persisted inside `AppSettings` but owned exclusively by backend
 /// workflows. The frontend still receives them in `get_settings` so existing
 /// setup/settings forms can round-trip one object, but `update_settings`
@@ -878,9 +906,6 @@ pub async fn update_settings(
     let port_changed =
         settings.tcp_port != old_settings.tcp_port || settings.udp_port != old_settings.udp_port;
 
-    // Persist to disk BEFORE mutating the in-memory config so a failed write
-    // can't leave the running session (and the runtime apply below) diverged
-    // from what's on disk. Only commit the new settings once the write succeeds.
     let save_data = {
         let config = state.config.read().await;
         config.prepare_save_settings(&settings).map_err(|e| {
@@ -891,15 +916,6 @@ pub async fn update_settings(
             )
         })?
     };
-    {
-        let (data, tmp, final_path) = save_data;
-        tokio::task::spawn_blocking(move || {
-            crate::storage::config::AppConfig::write_to_disk(&data, &tmp, &final_path)
-        })
-        .await
-        .map_err(|e| coded_ctx("settings_save_failed", "Save failed", e))?
-        .map_err(|e| coded_ctx("settings_save_failed", "Save failed", e))?;
-    }
     {
         let mut roots = settings.shared_folders.clone();
         if !settings.download_folder.is_empty() {
@@ -913,16 +929,15 @@ pub async fn update_settings(
             explicit_additions.push(settings.download_folder.clone());
         }
         let registry = state.approved_roots.clone();
-        tokio::task::spawn_blocking(move || registry.update_roots(&roots, &explicit_additions))
-            .await
-            .map_err(|e| {
-                coded_ctx(
-                    "settings_root_registry_task_failed",
-                    "Root approval failed",
-                    e,
-                )
-            })?
-            .map_err(|e| coded_ctx("settings_root_registry_failed", "Root approval failed", e))?;
+        let (data, tmp, final_path) = save_data;
+        tokio::task::spawn_blocking(move || {
+            persist_with_root_transaction(registry, &roots, &explicit_additions, || {
+                crate::storage::config::AppConfig::write_to_disk(&data, &tmp, &final_path)
+            })
+        })
+        .await
+        .map_err(|e| coded_ctx("settings_transaction_task_failed", "Save failed", e))?
+        .map_err(|e| coded_ctx("settings_save_failed", "Save failed", e))?;
     }
     {
         let mut config = state.config.write().await;
@@ -1468,6 +1483,61 @@ pub async fn open_ember_website() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_write_failure_restores_exact_approved_root_snapshot() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-root-transaction-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let data = base.join("data");
+        let old_root = base.join("old");
+        let new_root = base.join("new");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&old_root).unwrap();
+        std::fs::create_dir_all(&new_root).unwrap();
+        let old = old_root.to_string_lossy().into_owned();
+        let new = new_root.to_string_lossy().into_owned();
+        let registry = crate::security::filesystem::initialize_approved_roots(
+            &data,
+            std::slice::from_ref(&old),
+        )
+        .unwrap();
+        let state_path = data.join("approved_roots.json");
+        let before = std::fs::read(&state_path).unwrap();
+
+        let error = persist_with_root_transaction(
+            registry.clone(),
+            std::slice::from_ref(&new),
+            std::slice::from_ref(&new),
+            || anyhow::bail!("injected config write failure"),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("injected config write failure"));
+        assert!(registry.verify_root(&old_root).is_ok());
+        assert!(registry.verify_root(&new_root).is_err());
+        assert_eq!(std::fs::read(&state_path).unwrap(), before);
+        assert!(!data.join("approved_roots.transaction.json").exists());
+
+        let mut interrupted = registry
+            .prepare_update(std::slice::from_ref(&new), std::slice::from_ref(&new))
+            .unwrap();
+        interrupted.commit().unwrap();
+        drop(interrupted);
+        assert!(data.join("approved_roots.transaction.json").exists());
+        let recovered = crate::security::filesystem::initialize_approved_roots(
+            &data,
+            std::slice::from_ref(&old),
+        )
+        .unwrap();
+        assert!(recovered.verify_root(&old_root).is_ok());
+        assert!(recovered.verify_root(&new_root).is_err());
+        assert!(!data.join("approved_roots.transaction.json").exists());
+        let _ = std::fs::remove_dir_all(base);
+    }
 
     #[test]
     fn default_settings_pass_validation() {

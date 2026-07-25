@@ -544,6 +544,31 @@ const PUNCH_RDV_DOMAIN: &[u8] = b"ember-rdv-v1";
 const OP_PUNCH_REGISTER_V3: u8 = 0x10;
 const OP_PUNCH_POLL_V3: u8 = 0x11;
 const OP_PUNCH_ACK_V3: u8 = 0x12;
+const PUNCH_RDV_V4_DOMAIN: &[u8] = b"ember-rdv-v4";
+const OP_PUNCH_REGISTER_V4: u8 = 0x23;
+const OP_PUNCH_POLL_V4: u8 = 0x24;
+const OP_PUNCH_ACK_V4: u8 = 0x25;
+const PUNCH_PROOF_TTL_SECS: i64 = 30;
+const PUNCH_PROOF_CLOCK_SKEW_SECS: i64 = 300;
+const SIGNED_IP_V4: u8 = 4;
+const SIGNED_IP_V6: u8 = 6;
+
+fn encode_signed_ip(ip: IpAddr) -> Vec<u8> {
+    match ip {
+        IpAddr::V4(v4) => {
+            let mut out = Vec::with_capacity(5);
+            out.push(SIGNED_IP_V4);
+            out.extend_from_slice(&v4.octets());
+            out
+        }
+        IpAddr::V6(v6) => {
+            let mut out = Vec::with_capacity(17);
+            out.push(SIGNED_IP_V6);
+            out.extend_from_slice(&v6.octets());
+            out
+        }
+    }
+}
 
 fn punch_identity(ember_hash: &[u8; 16]) -> (String, [u8; 32]) {
     use sha2::Digest;
@@ -566,26 +591,94 @@ fn sign_punch(secret_key: &[u8; 32], message: &[u8]) -> [u8; 64] {
         .to_bytes()
 }
 
+fn our_punch_pubkey(secret_key: &[u8; 32]) -> [u8; 32] {
+    ed25519_dalek::SigningKey::from_bytes(secret_key)
+        .verifying_key()
+        .to_bytes()
+}
+
+fn punch_register_wire(
+    protocol: crate::network::rendezvous::RendezvousProtocol,
+) -> (&'static [u8], u8, &'static str) {
+    match protocol {
+        crate::network::rendezvous::RendezvousProtocol::LegacyV3 => {
+            (PUNCH_RDV_DOMAIN, OP_PUNCH_REGISTER_V3, "/v3/punch/register")
+        }
+        crate::network::rendezvous::RendezvousProtocol::IpBoundV4 => (
+            PUNCH_RDV_V4_DOMAIN,
+            OP_PUNCH_REGISTER_V4,
+            "/v4/punch/register",
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_punch_register_message(
+    protocol: crate::network::rendezvous::RendezvousProtocol,
+    from_id: &[u8; 32],
+    target_id: &[u8; 32],
+    capability: &[u8; 32],
+    epoch: i64,
+    port: u16,
+    advertised_ip: IpAddr,
+    nat_type: u8,
+    nonce: &[u8; 16],
+    ts: i64,
+) -> Vec<u8> {
+    let (domain, operation, _) = punch_register_wire(protocol);
+    let signed_ip = (protocol == crate::network::rendezvous::RendezvousProtocol::IpBoundV4)
+        .then(|| encode_signed_ip(advertised_ip));
+    let mut signed = Vec::with_capacity(
+        domain.len() + 1 + 32 * 3 + 8 + 2 + signed_ip.as_ref().map_or(0, Vec::len) + 1 + 16 + 8,
+    );
+    signed.extend_from_slice(domain);
+    signed.push(operation);
+    signed.extend_from_slice(from_id);
+    signed.extend_from_slice(target_id);
+    signed.extend_from_slice(capability);
+    signed.extend_from_slice(&epoch.to_le_bytes());
+    signed.extend_from_slice(&port.to_le_bytes());
+    if let Some(signed_ip) = signed_ip {
+        signed.extend_from_slice(&signed_ip);
+    }
+    signed.push(nat_type);
+    signed.extend_from_slice(nonce);
+    signed.extend_from_slice(&ts.to_le_bytes());
+    signed
+}
+
 /// Register a signed hole-punch request under the rotating pairwise
-/// capability shared with the target friend.
-pub async fn register_punch(
+/// capability shared with the target friend. `advertised_ip` is bound into
+/// the signature and must match the rendezvous-observed client address.
+pub async fn register_punch_with_ip(
     rendezvous_url: &str,
     from_ember_hash: &[u8; 16],
     target_ember_hash: &[u8; 16],
     port: u16,
     nat_type: u8,
+    advertised_ip: IpAddr,
     secret_key: &[u8; 32],
+    our_ember_hash_for_identity: &[u8; 16],
 ) -> Result<(), String> {
     require_https(rendezvous_url)?;
-    let url = format!("{}/v3/punch/register", rendezvous_url.trim_end_matches('/'));
+    let protocol = crate::network::rendezvous::negotiate_protocol(rendezvous_url).await?;
+    if matches!(advertised_ip, IpAddr::V6(_)) {
+        return Err("punch registration rejects IPv6 until end-to-end verify lands".to_string());
+    }
     let (from_id, from_raw) = punch_identity(from_ember_hash);
     let (target_id, target_raw) = punch_identity(target_ember_hash);
     let ts = crate::network::rendezvous::current_timestamp();
     let epoch = super::crypto::pairwise_capability_epoch(ts);
-    let target_pubkey =
-        crate::network::rendezvous::fetch_identity_pubkey(rendezvous_url, target_ember_hash)
-            .await?
-            .ok_or_else(|| "punch target has no registered v2 identity".to_string())?;
+    let our_pubkey = our_punch_pubkey(secret_key);
+    let target_pubkey = crate::network::rendezvous::fetch_identity_pubkey_authenticated(
+        rendezvous_url,
+        target_ember_hash,
+        our_ember_hash_for_identity,
+        &our_pubkey,
+        secret_key,
+    )
+    .await?
+    .ok_or_else(|| "punch target has no registered v2 identity".to_string())?;
     let capability = super::crypto::derive_pairwise_presence_capability(
         secret_key,
         &target_pubkey,
@@ -594,32 +687,41 @@ pub async fn register_punch(
     )
     .ok_or_else(|| "could not derive pairwise punch capability".to_string())?;
     let nonce = punch_nonce();
-    let mut signed = Vec::with_capacity(PUNCH_RDV_DOMAIN.len() + 1 + 32 * 3 + 8 + 2 + 1 + 16 + 8);
-    signed.extend_from_slice(PUNCH_RDV_DOMAIN);
-    signed.push(OP_PUNCH_REGISTER_V3);
-    signed.extend_from_slice(&from_raw);
-    signed.extend_from_slice(&target_raw);
-    signed.extend_from_slice(&capability);
-    signed.extend_from_slice(&epoch.to_le_bytes());
-    signed.extend_from_slice(&port.to_le_bytes());
-    signed.push(nat_type);
-    signed.extend_from_slice(&nonce);
-    signed.extend_from_slice(&ts.to_le_bytes());
+    let (_, _, route) = punch_register_wire(protocol);
+    let signed = build_punch_register_message(
+        protocol,
+        &from_raw,
+        &target_raw,
+        &capability,
+        epoch,
+        port,
+        advertised_ip,
+        nat_type,
+        &nonce,
+        ts,
+    );
     let sig = sign_punch(secret_key, &signed);
+    let mut body = serde_json::json!({
+        "from_id": from_id,
+        "target_id": target_id,
+        "capability": hex::encode(capability),
+        "epoch": epoch,
+        "port": port,
+        "nat_type": nat_type,
+        "ts": ts,
+        "nonce": hex::encode(nonce),
+        "sig": hex::encode(sig),
+    });
+    if protocol == crate::network::rendezvous::RendezvousProtocol::IpBoundV4 {
+        body.as_object_mut().expect("JSON object").insert(
+            "ip".to_string(),
+            serde_json::Value::String(advertised_ip.to_string()),
+        );
+    }
     let client = relay_http_client(rendezvous_url).await?;
     let resp = client
-        .post(&url)
-        .json(&serde_json::json!({
-            "from_id": from_id,
-            "target_id": target_id,
-            "capability": hex::encode(capability),
-            "epoch": epoch,
-            "port": port,
-            "nat_type": nat_type,
-            "ts": ts,
-            "nonce": hex::encode(nonce),
-            "sig": hex::encode(sig),
-        }))
+        .post(format!("{}{}", rendezvous_url.trim_end_matches('/'), route))
+        .json(&body)
         .timeout(Duration::from_secs(10))
         .send()
         .await
@@ -633,6 +735,80 @@ pub async fn register_punch(
     }
 }
 
+/// Verify initiator register proof returned by punch poll before dialing.
+pub fn verify_punch_register_proof(info: &PunchInfo) -> Result<(), String> {
+    use ed25519_dalek::{Signature, VerifyingKey};
+    if info.proof_version == 3 {
+        return Ok(());
+    }
+    if info.proof_version != 4 {
+        return Err("punch proof: unsupported proof version".to_string());
+    }
+    verify_punch_proof_freshness(
+        info.register_ts,
+        info.epoch,
+        crate::network::rendezvous::current_timestamp(),
+    )?;
+    if info.from_id.len() != 64 || !info.from_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("punch proof: invalid from_id".to_string());
+    }
+    let mut from_raw = [0u8; 32];
+    hex::decode_to_slice(&info.from_id, &mut from_raw)
+        .map_err(|_| "punch proof: invalid from_id".to_string())?;
+    if !crate::network::rendezvous::pubkey_matches_id(&info.from_pubkey, &info.from_id) {
+        return Err("punch proof: from_pubkey does not match from_id".to_string());
+    }
+    let ip: IpAddr = info
+        .ip
+        .parse()
+        .map_err(|_| "punch proof: invalid ip".to_string())?;
+    if matches!(ip, IpAddr::V6(_)) {
+        return Err("punch proof: IPv6 unsupported".to_string());
+    }
+    let Ok(target_raw) = hex::decode(&info.target_id_raw_hex) else {
+        return Err("punch proof: missing target binding".to_string());
+    };
+    if target_raw.len() != 32 {
+        return Err("punch proof: invalid target binding".to_string());
+    }
+    let mut target = [0u8; 32];
+    target.copy_from_slice(&target_raw);
+    let signed = build_punch_register_message(
+        crate::network::rendezvous::RendezvousProtocol::IpBoundV4,
+        &from_raw,
+        &target,
+        &info.capability,
+        info.epoch,
+        info.port,
+        ip,
+        info.nat_type,
+        &info.register_nonce,
+        info.register_ts,
+    );
+    let Ok(vk) = VerifyingKey::from_bytes(&info.from_pubkey) else {
+        return Err("punch proof: invalid from_pubkey".to_string());
+    };
+    let signature = Signature::from_bytes(&info.register_sig);
+    vk.verify_strict(&signed, &signature)
+        .map_err(|_| "punch proof: register signature invalid".to_string())
+}
+
+fn verify_punch_proof_freshness(register_ts: i64, epoch: i64, now: i64) -> Result<(), String> {
+    let age = now.saturating_sub(register_ts);
+    if age > PUNCH_PROOF_TTL_SECS + PUNCH_PROOF_CLOCK_SKEW_SECS
+        || age < -PUNCH_PROOF_CLOCK_SKEW_SECS
+    {
+        return Err(
+            "punch proof: register timestamp is stale or too far in the future".to_string(),
+        );
+    }
+    let current_epoch = super::crypto::pairwise_capability_epoch(now);
+    if epoch != current_epoch && epoch != current_epoch - 1 {
+        return Err("punch proof: capability epoch is not current or previous".to_string());
+    }
+    Ok(())
+}
+
 /// Signed self-mailbox poll. No friend list or stable target candidates are
 /// sent; the returned capability is checked by the caller against its local
 /// friend relationship before acknowledgement.
@@ -642,20 +818,28 @@ pub async fn poll_punch(
     secret_key: &[u8; 32],
 ) -> Result<Option<PunchInfo>, String> {
     require_https(rendezvous_url)?;
-    let url = format!("{}/v3/punch/poll", rendezvous_url.trim_end_matches('/'));
+    let protocol = crate::network::rendezvous::negotiate_protocol(rendezvous_url).await?;
+    let (domain, operation, route) = match protocol {
+        crate::network::rendezvous::RendezvousProtocol::LegacyV3 => {
+            (PUNCH_RDV_DOMAIN, OP_PUNCH_POLL_V3, "/v3/punch/poll")
+        }
+        crate::network::rendezvous::RendezvousProtocol::IpBoundV4 => {
+            (PUNCH_RDV_V4_DOMAIN, OP_PUNCH_POLL_V4, "/v4/punch/poll")
+        }
+    };
     let (target_id, target_raw) = punch_identity(our_ember_hash);
     let ts = crate::network::rendezvous::current_timestamp();
     let nonce = punch_nonce();
-    let mut signed = Vec::with_capacity(PUNCH_RDV_DOMAIN.len() + 1 + 32 + 16 + 8);
-    signed.extend_from_slice(PUNCH_RDV_DOMAIN);
-    signed.push(OP_PUNCH_POLL_V3);
+    let mut signed = Vec::with_capacity(domain.len() + 1 + 32 + 16 + 8);
+    signed.extend_from_slice(domain);
+    signed.push(operation);
     signed.extend_from_slice(&target_raw);
     signed.extend_from_slice(&nonce);
     signed.extend_from_slice(&ts.to_le_bytes());
     let sig = sign_punch(secret_key, &signed);
     let client = relay_http_client(rendezvous_url).await?;
     let resp = client
-        .post(&url)
+        .post(format!("{}{}", rendezvous_url.trim_end_matches('/'), route))
         .json(&serde_json::json!({
             "target_id": target_id,
             "ts": ts,
@@ -676,27 +860,64 @@ pub async fn poll_punch(
 
     let body: serde_json::Value =
         read_json_capped(resp, MAX_RENDEZVOUS_JSON_BYTES, "punch poll").await?;
-    Ok(Some(PunchInfo {
+    let mut capability = [0u8; 32];
+    hex::decode_to_slice(
+        body["capability"].as_str().unwrap_or_default(),
+        &mut capability,
+    )
+    .map_err(|_| "punch poll: invalid capability".to_string())?;
+    let proof_version = body["proof_version"]
+        .as_u64()
+        .and_then(|value| u8::try_from(value).ok())
+        .unwrap_or(match protocol {
+            crate::network::rendezvous::RendezvousProtocol::LegacyV3 => 3,
+            crate::network::rendezvous::RendezvousProtocol::IpBoundV4 => 0,
+        });
+    let mut register_nonce = [0u8; 16];
+    let mut register_sig = [0u8; 64];
+    let mut from_pubkey = [0u8; 32];
+    if proof_version == 4 {
+        hex::decode_to_slice(
+            body["register_nonce"].as_str().unwrap_or_default(),
+            &mut register_nonce,
+        )
+        .map_err(|_| "punch poll: invalid register_nonce".to_string())?;
+        hex::decode_to_slice(
+            body["register_sig"].as_str().unwrap_or_default(),
+            &mut register_sig,
+        )
+        .map_err(|_| "punch poll: invalid register_sig".to_string())?;
+        hex::decode_to_slice(
+            body["from_pubkey"].as_str().unwrap_or_default(),
+            &mut from_pubkey,
+        )
+        .map_err(|_| "punch poll: invalid from_pubkey".to_string())?;
+    }
+    let info = PunchInfo {
         punch_id: body["punch_id"].as_str().unwrap_or("").to_string(),
         from_id: body["from_id"].as_str().unwrap_or("").to_string(),
         ip: body["ip"].as_str().unwrap_or("").to_string(),
-        // Range-check rather than truncate: a bogus wire value like 65537 must
-        // not silently wrap to a valid-looking port (1). Out-of-range -> 0,
-        // which the punch consumer rejects as undialable.
         port: u16::try_from(body["port"].as_u64().unwrap_or(0)).unwrap_or(0),
-        // Unknown/out-of-range NAT type defaults to 5 (Unknown), matching the
-        // absent-field default above.
         nat_type: u8::try_from(body["nat_type"].as_u64().unwrap_or(5)).unwrap_or(5),
-        capability: {
-            let mut value = [0u8; 32];
-            hex::decode_to_slice(body["capability"].as_str().unwrap_or_default(), &mut value)
-                .map_err(|_| "punch poll: invalid capability".to_string())?;
-            value
-        },
+        capability,
         epoch: body["epoch"]
             .as_i64()
             .ok_or_else(|| "punch poll: missing capability epoch".to_string())?,
-    }))
+        proof_version,
+        register_ts: if proof_version == 4 {
+            body["register_ts"]
+                .as_i64()
+                .ok_or_else(|| "punch poll: missing register_ts".to_string())?
+        } else {
+            0
+        },
+        register_nonce,
+        register_sig,
+        from_pubkey,
+        target_id_raw_hex: hex::encode(target_raw),
+    };
+    verify_punch_register_proof(&info)?;
+    Ok(Some(info))
 }
 
 pub async fn ack_punch(
@@ -708,6 +929,7 @@ pub async fn ack_punch(
     secret_key: &[u8; 32],
 ) -> Result<(), String> {
     require_https(rendezvous_url)?;
+    let protocol = crate::network::rendezvous::negotiate_protocol(rendezvous_url).await?;
     if punch_id.len() != 64 || !punch_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err("punch ack: invalid punch id".to_string());
     }
@@ -717,9 +939,17 @@ pub async fn ack_punch(
     let (target_id, target_raw) = punch_identity(our_ember_hash);
     let ts = crate::network::rendezvous::current_timestamp();
     let nonce = punch_nonce();
-    let mut signed = Vec::with_capacity(PUNCH_RDV_DOMAIN.len() + 1 + 32 * 3 + 8 + 16 + 8);
-    signed.extend_from_slice(PUNCH_RDV_DOMAIN);
-    signed.push(OP_PUNCH_ACK_V3);
+    let (domain, operation, route) = match protocol {
+        crate::network::rendezvous::RendezvousProtocol::LegacyV3 => {
+            (PUNCH_RDV_DOMAIN, OP_PUNCH_ACK_V3, "/v3/punch/ack")
+        }
+        crate::network::rendezvous::RendezvousProtocol::IpBoundV4 => {
+            (PUNCH_RDV_V4_DOMAIN, OP_PUNCH_ACK_V4, "/v4/punch/ack")
+        }
+    };
+    let mut signed = Vec::with_capacity(domain.len() + 1 + 32 * 3 + 8 + 16 + 8);
+    signed.extend_from_slice(domain);
+    signed.push(operation);
     signed.extend_from_slice(&target_raw);
     signed.extend_from_slice(capability);
     signed.extend_from_slice(&epoch.to_le_bytes());
@@ -727,10 +957,9 @@ pub async fn ack_punch(
     signed.extend_from_slice(&nonce);
     signed.extend_from_slice(&ts.to_le_bytes());
     let sig = sign_punch(secret_key, &signed);
-    let url = format!("{}/v3/punch/ack", rendezvous_url.trim_end_matches('/'));
     let response = relay_http_client(rendezvous_url)
         .await?
-        .post(url)
+        .post(format!("{}{}", rendezvous_url.trim_end_matches('/'), route))
         .json(&serde_json::json!({
             "target_id": target_id,
             "capability": hex::encode(capability),
@@ -757,10 +986,16 @@ pub struct PunchInfo {
     pub from_id: String,
     pub ip: String,
     pub port: u16,
-    #[allow(dead_code)]
     pub nat_type: u8,
     pub capability: [u8; 32],
     pub epoch: i64,
+    pub proof_version: u8,
+    pub register_ts: i64,
+    pub register_nonce: [u8; 16],
+    pub register_sig: [u8; 64],
+    pub from_pubkey: [u8; 32],
+    /// Hex-encoded target id raw bytes used when verifying the register proof.
+    pub target_id_raw_hex: String,
 }
 
 /// Connect to a relay-capable peer over QUIC and negotiate a relay session.
@@ -1047,20 +1282,27 @@ fn is_public_relay_target(ip: Ipv4Addr) -> bool {
 /// (which only kicks in *after* the spawned task has read and
 /// parsed the first message).
 ///
-/// The permit is held for the **lifetime of the accept task**, which
-/// for relay sessions runs for the duration of the relayed transfer
-/// (potentially minutes), so the cap also bounds concurrent relay
-/// sessions plus hole-punched direct connections plus in-progress
-/// handshakes. Sized at 64 to leave room for normal traffic spikes
-/// while still being orders of magnitude below a real
-/// scheduler/memory exhaustion threshold.
+/// The permit is held for the **lifetime of the accepted session**: relay
+/// bridges keep it in their task, while direct/relay-target handoffs transfer
+/// it with both stream halves into the upload subsystem. The cap therefore
+/// bounds relays, hole-punched direct connections, and in-progress handshakes.
+/// Sized at 64 to leave room for normal traffic spikes while still being
+/// orders of magnitude below a real scheduler/memory exhaustion threshold.
 const QUIC_ACCEPT_INFLIGHT_CAP: usize = 64;
 const QUIC_ACCEPT_RESERVED_FRIENDS: usize = 8;
 const QUIC_ACCEPT_ORDINARY_CAP: usize = QUIC_ACCEPT_INFLIGHT_CAP - QUIC_ACCEPT_RESERVED_FRIENDS;
+/// Concurrent handshakes when ordinary session slots are full, so a friend can
+/// prove identity before spending a reserved session permit.
+const QUIC_HANDSHAKE_OVERFLOW_CAP: usize = 16;
 const QUIC_PENDING_PER_IP: usize = 4;
-const QUIC_PENDING_PER_IP_WITH_RESERVE: usize = 6;
+const QUIC_ACTIVE_PER_PRINCIPAL: usize = 4;
 const QUIC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const QUIC_FIRST_STREAM_TIMEOUT: Duration = Duration::from_secs(8);
+
+enum PreSessionPermit {
+    Ordinary(tokio::sync::OwnedSemaphorePermit),
+    HandshakeOverflow(tokio::sync::OwnedSemaphorePermit),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QuicIncomingAddressPolicy {
@@ -1093,6 +1335,89 @@ impl Drop for PendingIpGuard {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ActiveSessionPrincipal {
+    Friend([u8; 16]),
+    Ip(IpAddr),
+}
+
+struct ActiveSessionGuard {
+    counts: std::sync::Arc<parking_lot::Mutex<HashMap<ActiveSessionPrincipal, usize>>>,
+    principal: ActiveSessionPrincipal,
+}
+
+impl Drop for ActiveSessionGuard {
+    fn drop(&mut self) {
+        let mut counts = self.counts.lock();
+        if let Some(count) = counts.get_mut(&self.principal) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.principal);
+            }
+        }
+    }
+}
+
+fn try_acquire_active_session(
+    counts: &std::sync::Arc<parking_lot::Mutex<HashMap<ActiveSessionPrincipal, usize>>>,
+    principal: ActiveSessionPrincipal,
+) -> Option<std::sync::Arc<ActiveSessionGuard>> {
+    let mut locked = counts.lock();
+    let count = locked.entry(principal).or_insert(0);
+    if *count >= QUIC_ACTIVE_PER_PRINCIPAL {
+        return None;
+    }
+    *count += 1;
+    drop(locked);
+    Some(std::sync::Arc::new(ActiveSessionGuard {
+        counts: counts.clone(),
+        principal,
+    }))
+}
+
+struct QuicSessionGuard {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    _active: std::sync::Arc<ActiveSessionGuard>,
+}
+
+struct GuardedRead<R> {
+    inner: R,
+    _guard: std::sync::Arc<QuicSessionGuard>,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for GuardedRead<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+struct GuardedWrite<W> {
+    inner: W,
+    _guard: std::sync::Arc<QuicSessionGuard>,
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for GuardedWrite<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 /// Run the QUIC accept loop. Handles three kinds of inbound QUIC connections:
 ///   1. **RELAY_REQUEST** — peer wants us to relay a LowID transfer (existing relay logic)
 ///   2. **RELAY_CONNECT** — a relay node is forwarding a client to us (relay target)
@@ -1117,8 +1442,14 @@ pub async fn run_quic_accept_loop(
     let ordinary_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(QUIC_ACCEPT_ORDINARY_CAP));
     let reserved_sem =
         std::sync::Arc::new(tokio::sync::Semaphore::new(QUIC_ACCEPT_RESERVED_FRIENDS));
+    let handshake_overflow_sem =
+        std::sync::Arc::new(tokio::sync::Semaphore::new(QUIC_HANDSHAKE_OVERFLOW_CAP));
     let pending_ip_counts =
         std::sync::Arc::new(parking_lot::Mutex::new(HashMap::<IpAddr, usize>::new()));
+    let active_session_counts = std::sync::Arc::new(parking_lot::Mutex::new(HashMap::<
+        ActiveSessionPrincipal,
+        usize,
+    >::new()));
     loop {
         let incoming = match endpoint.accept().await {
             Some(inc) => inc,
@@ -1138,35 +1469,11 @@ pub async fn run_quic_accept_loop(
             continue;
         }
 
-        // Pre-spawn admission gate. `try_acquire_owned` is non-blocking
-        // and lets us drop excess inbound connections fast (refusing
-        // the QUIC handshake) instead of queueing work that would
-        // accumulate during a flood.
-        let (permit, using_friend_reserve) = match ordinary_sem.clone().try_acquire_owned() {
-            Ok(permit) => (permit, false),
-            Err(_) => match reserved_sem.clone().try_acquire_owned() {
-                Ok(permit) => (permit, true),
-                Err(_) => {
-                    debug!(
-                        "QUIC accept: at concurrency cap ({}), refusing inbound from {:?}",
-                        QUIC_ACCEPT_INFLIGHT_CAP,
-                        incoming.remote_address(),
-                    );
-                    incoming.refuse();
-                    continue;
-                }
-            },
-        };
         let remote_ip = incoming.remote_address().ip();
         {
             let mut counts = pending_ip_counts.lock();
             let count = counts.entry(remote_ip).or_insert(0);
-            let limit = if using_friend_reserve {
-                QUIC_PENDING_PER_IP_WITH_RESERVE
-            } else {
-                QUIC_PENDING_PER_IP
-            };
-            if *count >= limit {
+            if *count >= QUIC_PENDING_PER_IP {
                 drop(counts);
                 incoming.refuse();
                 continue;
@@ -1178,17 +1485,35 @@ pub async fn run_quic_accept_loop(
             ip: remote_ip,
         };
 
+        // Prefer an ordinary session slot. If none remain, admit a short-lived
+        // handshake overflow permit so a friend can prove identity before we
+        // spend a reserved session slot (non-friends never hold reserved).
+        let pre_session = match ordinary_sem.clone().try_acquire_owned() {
+            Ok(permit) => PreSessionPermit::Ordinary(permit),
+            Err(_) => match handshake_overflow_sem.clone().try_acquire_owned() {
+                Ok(permit) => PreSessionPermit::HandshakeOverflow(permit),
+                Err(_) => {
+                    debug!(
+                        "QUIC accept: at concurrency cap, refusing inbound from {:?}",
+                        incoming.remote_address(),
+                    );
+                    drop(pending_ip_guard);
+                    incoming.refuse();
+                    continue;
+                }
+            },
+        };
+
+        let ordinary_sem = ordinary_sem.clone();
+        let reserved_sem = reserved_sem.clone();
         let mgr = relay_manager.clone();
         let ep = endpoint.clone();
         let cb_tx = inbound_stream_tx.clone();
         let friends = friend_hashes.clone();
+        let active_counts = active_session_counts.clone();
         let accepted_at = tokio::time::Instant::now();
         tokio::spawn(async move {
-            // Hold the permit for the lifetime of the accept task so
-            // long-running relay sessions count against the cap; they
-            // already have their own per-session timeouts.
-            let _permit = permit;
-            let _pending_ip_guard = pending_ip_guard;
+            let pending_ip_guard = pending_ip_guard;
             let conn = match tokio::time::timeout_at(accepted_at + QUIC_HANDSHAKE_TIMEOUT, incoming)
                 .await
             {
@@ -1202,20 +1527,54 @@ pub async fn run_quic_accept_loop(
                     return;
                 }
             };
+            // Handshake finished — release per-IP pending so long relays do not
+            // starve other peers behind the same NAT address.
+            drop(pending_ip_guard);
 
             let remote = conn.remote_address();
             debug!("Relay accept: new QUIC connection from {remote}");
-            if using_friend_reserve {
-                let peer_node_id = super::quic::connection_node_id(&conn);
-                let known_friend = match peer_node_id {
-                    Some(node_id) => friends.read().await.contains(&node_id),
-                    None => false,
-                };
-                if !known_friend {
-                    conn.close(0u32.into(), b"friend reserve requires pinned identity");
-                    return;
+            let peer_node_id = super::quic::connection_node_id(&conn);
+            let known_friend = match peer_node_id {
+                Some(node_id) => friends.read().await.contains(&node_id),
+                None => false,
+            };
+
+            let session_permit = match pre_session {
+                PreSessionPermit::Ordinary(permit) => permit,
+                PreSessionPermit::HandshakeOverflow(_overflow) => {
+                    if !known_friend {
+                        conn.close(0u32.into(), b"friend reserve requires pinned identity");
+                        return;
+                    }
+                    match reserved_sem.try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => match ordinary_sem.try_acquire_owned() {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                conn.close(0u32.into(), b"no session capacity");
+                                return;
+                            }
+                        },
+                    }
                 }
-            }
+            };
+            let principal = match (known_friend, peer_node_id) {
+                (true, Some(node_id)) => ActiveSessionPrincipal::Friend(node_id),
+                _ => ActiveSessionPrincipal::Ip(remote_ip),
+            };
+            let Some(active_session_guard) = try_acquire_active_session(&active_counts, principal)
+            else {
+                conn.close(0u32.into(), b"active principal session cap reached");
+                return;
+            };
+            // The same shared guard follows handed-off streams into the upload
+            // subsystem. For relay bridges it remains local to this task.
+            // Either way, the ordinary/reserved permit and principal count are
+            // released together exactly once when the final guard clone drops.
+            let session_guard = std::sync::Arc::new(QuicSessionGuard {
+                _permit: session_permit,
+                _active: active_session_guard,
+            });
 
             let (mut init_send, mut init_recv) = match tokio::time::timeout_at(
                 accepted_at + QUIC_FIRST_STREAM_TIMEOUT,
@@ -1488,8 +1847,14 @@ pub async fn run_quic_accept_loop(
 
                 let req = crate::network::ed2k::upload::InboundStreamRequest {
                     peer_addr: remote,
-                    reader: Box::new(init_recv),
-                    writer: Box::new(init_send),
+                    reader: Box::new(GuardedRead {
+                        inner: init_recv,
+                        _guard: session_guard.clone(),
+                    }),
+                    writer: Box::new(GuardedWrite {
+                        inner: init_send,
+                        _guard: session_guard.clone(),
+                    }),
                 };
                 if let Err(e) = cb_tx.try_send(req) {
                     debug!("QUIC accept: dropping relay-target stream from {remote}: {e}");
@@ -1504,8 +1869,14 @@ pub async fn run_quic_accept_loop(
                 let chained = std::io::Cursor::new(header.to_vec()).chain(init_recv);
                 let req = crate::network::ed2k::upload::InboundStreamRequest {
                     peer_addr: remote,
-                    reader: Box::new(chained),
-                    writer: Box::new(init_send),
+                    reader: Box::new(GuardedRead {
+                        inner: chained,
+                        _guard: session_guard.clone(),
+                    }),
+                    writer: Box::new(GuardedWrite {
+                        inner: init_send,
+                        _guard: session_guard.clone(),
+                    }),
                 };
                 if let Err(e) = cb_tx.try_send(req) {
                     debug!("QUIC accept: dropping direct stream from {remote}: {e}");
@@ -1741,6 +2112,74 @@ mod tests {
     }
 
     #[test]
+    fn v4_punch_proof_round_trip_reuses_registration_transcript() {
+        let secret = [0x37; 32];
+        let public = our_punch_pubkey(&secret);
+        let ember_hash = super::super::crypto::node_id_from_public_key(
+            &ed25519_dalek::VerifyingKey::from_bytes(&public).unwrap(),
+        );
+        let (from_id, from_raw) = punch_identity(&ember_hash);
+        let target_raw = [0x42; 32];
+        let capability = [0xA5; 32];
+        let now = crate::network::rendezvous::current_timestamp();
+        let epoch = super::super::crypto::pairwise_capability_epoch(now);
+        let nonce = [0x19; 16];
+        let ip = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+        let signed = build_punch_register_message(
+            crate::network::rendezvous::RendezvousProtocol::IpBoundV4,
+            &from_raw,
+            &target_raw,
+            &capability,
+            epoch,
+            4662,
+            ip,
+            1,
+            &nonce,
+            now,
+        );
+        let info = PunchInfo {
+            punch_id: "11".repeat(32),
+            from_id,
+            ip: ip.to_string(),
+            port: 4662,
+            nat_type: 1,
+            capability,
+            epoch,
+            proof_version: 4,
+            register_ts: now,
+            register_nonce: nonce,
+            register_sig: sign_punch(&secret, &signed),
+            from_pubkey: public,
+            target_id_raw_hex: hex::encode(target_raw),
+        };
+        verify_punch_register_proof(&info).expect("v4 server proof verifies");
+
+        let mut tampered = info;
+        tampered.port += 1;
+        assert!(verify_punch_register_proof(&tampered).is_err());
+    }
+
+    #[test]
+    fn v4_punch_registration_matches_server_transcript_vector() {
+        let transcript = build_punch_register_message(
+            crate::network::rendezvous::RendezvousProtocol::IpBoundV4,
+            &[0x11; 32],
+            &[0x22; 32],
+            &[0x33; 32],
+            0x0102_0304_0506_0708,
+            0x1234,
+            IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)),
+            5,
+            &[0x44; 16],
+            0x1112_1314_1516_1718,
+        );
+        assert_eq!(
+            hex::encode(transcript),
+            "656d6265722d7264762d76342311111111111111111111111111111111111111111111111111111111111111112222222222222222222222222222222222222222222222222222222222222222333333333333333333333333333333333333333333333333333333333333333308070605040302013412040808040405444444444444444444444444444444441817161514131211"
+        );
+    }
+
+    #[test]
     fn relay_manager_rejects_replayed_request_nonce() {
         let mut mgr = RelayManager::new();
         let pk = [5u8; 32];
@@ -1918,6 +2357,94 @@ mod tests {
             QUIC_ACCEPT_ORDINARY_CAP + QUIC_ACCEPT_RESERVED_FRIENDS,
             QUIC_ACCEPT_INFLIGHT_CAP
         );
+        assert!(QUIC_HANDSHAKE_OVERFLOW_CAP > 0);
+        assert_eq!(QUIC_PENDING_PER_IP, 4);
+    }
+
+    #[test]
+    fn active_session_guard_caps_and_releases_principal() {
+        let counts = std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let principal = ActiveSessionPrincipal::Ip("203.0.113.9".parse().unwrap());
+        let mut guards = Vec::new();
+        for _ in 0..QUIC_ACTIVE_PER_PRINCIPAL {
+            guards.push(
+                try_acquire_active_session(&counts, principal)
+                    .expect("principal remains below active cap"),
+            );
+        }
+        assert!(try_acquire_active_session(&counts, principal).is_none());
+        guards.pop();
+        assert!(try_acquire_active_session(&counts, principal).is_some());
+    }
+
+    #[test]
+    fn friend_identity_principals_do_not_share_nat_cap() {
+        let counts = std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let alice = ActiveSessionPrincipal::Friend([1; 16]);
+        let bob = ActiveSessionPrincipal::Friend([2; 16]);
+        let _alice = try_acquire_active_session(&counts, alice).unwrap();
+        let _bob = try_acquire_active_session(&counts, bob).unwrap();
+        assert_eq!(counts.lock().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn handed_off_stream_holds_session_permit_until_both_halves_drop() {
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let counts = std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let principal = ActiveSessionPrincipal::Ip("8.8.8.8".parse().unwrap());
+        let active = try_acquire_active_session(&counts, principal).unwrap();
+        let guard = std::sync::Arc::new(QuicSessionGuard {
+            _permit: permit,
+            _active: active,
+        });
+        let reader = GuardedRead {
+            inner: tokio::io::empty(),
+            _guard: guard.clone(),
+        };
+        let writer = GuardedWrite {
+            inner: tokio::io::sink(),
+            _guard: guard.clone(),
+        };
+        drop(guard);
+
+        assert_eq!(semaphore.available_permits(), 0);
+        assert_eq!(counts.lock().get(&principal), Some(&1));
+        drop(reader);
+        assert_eq!(semaphore.available_permits(), 0);
+        assert_eq!(counts.lock().get(&principal), Some(&1));
+        drop(writer);
+        assert_eq!(semaphore.available_permits(), 1);
+        assert!(!counts.lock().contains_key(&principal));
+    }
+
+    #[test]
+    fn punch_proof_freshness_accepts_boundaries_and_current_epochs() {
+        let now = 9_000;
+        let epoch = super::super::crypto::pairwise_capability_epoch(now);
+        assert!(verify_punch_proof_freshness(now, epoch, now).is_ok());
+        assert!(verify_punch_proof_freshness(
+            now - PUNCH_PROOF_TTL_SECS - PUNCH_PROOF_CLOCK_SKEW_SECS,
+            epoch - 1,
+            now,
+        )
+        .is_ok());
+        assert!(
+            verify_punch_proof_freshness(now + PUNCH_PROOF_CLOCK_SKEW_SECS, epoch, now,).is_ok()
+        );
+    }
+
+    #[test]
+    fn punch_proof_freshness_rejects_historical_replay_and_old_epoch() {
+        let now = 9_000;
+        let epoch = super::super::crypto::pairwise_capability_epoch(now);
+        assert!(verify_punch_proof_freshness(
+            now - PUNCH_PROOF_TTL_SECS - PUNCH_PROOF_CLOCK_SKEW_SECS - 1,
+            epoch,
+            now,
+        )
+        .is_err());
+        assert!(verify_punch_proof_freshness(now, epoch - 2, now).is_err());
     }
 
     #[test]

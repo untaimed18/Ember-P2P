@@ -96,6 +96,19 @@ impl TokenBucket {
         self.tokens -= 1.0;
         true
     }
+
+    /// Peek whether the bucket is under stress without consuming a token.
+    fn available_tokens(&mut self) -> f64 {
+        let now = std::time::Instant::now();
+        self.tokens = (self.tokens
+            + now
+                .saturating_duration_since(self.last_refill)
+                .as_secs_f64()
+                * self.refill_per_second)
+            .min(self.capacity);
+        self.last_refill = now;
+        self.tokens
+    }
 }
 
 fn admit_firewall_request_ip(
@@ -141,6 +154,18 @@ mod firewall_request_bound_tests {
     fn token_bucket_rejects_after_burst() {
         let mut bucket = TokenBucket::new(2, 0.0);
         assert!(bucket.try_take());
+        assert!(bucket.try_take());
+        assert!(!bucket.try_take());
+    }
+
+    #[test]
+    fn token_bucket_reports_stress_without_consuming() {
+        let mut bucket = TokenBucket::new(10, 0.0);
+        assert!(bucket.available_tokens() >= 8.0);
+        for _ in 0..9 {
+            assert!(bucket.try_take());
+        }
+        assert!(bucket.available_tokens() < 8.0);
         assert!(bucket.try_take());
         assert!(!bucket.try_take());
     }
@@ -2871,6 +2896,15 @@ mod tests {
         assert!(!next.dispatched);
     }
 
+    #[tokio::test]
+    async fn browse_response_uses_origin_stream_during_dual_dial() {
+        let (origin_tx, mut origin_rx) = tokio::sync::mpsc::channel(1);
+        let (_canonical_tx, mut canonical_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        send_browse_response_to_origin(&origin_tx, vec![1, 2, 3]).unwrap();
+        assert_eq!(origin_rx.recv().await, Some(vec![1, 2, 3]));
+        assert!(canonical_rx.try_recv().is_err());
+    }
+
     #[test]
     fn cancelling_active_browse_retires_its_session_queue() {
         let friend = [0xB2; 16];
@@ -5022,6 +5056,13 @@ fn browse_request_is_pending(
         .is_some_and(|queue| queue.iter().any(|request| request.request_id == request_id))
 }
 
+fn send_browse_response_to_origin(
+    reply_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    packet: Vec<u8>,
+) -> Result<(), tokio::sync::mpsc::error::TrySendError<Vec<u8>>> {
+    reply_tx.try_send(packet)
+}
+
 async fn retire_ember_session(
     sessions: &upload_server::EmberSessionMap,
     friend: [u8; 16],
@@ -5064,10 +5105,11 @@ async fn dispatch_browse_head(
         let current = state.ember_sessions.read().await.get(&friend).cloned();
         let reason = match current {
             Some(handle) if handle.session_id() == head.session_id && handle.is_fresh() => {
-                let mut packet = Vec::with_capacity(6);
+                let mut packet = Vec::with_capacity(10);
                 packet.push(OP_EMULEPROT);
-                packet.extend_from_slice(&(1u32).to_le_bytes());
+                packet.extend_from_slice(&(5u32).to_le_bytes());
                 packet.push(ed2k::messages::OP_EMBER_BROWSE_REQ);
+                packet.extend_from_slice(ed2k::multi_source::BROWSE_RESPONSE_V1_MAGIC);
                 match handle.tx.try_send(packet) {
                     Ok(()) => {
                         if let Some(request) = state
@@ -12614,7 +12656,13 @@ pub async fn start_network(
                     }
                 }
 
-                if let UploadEventKind::EmberBrowseRequest { ember_hash: browse_eh } = event.kind {
+                if let UploadEventKind::EmberBrowseRequest {
+                    ember_hash: browse_eh,
+                    session_id,
+                    ref reply_tx,
+                    supports_ebr1,
+                } = event.kind
+                {
                     if !settings.friend_browse_disabled
                         && friend_hashes.read().await.contains(&browse_eh)
                     {
@@ -12636,45 +12684,62 @@ pub async fn start_network(
                         // the peer receiving our answer actually keeps.
                         const MAX_BROWSE_ANSWER_FILES: usize = 1_000;
                         const MAX_BROWSE_ANSWER_BYTES: usize = 400 * 1024;
-                        let mut res_payload = Vec::new();
-                        let count_offset = res_payload.len();
-                        res_payload.extend_from_slice(&0u32.to_le_bytes());
-                        let mut actual_count = 0u32;
-                        // Only files the user actively shares — mirrors
-                        // `build_shared_files_answer`'s vanilla-eD2k browse
-                        // filter. Without this, a friend's browse request
-                        // leaked indexed-but-unshared files that the same
-                        // user's vanilla `OP_ASKSHAREDFILES` answer already
-                        // correctly withholds.
+                        let mut encoded_entries: Vec<([u8; 16], u64, Vec<u8>, Option<[u8; 20]>)> =
+                            Vec::new();
                         for f in files.iter().filter(|f| f.shared).take(MAX_BROWSE_ANSWER_FILES) {
-                            if res_payload.len() >= MAX_BROWSE_ANSWER_BYTES {
+                            let Ok(hash_bytes) = hex::decode(&f.hash) else {
+                                continue;
+                            };
+                            if hash_bytes.len() != 16 {
+                                continue;
+                            }
+                            let mut hash = [0u8; 16];
+                            hash.copy_from_slice(&hash_bytes);
+                            let name_bytes = f.name.as_bytes().to_vec();
+                            let aich = if f.aich_hash.len() == 40 {
+                                let mut root = [0u8; 20];
+                                if hex::decode_to_slice(&f.aich_hash, &mut root).is_ok() {
+                                    Some(root)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+                            encoded_entries.push((hash, f.size, name_bytes, aich));
+                            // Rough pre-cap so encode stays under the frame budget.
+                            let approx = encoded_entries.iter().fold(8usize, |acc, e| {
+                                acc + 16 + 8 + 2 + e.2.len() + 1 + if e.3.is_some() { 20 } else { 0 }
+                            });
+                            if approx >= MAX_BROWSE_ANSWER_BYTES {
                                 break;
                             }
-                            if let Ok(hash_bytes) = hex::decode(&f.hash) {
-                                if hash_bytes.len() == 16 {
-                                    res_payload.extend_from_slice(&hash_bytes);
-                                    res_payload.extend_from_slice(&f.size.to_le_bytes());
-                                    let name_bytes = f.name.as_bytes();
-                                    let name_len = name_bytes.len().min(u16::MAX as usize) as u16;
-                                    res_payload.extend_from_slice(&name_len.to_le_bytes());
-                                    res_payload.extend_from_slice(&name_bytes[..name_len as usize]);
-                                    actual_count += 1;
-                                }
-                            }
                         }
-                        res_payload[count_offset..count_offset + 4]
-                            .copy_from_slice(&actual_count.to_le_bytes());
+                        let res_payload = if supports_ebr1 {
+                            ed2k::multi_source::encode_browse_response_v1(
+                                encoded_entries.iter().map(|(h, s, n, a)| {
+                                    (h, *s, n.as_slice(), a.as_ref())
+                                }),
+                            )
+                        } else {
+                            ed2k::multi_source::encode_browse_response_legacy(
+                                encoded_entries
+                                    .iter()
+                                    .map(|(h, s, n, _)| (h, *s, n.as_slice())),
+                            )
+                        };
                         let mut packet = Vec::with_capacity(6 + res_payload.len());
                         packet.push(OP_EMULEPROT);
                         let size = (1 + res_payload.len()) as u32;
                         packet.extend_from_slice(&size.to_le_bytes());
                         packet.push(ed2k::messages::OP_EMBER_BROWSE_RES);
                         packet.extend_from_slice(&res_payload);
-                        let sessions = state.ember_sessions.read().await;
-                        if let Some(handle) = sessions.get(&browse_eh) {
-                            if let Err(e) = handle.tx.try_send(packet) {
-                                tracing::warn!("Browse response to {} dropped: {e}", hex::encode(browse_eh));
-                            }
+                        if let Err(e) = send_browse_response_to_origin(reply_tx, packet) {
+                            tracing::warn!(
+                                "Browse response to {} on session {} dropped: {e}",
+                                hex::encode(browse_eh),
+                                session_id,
+                            );
                         }
                         let _ = app_handle.emit("ember:browse-request", serde_json::json!({
                             "user_hash": hash_hex,
@@ -12743,10 +12808,24 @@ pub async fn start_network(
                         continue;
                     }
                     let hash_hex = hex::encode(browse_eh);
-                    let files: Vec<serde_json::Value> = entries.iter().map(|(hash, size, name)| {
-                        let clean_name = crate::security::sanitize_display_name(name);
-                        serde_json::json!({ "hash": hash, "size": size, "name": clean_name })
-                    }).collect();
+                    let files: Vec<serde_json::Value> = entries
+                        .iter()
+                        .map(|(hash, size, name, aich)| {
+                            let clean_name = crate::security::sanitize_display_name(name);
+                            let mut obj = serde_json::json!({
+                                "hash": hash,
+                                "size": size,
+                                "name": clean_name,
+                            });
+                            if let Some(aich_hash) = aich.as_ref().filter(|h| h.len() == 40) {
+                                obj.as_object_mut().unwrap().insert(
+                                    "aich_hash".into(),
+                                    serde_json::Value::String(aich_hash.clone()),
+                                );
+                            }
+                            obj
+                        })
+                        .collect();
                     if let Some(request_id) = complete_browse_request(
                         &mut state.pending_browse_requests,
                         browse_eh,
@@ -16561,8 +16640,16 @@ pub async fn start_network(
                                     return;
                                 };
                                 let expected_capability =
-                                    match rendezvous::fetch_identity_pubkey(&rv_url, &friend_hash)
-                                        .await
+                                    match rendezvous::fetch_identity_pubkey_authenticated(
+                                        &rv_url,
+                                        &friend_hash,
+                                        &our_punch_hash,
+                                        &ed25519_dalek::SigningKey::from_bytes(&punch_secret)
+                                            .verifying_key()
+                                            .to_bytes(),
+                                        &punch_secret,
+                                    )
+                                    .await
                                     {
                                         Ok(Some(pubkey)) => {
                                             let owner_pubkey =
@@ -16592,7 +16679,18 @@ pub async fn start_network(
                                     .await;
                                     return;
                                 }
-                                let Ok(ip) = info.ip.parse::<std::net::IpAddr>() else { return; };
+                                let Ok(ip) = info.ip.parse::<std::net::IpAddr>() else {
+                                    let _ = ember::relay::ack_punch(
+                                        &rv_url,
+                                        &our_punch_hash,
+                                        &info.punch_id,
+                                        &info.capability,
+                                        info.epoch,
+                                        &punch_secret,
+                                    )
+                                    .await;
+                                    return;
+                                };
                                 let routable = match ip {
                                     std::net::IpAddr::V4(v4) => !crate::security::is_special_use_v4(v4),
                                     std::net::IpAddr::V6(_) => !crate::security::is_private_ip(ip),
@@ -16602,6 +16700,15 @@ pub async fn start_network(
                                         "Punch responder: ignoring non-routable initiator {ip}:{}",
                                         info.port
                                     );
+                                    let _ = ember::relay::ack_punch(
+                                        &rv_url,
+                                        &our_punch_hash,
+                                        &info.punch_id,
+                                        &info.capability,
+                                        info.epoch,
+                                        &punch_secret,
+                                    )
+                                    .await;
                                     return;
                                 }
                                 let initiator_addr = SocketAddr::new(ip, info.port);
@@ -16616,13 +16723,16 @@ pub async fn start_network(
                                 // port is our QUIC port, not `our_addr.port()`
                                 // (the KAD UDP NAT mapping) — the initiator
                                 // dials this port over QUIC, not UDP/KAD.
-                                if our_ext_addr.is_some() {
-                                    if let Err(e) = ember::relay::register_punch(
+                                if let Some(ext_addr) = our_ext_addr {
+                                    if let Err(e) = ember::relay::register_punch_with_ip(
                                         &rv_url,
                                         &our_punch_hash,
                                         &friend_hash,
-                                        advertised_quic_port, our_nat_type.as_u8(),
+                                        advertised_quic_port,
+                                        our_nat_type.as_u8(),
+                                        ext_addr.ip(),
                                         &punch_secret,
+                                        &our_punch_hash,
                                     ).await {
                                         tracing::debug!("Punch responder: reciprocal register failed: {e}");
                                     }
@@ -30443,7 +30553,10 @@ async fn handle_udp_packet_inner(
                 .routing_table
                 .all_contacts()
                 .any(|contact| contact.ip == peer_ip && contact.verified && !contact.is_dead());
-            if !packet_valid_receiver_key && !verified_contact {
+            // Under response-budget stress, require modern receiver-key proof so
+            // spoofed UDP from verified contacts cannot burn the remaining budget.
+            let under_load = state.firewall_req_response_bucket.available_tokens() < 8.0;
+            if !packet_valid_receiver_key && (under_load || !verified_contact) {
                 debug!("Ignoring unverified FirewalledReq context from {from}");
                 return;
             }
@@ -30609,7 +30722,8 @@ async fn handle_udp_packet_inner(
             let verified_contact = state.routing_table.all_contacts().any(|contact| {
                 contact.ip == requester_ip && contact.verified && !contact.is_dead()
             });
-            if !packet_valid_receiver_key && !verified_contact {
+            let under_load = state.firewall_req_response_bucket.available_tokens() < 8.0;
+            if !packet_valid_receiver_key && (under_load || !verified_contact) {
                 debug!("Ignoring unverified Firewalled2Req context from {from}");
                 return;
             }
@@ -36108,24 +36222,34 @@ async fn reverify_complete_part_file(
         .join(format!("{transfer_id}.part"));
     let expected = file_hash.to_string();
     let verify_path = part_path.clone();
-    let computed_hash =
-        tokio::task::spawn_blocking(move || ed2k::hash::ed2k_hash_file(&verify_path))
-            .await
-            .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
+    let verify_root = download_dir.to_path_buf();
+    let expected_aich_owned = expected_aich.map(str::to_string);
+    let (computed_hash, verified_identity, computed_aich) =
+        tokio::task::spawn_blocking(move || {
+            let allowed = vec![verify_root.to_string_lossy().into_owned()];
+            let (_, mut file) =
+                crate::security::filesystem::open_existing_approved(&verify_path, &allowed, false)?;
+            let identity = crate::security::filesystem::opened_file_identity(&file)?;
+            let hash = ed2k::hash::ed2k_hash_open_file(&mut file)?;
+            let aich = if expected_aich_owned.is_some() {
+                Some(hex::encode(
+                    ed2k::aich::AICHRecoveryHashSet::build_from_open_file(&mut file)?.root_hash,
+                ))
+            } else {
+                None
+            };
+            Ok::<_, anyhow::Error>((hash, identity, aich))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
 
     if computed_hash != expected {
         anyhow::bail!("Re-verification hash mismatch — .part preserved for retry");
     }
     if let Some(expected_aich) = expected_aich {
-        let verify_path = part_path.clone();
-        let expected_aich = expected_aich.to_string();
-        let actual = tokio::task::spawn_blocking(move || {
-            ed2k::aich::AICHRecoveryHashSet::build_from_file(&verify_path)
-                .map(|set| hex::encode(set.root_hash))
-        })
-        .await
-        .map_err(|error| anyhow::anyhow!("AICH verification task failed: {error}"))??;
-        if !actual.eq_ignore_ascii_case(&expected_aich) {
+        let actual = computed_aich
+            .ok_or_else(|| anyhow::anyhow!("AICH verification did not produce a root"))?;
+        if !actual.eq_ignore_ascii_case(expected_aich) {
             anyhow::bail!(
                 "Expected AICH hash mismatch — .part preserved for retry (expected {expected_aich}, got {actual})"
             );
@@ -36133,22 +36257,29 @@ async fn reverify_complete_part_file(
     }
 
     let safe_name = crate::security::sanitize_filename(file_name);
-    let completed_dir = download_dir.join("Downloads");
-    tokio::fs::create_dir_all(&completed_dir)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to create Downloads dir: {e}"))?;
+    let prepare_root = download_dir.to_path_buf();
+    let allowed = vec![download_dir.to_string_lossy().into_owned()];
+    let completed_dir = tokio::task::spawn_blocking(move || {
+        crate::security::filesystem::prepare_approved_subdir(&prepare_root, "Downloads", &allowed)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("Failed to create Downloads dir: {e}"))??;
     let final_target = completed_dir.join(&safe_name);
     let pp = part_path.clone();
     let root = download_dir.to_path_buf();
     let actual_final = tokio::task::spawn_blocking(move || {
-        ed2k::transfer::move_part_to_final_approved(&pp, &final_target, &root)
+        ed2k::transfer::move_part_to_final_approved(&pp, &final_target, &root, &verified_identity)
     })
     .await
     .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
 
     // Clean up .part.met
     let met_path = part_path.with_extension("part.met");
-    let _ = tokio::fs::remove_file(&met_path).await;
+    let cleanup_root = download_dir.to_string_lossy().into_owned();
+    let _ = tokio::task::spawn_blocking(move || {
+        crate::security::filesystem::remove_approved_file(&met_path, &[cleanup_root])
+    })
+    .await;
 
     info!(
         "Re-verified and completed restored download {transfer_id} ({file_name}, {file_size} bytes)"

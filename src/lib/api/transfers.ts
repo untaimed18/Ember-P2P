@@ -8,6 +8,21 @@ import type {
   KnownClient,
 } from '$lib/types';
 
+/** Normalize a trusted AICH pin while rejecting malformed non-empty values. */
+export function validatedExpectedAich(
+  value: string | null | undefined,
+): string | null {
+  const trimmed = value?.trim().toLowerCase() ?? '';
+  if (!trimmed) return null;
+  if (trimmed.length !== 40 || !/^[0-9a-f]+$/.test(trimmed)) {
+    // Never silently downgrade a caller-supplied integrity pin to an
+    // unpinned download. Rust performs the same validation at the IPC
+    // boundary; failing here gives the renderer an immediate localized error.
+    throw new Error(m.error_transfers_invalid_expected_aich());
+  }
+  return trimmed;
+}
+
 export async function startDownload(
   fileHash: string,
   fileName: string,
@@ -41,7 +56,7 @@ export async function startDownload(
     peerPort,
     extraSources: extraSources ?? null,
     emberFileHash: emberFileHash?.trim() ? emberFileHash.trim() : null,
-    expectedAich: expectedAich ?? null,
+    expectedAich: validatedExpectedAich(expectedAich),
   });
 }
 

@@ -6,6 +6,11 @@
   //   - ed2k://|server|ip|port  -> add + connect to the ed2k server
   //   - ed2k://|serverlist|url  -> download a server.met list
   //   - *.emulecollection       -> open on the library page
+  //
+  // Backend contract (`list_pending_deep_links` / `ack_pending_deep_link`):
+  // links remain durable until explicitly acknowledged. Ack only after a
+  // completed action *or* an explicit user rejection — never after an
+  // accidental Escape/overlay dismiss, so OS-delivered actions are not lost.
   import { onMount } from 'svelte';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { goto } from '$app/navigation';
@@ -24,6 +29,9 @@
   import { toastSuccess, toastError } from '$lib/stores/toast';
   import { translateError } from '$lib/i18n';
   import * as m from '$lib/paraglide/messages';
+
+  type ConfirmDecision = 'accept' | 'reject' | 'defer';
+  type HandleResult = 'done' | 'defer' | 'fail';
 
   // Parse the `|`-delimited body of an ed2k link, dropping the trailing empty
   // segment(s) the `…|/` terminator produces. e.g.
@@ -69,10 +77,10 @@
 
   let confirmOpen = false;
   let confirmMessage = '';
-  let confirmResolver: ((confirmed: boolean) => void) | null = null;
+  let confirmResolver: ((decision: ConfirmDecision) => void) | null = null;
 
-  function requestConfirmation(preview: DeepLinkPreview): Promise<boolean> {
-    if (destroyed) return Promise.resolve(false);
+  function requestConfirmation(preview: DeepLinkPreview): Promise<ConfirmDecision> {
+    if (destroyed) return Promise.resolve('defer');
     confirmMessage = deepLinkConfirmationMessage(preview);
     confirmOpen = true;
     return new Promise((resolve) => {
@@ -80,14 +88,14 @@
     });
   }
 
-  function resolveConfirmation(confirmed: boolean) {
+  function resolveConfirmation(decision: ConfirmDecision) {
     const resolve = confirmResolver;
     confirmResolver = null;
     confirmOpen = false;
-    resolve?.(confirmed);
+    resolve?.(decision);
   }
 
-  async function handlePayload(raw: string): Promise<boolean> {
+  async function handlePayload(raw: string): Promise<HandleResult> {
     const payload = raw.trim();
     let preview: DeepLinkPreview;
     try {
@@ -97,16 +105,14 @@
       // payload. Surface once, then acknowledge so malformed links cannot
       // occupy all queue slots forever.
       if (!destroyed) toastError(translateError(e));
-      return !destroyed;
+      return destroyed ? 'defer' : 'done';
     }
 
-    if (preview.kind !== 'collection') {
-      const confirmed = await requestConfirmation(preview);
-      if (destroyed) return false;
-      // Explicit cancellation is a terminal user decision and is therefore
-      // acknowledged without executing the network/filesystem action.
-      if (!confirmed) return true;
-    }
+    const decision = await requestConfirmation(preview);
+    if (destroyed || decision === 'defer') return 'defer';
+    // Explicit "Ignore link" is a terminal user decision: ack without
+    // executing the network/filesystem action.
+    if (decision === 'reject') return 'done';
 
     try {
       if (preview.kind === 'file') {
@@ -117,6 +123,7 @@
           info.size,
           '',
           0,
+          undefined,
           undefined,
           info.aich,
         );
@@ -137,7 +144,7 @@
               ? m.servers_validation_ip_invalid()
               : m.servers_validation_port_range(),
           );
-          return false;
+          return 'fail';
         }
         // Add to the list, but don't let a duplicate-add error block the
         // connect — a link pointing at an already-known server should still
@@ -156,13 +163,13 @@
           // Match the backend's pinned-fetch policy: never silently turn an
           // OS-delivered deep link into an insecure HTTP server-list request.
           toastError(m.security_url_must_be_https());
-          return false;
+          return 'fail';
         }
         const msg = await downloadServerMet(url);
         if (!destroyed) toastSuccess(msg);
       } else if (preview.kind === 'collection') {
         const coll = await openCollectionFile(payload);
-        if (destroyed) return false;
+        if (destroyed) return 'defer';
         const presented = presentIncomingCollection(coll);
         await goto('/library');
         await presented;
@@ -172,11 +179,11 @@
       }
       // Unknown ed2k:// variants (e.g. magnet-style or future opcodes) are
       // ignored silently — the buffer already filtered to our known prefixes.
-      return true;
+      return 'done';
     } catch (e: unknown) {
-      if (destroyed) return false;
+      if (destroyed) return 'defer';
       toastError(translateError(e));
-      return false;
+      return 'fail';
     }
   }
 
@@ -189,10 +196,30 @@
   // Failed entries remain durable for a later app/session retry, but must not
   // immediately re-toast in a tight drain loop.
   const failedIds = new Set<string>();
+  // Escape/overlay dismissals remain durable but are excluded from automatic
+  // drains until the user explicitly chooses Review. Keeping them separate
+  // from failures also lets newly-arrived/later queued links continue.
+  const deferredIds = new Set<string>();
+  let deferredCount = 0;
+  let reviewRequestedId: string | null = null;
   let ackRetryTimer: ReturnType<typeof setTimeout> | undefined;
   // Set on unmount so an in-flight drain stops routing payloads (goto/toasts)
   // into a component that no longer exists.
   let destroyed = false;
+
+  function syncDeferredCount() {
+    deferredCount = deferredIds.size;
+  }
+
+  function reviewDeferredLink() {
+    if (destroyed || reviewRequestedId) return;
+    const first = deferredIds.values().next();
+    if (first.done) return;
+    // Do not remove it yet: if listing the durable queue fails, the banner
+    // remains actionable and a later click can retry.
+    reviewRequestedId = first.value;
+    void drain();
+  }
 
   function scheduleAckRetry() {
     if (destroyed || ackRetryTimer) return;
@@ -227,23 +254,56 @@
       do {
         rerun = false;
         if (destroyed) break;
-        const links = (await listPendingDeepLinks()).filter((link) => !failedIds.has(link.id));
+        const pending = await listPendingDeepLinks();
+        const pendingIds = new Set(pending.map((link) => link.id));
+        let deferredChanged = false;
+        for (const id of deferredIds) {
+          if (!pendingIds.has(id)) {
+            deferredIds.delete(id);
+            deferredChanged = true;
+          }
+        }
+        if (reviewRequestedId && !pendingIds.has(reviewRequestedId)) {
+          reviewRequestedId = null;
+        }
+        if (deferredChanged) syncDeferredCount();
+
+        const links = pending.filter(
+          (link) =>
+            !failedIds.has(link.id) &&
+            (!deferredIds.has(link.id) || link.id === reviewRequestedId),
+        );
         for (const link of links) {
           if (destroyed) break;
+          const reviewingDeferred = link.id === reviewRequestedId;
           if (!completedIds.has(link.id)) {
-            if (await handlePayload(link.payload)) {
+            const result = await handlePayload(link.payload);
+            if (reviewingDeferred) reviewRequestedId = null;
+            if (result === 'done') {
+              if (deferredIds.delete(link.id)) syncDeferredCount();
               completedIds.add(link.id);
+            } else if (result === 'defer') {
+              // Keep the durable entry without automatically reopening it.
+              // Continue so one dismissed link cannot starve later entries.
+              deferredIds.add(link.id);
+              syncDeferredCount();
+              continue;
             } else {
+              if (reviewingDeferred && deferredIds.delete(link.id)) syncDeferredCount();
               failedIds.add(link.id);
               continue;
             }
           }
-          // Preserve queue order: if the head cannot be persisted as
-          // acknowledged, retry it before presenting later payloads.
+          if (reviewingDeferred) reviewRequestedId = null;
+          // If a completed link cannot be durably acknowledged, retry that ack
+          // before running additional side effects.
           if (!(await acknowledgeCompletedLink(link.id))) break;
         }
       } while (rerun);
     } catch (e) {
+      // A failed durable-list read must not leave the Review action latched
+      // disabled; the deferred ID itself remains available for another try.
+      reviewRequestedId = null;
       console.error('Failed to drain pending deep links:', e);
     } finally {
       processing = false;
@@ -279,7 +339,7 @@
     return () => {
       mounted = false;
       destroyed = true;
-      resolveConfirmation(false);
+      resolveConfirmation('defer');
       clearTimeout(ackRetryTimer);
       if (unlisten) unlisten();
     };
@@ -288,11 +348,62 @@
 
 <ConfirmDialog
   bind:open={confirmOpen}
-  title={m.confirm_default_title()}
+  title={m.deeplink_confirm_title()}
   message={confirmMessage}
-  confirmLabel={m.confirm_default_button()}
-  cancelLabel={m.common_cancel()}
+  confirmLabel={m.deeplink_confirm_open()}
+  cancelLabel={m.deeplink_confirm_ignore()}
   isolateMessage={true}
-  onconfirm={() => resolveConfirmation(true)}
-  oncancel={() => resolveConfirmation(false)}
+  onconfirm={() => resolveConfirmation('accept')}
+  oncancel={() => resolveConfirmation('reject')}
+  ondismiss={() => resolveConfirmation('defer')}
 />
+
+{#if deferredCount > 0}
+  <div class="deferred-link-notice" role="status" aria-live="polite">
+    <span>
+      {deferredCount === 1
+        ? m.deeplink_pending_one()
+        : m.deeplink_pending_other({ count: deferredCount })}
+    </span>
+    <button
+      type="button"
+      aria-disabled={reviewRequestedId !== null}
+      onclick={reviewDeferredLink}
+    >
+      {m.deeplink_review_pending()}
+    </button>
+  </div>
+{/if}
+
+<style>
+  .deferred-link-notice {
+    position: fixed;
+    left: 18px;
+    bottom: 42px;
+    z-index: 9400;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    max-width: min(440px, calc(100vw - 36px));
+    padding: 10px 12px 10px 14px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--surface-raised);
+    color: var(--text-primary);
+    box-shadow: var(--shadow-md);
+    font-size: 13px;
+  }
+
+  .deferred-link-notice span {
+    line-height: 1.35;
+  }
+
+  .deferred-link-notice button {
+    flex-shrink: 0;
+  }
+
+  .deferred-link-notice button[aria-disabled='true'] {
+    cursor: wait;
+    opacity: 0.65;
+  }
+</style>

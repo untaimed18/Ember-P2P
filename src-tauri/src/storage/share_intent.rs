@@ -2,11 +2,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 const STATE_FILE: &str = "share_intent.json";
 const STATE_VERSION: u32 = 1;
 const MAX_INTENTS: usize = 1_000_000;
+
+/// Process-local fail-closed latch used when durable share-intent persistence
+/// fails after catalog corruption. `effective_shared` consults this even when
+/// the on-disk store could not be updated.
+static FORCE_UNSHARED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedShareIntent {
@@ -76,6 +82,9 @@ impl ShareIntentStore {
     }
 
     pub fn effective_shared(&self, hash: &[u8; 16], catalog_value: bool) -> bool {
+        if FORCE_UNSHARED.load(Ordering::Acquire) {
+            return false;
+        }
         let key = normalize_hash(hash);
         let state = self.state.read();
         if state.denied.contains(&key) {
@@ -121,7 +130,9 @@ impl ShareIntentStore {
             state.catalog_seen = true;
             state.fail_closed = true;
             Ok(())
-        })
+        })?;
+        FORCE_UNSHARED.store(false, Ordering::Release);
+        Ok(())
     }
 
     pub fn mark_catalog_seen(&self) -> io::Result<()> {
@@ -229,6 +240,9 @@ pub fn global() -> io::Result<Arc<ShareIntentStore>> {
 }
 
 pub fn effective_shared(hash: &[u8; 16], catalog_value: bool) -> bool {
+    if FORCE_UNSHARED.load(Ordering::Acquire) {
+        return false;
+    }
     global()
         .map(|store| store.effective_shared(hash, catalog_value))
         .unwrap_or(false)
@@ -238,12 +252,35 @@ pub fn set_explicit_batch(updates: &[([u8; 16], bool)]) -> io::Result<()> {
     global()?.set_explicit_batch(updates)
 }
 
+/// Enter durable fail-closed mode. If persistence fails, latch a process-local
+/// unshared-all flag so rediscovery cannot publish until the store recovers.
 pub fn enter_fail_closed() -> io::Result<()> {
-    global()?.enter_fail_closed()
+    match global()?.enter_fail_closed() {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            force_unshared_all();
+            Err(error)
+        }
+    }
 }
 
 pub fn note_catalog_missing() -> io::Result<()> {
-    global()?.note_catalog_missing()
+    match global()?.note_catalog_missing() {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            force_unshared_all();
+            Err(error)
+        }
+    }
+}
+
+pub fn force_unshared_all() {
+    FORCE_UNSHARED.store(true, Ordering::Release);
+}
+
+#[cfg(test)]
+pub fn clear_force_unshared_for_tests() {
+    FORCE_UNSHARED.store(false, Ordering::Release);
 }
 
 #[cfg(test)]
@@ -282,6 +319,18 @@ mod tests {
         let hash = [0x24; 16];
         store.set_explicit_batch(&[(hash, false)]).unwrap();
         assert!(!store.effective_shared(&hash, true));
+        let _ = std::fs::remove_file(&store.path);
+    }
+
+    #[test]
+    fn force_unshared_blocks_even_without_durable_fail_closed() {
+        clear_force_unshared_for_tests();
+        let store = test_store(false);
+        let hash = [0x11; 16];
+        assert!(store.effective_shared(&hash, true));
+        force_unshared_all();
+        assert!(!effective_shared(&hash, true));
+        clear_force_unshared_for_tests();
         let _ = std::fs::remove_file(&store.path);
     }
 

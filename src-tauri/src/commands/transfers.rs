@@ -204,35 +204,74 @@ pub(crate) async fn start_promoted_downloads(state: &AppState, promoted: &[Trans
 
 /// Try to delete a file, retrying with a delay if it fails (e.g. because
 /// the download task still holds the handle on Windows).
-async fn delete_with_retry(path: &Path, max_attempts: u32, delay_ms: u64) {
-    if !path.exists() {
-        return;
-    }
+async fn delete_with_retry(
+    path: &Path,
+    allowed_roots: &[String],
+    expected: &crate::security::filesystem::ObjectIdentity,
+    max_attempts: u32,
+    delay_ms: u64,
+) {
     for attempt in 0..max_attempts {
-        match tokio::fs::remove_file(path).await {
-            Ok(()) => {
-                tracing::debug!("Deleted {}", path.display());
+        let delete_path = path.to_path_buf();
+        let display_path = delete_path.clone();
+        let allowed = allowed_roots.to_vec();
+        let expected = expected.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            crate::security::filesystem::remove_approved_file_if_identity(
+                &delete_path,
+                &allowed,
+                &expected,
+            )
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {
+                tracing::debug!("Deleted {}", display_path.display());
                 return;
             }
-            Err(e) if attempt + 1 < max_attempts => {
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                tracing::warn!("Delete task failed for {}: {e}", display_path.display());
+                return;
+            }
+            Ok(Err(e)) if attempt + 1 < max_attempts => {
                 tracing::debug!(
                     "Delete {} attempt {}/{} failed ({}), retrying...",
-                    path.display(),
+                    display_path.display(),
                     attempt + 1,
                     max_attempts,
                     e
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!(
                     "Failed to delete {} after {} attempts: {}",
-                    path.display(),
+                    display_path.display(),
                     max_attempts,
                     e
                 );
             }
         }
+    }
+}
+
+fn pin_cleanup_target(
+    path: &Path,
+    allowed_roots: &[String],
+) -> std::io::Result<
+    Option<(
+        std::path::PathBuf,
+        crate::security::filesystem::ObjectIdentity,
+    )>,
+> {
+    match crate::security::filesystem::open_existing_approved(path, allowed_roots, false) {
+        Ok((verified, file)) => Ok(Some((
+            verified,
+            crate::security::filesystem::opened_file_identity(&file)?,
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -245,32 +284,35 @@ async fn cleanup_partial_files(download_folder: &str, transfer_id: &str) {
     let part_path = temp_dir.join(format!("{transfer_id}.part"));
     let met_path = temp_dir.join(format!("{transfer_id}.part.met"));
     let allowed = vec![download_folder.to_string()];
-    let part_path = if part_path.exists() {
-        match crate::security::filesystem::verify_existing_path(&part_path, &allowed) {
-            Ok(path) => path,
-            Err(error) => {
-                tracing::warn!("Refusing to delete unverified part path: {error}");
-                return;
-            }
+    let part = match pin_cleanup_target(&part_path, &allowed) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!("Refusing to delete unverified part path: {error}");
+            return;
         }
-    } else {
-        part_path
     };
-    let met_path = if met_path.exists() {
-        match crate::security::filesystem::verify_existing_path(&met_path, &allowed) {
-            Ok(path) => path,
-            Err(error) => {
-                tracing::warn!("Refusing to delete unverified part metadata path: {error}");
-                return;
-            }
+    let met = match pin_cleanup_target(&met_path, &allowed) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!("Refusing to delete unverified part metadata path: {error}");
+            return;
         }
-    } else {
-        met_path
     };
-    tokio::join!(
-        delete_with_retry(&part_path, 6, 500),
-        delete_with_retry(&met_path, 6, 500),
-    );
+    match (part, met) {
+        (Some((part_path, part_identity)), Some((met_path, met_identity))) => {
+            tokio::join!(
+                delete_with_retry(&part_path, &allowed, &part_identity, 6, 500),
+                delete_with_retry(&met_path, &allowed, &met_identity, 6, 500),
+            );
+        }
+        (Some((part_path, part_identity)), None) => {
+            delete_with_retry(&part_path, &allowed, &part_identity, 6, 500).await;
+        }
+        (None, Some((met_path, met_identity))) => {
+            delete_with_retry(&met_path, &allowed, &met_identity, 6, 500).await;
+        }
+        (None, None) => {}
+    }
 }
 
 /// Walk `<download_folder>/Temp/` and remove any `.part` / `.part.met`
@@ -336,22 +378,15 @@ pub async fn sweep_orphan_part_files(
             skipped_known += 1;
             continue;
         }
-        let path = match crate::security::filesystem::verify_existing_path(
-            &path,
-            &[download_folder.to_string()],
-        ) {
-            Ok(path) => path,
-            Err(error) => {
-                failed += 1;
-                tracing::warn!(
-                    "Orphan sweep: refusing changed/unapproved path {}: {error}",
-                    path.display()
-                );
-                continue;
-            }
-        };
-        match tokio::fs::remove_file(&path).await {
-            Ok(()) => {
+        let allowed = vec![download_folder.to_string()];
+        let deletion = tokio::task::spawn_blocking({
+            let path = path.clone();
+            let allowed = allowed.clone();
+            move || crate::security::filesystem::remove_approved_file(&path, &allowed)
+        })
+        .await;
+        match deletion {
+            Ok(Ok(())) => {
                 if is_met {
                     swept_met += 1;
                 } else {
@@ -359,9 +394,19 @@ pub async fn sweep_orphan_part_files(
                 }
                 tracing::info!("Orphan sweep: removed {}", path.display());
             }
-            Err(e) => {
+            Ok(Err(error)) => {
                 failed += 1;
-                tracing::warn!("Orphan sweep: failed to remove {}: {e}", path.display());
+                tracing::warn!(
+                    "Orphan sweep: refusing changed/unapproved path {}: {error}",
+                    path.display()
+                );
+            }
+            Err(error) => {
+                failed += 1;
+                tracing::warn!(
+                    "Orphan sweep delete task failed for {}: {error}",
+                    path.display()
+                );
             }
         }
     }
@@ -404,17 +449,8 @@ pub async fn start_download(
     if file_hash.len() != 32 || hex::decode(&file_hash).is_err() {
         return Err(coded("transfers_invalid_file_hash", "Invalid file hash"));
     }
-    let expected_aich = expected_aich
-        .map(|value| value.trim().to_ascii_lowercase())
-        .filter(|value| !value.is_empty());
-    if expected_aich.as_ref().is_some_and(|value| {
-        value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
-    }) {
-        return Err(coded(
-            "transfers_invalid_expected_aich",
-            "Expected AICH must be a 40-character hexadecimal SHA-1 root",
-        ));
-    }
+    let expected_aich = crate::security::parse_expected_aich(expected_aich.as_deref())
+        .map_err(|message| coded("transfers_invalid_expected_aich", message))?;
 
     if !peer_ip.is_empty() {
         peer_ip
@@ -1816,6 +1852,7 @@ pub async fn recover_archive(
     }
 
     let fname = file_name.clone();
+    let allowed_for_recovery = vec![dl_folder.clone()];
     let recovery = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         crate::network::ed2k::archive_recovery::recover_archive(
@@ -1823,6 +1860,7 @@ pub async fn recover_archive(
             &fname,
             &verified_ranges,
             &canonical_temp,
+            &allowed_for_recovery,
             control.as_deref(),
         )
     });

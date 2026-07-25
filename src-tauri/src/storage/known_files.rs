@@ -172,6 +172,7 @@ impl KnownFileList {
                 if !path.exists() {
                     if let Err(error) = crate::storage::share_intent::note_catalog_missing() {
                         tracing::debug!("Could not record missing known.met state: {error}");
+                        crate::storage::share_intent::force_unshared_all();
                     }
                 }
                 list
@@ -196,6 +197,7 @@ impl KnownFileList {
                 }
                 if let Err(intent_error) = crate::storage::share_intent::enter_fail_closed() {
                     warn!("Failed to persist fail-closed share intent: {intent_error}");
+                    crate::storage::share_intent::force_unshared_all();
                 }
                 Self::new()
             }

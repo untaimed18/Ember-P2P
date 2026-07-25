@@ -204,10 +204,64 @@ export function verifyWorkflow({ root = scriptRoot } = {}) {
   return actionLines.length;
 }
 
+export function verifySecurityEpoch({ root = scriptRoot } = {}) {
+  const errors = [];
+  const updaterSource = read(root, "src-tauri/src/commands/updater.rs");
+  const workflow = read(root, ".github/workflows/release.yml");
+
+  const rustMatch = updaterSource.match(
+    /^\s*const CURRENT_SECURITY_EPOCH:\s*u64\s*=\s*(\d+)\s*;/m,
+  );
+  if (!rustMatch) {
+    errors.push(
+      "src-tauri/src/commands/updater.rs: CURRENT_SECURITY_EPOCH constant not found",
+    );
+  }
+
+  const workflowMatches = [
+    ...workflow.matchAll(/^\s*EMBER_UPDATE_SECURITY_EPOCH:\s*"(\d+)"\s*$/gm),
+  ];
+  if (workflowMatches.length !== 1) {
+    errors.push(
+      `release.yml: expected exactly one EMBER_UPDATE_SECURITY_EPOCH assignment, found ${workflowMatches.length}`,
+    );
+  }
+
+  let epoch = null;
+  if (rustMatch && workflowMatches.length === 1) {
+    const rustEpoch = Number(rustMatch[1]);
+    const workflowEpoch = Number(workflowMatches[0][1]);
+    if (
+      !Number.isSafeInteger(rustEpoch) ||
+      rustEpoch < 1 ||
+      !Number.isSafeInteger(workflowEpoch) ||
+      workflowEpoch < 1
+    ) {
+      errors.push(
+        `security epoch must be a positive safe integer (updater.rs=${rustMatch[1]}, release.yml=${workflowMatches[0][1]})`,
+      );
+    } else if (rustEpoch !== workflowEpoch) {
+      errors.push(
+        `security epoch mismatch: updater.rs CURRENT_SECURITY_EPOCH=${rustEpoch}, release.yml EMBER_UPDATE_SECURITY_EPOCH=${workflowEpoch}`,
+      );
+    } else {
+      epoch = rustEpoch;
+    }
+  }
+
+  if (errors.length) {
+    throw new Error(
+      `Release security epoch policy failed:\n- ${errors.join("\n- ")}`,
+    );
+  }
+  return epoch;
+}
+
 export function verifyReleasePolicy(options = {}) {
   const version = verifyVersions(options);
   const actions = verifyWorkflow(options);
-  return { version, actions };
+  const securityEpoch = verifySecurityEpoch(options);
+  return { version, actions, securityEpoch };
 }
 
 function parseArgs(argv) {
@@ -233,7 +287,7 @@ if (
   try {
     const result = verifyReleasePolicy(parseArgs(process.argv.slice(2)));
     console.log(
-      `release policy verified: version ${result.version}, ${result.actions} SHA-pinned action uses`,
+      `release policy verified: version ${result.version}, security epoch ${result.securityEpoch}, ${result.actions} SHA-pinned action uses`,
     );
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));

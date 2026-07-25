@@ -753,18 +753,38 @@ pub(crate) fn file_in_shared_folders(file_path: &str, shared_folders: &[String])
 
 async fn delete_file_with_retry(
     path: &std::path::Path,
+    allowed_roots: &[String],
+    expected: &crate::security::filesystem::ObjectIdentity,
     max_attempts: u32,
     delay_ms: u64,
 ) -> Result<(), String> {
     let mut last_error = None;
     for attempt in 1..=max_attempts {
-        match tokio::fs::remove_file(path).await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
+        let delete_path = path.to_path_buf();
+        let allowed = allowed_roots.to_vec();
+        let expected = expected.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::security::filesystem::remove_approved_file_if_identity(
+                &delete_path,
+                &allowed,
+                &expected,
+            )
+        })
+        .await
+        {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(e)) => {
                 last_error = Some(e);
                 if attempt < max_attempts {
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                 }
+            }
+            Err(e) => {
+                return Err(coded_ctx(
+                    "sharing_delete_failed",
+                    format!("Delete task failed for {}", path.display()),
+                    e,
+                ));
             }
         }
     }
@@ -1193,37 +1213,28 @@ pub async fn add_shared_folder(
         info!("Folder {canonical_str} is already shared, skipping duplicate scan");
         return Ok(());
     };
+    let mut roots = {
+        let config = state.config.read().await;
+        let mut roots = config.settings.shared_folders.clone();
+        if !config.settings.download_folder.is_empty() {
+            roots.push(config.settings.download_folder.clone());
+        }
+        roots
+    };
+    roots.push(canonical_str.clone());
+    let registry = state.approved_roots.clone();
+    let approved = canonical_str.clone();
     tokio::task::spawn_blocking(move || {
-        crate::storage::config::AppConfig::write_to_disk(&data, &tmp, &final_path)
+        super::settings::persist_with_root_transaction(
+            registry,
+            &roots,
+            std::slice::from_ref(&approved),
+            || crate::storage::config::AppConfig::write_to_disk(&data, &tmp, &final_path),
+        )
     })
     .await
-    .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?
+    .map_err(|e| coded_ctx("sharing_config_transaction_error", "Config save error", e))?
     .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?;
-    {
-        let mut roots = {
-            let config = state.config.read().await;
-            let mut roots = config.settings.shared_folders.clone();
-            if !config.settings.download_folder.is_empty() {
-                roots.push(config.settings.download_folder.clone());
-            }
-            roots
-        };
-        roots.push(canonical_str.clone());
-        let registry = state.approved_roots.clone();
-        let approved = canonical_str.clone();
-        tokio::task::spawn_blocking(move || {
-            registry.update_roots(&roots, std::slice::from_ref(&approved))
-        })
-        .await
-        .map_err(|e| {
-            coded_ctx(
-                "sharing_root_registry_task_failed",
-                "Root approval failed",
-                e,
-            )
-        })?
-        .map_err(|e| coded_ctx("sharing_root_registry_failed", "Root approval failed", e))?;
-    }
     // The addition is durable on disk now; commit it in-memory and to the live
     // upload list. Both re-checks stay idempotent against a concurrent add of
     // the same path.
@@ -1757,42 +1768,30 @@ pub async fn remove_shared_folder(
             .prepare_save_settings(&new_settings)
             .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?
     };
-    {
-        let (data, tmp, final_path) = save_data;
-        tokio::task::spawn_blocking(move || {
+    let roots = {
+        let config = state.config.read().await;
+        let mut roots: Vec<String> = config
+            .settings
+            .shared_folders
+            .iter()
+            .filter(|root| !paths_equal_ignore_case(root, &canonical_path))
+            .cloned()
+            .collect();
+        if !config.settings.download_folder.is_empty() {
+            roots.push(config.settings.download_folder.clone());
+        }
+        roots
+    };
+    let registry = state.approved_roots.clone();
+    let (data, tmp, final_path) = save_data;
+    tokio::task::spawn_blocking(move || {
+        super::settings::persist_with_root_transaction(registry, &roots, &[], || {
             crate::storage::config::AppConfig::write_to_disk(&data, &tmp, &final_path)
         })
-        .await
-        .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?
-        .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?;
-    }
-    {
-        let roots = {
-            let config = state.config.read().await;
-            let mut roots: Vec<String> = config
-                .settings
-                .shared_folders
-                .iter()
-                .filter(|root| !paths_equal_ignore_case(root, &canonical_path))
-                .cloned()
-                .collect();
-            if !config.settings.download_folder.is_empty() {
-                roots.push(config.settings.download_folder.clone());
-            }
-            roots
-        };
-        let registry = state.approved_roots.clone();
-        tokio::task::spawn_blocking(move || registry.update_roots(&roots, &[]))
-            .await
-            .map_err(|e| {
-                coded_ctx(
-                    "sharing_root_registry_task_failed",
-                    "Root revocation failed",
-                    e,
-                )
-            })?
-            .map_err(|e| coded_ctx("sharing_root_registry_failed", "Root revocation failed", e))?;
-    }
+    })
+    .await
+    .map_err(|e| coded_ctx("sharing_config_transaction_error", "Config save error", e))?
+    .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?;
     {
         let mut config = state.config.write().await;
         config
@@ -2921,42 +2920,49 @@ pub async fn delete_shared_file(
         shared_access_dirs(&config)
     };
 
-    let canonical = tokio::task::spawn_blocking({
+    let (canonical, expected_identity) = tokio::task::spawn_blocking({
         let file_path = file_path.clone();
         let indexed_path = indexed_path.clone();
-        move || -> Result<std::path::PathBuf, String> {
+        let allowed_dirs = allowed_dirs.clone();
+        move || -> Result<
+            (
+                std::path::PathBuf,
+                crate::security::filesystem::ObjectIdentity,
+            ),
+            String,
+        > {
             let path = std::path::Path::new(&file_path);
-            if !path.exists() {
-                return Err(coded("sharing_file_not_exist", "File does not exist"));
-            }
-            if !path.is_file() {
-                return Err(coded("sharing_path_not_file", "Path is not a file"));
-            }
-            let canonical = crate::security::filesystem::verify_existing_path(path, &allowed_dirs)
-                .map_err(|e| coded_ctx("sharing_invalid_path", "Invalid or changed path", e))?;
-            let indexed_canonical =
-                std::path::Path::new(&indexed_path)
-                    .canonicalize()
+            let (canonical, opened) =
+                crate::security::filesystem::open_existing_approved(path, &allowed_dirs, false)
                     .map_err(|e| {
-                        coded_ctx(
-                            "sharing_file_not_in_index",
-                            "Indexed file can no longer be resolved",
-                            e,
-                        )
+                        coded_ctx("sharing_invalid_path", "Invalid or changed path", e)
                     })?;
+            let indexed_canonical = crate::security::filesystem::verify_existing_path(
+                std::path::Path::new(&indexed_path),
+                &allowed_dirs,
+            )
+            .map_err(|e| {
+                coded_ctx(
+                    "sharing_file_not_in_index",
+                    "Indexed file can no longer be resolved",
+                    e,
+                )
+            })?;
             if canonical != indexed_canonical {
                 return Err(coded(
                     "sharing_file_not_in_index",
                     "File is not the indexed Library entry",
                 ));
             }
-            Ok(canonical)
+            let identity = crate::security::filesystem::opened_file_identity(&opened)
+                .map_err(|e| coded_ctx("sharing_invalid_path", "Invalid or changed path", e))?;
+            Ok((canonical, identity))
         }
     })
     .await
     .map_err(|e| coded_ctx("sharing_task_failed", "Task failed", e))??;
 
-    delete_file_with_retry(&canonical, 6, 250).await?;
+    delete_file_with_retry(&canonical, &allowed_dirs, &expected_identity, 6, 250).await?;
 
     let canonical_str = canonical.to_string_lossy().to_string();
     let (removed, removed_hashes) = {

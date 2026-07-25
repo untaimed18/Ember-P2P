@@ -1,61 +1,28 @@
-//! Reactive Ember Ed25519 auth state machine for the upload-side TCP
-//! read loop.
+//! Legacy Ember Ed25519 challenge/response state machine (v1 PoP).
 //!
-//! ## Why a state machine and not just a function call?
+//! **Not a live authorization path.** Secure friend-stream v2 authenticates
+//! peers with Noise IK (`secure_stream`); friend chat/browse/priority gates
+//! consume `secure_v2_authenticated`, never `EmberAuthState::is_verified()`.
+//! This module remains for parser/adversarial unit tests and offline
+//! transcript analysis only — see `LEGACY_FRIEND_AUTH_ENABLED` in
+//! `ed2k/mod.rs` (always `false` in production builds).
 //!
-//! The download side (`multi_source.rs`) and the friend-connect dial
-//! path (`friend_connect.rs`) both *initiate* Ember auth — they own
-//! their reader directly and can drive a synchronous four-message
-//! round-trip via `friend_connect::perform_ember_auth`. The upload
-//! side cannot: its reader is moved into a dedicated `reader_task`
-//! that pushes whole packets through an mpsc channel to the
-//! dispatcher. A blocking `perform_ember_auth` call from inside the
-//! dispatcher would have nothing to read from. So instead we model
-//! the responder side of the same protocol as a small event-driven
-//! state machine and let the dispatcher feed it `(opcode, payload)`
-//! events.
+//! ## Historical wire protocol (retired)
 //!
-//! ## Wire protocol (mirror of `friend_connect::perform_ember_auth`)
+//! Initiator:
+//!   1. `OP_EMBER_AUTH_CHALLENGE` + nonce
+//!   2. read peer CHALLENGE
+//!   3. `OP_EMBER_AUTH_RESPONSE` + pubkey ‖ sig
+//!   4. read/verify peer RESPONSE
 //!
-//! Initiator (download side):
-//!   1. Send `OP_EMBER_AUTH_CHALLENGE` carrying `our_nonce_init`.
-//!   2. Read peer's `OP_EMBER_AUTH_CHALLENGE` carrying `our_nonce_resp`.
-//!   3. Send `OP_EMBER_AUTH_RESPONSE` carrying `our_pubkey || sig_init(our_nonce_resp)`.
-//!   4. Read peer's `OP_EMBER_AUTH_RESPONSE` carrying `peer_pubkey || sig_resp(our_nonce_init)`,
-//!      verify the binding `BLAKE3(peer_pubkey)[..16] == peer_ember_hash`,
-//!      and verify the signature.
-//!
-//! Responder (upload side, this module):
-//!   1. Receive initiator's CHALLENGE, save their nonce, generate ours.
-//!   2. Send our CHALLENGE (our nonce) and immediately our RESPONSE
-//!      (our pubkey || sig over their nonce). The dispatcher writes
-//!      both packets in order; TCP guarantees the initiator reads
-//!      CHALLENGE first then RESPONSE.
-//!   3. Receive initiator's RESPONSE, verify pubkey matches what they
-//!      advertised in `OP_EMBER_HELLO`, verify the binding, verify
-//!      the signature over our nonce.
-//!
-//! ## Re-entry / replay rules
-//!
-//! - A second CHALLENGE in any state other than `NotStarted` is
-//!   rejected (`UnexpectedPacket`). This stops a peer from rolling
-//!   their nonce mid-session to evade verification.
-//! - A RESPONSE in any state other than `PeerChallenged` is rejected.
-//! - Once `Verified` or `Failed`, the state machine stays terminal —
-//!   subsequent auth packets log and drop.
-//! - Bad signature, pubkey mismatch (advertised vs. signed), and
-//!   binding mismatch all transition to `Failed`. The dispatcher
-//!   should treat the session as un-verified from that point on.
+//! Responder mirrored those steps via this state machine on the upload
+//! dispatcher. Restoring it as a live signing oracle would re-introduce the
+//! cross-session nonce-signing attack surface v2 deliberately closed.
 //!
 //! ## What this module deliberately does NOT do
 //!
-//! - It doesn't read or write TCP. The dispatcher is responsible for
-//!   delivering events and emitting the returned `AuthOutbound` packets.
-//! - It doesn't generate the *initiator* side of the exchange — that
-//!   stays in `friend_connect::perform_ember_auth`.
-//! - It doesn't gate any access-control decisions on its own. Callers
-//!   should check `state.is_verified()` at the appropriate gate
-//!   (e.g. friend-slot priority, EmberFriendRequest emit).
+//! - Gate friend-slot priority, chat, browse, or FriendSeen.
+//! - Sign nonces on any network path while `LEGACY_FRIEND_AUTH_ENABLED` is false.
 
 // Secure-stream v2 deliberately leaves this implementation available only
 // for legacy parser/adversarial tests. No live authorization path constructs
