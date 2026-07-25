@@ -760,7 +760,11 @@ struct PairwisePresenceEntry {
     expires_at: Instant,
     /// The sole peer authorized to use this capability for lookup, punch, or
     /// mailbox offers. The presence owner signs this binding at registration.
+    /// Ignored when `open_intro` is set (friend-code intro presence).
     peer_pubkey: [u8; 32],
+    /// When true, any currently-registered requester may look up / punch this
+    /// capability. Used for friend-code intro presence (holders of `ember2:`).
+    open_intro: bool,
     pubkey: [u8; 32],
     epoch: i64,
     legacy_proof: Option<(i64, [u8; 64])>,
@@ -773,7 +777,9 @@ fn capability_allows_peer(
     epoch: i64,
     now: Instant,
 ) -> bool {
-    entry.expires_at > now && entry.epoch == epoch && entry.peer_pubkey == *peer_pubkey
+    entry.expires_at > now
+        && entry.epoch == epoch
+        && (entry.open_intro || entry.peer_pubkey == *peer_pubkey)
 }
 
 #[derive(Clone)]
@@ -1463,6 +1469,10 @@ struct CapabilityRegisterRequest {
     peer_pubkey: String,
     ts: i64,
     sig: String,
+    /// Friend-code intro presence: open ACL for any registered requester.
+    /// Requires `peer_pubkey == pubkey` (self-bound).
+    #[serde(default)]
+    intro: bool,
     /// During v4 rollout the client includes the exact v3 registration proof
     /// in the same request. The server verifies and stores both under one
     /// logical/rate-limited admission, avoiding a second mutation request.
@@ -2538,6 +2548,9 @@ async fn capability_register_impl(
     if VerifyingKey::from_bytes(&peer_pubkey).is_err() {
         return StatusCode::BAD_REQUEST;
     }
+    if body.intro && peer_pubkey != pubkey {
+        return StatusCode::BAD_REQUEST;
+    }
     let Ok(ip) = body.ip.parse::<IpAddr>() else {
         return StatusCode::BAD_REQUEST;
     };
@@ -2631,6 +2644,7 @@ async fn capability_register_impl(
         entry.ip == ip
             && entry.port == body.port
             && entry.peer_pubkey == peer_pubkey
+            && entry.open_intro == body.intro
             && entry.pubkey == pubkey
             && entry.epoch == body.epoch
     });
@@ -2642,6 +2656,7 @@ async fn capability_register_impl(
                 port: body.port,
                 expires_at: Instant::now() + ENTRY_TTL,
                 peer_pubkey,
+                open_intro: body.intro,
                 pubkey,
                 epoch: body.epoch,
                 legacy_proof: None,
@@ -4441,6 +4456,7 @@ mod relay_ticket_tests {
             port: 4662,
             expires_at: Instant::now() + Duration::from_secs(30),
             peer_pubkey: authorized,
+            open_intro: false,
             pubkey: [0x22; 32],
             epoch: 7,
             legacy_proof: None,
@@ -4458,6 +4474,96 @@ mod relay_ticket_tests {
             7,
             Instant::now()
         ));
+        let open = PairwisePresenceEntry {
+            open_intro: true,
+            ..entry.clone()
+        };
+        assert!(capability_allows_peer(
+            &open,
+            &[0x33; 32],
+            7,
+            Instant::now()
+        ));
+    }
+
+    #[tokio::test]
+    async fn intro_capability_registration_allows_any_registered_lookup() {
+        let state = test_state();
+        let (bob, _bob_id, bob_pubkey) = insert_test_identity(&state, 5).await;
+        let (alice, alice_id, alice_pubkey) = insert_test_identity(&state, 3).await;
+        let capability = [0xB1; 32];
+        let epoch = now_unix_secs().div_euclid(15 * 60);
+        let register_ts = now_unix_secs();
+        let register_message = build_capability_register_v4_msg(
+            &capability,
+            epoch,
+            4662,
+            &encode_signed_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4))),
+            &bob_pubkey,
+            &bob_pubkey,
+            register_ts,
+        );
+        let legacy_register_message = build_capability_register_v3_msg(
+            &capability,
+            epoch,
+            4662,
+            [8, 8, 4, 4],
+            &bob_pubkey,
+            &bob_pubkey,
+            register_ts,
+        );
+        assert_eq!(
+            capability_register_v4(
+                State(state.clone()),
+                ConnectInfo("8.8.8.8:1000".parse().unwrap()),
+                HeaderMap::new(),
+                Json(CapabilityRegisterRequest {
+                    capability: hex::encode(capability),
+                    epoch,
+                    port: 4662,
+                    ip: "8.8.4.4".to_string(),
+                    pubkey: hex::encode(bob_pubkey),
+                    peer_pubkey: hex::encode(bob_pubkey),
+                    ts: register_ts,
+                    sig: hex::encode(bob.sign(&register_message).to_bytes()),
+                    intro: true,
+                    legacy_sig: Some(hex::encode(bob.sign(&legacy_register_message).to_bytes())),
+                }),
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        let nonce = [0x2A; 16];
+        let lookup_ts = now_unix_secs();
+        let alice_raw = decode_hex_id(&alice_id).unwrap();
+        let lookup_message = build_capability_lookup_v4_msg(
+            &capability,
+            epoch,
+            &alice_raw,
+            &alice_pubkey,
+            &nonce,
+            lookup_ts,
+        );
+        let response = capability_lookup_v4(
+            State(state.clone()),
+            ConnectInfo("1.1.1.1:2000".parse().unwrap()),
+            HeaderMap::new(),
+            Json(CapabilityLookupRequest {
+                capability: hex::encode(capability),
+                epoch,
+                requester_id: alice_id,
+                requester_pubkey: hex::encode(alice_pubkey),
+                nonce: hex::encode(nonce),
+                ts: lookup_ts,
+                sig: hex::encode(alice.sign(&lookup_message).to_bytes()),
+            }),
+        )
+        .await
+        .expect("intro lookup should succeed for any registered peer");
+        assert_eq!(response.0.ip, "8.8.4.4");
+        assert_eq!(response.0.port, 4662);
+        assert_eq!(response.0.pubkey, hex::encode(bob_pubkey));
     }
 
     #[tokio::test]
@@ -4499,6 +4605,7 @@ mod relay_ticket_tests {
                 peer_pubkey: hex::encode(alice_pubkey),
                 ts: register_ts,
                 sig: hex::encode(bob.sign(&register_message).to_bytes()),
+                intro: false,
                 legacy_sig: Some(hex::encode(bob.sign(&legacy_register_message).to_bytes())),
             }),
         )
@@ -4604,6 +4711,7 @@ mod relay_ticket_tests {
                 peer_pubkey: hex::encode(alice_pubkey),
                 ts: register_ts,
                 sig: hex::encode(bob.sign(&register_message).to_bytes()),
+                intro: false,
                 legacy_sig: None,
             }),
         )
@@ -4952,6 +5060,7 @@ mod relay_ticket_tests {
                         peer_pubkey: hex::encode(peer_pubkey),
                         ts,
                         sig: hex::encode(owner.sign(&v4).to_bytes()),
+                        intro: false,
                         legacy_sig: Some(hex::encode(owner.sign(&legacy).to_bytes())),
                     }),
                 )
@@ -5002,6 +5111,7 @@ mod relay_ticket_tests {
                     peer_pubkey: hex::encode(peer_pubkey),
                     ts,
                     sig: hex::encode(owner.sign(&legacy).to_bytes()),
+                    intro: false,
                     legacy_sig: None,
                 }),
             )
@@ -5614,6 +5724,7 @@ mod relay_ticket_tests {
                 port: 4662,
                 expires_at: Instant::now() + ENTRY_TTL,
                 peer_pubkey: from_key.verifying_key().to_bytes(),
+                open_intro: false,
                 pubkey: target_key.verifying_key().to_bytes(),
                 epoch,
                 legacy_proof: None,

@@ -516,7 +516,7 @@
   "friends_minutes_ago": "il y a {minutes} min",
   "friends_hours_ago": "il y a {hours} h",
   "friends_search_firewalled": "{name} est derrière un pare-feu. Il devra peut-être activer la redirection de ports, ou attendre qu'il vous trouve.",
-  "friends_search_not_found": "{name} est introuvable sur le réseau. Vérifiez qu'il est en ligne avec Ember.",
+  "friends_search_not_found": "{name} est introuvable sur le réseau. Il est peut-être hors ligne, ou doit encore vous ajouter avec votre ID ami.",
   "friends_search_timeout": "{name} semble hors ligne ou injoignable.",
   "friends_search_refused": "{name} s'est déconnecté.",
   "friends_search_generic": "Impossible de joindre {name}.",

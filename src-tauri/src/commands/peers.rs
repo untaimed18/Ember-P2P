@@ -271,6 +271,11 @@ pub async fn add_friend(
     // them up. Returning Err here used to make the UI flag
     // "add friend failed" even though the DB row was successfully
     // written.
+    // Refresh our presence (intro + pairwise for this friend) before
+    // looking them up, so they can find us without waiting ~120s.
+    let _ = state
+        .network_tx
+        .try_send(NetworkCommand::ForceRendezvousRegister);
     if let Err(e) = state
         .network_tx
         .try_send(NetworkCommand::FindFriendAndConnect { ember_hash: hash })
@@ -648,6 +653,11 @@ pub async fn accept_friend_request(
     // auto-connect waits for the next friend-search cycle. Don't
     // surface that as an "accept failed" error to the UI when the
     // accept itself succeeded.
+    // Refresh our presence (intro + pairwise for this friend) before
+    // looking them up, so they can find us without waiting ~120s.
+    let _ = state
+        .network_tx
+        .try_send(NetworkCommand::ForceRendezvousRegister);
     if let Err(e) = state
         .network_tx
         .try_send(NetworkCommand::FindFriendAndConnect { ember_hash: hash })

@@ -600,7 +600,7 @@
   "friends_minutes_ago": "{minutes}m ago",
   "friends_hours_ago": "{hours}h ago",
   "friends_search_firewalled": "{name} is behind a firewall. They may need to enable port forwarding, or wait for them to find you.",
-  "friends_search_not_found": "{name} could not be found on the network. Make sure they're online with Ember.",
+  "friends_search_not_found": "{name} could not be found on the network. They may be offline, or still need to add you back with your Friend ID.",
   "friends_search_timeout": "{name} appears to be offline or unreachable.",
   "friends_search_refused": "{name} went offline.",
   "friends_search_generic": "Could not reach {name}.",

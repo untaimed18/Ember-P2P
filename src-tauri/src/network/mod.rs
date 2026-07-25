@@ -4227,6 +4227,10 @@ pub enum NetworkCommand {
     FindFriendAndConnect {
         ember_hash: [u8; 16],
     },
+    /// Force an immediate rendezvous presence re-register (intro + pairwise)
+    /// instead of waiting for the ~120s heartbeat. Used after add_friend so
+    /// the newly-added peer can find us via pairwise without delay.
+    ForceRendezvousRegister,
     RetryFriendSearch {
         ember_hash: [u8; 16],
         tx: oneshot::Sender<Result<(), String>>,
@@ -36107,6 +36111,12 @@ async fn handle_command_inner(
                     ed25519_secret_key,
                 );
             }
+        }
+
+        NetworkCommand::ForceRendezvousRegister => {
+            // Expire the heartbeat clock so the network loop's next tick
+            // re-publishes intro + pairwise presence without waiting ~120s.
+            state.rendezvous_last_register = None;
         }
 
         NetworkCommand::RetryFriendSearch {

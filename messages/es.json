@@ -587,7 +587,7 @@
   "friends_minutes_ago": "hace {minutes} min",
   "friends_hours_ago": "hace {hours} h",
   "friends_search_firewalled": "{name} está detrás de un cortafuegos. Quizá necesite activar el reenvío de puertos, o espera a que te encuentre.",
-  "friends_search_not_found": "No se pudo encontrar a {name} en la red. Asegúrate de que está en línea con Ember.",
+  "friends_search_not_found": "No se pudo encontrar a {name} en la red. Puede estar desconectado, o aún debe añadirte con tu ID de amigo.",
   "friends_search_timeout": "{name} parece estar desconectado o inalcanzable.",
   "friends_search_refused": "{name} se desconectó.",
   "friends_search_generic": "No se pudo contactar con {name}.",

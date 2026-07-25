@@ -4677,11 +4677,11 @@ async fn download_parts_from_source(
                 early_upload_accept = true;
                 debug!("Received early AcceptUploadReq from source {}", _src_idx);
             }
-            // EPX is Ember-only; gate on `hello_caps.is_ember` AND Ed25519
-            // PoP for this TCP session (`ember_auth_verified`).
+            // EPX is Ember-only; gate on HELLO + hash↔pubkey binding.
+            // Friend privileges still require PoP / secure_v2.
             (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE)
                 if hello_caps.is_ember
-                    && ember_auth_verified
+                    && ember_hash_binding_verified
                     && epx_packets_received
                         < crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION =>
             {
@@ -5027,7 +5027,7 @@ async fn download_parts_from_source(
         ember_auth_verified
     );
     let mut initial_epx_sent_generation: Option<u64> = None;
-    if hello_caps.is_ember && ember_auth_verified {
+    if hello_caps.is_ember && ember_hash_binding_verified {
         let sent_gen = ember_payload_generation.load(std::sync::atomic::Ordering::Relaxed);
         let epx_data = ember_payload.read().await.clone();
         if !epx_data.is_empty() {
@@ -5053,12 +5053,8 @@ async fn download_parts_from_source(
             );
         }
     }
-    // Only feed the peer-discovery mesh once PoP has actually verified this
-    // peer's Ember identity, not merely on a self-declared `is_ember` flag
-    // from an unauthenticated OP_EMBER_HELLO (see the symmetric fix in
-    // `transfer.rs`). The `ember_auth_verified = true` sites below emit
-    // the same event once PoP completes later in the session.
-    if hello_caps.is_ember && ember_auth_verified && !mesh_discovered_emitted {
+    // Feed the peer-discovery mesh once Ember HELLO binding verifies.
+    if hello_caps.is_ember && ember_hash_binding_verified && !mesh_discovered_emitted {
         if let std::net::IpAddr::V4(v4) = addr.ip() {
             let peer_tcp = addr.port();
             if peer_tcp > 0 && !crate::security::is_special_use_v4(v4) {
@@ -5388,11 +5384,11 @@ async fn download_parts_from_source(
             }
             continue;
         }
-        // Ember-only; gated on `hello_caps.is_ember` + PoP (see upload.rs).
+        // Ember-only; gated on HELLO + hash↔pubkey binding.
         if proto == OP_EMULEPROT
             && opcode == OP_EMBER_SOURCEEXCHANGE
             && hello_caps.is_ember
-            && ember_auth_verified
+            && ember_hash_binding_verified
             && epx_packets_received < crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION
         {
             sx_overhead.record_download((6 + _payload.len()) as u64);
@@ -5529,6 +5525,49 @@ async fn download_parts_from_source(
                             if peer_user_hash != [0u8; 16] {
                                 if let Some(cm) = &credit_mgr {
                                     cm.write().await.set_ember_hash(peer_user_hash, *peer_eh);
+                                }
+                            }
+                            if hello_caps.is_ember && !mesh_discovered_emitted {
+                                if let std::net::IpAddr::V4(v4) = addr.ip() {
+                                    let peer_tcp = addr.port();
+                                    if peer_tcp > 0 && !crate::security::is_special_use_v4(v4) {
+                                        if let Some(ref etx) = event_tx {
+                                            let _ = etx
+                                                .send(DownloadEvent::EmberPeerDiscovered {
+                                                    ip: v4,
+                                                    tcp_port: peer_tcp,
+                                                })
+                                                .await;
+                                            mesh_discovered_emitted = true;
+                                        }
+                                    }
+                                }
+                            }
+                            if hello_caps.is_ember && initial_epx_sent_generation.is_none() {
+                                let sent_gen = ember_payload_generation
+                                    .load(std::sync::atomic::Ordering::Relaxed);
+                                let epx_data = ember_payload.read().await.clone();
+                                if !epx_data.is_empty() {
+                                    info!(
+                                        "Sending EPX to newly bound Ember source {} ({} bytes, gen {})",
+                                        _src_idx,
+                                        epx_data.len(),
+                                        sent_gen
+                                    );
+                                    if write_packet_async_ms(
+                                        &mut *writer,
+                                        OP_EMULEPROT,
+                                        OP_EMBER_SOURCEEXCHANGE,
+                                        &*epx_data,
+                                    )
+                                    .await
+                                    .is_ok()
+                                    {
+                                        sx_overhead.record_upload((6 + epx_data.len()) as u64);
+                                        initial_epx_sent_generation = Some(sent_gen);
+                                    }
+                                } else {
+                                    initial_epx_sent_generation = Some(sent_gen);
                                 }
                             }
                         } else {
@@ -6747,7 +6786,7 @@ async fn download_parts_from_source(
 
                 // Periodic EPX re-send: if payload has been rebuilt and 5min elapsed
                 if hello_caps.is_ember
-                    && ember_auth_verified
+                    && ember_hash_binding_verified
                     && last_epx_resend.elapsed() >= EPX_RESEND_INTERVAL
                 {
                     let current_gen =
@@ -7708,7 +7747,7 @@ async fn download_parts_from_source(
                     }
                     // Ember-only; gated on `hello_caps.is_ember` + PoP (see upload.rs).
                     (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE)
-                        if hello_caps.is_ember && ember_auth_verified =>
+                        if hello_caps.is_ember && ember_hash_binding_verified =>
                     {
                         sx_overhead.record_download((6 + payload.len()) as u64);
                         if epx_packets_received

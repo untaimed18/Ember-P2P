@@ -4943,17 +4943,11 @@ impl UploadHandler {
             .ember_payload_generation
             .load(std::sync::atomic::Ordering::Relaxed);
         let mut last_epx_resend = std::time::Instant::now();
-        // EPX send is deferred until Ed25519 PoP succeeds on this TCP
-        // session (`ember_auth_state.is_verified()`). Sending on bare
-        // `is_ember` from OP_EMBER_HELLO would let an unauthenticated
-        // peer harvest our source/mesh hints, and peers that PoP-gate
-        // ingest would drop the packet anyway.
-        let mut epx_sent_after_pop = false;
-        // Only feed the peer-discovery mesh once PoP has actually verified
-        // this peer's Ember identity, not merely on a self-declared
-        // `is_ember` flag from an unauthenticated OP_EMBER_HELLO — mirrors
-        // the EPX-send gate immediately above. The `OP_EMBER_AUTH_RESPONSE`
-        // handler below emits the same event once PoP completes.
+        // EPX/mesh identity unlocks after Ember HELLO binding. Friend
+        // privileges still require secure_v2. HELLO usually arrives later
+        // in the dispatcher; emission happens when binding flips true.
+        let mut epx_sent_after_binding = false;
+        let mut mesh_discovered_emitted = secure_v2_authenticated;
         if hello_caps.is_ember && secure_v2_authenticated {
             if let std::net::IpAddr::V4(v4) = peer_addr.ip() {
                 if hello_caps.tcp_port > 0 && !crate::security::is_special_use_v4(v4) {
@@ -5530,10 +5524,9 @@ impl UploadHandler {
             }
 
             // Re-share EPX with Ember peers when our shared payload has
-            // been rebuilt since we last sent. Gated on PoP so we never
-            // push source/mesh hints to an unverified Ember claim.
+            // been rebuilt since we last sent. Gated on HELLO binding.
             if hello_caps.is_ember
-                && secure_v2_authenticated
+                && ember_hash_binding_verified
                 && last_epx_resend.elapsed() >= EPX_RESEND_INTERVAL
             {
                 let current_gen = self
@@ -8778,6 +8771,58 @@ impl UploadHandler {
                                         let mut cm = self.credit_manager.write().await;
                                         cm.set_ember_hash(peer_user_hash, *peer_eh);
                                     }
+                                    // Unlock mesh + first EPX once HELLO
+                                    // binding succeeds (friend privileges
+                                    // remain on secure_v2 / PoP).
+                                    if hello_caps.is_ember && !mesh_discovered_emitted {
+                                        if let std::net::IpAddr::V4(v4) = peer_addr.ip() {
+                                            if hello_caps.tcp_port > 0
+                                                && !crate::security::is_special_use_v4(v4)
+                                            {
+                                                let _ = self
+                                                    .upload_event_tx
+                                                    .send(UploadEvent {
+                                                        transfer_id: String::new(),
+                                                        kind: UploadEventKind::EmberPeerDiscovered {
+                                                            ip: v4,
+                                                            tcp_port: hello_caps.tcp_port,
+                                                        },
+                                                    })
+                                                    .await;
+                                                mesh_discovered_emitted = true;
+                                            }
+                                        }
+                                    }
+                                    if hello_caps.is_ember && !epx_sent_after_binding {
+                                        let epx_data = self.ember_payload.read().await.clone();
+                                        if !epx_data.is_empty() {
+                                            let gen = self
+                                                .ember_payload_generation
+                                                .load(std::sync::atomic::Ordering::Relaxed);
+                                            info!(
+                                                "Sending EPX to bound Ember peer {peer_addr} ({} bytes, gen {gen})",
+                                                epx_data.len()
+                                            );
+                                            if write_packet_async(
+                                                &mut writer,
+                                                OP_EMULEPROT,
+                                                OP_EMBER_SOURCEEXCHANGE,
+                                                &*epx_data,
+                                            )
+                                            .await
+                                            .is_ok()
+                                            {
+                                                last_epx_generation = gen;
+                                                last_epx_resend = std::time::Instant::now();
+                                                epx_sent_after_binding = true;
+                                                self.sx_overhead
+                                                    .record_upload((6 + epx_data.len()) as u64);
+                                            }
+                                        } else {
+                                            epx_sent_after_binding = true;
+                                            info!("EPX payload empty, skipping EPX send to {peer_addr}");
+                                        }
+                                    }
                                 } else {
                                     tracing::warn!(
                                         "Ember binding: peer {peer_addr} advertised pubkey does not BLAKE3-bind to ember_hash={} (possible spoof)",
@@ -8832,13 +8877,10 @@ impl UploadHandler {
                     }
                 }
 
-                // Gated on `hello_caps.is_ember` AND Ed25519 PoP for this
-                // TCP session. EPX injects sources into active downloads
-                // and feeds mesh/broker caches; friend/chat already require
-                // `ember_auth_state.is_verified()`, and TCP must not be
-                // weaker than the Noise_IK UDP ExchangeData path.
+                // Gated on HELLO + hash↔pubkey binding. Friend/chat still
+                // require secure_v2; EPX is mesh/source identity only.
                 (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE)
-                    if hello_caps.is_ember && secure_v2_authenticated =>
+                    if hello_caps.is_ember && ember_hash_binding_verified =>
                 {
                     self.sx_overhead.record_download((6 + payload.len()) as u64);
                     if epx_packets_received >= crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION {
@@ -8975,13 +9017,14 @@ impl UploadHandler {
                                                 },
                                             })
                                             .await;
+                                        mesh_discovered_emitted = true;
                                     }
                                 }
                             }
                             // First EPX push after PoP — mirrors download
                             // paths that only share sources once the peer
                             // has proven possession of its Ember identity.
-                            if hello_caps.is_ember && !epx_sent_after_pop {
+                            if hello_caps.is_ember && !epx_sent_after_binding {
                                 let epx_data = self.ember_payload.read().await.clone();
                                 if !epx_data.is_empty() {
                                     let gen = self
@@ -9002,12 +9045,12 @@ impl UploadHandler {
                                     {
                                         last_epx_generation = gen;
                                         last_epx_resend = std::time::Instant::now();
-                                        epx_sent_after_pop = true;
+                                        epx_sent_after_binding = true;
                                         self.sx_overhead
                                             .record_upload((6 + epx_data.len()) as u64);
                                     }
                                 } else {
-                                    epx_sent_after_pop = true;
+                                    epx_sent_after_binding = true;
                                     info!("EPX payload empty, skipping EPX send to {peer_addr}");
                                 }
                             }

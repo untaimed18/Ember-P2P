@@ -516,7 +516,7 @@
   "friends_minutes_ago": "{minutes} 分钟前",
   "friends_hours_ago": "{hours} 小时前",
   "friends_search_firewalled": "{name} 位于防火墙后方。对方可能需要启用端口转发，或等待对方找到你。",
-  "friends_search_not_found": "在网络上找不到 {name}。请确认对方已在线并使用 Ember。",
+  "friends_search_not_found": "在网络上找不到 {name}。对方可能离线，或仍需用你的好友 ID 添加你。",
   "friends_search_timeout": "{name} 似乎离线或无法访问。",
   "friends_search_refused": "{name} 已离线。",
   "friends_search_generic": "无法联系 {name}。",

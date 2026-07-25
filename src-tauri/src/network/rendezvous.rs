@@ -533,12 +533,32 @@ pub async fn register(
         // success message at info and the identifying bits at debug.
         info!("Rendezvous: registration succeeded on port {port}");
         debug!("Rendezvous: registered {}… (ip={})", &id[..8], external_ip);
+        let epoch = crate::network::ember::crypto::pairwise_capability_epoch(ts);
+        let protocol = negotiate_protocol(base_url).await?;
+        // Friend-code intro presence: public to holders of our ember2: code.
+        // Registered before pairwise entries so one-sided Add Friend can find us.
+        let intro_capability =
+            crate::network::ember::crypto::derive_intro_presence_capability(pubkey, epoch);
+        if let Err(error) = register_capability_presence(
+            base_url,
+            &intro_capability,
+            epoch,
+            port,
+            external_ip,
+            pubkey,
+            pubkey, // self-bound; server marks open_intro
+            secret_key,
+            protocol,
+            true,
+        )
+        .await
+        {
+            debug!("Intro presence registration failed: {error}");
+        }
         // Public presence is never indexed by the stable Friend ID. Register
         // one opaque rotating capability for each friend whose public key is
         // available; old/hash-only relationships simply fail closed until a
         // v2 identity exchange supplies that key.
-        let epoch = crate::network::ember::crypto::pairwise_capability_epoch(ts);
-        let protocol = negotiate_protocol(base_url).await?;
         for (_, friend_pubkey) in friend_identities {
             let Some(capability) =
                 crate::network::ember::crypto::derive_pairwise_presence_capability(
@@ -550,7 +570,7 @@ pub async fn register(
             else {
                 continue;
             };
-            if let Err(error) = register_pairwise_presence(
+            if let Err(error) = register_capability_presence(
                 base_url,
                 &capability,
                 epoch,
@@ -560,6 +580,7 @@ pub async fn register(
                 friend_pubkey,
                 secret_key,
                 protocol,
+                false,
             )
             .await
             {
@@ -674,7 +695,7 @@ pub(crate) async fn fetch_identity_pubkey(
     Ok(Some(pubkey))
 }
 
-async fn register_pairwise_presence(
+async fn register_capability_presence(
     base_url: &str,
     capability: &[u8; 32],
     epoch: i64,
@@ -684,6 +705,7 @@ async fn register_pairwise_presence(
     peer_pubkey: &[u8; 32],
     secret_key: &[u8; 32],
     protocol: RendezvousProtocol,
+    intro: bool,
 ) -> Result<(), String> {
     use ed25519_dalek::Signer;
     let ts = current_timestamp();
@@ -740,6 +762,7 @@ async fn register_pairwise_presence(
         "peer_pubkey": hex::encode(peer_pubkey),
         "ts": ts,
         "sig": hex::encode(sig.to_bytes()),
+        "intro": intro,
     });
     if let Some(legacy_sig) = legacy_sig {
         body.as_object_mut()
@@ -826,16 +849,27 @@ pub async fn lookup(
     let protocol = negotiate_protocol(base_url).await?;
     let now = current_timestamp();
     let current_epoch = crate::network::ember::crypto::pairwise_capability_epoch(now);
-    let mut successful: Option<(reqwest::Response, [u8; 32], i64)> = None;
+
+    // Intro first (friend-code holders), then pairwise (mutual DH).
+    // For intro proofs the registrant signs peer_pubkey = owner; for
+    // pairwise they sign peer_pubkey = the authorized friend (us).
+    let mut candidates: Vec<([u8; 32], i64, [u8; 32])> = Vec::with_capacity(4);
     for epoch in [current_epoch, current_epoch - 1] {
-        let Some(capability) = crate::network::ember::crypto::derive_pairwise_presence_capability(
+        let intro =
+            crate::network::ember::crypto::derive_intro_presence_capability(&friend_pubkey, epoch);
+        candidates.push((intro, epoch, friend_pubkey));
+        if let Some(pairwise) = crate::network::ember::crypto::derive_pairwise_presence_capability(
             our_secret_key,
             &friend_pubkey,
             &friend_pubkey,
             epoch,
-        ) else {
-            return Ok(None);
-        };
+        ) {
+            candidates.push((pairwise, epoch, *our_pubkey));
+        }
+    }
+
+    let mut successful: Option<(reqwest::Response, [u8; 32], i64, [u8; 32])> = None;
+    for (capability, epoch, proof_peer_pubkey) in candidates {
         let nonce = random_nonce();
         let ts = current_timestamp();
         let (route, signed) = match protocol {
@@ -888,10 +922,10 @@ pub async fn lookup(
                 resp.status()
             ));
         }
-        successful = Some((resp, capability, epoch));
+        successful = Some((resp, capability, epoch, proof_peer_pubkey));
         break;
     }
-    let Some((resp, capability, epoch)) = successful else {
+    let Some((resp, capability, epoch, proof_peer_pubkey)) = successful else {
         return Ok(None);
     };
     let bytes = read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await?;
@@ -981,7 +1015,7 @@ pub async fn lookup(
                 port,
                 ip.octets(),
                 &pubkey,
-                our_pubkey,
+                &proof_peer_pubkey,
                 ts,
             ),
             4 => build_capability_register_v4_msg(
@@ -990,7 +1024,7 @@ pub async fn lookup(
                 port,
                 &encode_signed_ip(IpAddr::V4(ip)),
                 &pubkey,
-                our_pubkey,
+                &proof_peer_pubkey,
                 ts,
             ),
             _ => {
@@ -1012,7 +1046,7 @@ pub async fn lookup(
             // Friend IP/port is effectively PII — keep it at debug rather than
             // info so it doesn't land in user-shared log bundles by default.
             debug!(
-                "Rendezvous: pairwise presence found for {}… at {}:{}",
+                "Rendezvous: presence found for {}… at {}:{}",
                 &friend_id[..8],
                 ip,
                 port

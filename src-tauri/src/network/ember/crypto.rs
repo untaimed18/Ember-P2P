@@ -326,6 +326,18 @@ pub fn derive_pairwise_presence_capability(
     derive_pairwise_capability(our_ed25519_seed, peer_ed25519_pubkey, &purpose, epoch)
 }
 
+/// Friend-code intro presence: holders of an `ember2:` code (owner pubkey)
+/// can compute this without a DH. The owner registers it on every rendezvous
+/// heartbeat so a one-sided Add Friend can locate them before pairwise
+/// capabilities exist for both sides.
+pub fn derive_intro_presence_capability(
+    owner_ed25519_pubkey: &[u8; 32],
+    epoch: i64,
+) -> [u8; 32] {
+    let context = format!("ember-intro-presence-v1:{epoch}");
+    blake3::derive_key(&context, owner_ed25519_pubkey)
+}
+
 /// Encrypt a friend-chat plaintext with a fresh random nonce.
 ///
 /// Wire layout: `version(1) || nonce(24) || ciphertext‖tag`.
@@ -648,6 +660,23 @@ mod tests {
             derive_pairwise_presence_capability(&bob_seed, &alice_pub, &bob_pub, 12).unwrap();
         assert_eq!(alice_presence, bob_lookup_alice);
         assert_ne!(alice_presence, bob_presence);
+    }
+
+    #[test]
+    fn intro_presence_is_public_and_epoch_bound() {
+        let alice_pub = signing_key_from_bytes(&gen_seed())
+            .verifying_key()
+            .to_bytes();
+        let bob_pub = signing_key_from_bytes(&gen_seed())
+            .verifying_key()
+            .to_bytes();
+        let a = derive_intro_presence_capability(&alice_pub, 3);
+        let a_again = derive_intro_presence_capability(&alice_pub, 3);
+        let a_next = derive_intro_presence_capability(&alice_pub, 4);
+        let b = derive_intro_presence_capability(&bob_pub, 3);
+        assert_eq!(a, a_again);
+        assert_ne!(a, a_next);
+        assert_ne!(a, b);
     }
 
     #[test]

@@ -516,7 +516,7 @@
   "friends_minutes_ago": "vor {minutes} Min.",
   "friends_hours_ago": "vor {hours} Std.",
   "friends_search_firewalled": "{name} befindet sich hinter einer Firewall. Möglicherweise muss die Portweiterleitung aktiviert werden, oder Sie warten, bis die Person Sie findet.",
-  "friends_search_not_found": "{name} wurde im Netzwerk nicht gefunden. Stellen Sie sicher, dass die Person mit Ember online ist.",
+  "friends_search_not_found": "{name} wurde im Netzwerk nicht gefunden. Die Person ist möglicherweise offline oder muss dich noch mit deiner Friend-ID hinzufügen.",
   "friends_search_timeout": "{name} scheint offline oder nicht erreichbar zu sein.",
   "friends_search_refused": "{name} ist offline gegangen.",
   "friends_search_generic": "{name} konnte nicht erreicht werden.",

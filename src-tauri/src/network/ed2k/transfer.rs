@@ -1646,13 +1646,11 @@ impl Ed2kDownload {
                     debug!("Received early AcceptUploadReq before file status");
                 }
                 // EPX is an Ember-only extension; gate reception on
-                // `peer_is_ember` AND Ed25519 PoP for this TCP session
-                // (`ember_auth_verified`). Without PoP, a peer that only
-                // sent a parseable OP_EMBER_HELLO could inject crafted
-                // source/peer hints into active downloads and the mesh.
+                // Ember HELLO + hash↔pubkey binding. Full PoP/Noise remains
+                // required for friend privileges (chat/browse/priority).
                 (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE)
                     if peer_is_ember
-                        && ember_auth_verified
+                        && ember_hash_binding_verified
                         && epx_packets_received
                             < crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION =>
                 {
@@ -1971,12 +1969,11 @@ impl Ed2kDownload {
             }
         }
 
-        // Ember Peer Exchange: only share sources after Ed25519 PoP on
-        // this session. Snapshot the generation we sent so the periodic
-        // resend loop below can detect rebuilds during file-status /
-        // queue wait. (See `multi_source.rs` for the symmetric fix.)
+        // Ember Peer Exchange: share sources after Ember identity binding.
+        // Snapshot the generation we sent so the periodic resend loop below
+        // can detect rebuilds during file-status / queue wait.
         let mut initial_epx_sent_generation: Option<u64> = None;
-        if peer_is_ember && ember_auth_verified {
+        if peer_is_ember && ember_hash_binding_verified {
             let sent_gen = self
                 .ember_payload_generation
                 .load(std::sync::atomic::Ordering::Relaxed);
@@ -1999,17 +1996,12 @@ impl Ed2kDownload {
                 initial_epx_sent_generation = Some(sent_gen);
             }
         }
-        // Only feed the peer-discovery mesh once PoP has actually verified
-        // this peer's Ember identity, not merely on a self-declared
-        // `is_ember` flag from an unauthenticated OP_EMBER_HELLO. Before
-        // this gate, any peer could get itself broadcast into every other
-        // Ember node's mesh (and thus dialed) just by claiming `is_ember`,
-        // without ever proving key possession — a cheap amplification/
-        // pollution vector. The `ember_auth_verified = true` sites below
-        // emit the same event once PoP completes later in the session, so
-        // legitimate peers are still discovered — just not before they've
-        // proven it.
-        if peer_is_ember && ember_auth_verified && !mesh_discovered_emitted {
+        // Feed the peer-discovery mesh once Ember HELLO binding verifies
+        // the advertised (pubkey, ember_hash) pair. Binding is weaker than
+        // PoP (replayable if the pubkey was sniffed) but sufficient for
+        // StatusBar/KAD Ember-peer identity; friend privileges stay on
+        // secure_v2 / PoP.
+        if peer_is_ember && ember_hash_binding_verified && !mesh_discovered_emitted {
             if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
                 let peer_tcp = self.source_addr.port();
                 if peer_tcp > 0 && !crate::security::is_special_use_v4(v4) {
@@ -2346,7 +2338,7 @@ impl Ed2kDownload {
                     }
                 }
                 // Ember-only; gated on `peer_is_ember` + PoP (see upload.rs).
-                (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE) if peer_is_ember && ember_auth_verified => {
+                (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE) if peer_is_ember && ember_hash_binding_verified => {
                     self.sx_overhead.record_download((6 + payload.len()) as u64);
                     if epx_packets_received >= crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION
                     {
@@ -2482,6 +2474,51 @@ impl Ed2kDownload {
                                     if peer_user_hash != [0u8; 16] {
                                         if let Some(cm) = &self.credit_manager {
                                             cm.write().await.set_ember_hash(peer_user_hash, *eh);
+                                        }
+                                    }
+                                    if peer_is_ember && !mesh_discovered_emitted {
+                                        if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
+                                            let peer_tcp = self.source_addr.port();
+                                            if peer_tcp > 0
+                                                && !crate::security::is_special_use_v4(v4)
+                                            {
+                                                let _ = event_tx
+                                                    .send(DownloadEvent::EmberPeerDiscovered {
+                                                        ip: v4,
+                                                        tcp_port: peer_tcp,
+                                                    })
+                                                    .await;
+                                                mesh_discovered_emitted = true;
+                                            }
+                                        }
+                                    }
+                                    if peer_is_ember && initial_epx_sent_generation.is_none() {
+                                        let sent_gen = self
+                                            .ember_payload_generation
+                                            .load(std::sync::atomic::Ordering::Relaxed);
+                                        let epx_data = self.ember_payload.read().await.clone();
+                                        if !epx_data.is_empty() {
+                                            debug!(
+                                                "Sending Ember Peer Exchange to newly bound peer {} ({} bytes, gen {})",
+                                                self.source_addr,
+                                                epx_data.len(),
+                                                sent_gen
+                                            );
+                                            if write_packet_async(
+                                                &mut writer,
+                                                OP_EMULEPROT,
+                                                OP_EMBER_SOURCEEXCHANGE,
+                                                &*epx_data,
+                                            )
+                                            .await
+                                            .is_ok()
+                                            {
+                                                self.sx_overhead
+                                                    .record_upload((6 + epx_data.len()) as u64);
+                                                initial_epx_sent_generation = Some(sent_gen);
+                                            }
+                                        } else {
+                                            initial_epx_sent_generation = Some(sent_gen);
                                         }
                                     }
                                 } else {
@@ -3435,7 +3472,7 @@ impl Ed2kDownload {
 
                     // Periodic EPX re-send: if payload has been rebuilt and 5min elapsed
                     if peer_is_ember
-                        && ember_auth_verified
+                        && ember_hash_binding_verified
                         && last_epx_resend.elapsed() >= EPX_RESEND_INTERVAL
                     {
                         let current_gen = self
@@ -4024,7 +4061,7 @@ impl Ed2kDownload {
                         }
                         // Ember-only; gated on `peer_is_ember` + PoP (see upload.rs).
                         (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE)
-                            if peer_is_ember && ember_auth_verified =>
+                            if peer_is_ember && ember_hash_binding_verified =>
                         {
                             self.sx_overhead.record_download((6 + payload.len()) as u64);
                             if epx_packets_received
@@ -4155,6 +4192,26 @@ impl Ed2kDownload {
                                                     cm.write()
                                                         .await
                                                         .set_ember_hash(peer_user_hash, *eh);
+                                                }
+                                            }
+                                            if peer_is_ember && !mesh_discovered_emitted {
+                                                if let std::net::IpAddr::V4(v4) =
+                                                    self.source_addr.ip()
+                                                {
+                                                    let peer_tcp = self.source_addr.port();
+                                                    if peer_tcp > 0
+                                                        && !crate::security::is_special_use_v4(v4)
+                                                    {
+                                                        let _ = event_tx
+                                                            .send(
+                                                                DownloadEvent::EmberPeerDiscovered {
+                                                                    ip: v4,
+                                                                    tcp_port: peer_tcp,
+                                                                },
+                                                            )
+                                                            .await;
+                                                        mesh_discovered_emitted = true;
+                                                    }
                                                 }
                                             }
                                         } else {
