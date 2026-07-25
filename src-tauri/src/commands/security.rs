@@ -75,7 +75,7 @@ fn ipfilter_outcome_from_ack(ack: Option<Result<(), String>>) -> IpFilterApplyOu
     }
 }
 
-async fn persist_ip_filter_enabled(
+pub(crate) async fn persist_ip_filter_enabled(
     state: &tauri::State<'_, AppState>,
 ) -> Result<crate::types::AppSettings, String> {
     let _settings_save_guard = state.settings_save_lock.lock().await;
@@ -165,7 +165,7 @@ async fn apply_ipfilter_reload(
     }
 }
 
-fn extract_ipfilter_from_zip(zip_bytes: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn extract_ipfilter_from_zip(zip_bytes: &[u8]) -> Result<Vec<u8>, String> {
     extract_ipfilter_from_zip_with_limit(zip_bytes, MAX_RESPONSE_BYTES)
 }
 

@@ -9,7 +9,10 @@ use crate::network::NetworkCommand;
 use crate::types::AppSettings;
 
 const NODES_DAT_URL: &str = "https://upd.emule-security.org/nodes.dat";
-const IPFILTER_URL: &str = "https://upd.emule-security.org/ipfilter.dat";
+/// Official mirror only ships the zip nowadays; the bare `.dat` URL 404s
+/// (which made the first-run wizard IP-filter step always fail).
+const IPFILTER_ARCHIVE_URL: &str = "https://upd.emule-security.org/ipfilter.zip";
+const IPFILTER_MAX_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1200,16 +1203,15 @@ pub async fn download_ipfilter(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<IpFilterDownloadResult, String> {
-    info!("Downloading ipfilter.dat from {IPFILTER_URL}");
+    info!("Downloading ipfilter.zip from {IPFILTER_ARCHIVE_URL}");
 
-    const MAX_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
-    let response = crate::security::fetch_pinned_get(IPFILTER_URL)
+    let response = crate::security::fetch_pinned_get(IPFILTER_ARCHIVE_URL)
         .await
         .map_err(|e| coded_ctx("settings_http_request_failed", "HTTP request failed", e))?
         .error_for_status()
         .map_err(|e| coded_ctx("settings_http_error", "HTTP error", e))?;
     if let Some(cl) = response.content_length() {
-        if cl > MAX_RESPONSE_BYTES as u64 {
+        if cl > IPFILTER_MAX_RESPONSE_BYTES as u64 {
             return Err(coded(
                 "settings_response_too_large",
                 "Response too large (Content-Length exceeds limit)",
@@ -1229,12 +1231,24 @@ pub async fn download_ipfilter(
                 )
             })?;
             body.extend_from_slice(&chunk);
-            if body.len() > MAX_RESPONSE_BYTES {
+            if body.len() > IPFILTER_MAX_RESPONSE_BYTES {
                 return Err(coded("settings_response_too_large", "Response too large"));
             }
         }
         body
     };
+
+    let extracted = tokio::task::spawn_blocking(move || {
+        crate::commands::security::extract_ipfilter_from_zip(&bytes)
+    })
+    .await
+    .map_err(|e| {
+        coded_ctx(
+            "settings_extraction_task_failed",
+            "Extraction task failed",
+            e,
+        )
+    })??;
 
     // Validate before anything on disk or in memory is touched. Without
     // this, a dead mirror serving an HTML error page (still a 200, so
@@ -1243,9 +1257,9 @@ pub async fn download_ipfilter(
     // working filter with an empty one — silently wiping out the user's
     // protection while this command still reports success. See
     // `commands::security::download_and_load_ipfilter` for the same fix.
-    let (bytes, entry_count) = tokio::task::spawn_blocking(move || {
-        let entry_count = count_valid_entries(&bytes, "dat");
-        (bytes, entry_count)
+    let (extracted, entry_count) = tokio::task::spawn_blocking(move || {
+        let entry_count = count_valid_entries(&extracted, "dat");
+        (extracted, entry_count)
     })
     .await
     .map_err(|e| {
@@ -1274,7 +1288,7 @@ pub async fn download_ipfilter(
     let filter_path = data_dir.join("ipfilter.dat");
     {
         let filter_path_w = filter_path.clone();
-        let write_bytes = bytes.clone();
+        let write_bytes = extracted.clone();
         tokio::task::spawn_blocking(move || {
             crate::security::atomic_write(&filter_path_w, &write_bytes, false)
         })
@@ -1289,7 +1303,11 @@ pub async fn download_ipfilter(
         })?;
     }
 
-    let byte_count = bytes.len();
+    let byte_count = extracted.len();
+
+    // Match the Security-page download: first-run wizard should leave the
+    // filter enabled, not just drop a dormant file on disk.
+    crate::commands::security::persist_ip_filter_enabled(&state).await?;
 
     let (tx, mut rx) = tokio::sync::oneshot::channel();
     let outcome = match state.network_tx.try_send(NetworkCommand::ReloadIpFilter {
