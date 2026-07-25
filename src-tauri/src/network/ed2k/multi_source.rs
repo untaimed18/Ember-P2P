@@ -839,6 +839,10 @@ pub struct MultiSourceDownload {
     /// Drained on the network loop's stats tick into the
     /// `Source Exchange` overhead row.
     pub sx_overhead: crate::storage::statistics::SharedSxOverheadCounters,
+    /// Same idea as `sx_overhead`, but for file-open/queue handshake bytes
+    /// (hashset request/answer, StartUploadReq/AcceptUploadReq/QueueFull/
+    /// QueueRanking). Drained into `OverheadCategory::FileRequest`.
+    pub file_req_overhead: crate::storage::statistics::SharedFileReqOverheadCounters,
 }
 
 async fn check_control(control: &TransferControl) -> anyhow::Result<()> {
@@ -1681,6 +1685,7 @@ impl MultiSourceDownload {
             let geo_clone = self.geoip.clone();
             let fh_clone = self.friend_hashes.clone();
             let sx_oh = self.sx_overhead.clone();
+            let file_req_oh = self.file_req_overhead.clone();
 
             let fail_etx = event_tx.clone();
             let fail_tid = self.transfer_id.clone();
@@ -1761,6 +1766,7 @@ impl MultiSourceDownload {
                         src_ember_secret,
                         nick_for_src.clone(),
                         sx_oh.clone(),
+                        file_req_oh.clone(),
                         // No pre-established stream — this is the initial-
                         // sources path; we always dial these peers fresh.
                         None,
@@ -2116,6 +2122,7 @@ impl MultiSourceDownload {
                             let inj_geo = self.geoip.clone();
                             let inj_fh = self.friend_hashes.clone();
                             let inj_sx_oh = self.sx_overhead.clone();
+                            let inj_file_req_oh = self.file_req_overhead.clone();
                             let inj_missing_parts = peers_missing_parts.clone();
                             let handle = tokio::spawn(async move {
                                 let _permit = match acquire_source_permit(&sem, &ctrl).await {
@@ -2139,6 +2146,7 @@ impl MultiSourceDownload {
                                         inj_ember_secret,
                                         inj_nick,
                                         inj_sx_oh,
+                                        inj_file_req_oh,
                                         // Metadata-only injection (peer
                                         // discovered via KAD/server source
                                         // exchange); no pre-handshaked
@@ -2355,6 +2363,7 @@ impl MultiSourceDownload {
                             let inj_geo = self.geoip.clone();
                             let inj_fh = self.friend_hashes.clone();
                             let inj_sx_oh = self.sx_overhead.clone();
+                            let inj_file_req_oh = self.file_req_overhead.clone();
                             let inj_missing_parts = peers_missing_parts.clone();
                             let handle = tokio::spawn(async move {
                                 let _permit = match acquire_source_permit(&sem, &ctrl).await {
@@ -2378,6 +2387,7 @@ impl MultiSourceDownload {
                                         inj_ember_secret,
                                         inj_nick,
                                         inj_sx_oh,
+                                        inj_file_req_oh,
                                         // The crucial bit: hand the
                                         // already-handshaked stream to
                                         // download_parts_from_source so it
@@ -2838,6 +2848,7 @@ impl MultiSourceDownload {
                 let a_geo = self.geoip.clone();
                 let a_fh = self.friend_hashes.clone();
                 let a_sx_oh = self.sx_overhead.clone();
+                let a_file_req_oh = self.file_req_overhead.clone();
                 let a_missing_parts = peers_missing_parts.clone();
                 adopted_handles.push(tokio::spawn(async move {
                     let _permit = match acquire_source_permit(&sem, &ctrl).await {
@@ -2861,6 +2872,7 @@ impl MultiSourceDownload {
                             a_ember_secret,
                             a_nick,
                             a_sx_oh,
+                            a_file_req_oh,
                             Some(stream),
                             a_missing_parts,
                         ) => res,
@@ -3258,6 +3270,7 @@ impl MultiSourceDownload {
                 let r_geo = self.geoip.clone();
                 let r_fh = self.friend_hashes.clone();
                 let r_sx_oh = self.sx_overhead.clone();
+                let r_file_req_oh = self.file_req_overhead.clone();
                 let r_sem = conn_semaphore.clone();
                 // Clone the shared "peers that queued" set so this
                 // retry task can flag its peer when the task ends in
@@ -3292,6 +3305,7 @@ impl MultiSourceDownload {
                             r_ember_secret,
                             r_nick,
                             r_sx_oh,
+                            r_file_req_oh,
                             // Retry round always re-dials; the original
                             // pre-established stream (if any) was consumed
                             // by the initial attempt and is no longer
@@ -3729,6 +3743,7 @@ async fn download_parts_from_source(
     ed25519_secret_key: [u8; 32],
     our_nickname: String,
     sx_overhead: crate::storage::statistics::SharedSxOverheadCounters,
+    file_req_overhead: crate::storage::statistics::SharedFileReqOverheadCounters,
     // `pre_established`: if `Some`, skip TCP connect + obfuscation +
     // Hello + EmuleInfo because the upload listener already did all
     // of that for an inbound KAD/server callback. We adopt the
@@ -6028,10 +6043,12 @@ async fn download_parts_from_source(
                     &hashset_req2,
                 )
                 .await?;
+                file_req_overhead.record_upload((6 + hashset_req2.len()) as u64);
             } else {
                 let hashset_req = build_hashset_request(file_hash);
                 write_packet_async_ms(&mut *writer, OP_EDONKEYHEADER, OP_HASHSETREQ, &hashset_req)
                     .await?;
+                file_req_overhead.record_upload((6 + hashset_req.len()) as u64);
             }
             // Read up to 5 packets waiting for the hashset answer.
             // The peer may interleave SecIdent or other control packets.
@@ -6043,6 +6060,7 @@ async fn download_parts_from_source(
                     Ok((proto, opcode, payload))
                         if proto == OP_EDONKEYHEADER && opcode == OP_HASHSETANSWER =>
                     {
+                        file_req_overhead.record_download((6 + payload.len()) as u64);
                         if let Ok((_h, hashes)) = parse_hashset_answer(&payload) {
                             debug!(
                                 "Got hashset with {} part hashes from source {}",
@@ -6064,6 +6082,7 @@ async fn download_parts_from_source(
                     Ok((proto, opcode, payload))
                         if proto == OP_EMULEPROT && opcode == OP_HASHSETANSWER2 =>
                     {
+                        file_req_overhead.record_download((6 + payload.len()) as u64);
                         if let Ok(resp) = parse_hashset_answer2(&payload) {
                             let local_ident = FileIdentifier {
                                 md4_hash: *file_hash,
@@ -6120,9 +6139,10 @@ async fn download_parts_from_source(
                         }
                         break;
                     }
-                    Ok((proto, opcode, _))
+                    Ok((proto, opcode, payload))
                         if proto == OP_EDONKEYHEADER && opcode == OP_ACCEPTUPLOADREQ =>
                     {
+                        file_req_overhead.record_download((6 + payload.len()) as u64);
                         early_upload_accept = true;
                         debug!("Source {} received AcceptUploadReq while waiting for hashset — stopping hashset wait", _src_idx);
                         break;
@@ -6228,6 +6248,7 @@ async fn download_parts_from_source(
             &upload_req,
         )
         .await?;
+        file_req_overhead.record_upload((6 + upload_req.len()) as u64);
 
         queued_count.fetch_add(1, Ordering::Relaxed);
         queued_guard.armed = true;
@@ -6296,6 +6317,7 @@ async fn download_parts_from_source(
                 }
             };
             if proto == OP_EDONKEYHEADER && opcode == OP_ACCEPTUPLOADREQ {
+                file_req_overhead.record_download((6 + payload.len()) as u64);
                 queued_guard.armed = false;
                 queued_count.fetch_sub(1, Ordering::Relaxed);
                 active_count.fetch_add(1, Ordering::Relaxed);
@@ -6312,6 +6334,7 @@ async fn download_parts_from_source(
                 break;
             }
             if proto == OP_EMULEPROT && opcode == OP_QUEUEFULL && payload.is_empty() {
+                file_req_overhead.record_download(6u64);
                 emit_source!("queue_full", None, 0u64);
                 anyhow::bail!("peer queue is full");
             }
@@ -6320,10 +6343,12 @@ async fn download_parts_from_source(
                 anyhow::bail!("peer has no free upload slots (OutOfPartReqs)");
             }
             if proto == OP_EMULEPROT && opcode == OP_QUEUERANKING && payload.len() >= 2 {
+                file_req_overhead.record_download((6 + payload.len()) as u64);
                 let rank = u16::from_le_bytes([payload[0], payload[1]]);
                 last_rank = Some(rank as u32);
                 emit_source!("queued", Some(rank as u32), 0u64);
             } else if proto == OP_EDONKEYHEADER && opcode == OP_QUEUERANK && payload.len() >= 4 {
+                file_req_overhead.record_download((6 + payload.len()) as u64);
                 let rank = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
                 last_rank = Some(rank);
                 emit_source!("queued", Some(rank), 0u64);
@@ -7531,10 +7556,12 @@ async fn download_parts_from_source(
                     // OP_QUEUEFULL (0x93) shares its opcode with OP_MULTIPACKETANSWER;
                     // QueueFull always has an empty payload.
                     (OP_EMULEPROT, OP_QUEUEFULL) if payload.is_empty() => {
+                        file_req_overhead.record_download(6u64);
                         emit_source!("queue_full", None, measured_speed);
                         anyhow::bail!("peer revoked upload slot (QueueFull during transfer)");
                     }
                     (OP_EMULEPROT, OP_QUEUERANKING) if payload.len() >= 2 => {
+                        file_req_overhead.record_download((6 + payload.len()) as u64);
                         let rank = u16::from_le_bytes([payload[0], payload[1]]);
                         emit_source!("queued", Some(rank as u32), measured_speed);
                         anyhow::bail!("peer put us back in queue at rank {} during transfer", rank);

@@ -328,6 +328,10 @@ pub struct Ed2kDownload {
     /// `OverheadCategory::SourceExchange` so the Statistics page
     /// reflects real peer-SX traffic, not just server source-asking.
     pub sx_overhead: crate::storage::statistics::SharedSxOverheadCounters,
+    /// Same idea as `sx_overhead`, but for file-open/queue handshake bytes
+    /// (hashset request/answer, StartUploadReq/AcceptUploadReq/QueueFull/
+    /// QueueRanking). Drained into `OverheadCategory::FileRequest`.
+    pub file_req_overhead: crate::storage::statistics::SharedFileReqOverheadCounters,
 }
 
 /// eMule-style error classification: only protocol-level failures (FNF, hash
@@ -2709,9 +2713,13 @@ impl Ed2kDownload {
                 build_hashset_request2(&self.file_hash, self.file_size, None, true, false);
             write_packet_async(&mut writer, OP_EMULEPROT, OP_HASHSETREQUEST2, &hashset_req2)
                 .await?;
+            self.file_req_overhead
+                .record_upload((6 + hashset_req2.len()) as u64);
         } else {
             let hashset_req = build_hashset_request(&self.file_hash);
             write_packet_async(&mut writer, OP_EDONKEYHEADER, OP_HASHSETREQ, &hashset_req).await?;
+            self.file_req_overhead
+                .record_upload((6 + hashset_req.len()) as u64);
         }
 
         let mut part_hashes: Vec<[u8; 16]> = Vec::new();
@@ -2731,6 +2739,8 @@ impl Ed2kDownload {
             {
                 Ok((proto, opcode, payload)) => {
                     if proto == OP_EDONKEYHEADER && opcode == OP_HASHSETANSWER {
+                        self.file_req_overhead
+                            .record_download((6 + payload.len()) as u64);
                         match parse_hashset_answer(&payload) {
                             Ok((_hash, hashes)) => {
                                 if verify_hashset(&self.file_hash, &hashes, self.file_size) {
@@ -2747,6 +2757,8 @@ impl Ed2kDownload {
                         }
                         break;
                     } else if proto == OP_EMULEPROT && opcode == OP_HASHSETANSWER2 {
+                        self.file_req_overhead
+                            .record_download((6 + payload.len()) as u64);
                         match parse_hashset_answer2(&payload) {
                             Ok(resp) => {
                                 let local_ident = FileIdentifier {
@@ -2797,6 +2809,8 @@ impl Ed2kDownload {
                         }
                         break;
                     } else if proto == OP_EDONKEYHEADER && opcode == OP_ACCEPTUPLOADREQ {
+                        self.file_req_overhead
+                            .record_download((6 + payload.len()) as u64);
                         early_upload_accept = true;
                         debug!("Received AcceptUploadReq while waiting for hashset — stopping hashset wait");
                         break;
@@ -2867,6 +2881,8 @@ impl Ed2kDownload {
                 &upload_req,
             )
             .await?;
+            self.file_req_overhead
+                .record_upload((6 + upload_req.len()) as u64);
 
             let _ = event_tx
                 .send(DownloadEvent::SourcesUpdate {
@@ -2929,6 +2945,8 @@ impl Ed2kDownload {
                 };
 
                 if proto == OP_EDONKEYHEADER && opcode == OP_ACCEPTUPLOADREQ {
+                    self.file_req_overhead
+                        .record_download((6 + payload.len()) as u64);
                     debug!("Upload accepted");
                     self.emit_source_detail_parts(
                         event_tx,
@@ -2954,6 +2972,7 @@ impl Ed2kDownload {
                 }
 
                 if proto == OP_EMULEPROT && opcode == OP_QUEUEFULL && payload.is_empty() {
+                    self.file_req_overhead.record_download(6u64);
                     self.emit_source_detail_parts(
                         event_tx,
                         "queue_full",
@@ -2970,6 +2989,8 @@ impl Ed2kDownload {
                 }
 
                 if proto == OP_EMULEPROT && opcode == OP_QUEUERANKING && payload.len() >= 2 {
+                    self.file_req_overhead
+                        .record_download((6 + payload.len()) as u64);
                     let rank = u16::from_le_bytes([payload[0], payload[1]]);
                     info!("Queued at position {} on peer {}", rank, self.source_addr);
                     self.emit_source_detail_parts(
@@ -3901,6 +3922,7 @@ impl Ed2kDownload {
                             break;
                         }
                         (OP_EMULEPROT, OP_QUEUEFULL) if payload.is_empty() => {
+                            self.file_req_overhead.record_download(6u64);
                             self.emit_source_detail_parts(
                                 event_tx,
                                 "queue_full",
@@ -3916,6 +3938,8 @@ impl Ed2kDownload {
                             anyhow::bail!("peer revoked upload slot (QueueFull during transfer)");
                         }
                         (OP_EMULEPROT, OP_QUEUERANKING) if payload.len() >= 2 => {
+                            self.file_req_overhead
+                                .record_download((6 + payload.len()) as u64);
                             let rank = u16::from_le_bytes([payload[0], payload[1]]);
                             self.emit_source_detail_parts(
                                 event_tx,

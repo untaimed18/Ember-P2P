@@ -7373,6 +7373,7 @@ async fn try_start_pending_download_from_known_sources(
     ed25519_pubkey: [u8; 32],
     ed25519_secret_key: [u8; 32],
     sx_overhead: &crate::storage::statistics::SharedSxOverheadCounters,
+    file_req_overhead: &crate::storage::statistics::SharedFileReqOverheadCounters,
 ) -> bool {
     if let Some(pd) = state.pending_downloads.get(transfer_id) {
         if pd.control.is_paused() || pd.control.is_cancelled() {
@@ -7575,6 +7576,7 @@ async fn try_start_pending_download_from_known_sources(
         geoip: geoip.clone(),
         tracker_registry: Some(state.tracker_registry.clone()),
         sx_overhead: sx_overhead.clone(),
+        file_req_overhead: file_req_overhead.clone(),
     };
     let dl_tid = ms_download.transfer_id.clone();
     let dl_tid2 = dl_tid.clone();
@@ -14048,6 +14050,7 @@ pub async fn start_network(
                                 ed25519_pubkey,
                                 ed25519_secret_key,
                                 &stats_manager.sx_counters,
+                                &stats_manager.file_req_counters,
                             )
                             .await;
                             if started {
@@ -15224,6 +15227,7 @@ pub async fn start_network(
                                         geoip: geoip.clone(),
                                         tracker_registry: Some(state.tracker_registry.clone()),
                                         sx_overhead: stats_manager.sx_counters.clone(),
+                                        file_req_overhead: stats_manager.file_req_counters.clone(),
                                     };
                                     let tid = ms_download.transfer_id.clone();
                                     let tid2 = tid.clone();
@@ -18904,6 +18908,7 @@ pub async fn start_network(
                             ed25519_pubkey,
                             ed25519_secret_key,
                             &stats_manager.sx_counters,
+                            &stats_manager.file_req_counters,
                         )
                         .await;
                     }
@@ -19182,6 +19187,7 @@ pub async fn start_network(
                             geoip: geoip.clone(),
                             tracker_registry: Some(state.tracker_registry.clone()),
                             sx_overhead: stats_manager.sx_counters.clone(),
+                            file_req_overhead: stats_manager.file_req_counters.clone(),
                         };
                         let tx = dl_event_tx.clone();
                         let dl_tid = ms_download.transfer_id.clone();
@@ -19402,6 +19408,7 @@ pub async fn start_network(
                             geoip: geoip.clone(),
                             tracker_registry: Some(state.tracker_registry.clone()),
                             sx_overhead: stats_manager.sx_counters.clone(),
+                            file_req_overhead: stats_manager.file_req_counters.clone(),
                         };
                         let dl_tid = ms_download.transfer_id.clone();
                         let dl_tid2 = dl_tid.clone();
@@ -21423,6 +21430,7 @@ pub async fn start_network(
                             ed25519_pubkey,
                             ed25519_secret_key,
                             &stats_manager.sx_counters,
+                            &stats_manager.file_req_counters,
                         ).await;
                     }
                 }
@@ -22008,6 +22016,7 @@ pub async fn start_network(
                                         ed25519_pubkey,
                                         ed25519_secret_key,
                                         &stats_manager.sx_counters,
+                                        &stats_manager.file_req_counters,
                                     ).await;
                                 }
                             }
@@ -22772,6 +22781,7 @@ pub async fn start_network(
                                     geoip: geoip.clone(),
                                     tracker_registry: Some(state.tracker_registry.clone()),
                                     sx_overhead: stats_manager.sx_counters.clone(),
+                                    file_req_overhead: stats_manager.file_req_counters.clone(),
                                 };
                                 let dl_tid = ms_download.transfer_id.clone();
                                 state.active_source_senders.insert(dl_tid.clone(), src_inject_tx);
@@ -23064,6 +23074,7 @@ pub async fn start_network(
                                 ember_file_hash: state.ember_content_hashes.get(&parts.file_hash).copied().unwrap_or([0u8; 32]),
                                 geoip: geoip.clone(),
                                 sx_overhead: stats_manager.sx_counters.clone(),
+                                file_req_overhead: stats_manager.file_req_counters.clone(),
                             };
                             {
                                 let mut mgr = transfer_manager.write().await;
@@ -24714,6 +24725,7 @@ pub async fn start_network(
                             ed25519_pubkey,
                             ed25519_secret_key,
                             &stats_manager.sx_counters,
+                            &stats_manager.file_req_counters,
                         )
                         .await;
                     }
@@ -32401,6 +32413,7 @@ async fn handle_command_inner(
                         geoip: geoip.clone(),
                         tracker_registry: Some(state.tracker_registry.clone()),
                         sx_overhead: stats_manager.sx_counters.clone(),
+                        file_req_overhead: stats_manager.file_req_counters.clone(),
                     };
 
                     let tx = dl_event_tx.clone();

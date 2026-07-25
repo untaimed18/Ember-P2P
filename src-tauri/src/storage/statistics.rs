@@ -72,6 +72,14 @@ impl SxOverheadCounters {
 
 pub type SharedSxOverheadCounters = Arc<SxOverheadCounters>;
 
+/// Lock-free counters for peer-to-peer file-open/queue handshake bytes
+/// (hashset request/answer, StartUploadReq/AcceptUploadReq/QueueFull/
+/// QueueRanking) — the traffic `OverheadCategory::FileRequest` is meant to
+/// track. Shares the same shape as [`SxOverheadCounters`] so the upload /
+/// transfer / multi_source tasks can bump it the exact same way they
+/// already bump `sx_overhead`, without a per-packet Mutex.
+pub type SharedFileReqOverheadCounters = Arc<SxOverheadCounters>;
+
 /// Lock-free KAD upload wire-byte counter. Populated by `send_kad_packet`;
 /// drained into `OverheadCategory::Kad` on the 1s stats tick.
 pub type SharedKadUploadOverhead = Arc<AtomicU64>;
@@ -85,6 +93,7 @@ pub struct StatsManager {
     pub session_down_counter: Arc<AtomicU64>,
     pub session_up_counter: Arc<AtomicU64>,
     pub sx_counters: SharedSxOverheadCounters,
+    pub file_req_counters: SharedFileReqOverheadCounters,
     pub kad_upload_bytes: SharedKadUploadOverhead,
     /// Monotonic session-start marker for connection-time accounting.
     /// `session_start_time` is a wall-clock timestamp kept for "session
@@ -110,6 +119,7 @@ impl StatsManager {
             session_down_counter: Arc::new(AtomicU64::new(0)),
             session_up_counter: Arc::new(AtomicU64::new(0)),
             sx_counters: Arc::new(SxOverheadCounters::default()),
+            file_req_counters: Arc::new(SxOverheadCounters::default()),
             kad_upload_bytes: Arc::new(AtomicU64::new(0)),
             session_start_instant: std::time::Instant::now(),
         }
@@ -140,6 +150,22 @@ impl StatsManager {
         let kad_up = self.kad_upload_bytes.swap(0, Ordering::Relaxed);
         if kad_up > 0 {
             self.add_overhead(OverheadCategory::Kad, OverheadDirection::Upload, kad_up);
+        }
+
+        let freq_up = self.file_req_counters.upload_bytes.swap(0, Ordering::Relaxed);
+        let freq_down = self
+            .file_req_counters
+            .download_bytes
+            .swap(0, Ordering::Relaxed);
+        if freq_up > 0 {
+            self.add_overhead(OverheadCategory::FileRequest, OverheadDirection::Upload, freq_up);
+        }
+        if freq_down > 0 {
+            self.add_overhead(
+                OverheadCategory::FileRequest,
+                OverheadDirection::Download,
+                freq_down,
+            );
         }
     }
 
@@ -340,10 +366,19 @@ impl StatsManager {
 #[derive(Debug, Clone, Copy)]
 pub enum OverheadCategory {
     Kad,
-    /// Reserved for peer TCP file-request / handshake protocol bytes.
-    /// Formerly mis-attributed KAD source-search initiation estimates;
-    /// those now flow through `send_kad_packet` → Kad upload.
-    #[allow(dead_code)]
+    /// Peer TCP file-open/queue handshake bytes: hashset request/answer
+    /// and StartUploadReq/AcceptUploadReq/QueueFull/QueueRanking. Fed via
+    /// `StatsManager::file_req_counters` (drained on the same 1s tick as
+    /// `sx_counters`) rather than a direct `add_overhead` call, so the
+    /// upload/transfer/multi_source tasks bump a lock-free atomic instead
+    /// of taking the stats mutex per packet.
+    ///
+    /// Formerly reserved/unused — this category used to sit at a
+    /// permanent zero on the Statistics page. The multipacket-bundled
+    /// file-open request/answer (`OP_MULTIPACKET*`) still isn't split out
+    /// of this bucket because it's interleaved with Source Exchange bytes
+    /// in the same wire packet; only the classic single-opcode exchange
+    /// and the always-separate hashset/queue opcodes are counted here.
     FileRequest,
     Server,
     SourceExchange,
@@ -410,6 +445,29 @@ mod tests {
             "expected 2048 B/s steady-state upload, got {}",
             mgr.stats.session_up_rate
         );
+    }
+
+    /// `file_req_counters` (fed by hashset request/answer and
+    /// StartUploadReq/AcceptUploadReq/QueueFull/QueueRanking bytes in
+    /// transfer.rs / multi_source.rs) must flow into
+    /// `OverheadCategory::FileRequest` on the same tick as the SX/Kad
+    /// counters — this used to be a permanently-zero category.
+    #[test]
+    fn drain_sx_counters_also_drains_file_request_overhead() {
+        let mut mgr = StatsManager::new();
+        mgr.file_req_counters.record_upload(37);
+        mgr.file_req_counters.record_download(91);
+        assert_eq!(mgr.stats.overhead_file_request, 0);
+
+        mgr.drain_sx_counters();
+
+        assert_eq!(mgr.stats.overhead_file_request, 128);
+        assert_eq!(mgr.stats.session_up_overhead, 37);
+        assert_eq!(mgr.stats.session_down_overhead, 91);
+        // Counters are one-shot per tick — a second drain without new
+        // traffic must not double-count.
+        mgr.drain_sx_counters();
+        assert_eq!(mgr.stats.overhead_file_request, 128);
     }
 
     #[test]
