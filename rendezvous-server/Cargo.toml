@@ -17,7 +17,6 @@ blake3 = "1"
 sha2 = "0.10"
 hex = "0.4"
 futures-util = "0.3"
-rand = "0.8"
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 tower = { version = "0.5", features = ["util"] }
