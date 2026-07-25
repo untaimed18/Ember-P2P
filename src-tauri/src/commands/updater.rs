@@ -12,7 +12,7 @@ use minisign_verify::{PublicKey, Signature};
 use reqwest::{
     header::{ACCEPT, CONTENT_LENGTH, LOCATION},
     redirect::Policy as RedirectPolicy,
-    Client, Response,
+    Client, Response, StatusCode,
 };
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -37,6 +37,26 @@ const METADATA_DEADLINE: Duration = Duration::from_secs(60);
 const ARTIFACT_DEADLINE: Duration = Duration::from_secs(30 * 60);
 const CURRENT_SECURITY_EPOCH: u64 = 1;
 const STATE_FILE: &str = "updater-security-state.json";
+
+/// Manifest or signature asset is absent at the configured endpoint. Treated as
+/// "no update available" rather than a hard check failure — common when a
+/// release exists without the hardened `latest.json.sig` yet.
+#[derive(Debug)]
+struct UpdaterResourceMissing;
+
+impl std::fmt::Display for UpdaterResourceMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("updater resource not found")
+    }
+}
+
+impl std::error::Error for UpdaterResourceMissing {}
+
+fn is_missing_updater_resource(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<UpdaterResourceMissing>().is_some())
+}
 
 #[derive(Default)]
 pub struct UpdaterService {
@@ -505,6 +525,9 @@ async fn send_with_redirects(
             continue;
         }
         if !response.status().is_success() {
+            if response.status() == StatusCode::NOT_FOUND {
+                return Err(UpdaterResourceMissing.into());
+            }
             bail!("updater server returned HTTP {}", response.status());
         }
         return Ok((response, url, addresses));
@@ -701,22 +724,45 @@ fn matching_platform(manifest: &SignedManifest, update: &Update) -> Result<Signe
 async fn secure_check(app: &AppHandle) -> Result<Option<(UpdateInfo, PendingUpdate)>> {
     let config = embedded_updater_config()?;
     let signature_endpoint = signature_url(&config.endpoint)?;
-    let manifest_response = fetch_capped(
+    let manifest_response = match fetch_capped(
         &config.endpoint,
         MANIFEST_MAX_BYTES,
         METADATA_DEADLINE,
         "application/json",
         NetworkPolicy::PRODUCTION,
     )
-    .await?;
-    let signature_response = fetch_capped(
+    .await
+    {
+        Ok(response) => response,
+        Err(error) if is_missing_updater_resource(&error) => {
+            tracing::debug!(
+                "Secure updater manifest missing at configured endpoint; treating as no update"
+            );
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let signature_response = match fetch_capped(
         &signature_endpoint,
         SIGNATURE_MAX_BYTES,
         METADATA_DEADLINE,
         "application/octet-stream",
         NetworkPolicy::PRODUCTION,
     )
-    .await?;
+    .await
+    {
+        Ok(response) => response,
+        Err(error) if is_missing_updater_resource(&error) => {
+            // Stock Tauri releases may publish latest.json without the hardened
+            // latest.json.sig. Until that asset exists, there is no signed update
+            // to offer — not a check failure.
+            tracing::debug!(
+                "Secure updater signature missing at configured endpoint; treating as no update"
+            );
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
     verify_minisign(
         &manifest_response.bytes,
         &signature_response.bytes,
@@ -1174,6 +1220,14 @@ QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfN
         save_rollback_state(&path, &pending).unwrap();
         assert!(pending_meets_persisted_floor(&path, &pending).unwrap());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn missing_updater_resource_is_detectable_through_anyhow() {
+        let error = anyhow::Error::new(UpdaterResourceMissing)
+            .context("failed to read updater signature");
+        assert!(is_missing_updater_resource(&error));
+        assert!(!is_missing_updater_resource(&anyhow!("updater server returned HTTP 500")));
     }
 
     #[test]
