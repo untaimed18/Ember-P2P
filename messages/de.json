@@ -465,7 +465,7 @@
   "friends_clear_search": "Suche löschen",
   "friends_online_count_one": "{online} online / 1 Freund",
   "friends_online_count_other": "{online} online / {total} Freunde",
-  "friends_hash_placeholder": "Friend ID (32 Hex-Zeichen)",
+  "friends_hash_placeholder": "v2-Friend-Code oder 32-Hex-Friend-ID",
   "friends_nickname_placeholder": "Spitzname (optional)",
   "friends_nickname_edit_placeholder": "Spitznamen eingeben",
   "friends_match_count_one": "1 Treffer",

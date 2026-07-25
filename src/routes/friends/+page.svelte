@@ -714,8 +714,9 @@
           type="text"
           bind:value={newHash}
           placeholder={m.friends_hash_placeholder()}
-          maxlength="32"
+          maxlength="128"
           spellcheck="false"
+          autocomplete="off"
           class="hash-input"
           onkeydown={addFormKeydown}
           aria-label={m.friends_hash_placeholder()}

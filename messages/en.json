@@ -549,7 +549,7 @@
   "friends_clear_search": "Clear search",
   "friends_online_count_one": "{online} online / 1 friend",
   "friends_online_count_other": "{online} online / {total} friends",
-  "friends_hash_placeholder": "Friend ID (32 hex characters)",
+  "friends_hash_placeholder": "v2 Friend Code or 32-hex Friend ID",
   "friends_nickname_placeholder": "Nickname (optional)",
   "friends_nickname_edit_placeholder": "Enter nickname",
   "friends_match_count_one": "1 match",

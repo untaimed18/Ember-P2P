@@ -536,7 +536,7 @@
   "friends_clear_search": "Limpiar búsqueda",
   "friends_online_count_one": "{online} en línea / 1 amigo",
   "friends_online_count_other": "{online} en línea / {total} amigos",
-  "friends_hash_placeholder": "ID de amigo (32 caracteres hex)",
+  "friends_hash_placeholder": "Código de amigo v2 o ID hex de 32 caracteres",
   "friends_nickname_placeholder": "Apodo (opcional)",
   "friends_nickname_edit_placeholder": "Escribe un apodo",
   "friends_match_count_one": "1 coincidencia",

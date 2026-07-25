@@ -465,7 +465,7 @@
   "friends_clear_search": "Effacer la recherche",
   "friends_online_count_one": "{online} en ligne / 1 ami",
   "friends_online_count_other": "{online} en ligne / {total} amis",
-  "friends_hash_placeholder": "Friend ID (32 caractères hexadécimaux)",
+  "friends_hash_placeholder": "Code ami v2 ou Friend ID hex (32 car.)",
   "friends_nickname_placeholder": "Pseudonyme (facultatif)",
   "friends_nickname_edit_placeholder": "Saisir un pseudonyme",
   "friends_match_count_one": "1 correspondance",

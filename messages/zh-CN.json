@@ -465,7 +465,7 @@
   "friends_clear_search": "清除搜索",
   "friends_online_count_one": "{online} 人在线 / 共 1 位好友",
   "friends_online_count_other": "{online} 人在线 / 共 {total} 位好友",
-  "friends_hash_placeholder": "好友 ID（32 位十六进制）",
+  "friends_hash_placeholder": "v2 好友码或 32 位十六进制好友 ID",
   "friends_nickname_placeholder": "昵称（可选）",
   "friends_nickname_edit_placeholder": "输入昵称",
   "friends_match_count_one": "1 个匹配",
