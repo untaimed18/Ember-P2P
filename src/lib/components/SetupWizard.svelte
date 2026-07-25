@@ -9,6 +9,7 @@
   import SpeedInput from './SpeedInput.svelte';
   import {
     updateSettings as saveSettings,
+    getSettings,
     downloadNodesDat,
     downloadIpfilter,
     type NodesDatDownloadResult,
@@ -192,12 +193,25 @@
     udpPort = udp;
     saving = true;
     saveError = '';
+
+    // Bootstrap downloads (ipfilter enable) bump `settings_revision` out of
+    // band. Always start from the live revision so a retry after a partial
+    // finish doesn't fail with `settings_stale_revision`.
+    let base: AppSettings;
+    try {
+      base = await getSettings();
+    } catch (e) {
+      saveError = translateError(e, m.settings_save_failed());
+      saving = false;
+      return;
+    }
+
     // Keep setup_complete=false across the first save so that if the user
     // kills the app mid-bootstrap (or it crashes during downloads) the wizard
     // reappears on next launch and can retry. Only flip to true after the
     // optional bootstrap downloads finish.
     const partial: AppSettings = {
-      ...settings,
+      ...base,
       nickname: nickname.trim(),
       download_folder: downloadFolder,
       tcp_port: tcpPort,
@@ -211,7 +225,8 @@
     };
 
     try {
-      await saveSettings(partial);
+      const first = await saveSettings(partial);
+      Object.assign(partial, first.settings);
     } catch (e) {
       saveError = translateError(e, m.settings_save_failed());
       saving = false;
@@ -239,11 +254,27 @@
     await new Promise(r => setTimeout(r, 900));
     downloading = false;
 
-    // Bootstrap is complete (success or user-acknowledged failure). Persist
-    // setup_complete=true now so the wizard doesn't reappear next launch.
-    const final: AppSettings = { ...partial, setup_complete: true };
+    // `download_ipfilter` persists `ip_filter_enabled` and bumps the revision.
+    // Re-read before flipping setup_complete so the final save isn't rejected
+    // as stale — that left the wizard stuck with a "settings changed" error
+    // and never reached the automatic relaunch.
+    let latest: AppSettings;
     try {
-      await saveSettings(final);
+      latest = await getSettings();
+    } catch (e) {
+      saveError = translateError(e, m.settings_save_failed());
+      return;
+    }
+
+    const final: AppSettings = {
+      ...partial,
+      settings_revision: latest.settings_revision,
+      ip_filter_enabled: latest.ip_filter_enabled,
+      setup_complete: true,
+    };
+    try {
+      const second = await saveSettings(final);
+      Object.assign(final, second.settings);
     } catch (e) {
       // If this second save fails the wizard will show again — annoying but
       // safe. Surface the error.
@@ -255,8 +286,11 @@
     try {
       await new Promise(r => setTimeout(r, 600));
       await relaunch();
-    } catch {
+    } catch (e) {
       relaunching = false;
+      saveError = m.settings_restart_failed({ error: translateError(e) });
+      // Settings are already persisted with setup_complete=true; dismiss the
+      // wizard so the user can use the app and restart manually if needed.
       await oncomplete(final);
     }
   }
