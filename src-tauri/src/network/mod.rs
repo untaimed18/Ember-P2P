@@ -7,7 +7,7 @@ pub mod upnp;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use byteorder::{LittleEndian, ReadBytesExt};
@@ -61,6 +61,91 @@ use self::kad::types::*;
 use crate::storage::known_files::KnownFileList;
 use crate::storage::statistics::{StatsManager, TransferStats};
 
+const FIREWALL_REQ_COOLDOWN_SECS: i64 = 60;
+const MAX_FIREWALL_REQ_COOLDOWN_ENTRIES: usize = 4096;
+
+struct TokenBucket {
+    tokens: f64,
+    capacity: f64,
+    refill_per_second: f64,
+    last_refill: std::time::Instant,
+}
+
+impl TokenBucket {
+    fn new(capacity: usize, refill_per_second: f64) -> Self {
+        Self {
+            tokens: capacity as f64,
+            capacity: capacity as f64,
+            refill_per_second,
+            last_refill: std::time::Instant::now(),
+        }
+    }
+
+    fn try_take(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        self.tokens = (self.tokens
+            + now
+                .saturating_duration_since(self.last_refill)
+                .as_secs_f64()
+                * self.refill_per_second)
+            .min(self.capacity);
+        self.last_refill = now;
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
+}
+
+fn admit_firewall_request_ip(
+    cooldowns: &mut HashMap<Ipv4Addr, i64>,
+    ip: Ipv4Addr,
+    now: i64,
+) -> bool {
+    if cooldowns.len() >= MAX_FIREWALL_REQ_COOLDOWN_ENTRIES {
+        cooldowns.retain(|_, ts| now.saturating_sub(*ts) < FIREWALL_REQ_COOLDOWN_SECS);
+    }
+    if cooldowns.len() >= MAX_FIREWALL_REQ_COOLDOWN_ENTRIES && !cooldowns.contains_key(&ip) {
+        return false;
+    }
+    if cooldowns
+        .get(&ip)
+        .is_some_and(|previous| now.saturating_sub(*previous) < FIREWALL_REQ_COOLDOWN_SECS)
+    {
+        return false;
+    }
+    cooldowns.insert(ip, now);
+    true
+}
+
+#[cfg(test)]
+mod firewall_request_bound_tests {
+    use super::*;
+
+    #[test]
+    fn cooldown_map_never_exceeds_hard_cap() {
+        let mut cooldowns = HashMap::new();
+        for index in 0..MAX_FIREWALL_REQ_COOLDOWN_ENTRIES {
+            cooldowns.insert(Ipv4Addr::new(10, (index >> 8) as u8, index as u8, 1), 100);
+        }
+        assert!(!admit_firewall_request_ip(
+            &mut cooldowns,
+            Ipv4Addr::new(203, 0, 113, 1),
+            100
+        ));
+        assert_eq!(cooldowns.len(), MAX_FIREWALL_REQ_COOLDOWN_ENTRIES);
+    }
+
+    #[test]
+    fn token_bucket_rejects_after_burst() {
+        let mut bucket = TokenBucket::new(2, 0.0);
+        assert!(bucket.try_take());
+        assert!(bucket.try_take());
+        assert!(!bucket.try_take());
+    }
+}
+
 struct ServerConnectResult {
     addr: SocketAddr,
     ip: String,
@@ -104,13 +189,6 @@ struct RendezvousRegisterResult {
 
 struct FriendRelayTicketPollResult {
     result: Result<rendezvous::FriendRelayTicketPollPage, String>,
-    protocol: FriendRelayTicketPollProtocol,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FriendRelayTicketPollProtocol {
-    V3,
-    LegacyV2,
 }
 
 fn relay_ticket_next_round_delay(
@@ -232,8 +310,28 @@ fn advertised_udp_port(state: &NetworkState) -> u16 {
 
 /// Whether STUN keep-alive should actively refresh/advertise mappings.
 /// Symmetric / unstable remapping (typical VPN) must not override Settings ports.
+fn mapping_probe_allowed_by_activity(
+    server_connected: bool,
+    kad_connected: bool,
+    active_transfer: bool,
+    active_friend_connection: bool,
+) -> bool {
+    server_connected || kad_connected || active_transfer || active_friend_connection
+}
+
+fn mapping_probe_has_active_reason(state: &NetworkState) -> bool {
+    mapping_probe_allowed_by_activity(
+        state.server_connected,
+        kad_ready_for_sources(state),
+        !state.pending_downloads.is_empty() || !state.active_source_senders.is_empty(),
+        !state.online_friends.is_empty() || !state.outbound_session_tasks.is_empty(),
+    )
+}
+
 fn stun_keepalive_should_run(state: &NetworkState) -> bool {
-    state.stun_keepalive_enabled && !state.stun_ka_auto_suspended
+    state.stun_keepalive_enabled
+        && !state.stun_ka_auto_suspended
+        && mapping_probe_has_active_reason(state)
 }
 
 /// Whether `external_udp_port` currently holds a STUN-confirmed mapping that
@@ -758,11 +856,7 @@ fn check_and_record_udp_epx_rate(
         return true;
     }
     if map.len() >= MAX_EMBER_UDP_EPX_RATE_ENTRIES {
-        if let Some(oldest_key) = map
-            .iter()
-            .min_by_key(|(_, (_, ts))| *ts)
-            .map(|(k, _)| *k)
-        {
+        if let Some(oldest_key) = map.iter().min_by_key(|(_, (_, ts))| *ts).map(|(k, _)| *k) {
             map.remove(&oldest_key);
         }
     }
@@ -1633,6 +1727,32 @@ fn pending_download_retry_interval(search_count: u32) -> i64 {
     }
 }
 
+fn insert_pending_download_bounded(
+    pending: &mut HashMap<String, PendingDownload>,
+    transfer_id: String,
+    download: PendingDownload,
+) -> bool {
+    if pending.contains_key(&transfer_id)
+        || pending.len() < crate::commands::transfers::MAX_PENDING_DOWNLOADS
+    {
+        pending.insert(transfer_id, download);
+        true
+    } else {
+        warn!(
+            "Refusing pending-download map insertion at cap {}",
+            crate::commands::transfers::MAX_PENDING_DOWNLOADS
+        );
+        false
+    }
+}
+
+fn shutdown_phase_deadline(
+    global: tokio::time::Instant,
+    phase_max: std::time::Duration,
+) -> tokio::time::Instant {
+    std::cmp::min(global, tokio::time::Instant::now() + phase_max)
+}
+
 /// KAD re-search interval for active downloads that already have sources.
 /// More relaxed than `pending_download_retry_interval` since these downloads
 /// are already transferring — we're just looking for additional sources.
@@ -1674,6 +1794,7 @@ const MAX_FAIL_COUNT_FOR_UDP: u32 = 3;
 /// path resets the per-server counter via `record_udp_reply`.
 const MAX_UDP_CONSECUTIVE_FAILURES: u32 = 5;
 const SERVER_UDP_SOURCE_REASK_SECS: i64 = 30 * 60;
+const SERVER_UDP_SOURCE_REPLY_TTL_SECS: i64 = 120;
 
 fn is_eligible_udp_server(
     server: &ed2k::server_list::ServerEntry,
@@ -1765,6 +1886,66 @@ fn build_all_getsources_packets(
         }
     }
     packets
+}
+
+fn is_recent_configured_server_source_reply(
+    server_list: &ServerList,
+    queries: &HashMap<(String, u16, [u8; 16]), i64>,
+    addr: SocketAddr,
+    file_hash: &[u8; 16],
+    now: i64,
+) -> bool {
+    let tcp_port = addr.port().saturating_sub(4);
+    let ip = addr.ip().to_string();
+    let configured = server_list
+        .servers()
+        .iter()
+        .any(|server| server.ip == ip && server.port == tcp_port);
+    configured
+        && queries
+            .get(&(ip, tcp_port, *file_hash))
+            .is_some_and(|sent_at| now.saturating_sub(*sent_at) <= SERVER_UDP_SOURCE_REPLY_TTL_SECS)
+}
+
+#[cfg(test)]
+mod server_udp_source_admission_tests {
+    use super::*;
+
+    #[test]
+    fn requires_configured_endpoint_and_recent_matching_query() {
+        let mut servers = ServerList::new();
+        servers.add(ServerEntry::new("198.51.100.10".to_string(), 4661));
+        let addr: SocketAddr = "198.51.100.10:4665".parse().unwrap();
+        let hash = [0x44; 16];
+        let mut queries = HashMap::new();
+        queries.insert(("198.51.100.10".to_string(), 4661, hash), 1_000);
+
+        assert!(is_recent_configured_server_source_reply(
+            &servers, &queries, addr, &hash, 1_100
+        ));
+        // Correlation is non-destructive: duplicate replies remain valid in
+        // the same response window.
+        assert!(is_recent_configured_server_source_reply(
+            &servers, &queries, addr, &hash, 1_100
+        ));
+        assert!(!is_recent_configured_server_source_reply(
+            &servers, &queries, addr, &hash, 1_121
+        ));
+        assert!(!is_recent_configured_server_source_reply(
+            &servers,
+            &queries,
+            "198.51.100.11:4665".parse().unwrap(),
+            &hash,
+            1_100
+        ));
+        assert!(!is_recent_configured_server_source_reply(
+            &servers,
+            &queries,
+            addr,
+            &[0x45; 16],
+            1_100
+        ));
+    }
 }
 
 /// Build UDP GETSOURCES packets for ALL eligible servers, packing multiple
@@ -2050,6 +2231,7 @@ async fn process_inbound_friend_request(
     online_friends: &mut HashMap<[u8; 16], i64>,
     require_approval: bool,
     req_hash: [u8; 16],
+    peer_pubkey: Option<[u8; 32]>,
     nickname: &str,
     peer_ip: &str,
     peer_port: u16,
@@ -2072,6 +2254,7 @@ async fn process_inbound_friend_request(
     let h_q = hash_hex.clone();
     let n_q = nickname.to_string();
     let ip_q = peer_ip.to_string();
+    let peer_pubkey_q = peer_pubkey;
     let db_outcome = tokio::task::spawn_blocking(move || {
         let (is_friend, already_mutual) = db_q
             .get_friends_full()
@@ -2088,13 +2271,20 @@ async fn process_inbound_friend_request(
             // Auto-confirm only after Ed25519 PoP (or equivalent verified
             // binding). An unverified reciprocal request still queues so a
             // spoofed hash cannot promote a listed friend to mutual.
-            match db_q.set_friend_mutual(&h_q, &ip_q, peer_port) {
+            match db_q.set_friend_mutual(&h_q, &ip_q, peer_port, peer_pubkey_q.as_ref()) {
                 Ok(n) if n > 0 => FriendRequestDbOutcome::Promoted,
                 Ok(_) => FriendRequestDbOutcome::PromotionSkipped,
                 Err(e) => FriendRequestDbOutcome::Failed(e.to_string()),
             }
         } else {
-            match db_q.add_friend_request(&h_q, &n_q, &ip_q, peer_port, verified) {
+            match db_q.add_friend_request(
+                &h_q,
+                peer_pubkey_q.as_ref(),
+                &n_q,
+                &ip_q,
+                peer_port,
+                verified,
+            ) {
                 Ok(()) => FriendRequestDbOutcome::Queued,
                 Err(e) => FriendRequestDbOutcome::Failed(e.to_string()),
             }
@@ -2198,7 +2388,15 @@ fn spawn_rendezvous_friend_lookup(
     let nat_ctx_fc = state.friend_nat_context.clone();
 
     tokio::spawn(async move {
-        match rendezvous::lookup(&rv_url, &target_hash).await {
+        match rendezvous::lookup(
+            &rv_url,
+            &our_eh,
+            &ed25519_pubkey,
+            &ed25519_secret_key,
+            &target_hash,
+        )
+        .await
+        {
             Ok(Some((ip, port))) => {
                 info!(
                     "Rendezvous found friend {} at {}:{}",
@@ -2315,13 +2513,16 @@ fn spawn_rendezvous_friend_lookup(
                         Err(e) => {
                             info!("Persistent session to {} failed: {e}", addr);
                             let emsg = format!("{e}");
-                            let reason = if emsg.contains("timeout") {
-                                "timeout"
-                            } else if emsg.contains("refused") {
-                                "refused"
-                            } else {
-                                "error"
-                            };
+                            let reason =
+                                if emsg.contains(ed2k::secure_stream::UPGRADE_REQUIRED_ERROR) {
+                                    "secure_v2_required"
+                                } else if emsg.contains("timeout") {
+                                    "timeout"
+                                } else if emsg.contains("refused") {
+                                    "refused"
+                                } else {
+                                    "error"
+                                };
                             // No `EmberFriendDisconnected` — we never
                             // emitted online for this peer so there's
                             // nothing to roll back. The trailing
@@ -2440,20 +2641,56 @@ mod tests {
     };
 
     #[test]
+    fn disconnected_startup_does_not_admit_mapping_probes() {
+        assert!(!mapping_probe_allowed_by_activity(
+            false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn connected_or_active_work_admits_mapping_probes() {
+        assert!(mapping_probe_allowed_by_activity(true, false, false, false));
+        assert!(mapping_probe_allowed_by_activity(false, true, false, false));
+        assert!(mapping_probe_allowed_by_activity(false, false, true, false));
+        assert!(mapping_probe_allowed_by_activity(false, false, false, true));
+    }
+
+    #[test]
+    fn expected_aich_parser_is_optional_and_strict() {
+        assert!(expected_aich_bytes(None).is_none());
+        assert_eq!(
+            expected_aich_bytes(Some(&"ab".repeat(20))),
+            Some([0xabu8; 20])
+        );
+        assert!(expected_aich_bytes(Some("abcd")).is_none());
+        assert!(expected_aich_bytes(Some(&"zz".repeat(20))).is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_fault_wait_never_exceeds_outer_deadline() {
+        let started = tokio::time::Instant::now();
+        let global = started + std::time::Duration::from_millis(25);
+        let phase = shutdown_phase_deadline(global, std::time::Duration::from_secs(30));
+        assert!(phase <= global);
+        let timed_out =
+            tokio::time::timeout_at(phase, tokio::time::sleep(std::time::Duration::from_secs(1)))
+                .await;
+        assert!(timed_out.is_err());
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "nested fault wait escaped the outer shutdown deadline"
+        );
+    }
+
+    #[test]
     fn relay_poll_success_preserves_one_second_minimum_cadence() {
         let started = tokio::time::Instant::now();
         assert_eq!(
-            relay_ticket_next_round_delay(
-                started,
-                started + std::time::Duration::from_millis(200)
-            ),
+            relay_ticket_next_round_delay(started, started + std::time::Duration::from_millis(200)),
             std::time::Duration::from_millis(800)
         );
         assert_eq!(
-            relay_ticket_next_round_delay(
-                started,
-                started + std::time::Duration::from_secs(2)
-            ),
+            relay_ticket_next_round_delay(started, started + std::time::Duration::from_secs(2)),
             std::time::Duration::ZERO
         );
     }
@@ -2476,11 +2713,99 @@ mod tests {
         assert_eq!(first.stable_hits, 1);
 
         // Second identical observation confirms it.
-        let second =
-            tcp_port_confirmation(4662, first.candidate_port, first.stable_hits, 51234);
+        let second = tcp_port_confirmation(4662, first.candidate_port, first.stable_hits, 51234);
         assert_eq!(second.confirmed_port, Some(51234));
         assert_eq!(second.candidate_port, None);
         assert_eq!(second.stable_hits, 0);
+    }
+
+    #[test]
+    fn should_reconnect_for_tcp_remap_when_lowid_with_a_new_confirmed_port() {
+        assert!(should_reconnect_for_tcp_remap(
+            true,
+            true,
+            false,
+            Some(51234),
+            Some(4662),
+            true
+        ));
+    }
+
+    #[test]
+    fn should_not_reconnect_for_tcp_remap_when_already_highid() {
+        // Nothing to fix — reconnecting would only risk disrupting a
+        // perfectly good HighID session.
+        assert!(!should_reconnect_for_tcp_remap(
+            false,
+            true,
+            false,
+            Some(51234),
+            Some(4662),
+            true
+        ));
+    }
+
+    #[test]
+    fn should_not_reconnect_for_tcp_remap_when_disconnected() {
+        assert!(!should_reconnect_for_tcp_remap(
+            true,
+            false,
+            false,
+            Some(51234),
+            Some(4662),
+            true
+        ));
+    }
+
+    #[test]
+    fn should_not_reconnect_for_tcp_remap_when_reconnect_already_in_flight() {
+        assert!(!should_reconnect_for_tcp_remap(
+            true,
+            true,
+            true,
+            Some(51234),
+            Some(4662),
+            true
+        ));
+    }
+
+    #[test]
+    fn should_not_reconnect_for_tcp_remap_when_port_unconfirmed() {
+        assert!(!should_reconnect_for_tcp_remap(
+            true,
+            true,
+            false,
+            None,
+            Some(4662),
+            true
+        ));
+    }
+
+    #[test]
+    fn should_not_reconnect_for_tcp_remap_when_server_already_has_this_port() {
+        // The server already knows this exact port (either it was current
+        // at login, or a prior reconnect already pushed it) — nothing to
+        // gain from reconnecting again.
+        assert!(!should_reconnect_for_tcp_remap(
+            true,
+            true,
+            false,
+            Some(51234),
+            Some(51234),
+            true
+        ));
+    }
+
+    #[test]
+    fn should_not_reconnect_for_tcp_remap_during_cooldown() {
+        assert!(!should_reconnect_for_tcp_remap(
+            true,
+            true,
+            false,
+            Some(51234),
+            Some(4662),
+            false
+        ));
     }
 
     #[test]
@@ -2490,8 +2815,7 @@ mod tests {
 
         // A different port on the next cycle restarts the streak instead of
         // ever being trusted from an inconsistent reading.
-        let flapped =
-            tcp_port_confirmation(4662, first.candidate_port, first.stable_hits, 60000);
+        let flapped = tcp_port_confirmation(4662, first.candidate_port, first.stable_hits, 60000);
         assert_eq!(flapped.confirmed_port, None);
         assert_eq!(flapped.candidate_port, Some(60000));
         assert_eq!(flapped.stable_hits, 1);
@@ -3631,6 +3955,8 @@ pub enum NetworkCommand {
         /// `ember_content_hashes` so completion verify does not depend
         /// solely on having seen a DHT keyword hit this session.
         ember_file_hash: String,
+        /// Optional trusted AICH master from an ed2k link/collection.
+        expected_aich: Option<String>,
         transfer_id: String,
         control: Arc<TransferControl>,
         /// When true, register seeds + run KAD/TCP/UDP source discovery
@@ -3862,6 +4188,7 @@ pub enum NetworkCommand {
     },
     FriendRemoved {
         ember_hash: [u8; 16],
+        tx: oneshot::Sender<()>,
     },
     FindFriendAndConnect {
         ember_hash: [u8; 16],
@@ -3999,7 +4326,11 @@ pub enum NetworkCommand {
         peer_pubkey: Option<[u8; 32]>,
         tx: oneshot::Sender<Result<(), String>>,
     },
-    Shutdown,
+    Shutdown {
+        /// One process-wide absolute deadline, created by the outer Tauri exit
+        /// handler and shared by every network persistence phase.
+        deadline: tokio::time::Instant,
+    },
 }
 
 /// Returned by the network task when an outgoing Ember ping has been
@@ -4169,11 +4500,22 @@ struct PendingDownload {
     file_hash: String,
     file_name: String,
     file_size: u64,
+    expected_aich: Option<String>,
     control: Arc<TransferControl>,
     search_count: u32,
     last_search_at: i64,
     /// Download priority: 0 = low, 1 = normal, 2 = high
     priority: u32,
+}
+
+fn expected_aich_bytes(value: Option<&str>) -> Option<[u8; 20]> {
+    let bytes = hex::decode(value?).ok()?;
+    if bytes.len() != 20 {
+        return None;
+    }
+    let mut hash = [0u8; 20];
+    hash.copy_from_slice(&bytes);
+    Some(hash)
 }
 
 async fn udp_reask_completed_parts(state: &NetworkState, transfer_id: &str) -> Option<Vec<bool>> {
@@ -5233,6 +5575,10 @@ struct NetworkState {
     callback_row_pending_since: HashMap<(String, String, u16), i64>,
     /// Semaphore limiting concurrent outgoing TCP connections for firewall checks
     firewall_connect_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Global admission protects both the UDP response and TCP connect-back
+    /// sides from spoofed-source amplification.
+    firewall_req_response_bucket: TokenBucket,
+    firewall_req_connect_bucket: TokenBucket,
     /// K18: per-IP cooldown timestamps for incoming FirewalledReq. An
     /// attacker with UDP spoof capability can send many FirewalledReq
     /// packets that each trigger an outgoing TCP connect-back attempt
@@ -5247,19 +5593,9 @@ struct NetworkState {
     /// [`PendingBrowseRequest`] for why a request ID alone is insufficient.
     pending_browse_requests: PendingBrowseRequests,
     /// Short-lived dedup for inbound Ember chat messages: ember_hash ->
-    /// (last message text, received-at timestamp). A friend's chat can
-    /// legitimately arrive via either the dedicated `friend_connect.rs`
-    /// session (`UploadEventKind::EmberChatMessage`) or an ordinary
-    /// `transfer.rs` download connection to the same friend
-    /// (`DownloadEvent::EmberChatMessage`) — the latter has no
-    /// `ember_sessions` slot-ownership check (deliberately: a transient
-    /// download connection must never be allowed to steal the canonical
-    /// session slot used for outbound chat routing), so if both happen to
-    /// be open at once and the peer's own client re-sends the same
-    /// logical message down more than one connection, we'd otherwise
-    /// persist and display it twice. Suppressing an exact-text repeat
-    /// from the same friend within `EMBER_CHAT_DEDUP_WINDOW_SECS` closes
-    /// that without touching connection/session semantics.
+    /// (last message text, received-at timestamp). Only canonical v2 sessions
+    /// can reach this map; the short window suppresses accidental same-session
+    /// application retries without accepting generic transfer-path chat.
     recent_ember_chat: HashMap<[u8; 16], (String, i64)>,
     /// Shared Ember session map for sending outbound packets to friend connections
     ember_sessions: upload_server::EmberSessionMap,
@@ -5632,6 +5968,62 @@ const MAX_AICH_HASH_SETS: usize = 10_000;
 /// integrity (eviction would risk losing the only trusted root for
 /// a given file).
 const MAX_AICH_ROOT_MAP_SOFT_CAP: usize = 100_000;
+static AICH_CACHE_WRITE_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+fn persist_aich_cache_entry(
+    path: &Path,
+    file_hash: [u8; 16],
+    aich_hash: [u8; 20],
+) -> std::io::Result<()> {
+    let _guard = AICH_CACHE_WRITE_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .map_err(|_| std::io::Error::other("AICH cache lock poisoned"))?;
+    const MAX_CACHE_BYTES: u64 = 16 * 1024 * 1024;
+    let mut entries = std::collections::BTreeMap::<String, String>::new();
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.len() > MAX_CACHE_BYTES => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "AICH cache exceeds size limit",
+            ));
+        }
+        Ok(_) => {
+            let contents = std::fs::read_to_string(path)?;
+            for line in contents.lines() {
+                let Some((file, root)) = line.split_once('=') else {
+                    continue;
+                };
+                if file.len() == 32
+                    && root.len() == 40
+                    && file.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    && root.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    && entries.len() < MAX_AICH_ROOT_MAP_SOFT_CAP
+                {
+                    entries.insert(file.to_ascii_lowercase(), root.to_ascii_lowercase());
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    entries.insert(hex::encode(file_hash), hex::encode(aich_hash));
+    if entries.len() > MAX_AICH_ROOT_MAP_SOFT_CAP {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "AICH cache entry limit reached",
+        ));
+    }
+    let mut output = String::with_capacity(entries.len().saturating_mul(74));
+    for (file, root) in entries {
+        output.push_str(&file);
+        output.push('=');
+        output.push_str(&root);
+        output.push('\n');
+    }
+    crate::security::atomic_write(path, output.as_bytes(), true)
+}
 
 /// Window for suppressing an exact-text repeat of a friend's chat message
 /// arriving via a second connection (see `NetworkState::recent_ember_chat`).
@@ -6948,6 +7340,7 @@ async fn try_start_pending_download_from_known_sources(
     // round-trips.
     let (est_inject_tx, est_inject_rx) =
         mpsc::channel::<ed2k::multi_source::EstablishedSource>(ESTABLISHED_SOURCE_CHANNEL_CAP);
+    let expected_aich_master = expected_aich_bytes(pending.expected_aich.as_deref());
     let ms_download = MultiSourceDownload {
         transfer_id: pending.transfer_id,
         file_hash: hash_bytes,
@@ -6980,8 +7373,10 @@ async fn try_start_pending_download_from_known_sources(
         banned_ips: Some(shared_banned_ips.clone()),
         external_ip: state.external_ip,
         aich_pending: Some(state.aich_recovery_pending.clone()),
-        trusted_aich_master: state.aich_root_map.get(&hash_bytes).copied(),
-                                ember_file_hash: state.ember_content_hashes.get(&hash_bytes).copied().unwrap_or([0u8; 32]),
+        trusted_aich_master: expected_aich_master
+            .or_else(|| state.aich_root_map.get(&hash_bytes).copied()),
+        expected_aich_master,
+        ember_file_hash: state.ember_content_hashes.get(&hash_bytes).copied().unwrap_or([0u8; 32]),
         geoip: geoip.clone(),
         tracker_registry: Some(state.tracker_registry.clone()),
         sx_overhead: sx_overhead.clone(),
@@ -7883,6 +8278,7 @@ pub async fn start_network(
     mut cmd_rx: mpsc::Receiver<NetworkCommand>,
     mut settings: AppSettings,
     identity: Arc<crate::storage::identity::NodeIdentity>,
+    security_policy: Arc<crate::security::policy::SecurityPolicyGate>,
     local_index: Arc<RwLock<LocalIndex>>,
     fresh_part_hashes: Arc<RwLock<HashMap<[u8; 16], Vec<[u8; 16]>>>>,
     db: Arc<Database>,
@@ -7902,6 +8298,21 @@ pub async fn start_network(
     uss_enabled_flag: crate::bandwidth::UssEnabledFlag,
     spam_filter: Arc<RwLock<crate::search::spam::SpamFilter>>,
 ) -> anyhow::Result<()> {
+    // Do not bind KAD/eD2K/Ember sockets or start the upload listener while a
+    // recovered/reset policy database is awaiting explicit acknowledgement.
+    while !security_policy.is_loaded() {
+        tokio::select! {
+            command = cmd_rx.recv() => {
+                match command {
+                    Some(NetworkCommand::Shutdown { .. }) | None => return Ok(()),
+                    Some(_) => {
+                        warn!("Dropping network command while security policy reset is unacknowledged");
+                    }
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+        }
+    }
     let data_dir = crate::storage::paths::ensure_data_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     let geoip = crate::geoip::empty();
@@ -8061,7 +8472,9 @@ pub async fn start_network(
     // authoritative KAD-contact store (complete, with the real UDP port) and
     // `default_bootstrap_contacts()` covers a cold start, so KAD bootstrap no
     // longer depends on this lossy table.
-    let saved_db_peers = db.get_peers().unwrap_or_default();
+    let saved_db_peers = db
+        .get_peers()
+        .map_err(|error| anyhow::anyhow!("failed to load peer/ban policy: {error}"))?;
     if !saved_db_peers.is_empty() {
         info!("Loaded {} peers from database", saved_db_peers.len());
     }
@@ -8161,7 +8574,10 @@ pub async fn start_network(
         .flat_map(|p| p.addresses.iter())
         .filter_map(|addr| addr.rsplit_once(':').and_then(|(ip, _)| ip.parse().ok()))
         .collect();
-    banned_ips.extend(db.get_banned_ips().unwrap_or_default());
+    banned_ips.extend(
+        db.get_banned_ips()
+            .map_err(|error| anyhow::anyhow!("failed to load automatic bans: {error}"))?,
+    );
 
     // Extract banned user hashes for upload-only enforcement
     let banned_hashes: HashSet<[u8; 16]> = saved_db_peers
@@ -8239,6 +8655,10 @@ pub async fn start_network(
     let mut pending_server_met_bootstrap = server_list.is_empty();
     let mut server_met_bootstrap_task: Option<tokio::task::JoinHandle<Result<Vec<u8>, String>>> =
         None;
+
+    let reputation =
+        ember::reputation::ReputationManager::load_checked(&data_dir.join("reputation.json"))
+            .map_err(|error| anyhow::anyhow!(error))?;
 
     let mut state = NetworkState {
         local_id,
@@ -8408,6 +8828,8 @@ pub async fn start_network(
         aich_root_map: HashMap::new(),
         callback_row_pending_since: HashMap::new(),
         firewall_connect_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
+        firewall_req_response_bucket: TokenBucket::new(128, 4.0),
+        firewall_req_connect_bucket: TokenBucket::new(32, 1.0),
         firewall_req_cooldown: HashMap::new(),
         online_friends: HashMap::new(),
         pending_browse_requests: HashMap::new(),
@@ -8442,7 +8864,7 @@ pub async fn start_network(
         connection_broker: None,
         broker_event_rx: None,
         relay_manager: Arc::new(tokio::sync::Mutex::new(ember::relay::RelayManager::new())),
-        reputation: ember::reputation::ReputationManager::load(&data_dir.join("reputation.json")),
+        reputation,
         ember_capable_peers: HashSet::new(),
         ember_transport: ember::transport::EmberTransport::new(
             identity.noise_private_key,
@@ -9118,15 +9540,11 @@ pub async fn start_network(
     reputation_save_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut watchdog_timer = tokio::time::interval(std::time::Duration::from_secs(30));
     watchdog_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    // Broker tick + event drain. Runs at 200 ms so:
-    //   * `BrokerEvent::StartPunch` / `StartRelay` posted by
-    //     `attempt_low_to_low()` are dispatched into spawned tasks
-    //     within a single tick, instead of waiting for the 5-minute
-    //     `cleanup_timer` arm where this code used to live (which
-    //     was longer than `PUNCH_TIMEOUT` / `RELAY_TIMEOUT`, making
-    //     hole-punch and LowID-to-LowID effectively dead).
+    // Broker tick + event drain. Runs at 200 ms so relay events are
+    // dispatched within a single tick rather than waiting for the
+    // 5-minute cleanup timer.
     //   * `broker.tick()` reaps expired in-flight attempts close to
-    //     their nominal 20 s / 30 s timeouts.
+    //     their nominal 30 s timeout.
     // Idle cost per tick is one `try_recv()` (returns `Empty` instantly)
     // plus a hashmap walk over at most `MAX_ACTIVE_ATTEMPTS` entries.
     let mut broker_timer = tokio::time::interval(std::time::Duration::from_millis(200));
@@ -9217,9 +9635,6 @@ pub async fn start_network(
     let mut rendezvous_register_started_at: Option<tokio::time::Instant> = None;
     let mut friend_relay_ticket_polls_in_flight = 0usize;
     let mut friend_relay_ticket_sessions_in_flight = HashSet::<String>::new();
-    let mut friend_relay_ticket_candidate_offset = 0usize;
-    let mut friend_relay_ticket_poll_protocol = FriendRelayTicketPollProtocol::V3;
-    let mut friend_relay_ticket_friend_limit_warned = false;
     let mut friend_relay_ticket_poll_retry_delay = std::time::Duration::from_secs(1);
     let mut friend_relay_ticket_poll_not_before = tokio::time::Instant::now();
     let mut friend_relay_ticket_poll_round_started_at: Option<tokio::time::Instant> = None;
@@ -9234,20 +9649,60 @@ pub async fn start_network(
     // Defer transfer resume, orphan sweep, firewall rules, and heavy disk
     // loads until the event loop can service splash IPC. UPnP setup is also
     // kicked here (non-blocking) via the maintain-result channel.
-    let mut pending_incomplete_downloads = match db.get_incomplete_downloads() {
-        Ok(v) if !v.is_empty() => {
-            info!(
-                "Will resume {} incomplete downloads after event loop starts",
-                v.len()
-            );
-            Some(v)
-        }
-        Ok(_) => None,
-        Err(e) => {
-            warn!("Failed to load incomplete downloads for resume: {e}");
+    // Hold the same admission mutex used by direct and collection IPC until
+    // every retained startup row has entered the manager/network maps. This
+    // prevents a renderer request racing the restore at N+1.
+    let mut startup_download_admission =
+        if let Some(app_state) = app_handle.try_state::<crate::app_state::AppState>() {
+            Some(app_state.download_admission.clone().lock_owned().await)
+        } else {
             None
+        };
+    let overflow_count = db
+        .quarantine_excess_pending_downloads(
+            crate::commands::transfers::MAX_PENDING_DOWNLOADS,
+            crate::commands::transfers::MAX_PENDING_REMAINING_BYTES,
+        )
+        .unwrap_or_else(|error| {
+            warn!("Failed to migrate oversized pending-download queue: {error}");
+            0
+        });
+    if overflow_count > 0 {
+        warn!(
+            "Quarantined {overflow_count} legacy pending download(s) beyond the safety budget; a durable UI notice will be shown"
+        );
+    }
+    let mut restored_rows = Vec::new();
+    const RESTORE_PAGE_SIZE: usize = 256;
+    let mut restore_offset = 0usize;
+    loop {
+        match db.get_incomplete_downloads_page(RESTORE_PAGE_SIZE, restore_offset) {
+            Ok(page) if page.is_empty() => break,
+            Ok(page) => {
+                restore_offset = restore_offset.saturating_add(page.len());
+                restored_rows.extend(page);
+                if restored_rows.len() >= crate::commands::transfers::MAX_PENDING_DOWNLOADS {
+                    break;
+                }
+            }
+            Err(error) => {
+                warn!("Failed to load incomplete download restore page: {error}");
+                break;
+            }
         }
+    }
+    let mut pending_incomplete_downloads = if restored_rows.is_empty() {
+        None
+    } else {
+        info!(
+            "Will resume {} incomplete downloads after event loop starts",
+            restored_rows.len()
+        );
+        Some(restored_rows)
     };
+    if pending_incomplete_downloads.is_none() {
+        startup_download_admission.take();
+    }
     let mut part_progress_task: Option<
         tokio::task::JoinHandle<std::collections::HashMap<String, (u64, bool, bool)>>,
     > = None;
@@ -9394,6 +9849,7 @@ pub async fn start_network(
         tokio::sync::mpsc::channel::<ed2k::aich::AICHRecoveryHashSet>(128);
 
     info!("Network event loop starting");
+    let mut shutdown_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
 
     let loop_panic = std::panic::AssertUnwindSafe(async {
     loop {
@@ -9406,7 +9862,8 @@ pub async fn start_network(
                 break;
             };
             match cmd {
-                NetworkCommand::Shutdown => {
+                NetworkCommand::Shutdown { deadline } => {
+                    shutdown_deadline = deadline;
                     shutting_down = true;
                     break;
                 }
@@ -9686,7 +10143,9 @@ pub async fn start_network(
                         // Verify off the network task — do not await a full-file
                         // hash before the event loop can drain IPC.
                         let expected = transfer.file_hash.clone();
+                        let expected_aich = transfer.expected_aich.clone();
                         let verify_path = final_path.clone();
+                        let allowed_root = dl_folder.clone();
                         let tid = transfer.id.clone();
                         let tid_handle = tid.clone();
                         let tx = dl_event_tx.clone();
@@ -9705,12 +10164,29 @@ pub async fn start_network(
                         }
                         let handle = tokio::spawn(async move {
                             let hash_matches = tokio::task::spawn_blocking(move || {
-                                ed2k::hash::ed2k_hash_file(&verify_path).ok()
+                                let verified_path =
+                                    crate::security::filesystem::verify_existing_path(
+                                        &verify_path,
+                                        &[allowed_root],
+                                    )
+                                    .ok()?;
+                                let md4 = ed2k::hash::ed2k_hash_file(&verified_path).ok()?;
+                                if !md4.eq_ignore_ascii_case(&expected) {
+                                    return Some(false);
+                                }
+                                if let Some(expected_aich) = expected_aich {
+                                    let actual = ed2k::aich::AICHRecoveryHashSet::build_from_file(
+                                        &verified_path,
+                                    )
+                                    .ok()
+                                    .map(|set| hex::encode(set.root_hash))?;
+                                    return Some(actual.eq_ignore_ascii_case(&expected_aich));
+                                }
+                                Some(true)
                             })
                             .await
                             .ok()
                             .flatten()
-                            .map(|h| h.eq_ignore_ascii_case(&expected))
                             .unwrap_or(false);
                             if hash_matches {
                                 let _ = tx
@@ -9757,6 +10233,7 @@ pub async fn start_network(
                             let file_hash = transfer.file_hash.clone();
                             let file_name = transfer.file_name.clone();
                             let file_size = transfer.total_size;
+                            let expected_aich = transfer.expected_aich.clone();
                             let dl_dir = PathBuf::from(&dl_folder);
                             let tx = dl_event_tx.clone();
                             let dl_tid = tid.clone();
@@ -9781,7 +10258,12 @@ pub async fn start_network(
                             }
                             let handle = tokio::spawn(async move {
                                 let result = reverify_complete_part_file(
-                                    &dl_tid, &file_hash, &file_name, file_size, &dl_dir,
+                                    &dl_tid,
+                                    &file_hash,
+                                    &file_name,
+                                    file_size,
+                                    expected_aich.as_deref(),
+                                    &dl_dir,
                                 )
                                 .await;
                                 match result {
@@ -9850,13 +10332,14 @@ pub async fn start_network(
                     ))
                     && transfer.status != TransferStatus::Insufficient
                 {
-                    state.pending_downloads.insert(
+                    insert_pending_download_bounded(&mut state.pending_downloads,
                         transfer.id.clone(),
                         PendingDownload {
                             transfer_id: transfer.id.clone(),
                             file_hash: transfer.file_hash.clone(),
                             file_name: transfer.file_name.clone(),
                             file_size: transfer.total_size,
+                            expected_aich: transfer.expected_aich.clone(),
                             control,
                             search_count: 0,
                             last_search_at: 0,
@@ -9891,6 +10374,9 @@ pub async fn start_network(
                     }
                 }
             }
+            // Startup rows now occupy the manager and pending network map;
+            // renderer admissions may safely continue against the same totals.
+            startup_download_admission.take();
         }
 
         if pending_startup_cleanup
@@ -9907,6 +10393,7 @@ pub async fn start_network(
                 crate::commands::transfers::sweep_orphan_part_files(
                     &settings.download_folder,
                     &known_ids,
+                    &db,
                 )
                 .await;
             }
@@ -10160,6 +10647,7 @@ pub async fn start_network(
             || (settings.ember_native_enabled && state.external_ip.is_none()))
             && state.nat_info.nat_type == ember::nat::NatType::Unknown
             && !nat_probe_in_flight
+            && mapping_probe_has_active_reason(&state)
             && nat_probe_backoff_until.map_or(true, |deadline| {
                 tokio::time::Instant::now() >= deadline
             });
@@ -10375,7 +10863,15 @@ pub async fn start_network(
             // Commands from the frontend (also handled by try_recv drain above)
             cmd = cmd_rx.recv() => {
                 match cmd {
-                    Some(NetworkCommand::Shutdown) | None => {
+                    Some(NetworkCommand::Shutdown { deadline }) => {
+                        shutdown_deadline = deadline;
+                        info!("Network shutting down");
+                        // See the try_recv drain above: stop the upload listener
+                        // before the shutdown save sequence runs.
+                        state.upload_disconnected.store(true, std::sync::atomic::Ordering::Relaxed);
+                        break;
+                    }
+                    None => {
                         info!("Network shutting down");
                         // See the try_recv drain above: stop the upload listener
                         // before the shutdown save sequence runs.
@@ -10726,10 +11222,13 @@ pub async fn start_network(
                                         .as_ref()
                                         .map(|record| record.last_shared)
                                         .unwrap_or(0),
-                                    is_shared: existing
-                                        .as_ref()
-                                        .map(|record| record.is_shared)
-                                        .unwrap_or(true),
+                                    is_shared: crate::storage::share_intent::effective_shared(
+                                        &fh,
+                                        existing
+                                            .as_ref()
+                                            .map(|record| record.is_shared)
+                                            .unwrap_or(true),
+                                    ),
                                     complete_sources: existing
                                         .as_ref()
                                         .map(|record| record.complete_sources)
@@ -10783,10 +11282,13 @@ pub async fn start_network(
                                         .map(|record| record.complete_sources)
                                         .unwrap_or(0),
                                     folder,
-                                    shared: existing
-                                        .as_ref()
-                                        .map(|record| record.is_shared)
-                                        .unwrap_or(true),
+                                    shared: crate::storage::share_intent::effective_shared(
+                                        &fh,
+                                        existing
+                                            .as_ref()
+                                            .map(|record| record.is_shared)
+                                            .unwrap_or(true),
+                                    ),
                                     shared_kad: false,
                                     shared_ed2k: false,
                                 };
@@ -10904,15 +11406,13 @@ pub async fn start_network(
                                         Ok(hs) => {
                                             let aich_hex = hex::encode(hs.root_hash);
                                             let cache_path = aich_data_dir.join("aich_cache.dat");
-                                            let entry = format!("{}={}\n", hex::encode(fh), aich_hex);
-                                            let _ = std::fs::OpenOptions::new()
-                                                .create(true)
-                                                .append(true)
-                                                .open(&cache_path)
-                                                .and_then(|mut f| {
-                                                    use std::io::Write;
-                                                    f.write_all(entry.as_bytes())
-                                                });
+                                            if let Err(error) =
+                                                persist_aich_cache_entry(&cache_path, fh, hs.root_hash)
+                                            {
+                                                tracing::warn!(
+                                                    "Failed to persist AICH cache entry: {error}"
+                                                );
+                                            }
                                             tracing::info!("Computed AICH root for completed download: {aich_hex}");
                                             if let Err(e) = aich_tx.try_send(hs) {
                                                 tracing::warn!("AICH hash-set queue full/closed, hash set not stored: {e}");
@@ -11061,6 +11561,7 @@ pub async fn start_network(
                                         .unwrap_or(0),
                                     extra_sources: Vec::new(),
                                     ember_file_hash: String::new(),
+                                    expected_aich: t.expected_aich.clone(),
                                     transfer_id: t.id.clone(),
                                     control,
                                     discovery_only: false,
@@ -11169,11 +11670,12 @@ pub async fn start_network(
                                 .get(transfer_id)
                                 .map(|pd| pd.search_count)
                                 .unwrap_or(0);
-                            state.pending_downloads.insert(transfer_id.clone(), PendingDownload {
+                            insert_pending_download_bounded(&mut state.pending_downloads, transfer_id.clone(), PendingDownload {
                                 transfer_id: transfer_id.clone(),
                                 file_hash: t.file_hash.clone(),
                                 file_name: t.file_name.clone(),
                                 file_size: t.total_size,
+                                expected_aich: t.expected_aich.clone(),
                                 control,
                                 search_count: prev_search_count.saturating_add(1),
                                 last_search_at: 0,
@@ -11188,36 +11690,6 @@ pub async fn start_network(
                                         warn!("DB update_transfer_status('searching') failed for {tid}: {e}");
                                     }
                                 });
-                            }
-
-                            // Attempt archive recovery if we have significant progress on an archive file
-                            let ext = std::path::Path::new(&t.file_name)
-                                .extension()
-                                .map(|e| e.to_string_lossy().to_lowercase())
-                                .unwrap_or_default();
-                            let is_archive = matches!(ext.as_str(), "zip" | "rar" | "ace" | "7z");
-                            if is_archive && t.progress > 50.0 {
-                                let part_path = PathBuf::from(&settings.download_folder)
-                                    .join("Temp")
-                                    .join(format!("{}.part", t.id));
-                                if part_path.exists() {
-                                    let tracker = ed2k::part_tracker::PartTracker::new(t.total_size, &part_path);
-                                    let filled = tracker.filled_ranges();
-                                    if !filled.is_empty() {
-                                        let fname = t.file_name.clone();
-                                        let pp = part_path.clone();
-                                        tokio::task::spawn_blocking(move || {
-                                            match ed2k::archive_recovery::recover_archive(&pp, &fname, &filled) {
-                                                Ok(recovered) => {
-                                                    tracing::info!("Archive recovery successful: {}", recovered.display());
-                                                }
-                                                Err(e) => {
-                                                    tracing::debug!("Archive recovery not possible: {e}");
-                                                }
-                                            }
-                                        });
-                                    }
-                                }
                             }
 
                             let _ = app_handle.emit("transfer-status", serde_json::json!({
@@ -11358,87 +11830,19 @@ pub async fn start_network(
                     continue;
                 }
 
-                if let DownloadEvent::EmberFriendRequest { ember_hash: req_hash, ref nickname, ref peer_ip, peer_port, verified } = event {
-                    process_inbound_friend_request(
-                        &db,
-                        &app_handle,
-                        &mut state.online_friends,
-                        settings.friend_require_approval,
-                        req_hash,
-                        nickname,
-                        peer_ip,
-                        peer_port,
-                        verified,
-                    )
-                    .await;
+                if let DownloadEvent::EmberFriendRequest { ember_hash, .. } = event {
+                    debug!(
+                        "Dropping unbound friend request from generic download connection for {}",
+                        hex::encode(ember_hash)
+                    );
                     continue;
                 }
 
-                // Inbound friend activity on download connections → mark online
-                {
-                    let activity_eh = match &event {
-                        DownloadEvent::EmberChatMessage { ember_hash, .. }
-                        | DownloadEvent::EmberBrowseResponse { ember_hash, .. } => Some(*ember_hash),
-                        _ => None,
-                    };
-                    if let Some(eh) = activity_eh {
-                        if !state.online_friends.contains_key(&eh) && friend_hashes.read().await.contains(&eh) {
-                            state.online_friends.insert(eh, chrono::Utc::now().timestamp());
-                            let _ = app_handle.emit("ember:friend-online", serde_json::json!({
-                                "user_hash": hex::encode(eh),
-                            }));
-                        }
-                    }
-                }
-
-                if let DownloadEvent::EmberChatMessage { ember_hash: chat_ember_hash, ref message } = event {
-                    if !settings.friend_chat_disabled {
-                        let hash_hex = hex::encode(chat_ember_hash);
-                        // L20: even though we strip bidi / zero-width
-                        // controls on egress, an honest local install
-                        // can't speak for the friend's client. A
-                        // peer running a forked or pre-L20 build is
-                        // still free to ship overrides on the wire,
-                        // and the recipient's `<bdi>` wrapping (M14)
-                        // only neutralises the *visual* effect — the
-                        // raw character is still in the DB and would
-                        // be exported intact. Sanitising on ingress
-                        // closes that storage and roundtrip path.
-                        let cleaned = crate::security::sanitize_chat_text(message);
-                        // Dedup against a near-simultaneous delivery of the
-                        // same text via the other channel (an ordinary
-                        // download connection has no `ember_sessions`
-                        // ownership check — see `recent_ember_chat`'s doc
-                        // comment for why that's intentional rather than a
-                        // gap to plumb around).
-                        let now = chrono::Utc::now().timestamp();
-                        let is_dup = state
-                            .recent_ember_chat
-                            .get(&chat_ember_hash)
-                            .is_some_and(|(last_msg, last_at)| {
-                                *last_msg == cleaned
-                                    && now.saturating_sub(*last_at) <= EMBER_CHAT_DEDUP_WINDOW_SECS
-                            });
-                        state
-                            .recent_ember_chat
-                            .insert(chat_ember_hash, (cleaned.clone(), now));
-                        if !is_dup {
-                            let db2 = db.clone();
-                            let h2 = hash_hex.clone();
-                            let msg2 = cleaned.clone();
-                            tokio::task::spawn_blocking(move || {
-                                if let Err(e) = db2.insert_chat_message(&h2, "received", &msg2) {
-                                    tracing::warn!("Failed to persist received chat message: {e}");
-                                }
-                            });
-                            let _ = app_handle.emit("ember:chat-message", serde_json::json!({
-                                "user_hash": hash_hex,
-                                "message": cleaned,
-                                "direction": "received",
-                                "timestamp": now,
-                            }));
-                        }
-                    }
+                if let DownloadEvent::EmberChatMessage { ember_hash, .. } = event {
+                    debug!(
+                        "Dropping unbound chat event from generic download connection for {}",
+                        hex::encode(ember_hash)
+                    );
                     continue;
                 }
 
@@ -11873,6 +12277,7 @@ pub async fn start_network(
                             peer_port: t.peer_id.split(':').nth(1).and_then(|p| p.parse().ok()).unwrap_or(0),
                             extra_sources: Vec::new(),
                             ember_file_hash: String::new(),
+                            expected_aich: t.expected_aich.clone(),
                             transfer_id: t.id.clone(),
                             control,
                             discovery_only: false,
@@ -12132,22 +12537,34 @@ pub async fn start_network(
                     }
                 }
 
-                if let UploadEventKind::EmberFriendRequest { ember_hash: req_hash, ref nickname, ref peer_ip, peer_port, verified } = event.kind {
-                    process_inbound_friend_request(
-                        &db,
-                        &app_handle,
-                        &mut state.online_friends,
-                        settings.friend_require_approval,
-                        req_hash,
-                        nickname,
-                        peer_ip,
-                        peer_port,
-                        verified,
-                    )
-                    .await;
+                if let UploadEventKind::EmberFriendRequest { ember_hash: req_hash, pubkey, ref nickname, ref peer_ip, peer_port, verified } = event.kind {
+                    if verified {
+                        process_inbound_friend_request(
+                            &db,
+                            &app_handle,
+                            &mut state.online_friends,
+                            settings.friend_require_approval,
+                            req_hash,
+                            pubkey,
+                            nickname,
+                            peer_ip,
+                            peer_port,
+                            true,
+                        )
+                        .await;
+                    } else {
+                        debug!(
+                            "Dropping unverified friend request outside secure-stream v2 for {}",
+                            hex::encode(req_hash)
+                        );
+                    }
                 }
 
                 if let UploadEventKind::EmberChatMessage { ember_hash: chat_eh, ref message } = event.kind {
+                    if !friend_hashes.read().await.contains(&chat_eh) {
+                        debug!("Dropping secure chat event after friend removal");
+                        continue;
+                    }
                     if !settings.friend_chat_disabled {
                         let hash_hex = hex::encode(chat_eh);
                         // L20: same ingress sanitisation as the
@@ -12321,6 +12738,10 @@ pub async fn start_network(
                     ref entries,
                 } = event.kind
                 {
+                    if !friend_hashes.read().await.contains(&browse_eh) {
+                        debug!("Dropping secure browse response after friend removal");
+                        continue;
+                    }
                     let hash_hex = hex::encode(browse_eh);
                     let files: Vec<serde_json::Value> = entries.iter().map(|(hash, size, name)| {
                         let clean_name = crate::security::sanitize_display_name(name);
@@ -12619,6 +13040,7 @@ pub async fn start_network(
                             peer_port: t.peer_id.split(':').nth(1).and_then(|p| p.parse().ok()).unwrap_or(0),
                             extra_sources: Vec::new(),
                             ember_file_hash: String::new(),
+                            expected_aich: t.expected_aich.clone(),
                             transfer_id: t.id.clone(),
                             control,
                             discovery_only: false,
@@ -13793,7 +14215,7 @@ pub async fn start_network(
                                         buddy_ip,
                                         buddy_port_raw,
                                         buddy_hash,
-                                        fh,
+                                        fh.clone(),
                                     ).await {
                                         if let Some(pfs) = state.per_file_sources.get_mut(&transfer_id) {
                                             pfs.mark_callback_requested(cb_src.ip, cb_src.tcp_port, cb_src.source_user_hash);
@@ -13960,7 +14382,7 @@ pub async fn start_network(
                         if let Some(pending) = state.pending_downloads.remove(&transfer_id) {
                             if sources.is_empty() && callback_sources.is_empty() && effective_lowid == 0 {
                                 info!("No sources found yet for {transfer_id}, will retry later");
-                                state.pending_downloads.insert(transfer_id, pending);
+                                insert_pending_download_bounded(&mut state.pending_downloads, transfer_id, pending);
                             } else if sources.is_empty() {
                                 // Only callback/LowID sources — keep pending; callbacks
                                 // will arrive via kad_callback_rx or server poll.
@@ -14081,7 +14503,7 @@ pub async fn start_network(
                                     "status": "searching",
                                     "sources": indirect_count,
                                 }));
-                                state.pending_downloads.insert(transfer_id, pending);
+                                insert_pending_download_bounded(&mut state.pending_downloads, transfer_id, pending);
                             } else {
                                 let hash_bytes = match hex::decode(&pending.file_hash) {
                                     Ok(b) if b.len() == 16 => {
@@ -14091,7 +14513,7 @@ pub async fn start_network(
                                     }
                                     _ => {
                                         error!("Bad hash in pending download, re-queuing for retry");
-                                        state.pending_downloads.insert(transfer_id, pending);
+                                        insert_pending_download_bounded(&mut state.pending_downloads, transfer_id, pending);
                                         continue;
                                     }
                                 };
@@ -14376,7 +14798,7 @@ pub async fn start_network(
                                                 "status": "searching",
                                             }),
                                         );
-                                        state.pending_downloads.insert(transfer_id, pending);
+                                        insert_pending_download_bounded(&mut state.pending_downloads, transfer_id, pending);
                                         continue;
                                     }
                                     info!(
@@ -14417,6 +14839,8 @@ pub async fn start_network(
                                     let (src_inject_tx, src_inject_rx) = mpsc::channel::<DownloadSource>(32);
                                     let (est_inject_tx, est_inject_rx) =
                                         mpsc::channel::<ed2k::multi_source::EstablishedSource>(ESTABLISHED_SOURCE_CHANNEL_CAP);
+                                    let expected_aich_master =
+                                        expected_aich_bytes(pending.expected_aich.as_deref());
                                     let ms_download = MultiSourceDownload {
                                         transfer_id: pending.transfer_id,
                                         file_hash: hash_bytes,
@@ -14449,8 +14873,10 @@ pub async fn start_network(
                                         banned_ips: Some(shared_banned_ips.clone()),
                                         external_ip: state.external_ip,
                                         aich_pending: Some(state.aich_recovery_pending.clone()),
-                                        trusted_aich_master: state.aich_root_map.get(&hash_bytes).copied(),
-                                ember_file_hash: state.ember_content_hashes.get(&hash_bytes).copied().unwrap_or([0u8; 32]),
+                                        trusted_aich_master: expected_aich_master
+                                            .or_else(|| state.aich_root_map.get(&hash_bytes).copied()),
+                                        expected_aich_master,
+                                        ember_file_hash: state.ember_content_hashes.get(&hash_bytes).copied().unwrap_or([0u8; 32]),
                                         geoip: geoip.clone(),
                                         tracker_registry: Some(state.tracker_registry.clone()),
                                         sx_overhead: stats_manager.sx_counters.clone(),
@@ -15571,8 +15997,8 @@ pub async fn start_network(
                         // Capacity 1024 (was 32): every broker producer
                         // already calls `try_send`, so the cap acts as
                         // pure cushion against burst bookkeeping events
-                        // (StartPunch / StartRelay / ConnectionReady /
-                        // *Failed). Small caps used to drop legitimate
+                        // (StartRelay / ConnectionReady / *Failed). Small
+                        // caps used to drop legitimate
                         // events under load; this gives the periodic
                         // drain plenty of headroom while staying well
                         // under the per-attempt MAX_ACTIVE_ATTEMPTS=8.
@@ -15607,6 +16033,7 @@ pub async fn start_network(
                                             ep_arc,
                                             relay_mgr,
                                             quic_cb_tx,
+                                            friend_hashes.clone(),
                                         ));
                                         tracing::info!("QUIC accept loop spawned");
 
@@ -15705,20 +16132,14 @@ pub async fn start_network(
                     if let Some(rv_ip) = state.external_ip {
                         let rv_pubkey = ed25519_pubkey;
                         let rv_secret = ed25519_secret_key;
-                        // Publish our Noise key so DHT peers can bootstrap
-                        // from us — but only when the DHT is actually on,
-                        // so we never advertise an undiallable contact.
-                        let rv_noise = if settings.ember_native_enabled {
-                            Some(*state.ember_transport.local_noise_public_key())
-                        } else {
-                            None
-                        };
-                        // The Ember Noise transport shares the KAD UDP socket,
-                        // so the `/bootstrap` pool must advertise the *actual
-                        // bound* UDP port (which may differ from the configured
-                        // one if it was taken). Only meaningful with a Noise key.
-                        let rv_ember_port =
-                            if settings.ember_native_enabled { Some(udp_port) } else { None };
+                        let rv_key_db = db.clone();
+                        let rv_friends = tokio::task::spawn_blocking(move || {
+                            rv_key_db.get_friend_public_keys()
+                        })
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .unwrap_or_default();
                         let tx = rendezvous_register_result_tx.clone();
                         rendezvous_register_in_flight = true;
                         rendezvous_register_started_at = Some(tokio::time::Instant::now());
@@ -15734,8 +16155,7 @@ pub async fn start_network(
                                     rv_ip,
                                     &rv_pubkey,
                                     &rv_secret,
-                                    rv_noise.as_ref(),
-                                    rv_ember_port,
+                                    &rv_friends,
                                 )
                                     .await;
                             let _ = tx.send(RendezvousRegisterResult {
@@ -15801,153 +16221,46 @@ pub async fn start_network(
                     && friend_relay_ticket_polls_in_flight == 0
                     && tokio::time::Instant::now() >= friend_relay_ticket_poll_not_before
                 {
-                    let mut friend_candidates: Vec<[u8; 16]> =
-                        friend_hashes.read().await.iter().copied().collect();
-                    friend_candidates.sort_unstable();
-                    if friend_candidates.len() > rendezvous::FRIEND_RELAY_TICKET_SUPPORTED_FRIENDS {
-                        if !friend_relay_ticket_friend_limit_warned {
-                            tracing::warn!(
-                                "Friend relay ticket discovery supports at most {} friends; \
-                                 limiting this polling cycle from {} entries",
-                                rendezvous::FRIEND_RELAY_TICKET_SUPPORTED_FRIENDS,
-                                friend_candidates.len(),
-                            );
-                            friend_relay_ticket_friend_limit_warned = true;
-                        }
-                        friend_candidates
-                            .truncate(rendezvous::FRIEND_RELAY_TICKET_SUPPORTED_FRIENDS);
-                    } else {
-                        friend_relay_ticket_friend_limit_warned = false;
-                    }
-                    if !friend_candidates.is_empty() {
-                        match friend_relay_ticket_poll_protocol {
-                            FriendRelayTicketPollProtocol::V3 => {
-                                friend_relay_ticket_poll_round_started_at =
-                                    Some(tokio::time::Instant::now());
-                                let round_timestamp = rendezvous::current_timestamp();
-                                let page_count = friend_candidates.len().div_ceil(
-                                    rendezvous::FRIEND_RELAY_TICKET_POLL_CANDIDATES_PER_REQUEST,
-                                );
-                                let requests_this_round = page_count.min(
-                                    rendezvous::FRIEND_RELAY_TICKET_PARALLEL_POLL_REQUESTS,
-                                );
-                                for _ in 0..requests_this_round {
-                                    let start =
-                                        friend_relay_ticket_candidate_offset % friend_candidates.len();
-                                    let end = (start
-                                        + rendezvous::FRIEND_RELAY_TICKET_POLL_CANDIDATES_PER_REQUEST)
-                                        .min(friend_candidates.len());
-                                    friend_relay_ticket_candidate_offset = if end == friend_candidates.len() {
-                                        0
-                                    } else {
-                                        end
-                                    };
-                                    let candidate_page = friend_candidates[start..end].to_vec();
-                                    let rv_url = settings.rendezvous_url.clone();
-                                    let poll_tx = friend_relay_ticket_poll_result_tx.clone();
-                                    friend_relay_ticket_polls_in_flight += 1;
-                                    tokio::spawn(async move {
-                                        let result = match tokio::time::timeout(
-                                            rendezvous::FRIEND_RELAY_TICKET_POLL_TIMEOUT,
-                                            rendezvous::poll_friend_relay_tickets(
-                                                &rv_url,
-                                                &ember_hash,
-                                                &candidate_page,
-                                                None,
-                                                round_timestamp,
-                                                &ed25519_secret_key,
-                                            ),
-                                        )
-                                        .await
-                                        {
-                                            Ok(result) => result,
-                                            Err(_) => Err("friend relay ticket poll timed out".to_string()),
-                                        };
-                                        let _ = poll_tx.send(FriendRelayTicketPollResult {
-                                            result,
-                                            protocol: FriendRelayTicketPollProtocol::V3,
-                                        });
-                                    });
-                                }
-                            }
-                            FriendRelayTicketPollProtocol::LegacyV2 => {
-                                let rv_url = settings.rendezvous_url.clone();
-                                let poll_tx = friend_relay_ticket_poll_result_tx.clone();
-                                friend_relay_ticket_polls_in_flight += 1;
-                                friend_relay_ticket_poll_not_before =
-                                    tokio::time::Instant::now()
-                                        + rendezvous::FRIEND_RELAY_TICKET_LEGACY_POLL_INTERVAL;
-                                tokio::spawn(async move {
-                                    let result = match tokio::time::timeout(
-                                        rendezvous::FRIEND_RELAY_TICKET_POLL_TIMEOUT,
-                                        rendezvous::poll_friend_relay_tickets_v2_compat(
-                                            &rv_url,
-                                            &ember_hash,
-                                            &ed25519_secret_key,
-                                        ),
-                                    )
-                                    .await
-                                    {
-                                        Ok(result) => result,
-                                        Err(_) => Err("friend relay ticket v2 poll timed out".to_string()),
-                                    };
-                                    let _ = poll_tx.send(FriendRelayTicketPollResult {
-                                        result,
-                                        protocol: FriendRelayTicketPollProtocol::LegacyV2,
-                                    });
-                                });
-                            }
-                        }
-                    }
+                    // One authenticated self-mailbox poll. No friend IDs,
+                    // candidate pages, nicknames, or graph-sized payloads
+                    // leave the client while idle.
+                    friend_relay_ticket_poll_round_started_at =
+                        Some(tokio::time::Instant::now());
+                    let rv_url = settings.rendezvous_url.clone();
+                    let poll_tx = friend_relay_ticket_poll_result_tx.clone();
+                    friend_relay_ticket_polls_in_flight = 1;
+                    tokio::spawn(async move {
+                        let result = match tokio::time::timeout(
+                            rendezvous::FRIEND_RELAY_TICKET_POLL_TIMEOUT,
+                            rendezvous::poll_friend_relay_tickets(
+                                &rv_url,
+                                &ember_hash,
+                                &ed25519_secret_key,
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => Err("friend relay mailbox poll timed out".to_string()),
+                        };
+                        let _ = poll_tx.send(FriendRelayTicketPollResult { result });
+                    });
                 }
             }
 
             Some(result) = friend_relay_ticket_poll_result_rx.recv() => {
                 friend_relay_ticket_polls_in_flight =
                     friend_relay_ticket_polls_in_flight.saturating_sub(1);
-                if result.protocol != friend_relay_ticket_poll_protocol {
-                    // A result from the v3 batch that detected an unsupported
-                    // route cannot re-enable parallel polling after we have
-                    // switched to the legacy budget.
-                    if friend_relay_ticket_poll_protocol
-                        == FriendRelayTicketPollProtocol::LegacyV2
-                        && friend_relay_ticket_polls_in_flight == 0
-                    {
-                        friend_relay_ticket_poll_timer.reset_immediately();
-                    }
-                    continue;
-                }
                 let page = match result.result {
                     Ok(page) => page,
                     Err(e) => {
                         tracing::trace!("Friend relay ticket poll: {e}");
-                        if result.protocol == FriendRelayTicketPollProtocol::V3
-                            && rendezvous::is_v3_relay_ticket_poll_unsupported(&e)
-                        {
-                            friend_relay_ticket_poll_protocol =
-                                FriendRelayTicketPollProtocol::LegacyV2;
-                            friend_relay_ticket_candidate_offset = 0;
-                            friend_relay_ticket_poll_round_started_at = None;
-                            friend_relay_ticket_poll_retry_delay =
-                                std::time::Duration::from_secs(1);
-                            friend_relay_ticket_poll_not_before = tokio::time::Instant::now();
-                            if friend_relay_ticket_polls_in_flight == 0 {
-                                friend_relay_ticket_poll_timer.reset_immediately();
-                            }
-                            continue;
-                        }
                         if rendezvous::is_transient_relay_ticket_read_error(&e)
                             || e.contains("timed out")
                         {
-                            let minimum_delay =
-                                if result.protocol == FriendRelayTicketPollProtocol::LegacyV2 {
-                                    rendezvous::FRIEND_RELAY_TICKET_LEGACY_POLL_INTERVAL
-                                } else {
-                                    std::time::Duration::ZERO
-                                };
                             friend_relay_ticket_poll_not_before =
                                 tokio::time::Instant::now()
-                                    + friend_relay_ticket_poll_retry_delay.max(minimum_delay);
+                                    + friend_relay_ticket_poll_retry_delay;
                             friend_relay_ticket_poll_retry_delay =
                                 (friend_relay_ticket_poll_retry_delay * 2)
                                     .min(std::time::Duration::from_secs(5));
@@ -15956,27 +16269,18 @@ pub async fn start_network(
                     }
                 };
                 friend_relay_ticket_poll_retry_delay = std::time::Duration::from_secs(1);
-                if result.protocol == FriendRelayTicketPollProtocol::V3 {
-                    if friend_relay_ticket_polls_in_flight == 0 {
-                        let now = tokio::time::Instant::now();
-                        let delay = friend_relay_ticket_poll_round_started_at
-                            .take()
-                            .map(|started_at| relay_ticket_next_round_delay(started_at, now))
-                            .unwrap_or(rendezvous::FRIEND_RELAY_TICKET_RESPONDER_POLL_INTERVAL);
-                        // Reset to the scheduled cadence boundary, not
-                        // immediately: fast responses must never create a
-                        // tight poll loop, while a completion just after a
-                        // missed tick can still begin the next round now.
-                        friend_relay_ticket_poll_not_before = now + delay;
-                        friend_relay_ticket_poll_timer.reset_after(delay);
-                    }
-                }
-                if page.next_cursor.is_some() {
-                    // A v3 request has at most 16 candidates and one ticket
-                    // per pair, so a cursor should be unreachable. Do not
-                    // stall other candidate slices if a malformed/legacy
-                    // response supplies one.
-                    tracing::debug!("Ignoring unexpected relay ticket poll cursor");
+                if friend_relay_ticket_polls_in_flight == 0 {
+                    let now = tokio::time::Instant::now();
+                    let delay = friend_relay_ticket_poll_round_started_at
+                        .take()
+                        .map(|started_at| relay_ticket_next_round_delay(started_at, now))
+                        .unwrap_or(rendezvous::FRIEND_RELAY_TICKET_RESPONDER_POLL_INTERVAL);
+                    // Reset to the scheduled cadence boundary, not
+                    // immediately: fast responses must never create a
+                    // tight poll loop, while a completion just after a
+                    // missed tick can still begin the next round now.
+                    friend_relay_ticket_poll_not_before = now + delay;
+                    friend_relay_ticket_poll_timer.reset_after(delay);
                 }
                 let offers = page.tickets;
 
@@ -16008,19 +16312,8 @@ pub async fn start_network(
 
                     let rv_url = settings.rendezvous_url.clone();
                     let done_tx = friend_relay_ticket_session_done_tx.clone();
-                    let fc_our_user_hash = state.user_hash;
                     let fc_our_ember_hash = ember_hash;
-                    let fc_nickname = settings.nickname.clone();
-                    let fc_client_id = state
-                        .external_ip
-                        .map(|eip| u32::from_le_bytes(eip.octets()))
-                        .unwrap_or(0);
-                    let fc_tcp_port = advertised_tcp_port(&state);
-                    let fc_udp_port = advertised_udp_port(&state);
-                    let fc_obfuscate = settings.friend_session_encryption;
-                    let fc_ember_sessions = state.ember_sessions.clone();
-                    let fc_ul_event_tx = ul_event_tx.clone();
-                    let fc_friend_hashes = friend_hashes.clone();
+                    let relay_inbound_tx = inbound_stream_tx.clone();
 
                     tokio::spawn(async move {
                         let responder_token = match tokio::time::timeout(
@@ -16060,34 +16353,18 @@ pub async fn start_network(
                                     std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
                                     0,
                                 );
-                                match ed2k::friend_connect::run_friend_session_over_transport(
-                                    Box::new(reader),
-                                    Box::new(writer),
-                                    addr,
-                                    peer_ember_hash,
-                                    fc_our_user_hash,
-                                    fc_our_ember_hash,
-                                    fc_nickname,
-                                    fc_client_id,
-                                    fc_tcp_port,
-                                    fc_udp_port,
-                                    fc_obfuscate,
-                                    fc_ember_sessions,
-                                    fc_ul_event_tx,
-                                    fc_friend_hashes,
-                                    Some(ed25519_pubkey),
-                                    Some(ed25519_secret_key),
-                                )
-                                .await
+                                if let Err(e) = relay_inbound_tx
+                                    .send(upload_server::InboundStreamRequest {
+                                        peer_addr: addr,
+                                        reader: Box::new(reader),
+                                        writer: Box::new(writer),
+                                    })
+                                    .await
                                 {
-                                    Ok(_) => tracing::info!(
-                                        "Friend relay session established for {}",
-                                        hex::encode(peer_ember_hash)
-                                    ),
-                                    Err(e) => tracing::debug!(
-                                        "Friend relay session failed for {}: {e}",
-                                        hex::encode(peer_ember_hash)
-                                    ),
+                                    tracing::debug!(
+                                        "Friend relay responder handoff failed for {}: {e}",
+                                        hex::encode(peer_ember_hash),
+                                    );
                                 }
                             }
                             Err(e) => {
@@ -16190,18 +16467,14 @@ pub async fn start_network(
                             let rv_hash = ember_hash;
                             let rv_pubkey = ed25519_pubkey;
                             let rv_secret = ed25519_secret_key;
-                            // Re-advertise the Noise key on every heartbeat
-                            // (only while the DHT is enabled), so the
-                            // bootstrap pool keeps a fresh address for us.
-                            let rv_noise = if settings.ember_native_enabled {
-                                Some(*state.ember_transport.local_noise_public_key())
-                            } else {
-                                None
-                            };
-                            // Keep the bootstrap pool's UDP port for us fresh on
-                            // every heartbeat (see initial-register rationale).
-                            let rv_ember_port =
-                                if settings.ember_native_enabled { Some(udp_port) } else { None };
+                            let rv_key_db = db.clone();
+                            let rv_friends = tokio::task::spawn_blocking(move || {
+                                rv_key_db.get_friend_public_keys()
+                            })
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .unwrap_or_default();
                             let tx = rendezvous_register_result_tx.clone();
                             rendezvous_register_in_flight = true;
                             rendezvous_register_started_at = Some(tokio::time::Instant::now());
@@ -16217,8 +16490,7 @@ pub async fn start_network(
                                         rv_ip,
                                         &rv_pubkey,
                                         &rv_secret,
-                                        rv_noise.as_ref(),
-                                        rv_ember_port,
+                                        &rv_friends,
                                     )
                                         .await;
                                 let _ = tx.send(RendezvousRegisterResult {
@@ -16235,42 +16507,25 @@ pub async fn start_network(
                     }
                 }
 
-                // Poll for incoming hole-punch requests targeting our own
-                // `(ip, tcp_port)` synthetic id — the exact id a
-                // downloader computes for us when it discovers us as a
-                // LowID/firewalled source (see `attempt_low_to_low`'s
-                // callers, which key `StartPunch`/`StartRelay` by
-                // `(source_ip, source_port)` using the KAD-advertised
-                // `tcp_port`, never `quic_port` — same rationale as the
-                // authenticated friend ticket poller immediately above).
-                //
-                // Before this, only the *initiator* side of a broker
-                // attempt ever called `register_punch`/`poll_punch` — the
-                // source being punched had no channel to learn who was
-                // trying to reach it, so `poll_punch` on the initiator's
-                // side could never find a match and every LowID-to-LowID
-                // hole-punch attempt burned its full `PUNCH_TIMEOUT`
-                // before falling back to relay. This mirrors the
-                // reciprocal rendezvous flow: register ourselves back at the initiator so its own
-                // poll finds us, then also dial out ourselves (NAT
-                // hole-punching needs an outbound packet from *both*
-                // sides to open a pinhole for the other's inbound
-                // traffic).
+                // Poll signed v2 punch requests addressed to our registered
+                // Ember identity. Only known friends are accepted; anonymous
+                // LowID sources bypass punch and use relay.
                 if state.rendezvous_registered {
-                    if let (Some(ext_ip), Some(broker)) =
+                    if let (Some(_ext_ip), Some(broker)) =
                         (state.external_ip, state.connection_broker.as_ref())
                     {
                         if let Some(endpoint) = broker.quic_endpoint().cloned() {
-                            // Must match the KAD-advertised tcp_port other
-                            // producers key `(source_ip, source_port)` by —
-                            // see the doc comment above this block.
-                            let our_punch_id = format!(
-                                "{:0>64}",
-                                format!("{:08x}{:04x}", u32::from(ext_ip), advertised_tcp_port(&state))
-                            );
+                            let known_punch_friends: HashMap<String, [u8; 16]> = friend_hashes
+                                .read()
+                                .await
+                                .iter()
+                                .map(|hash| (rendezvous::hashed_id(hash), *hash))
+                                .collect();
+                            let our_punch_hash = ember_hash;
+                            let punch_secret = ed25519_secret_key;
                             // The port we ask the initiator to dial back on IS
                             // the QUIC port (opposite of the id above): this is
-                            // the payload value carried in the `/punch` record,
+                            // the payload value carried in the signed v2 punch record,
                             // not the lookup key, and the initiator's
                             // `punch_quic` call connects over QUIC — so it must
                             // land on our actual bound QUIC socket, not the
@@ -16282,7 +16537,11 @@ pub async fn start_network(
                             let our_ext_addr = state.nat_info.external_addr;
                             let punch_cb_tx = inbound_stream_tx.clone();
                             tokio::spawn(async move {
-                                let info = match ember::relay::poll_punch(&rv_url, &our_punch_id).await {
+                                let info = match ember::relay::poll_punch(
+                                    &rv_url,
+                                    &our_punch_hash,
+                                    &punch_secret,
+                                ).await {
                                     Ok(Some(info)) => info,
                                     Ok(None) => return,
                                     Err(e) => {
@@ -16290,6 +16549,49 @@ pub async fn start_network(
                                         return;
                                     }
                                 };
+                                let Some(friend_hash) = known_punch_friends.get(&info.from_id).copied() else {
+                                    let _ = ember::relay::ack_punch(
+                                        &rv_url,
+                                        &our_punch_hash,
+                                        &info.punch_id,
+                                        &info.capability,
+                                        info.epoch,
+                                        &punch_secret,
+                                    ).await;
+                                    return;
+                                };
+                                let expected_capability =
+                                    match rendezvous::fetch_identity_pubkey(&rv_url, &friend_hash)
+                                        .await
+                                    {
+                                        Ok(Some(pubkey)) => {
+                                            let owner_pubkey =
+                                                ed25519_dalek::SigningKey::from_bytes(
+                                                    &punch_secret,
+                                                )
+                                                .verifying_key()
+                                                .to_bytes();
+                                            ember::crypto::derive_pairwise_presence_capability(
+                                                &punch_secret,
+                                                &pubkey,
+                                                &owner_pubkey,
+                                                info.epoch,
+                                            )
+                                        }
+                                        _ => None,
+                                    };
+                                if expected_capability != Some(info.capability) {
+                                    let _ = ember::relay::ack_punch(
+                                        &rv_url,
+                                        &our_punch_hash,
+                                        &info.punch_id,
+                                        &info.capability,
+                                        info.epoch,
+                                        &punch_secret,
+                                    )
+                                    .await;
+                                    return;
+                                }
                                 let Ok(ip) = info.ip.parse::<std::net::IpAddr>() else { return; };
                                 let routable = match ip {
                                     std::net::IpAddr::V4(v4) => !crate::security::is_special_use_v4(v4),
@@ -16316,8 +16618,11 @@ pub async fn start_network(
                                 // dials this port over QUIC, not UDP/KAD.
                                 if our_ext_addr.is_some() {
                                     if let Err(e) = ember::relay::register_punch(
-                                        &rv_url, &our_punch_id, &info.from_id,
+                                        &rv_url,
+                                        &our_punch_hash,
+                                        &friend_hash,
                                         advertised_quic_port, our_nat_type.as_u8(),
+                                        &punch_secret,
                                     ).await {
                                         tracing::debug!("Punch responder: reciprocal register failed: {e}");
                                     }
@@ -16355,6 +16660,14 @@ pub async fn start_network(
                                         );
                                     }
                                 }
+                                let _ = ember::relay::ack_punch(
+                                    &rv_url,
+                                    &our_punch_hash,
+                                    &info.punch_id,
+                                    &info.capability,
+                                    info.epoch,
+                                    &punch_secret,
+                                ).await;
                             });
                         }
                     }
@@ -16823,7 +17136,10 @@ pub async fn start_network(
                 // before it was ever processed.)
 
                 // Periodic NAT reprobe (every 5 minutes)
-                if state.nat_info.needs_reprobe() && state.external_ip.is_some() {
+                if state.nat_info.needs_reprobe()
+                    && state.external_ip.is_some()
+                    && mapping_probe_has_active_reason(&state)
+                {
                     if !nat_probe_in_flight {
                         nat_probe_in_flight = true;
                         nat_probe_started_at = Some(tokio::time::Instant::now());
@@ -16957,14 +17273,9 @@ pub async fn start_network(
             }
 
             // Broker tick + event drain. Used to live inside the
-            // `cleanup_timer` arm (5-minute cadence), which made every
-            // `BrokerEvent::StartPunch` / `StartRelay` posted by
-            // `attempt_low_to_low()` sit in the channel for minutes —
-            // long past the per-attempt PUNCH_TIMEOUT (20s) and
-            // RELAY_TIMEOUT (30s), and `broker.tick()` would then GC
-            // the matching attempt before the event was even dispatched.
-            // Net effect: hole-punch and LowID-to-LowID never fired in
-            // any session shorter than 5 minutes. 200 ms cadence is
+            // `cleanup_timer` arm (5-minute cadence), which made relay
+            // events sit in the channel past their 30-second timeout.
+            // 200 ms cadence is
             // small enough that punch/relay scheduling is effectively
             // event-driven and large enough that an idle tick costs
             // one `try_recv()` (returns `Empty` instantly) plus a
@@ -16980,185 +17291,6 @@ pub async fn start_network(
                 if let Some(ref mut rx) = state.broker_event_rx {
                     while let Ok(event) = rx.try_recv() {
                         match event {
-                            ember::broker::BrokerEvent::StartPunch { ref attempt_key, source_ip, source_port, our_external_addr, our_nat_type, .. } => {
-                                tracing::info!("Broker: initiating hole-punch for {} -> {}:{} (ext={})", attempt_key, source_ip, source_port, our_external_addr);
-                                let rv_url = settings.rendezvous_url.clone();
-                                // Both `from_id` and `target_id` MUST be 64 chars or
-                                // the rendezvous server returns `400 Bad Request`
-                                // (`punch_register` checks `len() != 64` for both).
-                                // `ember_hash` is 16 bytes = 32 hex chars, so we
-                                // need to left-pad it to 64. Previously this was
-                                // sent unpadded, which made every single punch
-                                // attempt fail at the register step before any
-                                // hole-punch logic could run.
-                                let our_id = format!("{:0>64}", hex::encode(ember_hash));
-                                let target_id = format!("{:0>64}", format!("{:08x}{:04x}", u32::from(source_ip), source_port));
-                                let port = our_external_addr.port();
-                                let nat_type_val = our_nat_type.as_u8();
-                                let attempt_key_owned = attempt_key.clone();
-
-                                let (attempt_transfer_id, attempt_file_hash) = state.connection_broker.as_ref()
-                                    .and_then(|b| b.get_attempt_info(&attempt_key_owned))
-                                    .map(|(tid, fh, _, _)| (tid, fh))
-                                    .unwrap_or_default();
-
-                                let broker_tx = state.connection_broker.as_ref()
-                                    .map(|b| b.event_sender());
-                                let quic_ep = state.connection_broker.as_ref()
-                                    .and_then(|b| b.quic_endpoint().cloned());
-
-                                tokio::spawn(async move {
-                                    let Some(broker_tx) = broker_tx else { return; };
-
-                                    if let Err(e) = ember::relay::register_punch(
-                                        &rv_url, &our_id, &target_id, port, nat_type_val,
-                                    ).await {
-                                        tracing::debug!("Broker: punch register failed for {attempt_key_owned}: {e}");
-                                        if let Err(send_err) = broker_tx.try_send(ember::broker::BrokerEvent::PunchFailed {
-                                            attempt_key: attempt_key_owned,
-                                            reason: format!("register failed: {e}"),
-                                        }) {
-                                            tracing::debug!("Broker: dropping punch failure event (queue full/closed): {send_err}");
-                                        }
-                                        return;
-                                    }
-
-                                    let mut remote_addr = None;
-                                    for _ in 0..8 {
-                                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                                        match ember::relay::poll_punch(&rv_url, &our_id).await {
-                                            Ok(Some(info)) => {
-                                                if info.from_id != target_id {
-                                                    tracing::debug!(
-                                                        "Broker: ignoring punch response from unexpected id {} (wanted {})",
-                                                        info.from_id,
-                                                        target_id,
-                                                    );
-                                                    continue;
-                                                }
-                                                if let Ok(ip) = info.ip.parse::<std::net::IpAddr>() {
-                                                    // Validate the rendezvous-relayed target before we
-                                                    // dial it over QUIC. The punch endpoint is a peer's
-                                                    // self-report proxied by the broker, so a malicious
-                                                    // or buggy peer could name a special-use / non-routable
-                                                    // address (loopback, LAN, CGNAT, 0.0.0.0/8, ...) or a
-                                                    // zero port. Skip those instead of attempting a
-                                                    // connection to a local/undialable endpoint.
-                                                    let target_routable = match ip {
-                                                        std::net::IpAddr::V4(v4) => {
-                                                            !crate::security::is_special_use_v4(v4)
-                                                        }
-                                                        std::net::IpAddr::V6(_) => {
-                                                            !crate::security::is_private_ip(ip)
-                                                        }
-                                                    };
-                                                    if !target_routable || info.port == 0 {
-                                                        tracing::debug!(
-                                                            "Broker: ignoring punch target {ip}:{} (non-routable / port 0)",
-                                                            info.port
-                                                        );
-                                                        continue;
-                                                    }
-                                                    // Decode the peer's advertised NAT type (carried
-                                                    // through the rendezvous /punch coordination) and
-                                                    // use it to gate the QUIC attempt. Hole-punching
-                                                    // needs at least one side to have a predictable
-                                                    // mapping: our side is already punchable (the broker
-                                                    // only emits StartPunch when it is), but a weak
-                                                    // RestrictedCone/PortRestricted local NAT against a
-                                                    // Symmetric/Unknown peer almost never lands — skip
-                                                    // straight to relay instead of burning the QUIC
-                                                    // handshake timeout.
-                                                    let peer_nat = ember::nat::NatType::from_u8(info.nat_type);
-                                                    tracing::info!(
-                                                        "Broker: punch peer {} responded at {}:{} (peer_nat={:?})",
-                                                        info.from_id, ip, info.port, peer_nat
-                                                    );
-                                                    let punch_viable = matches!(
-                                                        our_nat_type,
-                                                        ember::nat::NatType::Open | ember::nat::NatType::FullCone
-                                                    ) || peer_nat.is_punchable();
-                                                    if !punch_viable {
-                                                        tracing::info!(
-                                                            "Broker: skipping low-probability punch to {}:{} (our_nat={:?}, peer_nat={:?}); escalating to relay",
-                                                            ip, info.port, our_nat_type, peer_nat
-                                                        );
-                                                        if let Err(send_err) = broker_tx.try_send(ember::broker::BrokerEvent::PunchFailed {
-                                                            attempt_key: attempt_key_owned.clone(),
-                                                            reason: format!("both NATs hard to punch (our={our_nat_type:?}, peer={peer_nat:?})"),
-                                                        }) {
-                                                            tracing::debug!("Broker: dropping punch failure event (queue full/closed): {send_err}");
-                                                        }
-                                                        return;
-                                                    }
-                                                    remote_addr = Some(SocketAddr::new(ip, info.port));
-                                                    break;
-                                                }
-                                            }
-                                            Ok(None) => {}
-                                            Err(e) => {
-                                                tracing::debug!("Broker: punch poll error: {e}");
-                                            }
-                                        }
-                                    }
-
-                                    let Some(addr) = remote_addr else {
-                                        tracing::info!("Broker: punch timed out waiting for peer {attempt_key_owned}");
-                                        if let Err(send_err) = broker_tx.try_send(ember::broker::BrokerEvent::PunchFailed {
-                                            attempt_key: attempt_key_owned,
-                                            reason: "peer not found via rendezvous".into(),
-                                        }) {
-                                            tracing::debug!("Broker: dropping punch failure event (queue full/closed): {send_err}");
-                                        }
-                                        return;
-                                    };
-
-                                    let Some(endpoint) = quic_ep else {
-                                        tracing::warn!("Broker: no QUIC endpoint for punch {attempt_key_owned}");
-                                        if let Err(send_err) = broker_tx.try_send(ember::broker::BrokerEvent::PunchFailed {
-                                            attempt_key: attempt_key_owned,
-                                            reason: "no QUIC endpoint".into(),
-                                        }) {
-                                            tracing::debug!("Broker: dropping punch failure event (queue full/closed): {send_err}");
-                                        }
-                                        return;
-                                    };
-
-                                    tracing::info!("Broker: attempting QUIC connect to {addr} for {attempt_key_owned}");
-                                    // `None` pin: the punch target is a LowID source known only by
-                                    // IP:port (its KAD record advertises a Noise pubkey, not its
-                                    // ember_hash), so we can't pin the QUIC cert's node id here.
-                                    // The unpinned verifier still requires a well-formed Ember cert
-                                    // + handshake-signature proof; node identity is bound by the
-                                    // subsequent TCP Ed25519 proof-of-possession.
-                                    match ember::broker::punch_quic(&endpoint, addr, None).await {
-                                        Ok((send, recv)) => {
-                                            tracing::info!("Broker: hole-punch succeeded to {addr}");
-                                            let _ = broker_tx.send(ember::broker::BrokerEvent::ConnectionReady(
-                                                ember::broker::BrokerConnection {
-                                                    transfer_id: attempt_transfer_id,
-                                                    file_hash: attempt_file_hash,
-                                                    source_ip,
-                                                    source_port,
-                                                    method: ember::broker::ConnectionMethod::HolePunch,
-                                                    relay_addr: None,
-                                                    reader: Box::new(recv),
-                                                    writer: Box::new(send),
-                                                },
-                                            )).await;
-                                        }
-                                        Err(e) => {
-                                            tracing::debug!("Broker: QUIC punch failed for {attempt_key_owned}: {e}");
-                                            if let Err(send_err) = broker_tx.try_send(ember::broker::BrokerEvent::PunchFailed {
-                                                attempt_key: attempt_key_owned,
-                                                reason: e,
-                                            }) {
-                                                tracing::debug!("Broker: dropping punch failure event (queue full/closed): {send_err}");
-                                            }
-                                        }
-                                    }
-                                });
-                            }
                             ember::broker::BrokerEvent::StartRelay { ref attempt_key, source_ip, source_port, file_hash, relay_addr, relay_attestation_hash, relay_ember_hash, .. } => {
                                 tracing::info!("Broker: initiating relay for {} -> {}:{} (relay={:?})", attempt_key, source_ip, source_port, relay_addr);
 
@@ -17401,11 +17533,6 @@ pub async fn start_network(
                                     // same advertised port (see `PerFileSourceList::
                                     // resolve_idx`).
                                     pfs.set_low_to_low(source_ip, source_port, None);
-                                }
-                            }
-                            ember::broker::BrokerEvent::PunchFailed { ref attempt_key, ref reason } => {
-                                if let Some(ref mut broker) = state.connection_broker {
-                                    broker.punch_failed(attempt_key, reason).await;
                                 }
                             }
                             ember::broker::BrokerEvent::RelayFailed { ref attempt_key, ref reason } => {
@@ -18369,13 +18496,14 @@ pub async fn start_network(
                             let mut mgr = transfer_manager.write().await;
                             mgr.register_control(&t.id, control.clone());
                         }
-                        state.pending_downloads.insert(
+                        insert_pending_download_bounded(&mut state.pending_downloads,
                             t.id.clone(),
                             PendingDownload {
                                 transfer_id: t.id.clone(),
                                 file_hash: t.file_hash.clone(),
                                 file_name: t.file_name.clone(),
                                 file_size: t.total_size,
+                                expected_aich: t.expected_aich.clone(),
                                 control,
                                 search_count: 0,
                                 last_search_at: 0,
@@ -18494,7 +18622,7 @@ pub async fn start_network(
                                 arr
                             }
                             _ => {
-                                state.pending_downloads.insert(tid.clone(), pending);
+                                insert_pending_download_bounded(&mut state.pending_downloads, tid.clone(), pending);
                                 continue;
                             }
                         };
@@ -18526,7 +18654,7 @@ pub async fn start_network(
                         drop(a4af_snap);
                         drop(sm_guard2);
                         if ready_sources.is_empty() {
-                            state.pending_downloads.insert(tid.clone(), pending);
+                            insert_pending_download_bounded(&mut state.pending_downloads, tid.clone(), pending);
                             continue;
                         }
                         let dl_dir = PathBuf::from(&settings.download_folder);
@@ -18558,13 +18686,14 @@ pub async fn start_network(
                                     let mut mgr = transfer_manager.write().await;
                                     mgr.register_control(&t.id, control.clone());
                                 }
-                                state.pending_downloads.insert(
+                                insert_pending_download_bounded(&mut state.pending_downloads,
                                     t.id.clone(),
                                     PendingDownload {
                                         transfer_id: t.id.clone(),
                                         file_hash: t.file_hash.clone(),
                                         file_name: t.file_name.clone(),
                                         file_size: t.total_size,
+                                    expected_aich: t.expected_aich.clone(),
                                         control,
                                         search_count: 0,
                                         last_search_at: 0,
@@ -18637,6 +18766,8 @@ pub async fn start_network(
                             mpsc::channel::<ed2k::multi_source::EstablishedSource>(ESTABLISHED_SOURCE_CHANNEL_CAP);
                         state.active_source_senders.insert(tid.clone(), new_source_tx);
                         state.active_established_senders.insert(tid.clone(), new_established_tx);
+                        let expected_aich_master =
+                            expected_aich_bytes(pending.expected_aich.as_deref());
                         let ms_download = MultiSourceDownload {
                             transfer_id: pending.transfer_id,
                             file_hash: hash_bytes,
@@ -18669,8 +18800,10 @@ pub async fn start_network(
                             banned_ips: Some(shared_banned_ips.clone()),
                             external_ip: state.external_ip,
                             aich_pending: Some(state.aich_recovery_pending.clone()),
-                            trusted_aich_master: state.aich_root_map.get(&hash_bytes).copied(),
-                                ember_file_hash: state.ember_content_hashes.get(&hash_bytes).copied().unwrap_or([0u8; 32]),
+                            trusted_aich_master: expected_aich_master
+                                .or_else(|| state.aich_root_map.get(&hash_bytes).copied()),
+                            expected_aich_master,
+                            ember_file_hash: state.ember_content_hashes.get(&hash_bytes).copied().unwrap_or([0u8; 32]),
                             geoip: geoip.clone(),
                             tracker_registry: Some(state.tracker_registry.clone()),
                             sx_overhead: stats_manager.sx_counters.clone(),
@@ -18703,7 +18836,7 @@ pub async fn start_network(
                                 arr
                             }
                             _ => {
-                                state.pending_downloads.insert(tid.clone(), pending);
+                                insert_pending_download_bounded(&mut state.pending_downloads, tid.clone(), pending);
                                 continue;
                             }
                         };
@@ -18719,7 +18852,7 @@ pub async fn start_network(
                             .map(|(ip, port)| (ip.to_string(), port))
                             .collect();
                         if live_sources.is_empty() {
-                            state.pending_downloads.insert(tid.clone(), pending);
+                            insert_pending_download_bounded(&mut state.pending_downloads, tid.clone(), pending);
                             continue;
                         }
                         let dl_dir = PathBuf::from(&settings.download_folder);
@@ -18751,13 +18884,14 @@ pub async fn start_network(
                                     let mut mgr = transfer_manager.write().await;
                                     mgr.register_control(&t.id, control.clone());
                                 }
-                                state.pending_downloads.insert(
+                                insert_pending_download_bounded(&mut state.pending_downloads,
                                     t.id.clone(),
                                     PendingDownload {
                                         transfer_id: t.id.clone(),
                                         file_hash: t.file_hash.clone(),
                                         file_name: t.file_name.clone(),
                                         file_size: t.total_size,
+                                    expected_aich: t.expected_aich.clone(),
                                         control,
                                         search_count: 0,
                                         last_search_at: 0,
@@ -18852,6 +18986,8 @@ pub async fn start_network(
                         let (src_inject_tx, src_inject_rx) = mpsc::channel::<DownloadSource>(32);
                         let (est_inject_tx, est_inject_rx) =
                             mpsc::channel::<ed2k::multi_source::EstablishedSource>(ESTABLISHED_SOURCE_CHANNEL_CAP);
+                        let expected_aich_master =
+                            expected_aich_bytes(pending.expected_aich.as_deref());
                         let ms_download = MultiSourceDownload {
                             transfer_id: pending.transfer_id,
                             file_hash: hash_bytes,
@@ -18884,8 +19020,10 @@ pub async fn start_network(
                             banned_ips: Some(shared_banned_ips.clone()),
                             external_ip: state.external_ip,
                             aich_pending: Some(state.aich_recovery_pending.clone()),
-                            trusted_aich_master: state.aich_root_map.get(&hash_bytes).copied(),
-                                ember_file_hash: state.ember_content_hashes.get(&hash_bytes).copied().unwrap_or([0u8; 32]),
+                            trusted_aich_master: expected_aich_master
+                                .or_else(|| state.aich_root_map.get(&hash_bytes).copied()),
+                            expected_aich_master,
+                            ember_file_hash: state.ember_content_hashes.get(&hash_bytes).copied().unwrap_or([0u8; 32]),
                             geoip: geoip.clone(),
                             tracker_registry: Some(state.tracker_registry.clone()),
                             sx_overhead: stats_manager.sx_counters.clone(),
@@ -21139,8 +21277,10 @@ pub async fn start_network(
                     // the matching TCP port.
                     {
                         let resp_addr = match &resp {
-                            ServerUdpResponse::StatusResponse { addr, .. }
-                            | ServerUdpResponse::FoundSources { addr, .. } => Some(*addr),
+                            ServerUdpResponse::StatusResponse { addr, .. } => Some(*addr),
+                            // FoundSources is recorded only after endpoint +
+                            // recent-query correlation in its handler below.
+                            ServerUdpResponse::FoundSources { .. } => None,
                             // Search replies are recorded only after the
                             // sent-IP allowlist check below (eMule
                             // ProcessUDPSearchAnswer).
@@ -21187,6 +21327,28 @@ pub async fn start_network(
                             }
                         }
                         ServerUdpResponse::FoundSources { addr, files } => {
+                            let now = chrono::Utc::now().timestamp();
+                            let files: Vec<_> = files
+                                .into_iter()
+                                .filter(|(file_hash, _)| {
+                                    is_recent_configured_server_source_reply(
+                                        &state.server_list,
+                                        &state.server_udp_source_reask_at,
+                                        addr,
+                                        file_hash,
+                                        now,
+                                    )
+                                })
+                                .collect();
+                            if files.is_empty() {
+                                debug!(
+                                    "Ignoring unsolicited/stale UDP FoundSources from {addr}"
+                                );
+                                continue;
+                            }
+                            let ip_str = addr.ip().to_string();
+                            let tcp_port = addr.port().saturating_sub(4);
+                            state.server_list.record_udp_reply(&ip_str, tcp_port);
                             // Bump per-reply diagnostic ONCE per packet, not
                             // per file — `udp_discovery_replies` measures
                             // "server answered our UDP query at all", and
@@ -22190,6 +22352,8 @@ pub async fn start_network(
                                 let (src_inject_tx, src_inject_rx) = mpsc::channel::<DownloadSource>(32);
                                 let (est_inject_tx, est_inject_rx) =
                                     mpsc::channel::<ed2k::multi_source::EstablishedSource>(ESTABLISHED_SOURCE_CHANNEL_CAP);
+                                let expected_aich_master =
+                                    expected_aich_bytes(pd.expected_aich.as_deref());
                                 let ms_download = MultiSourceDownload {
                                     transfer_id: pd.transfer_id.clone(),
                                     file_hash,
@@ -22222,7 +22386,9 @@ pub async fn start_network(
                                     banned_ips: Some(shared_banned_ips.clone()),
                                     external_ip: state.external_ip,
                                     aich_pending: Some(state.aich_recovery_pending.clone()),
-                                    trusted_aich_master: state.aich_root_map.get(&file_hash).copied(),
+                                    trusted_aich_master: expected_aich_master
+                                        .or_else(|| state.aich_root_map.get(&file_hash).copied()),
+                                    expected_aich_master,
                                     ember_file_hash: state
                                         .ember_content_hashes
                                         .get(&file_hash)
@@ -22487,6 +22653,8 @@ pub async fn start_network(
                                 None
                             } else if let Some(pd) = state.pending_downloads.remove(&tid) {
                             let source_addr = SocketAddr::new(parts.peer_ip.into(), parts.peer_port);
+                            let expected_aich_master =
+                                expected_aich_bytes(pd.expected_aich.as_deref());
                             info!("Starting callback download {tid} from {source_addr}");
                             let download = Ed2kDownload {
                                 transfer_id: pd.transfer_id.clone(),
@@ -22515,7 +22683,9 @@ pub async fn start_network(
                                 banned_ips: Some(shared_banned_ips.clone()),
                                 external_ip: state.external_ip,
                                 aich_pending: Some(state.aich_recovery_pending.clone()),
-                                trusted_aich_master: state.aich_root_map.get(&parts.file_hash).copied(),
+                                trusted_aich_master: expected_aich_master
+                                    .or_else(|| state.aich_root_map.get(&parts.file_hash).copied()),
+                                expected_aich_master,
                                 ember_file_hash: state.ember_content_hashes.get(&parts.file_hash).copied().unwrap_or([0u8; 32]),
                                 geoip: geoip.clone(),
                                 sx_overhead: stats_manager.sx_counters.clone(),
@@ -25078,7 +25248,12 @@ pub async fn start_network(
     }
 
     if let Some(handle) = cache_write_handle.take() {
-        match tokio::time::timeout(std::time::Duration::from_secs(2), handle).await {
+        match tokio::time::timeout_at(
+            shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(2)),
+            handle,
+        )
+        .await
+        {
             Ok(Ok(())) => debug!("Cache refresh task finished before shutdown"),
             Ok(Err(_)) => debug!("Cache refresh task cancelled during shutdown"),
             Err(_) => warn!("Cache refresh task did not finish before shutdown"),
@@ -25093,7 +25268,11 @@ pub async fn start_network(
             }
         }
     }
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    tokio::time::sleep_until(shutdown_phase_deadline(
+        shutdown_deadline,
+        std::time::Duration::from_millis(300),
+    ))
+    .await;
 
     // Cancel and await all active download tasks. Abort every task first, then
     // await them *concurrently* under one global deadline. Awaiting each task's
@@ -25113,9 +25292,12 @@ pub async fn start_network(
                 }
             },
         ));
-        if tokio::time::timeout(std::time::Duration::from_secs(5), await_all)
-            .await
-            .is_err()
+        if tokio::time::timeout_at(
+            shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(5)),
+            await_all,
+        )
+        .await
+        .is_err()
         {
             warn!("Some download tasks did not finish within the shutdown abort window");
         }
@@ -25148,9 +25330,12 @@ pub async fn start_network(
             futures::future::join_all(trackers.into_iter().map(|(tid, tracker)| async move {
                 save_part_tracker_snapshot(tracker, &tid, "shutdown").await;
             }));
-        if tokio::time::timeout(std::time::Duration::from_secs(8), saves)
-            .await
-            .is_err()
+        if tokio::time::timeout_at(
+            shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(8)),
+            saves,
+        )
+        .await
+        .is_err()
         {
             warn!("Timed out saving some .part.met file(s) within the shutdown window");
         }
@@ -25177,8 +25362,8 @@ pub async fn start_network(
     }
     let contacts = state.routing_table.export_bootstrap_contacts(200);
     let nodes_path = state.data_dir.join("nodes.dat");
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+    match tokio::time::timeout_at(
+        shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(5)),
         state.nodes_save_lock.lock(),
     )
     .await
@@ -25210,7 +25395,8 @@ pub async fn start_network(
     // silently rolls back session bytes (and completed counts) accrued
     // after the snapshot was taken.
     if stats_save_in_flight {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline =
+            shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(5));
         while stats_save_in_flight {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -25229,9 +25415,14 @@ pub async fn start_network(
                         }
                     }
                     // Sibling periodic jobs may finish while we wait for Stats;
-                    // log failures but don't touch their in-flight flags — we're
-                    // past the event loop and about to exit.
+                    // update their flags too so the authoritative shutdown
+                    // writers below know those stale snapshots are joined.
                     other => {
+                        match other {
+                            PeriodicSaveJob::Reputation => reputation_save_in_flight = false,
+                            PeriodicSaveJob::Known2 | PeriodicSaveJob::Nodes => {}
+                            PeriodicSaveJob::Stats => unreachable!(),
+                        }
                         if let Err(e) = result.result {
                             let name = match other {
                                 PeriodicSaveJob::Reputation => "reputation.json",
@@ -25270,8 +25461,8 @@ pub async fn start_network(
     // to be in flight at quit time. Bounded so a genuinely stuck save can't
     // hang shutdown.
     if known_met_save_in_flight {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+        match tokio::time::timeout_at(
+            shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(5)),
             known_met_save_result_rx.recv(),
         )
         .await
@@ -25326,8 +25517,11 @@ pub async fn start_network(
     }
 
     let known_path = state.data_dir.join("known.met");
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+    match tokio::time::timeout_at(
+        shutdown_phase_deadline(
+            shutdown_deadline,
+            std::time::Duration::from_secs(5),
+        ),
         state.known_met_save_lock.lock(),
     )
     .await
@@ -25371,9 +25565,12 @@ pub async fn start_network(
         }
     }
     if let Some(mut handle) = credit_flush_handle.take() {
-        if tokio::time::timeout(std::time::Duration::from_secs(5), &mut handle)
-            .await
-            .is_err()
+        if tokio::time::timeout_at(
+            shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(5)),
+            &mut handle,
+        )
+        .await
+        .is_err()
         {
             warn!(
                 "Periodic credit flush still running at shutdown; aborting its async owner and retrying the final flush through serialized save ownership"
@@ -25382,8 +25579,11 @@ pub async fn start_network(
             let _ = handle.await;
         }
     }
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(8),
+    match tokio::time::timeout_at(
+        shutdown_phase_deadline(
+            shutdown_deadline,
+            std::time::Duration::from_secs(8),
+        ),
         flush_credit_state(
             &credit_manager,
             &db,
@@ -25400,35 +25600,116 @@ pub async fn start_network(
         ),
     }
 
+    // Reputation carries active automatic bans. Join any stale periodic
+    // writer before the final authoritative snapshot so it cannot rename an
+    // older ban set over the shutdown save.
+    let reputation_join_deadline =
+        shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(5));
+    while reputation_save_in_flight {
+        match tokio::time::timeout_at(reputation_join_deadline, periodic_save_result_rx.recv())
+            .await
+        {
+            Ok(Some(result)) => {
+                match result.job {
+                    PeriodicSaveJob::Reputation => reputation_save_in_flight = false,
+                    PeriodicSaveJob::Known2 | PeriodicSaveJob::Nodes | PeriodicSaveJob::Stats => {}
+                }
+                if let Err(error) = result.result {
+                    error!("Periodic shutdown writer failed before final save: {error}");
+                }
+            }
+            Ok(None) => break,
+            Err(_) => {
+                error!(
+                    "Shutdown deadline exhausted joining the periodic reputation/ban writer; shutdown result is explicitly truncated"
+                );
+                break;
+            }
+        }
+    }
+
     let rep_path = state.data_dir.join("reputation.json");
-    if let Err(e) = state.reputation.save(&rep_path) {
-        error!("Failed to save reputation.json on shutdown: {e}");
-    } else {
-        info!(
-            "Reputation data saved on shutdown ({} peers tracked)",
-            state.reputation.tracked_count()
+    if tokio::time::Instant::now() >= shutdown_deadline {
+        error!(
+            "Shutdown deadline exhausted before reputation/ban save; shutdown result is explicitly truncated"
         );
+    } else {
+        let reputation_snapshot = state.reputation.clone();
+        let tracked = reputation_snapshot.tracked_count();
+        let writer = tokio::task::spawn_blocking(move || reputation_snapshot.save(&rep_path));
+        match tokio::time::timeout_at(shutdown_deadline, writer).await {
+            Ok(Ok(Ok(()))) => {
+                info!("Reputation data saved on shutdown ({tracked} peers tracked)")
+            }
+            Ok(Ok(Err(error))) => {
+                error!("Failed to save reputation.json on shutdown: {error}")
+            }
+            Ok(Err(error)) => error!("Reputation shutdown writer failed: {error}"),
+            Err(_) => error!(
+                "Shutdown deadline exhausted joining reputation/ban writer; shutdown result is explicitly truncated"
+            ),
+        }
     }
 
     // Persist the source cache (peer user hashes + crypt options) so the next
     // session can obfuscate connections to the same crypt-required peers
     // immediately, mirroring eMule's persisted source identities.
-    {
+    if tokio::time::Instant::now() < shutdown_deadline {
         let sources_met = state.data_dir.join("sources.met");
-        let sm = source_manager.read().await;
-        match sm.save_to_disk(&sources_met) {
-            Ok(n) => info!("Saved {n} cached sources (with user hashes) to sources.met"),
-            Err(e) => error!("Failed to save sources.met on shutdown: {e}"),
+        let source_snapshot = source_manager.read().await.clone();
+        let writer =
+            tokio::task::spawn_blocking(move || source_snapshot.save_to_disk(&sources_met));
+        match tokio::time::timeout_at(shutdown_deadline, writer).await {
+            Ok(Ok(Ok(count))) => {
+                info!("Saved {count} cached sources (with user hashes) to sources.met")
+            }
+            Ok(Ok(Err(error))) => error!("Failed to save sources.met on shutdown: {error}"),
+            Ok(Err(error)) => error!("sources.met shutdown writer failed: {error}"),
+            Err(_) => error!(
+                "Shutdown deadline exhausted joining sources.met writer; shutdown result is explicitly truncated"
+            ),
         }
+    } else {
+        error!(
+            "Shutdown deadline exhausted before sources.met; shutdown result is explicitly truncated"
+        );
     }
 
     let server_met_path = state.data_dir.join("server.met");
-    spawn_save_server_met(
-        &state.server_list,
-        server_met_path.clone(),
-        &state.server_met_save_generation,
-        &state.server_met_save_lock,
-    );
+    if tokio::time::Instant::now() < shutdown_deadline {
+        match state.server_list.to_server_met_bytes() {
+            Ok(bytes) => {
+                let generation = state.server_met_save_generation.clone();
+                let save_lock = state.server_met_save_lock.clone();
+                let gen = generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let writer = tokio::task::spawn_blocking(move || {
+                    let _guard = match save_lock.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    if generation.load(std::sync::atomic::Ordering::Relaxed) != gen {
+                        return Ok(());
+                    }
+                    ed2k::server_list::ServerList::write_server_met_bytes(&server_met_path, &bytes)
+                });
+                match tokio::time::timeout_at(shutdown_deadline, writer).await {
+                    Ok(Ok(Ok(()))) => info!("server.met writer joined on shutdown"),
+                    Ok(Ok(Err(error))) => {
+                        error!("Failed to save server.met on shutdown: {error}")
+                    }
+                    Ok(Err(error)) => error!("server.met shutdown writer failed: {error}"),
+                    Err(_) => error!(
+                        "Shutdown deadline exhausted while joining server.met writer; shutdown result is explicitly truncated"
+                    ),
+                }
+            }
+            Err(error) => error!("Failed to serialize server.met on shutdown: {error}"),
+        }
+    } else {
+        error!(
+            "Shutdown deadline exhausted before server.met; shutdown result is explicitly truncated"
+        );
+    }
 
     // Unregister from the rendezvous server LAST and with a short bound.
     // This is a best-effort courtesy call to a remote host that may be slow
@@ -25440,8 +25721,8 @@ pub async fn start_network(
     if state.rendezvous_registered {
         let rv_url = settings.rendezvous_url.clone();
         let rv_hash = ember_hash;
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(3),
+        match tokio::time::timeout_at(
+            shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(3)),
             rendezvous::unregister(&rv_url, &rv_hash, &ed25519_secret_key),
         )
         .await
@@ -25457,8 +25738,11 @@ pub async fn start_network(
         // shutdown on TCP connect timeouts. Timed leases expire on their own
         // within the hour, and permanent-lease mappings (the error-725
         // fallback) are reclaimed by the next session's conflict handling.
-        let _ =
-            tokio::time::timeout(std::time::Duration::from_secs(5), upnp_mappings.teardown()).await;
+        let _ = tokio::time::timeout_at(
+            shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(5)),
+            upnp_mappings.teardown(),
+        )
+        .await;
     }
 
     Ok(())
@@ -28373,7 +28657,9 @@ async fn handle_udp_packet_inner(
     // aggregate throughput. Reject decompression when the IP is over its
     // 10-packets/sec budget for compressed traffic specifically.
     if data.first() == Some(&kad::messages::OP_KADEMLIAPACKEDPROT)
-        && state.flood_protection.over_compressed_budget(from.ip())
+        && state
+            .flood_protection
+            .over_compressed_budget(from.ip(), data.len())
     {
         debug!("Dropping compressed KAD packet from {from}: per-IP decompression budget exhausted");
         return;
@@ -28403,6 +28689,19 @@ async fn handle_udp_packet_inner(
             ) {
                 packet_sender_udp_key = decrypted.sender_udp_key;
                 packet_valid_receiver_key = decrypted.valid_receiver_key;
+                // Obfuscation hides the packed-protocol marker from the
+                // pre-decrypt check. Charge the same CPU/byte budget now,
+                // after authentication/deobfuscation but before zlib sees it.
+                if decrypted.payload.first() == Some(&kad::messages::OP_KADEMLIAPACKEDPROT)
+                    && state
+                        .flood_protection
+                        .over_compressed_budget(from.ip(), decrypted.payload.len())
+                {
+                    debug!(
+                        "Dropping obfuscated compressed KAD packet from {from}: decompression budget exhausted"
+                    );
+                    return;
+                }
                 match messages::decode_packet(&decrypted.payload) {
                     Ok(m) => {
                         // The pre-decrypt rate check above necessarily used
@@ -29785,22 +30084,18 @@ async fn handle_udp_packet_inner(
                 }
             };
 
-            let mut results = state.dht_store.search_keywords(&target);
-            if let Some(expr) = &search_expr {
-                results.retain(|entry| matches_search_expr_for_entry(expr, entry));
-            }
-
             // eMule answers keyword search from the indexed store only.
             // Mixing in local share answers inflated reflection volume vs
             // stock peers; publish_manager indexing already feeds the DHT
             // via PublishKeyReq when we are a responsible node.
             let start = (start_position & 0x7FFF) as usize;
-            let end = results.len().min(start + 200);
-            let page = if start < results.len() {
-                results[start..end].to_vec()
-            } else {
-                Vec::new()
-            };
+            let page = state
+                .dht_store
+                .search_keywords_page(&target, start, 200, |_, tags| {
+                    search_expr
+                        .as_ref()
+                        .map_or(true, |expr| matches_search_expr_for_tags(expr, tags))
+                });
 
             if !page.is_empty() {
                 send_kad_search_results(
@@ -29821,19 +30116,12 @@ async fn handle_udp_packet_inner(
             start_position,
             file_size,
         } => {
-            let results = state
-                .dht_store
-                .search_sources(&target)
-                .into_iter()
-                .filter(|entry| matches_requested_file_size(entry, file_size))
-                .collect::<Vec<_>>();
             let start = (start_position & 0x7FFF) as usize;
-            let end = results.len().min(start + 200);
-            let page = if start < results.len() {
-                results[start..end].to_vec()
-            } else {
-                Vec::new()
-            };
+            let page = state
+                .dht_store
+                .search_sources_page(&target, start, 200, |_, tags| {
+                    matches_requested_file_size_tags(tags, file_size)
+                });
 
             // eMule behavior: do not send SearchRes when there are no results.
             if !page.is_empty() {
@@ -30113,10 +30401,9 @@ async fn handle_udp_packet_inner(
         KadMessage::SearchNotesReq { target, file_size } => {
             let results = state
                 .dht_store
-                .search_notes(&target)
-                .into_iter()
-                .filter(|entry| matches_requested_file_size(entry, file_size))
-                .collect::<Vec<_>>();
+                .search_notes_page(&target, 0, 200, |_, tags| {
+                    matches_requested_file_size_tags(tags, file_size)
+                });
             // eMule behavior: do not send SearchRes when there are no results.
             if !results.is_empty() {
                 send_kad_search_results(
@@ -30148,6 +30435,21 @@ async fn handle_udp_packet_inner(
                 std::net::IpAddr::V4(v4) => v4,
                 _ => return,
             };
+            // Modern obfuscated requests prove receiver-key context. Plain
+            // legacy eMule probes remain interoperable when they come from a
+            // live, verified routing-table contact.
+            let verified_contact = state
+                .routing_table
+                .all_contacts()
+                .any(|contact| contact.ip == peer_ip && contact.verified && !contact.is_dead());
+            if !packet_valid_receiver_key && !verified_contact {
+                debug!("Ignoring unverified FirewalledReq context from {from}");
+                return;
+            }
+            if !state.firewall_req_response_bucket.try_take() {
+                debug!("Dropping FirewalledReq from {from}: global response budget exhausted");
+                return;
+            }
             let ip_raw = u32::from_be_bytes(peer_ip.octets());
             let res = KadMessage::FirewalledRes { ip: ip_raw };
             if let Ok(packet) = messages::encode_packet(&res) {
@@ -30161,8 +30463,6 @@ async fn handle_udp_packet_inner(
             // Also reject special-use / port-0 / port-53 destinations
             // so the connect-back path can't be abused as a reflective
             // TCP probe at arbitrary private hosts or DNS resolvers.
-            const FIREWALL_REQ_COOLDOWN_SECS: i64 = 60;
-            const MAX_FIREWALL_REQ_COOLDOWN_ENTRIES: usize = 4096;
             if peer_tcp_port == 0
                 || peer_tcp_port == 53
                 || crate::security::is_special_use_v4(peer_ip)
@@ -30170,30 +30470,21 @@ async fn handle_udp_packet_inner(
                 return;
             }
             let now = chrono::Utc::now().timestamp();
-            // Prune stale entries lazily to keep the map bounded.
-            if state.firewall_req_cooldown.len() >= MAX_FIREWALL_REQ_COOLDOWN_ENTRIES {
-                state
-                    .firewall_req_cooldown
-                    .retain(|_, ts| now - *ts < FIREWALL_REQ_COOLDOWN_SECS);
+            if !admit_firewall_request_ip(&mut state.firewall_req_cooldown, peer_ip, now) {
+                debug!(
+                    "Skipping FirewalledReq connect-back to {peer_ip}: cooldown/map cap reached"
+                );
+                return;
             }
-            if let Some(prev) = state.firewall_req_cooldown.get(&peer_ip) {
-                if now - *prev < FIREWALL_REQ_COOLDOWN_SECS {
-                    debug!(
-                        "Skipping FirewalledReq connect-back to {peer_ip}: within {FIREWALL_REQ_COOLDOWN_SECS}s cooldown"
-                    );
-                    return;
-                }
+            if !state.firewall_req_connect_bucket.try_take() {
+                debug!("Skipping FirewalledReq connect-back: global connect budget exhausted");
+                return;
             }
-            state.firewall_req_cooldown.insert(peer_ip, now);
 
-            if peer_tcp_port > 0 {
+            if let Ok(permit) = state.firewall_connect_semaphore.clone().try_acquire_owned() {
                 let tcp_addr = SocketAddr::new(peer_ip.into(), peer_tcp_port);
-                let fw_sem = state.firewall_connect_semaphore.clone();
                 tokio::spawn(async move {
-                    let _permit = match fw_sem.acquire().await {
-                        Ok(p) => p,
-                        Err(_) => return,
-                    };
+                    let _permit = permit;
                     let result = tokio::time::timeout(
                         std::time::Duration::from_secs(5),
                         tokio::net::TcpStream::connect(tcp_addr),
@@ -30218,6 +30509,8 @@ async fn handle_udp_packet_inner(
                         _ => debug!("Peer {tcp_addr} is NOT reachable on TCP"),
                     }
                 });
+            } else {
+                debug!("Skipping FirewalledReq connect-back: all connect slots busy");
             }
         }
 
@@ -30308,10 +30601,22 @@ async fn handle_udp_packet_inner(
             user_hash,
             connect_options,
         } => {
-            let ip_raw = match from.ip() {
-                std::net::IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
+            let requester_ip = match from.ip() {
+                std::net::IpAddr::V4(v4) => v4,
                 _ => return,
             };
+            let verified_contact = state.routing_table.all_contacts().any(|contact| {
+                contact.ip == requester_ip && contact.verified && !contact.is_dead()
+            });
+            if !packet_valid_receiver_key && !verified_contact {
+                debug!("Ignoring unverified Firewalled2Req context from {from}");
+                return;
+            }
+            if !state.firewall_req_response_bucket.try_take() {
+                debug!("Dropping Firewalled2Req from {from}: global response budget exhausted");
+                return;
+            }
+            let ip_raw = u32::from_be_bytes(requester_ip.octets());
             let res = KadMessage::FirewalledRes { ip: ip_raw };
             if let Ok(packet) = messages::encode_packet(&res) {
                 let _ =
@@ -30324,12 +30629,6 @@ async fn handle_udp_packet_inner(
             // probe, so reject port 0/53 and special-use destinations and
             // rate-limit per requester IP (shared cooldown map) before
             // spending a connection on it.
-            let requester_ip = match from.ip() {
-                std::net::IpAddr::V4(v4) => v4,
-                _ => return,
-            };
-            const FIREWALL2_REQ_COOLDOWN_SECS: i64 = 60;
-            const MAX_FIREWALL2_REQ_COOLDOWN_ENTRIES: usize = 4096;
             if peer_tcp_port == 0
                 || peer_tcp_port == 53
                 || crate::security::is_special_use_v4(requester_ip)
@@ -30337,34 +30636,22 @@ async fn handle_udp_packet_inner(
                 return;
             }
             let now = chrono::Utc::now().timestamp();
-            if state.firewall_req_cooldown.len() >= MAX_FIREWALL2_REQ_COOLDOWN_ENTRIES {
-                state
-                    .firewall_req_cooldown
-                    .retain(|_, ts| now - *ts < FIREWALL2_REQ_COOLDOWN_SECS);
+            if !admit_firewall_request_ip(&mut state.firewall_req_cooldown, requester_ip, now) {
+                debug!(
+                    "Skipping Firewalled2 connect-back to {requester_ip}: cooldown/map cap reached"
+                );
+                return;
             }
-            if let Some(prev) = state.firewall_req_cooldown.get(&requester_ip) {
-                if now - *prev < FIREWALL2_REQ_COOLDOWN_SECS {
-                    debug!(
-                        "Skipping Firewalled2 connect-back to {requester_ip}: within {FIREWALL2_REQ_COOLDOWN_SECS}s cooldown"
-                    );
-                    return;
-                }
+            if !state.firewall_req_connect_bucket.try_take() {
+                debug!("Skipping Firewalled2 connect-back: global connect budget exhausted");
+                return;
             }
-            state.firewall_req_cooldown.insert(requester_ip, now);
 
-            if peer_tcp_port > 0 {
-                let peer_ip = match from.ip() {
-                    std::net::IpAddr::V4(v4) => v4,
-                    _ => return,
-                };
-                let tcp_addr = SocketAddr::new(peer_ip.into(), peer_tcp_port);
+            if let Ok(permit) = state.firewall_connect_semaphore.clone().try_acquire_owned() {
+                let tcp_addr = SocketAddr::new(requester_ip.into(), peer_tcp_port);
                 let allow_obf = state.obfuscation_enabled && (connect_options & 0x01) != 0;
-                let fw_sem = state.firewall_connect_semaphore.clone();
                 tokio::spawn(async move {
-                    let _permit = match fw_sem.acquire().await {
-                        Ok(p) => p,
-                        Err(_) => return,
-                    };
+                    let _permit = permit;
                     let connect_result = tokio::time::timeout(
                         std::time::Duration::from_secs(5),
                         tokio::net::TcpStream::connect(tcp_addr),
@@ -30444,6 +30731,8 @@ async fn handle_udp_packet_inner(
                         }
                     }
                 });
+            } else {
+                debug!("Skipping Firewalled2 connect-back: all connect slots busy");
             }
         }
 
@@ -31286,6 +31575,7 @@ async fn handle_command_inner(
             peer_port,
             extra_sources,
             ember_file_hash,
+            expected_aich,
             transfer_id,
             control,
             discovery_only,
@@ -31444,13 +31734,15 @@ async fn handle_command_inner(
                     } else {
                         false
                     };
-                    state.pending_downloads.insert(
+                    insert_pending_download_bounded(
+                        &mut state.pending_downloads,
                         transfer_id.clone(),
                         PendingDownload {
                             transfer_id: transfer_id.clone(),
                             file_hash: file_hash.clone(),
                             file_name: file_name.clone(),
                             file_size,
+                            expected_aich: expected_aich.clone(),
                             control,
                             search_count: if kad_search_started { 1 } else { 0 },
                             last_search_at: if kad_search_started { now } else { 0 },
@@ -31614,13 +31906,15 @@ async fn handle_command_inner(
                         mgr.update_status(&transfer_id, TransferStatus::Searching);
                         mgr.register_control(&transfer_id, control.clone());
                     }
-                    state.pending_downloads.insert(
+                    insert_pending_download_bounded(
+                        &mut state.pending_downloads,
                         transfer_id.clone(),
                         PendingDownload {
                             transfer_id: transfer_id.clone(),
                             file_hash: file_hash.clone(),
                             file_name: file_name.clone(),
                             file_size,
+                            expected_aich: expected_aich.clone(),
                             control,
                             search_count: 0,
                             last_search_at: 0,
@@ -31636,56 +31930,59 @@ async fn handle_command_inner(
                         peer_port,
                         validated_extras.len()
                     );
-                }
-                let (src_inject_tx, src_inject_rx) = mpsc::channel::<DownloadSource>(32);
-                let (est_inject_tx, est_inject_rx) =
-                    mpsc::channel::<ed2k::multi_source::EstablishedSource>(
-                        ESTABLISHED_SOURCE_CHANNEL_CAP,
-                    );
-                let ms_download = MultiSourceDownload {
-                    // Clone instead of move so the outer `transfer_id`
-                    // survives for the source-discovery dispatch below.
-                    transfer_id: transfer_id.clone(),
-                    file_hash: hash_bytes,
-                    file_name,
-                    file_size,
-                    sources: download_sources,
-                    download_dir: PathBuf::from(&settings.download_folder),
-                    user_hash: state.user_hash,
-                    nickname: settings.nickname.clone(),
-                    tcp_port: advertised_tcp_port(&state),
-                    udp_port: advertised_udp_port(&state),
-                    bandwidth_limiter: bandwidth_limiter.clone(),
-                    control,
-                    source_manager: Some(source_manager.clone()),
-                    comment_manager: Some(state.comment_manager.clone()),
-                    credit_manager: Some(credit_manager.clone()),
-                    shared_buddy_info: Some(state.shared_buddy_info.clone()),
-                    obfuscation_enabled: state.obfuscation_enabled,
-                    server_addr: state.server_addr,
-                    new_source_rx: Some(src_inject_rx),
-                    new_established_rx: Some(est_inject_rx),
-                    ed2k_limits: settings.ed2k_download_limits(),
-                    ember_hash,
-                    ed25519_public_key: ed25519_pubkey,
-                    ed25519_secret_key,
-                    friend_hashes: Some(friend_hashes.clone()),
-                    ember_payload: shared_ember_payload.clone(),
-                    ember_payload_generation: ember_payload_generation.clone(),
-                    ip_filter: Some(state.shared_ip_filter.clone()),
-                    banned_ips: Some(shared_banned_ips.clone()),
-                    external_ip: state.external_ip,
-                    aich_pending: Some(state.aich_recovery_pending.clone()),
-                    trusted_aich_master: state.aich_root_map.get(&hash_bytes).copied(),
-                    ember_file_hash: state
-                        .ember_content_hashes
-                        .get(&hash_bytes)
-                        .copied()
-                        .unwrap_or([0u8; 32]),
-                    geoip: geoip.clone(),
-                    tracker_registry: Some(state.tracker_registry.clone()),
-                    sx_overhead: stats_manager.sx_counters.clone(),
-                };
+                    }
+                    let (src_inject_tx, src_inject_rx) = mpsc::channel::<DownloadSource>(32);
+                    let (est_inject_tx, est_inject_rx) =
+                        mpsc::channel::<ed2k::multi_source::EstablishedSource>(
+                            ESTABLISHED_SOURCE_CHANNEL_CAP,
+                        );
+                    let expected_aich_master = expected_aich_bytes(expected_aich.as_deref());
+                    let ms_download = MultiSourceDownload {
+                        // Clone instead of move so the outer `transfer_id`
+                        // survives for the source-discovery dispatch below.
+                        transfer_id: transfer_id.clone(),
+                        file_hash: hash_bytes,
+                        file_name,
+                        file_size,
+                        sources: download_sources,
+                        download_dir: PathBuf::from(&settings.download_folder),
+                        user_hash: state.user_hash,
+                        nickname: settings.nickname.clone(),
+                        tcp_port: advertised_tcp_port(&state),
+                        udp_port: advertised_udp_port(&state),
+                        bandwidth_limiter: bandwidth_limiter.clone(),
+                        control,
+                        source_manager: Some(source_manager.clone()),
+                        comment_manager: Some(state.comment_manager.clone()),
+                        credit_manager: Some(credit_manager.clone()),
+                        shared_buddy_info: Some(state.shared_buddy_info.clone()),
+                        obfuscation_enabled: state.obfuscation_enabled,
+                        server_addr: state.server_addr,
+                        new_source_rx: Some(src_inject_rx),
+                        new_established_rx: Some(est_inject_rx),
+                        ed2k_limits: settings.ed2k_download_limits(),
+                        ember_hash,
+                        ed25519_public_key: ed25519_pubkey,
+                        ed25519_secret_key,
+                        friend_hashes: Some(friend_hashes.clone()),
+                        ember_payload: shared_ember_payload.clone(),
+                        ember_payload_generation: ember_payload_generation.clone(),
+                        ip_filter: Some(state.shared_ip_filter.clone()),
+                        banned_ips: Some(shared_banned_ips.clone()),
+                        external_ip: state.external_ip,
+                        aich_pending: Some(state.aich_recovery_pending.clone()),
+                        trusted_aich_master: expected_aich_master
+                            .or_else(|| state.aich_root_map.get(&hash_bytes).copied()),
+                        expected_aich_master,
+                        ember_file_hash: state
+                            .ember_content_hashes
+                            .get(&hash_bytes)
+                            .copied()
+                            .unwrap_or([0u8; 32]),
+                        geoip: geoip.clone(),
+                        tracker_registry: Some(state.tracker_registry.clone()),
+                        sx_overhead: stats_manager.sx_counters.clone(),
+                    };
 
                     let tx = dl_event_tx.clone();
                     let tid = ms_download.transfer_id.clone();
@@ -31890,6 +32187,7 @@ async fn handle_command_inner(
                     let tid = transfer_id.clone();
                     let fname = file_name.clone();
                     let fhash = file_hash.clone();
+                    let expected_for_db = expected_aich.clone();
                     tokio::task::spawn_blocking(move || {
                         if db_ref.transfer_exists(&tid) {
                             let _ = db_ref.update_transfer_status(&tid, "searching");
@@ -31932,6 +32230,7 @@ async fn handle_command_inner(
                                 client_software: String::new(),
                                 country_code: None,
                                 user_hash: None,
+                                expected_aich: expected_for_db,
                                 completed_path: None,
                                 up_part_status: None,
                                 up_part_count: None,
@@ -31984,13 +32283,15 @@ async fn handle_command_inner(
                         .map(|t| priority_str_to_u32(&t.priority))
                         .unwrap_or(1)
                 };
-                state.pending_downloads.insert(
+                insert_pending_download_bounded(
+                    &mut state.pending_downloads,
                     transfer_id.clone(),
                     PendingDownload {
                         transfer_id: transfer_id.clone(),
                         file_hash: file_hash.clone(),
                         file_name,
                         file_size,
+                        expected_aich,
                         control,
                         search_count: if kad_search_started { 1 } else { 0 },
                         last_search_at: if kad_search_started { now } else { 0 },
@@ -33694,13 +33995,15 @@ async fn handle_command_inner(
                         mgr.register_control(tid, control.clone());
                         mgr.update_sources(tid, t.sources, 0, 0);
                         mgr.update_status(tid, TransferStatus::Searching);
-                        state.pending_downloads.insert(
+                        insert_pending_download_bounded(
+                            &mut state.pending_downloads,
                             tid.clone(),
                             PendingDownload {
                                 transfer_id: tid.clone(),
                                 file_hash: t.file_hash.clone(),
                                 file_name: t.file_name.clone(),
                                 file_size: t.total_size,
+                                expected_aich: t.expected_aich.clone(),
                                 control,
                                 search_count: 0,
                                 last_search_at: 0,
@@ -34288,6 +34591,30 @@ async fn handle_command_inner(
                     let _ = tx.send(Err(format!("Failed to persist file sharing state: {e}")));
                     return;
                 }
+                if let Err(e) = crate::storage::share_intent::set_explicit_batch(&parsed) {
+                    *known_files = before.clone();
+                    let ownership = state.known_met_save_lock.clone().lock_owned().await;
+                    let known_path = state.data_dir.join("known.met");
+                    let mut rollback = before;
+                    let rollback_result = tokio::task::spawn_blocking(move || {
+                        let _ownership = ownership;
+                        rollback.save(&known_path)
+                    })
+                    .await;
+                    let detail = match rollback_result {
+                        Ok(Ok(())) => e.to_string(),
+                        Ok(Err(rollback_error)) => {
+                            format!("{e}; known.met rollback failed: {rollback_error}")
+                        }
+                        Err(rollback_error) => {
+                            format!("{e}; known.met rollback task failed: {rollback_error}")
+                        }
+                    };
+                    let _ = tx.send(Err(format!(
+                        "Failed to persist independent share intent: {detail}"
+                    )));
+                    return;
+                }
             }
             let _ = tx.send(Ok(parsed.len()));
         }
@@ -34297,6 +34624,32 @@ async fn handle_command_inner(
                 let index = local_index.read().await;
                 index.all_files().to_vec()
             };
+            let independent_denies: Vec<([u8; 16], bool)> = all_index_files
+                .iter()
+                .filter(|file| !file.shared)
+                .filter_map(|file| {
+                    let bytes = hex::decode(&file.hash).ok()?;
+                    if bytes.len() != 16 {
+                        return None;
+                    }
+                    let mut hash = [0u8; 16];
+                    hash.copy_from_slice(&bytes);
+                    known_files
+                        .find_by_hash(&hash)
+                        .is_none()
+                        .then_some((hash, false))
+                })
+                .collect();
+            if !independent_denies.is_empty() {
+                if let Err(error) =
+                    crate::storage::share_intent::set_explicit_batch(&independent_denies)
+                {
+                    let _ = reconcile_ack.send(Err(format!(
+                        "Failed to persist independent unshare intent: {error}"
+                    )));
+                    return;
+                }
+            }
             for f in &all_index_files {
                 if let Ok(hash_bytes) = hex::decode(&f.hash) {
                     if hash_bytes.len() == 16 {
@@ -34368,6 +34721,8 @@ async fn handle_command_inner(
                                     f.complete_sources,
                                 ),
                             };
+                            let is_shared =
+                                crate::storage::share_intent::effective_shared(&fh, is_shared);
                             let mut part_hashes = existing
                                 .as_ref()
                                 .map(|r| r.part_hashes.clone())
@@ -34691,6 +35046,7 @@ async fn handle_command_inner(
 
                     let file_name = transfer.file_name.clone();
                     let file_size = transfer.total_size;
+                    let expected_aich = transfer.expected_aich.clone();
                     let tid = transfer.id.clone();
                     drop(mgr_guard);
 
@@ -34703,26 +35059,16 @@ async fn handle_command_inner(
                         );
                     }
 
-                    let canonical_part = part_path
-                        .canonicalize()
-                        .map_err(|e| format!("Invalid part-file path: {e}"))?;
-                    let canonical_temp_dir = temp_dir
-                        .canonicalize()
-                        .map_err(|e| format!("Invalid temp directory: {e}"))?;
-                    if !canonical_part.starts_with(&canonical_temp_dir) {
-                        return Err("Preview path escapes the temp directory".to_string());
-                    }
-                    let part_path = canonical_part;
+                    let part_path = crate::security::filesystem::verify_existing_path(
+                        &part_path,
+                        &[download_folder.clone()],
+                    )
+                    .map_err(|e| format!("Invalid or changed part-file path: {e}"))?;
                     let file_name_for_preview = file_name.clone();
 
                     tokio::task::spawn_blocking(move || {
                         let tracker =
                             ed2k::part_tracker::PartTracker::new(file_size, &part_path);
-                        let filled_ranges: Vec<ed2k::preview::FilledRange> = tracker
-                            .filled_ranges()
-                            .into_iter()
-                            .map(|(start, end)| ed2k::preview::FilledRange { start, end })
-                            .collect();
                         let completed_bytes = tracker.completed_bytes();
                         let has_part_hashes = !tracker.part_hashes().is_empty();
                         let verified_complete_parts = tracker.verified_parts();
@@ -34740,10 +35086,37 @@ async fn handle_command_inner(
                                 "File is not ready for preview (need the first 256KB downloaded and MD4-verified, and a previewable file type)".to_string(),
                             );
                         }
+                        if let Some(expected) = expected_aich {
+                            if !tracker.all_complete() {
+                                return Err(
+                                    "AICH-pinned previews require final AICH verification"
+                                        .to_string(),
+                                );
+                            }
+                            let set =
+                                ed2k::aich::AICHRecoveryHashSet::build_from_file(&part_path)
+                                    .map_err(|e| format!("AICH preview verification failed: {e}"))?;
+                            if !hex::encode(set.root_hash).eq_ignore_ascii_case(&expected) {
+                                return Err("Expected AICH hash mismatch; preview blocked".into());
+                            }
+                        }
+                        let verified_ranges: Vec<ed2k::preview::FilledRange> =
+                            verified_complete_parts
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, verified)| **verified)
+                                .map(|(index, _)| {
+                                    let start = index as u64 * part_size;
+                                    ed2k::preview::FilledRange {
+                                        start,
+                                        end: (start + part_size).min(file_size),
+                                    }
+                                })
+                                .collect();
 
                         let preview_path = ed2k::preview::create_preview_file(
                             &part_path,
-                            &filled_ranges,
+                            &verified_ranges,
                             &file_name_for_preview,
                         )
                         .map_err(|e| format!("Failed to create preview file: {e}"))?;
@@ -34782,7 +35155,10 @@ async fn handle_command_inner(
                 // would see `Ok(())` for a message that's actually lost.
                 // Falling through to the reconnect branch instead gives
                 // the message a real chance of delivery.
-                if let Some(sender) = sessions.get(&friend_eh).filter(|h| h.is_fresh()) {
+                if let Some(sender) = sessions
+                    .get(&friend_eh)
+                    .filter(|h| h.is_fresh() && h.is_secure_v2())
+                {
                     // Every friend session's `EmberSessionHandle` carries
                     // the peer's PoP-verified Ed25519 pubkey (see its doc
                     // comment), so encryption is always possible for a
@@ -34808,14 +35184,22 @@ async fn handle_command_inner(
                             packet.extend_from_slice(&size.to_le_bytes());
                             packet.push(ed2k::messages::OP_EMBER_CHAT_MSG);
                             packet.extend_from_slice(&envelope);
+                            if !friend_hashes.read().await.contains(&friend_eh) {
+                                let _ = tx.send(Err("Can only chat with friends".into()));
+                                return;
+                            }
                             match sender.tx.try_send(packet) {
                                 Ok(()) => {
                                     let hash_hex = hex::encode(friend_eh);
                                     let db2 = db.clone();
                                     let msg2 = message.clone();
                                     tokio::task::spawn_blocking(move || {
-                                        if let Err(e) = db2.insert_chat_message(&hash_hex, "sent", &msg2) {
-                                            tracing::warn!("Failed to persist sent chat message: {e}");
+                                        if let Err(e) =
+                                            db2.insert_chat_message(&hash_hex, "sent", &msg2)
+                                        {
+                                            tracing::warn!(
+                                                "Failed to persist sent chat message: {e}"
+                                            );
                                         }
                                     });
                                     let _ = app_handle.emit(
@@ -34898,7 +35282,7 @@ async fn handle_command_inner(
                                         obfs,
                                         sessions_clone.clone(),
                                         ul_tx,
-                                        fh,
+                                        fh.clone(),
                                         Some(ed25519_pubkey),
                                         Some(ed25519_secret_key),
                                         rv_url,
@@ -34907,6 +35291,15 @@ async fn handle_command_inner(
                                     .await
                                     {
                                         Ok(handle) => {
+                                            if !fh.read().await.contains(&friend_eh) {
+                                                let _ = tx
+                                                    .send(Err("Can only chat with friends".into()));
+                                                let _ = ul_tx2.send(upload_server::UploadEvent {
+                                                    transfer_id: String::new(),
+                                                    kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
+                                                }).await;
+                                                return;
+                                            }
                                             match crate::network::ember::crypto::encrypt_chat_for_peer(
                                                 &ed25519_secret_key,
                                                 &handle.peer_ember_pubkey,
@@ -35030,7 +35423,14 @@ async fn handle_command_inner(
                                 hex::encode(friend_eh)
                             );
                             tokio::spawn(async move {
-                                match crate::network::rendezvous::lookup(&rv_url, &friend_eh).await
+                                match crate::network::rendezvous::lookup(
+                                    &rv_url,
+                                    &our_eh,
+                                    &ed25519_pubkey,
+                                    &ed25519_secret_key,
+                                    &friend_eh,
+                                )
+                                .await
                                 {
                                     Ok(Some((ip, port))) => {
                                         let addr = std::net::SocketAddr::new(ip.into(), port);
@@ -35046,7 +35446,7 @@ async fn handle_command_inner(
                                             obfs,
                                             sess,
                                             ultx,
-                                            fh,
+                                            fh.clone(),
                                             Some(ed25519_pubkey),
                                             Some(ed25519_secret_key),
                                             rv_url.clone(),
@@ -35055,6 +35455,16 @@ async fn handle_command_inner(
                                         .await
                                         {
                                             Ok(handle) => {
+                                                if !fh.read().await.contains(&friend_eh) {
+                                                    let _ = tx.send(Err(
+                                                        "Can only chat with friends".into(),
+                                                    ));
+                                                    let _ = ultx2.send(upload_server::UploadEvent {
+                                                        transfer_id: String::new(),
+                                                        kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
+                                                    }).await;
+                                                    return;
+                                                }
                                                 match crate::network::ember::crypto::encrypt_chat_for_peer(
                                                     &ed25519_secret_key,
                                                     &handle.peer_ember_pubkey,
@@ -35188,7 +35598,7 @@ async fn handle_command_inner(
                     .read()
                     .await
                     .get(&friend_eh)
-                    .filter(|handle| handle.is_fresh())
+                    .filter(|handle| handle.is_fresh() && handle.is_secure_v2())
                     .cloned();
                 if let Some(sender) = sender {
                     match enqueue_browse_request(
@@ -35385,7 +35795,14 @@ async fn handle_command_inner(
                                 hex::encode(friend_eh)
                             );
                             tokio::spawn(async move {
-                                match crate::network::rendezvous::lookup(&rv_url, &friend_eh).await
+                                match crate::network::rendezvous::lookup(
+                                    &rv_url,
+                                    &our_eh,
+                                    &ed25519_pubkey,
+                                    &ed25519_secret_key,
+                                    &friend_eh,
+                                )
+                                .await
                                 {
                                     Ok(Some((ip, port))) => {
                                         let addr = std::net::SocketAddr::new(ip.into(), port);
@@ -35473,7 +35890,9 @@ async fn handle_command_inner(
 
         NetworkCommand::FriendRemoved {
             ember_hash: removed_hash,
+            tx,
         } => {
+            upload_server::revoke_all_secure_sessions(removed_hash);
             state.online_friends.remove(&removed_hash);
             if let Some(session_id) = state
                 .ember_sessions
@@ -35488,6 +35907,43 @@ async fn handle_command_inner(
             // immediately followed by re-add isn't blocked for up to
             // 10 minutes by a stale entry.
             state.outbound_session_tasks.remove(&removed_hash);
+            state.friend_reconnect_last.remove(&removed_hash);
+            state.recent_ember_chat.remove(&removed_hash);
+
+            if let Some(pending) = state.pending_browse_requests.remove(&removed_hash) {
+                for request in pending {
+                    let _ = app_handle.emit(
+                        "ember:browse-error",
+                        serde_json::json!({
+                            "user_hash": hex::encode(removed_hash),
+                            "request_id": request.request_id,
+                            "reason": "Friend was removed",
+                        }),
+                    );
+                }
+            }
+
+            // Queue entries outlive their originating TCP connection for
+            // eMule seniority.  Strip only the friend-priority bit; standard
+            // queue/file-transfer behavior and verified Ember accounting stay
+            // intact.
+            {
+                let mut queue = upload_queue.lock().await;
+                for entry in queue.iter_mut() {
+                    let matches_removed = entry.ember_pubkey.is_some_and(|pk| {
+                        crate::network::ember::crypto::verifying_key_from_bytes(&pk).is_some_and(
+                            |vk| {
+                                crate::network::ember::crypto::node_id_from_public_key(&vk)
+                                    == removed_hash
+                            },
+                        )
+                    });
+                    if matches_removed {
+                        entry.is_friend_slot = false;
+                    }
+                }
+            }
+            let _ = tx.send(());
         }
 
         NetworkCommand::FindFriendAndConnect {
@@ -35632,7 +36088,7 @@ async fn handle_command_inner(
             });
         }
 
-        NetworkCommand::Shutdown => {}
+        NetworkCommand::Shutdown { .. } => {}
     }
 }
 
@@ -35643,6 +36099,7 @@ async fn reverify_complete_part_file(
     file_hash: &str,
     file_name: &str,
     file_size: u64,
+    expected_aich: Option<&str>,
     download_dir: &std::path::Path,
 ) -> anyhow::Result<std::path::PathBuf> {
     let part_path = download_dir
@@ -35658,6 +36115,21 @@ async fn reverify_complete_part_file(
     if computed_hash != expected {
         anyhow::bail!("Re-verification hash mismatch — .part preserved for retry");
     }
+    if let Some(expected_aich) = expected_aich {
+        let verify_path = part_path.clone();
+        let expected_aich = expected_aich.to_string();
+        let actual = tokio::task::spawn_blocking(move || {
+            ed2k::aich::AICHRecoveryHashSet::build_from_file(&verify_path)
+                .map(|set| hex::encode(set.root_hash))
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("AICH verification task failed: {error}"))??;
+        if !actual.eq_ignore_ascii_case(&expected_aich) {
+            anyhow::bail!(
+                "Expected AICH hash mismatch — .part preserved for retry (expected {expected_aich}, got {actual})"
+            );
+        }
+    }
 
     let safe_name = crate::security::sanitize_filename(file_name);
     let completed_dir = download_dir.join("Downloads");
@@ -35666,10 +36138,12 @@ async fn reverify_complete_part_file(
         .map_err(|e| anyhow::anyhow!("Failed to create Downloads dir: {e}"))?;
     let final_target = completed_dir.join(&safe_name);
     let pp = part_path.clone();
-    let actual_final =
-        tokio::task::spawn_blocking(move || ed2k::transfer::move_part_to_final(&pp, &final_target))
-            .await
-            .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
+    let root = download_dir.to_path_buf();
+    let actual_final = tokio::task::spawn_blocking(move || {
+        ed2k::transfer::move_part_to_final_approved(&pp, &final_target, &root)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
 
     // Clean up .part.met
     let met_path = part_path.with_extension("part.met");
@@ -36269,6 +36743,7 @@ async fn handle_upload_event(
                 client_software,
                 country_code,
                 user_hash,
+                expected_aich: None,
                 completed_path: None,
                 up_part_status: None,
                 up_part_count: None,
@@ -36682,6 +37157,30 @@ fn convert_search_results(
                 }
             }
 
+            // Sanitize every remote string before deriving extension/type.
+            // Ordinary Arabic/Hebrew characters remain intact; only controls,
+            // bidi overrides and zero-width formatters are removed.
+            name = crate::security::sanitize_remote_text(&name, 8192);
+            file_type = crate::security::sanitize_remote_text(&file_type, 128);
+            comment = comment
+                .map(|value| crate::security::sanitize_remote_text(&value, 4096))
+                .filter(|value| !value.is_empty());
+            media.artist = media
+                .artist
+                .map(|value| crate::security::sanitize_remote_text(&value, 1024))
+                .filter(|value| !value.is_empty());
+            media.album = media
+                .album
+                .map(|value| crate::security::sanitize_remote_text(&value, 1024))
+                .filter(|value| !value.is_empty());
+            media.title = media
+                .title
+                .map(|value| crate::security::sanitize_remote_text(&value, 1024))
+                .filter(|value| !value.is_empty());
+            media.codec = media
+                .codec
+                .map(|value| crate::security::sanitize_remote_text(&value, 128))
+                .filter(|value| !value.is_empty());
             if name.is_empty() {
                 return None;
             }
@@ -36928,6 +37427,10 @@ fn convert_note_search_results(
                 return None;
             }
 
+            name = crate::security::sanitize_remote_text(&name, 8192);
+            comment = comment
+                .map(|value| crate::security::sanitize_remote_text(&value, 4096))
+                .filter(|value| !value.is_empty());
             let publisher_hex = entry.id.to_hex();
             let peer_name = publisher_hex.chars().take(8).collect::<String>();
 
@@ -37577,23 +38080,15 @@ fn read_kad_search_tag_ref(cursor: &mut Cursor<&[u8]>) -> std::io::Result<Search
     }
 }
 
-fn matches_search_expr_for_entry(
-    expr: &KadSearchExpr,
-    entry: &kad::messages::SearchResultEntry,
-) -> bool {
-    let file_name = entry
-        .tags
+fn matches_search_expr_for_tags(expr: &KadSearchExpr, tags: &[KadTag]) -> bool {
+    let file_name = tags
         .iter()
         .find(|tag| matches!(&tag.name, TagName::Id(TAG_FILENAME)))
         .and_then(|tag| tag.string_value())
         .unwrap_or_default()
         .to_lowercase();
-    let file_size = entry
-        .tags
-        .iter()
-        .find_map(search_entry_tag_u64)
-        .unwrap_or(0);
-    matches_search_expr_impl(expr, &file_name, file_size, Some(&entry.tags))
+    let file_size = tags.iter().find_map(search_entry_tag_u64).unwrap_or(0);
+    matches_search_expr_impl(expr, &file_name, file_size, Some(tags))
 }
 
 fn search_entry_tag_u64(tag: &KadTag) -> Option<u64> {
@@ -37693,10 +38188,7 @@ fn tag_matches_filesize(tag: &SearchTagRef) -> bool {
     }
 }
 
-fn matches_requested_file_size(
-    entry: &kad::messages::SearchResultEntry,
-    requested_size: u64,
-) -> bool {
+fn matches_requested_file_size_tags(tags: &[KadTag], requested_size: u64) -> bool {
     if requested_size == 0 {
         return true;
     }
@@ -37705,9 +38197,7 @@ fn matches_requested_file_size(
     // it; an entry with no size tag cannot be confirmed to match, so reject it
     // rather than leak a possibly-wrong-size source into the requester's
     // download source selection.
-    entry
-        .tags
-        .iter()
+    tags.iter()
         .find_map(search_entry_tag_u64)
         .map(|size| size == requested_size)
         .unwrap_or(false)

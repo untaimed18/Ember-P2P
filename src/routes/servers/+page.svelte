@@ -797,10 +797,10 @@
                 >
                   <td class="name-cell">
                     <span class="server-icon" class:connected-icon={isConnected(server)}>S</span>
-                    {server.name || m.servers_unnamed()}
+                    <bdi dir="auto">{server.name || m.servers_unnamed()}</bdi>
                   </td>
                   <td class="ip-cell">{server.ip} : {server.port}</td>
-                  <td class="desc-cell" title={server.description}>{server.description || '—'}</td>
+                  <td class="desc-cell" title={server.description}><bdi dir="auto">{server.description || '—'}</bdi></td>
                   <td class="num">{formatCount(server.user_count)}</td>
                   <td class="num">{formatCount(server.file_count)}</td>
                   <td class="num" class:fail-warn={server.fail_count > 0}>
@@ -952,7 +952,7 @@
         <span class="log-placeholder">{m.servers_log_placeholder()}</span>
       {:else}
         {#each logMessages as msg (msg)}
-          <div class="log-line">{msg}</div>
+          <div class="log-line"><bdi dir="auto">{msg}</bdi></div>
         {/each}
       {/if}
     </div>

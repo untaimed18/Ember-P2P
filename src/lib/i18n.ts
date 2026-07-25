@@ -314,6 +314,9 @@ export function translateError(input: unknown, fallback?: string): string {
   // exact error message (no surrounding text) to match. Any
   // additional context (e.g. an offending hash) belongs in a
   // separate field, not concatenated into the code.
+  if (raw.includes('SecureFriendV2Required')) {
+    return m.error_secure_friend_v2_required();
+  }
   switch (raw) {
     case 'FriendNotFound':
       return m.error_friend_not_found();

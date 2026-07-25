@@ -174,6 +174,11 @@ pub const CHAT_ENVELOPE_OVERHEAD: usize = 1 + CHAT_NONCE_LEN + CHAT_TAG_LEN;
 /// the same raw X25519 DH output can never be reused (even accidentally)
 /// as a key for some other protocol layered on the same identity keys.
 const CHAT_KEY_INFO: &[u8] = b"ember-friend-chat-v1";
+const PAIRWISE_KEY_INFO: &[u8] = b"ember-pairwise-capability-v1\0";
+/// Rotating rendezvous capabilities change every fifteen minutes. Presence
+/// entries expire sooner server-side, so accepting the previous epoch only
+/// bridges a clock/boundary race and does not create a long-lived identifier.
+pub const PAIRWISE_CAPABILITY_EPOCH_SECS: i64 = 15 * 60;
 
 /// Derive the X25519 secret scalar corresponding to an Ed25519 signing
 /// key's seed, per the standard Ed25519-to-X25519 conversion: hash the
@@ -189,6 +194,14 @@ fn ed25519_seed_to_x25519_scalar(seed: &[u8; 32]) -> [u8; 32] {
     scalar.copy_from_slice(&hash[..32]);
     hash.zeroize();
     scalar
+}
+
+/// Convert the persistent Ed25519 identity seed into the X25519 static
+/// private key used by Ember's Noise protocols.  Keeping this conversion in
+/// one place prevents the UDP and stream transports from accidentally binding
+/// different long-term identities.
+pub(crate) fn ed25519_seed_to_x25519_private(seed: &[u8; 32]) -> [u8; 32] {
+    ed25519_seed_to_x25519_scalar(seed)
 }
 
 /// Convert an Ed25519 public key (Edwards form) to its X25519
@@ -208,6 +221,11 @@ fn ed25519_pubkey_to_x25519(ed25519_pubkey: &[u8; 32]) -> Option<X25519PublicKey
     VerifyingKey::from_bytes(ed25519_pubkey).ok()?;
     let point = CompressedEdwardsY(*ed25519_pubkey).decompress()?;
     Some(X25519PublicKey::from(point.to_montgomery().to_bytes()))
+}
+
+/// Public-key half of [`ed25519_seed_to_x25519_private`].
+pub(crate) fn ed25519_public_to_x25519(ed25519_pubkey: &[u8; 32]) -> Option<[u8; 32]> {
+    Some(ed25519_pubkey_to_x25519(ed25519_pubkey)?.to_bytes())
 }
 
 /// Derive the symmetric AEAD key used to encrypt/decrypt friend-chat
@@ -243,6 +261,69 @@ pub fn derive_chat_key(
     hk.expand(CHAT_KEY_INFO, &mut key)
         .expect("32-byte OKM is within HKDF-SHA256's output range");
     Some(key)
+}
+
+/// Current rotating epoch for pairwise rendezvous capabilities.
+pub fn pairwise_capability_epoch(unix_seconds: i64) -> i64 {
+    unix_seconds.div_euclid(PAIRWISE_CAPABILITY_EPOCH_SECS)
+}
+
+/// Derive a purpose- and epoch-bound pairwise capability from static X25519
+/// DH. Only the two holders of the corresponding Ed25519 private keys can
+/// compute it; knowing either stable Ember/Friend ID is insufficient.
+pub fn derive_pairwise_capability(
+    our_ed25519_seed: &[u8; 32],
+    peer_ed25519_pubkey: &[u8; 32],
+    purpose: &[u8],
+    epoch: i64,
+) -> Option<[u8; 32]> {
+    if purpose.is_empty() || purpose.len() > 64 {
+        return None;
+    }
+    let their_x25519_pub = ed25519_pubkey_to_x25519(peer_ed25519_pubkey)?;
+    let signing = SigningKey::from_bytes(our_ed25519_seed);
+    let our_ed25519_pubkey = signing.verifying_key().to_bytes();
+    let mut our_scalar = ed25519_seed_to_x25519_scalar(our_ed25519_seed);
+    let our_secret = X25519StaticSecret::from(our_scalar);
+    our_scalar.zeroize();
+    let shared = our_secret.diffie_hellman(&their_x25519_pub);
+    if !shared.was_contributory() {
+        return None;
+    }
+    let (first, second) = if our_ed25519_pubkey <= *peer_ed25519_pubkey {
+        (&our_ed25519_pubkey, peer_ed25519_pubkey)
+    } else {
+        (peer_ed25519_pubkey, &our_ed25519_pubkey)
+    };
+    let mut info = Vec::with_capacity(
+        PAIRWISE_KEY_INFO.len() + 8 + 2 + purpose.len() + first.len() + second.len(),
+    );
+    info.extend_from_slice(PAIRWISE_KEY_INFO);
+    info.extend_from_slice(&epoch.to_le_bytes());
+    info.extend_from_slice(&(purpose.len() as u16).to_le_bytes());
+    info.extend_from_slice(purpose);
+    info.extend_from_slice(first);
+    info.extend_from_slice(second);
+    let hk = Hkdf::<Sha256>::new(None, shared.as_bytes());
+    let mut capability = [0u8; 32];
+    hk.expand(&info, &mut capability).ok()?;
+    Some(capability)
+}
+
+/// Directional presence capability for `owner_ed25519_pubkey`. A friend pair
+/// shares the DH secret, but each member registers a different owner-bound
+/// capability, preventing the rendezvous server's key/value entry for one
+/// peer from overwriting the other's presence.
+pub fn derive_pairwise_presence_capability(
+    our_ed25519_seed: &[u8; 32],
+    peer_ed25519_pubkey: &[u8; 32],
+    owner_ed25519_pubkey: &[u8; 32],
+    epoch: i64,
+) -> Option<[u8; 32]> {
+    let mut purpose = Vec::with_capacity(b"presence-owner-v1\0".len() + 32);
+    purpose.extend_from_slice(b"presence-owner-v1\0");
+    purpose.extend_from_slice(owner_ed25519_pubkey);
+    derive_pairwise_capability(our_ed25519_seed, peer_ed25519_pubkey, &purpose, epoch)
 }
 
 /// Encrypt a friend-chat plaintext with a fresh random nonce.
@@ -488,7 +569,9 @@ mod tests {
     fn chat_key_derivation_is_symmetric() {
         let alice_seed = gen_seed();
         let bob_seed = gen_seed();
-        let alice_pub = signing_key_from_bytes(&alice_seed).verifying_key().to_bytes();
+        let alice_pub = signing_key_from_bytes(&alice_seed)
+            .verifying_key()
+            .to_bytes();
         let bob_pub = signing_key_from_bytes(&bob_seed).verifying_key().to_bytes();
 
         let alice_key = derive_chat_key(&alice_seed, &bob_pub).expect("valid peer key");
@@ -502,12 +585,69 @@ mod tests {
     #[test]
     fn chat_key_derivation_differs_per_peer_pair() {
         let alice_seed = gen_seed();
-        let bob_pub = signing_key_from_bytes(&gen_seed()).verifying_key().to_bytes();
-        let carol_pub = signing_key_from_bytes(&gen_seed()).verifying_key().to_bytes();
+        let bob_pub = signing_key_from_bytes(&gen_seed())
+            .verifying_key()
+            .to_bytes();
+        let carol_pub = signing_key_from_bytes(&gen_seed())
+            .verifying_key()
+            .to_bytes();
 
         let key_with_bob = derive_chat_key(&alice_seed, &bob_pub).unwrap();
         let key_with_carol = derive_chat_key(&alice_seed, &carol_pub).unwrap();
         assert_ne!(key_with_bob, key_with_carol);
+    }
+
+    #[test]
+    fn pairwise_capabilities_are_symmetric_and_rotate() {
+        let alice_seed = gen_seed();
+        let bob_seed = gen_seed();
+        let alice_pub = signing_key_from_bytes(&alice_seed)
+            .verifying_key()
+            .to_bytes();
+        let bob_pub = signing_key_from_bytes(&bob_seed).verifying_key().to_bytes();
+        let epoch = 42;
+        let alice = derive_pairwise_capability(&alice_seed, &bob_pub, b"presence", epoch).unwrap();
+        let bob = derive_pairwise_capability(&bob_seed, &alice_pub, b"presence", epoch).unwrap();
+        assert_eq!(alice, bob);
+        assert_ne!(
+            alice,
+            derive_pairwise_capability(&alice_seed, &bob_pub, b"presence", epoch + 1).unwrap()
+        );
+    }
+
+    #[test]
+    fn pairwise_capabilities_differ_per_friend_and_purpose() {
+        let alice_seed = gen_seed();
+        let bob_pub = signing_key_from_bytes(&gen_seed())
+            .verifying_key()
+            .to_bytes();
+        let carol_pub = signing_key_from_bytes(&gen_seed())
+            .verifying_key()
+            .to_bytes();
+        let bob = derive_pairwise_presence_capability(&alice_seed, &bob_pub, &bob_pub, 9).unwrap();
+        let carol =
+            derive_pairwise_presence_capability(&alice_seed, &carol_pub, &carol_pub, 9).unwrap();
+        let mailbox = derive_pairwise_capability(&alice_seed, &bob_pub, b"mailbox", 9).unwrap();
+        assert_ne!(bob, carol);
+        assert_ne!(bob, mailbox);
+    }
+
+    #[test]
+    fn pairwise_presence_is_directional_per_owner() {
+        let alice_seed = gen_seed();
+        let bob_seed = gen_seed();
+        let alice_pub = signing_key_from_bytes(&alice_seed)
+            .verifying_key()
+            .to_bytes();
+        let bob_pub = signing_key_from_bytes(&bob_seed).verifying_key().to_bytes();
+        let alice_presence =
+            derive_pairwise_presence_capability(&alice_seed, &bob_pub, &alice_pub, 12).unwrap();
+        let bob_lookup_alice =
+            derive_pairwise_presence_capability(&bob_seed, &alice_pub, &alice_pub, 12).unwrap();
+        let bob_presence =
+            derive_pairwise_presence_capability(&bob_seed, &alice_pub, &bob_pub, 12).unwrap();
+        assert_eq!(alice_presence, bob_lookup_alice);
+        assert_ne!(alice_presence, bob_presence);
     }
 
     #[test]
@@ -598,7 +738,9 @@ mod tests {
     fn decrypt_chat_payload_decrypts_valid_envelope() {
         let alice_seed = gen_seed();
         let bob_seed = gen_seed();
-        let alice_pub = signing_key_from_bytes(&alice_seed).verifying_key().to_bytes();
+        let alice_pub = signing_key_from_bytes(&alice_seed)
+            .verifying_key()
+            .to_bytes();
         let bob_pub = signing_key_from_bytes(&bob_seed).verifying_key().to_bytes();
 
         let envelope = encrypt_chat_for_peer(&alice_seed, &bob_pub, b"encrypted hello").unwrap();
@@ -618,7 +760,9 @@ mod tests {
         // any time — accepting a plaintext fallback here would let them
         // forge chat messages.
         let our_seed = gen_seed();
-        let peer_pub = signing_key_from_bytes(&gen_seed()).verifying_key().to_bytes();
+        let peer_pub = signing_key_from_bytes(&gen_seed())
+            .verifying_key()
+            .to_bytes();
         let forged = b"pretend this is from the real friend";
         assert!(decrypt_chat_payload(&our_seed, &peer_pub, forged).is_none());
     }
@@ -628,8 +772,12 @@ mod tests {
         let alice_seed = gen_seed();
         let bob_seed = gen_seed();
         let mallory_seed = gen_seed();
-        let alice_pub = signing_key_from_bytes(&alice_seed).verifying_key().to_bytes();
-        let mallory_pub = signing_key_from_bytes(&mallory_seed).verifying_key().to_bytes();
+        let alice_pub = signing_key_from_bytes(&alice_seed)
+            .verifying_key()
+            .to_bytes();
+        let mallory_pub = signing_key_from_bytes(&mallory_seed)
+            .verifying_key()
+            .to_bytes();
 
         // Encrypted for Mallory, not Bob: Bob must not be able to decrypt
         // it, and it must be dropped outright (no plaintext fallback).
@@ -642,7 +790,9 @@ mod tests {
     fn encrypt_decrypt_for_peer_round_trip() {
         let alice_seed = gen_seed();
         let bob_seed = gen_seed();
-        let alice_pub = signing_key_from_bytes(&alice_seed).verifying_key().to_bytes();
+        let alice_pub = signing_key_from_bytes(&alice_seed)
+            .verifying_key()
+            .to_bytes();
         let bob_pub = signing_key_from_bytes(&bob_seed).verifying_key().to_bytes();
 
         let envelope = encrypt_chat_for_peer(&alice_seed, &bob_pub, b"ping").unwrap();

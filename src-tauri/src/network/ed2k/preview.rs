@@ -1,10 +1,14 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use tracing::info;
 
 const MIN_PREVIEW_SIZE: u64 = 16 * 1024;
 const COPY_BUFFER_SIZE: usize = 16 * 1024;
+static PREVIEW_TEMP: OnceLock<
+    parking_lot::Mutex<Option<crate::security::filesystem::PinnedTempDir>>,
+> = OnceLock::new();
 
 const VIDEO_EXTENSIONS: &[&str] = &[
     "avi", "mp4", "mkv", "wmv", "mpg", "mpeg", "mov", "flv", "webm", "m4v", "3gp", "divx", "ogm",
@@ -81,7 +85,7 @@ pub fn can_preview(
 /// Create a temporary preview file by copying filled ranges.
 pub fn create_preview_file(
     part_file_path: &Path,
-    filled_ranges: &[FilledRange],
+    verified_ranges: &[FilledRange],
     file_name: &str,
 ) -> anyhow::Result<PathBuf> {
     let ext = Path::new(file_name)
@@ -89,8 +93,18 @@ pub fn create_preview_file(
         .map(|e| e.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    let temp_dir = std::env::temp_dir().join("ember_preview");
-    std::fs::create_dir_all(&temp_dir)?;
+    let mut temp_guard = PREVIEW_TEMP
+        .get_or_init(|| parking_lot::Mutex::new(None))
+        .lock();
+    if temp_guard.is_none() {
+        *temp_guard = Some(crate::security::filesystem::PinnedTempDir::create(
+            "preview",
+        )?);
+    }
+    let temp_dir = temp_guard
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("preview temp directory unavailable"))?;
+    temp_dir.verify()?;
 
     let stem = Path::new(file_name)
         .file_stem()
@@ -107,17 +121,30 @@ pub fn create_preview_file(
         format!("{stem}_preview.{ext}")
     };
     let safe = crate::security::sanitize_filename(&raw);
-    let preview_path = temp_dir.join(safe);
+    let safe_path = Path::new(&safe);
+    let safe_stem = safe_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("preview");
+    let safe_ext = safe_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default();
+    let (preview_path, mut dst) = temp_dir.create_random_file(safe_stem, safe_ext)?;
 
     let mut src = std::fs::File::open(part_file_path)?;
-    let mut dst = std::fs::File::create(&preview_path)?;
 
-    let last_end = filled_ranges.iter().map(|r| r.end).max().unwrap_or(0);
+    let last_end = verified_ranges.iter().map(|r| r.end).max().unwrap_or(0);
     dst.set_len(last_end)?;
 
     let mut buf = vec![0u8; COPY_BUFFER_SIZE];
 
-    for range in filled_ranges {
+    for range in verified_ranges {
+        if range.start >= range.end || range.end > src.metadata()?.len() {
+            drop(dst);
+            let _ = std::fs::remove_file(&preview_path);
+            anyhow::bail!("invalid MD4-verified preview range");
+        }
         src.seek(SeekFrom::Start(range.start))?;
         dst.seek(SeekFrom::Start(range.start))?;
 
@@ -163,35 +190,40 @@ pub fn launch_preview(file_path: &Path) -> anyhow::Result<()> {
             .unwrap_or("<file>")
     );
 
-    #[cfg(target_os = "windows")]
-    {
-        opener::open(file_path)?;
+    let declared = file_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("preview path has no usable name"))?;
+    if !crate::security::filesystem::passive_type_agrees(declared, file_path) {
+        anyhow::bail!("preview type is not on the passive launch allowlist");
     }
-
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open").arg(file_path).spawn()?;
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        std::process::Command::new("xdg-open")
-            .arg(file_path)
-            .spawn()?;
-    }
-
+    opener::open(file_path)?;
     Ok(())
 }
 
 /// Clean up preview temp files. Removes all files in the preview directory.
 pub fn cleanup_previews() {
-    let temp_dir = std::env::temp_dir().join("ember_preview");
-    if temp_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&temp_dir) {
-            for entry in entries.flatten() {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-        let _ = std::fs::remove_dir(&temp_dir);
+    if let Some(temp) = PREVIEW_TEMP.get() {
+        temp.lock().take();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preview_copies_only_supplied_verified_ranges() {
+        let part = std::env::temp_dir().join(format!(
+            "ember-preview-range-test-{}-{}.part",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::write(&part, b"GOODUNVERIFIED").unwrap();
+        let preview =
+            create_preview_file(&part, &[FilledRange { start: 0, end: 4 }], "movie.mp4").unwrap();
+        assert_eq!(std::fs::read(&preview).unwrap(), b"GOOD");
+        let _ = std::fs::remove_file(preview);
+        let _ = std::fs::remove_file(part);
     }
 }

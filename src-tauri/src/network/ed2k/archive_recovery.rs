@@ -1,6 +1,7 @@
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use crate::sharing::manager::TransferControl;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use tracing::{debug, info};
 
@@ -22,6 +23,58 @@ const RAR_LONG_BLOCK: u16 = 0x8000;
 const ACE_SIGNATURE: &[u8] = b"**ACE**";
 const ACE_FILE_HEADER_TYPE: u8 = 0x01;
 
+const MAX_RECOVERY_INPUT_BYTES: u64 = 128 * 1024 * 1024 * 1024;
+const MAX_RECOVERY_OUTPUT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const MAX_RECOVERY_ENTRY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const MAX_RECOVERY_ENTRIES: usize = 10_000;
+const MAX_DECOMPRESSION_RATIO: u64 = 200;
+const RECOVERY_WALL_TIME: std::time::Duration = std::time::Duration::from_secs(120);
+
+struct RecoveryBudget {
+    started: std::time::Instant,
+    output_bytes: u64,
+    entries: usize,
+}
+
+impl RecoveryBudget {
+    fn new() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            output_bytes: 0,
+            entries: 0,
+        }
+    }
+
+    fn check(&self, control: Option<&TransferControl>) -> anyhow::Result<()> {
+        if control.is_some_and(TransferControl::is_cancelled) {
+            anyhow::bail!("archive recovery cancelled");
+        }
+        if self.started.elapsed() > RECOVERY_WALL_TIME {
+            anyhow::bail!("archive recovery exceeded wall-time limit");
+        }
+        Ok(())
+    }
+
+    fn reserve_output(&mut self, bytes: u64) -> anyhow::Result<()> {
+        self.output_bytes = self
+            .output_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| anyhow::anyhow!("archive recovery output size overflow"))?;
+        if self.output_bytes > MAX_RECOVERY_OUTPUT_BYTES {
+            anyhow::bail!("archive recovery output exceeds limit");
+        }
+        Ok(())
+    }
+
+    fn add_entry(&mut self) -> anyhow::Result<()> {
+        self.entries = self.entries.saturating_add(1);
+        if self.entries > MAX_RECOVERY_ENTRIES {
+            anyhow::bail!("archive recovery entry count exceeds limit");
+        }
+        Ok(())
+    }
+}
+
 /// Recover a partially downloaded archive. Scans the filled byte ranges
 /// of the .part file for valid archive entries and writes a reconstructed
 /// archive containing only the complete, validated entries.
@@ -31,9 +84,18 @@ pub fn recover_archive(
     part_path: &Path,
     file_name: &str,
     filled_ranges: &[(u64, u64)],
+    output_dir: &Path,
+    control: Option<&TransferControl>,
 ) -> anyhow::Result<PathBuf> {
     if filled_ranges.is_empty() {
         anyhow::bail!("no filled ranges available for recovery");
+    }
+    let mut previous_end = 0u64;
+    for &(start, end) in filled_ranges {
+        if start >= end || start < previous_end {
+            anyhow::bail!("verified recovery ranges are invalid or overlap");
+        }
+        previous_end = end;
     }
 
     let ext = Path::new(file_name)
@@ -55,39 +117,110 @@ pub fn recover_archive(
     // `sanitize_archive_name_in_place` (RAR/ACE paths).
     let safe_stem_full = crate::security::sanitize_filename(&stem);
     let safe_ext = crate::security::sanitize_filename(&ext);
-    let output_name = format!("{safe_stem_full}-rec.{safe_ext}");
-    let output_path = part_path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join(&output_name);
+    let input_size = std::fs::metadata(part_path)?.len();
+    if input_size > MAX_RECOVERY_INPUT_BYTES {
+        anyhow::bail!("archive recovery input exceeds limit");
+    }
+    if previous_end > input_size {
+        anyhow::bail!("verified recovery range exceeds input size");
+    }
+    crate::security::filesystem::ensure_not_reparse(output_dir)?;
+    let output_dir_identity = crate::security::filesystem::object_identity(output_dir)?;
+    let input_identity = crate::security::filesystem::object_identity(part_path)?;
+    let mut output = None;
+    for _ in 0..32 {
+        let output_name = format!(
+            "{safe_stem_full}-rec-{}.{}",
+            uuid::Uuid::new_v4().simple(),
+            safe_ext
+        );
+        let output_path = output_dir.join(output_name);
+        match crate::security::filesystem::create_new_nofollow(&output_path) {
+            Ok(file) => {
+                output = Some((output_path, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let (output_path, mut output_file) =
+        output.ok_or_else(|| anyhow::anyhow!("could not allocate exclusive recovery output"))?;
+    if let Err(error) = crate::security::restrict_file_permissions_checked(&output_path) {
+        drop(output_file);
+        let _ = std::fs::remove_file(&output_path);
+        return Err(error.into());
+    }
 
     let mut input = std::fs::File::open(part_path)?;
+    let mut budget = RecoveryBudget::new();
+    budget.check(control)?;
 
-    let result = match ext.as_str() {
+    let result: anyhow::Result<usize> = match ext.as_str() {
         "zip" | "cbz" | "jar" => {
             info!("Attempting ZIP recovery on {file_name}");
-            let mut output = std::fs::File::create(&output_path)?;
-            recover_zip(&mut input, &mut output, filled_ranges)?
+            recover_zip(
+                &mut input,
+                &mut output_file,
+                filled_ranges,
+                &mut budget,
+                control,
+            )
         }
         "rar" | "cbr" => {
             info!("Attempting RAR recovery on {file_name}");
-            let mut output = std::fs::File::create(&output_path)?;
-            recover_rar(&mut input, &mut output, filled_ranges)?
+            recover_rar(
+                &mut input,
+                &mut output_file,
+                filled_ranges,
+                &mut budget,
+                control,
+            )
         }
         "ace" => {
             info!("Attempting ACE recovery on {file_name}");
-            let mut output = std::fs::File::create(&output_path)?;
-            recover_ace(&mut input, &mut output, filled_ranges)?
+            recover_ace(
+                &mut input,
+                &mut output_file,
+                filled_ranges,
+                &mut budget,
+                control,
+            )
         }
-        _ => {
-            anyhow::bail!("unsupported archive format: .{ext}");
+        _ => Err(anyhow::anyhow!("unsupported archive format: .{ext}")),
+    };
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            drop(output_file);
+            let _ = std::fs::remove_file(&output_path);
+            return Err(error);
         }
     };
 
     if result > 0 {
-        info!("Archive recovery complete: {result} entries recovered to {output_name}");
+        if crate::security::filesystem::object_identity(output_dir)? != output_dir_identity
+            || crate::security::filesystem::object_identity(part_path)? != input_identity
+        {
+            drop(output_file);
+            let _ = std::fs::remove_file(&output_path);
+            anyhow::bail!("archive recovery input/output root changed during recovery");
+        }
+        if let Err(error) = output_file.sync_all() {
+            drop(output_file);
+            let _ = std::fs::remove_file(&output_path);
+            return Err(error.into());
+        }
+        info!(
+            "Archive recovery complete: {result} entries recovered to {}",
+            output_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("<recovered>")
+        );
         Ok(output_path)
     } else {
+        drop(output_file);
         let _ = std::fs::remove_file(&output_path);
         anyhow::bail!("no valid archive entries found in downloaded data");
     }
@@ -133,6 +266,8 @@ fn recover_zip(
     input: &mut std::fs::File,
     output: &mut std::fs::File,
     filled: &[(u64, u64)],
+    budget: &mut RecoveryBudget,
+    control: Option<&TransferControl>,
 ) -> anyhow::Result<usize> {
     let file_size = input.metadata()?.len();
     let mut entries: Vec<ZipLocalEntry> = Vec::new();
@@ -142,6 +277,9 @@ fn recover_zip(
     for &(range_start, range_end) in filled {
         let mut pos = range_start;
         while pos + ZIP_LOCAL_HEADER_SIZE as u64 <= range_end {
+            if pos & 0x0fff == 0 {
+                budget.check(control)?;
+            }
             input.seek(SeekFrom::Start(pos))?;
             if input.read_exact(&mut buf).is_err() {
                 break;
@@ -185,6 +323,16 @@ fn recover_zip(
                 pos = data_offset;
                 continue;
             }
+            if compressed_size as u64 > MAX_RECOVERY_ENTRY_BYTES
+                || uncompressed_size as u64 > MAX_RECOVERY_ENTRY_BYTES
+                || (uncompressed_size as u64)
+                    > (compressed_size as u64)
+                        .max(1)
+                        .saturating_mul(MAX_DECOMPRESSION_RATIO)
+            {
+                pos += 4;
+                continue;
+            }
 
             let data_offset =
                 pos + ZIP_LOCAL_HEADER_SIZE as u64 + name_len as u64 + extra_len as u64;
@@ -220,7 +368,14 @@ fn recover_zip(
             // header validation only when bit 3 says the authoritative CRC is
             // carried in a following data descriptor.
             let crc_valid = if (flags & 0x08) == 0 {
-                validate_zip_crc(input, data_offset, compressed_size, method, crc32)?
+                validate_zip_crc(
+                    input,
+                    data_offset,
+                    compressed_size,
+                    uncompressed_size,
+                    method,
+                    crc32,
+                )?
             } else {
                 true
             };
@@ -239,6 +394,7 @@ fn recover_zip(
             // runs later would place them outside the extraction root.
             let safe_file_name = sanitize_zip_entry_name(&file_name);
 
+            budget.add_entry()?;
             entries.push(ZipLocalEntry {
                 compressed_size,
                 uncompressed_size,
@@ -284,6 +440,15 @@ fn recover_zip(
     let mut copy_buf = vec![0u8; 64 * 1024];
 
     for entry in &entries {
+        budget.check(control)?;
+        budget.reserve_output(
+            ZIP_LOCAL_HEADER_SIZE as u64
+                + entry.file_name.len() as u64
+                + entry.extra.len() as u64
+                + entry.compressed_size as u64
+                + ZIP_CENTRAL_DIR_ENTRY_SIZE as u64
+                + entry.file_name.len() as u64,
+        )?;
         let local_header_offset = output.stream_position()?;
         if local_header_offset > u32::MAX as u64 {
             anyhow::bail!(
@@ -311,6 +476,7 @@ fn recover_zip(
         input.seek(SeekFrom::Start(entry.data_offset))?;
         let mut remaining = entry.compressed_size as u64;
         while remaining > 0 {
+            budget.check(control)?;
             let to_read = (remaining as usize).min(copy_buf.len());
             let n = input.read(&mut copy_buf[..to_read])?;
             if n == 0 {
@@ -356,6 +522,7 @@ fn recover_zip(
     }
     let mut cd_size: u64 = 0;
     for cd in &central_dir_entries {
+        budget.check(control)?;
         output.write_all(cd)?;
         cd_size += cd.len() as u64;
     }
@@ -367,6 +534,8 @@ fn recover_zip(
     }
 
     // Write End of Central Directory Record
+    let comment = b"Recovered by Ember";
+    budget.reserve_output(22 + comment.len() as u64)?;
     output.write_u32::<LittleEndian>(ZIP_END_OF_CENTRAL_DIR_MAGIC)?;
     output.write_u16::<LittleEndian>(0)?; // disk number
     output.write_u16::<LittleEndian>(0)?; // disk number with CD
@@ -374,7 +543,6 @@ fn recover_zip(
     output.write_u16::<LittleEndian>(entries.len() as u16)?;
     output.write_u32::<LittleEndian>(cd_size as u32)?;
     output.write_u32::<LittleEndian>(cd_offset as u32)?;
-    let comment = b"Recovered by Ember";
     output.write_u16::<LittleEndian>(comment.len() as u16)?;
     output.write_all(comment)?;
 
@@ -489,14 +657,18 @@ fn validate_zip_crc(
     input: &mut std::fs::File,
     offset: u64,
     size: u32,
+    uncompressed_size: u32,
     method: u16,
     expected_crc: u32,
 ) -> anyhow::Result<bool> {
     input.seek(SeekFrom::Start(offset))?;
     let limited = input.take(size as u64);
     let actual_crc = match method {
-        0 => crc32_reader(limited)?,
-        8 => crc32_reader(flate2::read::DeflateDecoder::new(limited))?,
+        0 => crc32_reader_limited(limited, uncompressed_size as u64)?,
+        8 => crc32_reader_limited(
+            flate2::read::DeflateDecoder::new(limited),
+            uncompressed_size as u64,
+        )?,
         // Recovery preserves unsupported methods verbatim, but cannot verify
         // their uncompressed CRC without a decoder.
         _ => return Ok(true),
@@ -504,15 +676,23 @@ fn validate_zip_crc(
     Ok(actual_crc == expected_crc)
 }
 
-fn crc32_reader(mut reader: impl Read) -> anyhow::Result<u32> {
+fn crc32_reader_limited(mut reader: impl Read, expected_size: u64) -> anyhow::Result<u32> {
     let mut hasher = crc32fast::Hasher::new();
     let mut buf = [0u8; 64 * 1024];
+    let mut total = 0u64;
     loop {
         let n = reader.read(&mut buf)?;
         if n == 0 {
             break;
         }
+        total = total.saturating_add(n as u64);
+        if total > expected_size || total > MAX_RECOVERY_ENTRY_BYTES {
+            anyhow::bail!("ZIP entry decompressed beyond its bounded declared size");
+        }
         hasher.update(&buf[..n]);
+    }
+    if total != expected_size {
+        return Ok(u32::MAX);
     }
     Ok(hasher.finalize())
 }
@@ -525,6 +705,8 @@ fn recover_rar(
     input: &mut std::fs::File,
     output: &mut std::fs::File,
     filled: &[(u64, u64)],
+    budget: &mut RecoveryBudget,
+    control: Option<&TransferControl>,
 ) -> anyhow::Result<usize> {
     let file_size = input.metadata()?.len();
 
@@ -543,8 +725,10 @@ fn recover_rar(
 
     // Write RAR signature + main archive header
     if is_new_format {
+        budget.reserve_output(RAR_SIGNATURE_NEW.len() as u64)?;
         output.write_all(RAR_SIGNATURE_NEW)?;
     } else {
+        budget.reserve_output(RAR_SIGNATURE_OLD.len() as u64)?;
         output.write_all(RAR_SIGNATURE_OLD)?;
     }
 
@@ -564,6 +748,7 @@ fn recover_rar(
         0x00,
         0x00, // PosAv
     ];
+    budget.reserve_output(main_header.len() as u64)?;
     output.write_all(&main_header)?;
 
     // Scan for RAR file headers in filled ranges
@@ -574,6 +759,9 @@ fn recover_rar(
     for &(range_start, range_end) in filled {
         let mut pos = range_start;
         while pos + 7 <= range_end {
+            if pos & 0x0fff == 0 {
+                budget.check(control)?;
+            }
             input.seek(SeekFrom::Start(pos))?;
             if input.read_exact(&mut buf).is_err() {
                 break;
@@ -639,6 +827,10 @@ fn recover_rar(
                 0
             };
             let total_pack = pack_size | (high_pack << 32);
+            if total_pack > MAX_RECOVERY_ENTRY_BYTES {
+                pos += 1;
+                continue;
+            }
 
             // `pack_size`/`high_pack` come straight from file bytes inside a
             // "filled" (already-downloaded) range, which can originate from
@@ -684,11 +876,14 @@ fn recover_rar(
             }
 
             // Write header + data to output
+            budget.add_entry()?;
+            budget.reserve_output(header_data.len() as u64 + total_pack)?;
             output.write_all(&header_data)?;
             if total_pack > 0 {
                 input.seek(SeekFrom::Start(data_start))?;
                 let mut remaining = total_pack;
                 while remaining > 0 {
+                    budget.check(control)?;
                     let to_read = (remaining as usize).min(copy_buf.len());
                     let n = input.read(&mut copy_buf[..to_read])?;
                     if n == 0 {
@@ -721,6 +916,8 @@ fn recover_ace(
     input: &mut std::fs::File,
     output: &mut std::fs::File,
     filled: &[(u64, u64)],
+    budget: &mut RecoveryBudget,
+    control: Option<&TransferControl>,
 ) -> anyhow::Result<usize> {
     let file_size = input.metadata()?.len();
 
@@ -741,6 +938,7 @@ fn recover_ace(
                 input.seek(SeekFrom::Start(0))?;
                 let mut header = vec![0u8; total as usize];
                 if input.read_exact(&mut header).is_ok() {
+                    budget.reserve_output(header.len() as u64)?;
                     output.write_all(&header)?;
                 }
             }
@@ -754,6 +952,9 @@ fn recover_ace(
     for &(range_start, range_end) in filled {
         let mut pos = range_start;
         while pos + 10 <= range_end {
+            if pos & 0x0fff == 0 {
+                budget.check(control)?;
+            }
             input.seek(SeekFrom::Start(pos))?;
             let mut header_start = [0u8; 4];
             if input.read_exact(&mut header_start).is_err() {
@@ -797,6 +998,10 @@ fn recover_ace(
                 header_body[5],
                 header_body[6],
             ]) as u64;
+            if pack_size > MAX_RECOVERY_ENTRY_BYTES {
+                pos += 1;
+                continue;
+            }
 
             let Some(data_start) = pos
                 .checked_add(4)
@@ -835,12 +1040,15 @@ fn recover_ace(
             }
 
             // Write header + data
+            budget.add_entry()?;
+            budget.reserve_output(4 + header_body.len() as u64 + pack_size)?;
             output.write_all(&header_start)?;
             output.write_all(&header_body)?;
             if pack_size > 0 {
                 input.seek(SeekFrom::Start(data_start))?;
                 let mut remaining = pack_size;
                 while remaining > 0 {
+                    budget.check(control)?;
                     let to_read = (remaining as usize).min(copy_buf.len());
                     let n = input.read(&mut copy_buf[..to_read])?;
                     if n == 0 {
@@ -870,4 +1078,89 @@ pub fn is_recoverable_archive(file_name: &str) -> bool {
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default();
     matches!(ext.as_str(), "zip" | "cbz" | "jar" | "rar" | "cbr" | "ace")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stored_zip_entry() -> Vec<u8> {
+        let data = b"TEST";
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(data);
+        let crc = hasher.finalize();
+        let mut bytes = Vec::new();
+        bytes
+            .write_u32::<LittleEndian>(ZIP_LOCAL_HEADER_MAGIC)
+            .unwrap();
+        bytes.write_u16::<LittleEndian>(20).unwrap();
+        bytes.write_u16::<LittleEndian>(0).unwrap();
+        bytes.write_u16::<LittleEndian>(0).unwrap();
+        bytes.write_u16::<LittleEndian>(0).unwrap();
+        bytes.write_u16::<LittleEndian>(0).unwrap();
+        bytes.write_u32::<LittleEndian>(crc).unwrap();
+        bytes.write_u32::<LittleEndian>(data.len() as u32).unwrap();
+        bytes.write_u32::<LittleEndian>(data.len() as u32).unwrap();
+        bytes.write_u16::<LittleEndian>(5).unwrap();
+        bytes.write_u16::<LittleEndian>(0).unwrap();
+        bytes.extend_from_slice(b"a.txt");
+        bytes.extend_from_slice(data);
+        bytes
+    }
+
+    #[test]
+    fn manual_zip_recovery_accepts_only_verified_range() {
+        let base = std::env::temp_dir().join(format!(
+            "ember-archive-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let part = base.join("input.part");
+        let bytes = stored_zip_entry();
+        std::fs::write(&part, &bytes).unwrap();
+
+        let recovered =
+            recover_archive(&part, "sample.zip", &[(0, bytes.len() as u64)], &base, None)
+                .expect("recover verified entry");
+        let archive = zip::ZipArchive::new(std::fs::File::open(&recovered).unwrap()).unwrap();
+        assert_eq!(archive.len(), 1);
+
+        let denied = recover_archive(
+            &part,
+            "sample.zip",
+            &[(0, ZIP_LOCAL_HEADER_SIZE as u64)],
+            &base,
+            None,
+        );
+        assert!(
+            denied.is_err(),
+            "entry data outside verified range must be rejected"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn recovery_honors_cancellation() {
+        let base = std::env::temp_dir().join(format!(
+            "ember-archive-cancel-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let part = base.join("input.part");
+        let bytes = stored_zip_entry();
+        std::fs::write(&part, &bytes).unwrap();
+        let control = TransferControl::new();
+        control.cancel();
+        assert!(recover_archive(
+            &part,
+            "sample.zip",
+            &[(0, bytes.len() as u64)],
+            &base,
+            Some(&control),
+        )
+        .is_err());
+        let _ = std::fs::remove_dir_all(base);
+    }
 }

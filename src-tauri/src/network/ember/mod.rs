@@ -311,7 +311,8 @@ fn append_relay_attestations(buf: &mut Vec<u8>, attestations: &[RelayAttestation
     // payload directly without going through the reservation path. A
     // partial trailer (fewer attestations) is strictly better than an
     // empty one: each one still verifies independently on the wire.
-    while count > 0 && buf.len() + 4 + 1 + 2 + count * RELAY_ATTESTATION_FIXED_SIZE > MAX_EPX_PAYLOAD
+    while count > 0
+        && buf.len() + 4 + 1 + 2 + count * RELAY_ATTESTATION_FIXED_SIZE > MAX_EPX_PAYLOAD
     {
         count -= 1;
     }

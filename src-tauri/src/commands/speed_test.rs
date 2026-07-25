@@ -3,6 +3,9 @@ use futures::StreamExt;
 use serde::Serialize;
 use tracing::info;
 
+static SPEED_TEST_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 const DOWNLOAD_TEST_URL: &str = "https://speed.cloudflare.com/__down?bytes=5000000";
 const UPLOAD_TEST_URL: &str = "https://speed.cloudflare.com/__up";
 const UPLOAD_TEST_BYTES: usize = 2_000_000;
@@ -21,6 +24,13 @@ pub struct SpeedTestResult {
 
 #[tauri::command]
 pub async fn run_speed_test() -> Result<SpeedTestResult, String> {
+    let _single_flight = crate::security::try_begin_single_flight(&SPEED_TEST_IN_FLIGHT)
+        .ok_or_else(|| {
+            crate::commands::errors::coded(
+                "speed_test_already_running",
+                "A speed test is already running",
+            )
+        })?;
     info!("Starting speed test...");
 
     let client = reqwest::Client::builder()

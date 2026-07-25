@@ -1743,7 +1743,15 @@
           }
           if (trimmed.toLowerCase().startsWith('ed2k://')) {
             const info = await parseEd2kLink(trimmed);
-            const res = await startDownload(info.hash, info.name, info.size, '', 0);
+            const res = await startDownload(
+              info.hash,
+              info.name,
+              info.size,
+              '',
+              0,
+              undefined,
+              info.aich,
+            );
             showInfo(res.already_queued
               ? m.transfers_already_in_list({ name: info.name })
               : m.transfers_queued_from_clipboard({ name: info.name }));
@@ -1806,7 +1814,15 @@
         return;
       }
       const info = await parseEd2kLink(text);
-      const res = await startDownload(info.hash, info.name, info.size, '', 0);
+      const res = await startDownload(
+        info.hash,
+        info.name,
+        info.size,
+        '',
+        0,
+        undefined,
+        info.aich,
+      );
       showInfo(res.already_queued
         ? m.transfers_already_in_list({ name: info.name })
         : m.transfers_queued_from_clipboard({ name: info.name }));
@@ -2865,7 +2881,7 @@
               </td>
               {#each visibleDownloadColumns as column (column.key)}
                 {#if column.key === 'file_name'}
-                  <td class="name-cell" title={t.file_name}><bdi>{t.file_name}</bdi></td>
+                  <td class="name-cell" title={t.file_name}><bdi dir="auto">{t.file_name}</bdi></td>
                 {:else if column.key === 'total_size'}
                   <td class="num-cell">{formatSize(t.total_size)}</td>
                 {:else if column.key === 'transferred'}
@@ -2979,7 +2995,7 @@
                       <span class="source-fields">
                         <span class="source-status-dot src-dot-{src.status}" title={sourceStatusLabel(src)}></span>
                         <span class="source-flag" title={src.country_code ?? ''}>{#if countryFlagSrc(src.country_code)}<img src={countryFlagSrc(src.country_code)} alt={src.country_code ?? ''} class="flag-img" />{/if}</span>
-                        <span class="source-client" title={src.peer_name || src.client_software || m.transfers_unknown_client()}><bdi>{src.peer_name || src.client_software || m.transfers_unknown_client()}</bdi></span>
+                        <span class="source-client" title={src.peer_name || src.client_software || m.transfers_unknown_client()}><bdi dir="auto">{src.peer_name || src.client_software || m.transfers_unknown_client()}</bdi></span>
                         <span class="source-sep"></span>
                         <span class="source-addr" title="{src.ip}:{src.port}">{src.ip}:{src.port}</span>
                         <span class="source-state src-st-{src.status}">{sourceStatusLabel(src)}</span>
@@ -3021,7 +3037,7 @@
                 <td class="col-dl-check"></td>
                 {#each visibleDownloadColumns as column (column.key)}
                   {#if column.key === 'file_name'}
-                    <td class="name-cell" title={t.file_name}><bdi>{t.file_name}</bdi></td>
+                    <td class="name-cell" title={t.file_name}><bdi dir="auto">{t.file_name}</bdi></td>
                   {:else if column.key === 'total_size'}
                     <td class="num-cell">{formatSize(t.total_size)}</td>
                   {:else if column.key === 'transferred'}
@@ -3289,14 +3305,14 @@
                   {#if column.key === 'country'}
                     <td class="flag-cell" title={t.country_code ?? ''}>{#if countryFlagSrc(t.country_code)}<img src={countryFlagSrc(t.country_code)} alt={t.country_code ?? ''} class="flag-img" />{/if}</td>
                   {:else if column.key === 'peer_name'}
-                    <td class="client-cell" title={t.peer_name || t.peer_id}><bdi>{t.peer_name || t.peer_id || '\u2014'}</bdi></td>
+                    <td class="client-cell" title={t.peer_name || t.peer_id}><bdi dir="auto">{t.peer_name || t.peer_id || '\u2014'}</bdi></td>
                   {:else if column.key === 'file_name'}
                     <td class="name-cell" title={isPartialSeed(t) ? m.transfers_upload_partial_seed_title({ name: t.file_name }) : t.file_name}>
-                      <span class="ul-name-text"><bdi>{t.file_name}</bdi></span>
+                      <span class="ul-name-text"><bdi dir="auto">{t.file_name}</bdi></span>
                       {#if isPartialSeed(t)}<span class="partial-seed-badge" title={m.transfers_upload_partial_seed_title({ name: t.file_name })}>{m.transfers_upload_partial_seed_badge()}</span>{/if}
                     </td>
                   {:else if column.key === 'client_software'}
-                    <td class="sw-cell" title={t.client_software || ''}><bdi>{t.client_software || '\u2014'}</bdi></td>
+                    <td class="sw-cell" title={t.client_software || ''}><bdi dir="auto">{t.client_software || '\u2014'}</bdi></td>
                   {:else if column.key === 'speed'}
                     {@const spd = liveSpeed(t)}
                     <td class="num-cell">{spd > 0 ? formatSpeed(spd) : '\u2014'}</td>
@@ -3447,7 +3463,7 @@
                     {@const label = q.user_hash ? q.user_hash.slice(0, 8) + '\u2026' : (q.peer_ip || '\u2014')}
                     <td class="client-cell" title={q.user_hash || q.peer_ip}>{q.is_friend ? '\u2605 ' : ''}{label}</td>
                   {:else if column.key === 'file_name'}
-                    <td class="name-cell" title={q.file_name}><bdi>{q.file_name}</bdi></td>
+                    <td class="name-cell" title={q.file_name}><bdi dir="auto">{q.file_name}</bdi></td>
                   {:else if column.key === 'wait_time'}
                     <td class="num-cell">{formatDuration(q.wait_seconds * 1000)}</td>
                   {:else if column.key === 'queue_rank'}
@@ -3766,13 +3782,13 @@
                 <tr class="client-row">
                   {#each visibleClientColumns as column (column.key)}
                     {#if column.key === 'peer_name'}
-                      <td class="client-cell" title={src.peer_name || src.ip}><bdi>{src.peer_name || src.ip}</bdi></td>
+                      <td class="client-cell" title={src.peer_name || src.ip}><bdi dir="auto">{src.peer_name || src.ip}</bdi></td>
                     {:else if column.key === 'country'}
                       <td class="flag-cell" title={src.country_code ?? ''}>{#if countryFlagSrc(src.country_code)}<img src={countryFlagSrc(src.country_code)} alt={src.country_code ?? ''} class="flag-img" />{/if}</td>
                     {:else if column.key === 'client_software'}
-                      <td title={src.client_software}><bdi>{src.client_software || '\u2014'}</bdi></td>
+                      <td title={src.client_software}><bdi dir="auto">{src.client_software || '\u2014'}</bdi></td>
                     {:else if column.key === 'file_name'}
-                      <td class="name-cell"><bdi>{allDownloads.find(d => d.id === expandedTransferId)?.file_name || '\u2014'}</bdi></td>
+                      <td class="name-cell"><bdi dir="auto">{allDownloads.find(d => d.id === expandedTransferId)?.file_name || '\u2014'}</bdi></td>
                     {:else if column.key === 'speed'}
                       <td class="num-cell">{src.status === 'transferring' ? formatSpeed(src.speed) : '\u2014'}</td>
                     {:else if column.key === 'downloaded'}

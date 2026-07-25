@@ -725,8 +725,18 @@ impl ServerList {
                         let mut sbuf = vec![0u8; slen];
                         cursor.read_exact(&mut sbuf)?;
                         match name_id {
-                            0x01 => entry.name = String::from_utf8_lossy(&sbuf).to_string(),
-                            0x0B => entry.description = String::from_utf8_lossy(&sbuf).to_string(),
+                            0x01 => {
+                                entry.name = crate::security::sanitize_remote_text(
+                                    &String::from_utf8_lossy(&sbuf),
+                                    MAX_SERVER_TAG_STR_LEN,
+                                )
+                            }
+                            0x0B => {
+                                entry.description = crate::security::sanitize_remote_text(
+                                    &String::from_utf8_lossy(&sbuf),
+                                    MAX_SERVER_TAG_STR_LEN,
+                                )
+                            }
                             _ => {}
                         }
                     }
@@ -879,8 +889,18 @@ impl ServerList {
                             break;
                         }
                         match name_id {
-                            0x01 => entry.name = String::from_utf8_lossy(&sbuf).to_string(),
-                            0x0B => entry.description = String::from_utf8_lossy(&sbuf).to_string(),
+                            0x01 => {
+                                entry.name = crate::security::sanitize_remote_text(
+                                    &String::from_utf8_lossy(&sbuf),
+                                    MAX_SERVER_TAG_STR_LEN,
+                                )
+                            }
+                            0x0B => {
+                                entry.description = crate::security::sanitize_remote_text(
+                                    &String::from_utf8_lossy(&sbuf),
+                                    MAX_SERVER_TAG_STR_LEN,
+                                )
+                            }
                             _ => {}
                         }
                     }
@@ -1209,7 +1229,8 @@ impl ServerList {
     /// Update a server display name learned from live protocol data.
     /// To avoid clobbering user-provided labels, we only replace empty/IP-like names.
     pub fn update_server_name_from_ident(&mut self, ip: &str, port: u16, name: &str) -> bool {
-        let trimmed = name.trim();
+        let sanitized = crate::security::sanitize_remote_text(name, MAX_SERVER_TAG_STR_LEN);
+        let trimmed = sanitized.trim();
         if trimmed.is_empty() {
             return false;
         }

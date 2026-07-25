@@ -1,5 +1,5 @@
 import { writable } from 'svelte/store';
-import { check, type Update } from '@tauri-apps/plugin-updater';
+import { Channel, invoke } from '@tauri-apps/api/core';
 import { relaunch } from '@tauri-apps/plugin-process';
 import * as m from '$lib/paraglide/messages';
 
@@ -35,6 +35,17 @@ export interface UpdaterState {
   /** Set when the user dismisses the banner for the current version. */
   dismissed: boolean;
 }
+
+interface SecureUpdateInfo {
+  version: string;
+  notes: string | null;
+  date: string | null;
+}
+
+type SecureUpdateProgress =
+  | { event: 'Started'; data: { contentLength: number } }
+  | { event: 'Progress'; data: { chunkLength: number } }
+  | { event: 'Finished' };
 
 const INITIAL: UpdaterState = {
   phase: 'idle',
@@ -116,9 +127,10 @@ export function isUpdateCheckDue(frequency: UpdateCheckFrequency): boolean {
   return Date.now() - last >= FREQUENCY_MS[frequency];
 }
 
-// Module-private handle to the pending update. Kept out of the store because
-// it's a non-serializable Tauri `Resource` (and we only ever need the latest).
-let pending: Update | null = null;
+// The native updater service owns the non-serializable, signed Update handle.
+// The renderer only tracks whether that service has a verified pending update;
+// it cannot supply URLs, targets, proxies, or downgrade options.
+let pending = false;
 
 // Guards against a second `installUpdate()` entering before the first has
 // flipped the phase to `downloading`. A Tauri `Update` resource is not safe to
@@ -131,14 +143,7 @@ let retryAction: 'check' | 'install' | 'relaunch' = 'check';
 let checkInFlight = false;
 
 async function disposePending(): Promise<void> {
-  if (!pending) return;
-  const stale = pending;
-  pending = null;
-  try {
-    await stale.close();
-  } catch {
-    // The resource may already be consumed by install; ignore.
-  }
+  pending = false;
 }
 
 function toMessage(e: unknown): string {
@@ -172,19 +177,19 @@ export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<
   checkInFlight = true;
   // Keep an existing `available` pending until the new check succeeds, so a
   // failed/empty re-check doesn't wipe the Install button's resource.
-  const keepPendingUntilSuccess = pending != null;
+  const keepPendingUntilSuccess = pending;
   recordCheckedNow();
   updater.update((s) => ({ ...s, phase: 'checking', error: null }));
   try {
-    const found = await check();
+    const found = await invoke<SecureUpdateInfo | null>('secure_updater_check');
     if (found) {
       await disposePending();
-      pending = found;
+      pending = true;
       updater.set({
         phase: 'available',
         version: found.version,
-        notes: found.body ?? null,
-        date: found.date ?? null,
+        notes: found.notes,
+        date: found.date,
         downloaded: 0,
         total: null,
         error: null,
@@ -247,10 +252,11 @@ export async function installUpdate(): Promise<void> {
   let downloaded = 0;
   let total: number | null = null;
   try {
-    await pending.downloadAndInstall((event) => {
+    const onEvent = new Channel<SecureUpdateProgress>();
+    onEvent.onmessage = (event) => {
       switch (event.event) {
         case 'Started':
-          total = event.data.contentLength ?? null;
+          total = event.data.contentLength;
           updater.update((s) => ({ ...s, phase: 'downloading', total, downloaded: 0 }));
           break;
         case 'Progress':
@@ -261,13 +267,12 @@ export async function installUpdate(): Promise<void> {
           updater.update((s) => ({ ...s, phase: 'installing' }));
           break;
       }
-    });
+    };
+    await invoke('secure_updater_install', { onEvent });
     updater.update((s) => ({ ...s, phase: 'ready' }));
-    // The update is staged on disk now; the relaunch is driven by
-    // `relaunch()`, not this handle. Release the `Update` resource here
-    // instead of leaking it until the next `checkForUpdates()`. (Only on
-    // success — the error path keeps `pending` so the Retry button can reuse
-    // it.)
+    // The native service consumed its verified Update only after successful
+    // artifact hash/signature checks and installation. Keep retry state only
+    // on the error path.
     await disposePending();
   } catch (e) {
     retryAction = 'install';

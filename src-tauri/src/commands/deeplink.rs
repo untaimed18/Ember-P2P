@@ -21,6 +21,121 @@ const MAX_COLLECTION_BYTES: u64 = 32 * 1024 * 1024;
 const PENDING_QUEUE_FILE: &str = "pending_deep_links.json";
 static NEXT_PENDING_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DeepLinkPreview {
+    pub kind: String,
+    pub name: Option<String>,
+    pub size: Option<u64>,
+    pub hash: Option<String>,
+    pub endpoint: Option<String>,
+    pub host: Option<String>,
+}
+
+fn ed2k_segments(link: &str) -> Vec<&str> {
+    link.get("ed2k://|".len()..)
+        .unwrap_or_default()
+        .split('|')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty() && *segment != "/")
+        .collect()
+}
+
+pub(crate) fn preview_deep_link_payload(payload: &str) -> Result<DeepLinkPreview, String> {
+    let payload = payload.trim();
+    let lower = payload.to_ascii_lowercase();
+    if lower.starts_with("ed2k://|file|") {
+        let info = crate::commands::search::parse_ed2k_link(payload.to_string())?;
+        return Ok(DeepLinkPreview {
+            kind: "file".into(),
+            name: Some(crate::security::sanitize_remote_text(&info.name, 8192)),
+            size: Some(info.size),
+            hash: Some(info.hash.to_ascii_lowercase()),
+            endpoint: None,
+            host: None,
+        });
+    }
+    if lower.starts_with("ed2k://|server|") {
+        let segments = ed2k_segments(payload);
+        let ip = segments.get(1).copied().unwrap_or_default();
+        let port = segments
+            .get(2)
+            .and_then(|value| value.parse::<u16>().ok())
+            .filter(|port| *port > 0)
+            .ok_or_else(|| coded("deeplink_terminal_invalid", "Invalid server deep link"))?;
+        let ip: std::net::IpAddr = ip
+            .parse()
+            .map_err(|_| coded("deeplink_terminal_invalid", "Invalid server deep link"))?;
+        return Ok(DeepLinkPreview {
+            kind: "server".into(),
+            name: None,
+            size: None,
+            hash: None,
+            endpoint: Some(format!("{ip}:{port}")),
+            host: None,
+        });
+    }
+    if lower.starts_with("ed2k://|serverlist|") {
+        let segments = ed2k_segments(payload);
+        let url = segments.get(1).copied().unwrap_or_default();
+        let parsed = url::Url::parse(url)
+            .map_err(|_| coded("deeplink_terminal_invalid", "Invalid server-list deep link"))?;
+        if parsed.scheme() != "https" {
+            return Err(coded(
+                "deeplink_terminal_invalid",
+                "Server-list links must use HTTPS",
+            ));
+        }
+        let host = parsed
+            .host_str()
+            .map(|host| crate::security::sanitize_remote_text(host, 255))
+            .filter(|host| !host.is_empty())
+            .ok_or_else(|| {
+                coded(
+                    "deeplink_terminal_invalid",
+                    "Server-list link has no valid host",
+                )
+            })?;
+        return Ok(DeepLinkPreview {
+            kind: "serverList".into(),
+            name: None,
+            size: None,
+            hash: None,
+            endpoint: None,
+            host: Some(host),
+        });
+    }
+    if !lower.starts_with("ed2k://") && lower.ends_with(".emulecollection") {
+        let name = std::path::Path::new(payload)
+            .file_name()
+            .map(|name| crate::security::sanitize_remote_text(&name.to_string_lossy(), 1024))
+            .filter(|name| !name.is_empty());
+        return Ok(DeepLinkPreview {
+            kind: "collection".into(),
+            name,
+            size: None,
+            hash: None,
+            endpoint: None,
+            host: None,
+        });
+    }
+    Err(coded(
+        "deeplink_terminal_invalid",
+        "Unsupported or malformed deep link",
+    ))
+}
+
+#[tauri::command]
+pub fn preview_deep_link(payload: String) -> Result<DeepLinkPreview, String> {
+    if payload.len() > MAX_PAYLOAD_LEN {
+        return Err(coded(
+            "deeplink_terminal_invalid",
+            "Deep link exceeds the maximum length",
+        ));
+    }
+    preview_deep_link_payload(&payload)
+}
+
 fn pending_queue_path(app: &AppHandle) -> std::path::PathBuf {
     crate::storage::paths::resolve_data_dir_with_app(app).join(PENDING_QUEUE_FILE)
 }
@@ -33,7 +148,7 @@ fn persist_pending_queue(app: &AppHandle, entries: &[PendingDeepLink]) -> Result
             e,
         )
     })?;
-    crate::security::atomic_write(&pending_queue_path(app), &data, false)
+    crate::security::atomic_write(&pending_queue_path(app), &data, true)
         .map_err(|e| coded_ctx("deeplink_queue_save_failed", "Deep-link queue error", e))
 }
 
@@ -231,4 +346,39 @@ pub async fn open_collection_file(path: String) -> Result<Collection, String> {
     })
     .await
     .map_err(|e| coded_ctx("collections_load_task_failed", "Load task failed", e))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn previews_sanitize_and_classify_confirmation_details() {
+        let file = preview_deep_link_payload(
+            "ed2k://|file|report\u{202E}fdp.exe|42|0123456789abcdef0123456789abcdef|/",
+        )
+        .unwrap();
+        assert_eq!(file.kind, "file");
+        assert_eq!(file.name.as_deref(), Some("reportfdp.exe"));
+        assert_eq!(file.size, Some(42));
+        assert_eq!(
+            file.hash.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+
+        let server = preview_deep_link_payload("ed2k://|server|203.0.113.8|4661|/").unwrap();
+        assert_eq!(server.endpoint.as_deref(), Some("203.0.113.8:4661"));
+
+        let list =
+            preview_deep_link_payload("ed2k://|serverlist|https://example.test/server.met|/")
+                .unwrap();
+        assert_eq!(list.host.as_deref(), Some("example.test"));
+    }
+
+    #[test]
+    fn permanently_malformed_links_are_terminal_errors() {
+        assert!(preview_deep_link_payload("ed2k://|server|not-an-ip|0|/").is_err());
+        assert!(preview_deep_link_payload("ed2k://|serverlist|http://example.test/x|/").is_err());
+        assert!(preview_deep_link_payload("ed2k://|unknown|value|/").is_err());
+    }
 }

@@ -15,6 +15,7 @@
     confirmLabel = m.confirm_default_button(),
     cancelLabel = m.common_cancel(),
     danger = false,
+    isolateMessage = false,
     // When true, render as a single-button informational alert: the Cancel
     // button is hidden and the confirm button acts as a plain "dismiss". The
     // overlay/Escape still close it. Defaults false so existing confirm dialogs
@@ -29,6 +30,7 @@
     confirmLabel?: string;
     cancelLabel?: string;
     danger?: boolean;
+    isolateMessage?: boolean;
     alert?: boolean;
     onconfirm?: () => void;
     oncancel?: () => void;
@@ -144,7 +146,9 @@
       transition:scale={{ start: 0.96, opacity: 0, duration: prefersReducedMotion.current ? 0 : 200 }}
     >
       <h3 id="confirm-title-{instanceId}">{title}</h3>
-      <p id="confirm-message-{instanceId}">{message}</p>
+      <p id="confirm-message-{instanceId}">
+        {#if isolateMessage}<bdi dir="auto">{message}</bdi>{:else}{message}{/if}
+      </p>
       <div class="dialog-actions">
         {#if !alert}
           <button class="ghost" onclick={handleCancel} disabled={actionTaken}>{cancelLabel}</button>

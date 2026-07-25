@@ -6,6 +6,19 @@ export interface PendingDeepLink {
   payload: string;
 }
 
+export interface DeepLinkPreview {
+  kind: 'file' | 'server' | 'serverList' | 'collection';
+  name?: string;
+  size?: number;
+  hash?: string;
+  endpoint?: string;
+  host?: string;
+}
+
+export async function previewDeepLink(payload: string): Promise<DeepLinkPreview> {
+  return invoke('preview_deep_link', { payload });
+}
+
 /** Lists durable pending links. A link remains queued until it is acknowledged. */
 export async function listPendingDeepLinks(): Promise<PendingDeepLink[]> {
   return invoke('list_pending_deep_links');

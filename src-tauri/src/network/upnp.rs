@@ -14,6 +14,65 @@ const RENEW_AFTER: Duration = Duration::from_secs(45 * 60);
 /// on the network task: at startup it gates the rest of network init, and
 /// during `maintain` re-discovery it stalls the select loop while it waits.
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_MAPPING_ENTRIES_TO_INSPECT: u32 = 256;
+const MAPPING_INSPECTION_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MappingOwnership {
+    Missing,
+    EmberOwned,
+    Foreign,
+    Unknown,
+}
+
+fn mapping_entry_is_ember_owned(
+    entry: &igd_next::PortMappingEntry,
+    protocol: igd_next::PortMappingProtocol,
+    port: u16,
+    local_ip: Ipv4Addr,
+    label: &str,
+) -> bool {
+    entry.external_port == port
+        && entry.protocol == protocol
+        && entry.internal_port == port
+        && entry
+            .internal_client
+            .parse::<Ipv4Addr>()
+            .is_ok_and(|ip| ip == local_ip)
+        && entry.port_mapping_description == label
+}
+
+async fn inspect_mapping(
+    gateway: &Gw,
+    protocol: igd_next::PortMappingProtocol,
+    port: u16,
+    local_ip: Ipv4Addr,
+    label: &str,
+) -> MappingOwnership {
+    let inspect = async {
+        for index in 0..MAX_MAPPING_ENTRIES_TO_INSPECT {
+            match gateway.get_generic_port_mapping_entry(index).await {
+                Ok(entry) if entry.external_port == port && entry.protocol == protocol => {
+                    return if mapping_entry_is_ember_owned(&entry, protocol, port, local_ip, label)
+                    {
+                        MappingOwnership::EmberOwned
+                    } else {
+                        MappingOwnership::Foreign
+                    };
+                }
+                Ok(_) => {}
+                Err(igd_next::GetGenericPortMappingEntryError::SpecifiedArrayIndexInvalid) => {
+                    return MappingOwnership::Missing;
+                }
+                Err(_) => return MappingOwnership::Unknown,
+            }
+        }
+        MappingOwnership::Unknown
+    };
+    tokio::time::timeout(MAPPING_INSPECTION_TIMEOUT, inspect)
+        .await
+        .unwrap_or(MappingOwnership::Unknown)
+}
 
 #[derive(Clone)]
 pub struct UpnpMappings {
@@ -94,7 +153,23 @@ impl UpnpMappings {
                 }
             }
             Err(igd_next::AddPortError::PortInUse) => {
-                let _ = gateway.remove_port(protocol, port).await;
+                match inspect_mapping(gateway, protocol, port, local_ip, label).await {
+                    MappingOwnership::EmberOwned => {}
+                    MappingOwnership::Foreign => {
+                        info!("UPnP: refusing to replace foreign {proto} mapping on port {port}");
+                        return false;
+                    }
+                    MappingOwnership::Missing | MappingOwnership::Unknown => {
+                        debug!(
+                            "UPnP: port {port}/{proto} is reported in use but ownership cannot be proven"
+                        );
+                        return false;
+                    }
+                }
+                if let Err(e) = gateway.remove_port(protocol, port).await {
+                    debug!("UPnP: failed to remove owned {proto} mapping on port {port}: {e}");
+                    return false;
+                }
                 match gateway
                     .add_port(protocol, port, local, LEASE_SECS, label)
                     .await
@@ -285,22 +360,62 @@ impl UpnpMappings {
 
     pub async fn teardown(&mut self) {
         if let Some(ref gateway) = self.gateway {
+            let local_ip = local_ipv4(gateway.addr);
             if self.tcp_mapped {
-                let _ = gateway
-                    .remove_port(igd_next::PortMappingProtocol::TCP, self.tcp_port)
-                    .await;
+                if let Some(local_ip) = local_ip {
+                    if inspect_mapping(
+                        gateway,
+                        igd_next::PortMappingProtocol::TCP,
+                        self.tcp_port,
+                        local_ip,
+                        "Ember P2P TCP",
+                    )
+                    .await
+                        == MappingOwnership::EmberOwned
+                    {
+                        let _ = gateway
+                            .remove_port(igd_next::PortMappingProtocol::TCP, self.tcp_port)
+                            .await;
+                    }
+                }
             }
             if self.udp_mapped {
-                let _ = gateway
-                    .remove_port(igd_next::PortMappingProtocol::UDP, self.udp_port)
-                    .await;
+                if let Some(local_ip) = local_ip {
+                    if inspect_mapping(
+                        gateway,
+                        igd_next::PortMappingProtocol::UDP,
+                        self.udp_port,
+                        local_ip,
+                        "Ember P2P UDP",
+                    )
+                    .await
+                        == MappingOwnership::EmberOwned
+                    {
+                        let _ = gateway
+                            .remove_port(igd_next::PortMappingProtocol::UDP, self.udp_port)
+                            .await;
+                    }
+                }
             }
             if self.quic_mapped {
                 if let Some(qp) = self.quic_port {
                     if qp != self.udp_port {
-                        let _ = gateway
-                            .remove_port(igd_next::PortMappingProtocol::UDP, qp)
-                            .await;
+                        if let Some(local_ip) = local_ip {
+                            if inspect_mapping(
+                                gateway,
+                                igd_next::PortMappingProtocol::UDP,
+                                qp,
+                                local_ip,
+                                "Ember P2P QUIC",
+                            )
+                            .await
+                                == MappingOwnership::EmberOwned
+                            {
+                                let _ = gateway
+                                    .remove_port(igd_next::PortMappingProtocol::UDP, qp)
+                                    .await;
+                            }
+                        }
                     }
                 }
             }
@@ -402,6 +517,45 @@ mod tests {
         assert_eq!(discovery_backoff_mins(3), 40);
         assert_eq!(discovery_backoff_mins(4), 60);
         assert_eq!(discovery_backoff_mins(100), 60);
+    }
+
+    #[test]
+    fn ownership_requires_client_port_protocol_and_description() {
+        let local_ip = Ipv4Addr::new(192, 168, 1, 20);
+        let mut entry = igd_next::PortMappingEntry {
+            remote_host: String::new(),
+            external_port: 4662,
+            protocol: igd_next::PortMappingProtocol::TCP,
+            internal_port: 4662,
+            internal_client: local_ip.to_string(),
+            enabled: true,
+            port_mapping_description: "Ember P2P TCP".to_string(),
+            lease_duration: LEASE_SECS,
+        };
+        assert!(mapping_entry_is_ember_owned(
+            &entry,
+            igd_next::PortMappingProtocol::TCP,
+            4662,
+            local_ip,
+            "Ember P2P TCP"
+        ));
+        entry.port_mapping_description = "Someone else's mapping".to_string();
+        assert!(!mapping_entry_is_ember_owned(
+            &entry,
+            igd_next::PortMappingProtocol::TCP,
+            4662,
+            local_ip,
+            "Ember P2P TCP"
+        ));
+        entry.port_mapping_description = "Ember P2P TCP".to_string();
+        entry.internal_client = "192.168.1.21".to_string();
+        assert!(!mapping_entry_is_ember_owned(
+            &entry,
+            igd_next::PortMappingProtocol::TCP,
+            4662,
+            local_ip,
+            "Ember P2P TCP"
+        ));
     }
 
     #[test]

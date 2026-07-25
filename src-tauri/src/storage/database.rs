@@ -1,16 +1,29 @@
 use parking_lot::Mutex;
 
+use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{Key as ChaChaKey, XChaCha20Poly1305, XNonce};
+use rand::{rngs::OsRng, RngCore};
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 use tracing::info;
+use zeroize::Zeroizing;
 
 use crate::storage::paths;
 use crate::types::*;
 
 const MAX_PEERS_ROWS: i64 = 10_000;
 const MAX_DOWNLOAD_HISTORY_ROWS: i64 = 5_000;
+const CHAT_KEY_FILE: &str = "chat-history.key";
+const CHAT_CIPHERTEXT_PREFIX: &str = "EMBRCHAT1:";
+const CHAT_NONCE_LEN: usize = 24;
+const CHAT_AAD_DOMAIN: &[u8] = b"ember-chat-db-row-v1\0";
 
 pub struct Database {
     conn: Mutex<Connection>,
+    /// Dedicated random key for chat-history encryption. It is stored beside
+    /// the database through `secret_store` (DPAPI on Windows) and zeroized
+    /// when the last Database handle is dropped.
+    chat_key: Zeroizing<[u8; 32]>,
     /// Set when `ember.db` was corrupt at open time and replaced after backup.
     /// Startup surfaces a non-silent notice (same pattern as config recovery).
     pub corrupt_backup: Option<std::path::PathBuf>,
@@ -55,8 +68,35 @@ impl Database {
     }
 
     fn open_at(db_path: &std::path::Path) -> anyhow::Result<Self> {
-        let conn = Connection::open(&db_path)?;
-        crate::security::restrict_file_permissions(&db_path);
+        // Repair ACLs before SQLite touches the main file or its WAL/SHM
+        // sidecars. A prior ACL-hardening bug could leave those sidecars with
+        // an empty DACL, in which case `Connection::open` fails before the
+        // post-open permission pass has a chance to repair them.
+        #[cfg(target_os = "windows")]
+        {
+            for path in std::iter::once(db_path.to_path_buf()).chain(
+                ["-wal", "-shm"].into_iter().map(|suffix| {
+                    let mut sidecar = db_path.as_os_str().to_os_string();
+                    sidecar.push(suffix);
+                    std::path::PathBuf::from(sidecar)
+                }),
+            ) {
+                match std::fs::symlink_metadata(&path) {
+                    Ok(_) => crate::security::restrict_file_permissions_checked(&path)?,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    // An empty DACL makes metadata itself fail. Attempt ACL
+                    // repair by pathname; the file owner still has WRITE_DAC.
+                    Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                        crate::security::restrict_file_permissions_checked(&path)?;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+
+        let conn = Connection::open(db_path)?;
+        crate::security::restrict_file_permissions_checked(&db_path)?;
+        let chat_key = Self::load_or_create_chat_key(db_path, &conn)?;
 
         let quick_check: String = conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
         if !quick_check.eq_ignore_ascii_case("ok") {
@@ -74,15 +114,182 @@ impl Database {
              PRAGMA secure_delete=ON;\
              PRAGMA busy_timeout=5000;",
         )?;
+        // SQLite may create WAL/SHM sidecars as soon as journal_mode changes.
+        // They contain the same sensitive rows as the main database.
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = db_path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            let sidecar = std::path::PathBuf::from(sidecar);
+            if sidecar.exists() {
+                crate::security::restrict_file_permissions_checked(&sidecar)?;
+            }
+        }
 
         let db = Self {
             conn: Mutex::new(conn),
+            chat_key: Zeroizing::new(chat_key),
             corrupt_backup: None,
         };
         db.run_migrations()?;
 
         info!("Database initialized");
         Ok(db)
+    }
+
+    fn load_or_create_chat_key(
+        db_path: &std::path::Path,
+        conn: &Connection,
+    ) -> anyhow::Result<[u8; 32]> {
+        let key_path = db_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join(CHAT_KEY_FILE);
+        match std::fs::read(&key_path) {
+            Ok(stored) => {
+                let was_protected = crate::storage::secret_store::is_protected(&stored);
+                let plaintext = crate::storage::secret_store::unprotect(&stored).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Chat history encryption key could not be recovered. Restore {} under \
+                         the original Windows account, or restore it from backup; history will \
+                         not be opened or replaced automatically: {e}",
+                        key_path.display()
+                    )
+                })?;
+                let key: [u8; 32] = plaintext.try_into().map_err(|bytes: Vec<u8>| {
+                    anyhow::anyhow!(
+                        "Chat history encryption key has invalid length {} (expected 32). \
+                         Refusing to open history.",
+                        bytes.len()
+                    )
+                })?;
+                // Transparently wrap a legacy restricted plaintext key. Never
+                // rewrite a key that failed unprotect/validation.
+                if !was_protected {
+                    let protected = crate::storage::secret_store::protect(&key)?;
+                    crate::security::atomic_write(&key_path, &protected, true)?;
+                }
+                Ok(key)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Losing this file must never silently rotate the key while
+                // encrypted rows still exist. That would make valid history
+                // look corrupt and could encourage destructive recovery.
+                let has_chat_table: bool = conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                         WHERE type='table' AND name='chat_messages')",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(false);
+                let has_encrypted_rows = has_chat_table
+                    && conn
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM chat_messages \
+                             WHERE message LIKE 'EMBRCHAT1:%' LIMIT 1)",
+                            [],
+                            |row| row.get::<_, bool>(0),
+                        )
+                        .unwrap_or(false);
+                if has_encrypted_rows {
+                    anyhow::bail!(
+                        "Chat history encryption key is missing at {}. Restore the key from \
+                         backup; refusing to generate a replacement or expose/drop history.",
+                        key_path.display()
+                    );
+                }
+                let mut key = [0u8; 32];
+                OsRng.fill_bytes(&mut key);
+                let protected = crate::storage::secret_store::protect(&key)?;
+                crate::security::atomic_write(&key_path, &protected, true)?;
+                Ok(key)
+            }
+            Err(error) => Err(anyhow::anyhow!(
+                "Failed to read chat history encryption key at {}: {error}",
+                key_path.display()
+            )),
+        }
+    }
+
+    fn chat_row_aad(id: i64, friend_hash: &str, direction: &str, timestamp: i64) -> Vec<u8> {
+        let mut aad = Vec::with_capacity(
+            CHAT_AAD_DOMAIN.len() + 8 + 8 + 4 + friend_hash.len() + 4 + direction.len(),
+        );
+        aad.extend_from_slice(CHAT_AAD_DOMAIN);
+        aad.extend_from_slice(&id.to_le_bytes());
+        aad.extend_from_slice(&timestamp.to_le_bytes());
+        aad.extend_from_slice(&(friend_hash.len() as u32).to_le_bytes());
+        aad.extend_from_slice(friend_hash.as_bytes());
+        aad.extend_from_slice(&(direction.len() as u32).to_le_bytes());
+        aad.extend_from_slice(direction.as_bytes());
+        aad
+    }
+
+    fn encrypt_chat_body(
+        key: &[u8; 32],
+        id: i64,
+        friend_hash: &str,
+        direction: &str,
+        timestamp: i64,
+        plaintext: &str,
+    ) -> anyhow::Result<String> {
+        let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(key));
+        let mut nonce = [0u8; CHAT_NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce);
+        let aad = Self::chat_row_aad(id, friend_hash, direction, timestamp);
+        let encrypted = cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: plaintext.as_bytes(),
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| anyhow::anyhow!("Failed to encrypt chat history row"))?;
+        let mut envelope = Vec::with_capacity(CHAT_NONCE_LEN + encrypted.len());
+        envelope.extend_from_slice(&nonce);
+        envelope.extend_from_slice(&encrypted);
+        Ok(format!(
+            "{CHAT_CIPHERTEXT_PREFIX}{}",
+            STANDARD_NO_PAD.encode(envelope)
+        ))
+    }
+
+    fn decrypt_chat_body(
+        key: &[u8; 32],
+        id: i64,
+        friend_hash: &str,
+        direction: &str,
+        timestamp: i64,
+        stored: &str,
+    ) -> anyhow::Result<String> {
+        let encoded = stored.strip_prefix(CHAT_CIPHERTEXT_PREFIX).ok_or_else(|| {
+            anyhow::anyhow!("Chat history row {id} is not encrypted; refusing plaintext fallback")
+        })?;
+        let envelope = STANDARD_NO_PAD
+            .decode(encoded)
+            .map_err(|_| anyhow::anyhow!("Chat history row {id} has an invalid ciphertext"))?;
+        if envelope.len() < CHAT_NONCE_LEN + 16 {
+            anyhow::bail!("Chat history row {id} has a truncated ciphertext");
+        }
+        let aad = Self::chat_row_aad(id, friend_hash, direction, timestamp);
+        let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(key));
+        let plaintext = cipher
+            .decrypt(
+                XNonce::from_slice(&envelope[..CHAT_NONCE_LEN]),
+                Payload {
+                    msg: &envelope[CHAT_NONCE_LEN..],
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Chat history authentication failed for row {id}; the database or key may \
+                     be damaged. Restore both from the same backup."
+                )
+            })?;
+        String::from_utf8(plaintext)
+            .map_err(|_| anyhow::anyhow!("Chat history row {id} decrypted to invalid UTF-8"))
     }
 
     fn is_corruption_error(error: &anyhow::Error) -> bool {
@@ -111,7 +318,7 @@ impl Database {
         }
 
         Self::move_database_file(db_path, &backup)?;
-        crate::security::restrict_file_permissions(&backup);
+        crate::security::restrict_file_permissions_checked(&backup)?;
 
         // Preserve WAL sidecars under matching backup names. Leaving a stale
         // sidecar beside the new database could make SQLite associate old
@@ -127,7 +334,7 @@ impl Database {
             destination_name.push(sidecar);
             let destination = std::path::PathBuf::from(destination_name);
             Self::move_database_file(&source, &destination)?;
-            crate::security::restrict_file_permissions(&destination);
+            crate::security::restrict_file_permissions_checked(&destination)?;
         }
 
         Ok(backup)
@@ -174,7 +381,7 @@ impl Database {
         // Ember build. Silently running would invite subtle data corruption
         // (missing columns, renamed tables, semantic changes). Bump this
         // when introducing a new migration.
-        const MAX_SUPPORTED_VERSION: i64 = 21;
+        const MAX_SUPPORTED_VERSION: i64 = 23;
         if version > MAX_SUPPORTED_VERSION {
             anyhow::bail!(
                 "Database schema version {version} is newer than this Ember build supports \
@@ -624,6 +831,113 @@ impl Database {
             tx.commit()?;
         }
 
+        if version < 22 {
+            // Optional trusted AICH master supplied by an ed2k link or
+            // collection. Keeping it on the transfer row carries the pin
+            // through pause/restart without changing any eMule wire format.
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(&tx, "transfers", "expected_aich", "TEXT")?;
+            set_version(&tx, 22)?;
+            tx.commit()?;
+        }
+
+        if version < 23 {
+            // Encrypt all historical chat bodies atomically. The version is
+            // advanced in the same transaction, so a crash leaves either the
+            // complete plaintext v22 database (which retries migration) or a
+            // complete encrypted v23 database—never a mixed committed state.
+            let tx = conn.unchecked_transaction()?;
+            // A few valid legacy/test databases carry only schema metadata
+            // (for example, after an interrupted old migration or a targeted
+            // auto-vacuum repair). Recreate the prerequisite tables before
+            // adding v23 columns so migration remains idempotent instead of
+            // failing with "no such table".
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS friends (
+                    user_hash TEXT PRIMARY KEY,
+                    nickname TEXT NOT NULL DEFAULT '',
+                    added_at INTEGER NOT NULL DEFAULT 0,
+                    last_ip TEXT DEFAULT '',
+                    last_port INTEGER DEFAULT 0,
+                    last_seen INTEGER DEFAULT 0,
+                    mutual INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS friend_requests (
+                    sender_hash TEXT PRIMARY KEY,
+                    sender_nickname TEXT NOT NULL DEFAULT '',
+                    received_at INTEGER NOT NULL DEFAULT 0,
+                    sender_ip TEXT DEFAULT '',
+                    sender_port INTEGER DEFAULT 0,
+                    verified INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS chat_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    friend_hash TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    read INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_chat_messages_friend
+                    ON chat_messages(friend_hash, timestamp);",
+            )?;
+            Self::add_column_if_missing(&tx, "friends", "ed25519_pubkey", "BLOB")?;
+            Self::add_column_if_missing(&tx, "friend_requests", "sender_pubkey", "BLOB")?;
+            let rows = {
+                let mut stmt = tx.prepare(
+                    "SELECT id, friend_hash, direction, message, timestamp \
+                     FROM chat_messages ORDER BY id",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            for (id, friend_hash, direction, stored, timestamp) in rows {
+                let encrypted = if stored.starts_with(CHAT_CIPHERTEXT_PREFIX) {
+                    // A partially prepared/manual database must authenticate,
+                    // not merely carry the marker, before migration completes.
+                    Self::decrypt_chat_body(
+                        &self.chat_key,
+                        id,
+                        &friend_hash,
+                        &direction,
+                        timestamp,
+                        &stored,
+                    )?;
+                    stored
+                } else {
+                    Self::encrypt_chat_body(
+                        &self.chat_key,
+                        id,
+                        &friend_hash,
+                        &direction,
+                        timestamp,
+                        &stored,
+                    )?
+                };
+                tx.execute(
+                    "UPDATE chat_messages SET message = ?1 WHERE id = ?2",
+                    params![encrypted, id],
+                )?;
+            }
+            set_version(&tx, 23)?;
+            tx.commit()?;
+
+            // Remove plaintext remnants from WAL/free pages after the
+            // transactional rewrite. `secure_delete=ON` protects released
+            // cells; checkpoint+VACUUM also rewrites the main file so a raw
+            // database scan cannot recover old message canaries.
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
+            info!("Encrypted local chat history (database v23)");
+        }
+
         Ok(())
     }
 
@@ -851,12 +1165,62 @@ impl Database {
             params![now],
         )?;
         let mut stmt = conn.prepare("SELECT ip FROM banned_ips")?;
-        let ips = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
-            .filter_map(|r| r.ok())
-            .filter_map(|s| s.parse::<std::net::Ipv4Addr>().ok())
-            .collect();
+        let mut ips = Vec::new();
+        for row in stmt.query_map([], |row| row.get::<_, String>(0))? {
+            let value = row?;
+            let parsed = value.parse::<std::net::Ipv4Addr>().map_err(|error| {
+                anyhow::anyhow!("invalid persisted banned IP {value:?}: {error}")
+            })?;
+            ips.push(parsed);
+        }
         Ok(ips)
+    }
+
+    /// Strict startup validation for policy-bearing database rows. Runtime UI
+    /// loaders may skip malformed non-security rows, but bans must never become
+    /// an empty set because one row failed JSON/IP parsing.
+    pub fn validate_security_policy(&self) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        let mut peers = conn.prepare("SELECT id, addresses FROM peers WHERE banned = 1")?;
+        for row in peers.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })? {
+            let (peer_id, addresses_json) = row?;
+            let addresses: Vec<String> =
+                serde_json::from_str(&addresses_json).map_err(|error| {
+                    anyhow::anyhow!("invalid addresses for banned peer {peer_id}: {error}")
+                })?;
+            for address in addresses {
+                let host = address
+                    .rsplit_once(':')
+                    .map(|(host, _)| host)
+                    .unwrap_or(address.as_str());
+                host.parse::<std::net::Ipv4Addr>().map_err(|error| {
+                    anyhow::anyhow!(
+                        "invalid address {address:?} for banned peer {peer_id}: {error}"
+                    )
+                })?;
+            }
+        }
+        let mut banned_ips = conn.prepare("SELECT ip FROM banned_ips")?;
+        for row in banned_ips.query_map([], |row| row.get::<_, String>(0))? {
+            let value = row?;
+            value.parse::<std::net::Ipv4Addr>().map_err(|error| {
+                anyhow::anyhow!("invalid persisted banned IP {value:?}: {error}")
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Explicit user-authorized reset for policy rows that failed startup
+    /// validation. This is never called automatically.
+    pub fn reset_security_policy(&self) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("UPDATE peers SET banned = 0", [])?;
+        tx.execute("DELETE FROM banned_ips", [])?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn save_transfer(&self, transfer: &Transfer) -> anyhow::Result<()> {
@@ -880,8 +1244,8 @@ impl Database {
             TransferStatus::NoneNeeded => "noneneeded",
         };
         conn.execute(
-            "INSERT INTO transfers (id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at, priority, category)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            "INSERT INTO transfers (id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at, priority, category, expected_aich)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
              ON CONFLICT(id) DO UPDATE SET
                file_name = excluded.file_name,
                file_hash = excluded.file_hash,
@@ -895,7 +1259,8 @@ impl Database {
                transferred = excluded.transferred,
                started_at = excluded.started_at,
                priority = excluded.priority,
-               category = excluded.category",
+               category = excluded.category,
+               expected_aich = excluded.expected_aich",
             params![
                 transfer.id,
                 transfer.file_name,
@@ -911,98 +1276,126 @@ impl Database {
                 transfer.started_at,
                 transfer.priority,
                 transfer.category,
+                transfer.expected_aich,
             ],
         )?;
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn get_incomplete_downloads(&self) -> anyhow::Result<Vec<Transfer>> {
+        self.get_incomplete_downloads_page(usize::MAX, 0)
+    }
+
+    pub fn get_incomplete_downloads_page(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<Vec<Transfer>> {
         let conn = self.conn.lock();
         // Include `failed` so Temp `.part` files for hash-failed downloads are
         // still owned by a known transfer id and survive orphan sweep. They are
         // restored into the manager as Failed (not auto-started).
         let mut stmt = conn.prepare(
-            "SELECT id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at, priority, category
-             FROM transfers WHERE status NOT IN ('completed', 'noneneeded') AND direction = 'download'"
+            "SELECT id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at, priority, category, expected_aich
+             FROM transfers
+             WHERE status NOT IN ('completed', 'noneneeded')
+               AND status NOT LIKE 'queue_overflow%'
+               AND direction = 'download'
+             ORDER BY started_at ASC, id ASC
+             LIMIT ?1 OFFSET ?2"
         )?;
 
         let transfers = stmt
-            .query_map([], |row| {
-                let direction_str: String = row.get(5)?;
-                let status_str: String = row.get(6)?;
-                let transferred_val = row.get::<_, i64>(10)?.max(0) as u64;
-                Ok(Transfer {
-                    id: row.get(0)?,
-                    // Defense-in-depth: re-sanitize the persisted name on
-                    // restore so a tampered DB row can't reintroduce path
-                    // separators/traversal/reserved names into the path that
-                    // gets built from it at finalize. Idempotent for names
-                    // that were already sanitized when first written.
-                    file_name: crate::security::sanitize_filename(&row.get::<_, String>(1)?),
-                    file_hash: row.get(2)?,
-                    peer_id: row.get(3)?,
-                    peer_name: row.get(4)?,
-                    direction: match direction_str.trim_matches('"') {
-                        "upload" => TransferDirection::Upload,
-                        _ => TransferDirection::Download,
-                    },
-                    status: match status_str.trim_matches('"') {
-                        "searching" => TransferStatus::Searching,
-                        "queued" => TransferStatus::Queued,
-                        "active" => TransferStatus::Active,
-                        "paused" => TransferStatus::Paused,
-                        "stopped" => TransferStatus::Stopped,
-                        "verifying" => TransferStatus::Verifying,
-                        "completing" => TransferStatus::Completing,
-                        "completed" => TransferStatus::Completed,
-                        "failed" => TransferStatus::Failed,
-                        "hashing" => TransferStatus::Hashing,
-                        "insufficient" => TransferStatus::Insufficient,
-                        "noneneeded" => TransferStatus::NoneNeeded,
-                        // A corrupted or future-version status string must
-                        // not silently resume as an active "searching"
-                        // transfer (which would kick off network activity on
-                        // load). Fall back to the inert Stopped state.
-                        _ => TransferStatus::Stopped,
-                    },
-                    progress: row.get(7)?,
-                    speed: row.get::<_, i64>(8)?.max(0) as u64,
-                    total_size: row.get::<_, i64>(9)?.max(0) as u64,
-                    transferred: transferred_val,
-                    completed_size: transferred_val,
-                    started_at: row.get(11)?,
-                    failure_reason: None,
-                    failure_kind: None,
-                    failure_stage: None,
-                    priority: row
-                        .get::<_, String>(12)
-                        .unwrap_or_else(|_| "normal".to_string()),
-                    sources: 0,
-                    active_sources: 0,
-                    queued_sources: 0,
-                    queue_rank: None,
-                    last_seen_complete: None,
-                    last_received: None,
-                    health: TransferHealth::Healthy,
-                    health_reason: None,
-                    stalled_since: None,
-                    category: row.get::<_, String>(13).unwrap_or_default(),
-                    wait_time: 0,
-                    upload_time: 0,
-                    a4af_sources: 0,
-                    max_sources: 0,
-                    preview_priority: false,
-                    preview_ready: false,
-                    ember_sources: 0,
-                    client_software: String::new(),
-                    country_code: None,
-                    user_hash: None,
-                    completed_path: None,
-                    up_part_status: None,
-                    up_part_count: None,
-                    up_peer_part_status: None,
-                })
-            })?
+            .query_map(
+                params![
+                    i64::try_from(limit).unwrap_or(i64::MAX),
+                    i64::try_from(offset).unwrap_or(i64::MAX)
+                ],
+                |row| {
+                    let direction_str: String = row.get(5)?;
+                    let status_str: String = row.get(6)?;
+                    let transferred_val = row.get::<_, i64>(10)?.max(0) as u64;
+                    Ok(Transfer {
+                        id: row.get(0)?,
+                        // Defense-in-depth: re-sanitize the persisted name on
+                        // restore so a tampered DB row can't reintroduce path
+                        // separators/traversal/reserved names into the path that
+                        // gets built from it at finalize. Idempotent for names
+                        // that were already sanitized when first written.
+                        file_name: crate::security::sanitize_filename(&row.get::<_, String>(1)?),
+                        file_hash: row.get(2)?,
+                        peer_id: row.get(3)?,
+                        peer_name: row.get(4)?,
+                        direction: match direction_str.trim_matches('"') {
+                            "upload" => TransferDirection::Upload,
+                            _ => TransferDirection::Download,
+                        },
+                        status: match status_str.trim_matches('"') {
+                            "searching" => TransferStatus::Searching,
+                            "queued" => TransferStatus::Queued,
+                            "active" => TransferStatus::Active,
+                            "paused" => TransferStatus::Paused,
+                            "stopped" => TransferStatus::Stopped,
+                            "verifying" => TransferStatus::Verifying,
+                            "completing" => TransferStatus::Completing,
+                            "completed" => TransferStatus::Completed,
+                            "failed" => TransferStatus::Failed,
+                            "hashing" => TransferStatus::Hashing,
+                            "insufficient" => TransferStatus::Insufficient,
+                            "noneneeded" => TransferStatus::NoneNeeded,
+                            // A corrupted or future-version status string must
+                            // not silently resume as an active "searching"
+                            // transfer (which would kick off network activity on
+                            // load). Fall back to the inert Stopped state.
+                            _ => TransferStatus::Stopped,
+                        },
+                        progress: row.get(7)?,
+                        speed: row.get::<_, i64>(8)?.max(0) as u64,
+                        total_size: row.get::<_, i64>(9)?.max(0) as u64,
+                        transferred: transferred_val,
+                        completed_size: transferred_val,
+                        started_at: row.get(11)?,
+                        failure_reason: None,
+                        failure_kind: None,
+                        failure_stage: None,
+                        priority: row
+                            .get::<_, String>(12)
+                            .unwrap_or_else(|_| "normal".to_string()),
+                        sources: 0,
+                        active_sources: 0,
+                        queued_sources: 0,
+                        queue_rank: None,
+                        last_seen_complete: None,
+                        last_received: None,
+                        health: TransferHealth::Healthy,
+                        health_reason: None,
+                        stalled_since: None,
+                        category: row.get::<_, String>(13).unwrap_or_default(),
+                        wait_time: 0,
+                        upload_time: 0,
+                        a4af_sources: 0,
+                        max_sources: 0,
+                        preview_priority: false,
+                        preview_ready: false,
+                        ember_sources: 0,
+                        client_software: String::new(),
+                        country_code: None,
+                        user_hash: None,
+                        expected_aich: row
+                            .get::<_, Option<String>>(14)?
+                            .filter(|value| {
+                                value.len() == 40
+                                    && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                            })
+                            .map(|value| value.to_ascii_lowercase()),
+                        completed_path: None,
+                        up_part_status: None,
+                        up_part_count: None,
+                        up_peer_part_status: None,
+                    })
+                },
+            )?
             .filter_map(|r| match r {
                 Ok(v) => Some(v),
                 Err(e) => {
@@ -1015,10 +1408,90 @@ impl Database {
         Ok(transfers)
     }
 
+    /// Deterministically quarantine legacy pending rows beyond the one global
+    /// count/remaining-byte budget. Rows are retained (never deleted) and stay
+    /// tagged until the frontend acknowledges the migration notice.
+    pub fn quarantine_excess_pending_downloads(
+        &self,
+        max_count: usize,
+        max_remaining_bytes: u64,
+    ) -> anyhow::Result<usize> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "WITH ranked AS (
+                 SELECT id,
+                        ROW_NUMBER() OVER (ORDER BY started_at ASC, id ASC) AS row_num,
+                        MAX(total_size - transferred, 0) AS remaining
+                 FROM transfers
+                 WHERE status NOT IN ('completed', 'noneneeded')
+                   AND status NOT LIKE 'queue_overflow%'
+                   AND direction = 'download'
+             ),
+             ordered AS (
+                 SELECT id,
+                        row_num,
+                        SUM(
+                            CASE
+                                WHEN row_num <= ?1 THEN MIN(remaining, ?2 + 1)
+                                ELSE 0
+                            END
+                        ) OVER (ORDER BY row_num ASC) AS remaining_sum
+                 FROM ranked
+             )
+             UPDATE transfers
+                SET status = 'queue_overflow'
+              WHERE id IN (
+                  SELECT id FROM ordered
+                   WHERE row_num > ?1 OR remaining_sum > ?2
+              )",
+            params![
+                i64::try_from(max_count).unwrap_or(i64::MAX),
+                i64::try_from(max_remaining_bytes).unwrap_or(i64::MAX)
+            ],
+        )?;
+        Ok(conn.changes() as usize)
+    }
+
+    /// Mark an overflow migration notice as seen and return its row count.
+    pub fn acknowledge_pending_download_overflow(&self) -> anyhow::Result<usize> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM transfers WHERE status = 'queue_overflow'",
+            [],
+            |row| row.get(0),
+        )?;
+        if count > 0 {
+            tx.execute(
+                "UPDATE transfers
+                    SET status = 'queue_overflow_acknowledged'
+                  WHERE status = 'queue_overflow'",
+                [],
+            )?;
+        }
+        tx.commit()?;
+        Ok(count.max(0) as usize)
+    }
+
     pub fn transfer_exists(&self, transfer_id: &str) -> bool {
         let conn = self.conn.lock();
         conn.query_row(
             "SELECT 1 FROM transfers WHERE id = ?1",
+            params![transfer_id],
+            |_| Ok(()),
+        )
+        .is_ok()
+    }
+
+    /// Whether a durable, non-terminal download row still owns its `.part`
+    /// files even if the row was quarantined instead of restored in memory.
+    pub fn incomplete_download_owns_partial(&self, transfer_id: &str) -> bool {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT 1 FROM transfers
+              WHERE id = ?1
+                AND direction = 'download'
+                AND status NOT IN ('completed', 'noneneeded')",
             params![transfer_id],
             |_| Ok(()),
         )
@@ -1559,17 +2032,59 @@ impl Database {
         Ok(())
     }
 
-    pub fn add_friend(&self, user_hash: &str, nickname: &str) -> anyhow::Result<()> {
+    pub fn add_friend(
+        &self,
+        user_hash: &str,
+        nickname: &str,
+        ed25519_pubkey: Option<&[u8; 32]>,
+    ) -> anyhow::Result<()> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         let now = chrono::Utc::now().timestamp();
         tx.execute(
-            "INSERT INTO friends (user_hash, nickname, added_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(user_hash) DO UPDATE SET nickname = excluded.nickname",
-            params![user_hash, nickname, now],
+            "INSERT INTO friends (user_hash, nickname, added_at, ed25519_pubkey) \
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(user_hash) DO UPDATE SET nickname = excluded.nickname,
+             ed25519_pubkey = COALESCE(excluded.ed25519_pubkey, friends.ed25519_pubkey)",
+            params![
+                user_hash,
+                nickname,
+                now,
+                ed25519_pubkey.map(|key| key.as_slice())
+            ],
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn get_friend_public_keys(&self) -> anyhow::Result<Vec<([u8; 16], [u8; 32])>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT user_hash, ed25519_pubkey FROM friends \
+             WHERE ed25519_pubkey IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                let hash_hex: String = row.get(0)?;
+                let pubkey: Vec<u8> = row.get(1)?;
+                Ok((hash_hex, pubkey))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(hash_hex, pubkey)| {
+                let hash_bytes = hex::decode(&hash_hex)?;
+                let hash: [u8; 16] = hash_bytes
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("invalid friend hash in database"))?;
+                let pubkey: [u8; 32] = pubkey
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("invalid friend public key in database"))?;
+                if !crate::network::ember::crypto::verify_ember_hash_binding(&pubkey, &hash) {
+                    anyhow::bail!("friend public key does not match stored friend hash");
+                }
+                Ok((hash, pubkey))
+            })
+            .collect()
     }
 
     pub fn remove_friend(&self, user_hash: &str) -> anyhow::Result<()> {
@@ -1691,6 +2206,7 @@ impl Database {
     pub fn add_friend_request(
         &self,
         sender_hash: &str,
+        sender_pubkey: Option<&[u8; 32]>,
         nickname: &str,
         sender_ip: &str,
         sender_port: u16,
@@ -1762,12 +2278,23 @@ impl Database {
         // re-request from the real user always raises the flag or
         // leaves it unchanged, never lowers it.
         tx.execute(
-            "INSERT INTO friend_requests (sender_hash, sender_nickname, received_at, sender_ip, sender_port, verified)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO friend_requests (sender_hash, sender_nickname, received_at, sender_ip, sender_port, verified, sender_pubkey)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(sender_hash) DO UPDATE SET sender_nickname = excluded.sender_nickname,
              sender_ip = excluded.sender_ip, sender_port = excluded.sender_port,
-             verified = MAX(friend_requests.verified, excluded.verified)",
-            params![sender_hash, nickname, now, sender_ip, sender_port as i64, verified as i64],
+             verified = MAX(friend_requests.verified, excluded.verified),
+             sender_pubkey = CASE WHEN excluded.verified != 0
+                THEN COALESCE(excluded.sender_pubkey, friend_requests.sender_pubkey)
+                ELSE friend_requests.sender_pubkey END",
+            params![
+                sender_hash,
+                nickname,
+                now,
+                sender_ip,
+                sender_port as i64,
+                verified as i64,
+                sender_pubkey.map(|key| key.as_slice())
+            ],
         )?;
         tx.commit()?;
         Ok(())
@@ -1839,9 +2366,9 @@ impl Database {
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
 
-        let request_data: Option<(String, String, u16)> = {
+        let request_data: Option<(String, String, u16, Option<Vec<u8>>)> = {
             let mut stmt = tx.prepare(
-                "SELECT sender_nickname, COALESCE(sender_ip, ''), COALESCE(sender_port, 0) \
+                "SELECT sender_nickname, COALESCE(sender_ip, ''), COALESCE(sender_port, 0), sender_pubkey \
                  FROM friend_requests WHERE sender_hash = ?1",
             )?;
             stmt.query_row(params![sender_hash], |row| {
@@ -1849,6 +2376,7 @@ impl Database {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?.clamp(0, u16::MAX as i64) as u16,
+                    row.get::<_, Option<Vec<u8>>>(3)?,
                 ))
             })
             .ok()
@@ -1875,13 +2403,15 @@ impl Database {
         // `added_at` is intentionally NOT overwritten on conflict so
         // long-standing friends keep their original add timestamp.
         tx.execute(
-            "INSERT INTO friends (user_hash, nickname, added_at, mutual) VALUES (?1, ?2, ?3, 1) \
-             ON CONFLICT(user_hash) DO UPDATE SET nickname = excluded.nickname, mutual = 1",
-            params![sender_hash, nickname, now],
+            "INSERT INTO friends (user_hash, nickname, added_at, mutual, ed25519_pubkey) \
+             VALUES (?1, ?2, ?3, 1, ?4) \
+             ON CONFLICT(user_hash) DO UPDATE SET nickname = excluded.nickname, mutual = 1,
+             ed25519_pubkey = COALESCE(excluded.ed25519_pubkey, friends.ed25519_pubkey)",
+            params![sender_hash, nickname, now, request_data.3.as_deref()],
         )?;
 
         {
-            let (_, ref ip, port) = request_data;
+            let (_, ref ip, port, _) = request_data;
             if !ip.is_empty() && port > 0 {
                 tx.execute(
                     "UPDATE friends SET last_ip = ?2, last_port = ?3, last_seen = ?4 WHERE user_hash = ?1",
@@ -1895,7 +2425,7 @@ impl Database {
             params![sender_hash],
         )?;
         tx.commit()?;
-        Ok(Some(request_data))
+        Ok(Some((request_data.0, request_data.1, request_data.2)))
     }
 
     /// Promote an existing friend to mutual and refresh their last-known
@@ -1905,18 +2435,32 @@ impl Database {
     /// `friend_requests` table (no queued row exists in that flow). Returns
     /// the number of friend rows updated — 0 means the peer wasn't actually in
     /// the friend list, so the caller should fall back to queuing.
-    pub fn set_friend_mutual(&self, user_hash: &str, ip: &str, port: u16) -> anyhow::Result<usize> {
+    pub fn set_friend_mutual(
+        &self,
+        user_hash: &str,
+        ip: &str,
+        port: u16,
+        ed25519_pubkey: Option<&[u8; 32]>,
+    ) -> anyhow::Result<usize> {
         let conn = self.conn.lock();
         let now = chrono::Utc::now().timestamp();
         let updated = if !ip.is_empty() && port > 0 {
             conn.execute(
-                "UPDATE friends SET mutual = 1, last_ip = ?2, last_port = ?3, last_seen = ?4 WHERE user_hash = ?1",
-                params![user_hash, ip, port as i64, now],
+                "UPDATE friends SET mutual = 1, last_ip = ?2, last_port = ?3, last_seen = ?4,
+                 ed25519_pubkey = COALESCE(?5, ed25519_pubkey) WHERE user_hash = ?1",
+                params![
+                    user_hash,
+                    ip,
+                    port as i64,
+                    now,
+                    ed25519_pubkey.map(|key| key.as_slice())
+                ],
             )?
         } else {
             conn.execute(
-                "UPDATE friends SET mutual = 1 WHERE user_hash = ?1",
-                params![user_hash],
+                "UPDATE friends SET mutual = 1,
+                 ed25519_pubkey = COALESCE(?2, ed25519_pubkey) WHERE user_hash = ?1",
+                params![user_hash, ed25519_pubkey.map(|key| key.as_slice())],
             )?
         };
         Ok(updated)
@@ -1955,9 +2499,15 @@ impl Database {
         let now = chrono::Utc::now().timestamp();
         tx.execute(
             "INSERT INTO chat_messages (friend_hash, direction, message, timestamp, read) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![friend_hash, direction, message, now, if direction == "sent" { 1 } else { 0 }],
+            params![friend_hash, direction, CHAT_CIPHERTEXT_PREFIX, now, if direction == "sent" { 1 } else { 0 }],
         )?;
         let new_id = tx.last_insert_rowid();
+        let encrypted =
+            Self::encrypt_chat_body(&self.chat_key, new_id, friend_hash, direction, now, message)?;
+        tx.execute(
+            "UPDATE chat_messages SET message = ?1 WHERE id = ?2",
+            params![encrypted, new_id],
+        )?;
         // Trim oldest messages above the cap. SQLite's `LIMIT -1 OFFSET ?`
         // means "everything past the first ? newest rows"; we delete
         // those. Friend hash is already validated upstream so we can
@@ -1982,41 +2532,48 @@ impl Database {
         before_id: Option<i64>,
     ) -> anyhow::Result<Vec<(i64, String, String, i64, bool)>> {
         let conn = self.conn.lock();
-        if let Some(bid) = before_id {
+        let rows: Vec<(i64, String, String, i64, bool)> = if let Some(bid) = before_id {
             let mut stmt = conn.prepare(
                 "SELECT id, direction, message, timestamp, read FROM chat_messages WHERE friend_hash = ?1 AND id < ?2 ORDER BY id DESC LIMIT ?3"
             )?;
-            let rows = stmt
-                .query_map(params![friend_hash, bid, limit], |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get::<_, i64>(4)? != 0,
-                    ))
-                })?
-                .filter_map(|r| r.ok())
-                .collect();
-            Ok(rows)
+            let mapped = stmt.query_map(params![friend_hash, bid, limit], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get::<_, i64>(4)? != 0,
+                ))
+            })?;
+            mapped.collect::<Result<Vec<_>, _>>()?
         } else {
             let mut stmt = conn.prepare(
                 "SELECT id, direction, message, timestamp, read FROM chat_messages WHERE friend_hash = ?1 ORDER BY id DESC LIMIT ?2"
             )?;
-            let rows = stmt
-                .query_map(params![friend_hash, limit], |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get::<_, i64>(4)? != 0,
-                    ))
-                })?
-                .filter_map(|r| r.ok())
-                .collect();
-            Ok(rows)
-        }
+            let mapped = stmt.query_map(params![friend_hash, limit], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get::<_, i64>(4)? != 0,
+                ))
+            })?;
+            mapped.collect::<Result<Vec<_>, _>>()?
+        };
+        rows.into_iter()
+            .map(|(id, direction, stored, timestamp, read)| {
+                let message = Self::decrypt_chat_body(
+                    &self.chat_key,
+                    id,
+                    friend_hash,
+                    &direction,
+                    timestamp,
+                    &stored,
+                )?;
+                Ok((id, direction, message, timestamp, read))
+            })
+            .collect()
     }
 
     pub fn mark_messages_read(&self, friend_hash: &str) -> anyhow::Result<()> {
@@ -2207,6 +2764,7 @@ mod tests {
         .expect("create schema");
         Database {
             conn: Mutex::new(conn),
+            chat_key: Zeroizing::new([0xA5; 32]),
             corrupt_backup: None,
         }
     }
@@ -2285,6 +2843,7 @@ mod tests {
         .expect("create schema");
         Database {
             conn: Mutex::new(conn),
+            chat_key: Zeroizing::new([0xA5; 32]),
             corrupt_backup: None,
         }
     }
@@ -2311,6 +2870,101 @@ mod tests {
         let mut loaded = db.get_banned_ips().expect("load");
         loaded.sort();
         assert_eq!(loaded, vec![live, permanent], "expired ban must be pruned");
+    }
+
+    #[test]
+    fn malformed_ban_row_fails_closed() {
+        let db = banned_ips_db();
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO banned_ips (ip, reason, banned_at, expires_at) VALUES ('not-an-ip', '', 0, 0)",
+                [],
+            )
+            .unwrap();
+        assert!(db.get_banned_ips().is_err());
+        assert!(db.validate_security_policy().is_err());
+    }
+
+    #[test]
+    fn expected_aich_survives_transfer_restart_load() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-aich-transfer-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let db = Database::open_at(&path).unwrap();
+        let expected = "ab".repeat(20);
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO transfers (
+                    id, file_name, file_hash, peer_id, peer_name, direction, status,
+                    progress, speed, total_size, transferred, started_at, priority,
+                    category, expected_aich
+                 ) VALUES (?1, ?2, ?3, '', '', 'download', 'paused', 0, 0, 4, 0, 1, 'normal', '', ?4)",
+                params!["transfer-aich", "file.bin", "11".repeat(16), expected],
+            )
+            .unwrap();
+        let loaded = db.get_incomplete_downloads().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded[0].expected_aich.as_deref(),
+            Some("abababababababababababababababababababab")
+        );
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn pending_restore_is_paginated_and_overflow_is_quarantined_without_deletion() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-pending-budget-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let db = Database::open_at(&path).unwrap();
+        {
+            let conn = db.conn.lock();
+            for (id, started_at) in [("oldest", 1i64), ("middle", 2), ("newest", 3)] {
+                conn.execute(
+                    "INSERT INTO transfers (
+                        id, file_name, file_hash, peer_id, peer_name, direction, status,
+                        progress, speed, total_size, transferred, started_at, priority,
+                        category, expected_aich
+                     ) VALUES (?1, ?2, ?3, '', '', 'download', 'paused', 0, 0, 10, 0, ?4, 'normal', '', NULL)",
+                    params![id, format!("{id}.bin"), "11".repeat(16), started_at],
+                )
+                .unwrap();
+            }
+        }
+
+        assert_eq!(db.quarantine_excess_pending_downloads(2, 20).unwrap(), 1);
+        let first = db.get_incomplete_downloads_page(1, 0).unwrap();
+        let second = db.get_incomplete_downloads_page(1, 1).unwrap();
+        assert_eq!(first[0].id, "oldest");
+        assert_eq!(second[0].id, "middle");
+        assert!(db.get_incomplete_downloads_page(1, 2).unwrap().is_empty());
+        assert!(
+            db.incomplete_download_owns_partial("newest"),
+            "quarantined rows must keep ownership of user .part data"
+        );
+
+        let total_rows: i64 = db
+            .conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM transfers", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(total_rows, 3, "migration must not delete user rows");
+        assert_eq!(db.acknowledge_pending_download_overflow().unwrap(), 1);
+        assert_eq!(db.acknowledge_pending_download_overflow().unwrap(), 0);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
     /// Re-banning never shortens a permanent ban into a finite one, and
@@ -2355,7 +3009,7 @@ mod tests {
                 |r| r.get(0),
             )
             .expect("version");
-        assert_eq!(version, 21);
+        assert_eq!(version, 23);
         drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
@@ -2382,6 +3036,7 @@ mod tests {
                  CREATE TABLE schema_version (version INTEGER NOT NULL DEFAULT 0);
                  INSERT INTO schema_version (version) VALUES (20);
                  CREATE TABLE statistics (key TEXT PRIMARY KEY, value INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE transfers (id TEXT PRIMARY KEY);
                  CREATE TABLE transfers_v5_backup (id TEXT);
                  CREATE TABLE shared_files_v7_backup (id TEXT);
                  CREATE TABLE settings_v7_backup (key TEXT);",
@@ -2409,9 +3064,172 @@ mod tests {
             )
             .expect("backup count");
         assert_eq!(backups, 0, "v21 must drop legacy backup tables");
+        let expected_aich_column: i64 = db
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('transfers') WHERE name = 'expected_aich'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            expected_aich_column, 1,
+            "v22 must persist optional AICH pins"
+        );
         drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    fn remove_test_database(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::remove_file(parent.join(CHAT_KEY_FILE));
+        }
+    }
+
+    #[test]
+    fn chat_rows_are_encrypted_and_survive_restart_and_pagination() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-chat-encrypted-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ember.db");
+        let canary = "plaintext-canary-chat-7c61";
+        {
+            let db = Database::open_at(&path).expect("open");
+            let first = db
+                .insert_chat_message(&"11".repeat(16), "sent", canary)
+                .unwrap();
+            let second = db
+                .insert_chat_message(&"11".repeat(16), "received", "second")
+                .unwrap();
+            let raw: String = db
+                .conn
+                .lock()
+                .query_row(
+                    "SELECT message FROM chat_messages WHERE id = ?1",
+                    params![first],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(raw.starts_with(CHAT_CIPHERTEXT_PREFIX));
+            assert!(!raw.contains(canary));
+
+            let newest = db.get_chat_messages(&"11".repeat(16), 1, None).unwrap();
+            assert_eq!(newest[0].0, second);
+            assert_eq!(newest[0].2, "second");
+            let older = db
+                .get_chat_messages(&"11".repeat(16), 5, Some(second))
+                .unwrap();
+            assert_eq!(older[0].0, first);
+            assert_eq!(older[0].2, canary);
+        }
+        {
+            let db = Database::open_at(&path).expect("restart");
+            let rows = db.get_chat_messages(&"11".repeat(16), 5, None).unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[1].2, canary);
+        }
+        let raw_db = std::fs::read(&path).unwrap();
+        assert!(
+            !raw_db
+                .windows(canary.len())
+                .any(|window| window == canary.as_bytes()),
+            "database file must not contain the plaintext canary"
+        );
+        remove_test_database(&path);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn chat_ciphertext_tampering_and_wrong_key_fail_closed() {
+        let key = [0x44; 32];
+        let row =
+            Database::encrypt_chat_body(&key, 9, &"22".repeat(16), "sent", 123, "secret").unwrap();
+        let mut envelope = STANDARD_NO_PAD
+            .decode(row.strip_prefix(CHAT_CIPHERTEXT_PREFIX).unwrap())
+            .unwrap();
+        *envelope.last_mut().unwrap() ^= 0x80;
+        let tampered = format!(
+            "{CHAT_CIPHERTEXT_PREFIX}{}",
+            STANDARD_NO_PAD.encode(envelope)
+        );
+        assert!(
+            Database::decrypt_chat_body(&key, 9, &"22".repeat(16), "sent", 123, &tampered).is_err()
+        );
+        assert!(
+            Database::decrypt_chat_body(&[0x45; 32], 9, &"22".repeat(16), "sent", 123, &row)
+                .is_err()
+        );
+        assert!(Database::decrypt_chat_body(
+            &key,
+            9,
+            &"22".repeat(16),
+            "sent",
+            123,
+            "legacy plaintext"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn plaintext_chat_migration_is_transactional_and_authenticated() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-chat-migrate-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ember.db");
+        let canary = "legacy-plaintext-canary-f143";
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO schema_version(version) VALUES (22);
+                 CREATE TABLE friends (
+                    user_hash TEXT PRIMARY KEY, nickname TEXT NOT NULL DEFAULT '',
+                    added_at INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE friend_requests (
+                    sender_hash TEXT PRIMARY KEY, sender_nickname TEXT NOT NULL DEFAULT '',
+                    received_at INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE chat_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    friend_hash TEXT NOT NULL, direction TEXT NOT NULL,
+                    message TEXT NOT NULL, timestamp INTEGER NOT NULL,
+                    read INTEGER NOT NULL DEFAULT 0
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chat_messages(friend_hash,direction,message,timestamp,read) \
+                 VALUES (?1,'received',?2,77,0)",
+                params!["33".repeat(16), canary],
+            )
+            .unwrap();
+        }
+        let db = Database::open_at(&path).expect("migrate");
+        let rows = db.get_chat_messages(&"33".repeat(16), 10, None).unwrap();
+        assert_eq!(rows[0].2, canary);
+        let stored: String = db
+            .conn
+            .lock()
+            .query_row("SELECT message FROM chat_messages", [], |row| row.get(0))
+            .unwrap();
+        assert!(stored.starts_with(CHAT_CIPHERTEXT_PREFIX));
+        drop(db);
+        let raw_db = std::fs::read(&path).unwrap();
+        assert!(!raw_db.windows(canary.len()).any(|w| w == canary.as_bytes()));
+        remove_test_database(&path);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

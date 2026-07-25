@@ -2387,7 +2387,7 @@
             </td>
             <td class="col-name" title={result.file.name}>
               <div class="name-cell-wrap">
-                <button class="ghost link-btn" onclick={() => showFileDetails(result)}>{result.clean_name || result.file.name}</button>
+                <button class="ghost link-btn" onclick={() => showFileDetails(result)}><bdi dir="auto">{result.clean_name || result.file.name}</bdi></button>
                 {#if dlTransfer}
                   <span class="dl-status-badge {dlBadgeClass(dlTransfer)}" title="{dlBadgeLabel(dlTransfer)}: {dlTransfer.file_name}">
                     {dlBadgeLabel(dlTransfer)}
@@ -2578,7 +2578,7 @@
           </button>
         </div>
         <div class="panel-body">
-          <div class="detail-row"><strong>{m.search_detail_name()}</strong> {selectedResult.file.name}</div>
+          <div class="detail-row"><strong>{m.search_detail_name()}</strong> <bdi dir="auto">{selectedResult.file.name}</bdi></div>
           <div class="detail-row"><strong>{m.search_detail_size()}</strong> {formatSize(selectedResult.file.size)}</div>
           <div class="detail-row"><strong>{m.search_detail_hash()}</strong> <code>{selectedResult.file.hash}</code></div>
           <div class="detail-row"><strong>{m.search_detail_sources()}</strong> {selectedResult.availability}</div>
@@ -2590,16 +2590,16 @@
               <div class="detail-row"><strong>{m.search_detail_bitrate()}</strong> {m.search_bitrate_value({ kbps: selectedResult.media.bitrate })}</div>
             {/if}
             {#if selectedResult.media.codec}
-              <div class="detail-row"><strong>{m.search_detail_codec()}</strong> {selectedResult.media.codec}</div>
+              <div class="detail-row"><strong>{m.search_detail_codec()}</strong> <bdi dir="auto">{selectedResult.media.codec}</bdi></div>
             {/if}
             {#if selectedResult.media.artist}
-              <div class="detail-row"><strong>{m.search_detail_artist()}</strong> {selectedResult.media.artist}</div>
+              <div class="detail-row"><strong>{m.search_detail_artist()}</strong> <bdi dir="auto">{selectedResult.media.artist}</bdi></div>
             {/if}
             {#if selectedResult.media.album}
-              <div class="detail-row"><strong>{m.search_detail_album()}</strong> {selectedResult.media.album}</div>
+              <div class="detail-row"><strong>{m.search_detail_album()}</strong> <bdi dir="auto">{selectedResult.media.album}</bdi></div>
             {/if}
             {#if selectedResult.media.title}
-              <div class="detail-row"><strong>{m.search_detail_title()}</strong> {selectedResult.media.title}</div>
+              <div class="detail-row"><strong>{m.search_detail_title()}</strong> <bdi dir="auto">{selectedResult.media.title}</bdi></div>
             {/if}
           {/if}
           <div class="detail-row">
@@ -2663,13 +2663,13 @@
             <div class="notes-list">
               {#each notes as note (note)}
                 <div class="note-item">
-                  <span class="note-peer"><bdi>{note.peer_name || m.search_note_anonymous()}</bdi></span>
+                  <span class="note-peer"><bdi dir="auto">{note.peer_name || m.search_note_anonymous()}</bdi></span>
                   {#if note.rating}
                     {@const r = Math.round(Math.max(0, Math.min(5, note.rating ?? 0)))}
                     <span class="note-rating">{'★'.repeat(r)}{'☆'.repeat(5 - r)}</span>
                   {/if}
                   {#if note.comment}
-                    <span class="note-comment"><bdi>{note.comment}</bdi></span>
+                    <span class="note-comment"><bdi dir="auto">{note.comment}</bdi></span>
                   {/if}
                 </div>
               {/each}

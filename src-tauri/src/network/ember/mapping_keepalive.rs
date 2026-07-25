@@ -26,7 +26,8 @@ use super::nat::{
 /// How often to refresh UDP/TCP mappings (NATMAP-like keep-alive cadence).
 pub const MAPPING_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 
-/// HTTP targets used only to hold a TCP mapping from our listen port.
+/// TCP targets used only to establish a short-lived mapping from our listen
+/// port. We intentionally send no HTTP request or identifying User-Agent.
 const TCP_HOLD_TARGETS: &[(&str, u16)] = &[
     ("connectivitycheck.gstatic.com", 80),
     ("www.msftconnecttest.com", 80),
@@ -209,18 +210,10 @@ async fn tcp_hold_connect(local_port: u16, host: &str, port: u16) -> Result<TcpS
     tcp.bind(bind_addr)
         .map_err(|e| format!("bind {local_port}: {e}"))?;
 
-    let mut stream = tokio::time::timeout(Duration::from_secs(8), tcp.connect(remote))
+    let stream = tokio::time::timeout(Duration::from_secs(8), tcp.connect(remote))
         .await
         .map_err(|_| "connect timeout".to_string())?
         .map_err(|e| format!("connect: {e}"))?;
-
-    let req = format!(
-        "HEAD / HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\nUser-Agent: Ember\r\n\r\n"
-    );
-    tokio::time::timeout(Duration::from_secs(5), stream.write_all(req.as_bytes()))
-        .await
-        .map_err(|_| "HTTP hold write timeout".to_string())?
-        .map_err(|e| format!("HTTP hold write: {e}"))?;
     Ok(stream)
 }
 
@@ -269,5 +262,12 @@ mod tests {
             .iter()
             .all(|server| !server.contains(".l.google.com")));
         assert!(!TCP_STUN_SERVERS.contains(&"stun.cloudflare.com:3478"));
+    }
+
+    #[test]
+    fn tcp_hold_protocol_sends_no_identifying_plaintext() {
+        let source = include_str!("mapping_keepalive.rs");
+        assert!(!source.contains(concat!("User-Agent", ": ", "Ember")));
+        assert!(!source.contains(concat!("HEAD ", "/", " HTTP/1.1")));
     }
 }

@@ -120,11 +120,21 @@ impl NodeIdentity {
     /// generation.
     pub fn load_or_create(data_dir: &Path) -> anyhow::Result<Self> {
         let path = data_dir.join("identity.json");
+        let protected_marker = data_dir.join("identity.protected");
         match std::fs::read(&path) {
             Ok(raw) => {
                 // Unwrap DPAPI at-rest protection. Legacy plaintext files pass
                 // through unchanged and are re-saved in protected form below.
                 let was_protected = crate::storage::secret_store::is_protected(&raw);
+                #[cfg(target_os = "windows")]
+                if protected_marker.exists() && !was_protected {
+                    anyhow::bail!(
+                        "Identity protection downgrade detected at {}: this installation has \
+                         previously stored a DPAPI-protected identity, but identity.json is now \
+                         plaintext. Refusing the replacement to prevent silent identity takeover.",
+                        path.display()
+                    );
+                }
                 let data = match crate::storage::secret_store::unprotect(&raw) {
                     Ok(d) => d,
                     Err(unwrap_err) => {
@@ -211,6 +221,10 @@ impl NodeIdentity {
                             let protected = crate::storage::secret_store::protect(&updated)?;
                             crate::security::atomic_write(&path, &protected, true)?;
                         }
+                        #[cfg(target_os = "windows")]
+                        if was_protected || migrated {
+                            crate::security::atomic_write(&protected_marker, b"DPAPI-v1", true)?;
+                        }
                         info!(
                             "Loaded persistent identity (KAD ID={}…)",
                             &hex::encode(id.kad_id)[..4]
@@ -251,6 +265,8 @@ impl NodeIdentity {
                 let protected = crate::storage::secret_store::protect(&data)?;
                 std::fs::create_dir_all(data_dir)?;
                 crate::security::atomic_write(&path, &protected, true)?;
+                #[cfg(target_os = "windows")]
+                crate::security::atomic_write(&protected_marker, b"DPAPI-v1", true)?;
                 info!(
                     "Generated new identity (KAD ID={}…)",
                     &hex::encode(id.kad_id)[..4]
@@ -269,5 +285,30 @@ impl NodeIdentity {
                 ))
             }
         }
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protected_marker_rejects_plaintext_replacement() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-identity-downgrade-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let identity = NodeIdentity::generate();
+        std::fs::write(
+            dir.join("identity.json"),
+            serde_json::to_vec_pretty(&identity).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("identity.protected"), b"DPAPI-v1").unwrap();
+        let error = NodeIdentity::load_or_create(&dir).unwrap_err().to_string();
+        assert!(error.contains("downgrade"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

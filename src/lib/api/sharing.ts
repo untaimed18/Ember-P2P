@@ -1,8 +1,9 @@
 import { invoke } from '@tauri-apps/api/core';
 import type { FileInfo, MediaMetadata } from '$lib/types';
 
-export async function addSharedFolder(path: string): Promise<void> {
-  return invoke('add_shared_folder', { path });
+/** Open the backend-owned native picker and add the selected folder. */
+export async function addSharedFolder(): Promise<string | null> {
+  return invoke('pick_shared_folder');
 }
 
 export async function removeSharedFolder(path: string): Promise<void> {

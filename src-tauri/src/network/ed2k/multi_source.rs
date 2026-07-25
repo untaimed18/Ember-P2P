@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use digest::Digest;
-use flate2::read::{DeflateDecoder, ZlibDecoder};
+use flate2::read::ZlibDecoder;
 use futures::stream::{FuturesUnordered, StreamExt};
 use futures::FutureExt;
 use md4::Md4;
@@ -24,6 +24,7 @@ use super::credits::CreditManager;
 use super::part_tracker::PartTracker;
 use super::sources::SourceManager;
 use super::tcp_obfuscation::{self, Rc4Reader, Rc4Writer};
+use super::transfer::CompressedPartAccumulator;
 use super::transfer::{is_filtered_source_ip, DownloadEvent};
 
 /// Shared registry of active download trackers so the shutdown path can
@@ -145,9 +146,6 @@ pub(crate) fn record_peer_missing_parts(
         }
     }
 }
-
-/// Maximum decompressed part size (PARTSIZE + margin = 10 MiB)
-const MAX_DECOMPRESSED_PART: usize = 10 * 1024 * 1024;
 
 /// Maximum accepted on-wire ed2k packet length for a download connection.
 /// The largest legitimate single packet is a file's hashset (16 bytes/part:
@@ -748,12 +746,6 @@ impl Drop for InProgressGuard {
     }
 }
 
-#[derive(Debug)]
-struct PendingCompressedBlock {
-    compressed_total_size: u32,
-    compressed: Vec<u8>,
-}
-
 /// A source that can provide parts of a file.
 #[derive(Debug, Clone)]
 pub struct DownloadSource {
@@ -832,6 +824,10 @@ pub struct MultiSourceDownload {
     /// peer HashSet2 arrives. Seeded into recovery so we do not wait for
     /// a first wire pin when a verified root is already available.
     pub trusted_aich_master: Option<[u8; 20]>,
+    /// AICH master explicitly supplied by the user-selected link/collection.
+    /// Unlike opportunistic EPX/cache roots this must match the final bytes
+    /// before preview or completion.
+    pub expected_aich_master: Option<[u8; 20]>,
     /// GeoIP reader for country code lookups
     pub geoip: crate::geoip::GeoIpReader,
     /// Shared registry so the shutdown path can save our tracker
@@ -1104,6 +1100,17 @@ impl MultiSourceDownload {
                     hex::encode(super::hash::empty_ed2k_file_md4())
                 );
             }
+            if let Some(expected_aich) = self.expected_aich_master {
+                use sha1::Digest;
+                let actual: [u8; 20] = sha1::Sha1::digest([]).into();
+                if actual != expected_aich {
+                    anyhow::bail!(
+                        "Expected AICH hash mismatch: expected {}, got {}",
+                        hex::encode(expected_aich),
+                        hex::encode(actual)
+                    );
+                }
+            }
             let _ = event_tx
                 .send(DownloadEvent::SourcesUpdate {
                     transfer_id: self.transfer_id.clone(),
@@ -1259,10 +1266,11 @@ impl MultiSourceDownload {
         // before any new block arrives. The progress aggregator keeps it fresh
         // as parts verify during the download.
         self.control.set_preview_ready(
-            tracker
-                .read()
-                .await
-                .is_preview_ready(&self.file_name, self.file_size),
+            self.expected_aich_master.is_none()
+                && tracker
+                    .read()
+                    .await
+                    .is_preview_ready(&self.file_name, self.file_size),
         );
 
         // Shared rarest-first chunk selector for dynamic part assignment
@@ -1453,6 +1461,7 @@ impl MultiSourceDownload {
         let agg_tracker = tracker.clone();
         let agg_control = self.control.clone();
         let agg_file_name = self.file_name.clone();
+        let agg_requires_final_aich = self.expected_aich_master.is_some();
 
         // Coalesce Progress / SourcesUpdate emissions to a fixed cadence
         // (~200 ms). The previous design fired one `transfer-progress`
@@ -1497,7 +1506,8 @@ impl MultiSourceDownload {
                                 // lock: cheap, and this is the cadence at which
                                 // the first part finishes + verifies mid-download.
                                 agg_control.set_preview_ready(
-                                    t.is_preview_ready(&agg_file_name, file_size),
+                                    !agg_requires_final_aich
+                                        && t.is_preview_ready(&agg_file_name, file_size),
                                 );
                                 t.progress_bytes().min(file_size)
                             };
@@ -1539,7 +1549,9 @@ impl MultiSourceDownload {
             // last source closes.
             let capped = {
                 let t = agg_tracker.read().await;
-                agg_control.set_preview_ready(t.is_preview_ready(&agg_file_name, file_size));
+                agg_control.set_preview_ready(
+                    !agg_requires_final_aich && t.is_preview_ready(&agg_file_name, file_size),
+                );
                 t.progress_bytes().min(file_size)
             };
             if capped != last_emitted_bytes {
@@ -3468,6 +3480,22 @@ impl MultiSourceDownload {
             };
 
             if verified_ok {
+                if let Some(expected_aich) = self.expected_aich_master {
+                    let aich_path = part_path.clone();
+                    let computed = tokio::task::spawn_blocking(move || {
+                        super::aich::AICHRecoveryHashSet::build_from_file(&aich_path)
+                            .map(|set| set.root_hash)
+                    })
+                    .await
+                    .map_err(|error| anyhow::anyhow!("AICH verification task failed: {error}"))??;
+                    if computed != expected_aich {
+                        anyhow::bail!(
+                            "Expected AICH hash mismatch: expected {}, got {}",
+                            hex::encode(expected_aich),
+                            hex::encode(computed)
+                        );
+                    }
+                }
                 // Verification passed — safe to move file and clean up resume state.
                 // Mark every part verified (covers < PARTSIZE single-part
                 // files that never set per-part flags, and acts as a
@@ -3480,8 +3508,9 @@ impl MultiSourceDownload {
                 let final_path = self.download_dir.join("Downloads").join(&safe_name);
                 let pp = part_path.clone();
                 let fp = final_path.clone();
+                let root = self.download_dir.clone();
                 let actual_final = tokio::task::spawn_blocking(move || {
-                    super::transfer::move_part_to_final(&pp, &fp)
+                    super::transfer::move_part_to_final_approved(&pp, &fp, &root)
                 })
                 .await
                 .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
@@ -3585,74 +3614,6 @@ impl MultiSourceDownload {
         }
 
         Ok(())
-    }
-}
-
-/// Maximum distinct in-flight compressed blocks per download session.
-/// A hostile peer could otherwise stream many `OP_COMPRESSEDPART*` packets
-/// with different `start` keys, each buffering up to
-/// `MAX_DECOMPRESSED_PART` bytes, and multiply our memory footprint. eMule
-/// negotiates at most a few outstanding requested blocks per session; 16
-/// is comfortably above any legitimate pipelining depth.
-const MAX_PENDING_COMPRESSED_BLOCKS: usize = 16;
-
-fn append_compressed_chunk_ms(
-    pending: &mut HashMap<u64, PendingCompressedBlock>,
-    start: u64,
-    total_packed_size: u32,
-    chunk: &[u8],
-) -> anyhow::Result<Option<Vec<u8>>> {
-    let total_packed = total_packed_size as usize;
-    if total_packed == 0 {
-        anyhow::bail!("compressed part advertised zero packed size");
-    }
-    if total_packed > MAX_DECOMPRESSED_PART {
-        anyhow::bail!("packed size {total_packed} exceeds limit");
-    }
-    // Memory DoS guard: refuse to track more than N concurrent compressed
-    // blocks per connection. Allow existing `start` keys to keep growing
-    // (legitimate continuation); only reject genuinely new entries once the
-    // map is full.
-    if !pending.contains_key(&start) && pending.len() >= MAX_PENDING_COMPRESSED_BLOCKS {
-        anyhow::bail!(
-            "too many concurrent compressed blocks from peer ({} open, max {})",
-            pending.len(),
-            MAX_PENDING_COMPRESSED_BLOCKS
-        );
-    }
-    let entry = pending
-        .entry(start)
-        .or_insert_with(|| PendingCompressedBlock {
-            compressed_total_size: total_packed_size,
-            compressed: Vec::with_capacity(total_packed),
-        });
-    if entry.compressed_total_size != total_packed_size {
-        let old_size = entry.compressed_total_size;
-        let _ = entry;
-        pending.remove(&start);
-        anyhow::bail!(
-            "compressed block at start={start}: size changed from {old_size} to {total_packed_size}",
-        );
-    }
-    entry.compressed.extend_from_slice(chunk);
-    let accumulated = entry.compressed.len();
-    let max_compressed = total_packed + total_packed / 10 + 1024;
-    if accumulated > max_compressed {
-        pending.remove(&start);
-        anyhow::bail!(
-            "accumulated compressed data ({accumulated}) exceeds safety limit ({max_compressed}) for start={start}",
-        );
-    }
-    if accumulated >= total_packed {
-        // Decompress exactly the declared packed size (see transfer.rs): the
-        // over-accumulation slack must not be fed to zlib, or trailing padding
-        // can corrupt the decompressed length and .part write.
-        let data = &entry.compressed[..total_packed];
-        let decompressed = decompress_ed2k_part_ms(data)?;
-        pending.remove(&start);
-        Ok(Some(decompressed))
-    } else {
-        Ok(None)
     }
 }
 
@@ -4720,7 +4681,7 @@ async fn download_parts_from_source(
                     Err(e) => debug!("Failed to parse early EPX from source {}: {e}", _src_idx),
                 }
             }
-            (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) => {
+            (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) if super::LEGACY_FRIEND_AUTH_ENABLED => {
                 if let (Some(eh), Some(ref etx)) = (peer_ember_hash, &event_tx) {
                     let nick = std::str::from_utf8(&payload).unwrap_or("").to_string();
                     // `verified = true` iff either:
@@ -4867,7 +4828,13 @@ async fn download_parts_from_source(
                     // privilege-gated emissions
                     // (`DownloadEvent::EmberFriendRequest.verified`)
                     // reflect the binding-only signal.
-                    if !ember_auth_verified && ember_hash_binding_verified {
+                    // V1 PoP is quarantined to tests/legacy parsing. Generic
+                    // file-transfer streams never sign attacker-selected
+                    // nonces or gain friend authorization.
+                    if super::LEGACY_FRIEND_AUTH_ENABLED
+                        && !ember_auth_verified
+                        && ember_hash_binding_verified
+                    {
                         if let (Some(peer_pk), Some(peer_eh)) =
                             (hello_caps.ember_pubkey, hello_caps.ember_hash)
                         {
@@ -5427,7 +5394,10 @@ async fn download_parts_from_source(
             }
             continue;
         }
-        if proto == OP_EMULEPROT && opcode == OP_EMBER_FRIEND_REQ {
+        if super::LEGACY_FRIEND_AUTH_ENABLED
+            && proto == OP_EMULEPROT
+            && opcode == OP_EMBER_FRIEND_REQ
+        {
             if let (Some(eh), Some(ref etx)) = (peer_ember_hash, &event_tx) {
                 let nick = std::str::from_utf8(&_payload).unwrap_or("").to_string();
                 // PoP-only `verified` (see early-friend-request site
@@ -5528,7 +5498,10 @@ async fn download_parts_from_source(
                         }
                     }
                 }
-                if !ember_auth_verified && ember_hash_binding_verified {
+                if super::LEGACY_FRIEND_AUTH_ENABLED
+                    && !ember_auth_verified
+                    && ember_hash_binding_verified
+                {
                     if let (Some(peer_pk), Some(peer_eh)) =
                         (hello_caps.ember_pubkey, hello_caps.ember_hash)
                     {
@@ -5557,9 +5530,7 @@ async fn download_parts_from_source(
                                 if hello_caps.is_ember && !mesh_discovered_emitted {
                                     if let std::net::IpAddr::V4(v4) = addr.ip() {
                                         let peer_tcp = addr.port();
-                                        if peer_tcp > 0
-                                            && !crate::security::is_special_use_v4(v4)
-                                        {
+                                        if peer_tcp > 0 && !crate::security::is_special_use_v4(v4) {
                                             if let Some(ref etx) = event_tx {
                                                 let _ = etx
                                                     .send(DownloadEvent::EmberPeerDiscovered {
@@ -6479,7 +6450,7 @@ async fn download_parts_from_source(
             consecutive_stale_skips = 0;
 
             let mut aich_recovery_data: Option<([u8; 20], Vec<u8>)> = None;
-            let mut pending_compressed: HashMap<u64, PendingCompressedBlock> = HashMap::new();
+            let mut pending_compressed = CompressedPartAccumulator::default();
 
             // Either resume from a pre-pipelined state (the previous
             // iteration's send-ahead already shipped the first batch
@@ -7266,9 +7237,32 @@ async fn download_parts_from_source(
                             );
                         }
 
-                        let Some(decompressed) = append_compressed_chunk_ms(
-                            &mut pending_compressed,
+                        let requested_end = batches
+                            .iter()
+                            .take(sent_idx)
+                            .flatten()
+                            .find_map(|(requested_start, requested_end)| {
+                                (*requested_start == start).then_some(*requested_end)
+                            })
+                            .or_else(|| {
+                                (resumed
+                                    && all_blocks.first().is_some_and(|(requested_start, _)| {
+                                        *requested_start == start
+                                    }))
+                                .then(|| all_blocks[0].1)
+                            })
+                            .or_else(|| {
+                                pipelined_next.as_ref().and_then(|pending| {
+                                    pending.all_blocks.first().and_then(
+                                        |(requested_start, requested_end)| {
+                                            (*requested_start == start).then_some(*requested_end)
+                                        },
+                                    )
+                                })
+                            });
+                        let Some(decompressed) = pending_compressed.append(
                             start,
+                            requested_end,
                             compressed_total_size,
                             compressed,
                         )?
@@ -7714,7 +7708,9 @@ async fn download_parts_from_source(
                             }
                         }
                     }
-                    (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) if hello_caps.is_ember => {
+                    (OP_EMULEPROT, OP_EMBER_FRIEND_REQ)
+                        if super::LEGACY_FRIEND_AUTH_ENABLED && hello_caps.is_ember =>
+                    {
                         if let (Some(eh), Some(ref etx)) = (peer_ember_hash, &event_tx) {
                             let nick = std::str::from_utf8(&payload).unwrap_or("").to_string();
                             // PoP-only `verified` (see early-friend-request
@@ -7744,9 +7740,11 @@ async fn download_parts_from_source(
                     // our friend and spoofed browse results are the two
                     // visible attacks here.
                     (OP_EMULEPROT, OP_EMBER_CHAT_MSG)
-                        if is_ember_friend
+                        if super::LEGACY_FRIEND_AUTH_ENABLED
+                            && is_ember_friend
                             && ember_auth_verified
-                            && payload.len() <= crate::network::ember::crypto::MAX_CHAT_WIRE_LEN =>
+                            && payload.len()
+                                <= crate::network::ember::crypto::MAX_CHAT_WIRE_LEN =>
                     {
                         if let (Some(eh), Some(ref etx), Some(pk)) =
                             (peer_ember_hash, &event_tx, hello_caps.ember_pubkey)
@@ -7766,7 +7764,9 @@ async fn download_parts_from_source(
                         }
                     }
                     (OP_EMULEPROT, OP_EMBER_BROWSE_RES)
-                        if is_ember_friend && ember_auth_verified =>
+                        if super::LEGACY_FRIEND_AUTH_ENABLED
+                            && is_ember_friend
+                            && ember_auth_verified =>
                     {
                         if let (Some(eh), Some(ref etx)) = (peer_ember_hash, &event_tx) {
                             let entries = parse_browse_response(&payload);
@@ -9110,51 +9110,6 @@ async fn read_packet_async_ms<R: AsyncReadExt + Unpin + ?Sized>(
         return Ok((super::messages::OP_EMULEPROT, opcode, unpacked));
     }
     Ok((protocol, opcode, payload))
-}
-
-fn decompress_ed2k_part_ms(compressed: &[u8]) -> anyhow::Result<Vec<u8>> {
-    use std::io::Read;
-    let zlib_result = {
-        let mut decoder = ZlibDecoder::new(compressed);
-        let mut decompressed = Vec::new();
-        let mut buf = [0u8; 8192];
-        (|| -> anyhow::Result<Vec<u8>> {
-            loop {
-                let n = decoder.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                decompressed.extend_from_slice(&buf[..n]);
-                if decompressed.len() > MAX_DECOMPRESSED_PART {
-                    anyhow::bail!("decompressed part exceeds size limit");
-                }
-            }
-            Ok(decompressed)
-        })()
-    };
-    if let Ok(data) = zlib_result {
-        return Ok(data);
-    }
-    let mut decoder = DeflateDecoder::new(compressed);
-    let mut decompressed = Vec::new();
-    let mut buf = [0u8; 8192];
-    let deflate_result: anyhow::Result<Vec<u8>> = (|| {
-        loop {
-            let n = decoder.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            decompressed.extend_from_slice(&buf[..n]);
-            if decompressed.len() > MAX_DECOMPRESSED_PART {
-                anyhow::bail!("decompressed part exceeds size limit");
-            }
-        }
-        Ok(decompressed)
-    })();
-    if let Ok(data) = deflate_result {
-        return Ok(data);
-    }
-    Err(zlib_result.unwrap_err())
 }
 
 async fn write_packet_async_ms<W: AsyncWriteExt + Unpin + ?Sized>(

@@ -251,6 +251,16 @@ fn cert_node_id(cert_der: &[u8]) -> Option<[u8; 16]> {
     Some(node_id_from_public_key(&verifying_key))
 }
 
+/// Recover the authenticated Ember node id from Quinn's rustls peer identity.
+/// The TLS handshake has already proved possession of this certificate key.
+pub fn connection_node_id(connection: &quinn::Connection) -> Option<[u8; 16]> {
+    let identity = connection.peer_identity()?;
+    let certificates = identity.downcast::<Vec<CertificateDer<'static>>>().ok()?;
+    certificates
+        .first()
+        .and_then(|cert| cert_node_id(cert.as_ref()))
+}
+
 /// Certificate verifier for QUIC connections to Ember peers.
 ///
 /// Behaviour:

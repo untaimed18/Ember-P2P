@@ -210,7 +210,7 @@
             onkeydown={(e) => onTabKeydown(e, tab.hash)}
           >
             <span class="dock-tab-presence" aria-hidden="true"></span>
-            <span class="dock-tab-name"><bdi>{tab.name}</bdi></span>
+            <span class="dock-tab-name"><bdi dir="auto">{tab.name}</bdi></span>
             {#if unreadFor(tab.hash) > 0}
               <span
                 class="dock-tab-unread"

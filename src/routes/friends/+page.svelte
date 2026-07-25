@@ -297,6 +297,9 @@
         case 'refused':
           msg = m.friends_search_refused({ name });
           break;
+        case 'secure_v2_required':
+          msg = m.error_secure_friend_v2_required();
+          break;
         default:
           msg = m.friends_search_generic({ name });
       }
@@ -357,8 +360,15 @@
     }
   }
 
+  function friendHashFromCode(value: string): string | null {
+    const trimmed = value.trim();
+    if (/^[0-9a-fA-F]{32}$/.test(trimmed)) return trimmed.toLowerCase();
+    const match = /^ember2:([0-9a-fA-F]{32}):([0-9a-fA-F]{64})$/i.exec(trimmed);
+    return match?.[1]?.toLowerCase() ?? null;
+  }
+
   function isValidHash(h: string): boolean {
-    return /^[0-9a-fA-F]{32}$/.test(h);
+    return friendHashFromCode(h) !== null;
   }
 
   async function handleAdd() {
@@ -368,11 +378,12 @@
     const nick = newNickname.trim();
     if (!hash) { addError = m.friends_validation_hash_required(); return; }
     if (!isValidHash(hash)) { addError = m.friends_validation_hash_format(); return; }
-    if (myHash && hash.toLowerCase() === myHash.toLowerCase()) {
+    const canonicalHash = friendHashFromCode(hash);
+    if (myHash && canonicalHash === friendHashFromCode(myHash)) {
       addError = m.friends_validation_self_add();
       return;
     }
-    if (friends.some((f) => f.user_hash.toLowerCase() === hash.toLowerCase())) {
+    if (friends.some((f) => f.user_hash.toLowerCase() === canonicalHash)) {
       addError = m.friends_validation_already_friend();
       return;
     }
@@ -548,31 +559,14 @@
           <span class="firewall-recheck-error" role="status">{m.friends_firewall_recheck_failed({ error: recheckError })}</span>
         {/if}
       </div>
-    {:else if isDiscoverable}
-      <div class="banner discoverable-banner" role="status">
-        <div class="discoverable-content">
-          <svg class="discoverable-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-            <circle cx="10" cy="10" r="3"/>
-            <path d="M5.64 5.64a7 7 0 000 8.72"/>
-            <path d="M14.36 5.64a7 7 0 010 8.72"/>
-            <path d="M3.05 3.05a11 11 0 000 13.9"/>
-            <path d="M16.95 3.05a11 11 0 010 13.9"/>
-          </svg>
-          <span>
-            {m.friends_discoverable_prefix()}
-            <strong>{m.friends_discoverable_emphasis()}</strong>
-            {m.friends_discoverable_suffix()}
-          </span>
-        </div>
-      </div>
     {/if}
   </div>
 
-  <!-- Your Friend ID -->
+  <!-- Your Friend ID + network status -->
   {#if myHash}
     <div class="my-id-card">
       <div class="my-id-left">
-        <div class="my-id-icon">
+        <div class="my-id-icon" aria-hidden="true">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
             <rect x="3" y="5" width="18" height="14" rx="2"/>
             <circle cx="9" cy="12" r="2.5"/>
@@ -582,6 +576,12 @@
         <div class="my-id-info">
           <span class="my-id-label">{m.friends_your_id_label()}</span>
           <span class="my-id-hash">{myHash}</span>
+          <span class="my-id-hint">{m.friends_id_share_hint()}</span>
+          {#if isFirewalled}
+            <span class="my-id-status firewalled">{m.friends_status_firewalled_short()}</span>
+          {:else if isDiscoverable}
+            <span class="my-id-status discoverable">{m.friends_status_discoverable()}</span>
+          {/if}
         </div>
       </div>
       <button class="my-id-copy" class:copied={myHashCopied} onclick={copyMyHash}>
@@ -600,6 +600,17 @@
       </button>
     </div>
   {/if}
+
+  <!-- How Friends work -->
+  <div class="how-panel" role="region" aria-label={m.friends_how_title()}>
+    <div class="how-title">{m.friends_how_title()}</div>
+    <ul class="how-list">
+      <li>{m.friends_how_share()}</li>
+      <li>{m.friends_how_mutual()}</li>
+      <li>{m.friends_how_priority()}</li>
+      <li>{m.friends_how_encrypted()}</li>
+    </ul>
+  </div>
 
   <!-- Pending friend requests -->
   {#if friendRequests.length > 0}
@@ -633,7 +644,7 @@
                   escaping prevents XSS; this closes the
                   bidi-spoofing presentation gap.
                 -->
-                <bdi>{req.sender_nickname || m.friends_unknown_sender()}</bdi>
+                <bdi dir="auto">{req.sender_nickname || m.friends_unknown_sender()}</bdi>
                 {#if req.verified}
                   <!-- "Verified" badge: see commit history for the
                        cryptographic semantics. -->
@@ -660,7 +671,9 @@
   <div class="controls-bar">
     <div class="controls-left">
       <button
-        class="ghost add-btn"
+        class="add-btn"
+        class:primary={!showAddForm}
+        class:danger={showAddForm}
         onclick={() => { showAddForm = !showAddForm; addError = null; }}
       >
         {showAddForm ? m.common_cancel() : m.friends_add_friend()}
@@ -763,6 +776,8 @@
   {:else}
     {#snippet friendCard(f: FriendInfo, isOnline: boolean)}
       {@const presence = friendPresence(f)}
+      {@const truncatedId = `${f.user_hash.slice(0, 8)}\u2026${f.user_hash.slice(-6)}`}
+      {@const lastAddr = f.last_ip && f.last_port > 0 ? `${f.last_ip}:${f.last_port}` : (f.last_ip || '')}
       <div class="friend-card" class:editing={editingHash === f.user_hash} class:online={isOnline} class:has-unread-card={!!unreadCounts.get(f.user_hash)}>
         <div class="card-header-row">
           <div class="card-avatar" class:avatar-online={presence === 'online'} class:avatar-offline={presence === 'offline'}>
@@ -789,7 +804,7 @@
               <button class="nick-btn" onclick={() => startEdit(f)} title={m.friends_edit_nickname_title()}>
                 <!-- `<bdi>` isolates the peer-supplied nickname from
                      the surrounding UI direction. -->
-                {#if f.nickname}<bdi>{f.nickname}</bdi>{:else}{m.friends_no_nickname()}{/if}
+                {#if f.nickname}<bdi dir="auto">{f.nickname}</bdi>{:else}{m.friends_no_nickname()}{/if}
               </button>
             {/if}
             <span class="card-status-label">
@@ -804,7 +819,23 @@
               {:else}
                 {m.friends_status_added({ when: formatDate(f.added_at) })}
               {/if}
+              {#if f.mutual && isOnline}
+                <span class="status-encrypted" title={m.friends_encrypted_chat_title()}>
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <rect x="3.5" y="7" width="9" height="6.5" rx="1.5"/>
+                    <path d="M5.5 7V5.5a2.5 2.5 0 0 1 5 0V7"/>
+                  </svg>
+                  {m.friends_encrypted_chat()}
+                </span>
+              {/if}
             </span>
+            <div class="card-meta">
+              <span class="card-id" title={f.user_hash}>{truncatedId}</span>
+              {#if lastAddr}
+                <span class="card-meta-sep" aria-hidden="true">·</span>
+                <span class="card-addr" title={m.friends_last_address({ addr: lastAddr })}>{m.friends_last_address({ addr: lastAddr })}</span>
+              {/if}
+            </div>
             {#if unreadCounts.get(f.user_hash)}
               <span class="card-unread-preview">
                 {(unreadCounts.get(f.user_hash) ?? 0) === 1
@@ -847,9 +878,10 @@
           <button
             class="action-btn chat-action"
             class:has-unread={unreadCounts.get(f.user_hash)}
+            class:primary-action={f.mutual}
             onclick={() => openChat(f)}
             disabled={!f.mutual}
-            title={f.mutual ? m.friends_action_chat() : m.friends_action_waiting_accept()}
+            title={f.mutual ? (isOnline ? m.friends_encrypted_chat_title() : m.friends_action_chat()) : m.friends_action_waiting_accept()}
           >
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
               <path d="M2 3h12v8H5l-3 3z"/>
@@ -1020,6 +1052,33 @@
     word-break: break-all;
   }
 
+  .my-id-hint {
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-top: 2px;
+  }
+
+  .my-id-status {
+    display: inline-flex;
+    align-items: center;
+    width: fit-content;
+    margin-top: 4px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+  }
+
+  .my-id-status.discoverable {
+    background: color-mix(in srgb, var(--success) 16%, transparent);
+    color: var(--success);
+  }
+
+  .my-id-status.firewalled {
+    background: color-mix(in srgb, var(--warning) 16%, transparent);
+    color: color-mix(in srgb, var(--warning) 85%, var(--text-primary));
+  }
+
   .my-id-copy {
     display: inline-flex;
     align-items: center;
@@ -1058,6 +1117,37 @@
     height: 13px;
   }
 
+  /* --- How Friends work --- */
+  .how-panel {
+    padding: 12px 16px;
+    margin-bottom: 12px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+  }
+
+  .how-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 6px;
+  }
+
+  .how-list {
+    margin: 0;
+    padding-left: 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 12px;
+    line-height: 1.45;
+    color: var(--text-secondary);
+  }
+
+  .how-list li::marker {
+    color: var(--accent);
+  }
+
   /* --- Controls bar --- */
   .controls-bar {
     display: flex;
@@ -1087,6 +1177,21 @@
   .add-btn {
     font-weight: 600;
     font-size: 12px;
+  }
+
+  .add-btn.primary {
+    padding: 6px 14px;
+    border: 1px solid var(--accent);
+    border-radius: var(--radius-md);
+    background: var(--accent);
+    color: var(--on-accent);
+    cursor: pointer;
+    font-family: inherit;
+  }
+
+  .add-btn.primary:hover {
+    background: var(--accent-hover);
+    border-color: var(--accent-hover);
   }
 
   .inline-stat {
@@ -1274,6 +1379,10 @@
   .card-status-label {
     font-size: 11px;
     color: var(--text-muted);
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
   }
 
   .status-online {
@@ -1281,6 +1390,44 @@
     font-weight: 600;
   }
 
+  .status-encrypted {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    color: var(--accent);
+    font-weight: 600;
+  }
+
+  .status-encrypted svg {
+    width: 11px;
+    height: 11px;
+  }
+
+  .card-meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    color: var(--text-muted);
+    min-width: 0;
+  }
+
+  .card-id {
+    font-family: var(--font-mono);
+    letter-spacing: 0.2px;
+  }
+
+  .card-meta-sep {
+    opacity: 0.5;
+  }
+
+  .card-addr {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 100%;
+  }
 
   .nick-btn {
     border: none;
@@ -1387,6 +1534,15 @@
 
   .action-btn.has-unread {
     color: var(--accent);
+  }
+
+  .action-btn.primary-action:not(:disabled) {
+    color: var(--accent);
+    font-weight: 600;
+  }
+
+  .action-btn.primary-action:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
   }
 
   .icon-btn {
@@ -1777,35 +1933,6 @@
   .request-reject:hover {
     color: var(--danger);
     border-color: var(--danger);
-  }
-
-  /* --- Discoverable banner --- */
-  .discoverable-banner {
-    background: color-mix(in srgb, var(--success) 8%, var(--bg-surface));
-    border: 1px solid color-mix(in srgb, var(--success) 40%, var(--border));
-    color: var(--text-secondary);
-    padding: 10px 16px;
-    border-radius: var(--radius-lg);
-    margin-bottom: 12px;
-  }
-
-  .discoverable-content {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    font-size: 12px;
-    line-height: 1.5;
-  }
-
-  .discoverable-content strong {
-    color: var(--success);
-  }
-
-  .discoverable-icon {
-    width: 18px;
-    height: 18px;
-    flex-shrink: 0;
-    color: var(--success);
   }
 
   /* --- Firewall warning banner --- */

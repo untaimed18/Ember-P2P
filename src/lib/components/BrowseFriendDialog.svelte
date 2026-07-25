@@ -284,7 +284,7 @@
       onkeydown={handleKeydown}
     >
       <div class="browse-header">
-        <h3 id="browse-title-{instanceId}">{m.browse_title_prefix()} <bdi>{friendName || friendHash.slice(0, 8) + '\u2026'}</bdi></h3>
+        <h3 id="browse-title-{instanceId}">{m.browse_title_prefix()} <bdi dir="auto">{friendName || friendHash.slice(0, 8) + '\u2026'}</bdi></h3>
         <button class="browse-close" onclick={onclose} title={m.common_close()} aria-label={m.common_close()}>
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
             <line x1="4" y1="4" x2="12" y2="12"/><line x1="12" y1="4" x2="4" y2="12"/>
@@ -328,7 +328,7 @@
                       button next to it. The text itself is still
                       rendered exactly as written.
                     -->
-                    <td class="col-name" title={file.name}><bdi>{file.name}</bdi></td>
+                    <td class="col-name" title={file.name}><bdi dir="auto">{file.name}</bdi></td>
                     <td class="col-size">{formatSize(file.size)}</td>
                     <td class="col-action">
                       {#if downloadedHashes.has(file.hash)}

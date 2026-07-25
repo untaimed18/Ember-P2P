@@ -81,12 +81,14 @@ pub async fn load_collection(
             "No shared or download folders configured",
         ));
     }
-    if !crate::security::is_path_within_dirs(&canonical, &allowed_dirs) {
-        return Err(coded(
-            "collections_file_outside_allowed_dirs",
-            "Collection file must be inside a shared or download folder",
-        ));
-    }
+    let canonical = crate::security::filesystem::verify_existing_path(&canonical, &allowed_dirs)
+        .map_err(|e| {
+            coded_ctx(
+                "collections_file_outside_allowed_dirs",
+                "Collection file must be inside an unchanged approved root",
+                e,
+            )
+        })?;
 
     // Cap the on-disk size before `Collection::load` reads the whole file into
     // memory (`std::fs::read`). `open_collection_file` already enforces this;
@@ -194,6 +196,15 @@ async fn create_collection_internal(
                 "Collection entries must use 32-character ED2K file hashes",
             ));
         }
+        if !file.aich_hash.is_empty()
+            && (file.aich_hash.len() != 40
+                || !file.aich_hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return Err(coded(
+                "collections_invalid_aich_hash",
+                "Collection AICH hashes must be 40-character hexadecimal SHA-1 roots",
+            ));
+        }
     }
     let collection = Collection {
         name: name.clone(),
@@ -254,12 +265,15 @@ async fn create_collection_internal(
                 "No shared or download folders configured",
             ));
         }
-        if !crate::security::is_path_within_dirs(&canonical, &allowed_dirs) {
-            return Err(coded(
-                "collections_output_outside_allowed_dirs",
-                "Output path must be inside a shared or download folder",
-            ));
-        }
+        crate::security::filesystem::verify_output_path(&canonical, &allowed_dirs).map_err(
+            |e| {
+                coded_ctx(
+                    "collections_output_outside_allowed_dirs",
+                    "Output path must be inside an unchanged approved root",
+                    e,
+                )
+            },
+        )?;
     }
 
     let ext = canonical
@@ -350,7 +364,7 @@ pub async fn create_collection_with_dialog(
         files,
         selected.to_string_lossy().into_owned(),
         binary,
-        false,
+        true,
     )
     .await
     .map(Some)
@@ -362,6 +376,7 @@ pub async fn download_collection_files(
     state: tauri::State<'_, AppState>,
     files: Vec<CollectionFile>,
 ) -> Result<CollectionDownloadResult, String> {
+    let _download_admission = state.download_admission.lock().await;
     if files.len() > 200 {
         return Err(coded(
             "collections_too_many_files",
@@ -401,6 +416,14 @@ pub async fn download_collection_files(
         if file.hash.len() != 32 || hex::decode(&file.hash).is_err() {
             skipped_count += 1;
             tracing::debug!("Skipping collection entry '{}': invalid hash", file.name);
+            continue;
+        }
+        if !file.aich_hash.is_empty()
+            && (file.aich_hash.len() != 40
+                || !file.aich_hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            skipped_count += 1;
+            tracing::debug!("Skipping collection entry '{}': invalid AICH", file.name);
             continue;
         }
         if max_dl_bytes > 0 && file.size > max_dl_bytes {
@@ -462,6 +485,8 @@ pub async fn download_collection_files(
             client_software: String::new(),
             country_code: None,
             user_hash: None,
+            expected_aich: (!file.aich_hash.is_empty())
+                .then(|| file.aich_hash.to_ascii_lowercase()),
             completed_path: None,
             up_part_status: None,
             up_part_count: None,
@@ -470,8 +495,25 @@ pub async fn download_collection_files(
 
         let (active_now, persisted_transfer) = {
             let mut mgr = state.transfer_manager.write().await;
-            if mgr.has_pending_for_hash(&file.hash) {
-                skipped_count += 1;
+            if let Some(existing_id) = mgr.pending_transfer_id_for_hash(&file.hash) {
+                let requested_pin =
+                    (!file.aich_hash.is_empty()).then(|| file.aich_hash.to_ascii_lowercase());
+                let existing_pin = mgr
+                    .get_transfer(&existing_id)
+                    .and_then(|transfer| transfer.expected_aich.clone());
+                if requested_pin.is_some() && existing_pin != requested_pin {
+                    failed_count += 1;
+                } else {
+                    skipped_count += 1;
+                }
+                continue;
+            }
+            if let Err(error) = super::transfers::ensure_pending_download_budget(&mgr, &[file.size])
+            {
+                tracing::warn!(
+                    "Collection admission stopped at the aggregate pending-download budget: {error}"
+                );
+                failed_count += 1;
                 continue;
             }
             let active_now = mgr.enqueue(transfer.clone());
@@ -496,6 +538,8 @@ pub async fn download_collection_files(
                     // discovery for each.
                     extra_sources: Vec::new(),
                     ember_file_hash: String::new(),
+                    expected_aich: (!file.aich_hash.is_empty())
+                        .then(|| file.aich_hash.to_ascii_lowercase()),
                     transfer_id: transfer_id.clone(),
                     control: control.clone(),
                     discovery_only: false,
@@ -544,6 +588,8 @@ pub async fn download_collection_files(
                     peer_port: 0,
                     extra_sources: Vec::new(),
                     ember_file_hash: String::new(),
+                    expected_aich: (!file.aich_hash.is_empty())
+                        .then(|| file.aich_hash.to_ascii_lowercase()),
                     transfer_id: transfer_id.clone(),
                     control,
                     discovery_only: true,

@@ -15,6 +15,41 @@ const CMD_TIMEOUT: std::time::Duration = CMD_REPLY_TIMEOUT;
 const DEFAULT_IPFILTER_ARCHIVE_URL: &str = "https://upd.emule-security.org/ipfilter.zip";
 const MAX_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
 
+#[tauri::command]
+pub async fn get_security_policy_state(
+    state: tauri::State<'_, AppState>,
+) -> Result<crate::security::policy::SecurityPolicyStatus, String> {
+    Ok(state.security_policy.status())
+}
+
+/// Explicitly acknowledge a recovered/reset security-policy store. The
+/// acknowledgement is made durable before the network startup gate opens.
+#[tauri::command]
+pub async fn acknowledge_security_policy_reset(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let db = state.db.clone();
+    let gate = state.security_policy.clone();
+    tokio::task::spawn_blocking(move || {
+        gate.acknowledge_reset_if_required(|| {
+            db.reset_security_policy()
+                .map_err(|error| std::io::Error::other(error.to_string()))
+        })
+    })
+    .await
+    .map_err(|error| {
+        coded_ctx(
+            "security_policy_reset_task_failed",
+            "Policy reset failed",
+            error,
+        )
+    })?
+    .map_err(|error| coded_ctx("security_policy_reset_failed", "Policy reset failed", error))?;
+    let _ = tauri::Emitter::emit(&app, "security-policy-ready", ());
+    Ok(())
+}
+
 #[derive(Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IpFilterApplyOutcome {
@@ -129,6 +164,13 @@ async fn apply_ipfilter_reload(
 }
 
 fn extract_ipfilter_from_zip(zip_bytes: &[u8]) -> Result<Vec<u8>, String> {
+    extract_ipfilter_from_zip_with_limit(zip_bytes, MAX_RESPONSE_BYTES)
+}
+
+fn extract_ipfilter_from_zip_with_limit(
+    zip_bytes: &[u8],
+    max_extracted_bytes: usize,
+) -> Result<Vec<u8>, String> {
     let cursor = Cursor::new(zip_bytes);
     let mut archive = ZipArchive::new(cursor).map_err(|e| {
         coded_ctx(
@@ -197,14 +239,14 @@ fn extract_ipfilter_from_zip(zip_bytes: &[u8]) -> Result<Vec<u8>, String> {
     // than stopping at the declared length. So cap the *actual* decompressed
     // stream with `take` — a zip bomb that understates its size can't grow
     // the buffer past the limit and exhaust memory.
-    if entry.size() > MAX_RESPONSE_BYTES as u64 {
+    if entry.size() > max_extracted_bytes as u64 {
         return Err(coded(
             "security_extracted_ipfilter_too_large",
             "Extracted ipfilter.dat is too large",
         ));
     }
 
-    let cap = MAX_RESPONSE_BYTES as u64;
+    let cap = max_extracted_bytes as u64;
     let mut extracted = Vec::new();
     entry
         .take(cap + 1)
@@ -228,6 +270,7 @@ fn extract_ipfilter_from_zip(zip_bytes: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn structured_ipfilter_outcome_requires_confirmed_reload() {
@@ -243,6 +286,20 @@ mod tests {
             ipfilter_outcome_from_ack(None),
             IpFilterApplyOutcome::Deferred
         );
+    }
+
+    #[test]
+    fn compressed_ipfilter_cap_applies_to_actual_extracted_bytes() {
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        archive
+            .start_file("ipfilter.dat", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        archive.write_all(&vec![b'A'; 1025]).unwrap();
+        let bytes = archive.finish().unwrap().into_inner();
+
+        let error = extract_ipfilter_from_zip_with_limit(&bytes, 1024)
+            .expect_err("decompressed output over cap must fail");
+        assert!(error.contains("security_extracted_ipfilter_too_large"));
     }
 }
 

@@ -807,7 +807,7 @@ pub struct SourceEntry {
 }
 
 /// Tracks known sources (peers) per file hash for source exchange responses.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SourceManager {
     sources: HashMap<[u8; 16], Vec<SourceEntry>>,
     max_per_file: usize,
@@ -1417,10 +1417,8 @@ impl SourceManager {
             }
         }
 
-        let mut out: Vec<(Ipv4Addr, u16)> = best_by_hash
-            .values()
-            .map(|e| (e.ip, e.tcp_port))
-            .collect();
+        let mut out: Vec<(Ipv4Addr, u16)> =
+            best_by_hash.values().map(|e| (e.ip, e.tcp_port)).collect();
         out.extend(anonymous);
         out
     }
@@ -1430,11 +1428,7 @@ impl SourceManager {
     pub fn is_session_only_port(&self, file_hash: &[u8; 16], ip: Ipv4Addr, port: u16) -> bool {
         self.sources
             .get(file_hash)
-            .and_then(|entries| {
-                entries
-                    .iter()
-                    .find(|e| e.ip == ip && e.tcp_port == port)
-            })
+            .and_then(|entries| entries.iter().find(|e| e.ip == ip && e.tcp_port == port))
             .map(|e| e.not_for_reconnect)
             .unwrap_or(false)
     }
@@ -1582,10 +1576,9 @@ impl SourceManager {
             // listening + ephemeral variants both marked reconnectable:
             // persist at most one dialable endpoint per user hash.
             keep.sort_by(|a, b| {
-                b.last_seen.cmp(&a.last_seen).then_with(|| {
-                    (b.udp_port > 0)
-                        .cmp(&(a.udp_port > 0))
-                })
+                b.last_seen
+                    .cmp(&a.last_seen)
+                    .then_with(|| (b.udp_port > 0).cmp(&(a.udp_port > 0)))
             });
             let mut seen_hash = std::collections::HashSet::new();
             keep.retain(|e| seen_hash.insert(e.user_hash));
@@ -2795,7 +2788,8 @@ mod tests {
     fn load_prefers_listening_over_ephemeral_even_when_ephemeral_has_udp() {
         // Legacy EmuleInfo attached UDP to the inbound connection port. Collapse
         // must still keep the listening port dialable.
-        let dir = std::env::temp_dir().join(format!("ember_sources_udp_eph_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ember_sources_udp_eph_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("sources_udp_eph.met");
 

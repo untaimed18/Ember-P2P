@@ -401,3 +401,32 @@ fn try_decrypt_with_key(
         valid_receiver_key: expected_receiver_key != 0 && receiver_key == expected_receiver_key,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::network::kad::messages::{
+        decode_packet, KadMessage, KADEMLIA2_BOOTSTRAP_REQ, OP_KADEMLIAPACKEDPROT,
+    };
+    use flate2::{write::ZlibEncoder, Compression};
+    use std::io::Write;
+
+    #[test]
+    fn normal_obfuscated_packed_kad_survives_decrypt_then_decode() {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&[]).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut packed = vec![OP_KADEMLIAPACKEDPROT, KADEMLIA2_BOOTSTRAP_REQ];
+        packed.extend_from_slice(&compressed);
+
+        let local_id = KadId([0x42; 16]);
+        let encrypted = encrypt_kad_packet(&packed, &local_id, 0x1122_3344, 0);
+        let decrypted = try_decrypt_kad_packet(&encrypted, &local_id, &[0x24; 16], 0, 0x0102_0304)
+            .expect("normal obfuscated KAD packet must decrypt");
+        assert_eq!(decrypted.payload[0], OP_KADEMLIAPACKEDPROT);
+        assert!(matches!(
+            decode_packet(&decrypted.payload).unwrap(),
+            KadMessage::BootstrapReq
+        ));
+    }
+}

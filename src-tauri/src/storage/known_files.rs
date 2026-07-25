@@ -136,27 +136,48 @@ impl KnownFileList {
         }
     }
 
-    pub fn load(path: &Path) -> Self {
+    /// Strict loader used by security-policy and share-intent startup. Missing
+    /// is a valid empty first-run catalog; read/size/parse failures are
+    /// returned so callers can fail closed instead of treating corruption as
+    /// an authoritative empty share policy.
+    pub fn load_checked(path: &Path) -> anyhow::Result<Self> {
         let mut list = Self::new();
-        if !path.exists() {
-            return list;
-        }
         // known.met is app-managed, but a corrupt or maliciously-swapped file
         // shouldn't be slurped wholesale. This ceiling bounds the worst-case
         // allocation while allowing millions of ordinary records.
         const MAX_KNOWN_MET_BYTES: u64 = 256 * 1024 * 1024;
-        if let Ok(meta) = std::fs::metadata(path) {
-            if meta.len() > MAX_KNOWN_MET_BYTES {
-                warn!(
-                    "known.met too large ({} bytes), refusing to load",
-                    meta.len()
-                );
-                return list;
-            }
+        let meta = match std::fs::metadata(path) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(list),
+            Err(error) => return Err(error.into()),
+        };
+        if meta.len() > MAX_KNOWN_MET_BYTES {
+            anyhow::bail!(
+                "known.met too large ({} bytes, max {MAX_KNOWN_MET_BYTES})",
+                meta.len()
+            );
         }
-        match std::fs::read(path) {
-            Ok(data) => {
-                if let Err(e) = list.parse_known_met(&data) {
+        let data = std::fs::read(path)?;
+        list.parse_known_met(&data)?;
+        list.load_path_index(&path.with_file_name("known_paths.dat"));
+        Ok(list)
+    }
+
+    /// Compatibility loader for non-policy callers. Errors still quarantine
+    /// the damaged catalog, but the independent share-intent store is notified
+    /// before an empty in-memory list is returned.
+    pub fn load(path: &Path) -> Self {
+        match Self::load_checked(path) {
+            Ok(list) => {
+                if !path.exists() {
+                    if let Err(error) = crate::storage::share_intent::note_catalog_missing() {
+                        tracing::debug!("Could not record missing known.met state: {error}");
+                    }
+                }
+                list
+            }
+            Err(e) => {
+                if path.exists() {
                     let backup = path.with_extension(format!(
                         "met.{}.corrupt",
                         chrono::Utc::now().format("%Y%m%d%H%M%S")
@@ -167,16 +188,18 @@ impl KnownFileList {
                         crate::security::restrict_file_permissions(&backup);
                     }
                     warn!(
-                        "Failed to parse known.met: {e}; starting with an empty catalog (backup: {})",
+                        "Failed to load known.met: {e}; fail-closed share intent enabled (backup: {})",
                         backup.display()
                     );
-                    list = Self::new();
+                } else {
+                    warn!("Failed to load known.met: {e}; fail-closed share intent enabled");
                 }
+                if let Err(intent_error) = crate::storage::share_intent::enter_fail_closed() {
+                    warn!("Failed to persist fail-closed share intent: {intent_error}");
+                }
+                Self::new()
             }
-            Err(e) => warn!("Failed to read known.met: {e}"),
         }
-        list.load_path_index(&path.with_file_name("known_paths.dat"));
-        list
     }
 
     fn parse_known_met(&mut self, data: &[u8]) -> anyhow::Result<()> {
@@ -773,7 +796,7 @@ impl KnownFileList {
             buf.write_all(&tags)?;
         }
 
-        crate::security::atomic_write(path, &buf, false)?;
+        crate::security::atomic_write(path, &buf, true)?;
         // Pair the companion path index to this specific known.met revision
         // by embedding known.met's current mtime. On load we only use the
         // cached path index when the mtime still matches — otherwise the
@@ -795,6 +818,9 @@ impl KnownFileList {
                 warn!("Failed to save known_paths.dat: {e}; keeping dirty flag set to retry next cycle");
                 self.dirty = true;
             }
+        }
+        if let Ok(store) = crate::storage::share_intent::global() {
+            store.mark_catalog_seen()?;
         }
         info!("Saved {} known files to known.met", self.files.len());
         Ok(())
@@ -1040,7 +1066,7 @@ impl KnownFileList {
             buf.write_u64::<LittleEndian>(entry.size)?;
             buf.write_i64::<LittleEndian>(entry.modified_at)?;
         }
-        crate::security::atomic_write(path, &buf, false)?;
+        crate::security::atomic_write(path, &buf, true)?;
         Ok(())
     }
 }
@@ -1094,7 +1120,7 @@ pub fn migrate_aich_v2(data_dir: &Path) {
         }
     }
 
-    if let Err(e) = std::fs::write(&marker, b"1") {
+    if let Err(e) = crate::security::atomic_write(&marker, b"1", true) {
         warn!("AICH v2 migration: failed to write marker ({e}); migration may repeat next startup");
     }
 }

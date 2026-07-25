@@ -1,11 +1,15 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    future::Future,
     hash::Hash,
+    io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    pin::Pin,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, OnceLock,
     },
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
@@ -19,13 +23,98 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use futures_util::FutureExt;
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
+
+const MAX_HTTP_CONNECTIONS: usize = 256;
+const RESERVED_HEALTH_CONNECTIONS: usize = 16;
+const HTTP_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
+const HTTP_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn http_path_admitted(reserve_only: bool, path: &str) -> bool {
+    !reserve_only || path == "/health"
+}
+
+struct IdleTimeoutStream {
+    inner: tokio::net::TcpStream,
+    idle: Duration,
+    deadline: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl IdleTimeoutStream {
+    fn new(inner: tokio::net::TcpStream, idle: Duration) -> Self {
+        Self {
+            inner,
+            idle,
+            deadline: Box::pin(tokio::time::sleep(idle)),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.deadline
+            .as_mut()
+            .reset(tokio::time::Instant::now() + self.idle);
+    }
+
+    fn timed_out(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
+        if self.deadline.as_mut().poll(cx).is_ready() {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "HTTP connection idle timeout",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for IdleTimeoutStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.timed_out(cx)?;
+        let before = buffer.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(cx, buffer);
+        if matches!(&result, Poll::Ready(Ok(()))) && buffer.filled().len() > before {
+            self.reset();
+        }
+        result
+    }
+}
+
+impl tokio::io::AsyncWrite for IdleTimeoutStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        self.timed_out(cx)?;
+        let result = Pin::new(&mut self.inner).poll_write(cx, buffer);
+        if matches!(result, Poll::Ready(Ok(written)) if written > 0) {
+            self.reset();
+        }
+        result
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        self.timed_out(cx)?;
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Authentication: every endpoint that mutates per-id state, or dequeues
@@ -45,19 +134,15 @@ use tracing::{debug, info, warn};
 const RDV_DOMAIN: &[u8] = b"ember-rdv-v1";
 const OP_REGISTER: u8 = 0x01;
 const OP_UNREGISTER: u8 = 0x02;
-// 0x03..=0x06 reserved for future signing of /punch and /relay-invite
-// endpoints once those IDs are migrated from synthetic (ip, port)
-// strings to presence-map ember-hash ids. Until then those endpoints
-// rely on per-IP rate-limiting and per-target caps for abuse control.
-/// Server-signed DHT `/bootstrap` pool responses.
-const OP_BOOTSTRAP: u8 = 0x07;
-const OP_RELAY_TICKET_OFFER: u8 = 0x08;
-const OP_RELAY_TICKET_POLL: u8 = 0x09;
-const OP_RELAY_TICKET_ACCEPT: u8 = 0x0a;
-const OP_RELAY_TICKET_STATUS: u8 = 0x0b;
-/// Candidate-filtered polling has a distinct operation and route so its
-/// signed payload can never be confused with the deployed v2 schema.
-const OP_RELAY_TICKET_POLL_V3: u8 = 0x0c;
+const OP_RELAY_TICKET_ACCEPT: u8 = 0x09;
+const OP_RELAY_TICKET_STATUS: u8 = 0x0a;
+const OP_CAPABILITY_REGISTER: u8 = 0x0c;
+const OP_CAPABILITY_LOOKUP: u8 = 0x0d;
+const OP_RELAY_MAILBOX_OFFER: u8 = 0x0e;
+const OP_RELAY_MAILBOX_POLL: u8 = 0x0f;
+const OP_PUNCH_REGISTER_V3: u8 = 0x10;
+const OP_PUNCH_POLL_V3: u8 = 0x11;
+const OP_PUNCH_ACK_V3: u8 = 0x12;
 
 /// Maximum allowed clock skew between the client and server timestamps
 /// in a signed request. 5 minutes covers normal NTP-skewed clients
@@ -145,12 +230,15 @@ fn decode_hex_nonce(s: &str) -> Option<[u8; 16]> {
 /// claimed id. Mirrors the client-side derivation chain
 /// `pubkey -> ember_hash (BLAKE3 truncated) -> id (SHA256)`.
 fn pubkey_matches_id(pubkey: &[u8; 32], claimed_id: &str) -> bool {
+    id_from_pubkey(pubkey).eq_ignore_ascii_case(claimed_id)
+}
+
+fn id_from_pubkey(pubkey: &[u8; 32]) -> String {
     let pk_blake = blake3::hash(pubkey);
     let ember_hash = &pk_blake.as_bytes()[..16];
     let mut sha = Sha256::new();
     sha.update(ember_hash);
-    let derived = hex::encode(sha.finalize());
-    derived.eq_ignore_ascii_case(claimed_id)
+    hex::encode(sha.finalize())
 }
 
 fn ed25519_verify(pubkey: &[u8; 32], message: &[u8], sig: &[u8; 64]) -> bool {
@@ -191,112 +279,6 @@ fn build_unregister_msg(id_raw: &[u8; 32], ts: i64) -> Vec<u8> {
     m
 }
 
-/// Load or generate the long-term Ed25519 key used to sign `/bootstrap`
-/// responses. Prefer `EMBER_BOOTSTRAP_SIGNING_KEY` (64 hex chars = 32-byte
-/// seed). Otherwise read/write `EMBER_BOOTSTRAP_KEY_FILE` (default
-/// `bootstrap_signing.key` hex seed) so restarts keep the same identity
-/// clients may pin.
-fn load_bootstrap_signing_key() -> SigningKey {
-    if let Ok(hex_seed) = std::env::var("EMBER_BOOTSTRAP_SIGNING_KEY") {
-        let mut seed = [0u8; 32];
-        if hex::decode_to_slice(hex_seed.trim(), &mut seed).is_ok() {
-            info!("Loaded bootstrap signing key from EMBER_BOOTSTRAP_SIGNING_KEY");
-            return SigningKey::from_bytes(&seed);
-        }
-        warn!("EMBER_BOOTSTRAP_SIGNING_KEY is set but not valid 64-hex; falling back to key file");
-    }
-
-    let path = std::env::var("EMBER_BOOTSTRAP_KEY_FILE")
-        .unwrap_or_else(|_| "bootstrap_signing.key".to_string());
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        let mut seed = [0u8; 32];
-        if hex::decode_to_slice(existing.trim(), &mut seed).is_ok() {
-            info!("Loaded bootstrap signing key from {path}");
-            return SigningKey::from_bytes(&seed);
-        }
-        warn!("Bootstrap key file {path} is corrupt; generating a new key");
-    }
-
-    let key = SigningKey::generate(&mut OsRng);
-    if let Err(e) = std::fs::write(&path, hex::encode(key.to_bytes())) {
-        warn!("Failed to persist bootstrap signing key to {path}: {e}");
-    } else {
-        info!(
-            "Generated new bootstrap signing key (pubkey {}); persisted to {path}",
-            hex::encode(key.verifying_key().to_bytes())
-        );
-    }
-    key
-}
-
-fn build_relay_ticket_offer_msg(
-    initiator_id: &[u8; 32],
-    responder_id: &[u8; 32],
-    purpose: &str,
-    nonce: &[u8; 16],
-    ts: i64,
-) -> Vec<u8> {
-    let purpose_bytes = purpose.as_bytes();
-    let mut m =
-        Vec::with_capacity(RDV_DOMAIN.len() + 1 + 32 + 32 + 1 + purpose_bytes.len() + 16 + 8);
-    m.extend_from_slice(RDV_DOMAIN);
-    m.push(OP_RELAY_TICKET_OFFER);
-    m.extend_from_slice(initiator_id);
-    m.extend_from_slice(responder_id);
-    m.push(purpose_bytes.len() as u8);
-    m.extend_from_slice(purpose_bytes);
-    m.extend_from_slice(nonce);
-    m.extend_from_slice(&ts.to_le_bytes());
-    m
-}
-
-fn build_relay_ticket_poll_v2_msg(responder_id: &[u8; 32], nonce: &[u8; 16], ts: i64) -> Vec<u8> {
-    let mut m = Vec::with_capacity(RDV_DOMAIN.len() + 1 + 32 + 16 + 8);
-    m.extend_from_slice(RDV_DOMAIN);
-    m.push(OP_RELAY_TICKET_POLL);
-    m.extend_from_slice(responder_id);
-    m.extend_from_slice(nonce);
-    m.extend_from_slice(&ts.to_le_bytes());
-    m
-}
-
-fn build_relay_ticket_poll_v3_msg(
-    responder_id: &[u8; 32],
-    friend_candidates: &[[u8; 32]],
-    cursor: Option<&[u8; 32]>,
-    nonce: &[u8; 16],
-    ts: i64,
-) -> Vec<u8> {
-    let mut m = Vec::with_capacity(
-        RDV_DOMAIN.len()
-            + 1
-            + 32
-            + 2
-            + friend_candidates.len() * 32
-            + 1
-            + cursor.map_or(0, |_| 32)
-            + 16
-            + 8,
-    );
-    m.extend_from_slice(RDV_DOMAIN);
-    m.push(OP_RELAY_TICKET_POLL_V3);
-    m.extend_from_slice(responder_id);
-    m.extend_from_slice(&(friend_candidates.len() as u16).to_le_bytes());
-    for candidate in friend_candidates {
-        m.extend_from_slice(candidate);
-    }
-    match cursor {
-        Some(cursor) => {
-            m.push(1);
-            m.extend_from_slice(cursor);
-        }
-        None => m.push(0),
-    }
-    m.extend_from_slice(nonce);
-    m.extend_from_slice(&ts.to_le_bytes());
-    m
-}
-
 fn build_relay_ticket_action_msg(
     operation: u8,
     identity_id: &[u8; 32],
@@ -314,6 +296,137 @@ fn build_relay_ticket_action_msg(
     m
 }
 
+fn build_capability_register_msg(
+    capability: &[u8; 32],
+    epoch: i64,
+    port: u16,
+    ip4: [u8; 4],
+    pubkey: &[u8; 32],
+    peer_pubkey: &[u8; 32],
+    ts: i64,
+) -> Vec<u8> {
+    let mut m = Vec::with_capacity(RDV_DOMAIN.len() + 1 + 32 + 8 + 2 + 4 + 32 + 32 + 8);
+    m.extend_from_slice(RDV_DOMAIN);
+    m.push(OP_CAPABILITY_REGISTER);
+    m.extend_from_slice(capability);
+    m.extend_from_slice(&epoch.to_le_bytes());
+    m.extend_from_slice(&port.to_le_bytes());
+    m.extend_from_slice(&ip4);
+    m.extend_from_slice(pubkey);
+    m.extend_from_slice(peer_pubkey);
+    m.extend_from_slice(&ts.to_le_bytes());
+    m
+}
+
+fn build_capability_lookup_msg(
+    capability: &[u8; 32],
+    epoch: i64,
+    requester_id: &[u8; 32],
+    requester_pubkey: &[u8; 32],
+    nonce: &[u8; 16],
+    ts: i64,
+) -> Vec<u8> {
+    let mut m = Vec::with_capacity(RDV_DOMAIN.len() + 1 + 32 + 8 + 32 + 32 + 16 + 8);
+    m.extend_from_slice(RDV_DOMAIN);
+    m.push(OP_CAPABILITY_LOOKUP);
+    m.extend_from_slice(capability);
+    m.extend_from_slice(&epoch.to_le_bytes());
+    m.extend_from_slice(requester_id);
+    m.extend_from_slice(requester_pubkey);
+    m.extend_from_slice(nonce);
+    m.extend_from_slice(&ts.to_le_bytes());
+    m
+}
+
+fn build_relay_mailbox_offer_msg(
+    initiator_id: &[u8; 32],
+    responder_id: &[u8; 32],
+    capability: &[u8; 32],
+    epoch: i64,
+    ticket_id: &[u8; 32],
+    envelope: &[u8],
+    nonce: &[u8; 16],
+    ts: i64,
+) -> Vec<u8> {
+    let mut m = Vec::with_capacity(RDV_DOMAIN.len() + 1 + 32 * 4 + 8 + 4 + envelope.len() + 16 + 8);
+    m.extend_from_slice(RDV_DOMAIN);
+    m.push(OP_RELAY_MAILBOX_OFFER);
+    m.extend_from_slice(initiator_id);
+    m.extend_from_slice(responder_id);
+    m.extend_from_slice(capability);
+    m.extend_from_slice(&epoch.to_le_bytes());
+    m.extend_from_slice(ticket_id);
+    m.extend_from_slice(&(envelope.len() as u32).to_le_bytes());
+    m.extend_from_slice(envelope);
+    m.extend_from_slice(nonce);
+    m.extend_from_slice(&ts.to_le_bytes());
+    m
+}
+
+fn build_relay_mailbox_poll_msg(responder_id: &[u8; 32], nonce: &[u8; 16], ts: i64) -> Vec<u8> {
+    let mut m = Vec::with_capacity(RDV_DOMAIN.len() + 1 + 32 + 16 + 8);
+    m.extend_from_slice(RDV_DOMAIN);
+    m.push(OP_RELAY_MAILBOX_POLL);
+    m.extend_from_slice(responder_id);
+    m.extend_from_slice(nonce);
+    m.extend_from_slice(&ts.to_le_bytes());
+    m
+}
+
+fn build_punch_register_v3_msg(
+    from_id: &[u8; 32],
+    target_id: &[u8; 32],
+    capability: &[u8; 32],
+    epoch: i64,
+    port: u16,
+    nat_type: u8,
+    nonce: &[u8; 16],
+    ts: i64,
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(RDV_DOMAIN.len() + 1 + 32 * 3 + 8 + 2 + 1 + 16 + 8);
+    message.extend_from_slice(RDV_DOMAIN);
+    message.push(OP_PUNCH_REGISTER_V3);
+    message.extend_from_slice(from_id);
+    message.extend_from_slice(target_id);
+    message.extend_from_slice(capability);
+    message.extend_from_slice(&epoch.to_le_bytes());
+    message.extend_from_slice(&port.to_le_bytes());
+    message.push(nat_type);
+    message.extend_from_slice(nonce);
+    message.extend_from_slice(&ts.to_le_bytes());
+    message
+}
+
+fn build_punch_poll_v3_msg(target_id: &[u8; 32], nonce: &[u8; 16], ts: i64) -> Vec<u8> {
+    let mut message = Vec::with_capacity(RDV_DOMAIN.len() + 1 + 32 + 16 + 8);
+    message.extend_from_slice(RDV_DOMAIN);
+    message.push(OP_PUNCH_POLL_V3);
+    message.extend_from_slice(target_id);
+    message.extend_from_slice(nonce);
+    message.extend_from_slice(&ts.to_le_bytes());
+    message
+}
+
+fn build_punch_ack_v3_msg(
+    target_id: &[u8; 32],
+    capability: &[u8; 32],
+    epoch: i64,
+    punch_id: &[u8; 32],
+    nonce: &[u8; 16],
+    ts: i64,
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(RDV_DOMAIN.len() + 1 + 32 * 3 + 8 + 16 + 8);
+    message.extend_from_slice(RDV_DOMAIN);
+    message.push(OP_PUNCH_ACK_V3);
+    message.extend_from_slice(target_id);
+    message.extend_from_slice(capability);
+    message.extend_from_slice(&epoch.to_le_bytes());
+    message.extend_from_slice(punch_id);
+    message.extend_from_slice(nonce);
+    message.extend_from_slice(&ts.to_le_bytes());
+    message
+}
+
 fn signed_request_replay_key(message: &[u8], sig: &[u8; 64]) -> [u8; 32] {
     let mut sha = Sha256::new();
     sha.update(message);
@@ -324,9 +437,9 @@ fn signed_request_replay_key(message: &[u8], sig: &[u8; 64]) -> [u8; 32] {
 const ENTRY_TTL: Duration = Duration::from_secs(300);
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_REQUESTS_PER_MINUTE: u64 = 60;
-/// A normal relay fallback can issue up to 60 status reads/minute plus eight
-/// parallel candidate poll pages per second (480/min) and bounded retries.
-/// Keep those authenticated reads isolated from general and punch budgets.
+/// Keep authenticated mailbox/status reads isolated from general and punch
+/// budgets. The generous ceiling absorbs bounded retries without letting
+/// signaling consume mutation capacity.
 const MAX_TICKET_READS_PER_MINUTE: u64 = 600;
 const RATE_WINDOW: Duration = Duration::from_secs(60);
 const MAX_STORE_ENTRIES: usize = 100_000;
@@ -414,10 +527,11 @@ const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// invokes the upgrade callback (client disconnect / failed handshake).
 const RELAY_UPGRADE_RESERVATION_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_PREBRIDGE_RELAY_FRAMES: usize = 32;
-const MAX_PREBRIDGE_RELAY_BYTES: usize = 1024 * 1024;
-/// A ticket outlives the client's 45-second initiator wait and its documented
-/// 4,096-friend discovery bound (eight 512-candidate pages at a worst-case
-/// two-second request timeout), while remaining brief enough that an
+const MAX_PREBRIDGE_RELAY_BYTES: usize = 256 * 1024;
+const MAX_RELAY_FRAME_BYTES: usize = 16 * 1024;
+const MAX_RELAY_QUEUE_BYTES: usize = 256 * 1024;
+/// A ticket outlives the client's 45-second initiator wait and repeated
+/// one-second self-mailbox polls, while remaining brief enough that an
 /// abandoned offer cannot become a reusable relay capability later.
 const RELAY_TICKET_TTL: Duration = Duration::from_secs(90);
 const MAX_RELAY_TICKETS: usize = 100_000;
@@ -430,15 +544,11 @@ const MAX_PENDING_RELAY_TICKETS_PER_INITIATOR: usize = 16;
 /// arbitrary non-friends block a legitimate friend from ever reaching the
 /// responder's local authorization check.
 const MAX_ACCEPTED_RELAY_TICKETS_PER_RESPONDER: usize = 8;
-/// A response remains well below the client's 8 KiB bounded JSON reader.
-/// Unknown initiators are filtered before this limit is applied.
-const MAX_RELAY_TICKET_POLL_RESULTS: usize = 16;
-/// Legacy v2 clients cannot provide a signed candidate filter or cursor.
-/// Keep their response bounded while retaining authenticated compatibility.
-const MAX_LEGACY_RELAY_TICKET_POLL_RESULTS: usize = 16;
-/// 512 hex IDs plus the signed request fields fit under the route's 64 KiB
-/// body limit while letting even large friend lists make progress quickly.
-const MAX_RELAY_TICKET_POLL_CANDIDATES: usize = 512;
+/// Encrypted envelopes are hex-encoded and relatively large;
+/// eight keep the complete JSON response below the client's 8 KiB cap.
+const MAX_RELAY_MAILBOX_RESULTS: usize = 8;
+/// Bound work per poll while advancing a persistent round-robin cursor.
+const MAX_RELAY_MAILBOX_SCAN_PER_POLL: usize = 64;
 const POLL_READ_NONCE_TTL: Duration = Duration::from_secs(10 * 60);
 const STATUS_READ_NONCE_TTL: Duration = RELAY_TICKET_TTL;
 const MAX_POLL_READ_NONCES: usize = 100_000;
@@ -446,14 +556,6 @@ const MAX_STATUS_READ_NONCES: usize = MAX_RELAY_TICKETS;
 
 #[derive(Clone)]
 struct PresenceEntry {
-    ip: IpAddr,
-    port: u16,
-    /// IP we observed the registration request from. Kept for
-    /// diagnostics / future heuristics; the auth model no longer
-    /// relies on it (signature is the authority), so it's marked
-    /// `dead_code` while still emitted in `debug!` logs.
-    #[allow(dead_code)]
-    conn_ip: IpAddr,
     expires_at: Instant,
     /// The Ed25519 pubkey the rendezvous id binds to. Pinned on first
     /// `/register` for this id and re-checked on every subsequent
@@ -462,37 +564,29 @@ struct PresenceEntry {
     /// let any network actor compute a victim's id and POST a fake
     /// address for it.
     pubkey: [u8; 32],
-    /// Optional X25519 Noise static public key, supplied by clients that
-    /// run the Ember-native DHT (`ember_native_enabled`). It is NOT part
-    /// of the signed registration message: a client only ever publishes
-    /// its own key, and the DHT verifies every contact's Ed25519 binding
-    /// on first PING — a wrong Noise key just fails the handshake, so an
-    /// unsigned value can't be weaponised. Entries that carry one are
-    /// eligible for the `/bootstrap` pool.
-    noise_pub: Option<[u8; 32]>,
-    /// Optional UDP port the client's Ember Noise transport listens on.
-    /// `port` above is the TCP friend-presence port returned by `/lookup`;
-    /// this is the UDP port `/bootstrap` advertises so cold-starting DHT
-    /// peers dial the right socket. Same unsigned trust model as
-    /// `noise_pub`: it only scopes a port on the client's own signed IP, so
-    /// at worst it points a dialer at a dead port on that same host. An
-    /// entry needs BOTH this and `noise_pub` to be bootstrap-eligible.
-    ember_port: Option<u16>,
-    /// Timestamp the registrant signed (`body.ts` from the accepted
-    /// `/register` call). Returned verbatim in `/lookup` responses so
-    /// callers can reconstruct and verify the exact signed message —
-    /// see `sig` below.
+}
+
+#[derive(Clone)]
+struct PairwisePresenceEntry {
+    ip: IpAddr,
+    port: u16,
+    expires_at: Instant,
+    /// The sole peer authorized to use this capability for lookup, punch, or
+    /// mailbox offers. The presence owner signs this binding at registration.
+    peer_pubkey: [u8; 32],
+    pubkey: [u8; 32],
+    epoch: i64,
     ts: i64,
-    /// The Ed25519 signature the registrant produced over
-    /// `RDV_DOMAIN || OP_REGISTER || id_raw || port_le || ipv4 || pubkey || ts_le`
-    /// at registration time. Replayed back verbatim in `/lookup`
-    /// responses: this is what lets a looker-upper cryptographically
-    /// confirm the (ip, port, pubkey, ts) tuple was produced by
-    /// whoever holds the private key for this id, and was not
-    /// substituted or fabricated by the rendezvous server itself.
-    /// (The server *does* hold a separate long-term key for signing
-    /// `/bootstrap` pool responses — see `bootstrap_signing_key`.)
     sig: [u8; 64],
+}
+
+fn capability_allows_peer(
+    entry: &PairwisePresenceEntry,
+    peer_pubkey: &[u8; 32],
+    epoch: i64,
+    now: Instant,
+) -> bool {
+    entry.expires_at > now && entry.epoch == epoch && entry.peer_pubkey == *peer_pubkey
 }
 
 #[derive(Clone)]
@@ -504,10 +598,13 @@ struct RateEntry {
 /// A hole-punch coordination request waiting for the other peer to poll.
 #[derive(Clone)]
 struct PunchEntry {
+    punch_id: String,
     from_id: String,
     from_ip: IpAddr,
     from_port: u16,
     nat_type: u8,
+    capability: [u8; 32],
+    epoch: i64,
     created_at: Instant,
 }
 
@@ -530,13 +627,87 @@ struct PunchEntry {
 ///
 /// Replaces the older single-direction relay where peer1's WS frames
 /// were silently dropped. The bridge is now genuinely full-duplex.
-type RelayPeerChannel = (tokio::sync::mpsc::Sender<Vec<u8>>, Arc<AtomicUsize>);
+#[derive(Clone)]
+struct RelayQueueSender {
+    sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+    queued_bytes: Arc<AtomicUsize>,
+}
+
+struct RelayQueueReceiver {
+    receiver: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    queued_bytes: Arc<AtomicUsize>,
+}
+
+impl RelayQueueSender {
+    async fn send(&self, frame: Vec<u8>) -> Result<(), ()> {
+        let len = frame.len();
+        let reserved = self
+            .queued_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
+                current
+                    .checked_add(len)
+                    .filter(|next| *next <= MAX_RELAY_QUEUE_BYTES)
+            })
+            .is_ok();
+        if !reserved {
+            return Err(());
+        }
+        struct Reservation<'a> {
+            counter: &'a AtomicUsize,
+            len: usize,
+            armed: bool,
+        }
+        impl Drop for Reservation<'_> {
+            fn drop(&mut self) {
+                if self.armed {
+                    self.counter.fetch_sub(self.len, Ordering::AcqRel);
+                }
+            }
+        }
+        let mut reservation = Reservation {
+            counter: &self.queued_bytes,
+            len,
+            armed: true,
+        };
+        self.sender.send(frame).await.map_err(|_| ())?;
+        reservation.armed = false;
+        Ok(())
+    }
+}
+
+impl RelayQueueReceiver {
+    async fn recv(&mut self) -> Option<Vec<u8>> {
+        let frame = self.receiver.recv().await?;
+        self.queued_bytes.fetch_sub(frame.len(), Ordering::AcqRel);
+        Some(frame)
+    }
+}
+
+fn relay_queue() -> (RelayQueueSender, RelayQueueReceiver) {
+    let (sender, receiver) = tokio::sync::mpsc::channel(64);
+    let queued_bytes = Arc::new(AtomicUsize::new(0));
+    (
+        RelayQueueSender {
+            sender,
+            queued_bytes: queued_bytes.clone(),
+        },
+        RelayQueueReceiver {
+            receiver,
+            queued_bytes,
+        },
+    )
+}
+
+type RelayPeerChannel = (RelayQueueSender, Arc<AtomicUsize>);
 
 struct RelaySessionEntry {
-    peer1_inbox_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    peer1_inbox_tx: Option<RelayQueueSender>,
     peer2_announce_tx: Option<tokio::sync::oneshot::Sender<RelayPeerChannel>>,
-    first_ip: IpAddr,
-    created_at: Instant,
+    deadline: Instant,
+}
+
+struct BridgedRelayEntry {
+    deadline: Instant,
 }
 
 /// A server-relay ticket never retains either raw bearer token. The matching
@@ -546,7 +717,9 @@ struct RelaySessionEntry {
 struct RelayTicket {
     initiator_id: String,
     responder_id: String,
-    purpose: String,
+    capability: [u8; 32],
+    epoch: i64,
+    mailbox_envelope: Vec<u8>,
     initiator_token_hash: [u8; 32],
     responder_token_hash: [u8; 32],
     initiator_joined: bool,
@@ -558,27 +731,39 @@ struct RelayTicket {
 }
 
 /// Ticket state and its admission indexes are mutated atomically under one
-/// lock. Polling looks up only the caller's signed candidates via
-/// `by_responder`,
-/// never scans/sorts every pending offer.
-/// Legacy v2 rotation cursor plus the time it was last advanced, so stale
-/// entries (responders that stopped polling mid-rotation) can be swept.
-struct LegacyV2Cursor {
-    last_initiator_id: String,
-    touched_at: Instant,
-}
-
+/// lock. Mailbox polling walks only the authenticated responder's bounded
+/// per-initiator index.
 #[derive(Default)]
 struct RelayTicketStore {
     tickets: HashMap<String, RelayTicket>,
     by_responder: HashMap<String, BTreeMap<String, String>>,
-    legacy_v2_cursors: HashMap<String, LegacyV2Cursor>,
-    /// Throttles the `legacy_v2_cursors` sweep so per-request prunes don't
-    /// rescan the whole cursor map every time.
-    legacy_v2_cursor_next_sweep: Option<Instant>,
+    mailbox_cursors: HashMap<String, String>,
     initiator_counts: HashMap<String, usize>,
     accepted_responder_counts: HashMap<String, usize>,
     expirations: VecDeque<(Instant, String)>,
+}
+
+fn select_mailbox_candidate(
+    tickets: &HashMap<String, RelayTicket>,
+    initiator: &String,
+    ticket_id: &String,
+    now: Instant,
+    scanned: &mut usize,
+    last_scanned: &mut Option<String>,
+    selected: &mut Vec<String>,
+) -> bool {
+    if *scanned >= MAX_RELAY_MAILBOX_SCAN_PER_POLL || selected.len() >= MAX_RELAY_MAILBOX_RESULTS {
+        return false;
+    }
+    *scanned += 1;
+    *last_scanned = Some(initiator.clone());
+    if tickets
+        .get(ticket_id)
+        .is_some_and(|ticket| !ticket.accepted && ticket.expires_at > now)
+    {
+        selected.push(ticket_id.clone());
+    }
+    true
 }
 
 impl RelayTicketStore {
@@ -613,6 +798,7 @@ impl RelayTicketStore {
             }
             if by_initiator.is_empty() {
                 self.by_responder.remove(&ticket.responder_id);
+                self.mailbox_cursors.remove(&ticket.responder_id);
             }
         }
         if let Some(count) = self.initiator_counts.get_mut(&ticket.initiator_id) {
@@ -663,21 +849,6 @@ impl RelayTicketStore {
             }
             self.remove(&ticket_id);
         }
-
-        // Legacy v2 cursors have no removal path of their own when a
-        // responder stops polling, so they would otherwise accumulate one
-        // entry per responder identity forever. A cursor untouched for a
-        // full ticket TTL cannot point past any still-live ticket (every
-        // ticket it could have referenced has expired), so dropping it only
-        // restarts that responder's rotation at the first page.
-        if self
-            .legacy_v2_cursor_next_sweep
-            .map_or(true, |at| at <= now)
-        {
-            self.legacy_v2_cursors
-                .retain(|_, cursor| now.saturating_duration_since(cursor.touched_at) < RELAY_TICKET_TTL);
-            self.legacy_v2_cursor_next_sweep = Some(now + SWEEP_INTERVAL);
-        }
     }
 
     fn mark_accepted(&mut self, ticket_id: &str) -> bool {
@@ -693,6 +864,72 @@ impl RelayTicketStore {
             .entry(ticket.responder_id.clone())
             .or_insert(0) += 1;
         true
+    }
+
+    fn mailbox_page_ids(&mut self, responder_id: &str, now: Instant) -> Vec<String> {
+        let Some(by_initiator) = self.by_responder.get(responder_id) else {
+            self.mailbox_cursors.remove(responder_id);
+            return Vec::new();
+        };
+        let cursor = self.mailbox_cursors.get(responder_id).cloned();
+        let mut selected = Vec::with_capacity(MAX_RELAY_MAILBOX_RESULTS);
+        let mut last_scanned = None;
+        let mut scanned = 0usize;
+
+        if let Some(cursor) = cursor {
+            use std::ops::Bound::{Excluded, Included, Unbounded};
+            for (initiator, ticket_id) in by_initiator.range((Excluded(cursor.clone()), Unbounded))
+            {
+                if !select_mailbox_candidate(
+                    &self.tickets,
+                    initiator,
+                    ticket_id,
+                    now,
+                    &mut scanned,
+                    &mut last_scanned,
+                    &mut selected,
+                ) {
+                    break;
+                }
+            }
+            if scanned < MAX_RELAY_MAILBOX_SCAN_PER_POLL
+                && selected.len() < MAX_RELAY_MAILBOX_RESULTS
+            {
+                for (initiator, ticket_id) in by_initiator.range((Unbounded, Included(cursor))) {
+                    if !select_mailbox_candidate(
+                        &self.tickets,
+                        initiator,
+                        ticket_id,
+                        now,
+                        &mut scanned,
+                        &mut last_scanned,
+                        &mut selected,
+                    ) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            for (initiator, ticket_id) in by_initiator {
+                if !select_mailbox_candidate(
+                    &self.tickets,
+                    initiator,
+                    ticket_id,
+                    now,
+                    &mut scanned,
+                    &mut last_scanned,
+                    &mut selected,
+                ) {
+                    break;
+                }
+            }
+        }
+
+        if let Some(last_scanned) = last_scanned {
+            self.mailbox_cursors
+                .insert(responder_id.to_owned(), last_scanned);
+        }
+        selected
     }
 }
 
@@ -760,7 +997,7 @@ impl<K: Eq + Hash + Copy> ScopedNonceCache<K> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum RelayRole {
     Initiator,
     Responder,
@@ -777,6 +1014,9 @@ struct RelayReservation {
 #[derive(Clone)]
 struct AppState {
     store: Arc<RwLock<HashMap<String, PresenceEntry>>>,
+    /// Public reachability is indexed only by rotating pairwise capability,
+    /// never by the stable Friend ID kept in `store` for mailbox auth.
+    capability_store: Arc<RwLock<HashMap<String, PairwisePresenceEntry>>>,
     /// Per-IP rate-limit window for the **general** API surface
     /// (`register`, `lookup`, `unregister`, `relay-invite`, etc.).
     /// Punch traffic now lives in `punch_rate_limits` so a flood of
@@ -801,6 +1041,8 @@ struct AppState {
     /// the per-target cap below bounds.
     punch_requests: Arc<RwLock<HashMap<(String, String), PunchEntry>>>,
     relay_sessions: Arc<RwLock<HashMap<String, RelaySessionEntry>>>,
+    bridged_relays: Arc<RwLock<HashMap<String, BridgedRelayEntry>>>,
+    relay_admissions: Arc<RwLock<HashMap<(String, RelayRole), IpAddr>>>,
     relay_ip_counts: Arc<RwLock<HashMap<IpAddr, usize>>>,
     next_relay_reservation_id: Arc<AtomicU64>,
     relay_tickets: Arc<RwLock<RelayTicketStore>>,
@@ -813,12 +1055,6 @@ struct AppState {
     /// unregister within that allowed skew window. It intentionally excludes
     /// idempotent ticket reads; see the scope-bounded caches below.
     replay_cache: Arc<RwLock<ReplayCache>>,
-    /// How many times each DHT node's Ed25519 pubkey has been handed out
-    /// via `/bootstrap`. Used as the load score for weighted sampling so
-    /// cold-start traffic doesn't concentrate on a few popular entries.
-    bootstrap_load: Arc<RwLock<HashMap<[u8; 32], u32>>>,
-    /// Long-term Ed25519 key that signs every `/bootstrap` response.
-    bootstrap_signing_key: Arc<SigningKey>,
     /// One stable poll nonce per live responder identity. Replays are
     /// idempotent reads, while a different nonce for the same identity is
     /// rejected until the entry expires.
@@ -853,40 +1089,45 @@ struct RegisterRequest {
     /// Hex-encoded Ed25519 signature over
     /// `RDV_DOMAIN || OP_REGISTER || sha256_id_raw || port_le || ipv4 || pubkey || ts_le`.
     sig: String,
-    /// Optional X25519 Noise static public key (64 hex chars), published
-    /// by Ember-DHT-enabled clients so they can serve in the `/bootstrap`
-    /// pool. Unsigned and best-effort: an unparseable value is dropped
-    /// rather than failing the registration. See `PresenceEntry::noise_pub`.
-    #[serde(default)]
-    noise_pub: Option<String>,
-    /// Optional UDP port the client's Ember Noise transport listens on.
-    /// The signed `port` above is the eMule TCP listener used for
-    /// friend-presence lookups; Ember runs over a separate UDP socket, so
-    /// `/bootstrap` must hand peers this port instead. Unsigned/best-effort
-    /// for the same reason as `noise_pub` (it only scopes a port on the
-    /// already-signed IP). See `PresenceEntry::ember_port`.
-    #[serde(default)]
-    ember_port: Option<u16>,
 }
 
 #[derive(Serialize)]
-struct LookupResponse {
+struct IdentityResponse {
+    pubkey: String,
+}
+
+#[derive(Deserialize)]
+struct CapabilityRegisterRequest {
+    capability: String,
+    epoch: i64,
+    port: u16,
+    ip: String,
+    pubkey: String,
+    peer_pubkey: String,
+    ts: i64,
+    sig: String,
+}
+
+#[derive(Deserialize)]
+struct CapabilityLookupRequest {
+    capability: String,
+    epoch: i64,
+    requester_id: String,
+    requester_pubkey: String,
+    nonce: String,
+    ts: i64,
+    sig: String,
+}
+
+#[derive(Serialize)]
+struct CapabilityLookupResponse {
+    acknowledged: bool,
+    capability: String,
+    epoch: i64,
     ip: String,
     port: u16,
-    /// Hex-encoded Ed25519 pubkey the registrant signed with. The
-    /// caller must confirm this pubkey actually derives to the id it
-    /// looked up (same `pubkey -> ember_hash -> id` chain as
-    /// registration) before trusting anything else in this response.
     pubkey: String,
-    /// Timestamp the registrant signed (see `PresenceEntry::ts`).
     ts: i64,
-    /// Hex-encoded Ed25519 signature over
-    /// `RDV_DOMAIN || OP_REGISTER || sha256_id_raw || port_le || ipv4 || pubkey || ts_le`,
-    /// produced by the registrant at registration time and replayed
-    /// verbatim here. The caller verifies it against `pubkey` to
-    /// confirm this exact (ip, port, pubkey, ts) tuple was actually
-    /// produced by the id's owner, not fabricated by the rendezvous
-    /// server.
     sig: String,
 }
 
@@ -899,39 +1140,21 @@ struct UnregisterRequest {
 }
 
 #[derive(Deserialize)]
-struct RelayTicketOfferRequest {
+struct RelayMailboxOfferRequest {
     initiator_id: String,
     responder_id: String,
-    purpose: String,
-    ts: i64,
-    /// A client-generated random nonce bound into the signature. Unlike a
-    /// timestamp alone, this lets concurrent valid requests in the same
-    /// second remain distinct while still making every captured request
-    /// replayable only once.
-    nonce: String,
-    sig: String,
-}
-
-/// Original v2 poll schema. Keep this route and signature format for clients
-/// already deployed before candidate-filtered paging existed.
-#[derive(Deserialize)]
-struct RelayTicketPollV2Request {
-    responder_id: String,
+    capability: String,
+    epoch: i64,
+    ticket_id: String,
+    envelope: String,
     ts: i64,
     nonce: String,
     sig: String,
 }
 
-/// Explicit v3 candidate-filtered polling schema.
 #[derive(Deserialize)]
-struct RelayTicketPollV3Request {
+struct RelayMailboxPollRequest {
     responder_id: String,
-    /// Signed, local-known friend candidates. The server filters before
-    /// applying its response page limit, so unknown offers cannot hide a
-    /// legitimate candidate in an oversized response.
-    friend_candidates: Vec<String>,
-    /// Opaque ticket-ID cursor for the next page of matching offers.
-    cursor: Option<String>,
     ts: i64,
     nonce: String,
     sig: String,
@@ -953,16 +1176,16 @@ struct RelayTicketOfferResponse {
 }
 
 #[derive(Serialize)]
-struct RelayTicketPollResponse {
-    tickets: Vec<RelayTicketPollItem>,
-    next_cursor: Option<String>,
+struct RelayMailboxPollItem {
+    ticket_id: String,
+    capability: String,
+    epoch: i64,
+    envelope: String,
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize)]
-struct RelayTicketPollItem {
-    ticket_id: String,
-    initiator_id: String,
-    purpose: String,
+#[derive(Serialize)]
+struct RelayMailboxPollResponse {
+    tickets: Vec<RelayMailboxPollItem>,
 }
 
 #[derive(Serialize)]
@@ -1357,12 +1580,6 @@ fn validate_relay_token(token: &str) -> bool {
     token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn validate_relay_purpose(purpose: &str) -> bool {
-    // The ticket protocol is deliberately purpose-scoped. Add new values only
-    // alongside a client implementation with matching authorization rules.
-    purpose == "friend"
-}
-
 fn random_relay_secret_hex() -> String {
     let mut bytes = [0u8; 32];
     OsRng.fill_bytes(&mut bytes);
@@ -1448,152 +1665,6 @@ fn responder_has_accepted_ticket_capacity(tickets: &RelayTicketStore, responder_
         .copied()
         .unwrap_or(0)
         < MAX_ACCEPTED_RELAY_TICKETS_PER_RESPONDER
-}
-
-fn decode_relay_ticket_poll_candidates(values: &[String]) -> Option<Vec<[u8; 32]>> {
-    if values.len() > MAX_RELAY_TICKET_POLL_CANDIDATES {
-        return None;
-    }
-    let mut candidates = Vec::with_capacity(values.len());
-    let mut seen = HashSet::with_capacity(values.len());
-    for value in values {
-        if !validate_hex_id(value) {
-            return None;
-        }
-        let raw = decode_hex_id(value)?;
-        if !seen.insert(raw) {
-            return None;
-        }
-        candidates.push(raw);
-    }
-    Some(candidates)
-}
-
-fn relay_ticket_poll_page(
-    tickets: &RelayTicketStore,
-    responder_id: &str,
-    friend_candidates: &HashSet<String>,
-    cursor: Option<&str>,
-    now: Instant,
-) -> (Vec<RelayTicketPollItem>, Option<String>) {
-    let mut matching: Vec<(&String, &RelayTicket)> = friend_candidates
-        .iter()
-        .filter_map(|initiator_id| {
-            let ticket_id = tickets.by_responder.get(responder_id)?.get(initiator_id)?;
-            let ticket = tickets.tickets.get(ticket_id)?;
-            (ticket.responder_id == responder_id
-                && !ticket.accepted
-                && cursor.is_none_or(|cursor| ticket_id.as_str() > cursor)
-                && ticket.expires_at > now)
-                .then_some((ticket_id, ticket))
-        })
-        .collect();
-    matching.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
-
-    let has_more = matching.len() > MAX_RELAY_TICKET_POLL_RESULTS;
-    matching.truncate(MAX_RELAY_TICKET_POLL_RESULTS);
-    let next_cursor = has_more.then(|| {
-        matching
-            .last()
-            .expect("a non-empty overfull ticket page has a final item")
-            .0
-            .clone()
-    });
-    let tickets = matching
-        .into_iter()
-        .map(|(ticket_id, ticket)| RelayTicketPollItem {
-            ticket_id: ticket_id.clone(),
-            initiator_id: ticket.initiator_id.clone(),
-            purpose: ticket.purpose.clone(),
-        })
-        .collect();
-    (tickets, next_cursor)
-}
-
-fn relay_ticket_poll_v2_page(
-    tickets: &mut RelayTicketStore,
-    responder_id: &str,
-    now: Instant,
-) -> Vec<RelayTicketPollItem> {
-    let cursor = tickets
-        .legacy_v2_cursors
-        .get(responder_id)
-        .map(|cursor| cursor.last_initiator_id.clone());
-    let mut selected: Vec<(String, String)> = Vec::new();
-    if let Some(by_initiator) = tickets.by_responder.get(responder_id) {
-        if let Some(cursor) = cursor.as_ref() {
-            for (initiator_id, ticket_id) in by_initiator.range((
-                std::ops::Bound::Excluded(cursor.clone()),
-                std::ops::Bound::Unbounded,
-            )) {
-                if selected.len() >= MAX_LEGACY_RELAY_TICKET_POLL_RESULTS {
-                    break;
-                }
-                if tickets
-                    .tickets
-                    .get(ticket_id)
-                    .is_some_and(|ticket| !ticket.accepted && ticket.expires_at > now)
-                {
-                    selected.push((initiator_id.clone(), ticket_id.clone()));
-                }
-            }
-            if selected.len() < MAX_LEGACY_RELAY_TICKET_POLL_RESULTS {
-                for (initiator_id, ticket_id) in by_initiator.range(..=cursor.clone()) {
-                    if selected.len() >= MAX_LEGACY_RELAY_TICKET_POLL_RESULTS {
-                        break;
-                    }
-                    if tickets
-                        .tickets
-                        .get(ticket_id)
-                        .is_some_and(|ticket| !ticket.accepted && ticket.expires_at > now)
-                    {
-                        selected.push((initiator_id.clone(), ticket_id.clone()));
-                    }
-                }
-            }
-        } else {
-            for (initiator_id, ticket_id) in by_initiator {
-                if selected.len() >= MAX_LEGACY_RELAY_TICKET_POLL_RESULTS {
-                    break;
-                }
-                if tickets
-                    .tickets
-                    .get(ticket_id)
-                    .is_some_and(|ticket| !ticket.accepted && ticket.expires_at > now)
-                {
-                    selected.push((initiator_id.clone(), ticket_id.clone()));
-                }
-            }
-        }
-    }
-
-    match selected.last() {
-        Some((initiator_id, _)) => {
-            tickets.legacy_v2_cursors.insert(
-                responder_id.to_owned(),
-                LegacyV2Cursor {
-                    last_initiator_id: initiator_id.clone(),
-                    touched_at: now,
-                },
-            );
-        }
-        None => {
-            tickets.legacy_v2_cursors.remove(responder_id);
-        }
-    }
-    selected
-        .into_iter()
-        .filter_map(|(_, ticket_id)| {
-            tickets
-                .tickets
-                .get(&ticket_id)
-                .map(|ticket| RelayTicketPollItem {
-                    ticket_id,
-                    initiator_id: ticket.initiator_id.clone(),
-                    purpose: ticket.purpose.clone(),
-                })
-        })
-        .collect()
 }
 
 /// Atomically reserves a role token and capacity before sending HTTP 101.
@@ -1698,6 +1769,11 @@ async fn commit_relay_ticket_reservation(
     }
     *pending = None;
     *joined = true;
+    drop(tickets);
+    state.relay_admissions.write().await.insert(
+        (reservation.ticket_id.clone(), reservation.role),
+        reservation.client_ip,
+    );
     Ok(())
 }
 
@@ -1730,6 +1806,7 @@ async fn rollback_relay_ticket_reservation(state: &AppState, reservation: &Relay
 }
 
 /// Unit-test helper for immediate, non-WebSocket callers.
+#[cfg(test)]
 async fn admit_relay_ticket_join(
     state: &AppState,
     ticket_id: &str,
@@ -1854,26 +1931,9 @@ async fn register(
         return status;
     }
 
-    // Optional DHT Noise key — decoded best-effort. A malformed value is
-    // simply dropped (the entry just won't be bootstrap-eligible) rather
-    // than failing an otherwise-valid registration.
-    let noise_pub = body.noise_pub.as_deref().and_then(decode_hex_pubkey);
-
-    // Optional Ember UDP port — best-effort like `noise_pub`. A zero port is
-    // meaningless (no listener) so it's normalised to `None`, which keeps the
-    // entry out of the `/bootstrap` pool rather than advertising a dead addr.
-    let ember_port = body.ember_port.filter(|p| *p != 0);
-
     let entry = PresenceEntry {
-        ip: presence_ip,
-        port: body.port,
-        conn_ip: client_ip,
         expires_at: Instant::now() + ENTRY_TTL,
         pubkey,
-        noise_pub,
-        ember_port,
-        ts: body.ts,
-        sig: sig_bytes,
     };
 
     let mut store = state.store.write().await;
@@ -1915,40 +1975,195 @@ async fn register(
     StatusCode::OK
 }
 
-async fn lookup(
+async fn legacy_presence_lookup_gone() -> StatusCode {
+    // Stable Friend IDs are authentication/mailbox addresses only. They must
+    // never be usable as public-presence lookup keys.
+    StatusCode::GONE
+}
+
+async fn identity_lookup(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Result<Json<LookupResponse>, StatusCode> {
+) -> Result<Json<IdentityResponse>, StatusCode> {
     if !validate_hex_id(&id) {
         return Err(StatusCode::BAD_REQUEST);
     }
-
     let client_ip = extract_client_ip(&headers, addr);
     if !check_rate_limit(&state, client_ip).await {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
-
     let store = state.store.read().await;
-    match store.get(&id.to_lowercase()) {
-        Some(entry) if entry.expires_at > Instant::now() => {
-            // See `register` above: per-request lines stay at debug to
-            // avoid PII in the default log stream.
-            debug!("lookup hit {} from {}", &id[..8], client_ip);
-            Ok(Json(LookupResponse {
-                ip: entry.ip.to_string(),
-                port: entry.port,
-                pubkey: hex::encode(entry.pubkey),
-                ts: entry.ts,
-                sig: hex::encode(entry.sig),
-            }))
-        }
-        _ => {
-            debug!("lookup miss {} from {}", &id[..8], client_ip);
-            Err(StatusCode::NOT_FOUND)
+    let entry = store
+        .get(&id.to_lowercase())
+        .filter(|entry| entry.expires_at > Instant::now())
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(IdentityResponse {
+        pubkey: hex::encode(entry.pubkey),
+    }))
+}
+
+async fn capability_register(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<CapabilityRegisterRequest>,
+) -> StatusCode {
+    if !validate_hex_id(&body.capability)
+        || body.port == 0
+        || !timestamp_fresh(body.ts)
+        || (body.epoch - now_unix_secs().div_euclid(15 * 60)).abs() > 1
+    {
+        return StatusCode::BAD_REQUEST;
+    }
+    let (Some(capability), Some(pubkey), Some(peer_pubkey), Some(sig)) = (
+        decode_hex_id(&body.capability),
+        decode_hex_pubkey(&body.pubkey),
+        decode_hex_pubkey(&body.peer_pubkey),
+        decode_hex_sig(&body.sig),
+    ) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    if VerifyingKey::from_bytes(&peer_pubkey).is_err() {
+        return StatusCode::BAD_REQUEST;
+    }
+    let Ok(ip) = body.ip.parse::<IpAddr>() else {
+        return StatusCode::BAD_REQUEST;
+    };
+    if !match ip {
+        IpAddr::V4(v4) => is_routable_public_v4(v4),
+        IpAddr::V6(v6) => is_routable_public_v6(v6),
+    } {
+        return StatusCode::BAD_REQUEST;
+    }
+    let client_ip = extract_client_ip(&headers, addr);
+    if !check_rate_limit(&state, client_ip).await {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
+    let owner_id = id_from_pubkey(&pubkey);
+    let owner_is_registered = state
+        .store
+        .read()
+        .await
+        .get(&owner_id)
+        .is_some_and(|entry| entry.expires_at > Instant::now() && entry.pubkey == pubkey);
+    if !owner_is_registered {
+        return StatusCode::FORBIDDEN;
+    }
+    let signed_ip4 = match ip {
+        IpAddr::V4(v4) => v4.octets(),
+        IpAddr::V6(_) => [0; 4],
+    };
+    let signed = build_capability_register_msg(
+        &capability,
+        body.epoch,
+        body.port,
+        signed_ip4,
+        &pubkey,
+        &peer_pubkey,
+        body.ts,
+    );
+    if !ed25519_verify(&pubkey, &signed, &sig) {
+        return StatusCode::FORBIDDEN;
+    }
+    if let Err(status) = replay_cache_status(
+        remember_signed_request(&state, signed_request_replay_key(&signed, &sig)).await,
+    ) {
+        return status;
+    }
+    let mut capabilities = state.capability_store.write().await;
+    let key = body.capability.to_lowercase();
+    if capabilities.len() >= MAX_STORE_ENTRIES && !capabilities.contains_key(&key) {
+        capabilities.retain(|_, entry| entry.expires_at > Instant::now());
+        if capabilities.len() >= MAX_STORE_ENTRIES {
+            return StatusCode::SERVICE_UNAVAILABLE;
         }
     }
+    capabilities.insert(
+        key,
+        PairwisePresenceEntry {
+            ip,
+            port: body.port,
+            expires_at: Instant::now() + ENTRY_TTL,
+            peer_pubkey,
+            pubkey,
+            epoch: body.epoch,
+            ts: body.ts,
+            sig,
+        },
+    );
+    StatusCode::OK
+}
+
+async fn capability_lookup(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<CapabilityLookupRequest>,
+) -> Result<Json<CapabilityLookupResponse>, StatusCode> {
+    if !validate_hex_id(&body.capability)
+        || !validate_hex_id(&body.requester_id)
+        || !timestamp_fresh(body.ts)
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let (Some(capability), Some(requester_raw), Some(requester_pubkey), Some(nonce), Some(sig)) = (
+        decode_hex_id(&body.capability),
+        decode_hex_id(&body.requester_id),
+        decode_hex_pubkey(&body.requester_pubkey),
+        decode_hex_nonce(&body.nonce),
+        decode_hex_sig(&body.sig),
+    ) else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    if !pubkey_matches_id(&requester_pubkey, &body.requester_id) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let client_ip = extract_client_ip(&headers, addr);
+    if !check_rate_limit(&state, client_ip).await {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    let requester_registered = state
+        .store
+        .read()
+        .await
+        .get(&body.requester_id.to_lowercase())
+        .is_some_and(|entry| entry.expires_at > Instant::now() && entry.pubkey == requester_pubkey);
+    if !requester_registered {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let signed = build_capability_lookup_msg(
+        &capability,
+        body.epoch,
+        &requester_raw,
+        &requester_pubkey,
+        &nonce,
+        body.ts,
+    );
+    if !ed25519_verify(&requester_pubkey, &signed, &sig) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    replay_cache_status(
+        remember_signed_request(&state, signed_request_replay_key(&signed, &sig)).await,
+    )?;
+    let capabilities = state.capability_store.read().await;
+    let entry = capabilities
+        .get(&body.capability.to_lowercase())
+        .filter(|entry| {
+            capability_allows_peer(entry, &requester_pubkey, body.epoch, Instant::now())
+        })
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(CapabilityLookupResponse {
+        acknowledged: true,
+        capability: body.capability.to_lowercase(),
+        epoch: entry.epoch,
+        ip: entry.ip.to_string(),
+        port: entry.port,
+        pubkey: hex::encode(entry.pubkey),
+        ts: entry.ts,
+        sig: hex::encode(entry.sig),
+    }))
 }
 
 async fn unregister(
@@ -1978,10 +2193,8 @@ async fn unregister(
     let id = body.id.to_lowercase();
     let pubkey = state.store.read().await.get(&id).map(|entry| entry.pubkey);
     if let Some(pubkey) = pubkey {
-        // Verify the signature with the pinned pubkey rather than
-        // trusting `client_ip == entry.conn_ip` (which CGN /
-        // proxy-mismatch / new ISP session breaks). The signature is
-        // the only authority that survives address churn.
+        // Verify with the pinned pubkey rather than trusting the current
+        // connection IP. The signature is the authority across address churn.
         let msg = build_unregister_msg(&id_raw, body.ts);
         if ed25519_verify(&pubkey, &msg, &sig_bytes) {
             if let Err(status) = replay_cache_status(
@@ -2009,203 +2222,169 @@ async fn unregister(
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
-struct PunchRequest {
+struct CapabilityPunchRequest {
     from_id: String,
     target_id: String,
+    capability: String,
+    epoch: i64,
     port: u16,
     nat_type: u8,
+    ts: i64,
+    nonce: String,
+    sig: String,
+}
+
+#[derive(Deserialize)]
+struct CapabilityPunchPollRequest {
+    target_id: String,
+    ts: i64,
+    nonce: String,
+    sig: String,
+}
+
+#[derive(Deserialize)]
+struct CapabilityPunchAckRequest {
+    target_id: String,
+    capability: String,
+    epoch: i64,
+    punch_id: String,
+    ts: i64,
+    nonce: String,
+    sig: String,
 }
 
 #[derive(Serialize)]
 struct PunchResponse {
+    punch_id: String,
     from_id: String,
     ip: String,
     port: u16,
     nat_type: u8,
+    capability: String,
+    epoch: i64,
 }
 
 fn prune_expired_punches(punches: &mut HashMap<(String, String), PunchEntry>, now: Instant) {
     punches.retain(|_, entry| now.duration_since(entry.created_at) < PUNCH_TTL);
 }
 
-/// Register a hole-punch request targeting another peer.
-async fn punch_register(
+async fn legacy_punch_gone() -> StatusCode {
+    StatusCode::GONE
+}
+
+async fn punch_register_v3(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Json(body): Json<PunchRequest>,
+    Json(body): Json<CapabilityPunchRequest>,
 ) -> StatusCode {
-    // Reject anything that isn't a well-formed 64-char hex id. The
-    // earlier `len != 64` check let punk inputs through (high-byte
-    // unicode, garbage from buggy clients) which then polluted logs
-    // and downstream `from_id` storage. `register` already enforced
-    // this; punch endpoints now match.
-    if !validate_hex_id(&body.from_id) || !validate_hex_id(&body.target_id) {
-        return StatusCode::BAD_REQUEST;
-    }
-    if body.port == 0 {
-        return StatusCode::BAD_REQUEST;
-    }
-    // NOTE: punch endpoints are intentionally NOT signature-gated. The
-    // current `/punch` keying scheme uses synthetic ids derived from
-    // the target peer's `(ip, port)` (see broker code path in the
-    // client), which are NOT registered presence-map identities and
-    // therefore have no pinned pubkey to verify against. Defenses
-    // remain: per-IP rate limiting, per-target cap, and the fact
-    // that a punch entry is just (ip, port, nat_type) — useless
-    // without a working QUIC handshake on top, which is mutually
-    // authenticated in `ember::broker`.
-    let client_ip = extract_client_ip(&headers, addr);
-
-    // Punch-specific rate limit. Uses its own per-IP map so heavy
-    // punch retries don't consume the budget for `register` /
-    // `lookup` / `relay-invite` from the same IP.
+    if !validate_hex_id(&body.from_id)
+        || !validate_hex_id(&body.target_id)
+        || !validate_hex_id(&body.capability)
+        || body.port == 0
+        || !timestamp_fresh(body.ts)
     {
-        let mut limits = state.punch_rate_limits.write().await;
-        let now = Instant::now();
-        if limits.len() >= MAX_RATE_ENTRIES && !limits.contains_key(&client_ip) {
-            // See `check_rate_limit` for rationale: purge stale
-            // entries before failing closed on a brand-new IP.
-            limits.retain(|_, entry| now.duration_since(entry.window_start) < RATE_WINDOW * 2);
-            if limits.len() >= MAX_RATE_ENTRIES && !limits.contains_key(&client_ip) {
-                return StatusCode::TOO_MANY_REQUESTS;
-            }
-        }
-        let entry = limits.entry(client_ip).or_insert(RateEntry {
-            count: 0,
-            window_start: now,
-        });
-        if now.duration_since(entry.window_start) >= RATE_WINDOW {
-            entry.count = 1;
-            entry.window_start = now;
-        } else {
-            entry.count += 1;
-            if entry.count > MAX_PUNCH_PER_MINUTE {
-                return StatusCode::TOO_MANY_REQUESTS;
-            }
-        }
+        return StatusCode::BAD_REQUEST;
     }
-
-    let from = body.from_id.to_lowercase();
-    let target = body.target_id.to_lowercase();
-    let entry = PunchEntry {
-        from_id: from.clone(),
-        from_ip: client_ip,
-        from_port: body.port,
-        nat_type: body.nat_type,
-        created_at: Instant::now(),
+    let (Some(from_raw), Some(target_raw), Some(capability), Some(nonce), Some(sig)) = (
+        decode_hex_id(&body.from_id),
+        decode_hex_id(&body.target_id),
+        decode_hex_id(&body.capability),
+        decode_hex_nonce(&body.nonce),
+        decode_hex_sig(&body.sig),
+    ) else {
+        return StatusCode::BAD_REQUEST;
     };
-
-    let mut punches = state.punch_requests.write().await;
-    let now = entry.created_at;
-    prune_expired_punches(&mut punches, now);
+    let client_ip = extract_client_ip(&headers, addr);
+    if !check_rate_limit_bucket(&state.punch_rate_limits, client_ip, MAX_PUNCH_PER_MINUTE).await {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
+    let signed = build_punch_register_v3_msg(
+        &from_raw,
+        &target_raw,
+        &capability,
+        body.epoch,
+        body.port,
+        body.nat_type,
+        &nonce,
+        body.ts,
+    );
+    if let Err(status) = verify_signed_relay_identity(&state, &body.from_id, &signed, &sig).await {
+        return status;
+    }
+    let target = body.target_id.to_lowercase();
+    let (target_pubkey, from_pubkey) = {
+        let store = state.store.read().await;
+        let Some(target_pubkey) = store
+            .get(&target)
+            .filter(|entry| entry.expires_at > Instant::now())
+            .map(|entry| entry.pubkey)
+        else {
+            return StatusCode::NOT_FOUND;
+        };
+        let Some(from_pubkey) = store
+            .get(&body.from_id.to_lowercase())
+            .filter(|entry| entry.expires_at > Instant::now())
+            .map(|entry| entry.pubkey)
+        else {
+            return StatusCode::FORBIDDEN;
+        };
+        (target_pubkey, from_pubkey)
+    };
+    let capability_authorized = state
+        .capability_store
+        .read()
+        .await
+        .get(&body.capability.to_lowercase())
+        .is_some_and(|entry| {
+            capability_allows_peer(entry, &from_pubkey, body.epoch, Instant::now())
+                && entry.pubkey == target_pubkey
+        });
+    if !capability_authorized {
+        return StatusCode::FORBIDDEN;
+    }
+    let from = body.from_id.to_lowercase();
     let key = (target.clone(), from.clone());
-    if !punches.contains_key(&key) && punches.len() >= MAX_PUNCH_REQUESTS_TOTAL {
-        if let Some(oldest_key) = punches
-            .iter()
-            .min_by_key(|(_, pending)| pending.created_at)
-            .map(|(key, _)| key.clone())
-        {
-            punches.remove(&oldest_key);
-        }
+    let now = Instant::now();
+    let mut punches = state.punch_requests.write().await;
+    prune_expired_punches(&mut punches, now);
+    if !punches.contains_key(&key)
+        && (punches.len() >= MAX_PUNCH_REQUESTS_TOTAL
+            || punches
+                .keys()
+                .filter(|(candidate, _)| candidate == &target)
+                .count()
+                >= MAX_PUNCH_PER_TARGET)
+    {
+        return StatusCode::SERVICE_UNAVAILABLE;
     }
-    // Enforce per-target cap. If we'd exceed it (and this isn't a
-    // refresh of an existing (target, from) entry), evict the oldest
-    // entry for this target to make room.
-    if !punches.contains_key(&key) {
-        let count_for_target = punches.keys().filter(|(t, _)| t == &target).count();
-        if count_for_target >= MAX_PUNCH_PER_TARGET {
-            if let Some(oldest_key) = punches
-                .iter()
-                .filter(|((t, _), _)| t == &target)
-                .min_by_key(|(_, e)| e.created_at)
-                .map(|(k, _)| k.clone())
-            {
-                punches.remove(&oldest_key);
-            }
-        }
-    }
-    punches.insert(key, entry);
-    drop(punches);
-    debug!(
-        "punch registered: {} -> {} from {}",
-        &from[..8],
-        &target[..8],
-        client_ip
+    punches.insert(
+        key,
+        PunchEntry {
+            punch_id: random_relay_secret_hex(),
+            from_id: from,
+            from_ip: client_ip,
+            from_port: body.port,
+            nat_type: body.nat_type,
+            capability,
+            epoch: body.epoch,
+            created_at: now,
+        },
     );
     StatusCode::OK
 }
 
-/// Poll for incoming punch requests targeting our ID.
-async fn punch_poll(
+async fn punch_poll_v3(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Path(id): Path<String>,
+    Json(body): Json<CapabilityPunchPollRequest>,
 ) -> Result<Json<PunchResponse>, StatusCode> {
-    if !validate_hex_id(&id) {
+    if !validate_hex_id(&body.target_id) || !timestamp_fresh(body.ts) {
         return Err(StatusCode::BAD_REQUEST);
     }
-    // NOTE: not signature-gated — see `punch_register` for the
-    // rationale (punch ids are `(ip, port)`-derived, not presence
-    // ember-hash ids, so there's no pubkey to verify against).
-    let client_ip = extract_client_ip(&headers, addr);
-    if !check_rate_limit(&state, client_ip).await {
-        return Err(StatusCode::TOO_MANY_REQUESTS);
-    }
-
-    let target = id.to_lowercase();
-    let mut punches = state.punch_requests.write().await;
-    let now = Instant::now();
-
-    // Remove expired entries while we're here.
-    prune_expired_punches(&mut punches, now);
-
-    // Each call returns the oldest pending punch for this target and
-    // removes only that one entry. Other pending punches for the same
-    // target stay queued for subsequent polls — this preserves the
-    // single-PunchInfo response shape the client expects while still
-    // accommodating the multi-from_id storage that prevents
-    // overwrite attacks (see `MAX_PUNCH_PER_TARGET`).
-    let oldest = punches
-        .iter()
-        .filter(|((t, _), _)| t == &target)
-        .min_by_key(|(_, e)| e.created_at)
-        .map(|(k, _)| k.clone());
-    match oldest.and_then(|k| punches.remove(&k)) {
-        Some(entry) => {
-            debug!("punch poll hit: {} from {}", &target[..8], client_ip);
-            Ok(Json(PunchResponse {
-                from_id: entry.from_id,
-                ip: entry.from_ip.to_string(),
-                port: entry.from_port,
-                nat_type: entry.nat_type,
-            }))
-        }
-        None => Err(StatusCode::NOT_FOUND),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Authenticated, role-bound server relay tickets
-// ---------------------------------------------------------------------------
-
-async fn relay_ticket_offer(
-    State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Json(body): Json<RelayTicketOfferRequest>,
-) -> Result<Json<RelayTicketOfferResponse>, StatusCode> {
-    if !validate_hex_id(&body.initiator_id)
-        || !validate_hex_id(&body.responder_id)
-        || !validate_relay_purpose(&body.purpose)
-        || !timestamp_fresh(body.ts)
-    {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    let (Some(initiator_raw), Some(responder_raw), Some(nonce), Some(sig)) = (
-        decode_hex_id(&body.initiator_id),
-        decode_hex_id(&body.responder_id),
+    let (Some(target_raw), Some(nonce), Some(sig)) = (
+        decode_hex_id(&body.target_id),
         decode_hex_nonce(&body.nonce),
         decode_hex_sig(&body.sig),
     ) else {
@@ -2215,38 +2394,178 @@ async fn relay_ticket_offer(
     if !check_rate_limit(&state, client_ip).await {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
+    let signed = build_punch_poll_v3_msg(&target_raw, &nonce, body.ts);
+    verify_signed_relay_identity(&state, &body.target_id, &signed, &sig).await?;
+    let target = body.target_id.to_lowercase();
+    let mut punches = state.punch_requests.write().await;
+    prune_expired_punches(&mut punches, Instant::now());
+    let entry = punches
+        .iter()
+        .filter(|((candidate, _), _)| candidate == &target)
+        .min_by_key(|(_, entry)| entry.created_at)
+        .map(|(_, entry)| entry.clone())
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(PunchResponse {
+        punch_id: entry.punch_id,
+        from_id: entry.from_id,
+        ip: entry.from_ip.to_string(),
+        port: entry.from_port,
+        nat_type: entry.nat_type,
+        capability: hex::encode(entry.capability),
+        epoch: entry.epoch,
+    }))
+}
 
-    let signed = build_relay_ticket_offer_msg(
+async fn punch_ack_v3(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<CapabilityPunchAckRequest>,
+) -> StatusCode {
+    if !validate_hex_id(&body.target_id)
+        || !validate_hex_id(&body.capability)
+        || !validate_hex_id(&body.punch_id)
+        || !timestamp_fresh(body.ts)
+    {
+        return StatusCode::BAD_REQUEST;
+    }
+    let (Some(target_raw), Some(capability), Some(punch_raw), Some(nonce), Some(sig)) = (
+        decode_hex_id(&body.target_id),
+        decode_hex_id(&body.capability),
+        decode_hex_id(&body.punch_id),
+        decode_hex_nonce(&body.nonce),
+        decode_hex_sig(&body.sig),
+    ) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let client_ip = extract_client_ip(&headers, addr);
+    if !check_rate_limit(&state, client_ip).await {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
+    let signed = build_punch_ack_v3_msg(
+        &target_raw,
+        &capability,
+        body.epoch,
+        &punch_raw,
+        &nonce,
+        body.ts,
+    );
+    if let Err(status) = verify_signed_relay_identity(&state, &body.target_id, &signed, &sig).await
+    {
+        return status;
+    }
+    let target = body.target_id.to_lowercase();
+    let mut punches = state.punch_requests.write().await;
+    let key = punches
+        .iter()
+        .find(|((candidate, _), entry)| {
+            candidate == &target
+                && entry.punch_id.eq_ignore_ascii_case(&body.punch_id)
+                && entry.capability == capability
+                && entry.epoch == body.epoch
+        })
+        .map(|(key, _)| key.clone());
+    match key.and_then(|key| punches.remove(&key)) {
+        Some(_) => StatusCode::OK,
+        None => StatusCode::NOT_FOUND,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Authenticated, role-bound server relay tickets
+// ---------------------------------------------------------------------------
+
+async fn relay_mailbox_offer(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<RelayMailboxOfferRequest>,
+) -> Result<Json<RelayTicketOfferResponse>, StatusCode> {
+    if !validate_hex_id(&body.initiator_id)
+        || !validate_hex_id(&body.responder_id)
+        || !validate_hex_id(&body.capability)
+        || !validate_relay_ticket_id(&body.ticket_id)
+        || !timestamp_fresh(body.ts)
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let envelope = hex::decode(&body.envelope).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if envelope.is_empty() || envelope.len() > 2 * 1024 {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    let (
+        Some(initiator_raw),
+        Some(responder_raw),
+        Some(capability),
+        Some(ticket_raw),
+        Some(nonce),
+        Some(sig),
+    ) = (
+        decode_hex_id(&body.initiator_id),
+        decode_hex_id(&body.responder_id),
+        decode_hex_id(&body.capability),
+        decode_hex_id(&body.ticket_id),
+        decode_hex_nonce(&body.nonce),
+        decode_hex_sig(&body.sig),
+    )
+    else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    let client_ip = extract_client_ip(&headers, addr);
+    if !check_rate_limit(&state, client_ip).await {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    let signed = build_relay_mailbox_offer_msg(
         &initiator_raw,
         &responder_raw,
-        &body.purpose,
+        &capability,
+        body.epoch,
+        &ticket_raw,
+        &envelope,
         &nonce,
         body.ts,
     );
     verify_signed_relay_identity(&state, &body.initiator_id, &signed, &sig).await?;
 
-    // The target must currently be a registered identity. That prevents
-    // issuing a bearer capability for a synthetic IP:port key or an arbitrary
-    // absent identity, and cryptographically binds this ticket's responder.
-    let responder_live = {
+    // The opaque capability must name live presence owned by the intended
+    // responder. Knowing only its stable mailbox ID cannot satisfy this.
+    let (responder_pubkey, initiator_pubkey) = {
         let store = state.store.read().await;
-        store
+        let responder_pubkey = store
             .get(&body.responder_id.to_lowercase())
-            .is_some_and(|entry| entry.expires_at > Instant::now())
+            .filter(|entry| entry.expires_at > Instant::now())
+            .map(|entry| entry.pubkey)
+            .ok_or(StatusCode::NOT_FOUND)?;
+        let initiator_pubkey = store
+            .get(&body.initiator_id.to_lowercase())
+            .filter(|entry| entry.expires_at > Instant::now())
+            .map(|entry| entry.pubkey)
+            .ok_or(StatusCode::FORBIDDEN)?;
+        (responder_pubkey, initiator_pubkey)
     };
-    if !responder_live {
-        return Err(StatusCode::NOT_FOUND);
+    let capability_live = state
+        .capability_store
+        .read()
+        .await
+        .get(&body.capability.to_lowercase())
+        .is_some_and(|entry| {
+            capability_allows_peer(entry, &initiator_pubkey, body.epoch, Instant::now())
+                && entry.pubkey == responder_pubkey
+        });
+    if !capability_live {
+        return Err(StatusCode::FORBIDDEN);
     }
 
-    let ticket_id = canonical_relay_ticket_id(&random_relay_secret_hex())
-        .expect("random relay ticket IDs are valid lowercase hex");
+    let ticket_id = canonical_relay_ticket_id(&body.ticket_id).ok_or(StatusCode::BAD_REQUEST)?;
     let initiator_token = issue_relay_role_token(&state, &ticket_id, RelayRole::Initiator);
     let responder_token = issue_relay_role_token(&state, &ticket_id, RelayRole::Responder);
     let now = Instant::now();
     let ticket = RelayTicket {
         initiator_id: body.initiator_id.to_lowercase(),
         responder_id: body.responder_id.to_lowercase(),
-        purpose: body.purpose,
+        capability,
+        epoch: body.epoch,
+        mailbox_envelope: envelope,
         initiator_token_hash: relay_token_hash(&initiator_token),
         responder_token_hash: relay_token_hash(&responder_token),
         initiator_joined: false,
@@ -2256,38 +2575,23 @@ async fn relay_ticket_offer(
         accepted: false,
         expires_at: now + RELAY_TICKET_TTL,
     };
-
     let mut tickets = state.relay_tickets.write().await;
     prune_expired_relay_tickets(&mut tickets, now);
-    // Never evict an unrelated user's pending friend ticket. The global cap
-    // is a fail-closed admission limit, not a reason to let an attacker
-    // displace the oldest legitimate offer.
     if tickets.tickets.len() >= MAX_RELAY_TICKETS {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
-    // A pair remains occupied until its ticket expires, even after
-    // acceptance. Otherwise one initiator could repeatedly issue/accept
-    // tickets to the same responder and consume all accepted slots.
-    if tickets
-        .by_responder
-        .get(&ticket.responder_id)
-        .is_some_and(|by_initiator| by_initiator.contains_key(&ticket.initiator_id))
+    if tickets.tickets.contains_key(&ticket_id)
+        || tickets
+            .by_responder
+            .get(&ticket.responder_id)
+            .is_some_and(|by_initiator| by_initiator.contains_key(&ticket.initiator_id))
     {
         return Err(StatusCode::CONFLICT);
     }
-    // Accepted tickets count here too. This caps a known-but-malicious
-    // initiator without reviving a responder-wide pending-offer cap that
-    // unknown identities could use to block real friends.
     if !initiator_has_ticket_capacity(&tickets, &ticket.initiator_id) {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     tickets.insert(ticket_id.clone(), ticket);
-
-    debug!(
-        "relay ticket offered: {} -> {}",
-        &body.initiator_id[..8],
-        &body.responder_id[..8]
-    );
     Ok(Json(RelayTicketOfferResponse {
         ticket_id,
         initiator_token,
@@ -2295,15 +2599,12 @@ async fn relay_ticket_offer(
     }))
 }
 
-/// Compatibility handler for the deployed v2 signed poll schema. Its bounded
-/// response is intentionally less capable than v3, but it stays authenticated
-/// and prevents old clients from failing with a signature-mismatch 403.
-async fn relay_ticket_poll_v2(
+async fn relay_mailbox_poll(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Json(body): Json<RelayTicketPollV2Request>,
-) -> Result<Json<RelayTicketPollResponse>, StatusCode> {
+    Json(body): Json<RelayMailboxPollRequest>,
+) -> Result<Json<RelayMailboxPollResponse>, StatusCode> {
     if !validate_hex_id(&body.responder_id) || !timestamp_fresh(body.ts) {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -2318,78 +2619,28 @@ async fn relay_ticket_poll_v2(
     if !check_ticket_read_rate_limit(&state, client_ip).await {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
-    let signed = build_relay_ticket_poll_v2_msg(&responder_raw, &nonce, body.ts);
-    // v2 clients generate a fresh nonce per request. This is a read-only
-    // compatibility path, so preserve its authenticated timestamp/signature
-    // verification without imposing v3's stable-nonce rule.
-    verify_signed_relay_identity_signature(&state, &body.responder_id, &signed, &sig).await?;
-
-    let responder_id = body.responder_id.to_lowercase();
-    let mut tickets = state.relay_tickets.write().await;
-    prune_expired_relay_tickets(&mut tickets, Instant::now());
-    Ok(Json(RelayTicketPollResponse {
-        tickets: relay_ticket_poll_v2_page(&mut tickets, &responder_id, Instant::now()),
-        next_cursor: None,
-    }))
-}
-
-async fn relay_ticket_poll_v3(
-    State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Json(body): Json<RelayTicketPollV3Request>,
-) -> Result<Json<RelayTicketPollResponse>, StatusCode> {
-    if !validate_hex_id(&body.responder_id) || !timestamp_fresh(body.ts) {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    let (Some(responder_raw), Some(nonce), Some(sig), Some(friend_candidates)) = (
-        decode_hex_id(&body.responder_id),
-        decode_hex_nonce(&body.nonce),
-        decode_hex_sig(&body.sig),
-        decode_relay_ticket_poll_candidates(&body.friend_candidates),
-    ) else {
-        return Err(StatusCode::BAD_REQUEST);
-    };
-    let cursor = match body.cursor.as_deref() {
-        Some(cursor) => canonical_relay_ticket_id(cursor).ok_or(StatusCode::BAD_REQUEST)?,
-        None => String::new(),
-    };
-    let cursor_raw = if cursor.is_empty() {
-        None
-    } else {
-        Some(decode_hex_id(&cursor).expect("canonical relay ticket cursors are valid 32-byte hex"))
-    };
-    let client_ip = extract_client_ip(&headers, addr);
-    if !check_ticket_read_rate_limit(&state, client_ip).await {
-        return Err(StatusCode::TOO_MANY_REQUESTS);
-    }
-    let signed = build_relay_ticket_poll_v3_msg(
-        &responder_raw,
-        &friend_candidates,
-        cursor_raw.as_ref(),
-        &nonce,
-        body.ts,
-    );
+    let signed = build_relay_mailbox_poll_msg(&responder_raw, &nonce, body.ts);
     verify_signed_relay_identity_signature(&state, &body.responder_id, &signed, &sig).await?;
     idempotent_read_status(
         remember_ticket_poll_nonce(&state, responder_raw, nonce, body.ts).await,
     )?;
 
-    let responder_id = body.responder_id.to_lowercase();
-    let friend_candidates: HashSet<String> = friend_candidates.iter().map(hex::encode).collect();
     let now = Instant::now();
-    let tickets = state.relay_tickets.read().await;
-    let (tickets, next_cursor) = relay_ticket_poll_page(
-        &tickets,
-        &responder_id,
-        &friend_candidates,
-        (!cursor.is_empty()).then_some(cursor.as_str()),
-        now,
-    );
-    Ok(Json(RelayTicketPollResponse {
-        tickets,
-        next_cursor,
-    }))
+    let responder_id = body.responder_id.to_lowercase();
+    let mut tickets = state.relay_tickets.write().await;
+    prune_expired_relay_tickets(&mut tickets, now);
+    let mut items = Vec::new();
+    for ticket_id in tickets.mailbox_page_ids(&responder_id, now) {
+        if let Some(ticket) = tickets.tickets.get(&ticket_id) {
+            items.push(RelayMailboxPollItem {
+                ticket_id,
+                capability: hex::encode(ticket.capability),
+                epoch: ticket.epoch,
+                envelope: hex::encode(&ticket.mailbox_envelope),
+            });
+        }
+    }
+    Ok(Json(RelayMailboxPollResponse { tickets: items }))
 }
 
 async fn relay_ticket_accept(
@@ -2548,8 +2799,8 @@ async fn relay_ws(
         tokio::time::sleep(RELAY_UPGRADE_RESERVATION_TIMEOUT).await;
         rollback_relay_ticket_reservation(&watchdog_state, &watchdog_reservation).await;
     });
-    ws.max_frame_size(1024 * 1024)
-        .max_message_size(1024 * 1024)
+    ws.max_frame_size(MAX_RELAY_FRAME_BYTES)
+        .max_message_size(MAX_RELAY_FRAME_BYTES)
         .on_upgrade(move |socket| handle_relay_ws_guarded(socket, state, reservation))
         .into_response()
 }
@@ -2587,7 +2838,7 @@ async fn handle_relay_ws_guarded(
             .catch_unwind()
             .await;
     if result.is_err() {
-        cleanup_relay(&cleanup_state, &cleanup_session, client_ip).await;
+        cleanup_relay(&cleanup_state, &cleanup_session, role).await;
     }
 }
 
@@ -2609,17 +2860,18 @@ async fn handle_relay_ws(
         // half-torn-down entry.
         let peer1_inbox_tx = session.peer1_inbox_tx.take();
         let announce_tx = session.peer2_announce_tx.take();
+        let session_deadline = session.deadline;
         drop(sessions);
 
         let (Some(peer1_inbox_tx), Some(announce_tx)) = (peer1_inbox_tx, announce_tx) else {
             // Slot was already drained — refuse rather than silently
             // half-bridging.
             let _ = socket.send(Message::Close(None)).await;
-            cleanup_relay(&state, &session_id, client_ip).await;
+            cleanup_relay(&state, &session_id, role).await;
             return;
         };
 
-        let (peer2_inbox_tx, peer2_inbox_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (peer2_inbox_tx, peer2_inbox_rx) = relay_queue();
         // Allocate the shared byte counter on the peer2 side so we can
         // hand a clone to peer1 through the announce channel. Both
         // halves will count against it.
@@ -2632,9 +2884,15 @@ async fn handle_relay_ws(
             .is_err()
         {
             let _ = socket.send(Message::Close(None)).await;
-            cleanup_relay(&state, &session_id, client_ip).await;
+            cleanup_relay(&state, &session_id, role).await;
             return;
         }
+        state.bridged_relays.write().await.insert(
+            session_id.clone(),
+            BridgedRelayEntry {
+                deadline: session_deadline,
+            },
+        );
         debug!(
             "relay session {} bridged (peer2={})",
             &session_id[..8.min(session_id.len())],
@@ -2647,25 +2905,24 @@ async fn handle_relay_ws(
             total_bytes,
             &state,
             &session_id,
-            client_ip,
+            role,
+            session_deadline,
         )
         .await;
     } else {
         // First peer — set up the rendezvous slot and run the peer1
         // loop until peer2 joins (announce_rx fires) or we time out.
-        let (peer1_inbox_tx, peer1_inbox_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-        let (peer2_announce_tx, peer2_announce_rx) = tokio::sync::oneshot::channel::<(
-            tokio::sync::mpsc::Sender<Vec<u8>>,
-            Arc<AtomicUsize>,
-        )>();
+        let (peer1_inbox_tx, peer1_inbox_rx) = relay_queue();
+        let (peer2_announce_tx, peer2_announce_rx) =
+            tokio::sync::oneshot::channel::<RelayPeerChannel>();
+        let session_deadline = Instant::now() + RELAY_SESSION_TIMEOUT;
 
         sessions.insert(
             session_id.clone(),
             RelaySessionEntry {
                 peer1_inbox_tx: Some(peer1_inbox_tx),
                 peer2_announce_tx: Some(peer2_announce_tx),
-                first_ip: client_ip,
-                created_at: Instant::now(),
+                deadline: session_deadline,
             },
         );
         drop(sessions);
@@ -2676,8 +2933,15 @@ async fn handle_relay_ws(
             client_ip
         );
 
-        run_peer1_loop(socket, peer1_inbox_rx, peer2_announce_rx, &session_id).await;
-        cleanup_relay(&state, &session_id, client_ip).await;
+        run_peer1_loop(
+            socket,
+            peer1_inbox_rx,
+            peer2_announce_rx,
+            &session_id,
+            session_deadline,
+        )
+        .await;
+        cleanup_relay(&state, &session_id, role).await;
     }
 }
 
@@ -2705,24 +2969,23 @@ fn enqueue_prebridge_frame(
 /// whichever authenticated role connects first.
 async fn run_peer1_loop(
     mut socket: WebSocket,
-    mut peer1_inbox_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
-    peer2_announce_rx: tokio::sync::oneshot::Receiver<(
-        tokio::sync::mpsc::Sender<Vec<u8>>,
-        Arc<AtomicUsize>,
-    )>,
+    mut peer1_inbox_rx: RelayQueueReceiver,
+    peer2_announce_rx: tokio::sync::oneshot::Receiver<RelayPeerChannel>,
     session_id: &str,
+    session_deadline: Instant,
 ) {
     let idle_timeout = tokio::time::sleep(RELAY_IDLE_TIMEOUT);
     tokio::pin!(idle_timeout);
     let mut announce_rx = Some(peer2_announce_rx);
-    let mut peer2_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>> = None;
+    let mut peer2_tx: Option<RelayQueueSender> = None;
     let mut total_bytes: Option<Arc<AtomicUsize>> = None;
     let mut prebridge_frames = VecDeque::<Vec<u8>>::new();
     let mut prebridge_bytes = 0usize;
-    let session_deadline = Instant::now() + RELAY_SESSION_TIMEOUT;
-
     loop {
         tokio::select! {
+            _ = tokio::time::sleep_until(session_deadline.into()) => {
+                break;
+            }
             _ = &mut idle_timeout, if peer2_tx.is_none() => {
                 info!("relay session {} timed out waiting for peer2", &session_id[..8.min(session_id.len())]);
                 break;
@@ -2762,6 +3025,9 @@ async fn run_peer1_loop(
                     && prebridge_bytes < MAX_PREBRIDGE_RELAY_BYTES) => {
                 match msg {
                     Some(Ok(Message::Binary(data))) => {
+                        if data.len() > MAX_RELAY_FRAME_BYTES {
+                            break;
+                        }
                         if let (Some(ref tx), Some(ref counter)) = (&peer2_tx, &total_bytes) {
                             let new_total =
                                 counter.fetch_add(data.len(), Ordering::Relaxed) + data.len();
@@ -2820,20 +3086,25 @@ async fn run_peer1_loop(
 /// double-charge the same payload.
 async fn bridge_relay(
     mut socket: WebSocket,
-    peer1_inbox_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-    mut peer2_inbox_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    peer1_inbox_tx: RelayQueueSender,
+    mut peer2_inbox_rx: RelayQueueReceiver,
     total_bytes: Arc<AtomicUsize>,
     state: &AppState,
     session_id: &str,
-    client_ip: IpAddr,
+    role: RelayRole,
+    deadline: Instant,
 ) {
-    let deadline = Instant::now() + RELAY_SESSION_TIMEOUT;
-
     loop {
         tokio::select! {
+            _ = tokio::time::sleep_until(deadline.into()) => {
+                break;
+            }
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(Message::Binary(data))) => {
+                        if data.len() > MAX_RELAY_FRAME_BYTES {
+                            break;
+                        }
                         let new_total =
                             total_bytes.fetch_add(data.len(), Ordering::Relaxed) + data.len();
                         if new_total > RELAY_BANDWIDTH_CAP_BYTES {
@@ -2875,16 +3146,53 @@ async fn bridge_relay(
         }
     }
 
-    cleanup_relay(state, session_id, client_ip).await;
+    cleanup_relay(state, session_id, role).await;
 }
 
-async fn cleanup_relay(state: &AppState, session_id: &str, client_ip: IpAddr) {
+async fn cleanup_relay(state: &AppState, session_id: &str, role: RelayRole) {
     state.relay_sessions.write().await.remove(session_id);
+    state.bridged_relays.write().await.remove(session_id);
+    let client_ip = state
+        .relay_admissions
+        .write()
+        .await
+        .remove(&(session_id.to_owned(), role));
+    let Some(client_ip) = client_ip else {
+        return;
+    };
     let mut counts = state.relay_ip_counts.write().await;
     if let Some(count) = counts.get_mut(&client_ip) {
         *count = count.saturating_sub(1);
         if *count == 0 {
             counts.remove(&client_ip);
+        }
+    }
+}
+
+async fn cleanup_relay_session_all(state: &AppState, session_id: &str) {
+    state.relay_sessions.write().await.remove(session_id);
+    state.bridged_relays.write().await.remove(session_id);
+    let removed_ips = {
+        let mut admissions = state.relay_admissions.write().await;
+        let keys: Vec<_> = admissions
+            .keys()
+            .filter(|(ticket_id, _)| ticket_id == session_id)
+            .cloned()
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| admissions.remove(&key))
+            .collect::<Vec<_>>()
+    };
+    if removed_ips.is_empty() {
+        return;
+    }
+    let mut counts = state.relay_ip_counts.write().await;
+    for ip in removed_ips {
+        if let Some(count) = counts.get_mut(&ip) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&ip);
+            }
         }
     }
 }
@@ -2898,7 +3206,8 @@ async fn stats_handler(
     if !check_rate_limit(&state, client_ip).await {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
-    let relay_count = state.relay_sessions.read().await.len();
+    let relay_count =
+        state.relay_sessions.read().await.len() + state.bridged_relays.read().await.len();
     let punch_count = state.punch_requests.read().await.len();
     let relay_ip_count = state.relay_ip_counts.read().await.len();
     let presence_count = state.store.read().await.len();
@@ -2918,198 +3227,22 @@ async fn health() -> &'static str {
     "ok"
 }
 
-/// One node in the `/bootstrap` pool. The client derives the 128-bit DHT
-/// node id itself from `ed25519_pub` (`BLAKE3(ed25519_pub)[..16]`) — it
-/// never trusts a server-supplied id — so we don't send one.
-#[derive(Serialize, Clone)]
-struct BootstrapNodeResponse {
-    /// "ip:port" the peer is reachable at for the Ember Noise transport.
-    addr: String,
-    /// X25519 Noise static public key (64 hex chars).
-    noise_pub: String,
-    /// Ed25519 public key (64 hex chars).
-    ed25519_pub: String,
-    /// How many times this node has been served from `/bootstrap` so far
-    /// (including this response once the client accepts it). Lower is
-    /// better — clients prefer these when seeding.
-    load: u32,
-}
-
-/// Signed `/bootstrap` envelope. Replaces the earlier bare JSON array so
-/// clients can authenticate the pool against the rendezvous operator's
-/// long-term key (and optionally pin that key).
-#[derive(Serialize)]
-struct BootstrapResponse {
-    /// Unix seconds when this response was signed.
-    ts: i64,
-    /// Server bootstrap Ed25519 public key (64 hex chars).
-    pubkey: String,
-    /// Hex Ed25519 signature over [`build_bootstrap_msg`].
-    sig: String,
-    nodes: Vec<BootstrapNodeResponse>,
-}
-
-/// Max nodes returned per `/bootstrap` GET. The client caps its own
-/// intake at 200; 50 is plenty to seed a routing table while bounding
-/// response size and the per-node bootstrap load.
-const MAX_BOOTSTRAP_RESPONSE: usize = 50;
-
-/// Canonical bytes the server signs for a `/bootstrap` response.
+/// L12: DHT bootstrap stub.
 ///
-/// Layout: `RDV_DOMAIN || OP_BOOTSTRAP || ts_le || count_u16_le ||`
-/// for each node in the returned order:
-/// `addr_len_u16_le || addr_utf8 || noise_pub(32) || ed25519_pub(32) || load_u32_le`.
-fn build_bootstrap_msg(ts: i64, nodes: &[BootstrapNodeResponse]) -> Vec<u8> {
-    let mut m = Vec::with_capacity(RDV_DOMAIN.len() + 1 + 8 + 2 + nodes.len() * 80);
-    m.extend_from_slice(RDV_DOMAIN);
-    m.push(OP_BOOTSTRAP);
-    m.extend_from_slice(&ts.to_le_bytes());
-    m.extend_from_slice(&(nodes.len() as u16).to_le_bytes());
-    for n in nodes {
-        let addr = n.addr.as_bytes();
-        let addr_len = (addr.len().min(u16::MAX as usize)) as u16;
-        m.extend_from_slice(&addr_len.to_le_bytes());
-        m.extend_from_slice(&addr[..addr_len as usize]);
-        let mut noise = [0u8; 32];
-        let mut ed = [0u8; 32];
-        let _ = hex::decode_to_slice(&n.noise_pub, &mut noise);
-        let _ = hex::decode_to_slice(&n.ed25519_pub, &mut ed);
-        m.extend_from_slice(&noise);
-        m.extend_from_slice(&ed);
-        m.extend_from_slice(&n.load.to_le_bytes());
-    }
-    m
-}
-
-/// Weighted sample of eligible bootstrap nodes: prefer low `bootstrap_load`
-/// so successive cold-starts spread across the pool. Deterministic LCG
-/// mixing (seeded by uptime) keeps us dependency-free while still rotating
-/// among equally-loaded peers.
-fn sample_bootstrap_nodes(
-    eligible: &[(&PresenceEntry, u32)],
-    max: usize,
-    mix: u64,
-) -> Vec<BootstrapNodeResponse> {
-    if eligible.is_empty() || max == 0 {
-        return Vec::new();
-    }
-
-    // Score = 1/(1+load); sample without replacement via weighted picks.
-    let mut remaining: Vec<(usize, f64)> = eligible
-        .iter()
-        .enumerate()
-        .map(|(i, (_, load))| (i, 1.0 / (1.0 + f64::from(*load))))
-        .collect();
-
-    let mut rng = mix ^ 0xA5A5_5A5A_C3C3_3C3C;
-    let mut picked = Vec::with_capacity(max.min(remaining.len()));
-    while picked.len() < max && !remaining.is_empty() {
-        let total: f64 = remaining.iter().map(|(_, w)| *w).sum();
-        if total <= 0.0 {
-            break;
-        }
-        rng = rng
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1);
-        let mut target = ((rng >> 33) as f64 / ((1u64 << 31) as f64)) * total;
-        let mut chosen = 0usize;
-        for (idx, (_, w)) in remaining.iter().enumerate() {
-            if target < *w {
-                chosen = idx;
-                break;
-            }
-            target -= *w;
-            chosen = idx;
-        }
-        let (ei, _) = remaining.swap_remove(chosen);
-        let (entry, load) = eligible[ei];
-        picked.push(BootstrapNodeResponse {
-            addr: SocketAddr::new(entry.ip, entry.ember_port.unwrap_or_default()).to_string(),
-            noise_pub: hex::encode(entry.noise_pub.unwrap_or_default()),
-            ed25519_pub: hex::encode(entry.pubkey),
-            // Advertise post-increment load so clients see the cost of
-            // this hand-out (matches what we persist below).
-            load: load.saturating_add(1),
-        });
-    }
-    picked
-}
-
-/// DHT bootstrap pool: signed, load-weighted sample of currently-registered
-/// Ember-DHT nodes. Cold-start clients
-/// (`ember/dht/bootstrap.rs::fetch_bootstrap_nodes`) verify the signature,
-/// optionally pin the server pubkey, then seed their routing table — no
-/// warm `nodes_ember.dat`, no KAD required.
-///
-/// Trust model: the signature authenticates the *list* as coming from this
-/// rendezvous operator. Individual contacts still cannot poison a routing
-/// table — the DHT re-verifies each contact's Ed25519 signature and the
-/// `node_id == BLAKE3(ed25519_pub)` binding on the first PING.
-async fn bootstrap(
-    State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-) -> Result<Json<BootstrapResponse>, StatusCode> {
-    if !check_rate_limit(&state, addr.ip()).await {
-        return Err(StatusCode::TOO_MANY_REQUESTS);
-    }
-
-    let now = Instant::now();
-    let store = state.store.read().await;
-    let loads = state.bootstrap_load.read().await;
-
-    let mut eligible: Vec<(&PresenceEntry, u32)> = store
-        .values()
-        .filter(|e| e.expires_at > now && e.noise_pub.is_some() && e.ember_port.is_some())
-        .map(|e| (e, *loads.get(&e.pubkey).unwrap_or(&0)))
-        .collect();
-    drop(loads);
-
-    if eligible.is_empty() {
-        let ts = now_unix_secs();
-        let nodes: Vec<BootstrapNodeResponse> = Vec::new();
-        let msg = build_bootstrap_msg(ts, &nodes);
-        let sig = state.bootstrap_signing_key.sign(&msg);
-        return Ok(Json(BootstrapResponse {
-            ts,
-            pubkey: hex::encode(state.bootstrap_signing_key.verifying_key().to_bytes()),
-            sig: hex::encode(sig.to_bytes()),
-            nodes,
-        }));
-    }
-
-    // Prefer lower load; stable secondary key so equal-load peers don't
-    // always lose to HashMap iteration order.
-    eligible.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.pubkey.cmp(&b.0.pubkey)));
-
-    let mix = state.started_at.elapsed().as_nanos() as u64;
-    let nodes = sample_bootstrap_nodes(&eligible, MAX_BOOTSTRAP_RESPONSE, mix);
-    drop(store);
-
-    // Persist the load increments for the nodes we actually returned.
-    {
-        let mut loads = state.bootstrap_load.write().await;
-        for n in &nodes {
-            let mut pk = [0u8; 32];
-            if hex::decode_to_slice(&n.ed25519_pub, &mut pk).is_ok() {
-                let entry = loads.entry(pk).or_insert(0);
-                *entry = entry.saturating_add(1);
-            }
-        }
-        // Bound the map so a long-lived server with churn doesn't grow forever.
-        if loads.len() > MAX_STORE_ENTRIES {
-            loads.clear();
-        }
-    }
-
-    let ts = now_unix_secs();
-    let msg = build_bootstrap_msg(ts, &nodes);
-    let sig = state.bootstrap_signing_key.sign(&msg);
-    Ok(Json(BootstrapResponse {
-        ts,
-        pubkey: hex::encode(state.bootstrap_signing_key.verifying_key().to_bytes()),
-        sig: hex::encode(sig.to_bytes()),
-        nodes,
-    }))
+/// `ember/dht/bootstrap.rs::fetch_bootstrap_nodes` GETs
+/// `<rendezvous>/bootstrap` and expects a JSON array of
+/// `BootstrapNode { node_id, addr, noise_pub, ed25519_pub }`. The
+/// V1 client never actually consumes the result (DHT is dormant
+/// behind `ember_native_enabled = false`), but until L12 the route
+/// didn't exist on the server side and every probe returned 404,
+/// which the client logs as a warning. We return an empty array
+/// so the client's "no peers known yet" branch fires cleanly. When
+/// the Ember DHT goes live, replace the empty body with a
+/// signed-and-pinned bootstrap pool — until then there's no value
+/// in publishing addresses for a network that nothing is talking
+/// to yet.
+async fn bootstrap_stub() -> Json<Vec<serde_json::Value>> {
+    Json(Vec::new())
 }
 
 async fn sweep_expired(state: AppState) {
@@ -3177,30 +3310,32 @@ async fn sweep_expired(state: AppState) {
             }
         }
 
-        // Sweep stale relay sessions (created but never bridged)
+        // Sweep both waiting and actively bridged sessions at their original
+        // absolute deadline. Counter release is registry-backed and
+        // idempotent, so racing task cleanup cannot double-decrement.
         {
-            let mut relays = state.relay_sessions.write().await;
-            let removed_ips: Vec<IpAddr> = relays
-                .values()
-                .filter(|entry| now.duration_since(entry.created_at) >= RELAY_SESSION_TIMEOUT)
-                .map(|entry| entry.first_ip)
+            let mut expired: HashSet<String> = state
+                .relay_sessions
+                .read()
+                .await
+                .iter()
+                .filter(|(_, entry)| entry.deadline <= now)
+                .map(|(id, _)| id.clone())
                 .collect();
-            relays.retain(|_, e| now.duration_since(e.created_at) < RELAY_SESSION_TIMEOUT);
-            drop(relays);
-            if !removed_ips.is_empty() {
-                let mut counts = state.relay_ip_counts.write().await;
-                for ip in &removed_ips {
-                    if let Some(count) = counts.get_mut(ip) {
-                        *count = count.saturating_sub(1);
-                        if *count == 0 {
-                            counts.remove(ip);
-                        }
-                    }
-                }
+            expired.extend(
+                state
+                    .bridged_relays
+                    .read()
+                    .await
+                    .iter()
+                    .filter(|(_, entry)| entry.deadline <= now)
+                    .map(|(id, _)| id.clone()),
+            );
+            for session_id in &expired {
+                cleanup_relay_session_all(&state, session_id).await;
             }
-            let relay_removed = removed_ips.len();
-            if relay_removed > 0 {
-                info!("swept {} stale relay sessions", relay_removed);
+            if !expired.is_empty() {
+                info!("swept {} expired relay sessions", expired.len());
             }
         }
 
@@ -3220,6 +3355,10 @@ async fn sweep_expired(state: AppState) {
                 info!("swept {} expired presence entries", store_removed);
             }
         }
+        {
+            let mut capabilities = state.capability_store.write().await;
+            capabilities.retain(|_, entry| entry.expires_at > now);
+        }
     }
 }
 
@@ -3232,19 +3371,16 @@ async fn main() {
         )
         .init();
 
-    let bootstrap_signing_key = Arc::new(load_bootstrap_signing_key());
-    info!(
-        "Bootstrap pool signing pubkey={}",
-        hex::encode(bootstrap_signing_key.verifying_key().to_bytes())
-    );
-
     let state = AppState {
         store: Arc::new(RwLock::new(HashMap::new())),
+        capability_store: Arc::new(RwLock::new(HashMap::new())),
         rate_limits: Arc::new(RwLock::new(HashMap::new())),
         ticket_read_rate_limits: Arc::new(RwLock::new(HashMap::new())),
         punch_rate_limits: Arc::new(RwLock::new(HashMap::new())),
         punch_requests: Arc::new(RwLock::new(HashMap::new())),
         relay_sessions: Arc::new(RwLock::new(HashMap::new())),
+        bridged_relays: Arc::new(RwLock::new(HashMap::new())),
+        relay_admissions: Arc::new(RwLock::new(HashMap::new())),
         relay_ip_counts: Arc::new(RwLock::new(HashMap::new())),
         next_relay_reservation_id: Arc::new(AtomicU64::new(1)),
         relay_tickets: Arc::new(RwLock::new(RelayTicketStore::default())),
@@ -3254,8 +3390,6 @@ async fn main() {
             key
         },
         replay_cache: Arc::new(RwLock::new(ReplayCache::default())),
-        bootstrap_load: Arc::new(RwLock::new(HashMap::new())),
-        bootstrap_signing_key,
         poll_read_nonces: Arc::new(RwLock::new(ScopedNonceCache::new())),
         status_read_nonces: Arc::new(RwLock::new(ScopedNonceCache::new())),
         started_at: Instant::now(),
@@ -3265,13 +3399,24 @@ async fn main() {
 
     let app = Router::new()
         .route("/register", post(register))
-        .route("/lookup/{id}", get(lookup))
+        .route("/lookup/{id}", get(legacy_presence_lookup_gone))
         .route("/unregister", delete(unregister))
-        .route("/punch", post(punch_register))
-        .route("/punch/{id}", get(punch_poll))
-        .route("/v2/relay-tickets/offer", post(relay_ticket_offer))
-        .route("/v2/relay-tickets/poll", post(relay_ticket_poll_v2))
-        .route("/v3/relay-tickets/poll", post(relay_ticket_poll_v3))
+        .route("/v3/identity/{id}", get(identity_lookup))
+        .route("/v3/presence/register", post(capability_register))
+        .route("/v3/presence/lookup", post(capability_lookup))
+        .route("/punch", post(legacy_punch_gone))
+        .route("/punch/{id}", get(legacy_punch_gone))
+        .route("/v2/punch/register", post(legacy_punch_gone))
+        .route("/v2/punch/poll", post(legacy_punch_gone))
+        .route("/v2/punch/ack", post(legacy_punch_gone))
+        .route("/v3/punch/register", post(punch_register_v3))
+        .route("/v3/punch/poll", post(punch_poll_v3))
+        .route("/v3/punch/ack", post(punch_ack_v3))
+        .route("/v2/relay-tickets/offer", post(legacy_punch_gone))
+        .route("/v2/relay-tickets/poll", post(legacy_punch_gone))
+        .route("/v3/relay-tickets/poll", post(legacy_punch_gone))
+        .route("/v4/relay-mailbox/offer", post(relay_mailbox_offer))
+        .route("/v4/relay-mailbox/poll", post(relay_mailbox_poll))
         .route(
             "/v2/relay-tickets/{ticket_id}/accept",
             post(relay_ticket_accept),
@@ -3284,9 +3429,18 @@ async fn main() {
         .route("/relay/{session_id}", get(legacy_relay_gone))
         .route("/relay-invite", post(legacy_relay_gone))
         .route("/relay-invites/{id}", get(legacy_relay_gone))
-        // DHT bootstrap pool: signed + load-weighted sample of Ember DHT
-        // nodes so a cold-start client can join without KAD. See `bootstrap()`.
-        .route("/bootstrap", get(bootstrap))
+        // L12: DHT bootstrap stub. The Ember DHT (`ember/dht/*`) is
+        // dormant in V1 (`ember_native_enabled=false`), but the
+        // bootstrap module probes `/bootstrap` proactively whenever
+        // the runtime hands it a rendezvous URL. Returning an empty
+        // 200 OK keeps that probe quiet — the client treats an
+        // empty list as "no peers known yet" and falls back to its
+        // local cache, which is the correct V1 behaviour. When the
+        // DHT goes live in a later version this handler can grow
+        // into a real bootstrap-node serializer; for now an empty
+        // array keeps the wire contract honest without adding any
+        // attack surface.
+        .route("/bootstrap", get(bootstrap_stub))
         .route("/health", get(health))
         .route("/stats", get(stats_handler))
         .layer(DefaultBodyLimit::max(64 * 1024))
@@ -3307,15 +3461,87 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    if let Err(e) = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await
-    {
-        eprintln!("Server error: {e}");
-        std::process::exit(1);
+    let ordinary = Arc::new(tokio::sync::Semaphore::new(
+        MAX_HTTP_CONNECTIONS - RESERVED_HEALTH_CONNECTIONS,
+    ));
+    let health_reserve = Arc::new(tokio::sync::Semaphore::new(RESERVED_HEALTH_CONNECTIONS));
+    let mut shutdown = Box::pin(shutdown_signal());
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => break,
+            accepted = listener.accept() => {
+                let (stream, peer_addr) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        warn!("HTTP accept failed: {error}");
+                        continue;
+                    }
+                };
+                let (permit, reserve_only) = match ordinary.clone().try_acquire_owned() {
+                    Ok(permit) => (permit, false),
+                    Err(_) => match health_reserve.clone().try_acquire_owned() {
+                        Ok(permit) => (permit, true),
+                        Err(_) => {
+                            drop(stream);
+                            continue;
+                        }
+                    },
+                };
+                let app = app.clone();
+                tokio::spawn(async move {
+                    use tower::ServiceExt;
+                    let _permit = permit;
+                    let service = hyper::service::service_fn(
+                        move |request: hyper::Request<hyper::body::Incoming>| {
+                            let app = app.clone();
+                            async move {
+                                let path = request.uri().path().to_owned();
+                                if !http_path_admitted(reserve_only, &path) {
+                                    return Ok::<_, std::convert::Infallible>(
+                                        hyper::Response::builder()
+                                            .status(StatusCode::SERVICE_UNAVAILABLE)
+                                            .body(axum::body::Body::from("reserved for health"))
+                                            .expect("static HTTP response is valid"),
+                                    );
+                                }
+                                let mut request = request.map(axum::body::Body::new);
+                                request.extensions_mut().insert(ConnectInfo(peer_addr));
+                                Ok::<_, std::convert::Infallible>(
+                                    app.oneshot(request)
+                                        .await
+                                        .expect("axum router is infallible"),
+                                )
+                            }
+                        },
+                    );
+                    let io = hyper_util::rt::TokioIo::new(IdleTimeoutStream::new(
+                        stream,
+                        HTTP_IDLE_TIMEOUT,
+                    ));
+                    let mut builder = hyper_util::server::conn::auto::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    );
+                    builder
+                        .http1()
+                        .timer(hyper_util::rt::TokioTimer::new())
+                        .header_read_timeout(HTTP_HEADER_TIMEOUT)
+                        .max_buf_size(32 * 1024);
+                    builder
+                        .http2()
+                        .timer(hyper_util::rt::TokioTimer::new())
+                        .max_concurrent_streams(64)
+                        .max_pending_accept_reset_streams(16)
+                        .keep_alive_interval(Some(Duration::from_secs(15)))
+                        .keep_alive_timeout(Duration::from_secs(10));
+                    if let Err(error) = builder
+                        .serve_connection_with_upgrades(io, service)
+                        .await
+                    {
+                        debug!("HTTP connection from {peer_addr} closed: {error}");
+                    }
+                });
+            }
+        }
     }
 }
 
@@ -3348,15 +3574,19 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod relay_ticket_tests {
     use super::*;
+    use ed25519_dalek::Signer;
 
     fn test_state() -> AppState {
         AppState {
             store: Arc::new(RwLock::new(HashMap::new())),
+            capability_store: Arc::new(RwLock::new(HashMap::new())),
             rate_limits: Arc::new(RwLock::new(HashMap::new())),
             ticket_read_rate_limits: Arc::new(RwLock::new(HashMap::new())),
             punch_rate_limits: Arc::new(RwLock::new(HashMap::new())),
             punch_requests: Arc::new(RwLock::new(HashMap::new())),
             relay_sessions: Arc::new(RwLock::new(HashMap::new())),
+            bridged_relays: Arc::new(RwLock::new(HashMap::new())),
+            relay_admissions: Arc::new(RwLock::new(HashMap::new())),
             relay_ip_counts: Arc::new(RwLock::new(HashMap::new())),
             next_relay_reservation_id: Arc::new(AtomicU64::new(1)),
             relay_tickets: Arc::new(RwLock::new(RelayTicketStore::default())),
@@ -3366,6 +3596,121 @@ mod relay_ticket_tests {
             status_read_nonces: Arc::new(RwLock::new(ScopedNonceCache::new())),
             started_at: Instant::now(),
         }
+    }
+
+    async fn insert_test_identity(
+        state: &AppState,
+        seed: u8,
+    ) -> (ed25519_dalek::SigningKey, String, [u8; 32]) {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let pubkey = key.verifying_key().to_bytes();
+        let id = id_from_pubkey(&pubkey);
+        state.store.write().await.insert(
+            id.clone(),
+            PresenceEntry {
+                expires_at: Instant::now() + ENTRY_TTL,
+                pubkey,
+            },
+        );
+        (key, id, pubkey)
+    }
+
+    #[tokio::test]
+    async fn stable_id_presence_lookup_is_denied() {
+        assert_eq!(legacy_presence_lookup_gone().await, StatusCode::GONE);
+    }
+
+    #[test]
+    fn pairwise_capability_rejects_unbound_sybil_peer() {
+        let authorized = [0x11; 32];
+        let entry = PairwisePresenceEntry {
+            ip: "8.8.8.8".parse().unwrap(),
+            port: 4662,
+            expires_at: Instant::now() + Duration::from_secs(30),
+            peer_pubkey: authorized,
+            pubkey: [0x22; 32],
+            epoch: 7,
+            ts: now_unix_secs(),
+            sig: [0; 64],
+        };
+        assert!(capability_allows_peer(
+            &entry,
+            &authorized,
+            7,
+            Instant::now()
+        ));
+        assert!(!capability_allows_peer(
+            &entry,
+            &[0x33; 32],
+            7,
+            Instant::now()
+        ));
+    }
+
+    #[tokio::test]
+    async fn signed_pairwise_capability_registration_and_lookup_succeeds() {
+        let state = test_state();
+        let (alice, alice_id, alice_pubkey) = insert_test_identity(&state, 3).await;
+        let (bob, _bob_id, bob_pubkey) = insert_test_identity(&state, 5).await;
+        let capability = [0xA7; 32];
+        let epoch = now_unix_secs().div_euclid(15 * 60);
+        let register_ts = now_unix_secs();
+        let register_message = build_capability_register_msg(
+            &capability,
+            epoch,
+            4662,
+            [8, 8, 4, 4],
+            &bob_pubkey,
+            &alice_pubkey,
+            register_ts,
+        );
+        let register_status = capability_register(
+            State(state.clone()),
+            ConnectInfo("8.8.8.8:1000".parse().unwrap()),
+            HeaderMap::new(),
+            Json(CapabilityRegisterRequest {
+                capability: hex::encode(capability),
+                epoch,
+                port: 4662,
+                ip: "8.8.4.4".to_string(),
+                pubkey: hex::encode(bob_pubkey),
+                peer_pubkey: hex::encode(alice_pubkey),
+                ts: register_ts,
+                sig: hex::encode(bob.sign(&register_message).to_bytes()),
+            }),
+        )
+        .await;
+        assert_eq!(register_status, StatusCode::OK);
+
+        let nonce = [0x19; 16];
+        let lookup_ts = now_unix_secs();
+        let alice_raw = decode_hex_id(&alice_id).unwrap();
+        let lookup_message = build_capability_lookup_msg(
+            &capability,
+            epoch,
+            &alice_raw,
+            &alice_pubkey,
+            &nonce,
+            lookup_ts,
+        );
+        let response = capability_lookup(
+            State(state),
+            ConnectInfo("1.1.1.1:2000".parse().unwrap()),
+            HeaderMap::new(),
+            Json(CapabilityLookupRequest {
+                capability: hex::encode(capability),
+                epoch,
+                requester_id: alice_id,
+                requester_pubkey: hex::encode(alice_pubkey),
+                nonce: hex::encode(nonce),
+                ts: lookup_ts,
+                sig: hex::encode(alice.sign(&lookup_message).to_bytes()),
+            }),
+        )
+        .await
+        .expect("authorized capability lookup");
+        assert!(response.0.acknowledged);
+        assert_eq!(response.0.ip, "8.8.4.4");
     }
 
     async fn insert_ticket(
@@ -3380,7 +3725,9 @@ mod relay_ticket_tests {
             RelayTicket {
                 initiator_id: "11".repeat(32),
                 responder_id: "22".repeat(32),
-                purpose: "friend".to_string(),
+                capability: [0; 32],
+                epoch: 0,
+                mailbox_envelope: Vec::new(),
                 initiator_token_hash: relay_token_hash(&initiator_token),
                 responder_token_hash: relay_token_hash(&responder_token),
                 initiator_joined: false,
@@ -3402,7 +3749,9 @@ mod relay_ticket_tests {
         RelayTicket {
             initiator_id: initiator_id.to_owned(),
             responder_id: responder_id.to_owned(),
-            purpose: "friend".to_string(),
+            capability: [0; 32],
+            epoch: 0,
+            mailbox_envelope: Vec::new(),
             initiator_token_hash: [0u8; 32],
             responder_token_hash: [0u8; 32],
             initiator_joined: false,
@@ -3415,33 +3764,27 @@ mod relay_ticket_tests {
     }
 
     #[test]
-    fn relay_ticket_operation_codes_are_stable() {
-        assert_eq!(OP_RELAY_TICKET_OFFER, 0x07);
-        assert_eq!(OP_RELAY_TICKET_POLL, 0x08);
+    fn current_privacy_operation_codes_are_stable() {
         assert_eq!(OP_RELAY_TICKET_ACCEPT, 0x09);
         assert_eq!(OP_RELAY_TICKET_STATUS, 0x0a);
-        assert_eq!(OP_RELAY_TICKET_POLL_V3, 0x0b);
+        assert_eq!(OP_CAPABILITY_REGISTER, 0x0c);
+        assert_eq!(OP_CAPABILITY_LOOKUP, 0x0d);
+        assert_eq!(OP_RELAY_MAILBOX_OFFER, 0x0e);
+        assert_eq!(OP_RELAY_MAILBOX_POLL, 0x0f);
+        assert_eq!(OP_PUNCH_REGISTER_V3, 0x10);
+        assert_eq!(OP_PUNCH_POLL_V3, 0x11);
+        assert_eq!(OP_PUNCH_ACK_V3, 0x12);
     }
 
     #[test]
-    fn v2_and_v3_poll_signatures_are_unambiguous() {
-        let responder = [1u8; 32];
-        let nonce = [2u8; 16];
-        let v2 = build_relay_ticket_poll_v2_msg(&responder, &nonce, 3);
-        let v3 = build_relay_ticket_poll_v3_msg(&responder, &[[4u8; 32]], None, &nonce, 3);
-        assert_ne!(v2, v3);
-    }
-
-    #[test]
-    fn concurrent_v3_pages_share_timestamp_without_nonce_conflict() {
+    fn repeated_v4_mailbox_reads_are_idempotent() {
         let responder = [1u8; 32];
         let nonce = [2u8; 16];
         let timestamp = 42;
-        let page_a =
-            build_relay_ticket_poll_v3_msg(&responder, &[[3u8; 32]], None, &nonce, timestamp);
-        let page_b =
-            build_relay_ticket_poll_v3_msg(&responder, &[[4u8; 32]], None, &nonce, timestamp);
-        assert_ne!(page_a, page_b, "candidate pages remain separately signed");
+        assert_ne!(
+            build_relay_mailbox_poll_msg(&responder, &nonce, timestamp),
+            build_relay_mailbox_poll_msg(&[3u8; 32], &nonce, timestamp)
+        );
 
         let mut cache = ScopedNonceCache::new();
         let now = Instant::now();
@@ -3615,6 +3958,27 @@ mod relay_ticket_tests {
     }
 
     #[test]
+    fn mailbox_pages_round_robin_past_first_eight_initiators() {
+        let responder_id = "44".repeat(32);
+        let mut tickets = RelayTicketStore::default();
+        for index in 0..9 {
+            tickets.insert(
+                format!("{:064x}", index + 100),
+                ticket_with_parties(&format!("{index:064x}"), &responder_id, false),
+            );
+        }
+
+        let first = tickets.mailbox_page_ids(&responder_id, Instant::now());
+        assert_eq!(first.len(), MAX_RELAY_MAILBOX_RESULTS);
+        let second = tickets.mailbox_page_ids(&responder_id, Instant::now());
+        assert_eq!(
+            second.first(),
+            Some(&format!("{:064x}", 108)),
+            "the ninth offer must not remain hidden behind the first page"
+        );
+    }
+
+    #[test]
     fn ticket_capacity_counts_accepted_and_offered_tickets() {
         let initiator_id = "33".repeat(32);
         let mut tickets = RelayTicketStore::default();
@@ -3648,71 +4012,6 @@ mod relay_ticket_tests {
         assert!(tickets.by_responder.is_empty());
         assert!(tickets.initiator_counts.is_empty());
         assert!(tickets.accepted_responder_counts.is_empty());
-    }
-
-    #[test]
-    fn poll_filters_unknown_offers_before_pagination() {
-        let responder_id = "22".repeat(32);
-        let mut tickets = RelayTicketStore::default();
-
-        for index in 0..(MAX_RELAY_TICKET_POLL_RESULTS * 2) {
-            let unknown_id = format!("{:064x}", index + 10_000);
-            tickets.insert(
-                format!("{:064x}", index + 1000),
-                ticket_with_parties(&unknown_id, &responder_id, false),
-            );
-        }
-        let mut candidates = HashSet::new();
-        for index in 0..(MAX_RELAY_TICKET_POLL_RESULTS + 1) {
-            let friend_id = format!("{:064x}", index + 20_000);
-            candidates.insert(friend_id.clone());
-            tickets.insert(
-                format!("{index:064x}"),
-                ticket_with_parties(&friend_id, &responder_id, false),
-            );
-        }
-
-        let (first_page, cursor) =
-            relay_ticket_poll_page(&tickets, &responder_id, &candidates, None, Instant::now());
-        assert_eq!(first_page.len(), MAX_RELAY_TICKET_POLL_RESULTS);
-        assert!(first_page
-            .iter()
-            .all(|item| candidates.contains(&item.initiator_id)));
-        let cursor = cursor.expect("the seventeenth matching friend offer is paginated");
-        let (second_page, final_cursor) = relay_ticket_poll_page(
-            &tickets,
-            &responder_id,
-            &candidates,
-            Some(&cursor),
-            Instant::now(),
-        );
-        assert_eq!(second_page.len(), 1);
-        assert!(candidates.contains(&second_page[0].initiator_id));
-        assert_eq!(final_cursor, None);
-    }
-
-    #[test]
-    fn legacy_v2_poll_rotates_deterministically_past_first_page() {
-        let responder_id = "22".repeat(32);
-        let mut tickets = RelayTicketStore::default();
-        let mut expected = HashSet::new();
-        for index in 0..(MAX_LEGACY_RELAY_TICKET_POLL_RESULTS + 1) {
-            let initiator_id = format!("{:064x}", index + 30_000);
-            expected.insert(initiator_id.clone());
-            tickets.insert(
-                format!("{:064x}", index + 40_000),
-                ticket_with_parties(&initiator_id, &responder_id, false),
-            );
-        }
-
-        let first = relay_ticket_poll_v2_page(&mut tickets, &responder_id, Instant::now());
-        let second = relay_ticket_poll_v2_page(&mut tickets, &responder_id, Instant::now());
-        let seen: HashSet<String> = first
-            .iter()
-            .chain(second.iter())
-            .map(|ticket| ticket.initiator_id.clone())
-            .collect();
-        assert!(expected.is_subset(&seen));
     }
 
     #[test]
@@ -3885,30 +4184,207 @@ mod relay_ticket_tests {
         assert!(tickets.expirations.is_empty());
     }
 
-    #[test]
-    fn legacy_v2_cursors_are_swept_after_ticket_ttl() {
-        let responder_id = "22".repeat(32);
-        let mut tickets = RelayTicketStore::default();
-        for index in 0..(MAX_LEGACY_RELAY_TICKET_POLL_RESULTS + 1) {
-            tickets.insert(
-                format!("{:064x}", index + 40_000),
-                ticket_with_parties(&format!("{:064x}", index + 30_000), &responder_id, false),
-            );
+    #[tokio::test]
+    async fn relay_queue_enforces_byte_budget() {
+        let (sender, mut receiver) = relay_queue();
+        for _ in 0..(MAX_RELAY_QUEUE_BYTES / MAX_RELAY_FRAME_BYTES) {
+            sender.send(vec![0u8; MAX_RELAY_FRAME_BYTES]).await.unwrap();
+        }
+        assert!(sender.send(vec![1]).await.is_err());
+        assert_eq!(receiver.recv().await.unwrap().len(), MAX_RELAY_FRAME_BYTES);
+        sender.send(vec![1]).await.unwrap();
+        assert_eq!(MAX_RELAY_FRAME_BYTES, 16 * 1024);
+    }
+
+    #[tokio::test]
+    async fn relay_registry_cleanup_is_idempotent() {
+        let state = test_state();
+        let session = "cd".repeat(32);
+        let first: IpAddr = "1.1.1.1".parse().unwrap();
+        let second: IpAddr = "8.8.8.8".parse().unwrap();
+        state
+            .relay_admissions
+            .write()
+            .await
+            .insert((session.clone(), RelayRole::Initiator), first);
+        state
+            .relay_admissions
+            .write()
+            .await
+            .insert((session.clone(), RelayRole::Responder), second);
+        state.relay_ip_counts.write().await.insert(first, 1);
+        state.relay_ip_counts.write().await.insert(second, 1);
+        state.bridged_relays.write().await.insert(
+            session.clone(),
+            BridgedRelayEntry {
+                deadline: Instant::now(),
+            },
+        );
+
+        cleanup_relay_session_all(&state, &session).await;
+        cleanup_relay_session_all(&state, &session).await;
+        assert!(state.relay_admissions.read().await.is_empty());
+        assert!(state.relay_ip_counts.read().await.is_empty());
+        assert!(state.bridged_relays.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn signed_v3_capability_punch_is_non_destructive_until_ack() {
+        use ed25519_dalek::Signer;
+
+        fn identity(seed: u8) -> (ed25519_dalek::SigningKey, String, [u8; 32]) {
+            let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+            let public = key.verifying_key().to_bytes();
+            let public_hash = blake3::hash(&public);
+            let ember_hash = &public_hash.as_bytes()[..16];
+            let id_raw: [u8; 32] = Sha256::digest(ember_hash).into();
+            (key, hex::encode(id_raw), id_raw)
         }
 
-        let now = Instant::now();
-        let page = relay_ticket_poll_v2_page(&mut tickets, &responder_id, now);
-        assert!(!page.is_empty());
-        assert!(tickets.legacy_v2_cursors.contains_key(&responder_id));
+        let state = test_state();
+        let (from_key, from_id, from_raw) = identity(7);
+        let (target_key, target_id, target_raw) = identity(8);
+        for (id, key) in [
+            (from_id.clone(), from_key.verifying_key().to_bytes()),
+            (target_id.clone(), target_key.verifying_key().to_bytes()),
+        ] {
+            state.store.write().await.insert(
+                id,
+                PresenceEntry {
+                    expires_at: Instant::now() + ENTRY_TTL,
+                    pubkey: key,
+                },
+            );
+        }
+        let capability = [0xA3; 32];
+        let epoch = now_unix_secs().div_euclid(15 * 60);
+        state.capability_store.write().await.insert(
+            hex::encode(capability),
+            PairwisePresenceEntry {
+                ip: "8.8.8.8".parse().unwrap(),
+                port: 4662,
+                expires_at: Instant::now() + ENTRY_TTL,
+                peer_pubkey: from_key.verifying_key().to_bytes(),
+                pubkey: target_key.verifying_key().to_bytes(),
+                epoch,
+                ts: now_unix_secs(),
+                sig: [0; 64],
+            },
+        );
+        let addr: SocketAddr = "8.8.8.8:40000".parse().unwrap();
+        let ts = now_unix_secs();
+        let nonce = [1u8; 16];
+        let register_message = build_punch_register_v3_msg(
+            &from_raw,
+            &target_raw,
+            &capability,
+            epoch,
+            5000,
+            1,
+            &nonce,
+            ts,
+        );
+        assert_eq!(
+            punch_register_v3(
+                State(state.clone()),
+                ConnectInfo(addr),
+                HeaderMap::new(),
+                Json(CapabilityPunchRequest {
+                    from_id: from_id.clone(),
+                    target_id: target_id.clone(),
+                    capability: hex::encode(capability),
+                    epoch,
+                    port: 5000,
+                    nat_type: 1,
+                    ts,
+                    nonce: hex::encode(nonce),
+                    sig: hex::encode(from_key.sign(&register_message).to_bytes()),
+                }),
+            )
+            .await,
+            StatusCode::OK
+        );
 
-        // A freshly touched cursor survives a sweep.
-        tickets.prune_expired(now);
-        assert!(tickets.legacy_v2_cursors.contains_key(&responder_id));
+        let mut punch_id = String::new();
+        for poll_nonce in [[2u8; 16], [3u8; 16]] {
+            let poll_ts = now_unix_secs();
+            let poll_message = build_punch_poll_v3_msg(&target_raw, &poll_nonce, poll_ts);
+            let response = punch_poll_v3(
+                State(state.clone()),
+                ConnectInfo(addr),
+                HeaderMap::new(),
+                Json(CapabilityPunchPollRequest {
+                    target_id: target_id.clone(),
+                    ts: poll_ts,
+                    nonce: hex::encode(poll_nonce),
+                    sig: hex::encode(target_key.sign(&poll_message).to_bytes()),
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+            if punch_id.is_empty() {
+                punch_id = response.punch_id;
+            } else {
+                assert_eq!(response.punch_id, punch_id);
+            }
+        }
 
-        // A cursor untouched for a full ticket TTL is dropped even though the
-        // responder never issued the empty-result poll that used to be the
-        // only removal path.
-        tickets.prune_expired(now + RELAY_TICKET_TTL);
-        assert!(tickets.legacy_v2_cursors.is_empty());
+        let punch_raw = decode_hex_id(&punch_id).unwrap();
+        let ack_nonce = [4u8; 16];
+        let ack_ts = now_unix_secs();
+        let ack_message = build_punch_ack_v3_msg(
+            &target_raw,
+            &capability,
+            epoch,
+            &punch_raw,
+            &ack_nonce,
+            ack_ts,
+        );
+        assert_eq!(
+            punch_ack_v3(
+                State(state.clone()),
+                ConnectInfo(addr),
+                HeaderMap::new(),
+                Json(CapabilityPunchAckRequest {
+                    target_id,
+                    capability: hex::encode(capability),
+                    epoch,
+                    punch_id,
+                    ts: ack_ts,
+                    nonce: hex::encode(ack_nonce),
+                    sig: hex::encode(target_key.sign(&ack_message).to_bytes()),
+                }),
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert!(state.punch_requests.read().await.is_empty());
+    }
+
+    #[test]
+    fn health_reserve_rejects_non_health_paths() {
+        assert!(http_path_admitted(false, "/register"));
+        assert!(http_path_admitted(true, "/health"));
+        assert!(!http_path_admitted(true, "/register"));
+        assert_eq!(MAX_HTTP_CONNECTIONS - RESERVED_HEALTH_CONNECTIONS, 240);
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_stream_terminates_silent_connection() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let _stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+        let (server, _) = listener.accept().await.unwrap();
+        let mut timed = IdleTimeoutStream::new(server, Duration::from_millis(10));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let error = timed.read_u8().await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        client.await.unwrap();
     }
 }

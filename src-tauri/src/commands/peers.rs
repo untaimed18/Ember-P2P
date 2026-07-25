@@ -128,6 +128,38 @@ fn parse_user_hash(hex_str: &str) -> Result<[u8; 16], String> {
     Ok(hash)
 }
 
+fn parse_friend_code(value: &str) -> Result<(String, [u8; 16], Option<[u8; 32]>), String> {
+    let trimmed = value.trim();
+    if let Some(rest) = trimmed
+        .strip_prefix("ember2:")
+        .or_else(|| trimmed.strip_prefix("EMBER2:"))
+    {
+        let mut fields = rest.split(':');
+        let hash_hex = fields.next().unwrap_or_default().to_ascii_lowercase();
+        let pubkey_hex = fields.next().unwrap_or_default();
+        if fields.next().is_some() {
+            return Err(coded(
+                "peers_user_hash_invalid",
+                "Friend code has an invalid format",
+            ));
+        }
+        let hash = parse_user_hash(&hash_hex)?;
+        let mut pubkey = [0u8; 32];
+        if hex::decode_to_slice(pubkey_hex, &mut pubkey).is_err()
+            || !crate::network::ember::crypto::verify_ember_hash_binding(&pubkey, &hash)
+        {
+            return Err(coded(
+                "peers_user_hash_invalid",
+                "Friend code public key does not match its Friend ID",
+            ));
+        }
+        return Ok((hash_hex, hash, Some(pubkey)));
+    }
+    let canonical = trimmed.to_ascii_lowercase();
+    let hash = parse_user_hash(&canonical)?;
+    Ok((canonical, hash, None))
+}
+
 #[derive(serde::Serialize)]
 pub struct FriendInfo {
     pub user_hash: String,
@@ -158,8 +190,7 @@ pub async fn add_friend(
     user_hash_hex: String,
     nickname: Option<String>,
 ) -> Result<(), String> {
-    let canonical = user_hash_hex.to_lowercase();
-    let hash = parse_user_hash(&canonical)?;
+    let (canonical, hash, friend_pubkey) = parse_friend_code(&user_hash_hex)?;
     // L20: strip bidi/zero-width/control formatters from
     // user-supplied nicknames before they're written to the DB.
     // The friends list uses `<bdi>` to neutralise visual
@@ -213,7 +244,10 @@ pub async fn add_friend(
     let db = state.db.clone();
     let db_hash = canonical.clone();
     let db_nick = nick.clone();
-    let db_result = tokio::task::spawn_blocking(move || db.add_friend(&db_hash, &db_nick)).await;
+    let db_result = tokio::task::spawn_blocking(move || {
+        db.add_friend(&db_hash, &db_nick, friend_pubkey.as_ref())
+    })
+    .await;
     if let Err(e) = db_result
         .as_ref()
         .map_err(|e| e.to_string())
@@ -267,17 +301,26 @@ pub async fn remove_friend(
     let mut friends = state.friend_hashes.write().await;
     friends.remove(&hash);
     drop(friends);
-    // Removal is already committed to the DB and the in-memory friend
-    // set above. The network notification only matters for tearing
-    // down a live session — if the channel is full a stale session may
-    // linger until next restart, which is preferable to surfacing a
-    // "remove friend failed" error after the row is already gone.
-    if let Err(e) = state
-        .network_tx
-        .try_send(NetworkCommand::FriendRemoved { ember_hash: hash })
-    {
-        tracing::warn!("Friend removed from DB, but live-session teardown was not enqueued (channel full): {e}");
-    }
+    // Revoke sockets synchronously before waiting on the network task so a
+    // saturated command queue can never extend access.  The bounded
+    // send/ack below then confirms pending browse/chat/priority state was
+    // centrally cleared too.
+    crate::network::ed2k::upload::revoke_all_secure_sessions(hash);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    bounded_send(
+        &state.network_tx,
+        NetworkCommand::FriendRemoved {
+            ember_hash: hash,
+            tx,
+        },
+    )
+    .await?;
+    await_reply(
+        rx,
+        "peers_friend_removal_not_acknowledged",
+        "Friend was removed, but live network teardown was not acknowledged",
+    )
+    .await?;
     Ok(())
 }
 
@@ -355,7 +398,11 @@ pub async fn get_friends(state: tauri::State<'_, AppState>) -> Result<Vec<Friend
 
 #[tauri::command]
 pub async fn get_my_ember_hash(state: tauri::State<'_, AppState>) -> Result<String, String> {
-    Ok(hex::encode(state.identity.ember_hash))
+    Ok(format!(
+        "ember2:{}:{}",
+        hex::encode(state.identity.ember_hash),
+        hex::encode(state.identity.ed25519_public_key)
+    ))
 }
 
 #[derive(serde::Serialize)]

@@ -278,7 +278,10 @@ impl Ed2kServerConnection {
                     if payload.len() >= 2 {
                         let len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
                         if payload.len() >= 2 + len {
-                            let msg = String::from_utf8_lossy(&payload[2..2 + len]).to_string();
+                            let msg = crate::security::sanitize_remote_text(
+                                &String::from_utf8_lossy(&payload[2..2 + len]),
+                                4096,
+                            );
                             info!("Server MOTD: {msg}");
                             session.motd_messages.push(msg);
                         }
@@ -992,7 +995,10 @@ fn parse_server_event(opcode: u8, payload: &[u8]) -> Vec<ServerEvent> {
             if payload.len() >= 2 {
                 let len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
                 if payload.len() >= 2 + len {
-                    let msg = String::from_utf8_lossy(&payload[2..2 + len]).to_string();
+                    let msg = crate::security::sanitize_remote_text(
+                        &String::from_utf8_lossy(&payload[2..2 + len]),
+                        4096,
+                    );
                     events.push(ServerEvent::Message(msg));
                 }
             }
@@ -1116,7 +1122,7 @@ fn parse_server_ident_name(payload: &[u8]) -> Option<String> {
                     if let Ok(s) = std::str::from_utf8(&payload[offset..offset + slen]) {
                         let trimmed = s.trim();
                         if !trimmed.is_empty() {
-                            return Some(trimmed.to_string());
+                            return Some(crate::security::sanitize_remote_text(trimmed, 256));
                         }
                     }
                 }
@@ -1162,7 +1168,7 @@ fn parse_server_ident_name(payload: &[u8]) -> Option<String> {
                     if let Ok(s) = std::str::from_utf8(&payload[offset..offset + len]) {
                         let trimmed = s.trim();
                         if !trimmed.is_empty() {
-                            return Some(trimmed.to_string());
+                            return Some(crate::security::sanitize_remote_text(trimmed, 256));
                         }
                     }
                 }
@@ -1792,6 +1798,7 @@ impl ServerResultTags {
     /// Route a decoded string value to the right field by tag id (KAD-style
     /// byte ids) or, for old-format tags, by lowercased name.
     fn apply_string(&mut self, name_id: u8, name: Option<&str>, value: String) {
+        let value = crate::security::sanitize_remote_text(&value, 8192);
         if name_id == 0x01 {
             self.file_name = value;
             return;

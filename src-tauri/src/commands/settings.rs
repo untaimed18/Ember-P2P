@@ -60,6 +60,57 @@ pub struct IpFilterDownloadResult {
     pub byte_count: usize,
 }
 
+/// Fields persisted inside `AppSettings` but owned exclusively by backend
+/// workflows. The frontend still receives them in `get_settings` so existing
+/// setup/settings forms can round-trip one object, but `update_settings`
+/// always restores these values from the authoritative in-memory config.
+const BACKEND_OWNED_SETTINGS_FIELDS: &[&str] = &[
+    "shared_folders",
+    "default_shared_folder_seeded",
+    "pending_share_states",
+    "pending_file_priorities",
+    "shared_folder_scan_cursors",
+];
+
+fn merge_renderer_settings(
+    mut renderer: serde_json::Value,
+    authoritative: &AppSettings,
+) -> Result<AppSettings, String> {
+    let renderer_object = renderer.as_object_mut().ok_or_else(|| {
+        coded(
+            "settings_invalid_update",
+            "Settings update must be a JSON object",
+        )
+    })?;
+    let authoritative_value = serde_json::to_value(authoritative).map_err(|error| {
+        coded_ctx(
+            "settings_serialize_failed",
+            "Failed to prepare settings update",
+            error,
+        )
+    })?;
+    let authoritative_object = authoritative_value.as_object().ok_or_else(|| {
+        coded(
+            "settings_serialize_failed",
+            "Failed to prepare settings update",
+        )
+    })?;
+    for field in BACKEND_OWNED_SETTINGS_FIELDS {
+        if let Some(value) = authoritative_object.get(*field) {
+            renderer_object.insert((*field).to_string(), value.clone());
+        } else {
+            renderer_object.remove(*field);
+        }
+    }
+    serde_json::from_value(renderer).map_err(|error| {
+        coded_ctx(
+            "settings_invalid_update",
+            "Settings update is invalid",
+            error,
+        )
+    })
+}
+
 fn normalized_path_components(path: &std::path::Path) -> Vec<String> {
     path.components()
         .map(|component| {
@@ -755,9 +806,18 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
 pub async fn update_settings(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
-    settings: AppSettings,
+    settings: serde_json::Value,
 ) -> Result<UpdateSettingsResult, String> {
-    let mut settings = settings;
+    // Serialize the read/merge/write transaction before deserializing the
+    // renderer payload. Internal cursor/pending maps can advance without
+    // changing the visible settings revision, so reading them before this lock
+    // could overwrite newer backend state with a stale renderer echo.
+    let _settings_save_guard = state.settings_save_lock.lock().await;
+    let old_settings = {
+        let config = state.config.read().await;
+        config.settings.clone()
+    };
+    let mut settings = merge_renderer_settings(settings, &old_settings)?;
     settings.spam_filter_profile = settings.spam_filter_profile.trim().to_ascii_lowercase();
     settings.close_to_tray_behavior = settings.close_to_tray_behavior.trim().to_ascii_lowercase();
     settings.update_check_frequency = settings.update_check_frequency.trim().to_ascii_lowercase();
@@ -795,11 +855,6 @@ pub async fn update_settings(
             .map_err(|e| coded_ctx("settings_validation_task_failed", "Validation failed", e))??;
     }
 
-    let _settings_save_guard = state.settings_save_lock.lock().await;
-    let old_settings = {
-        let config = state.config.read().await;
-        config.settings.clone()
-    };
     if settings.settings_revision != old_settings.settings_revision {
         return Err(coded(
             "settings_stale_revision",
@@ -844,6 +899,30 @@ pub async fn update_settings(
         .await
         .map_err(|e| coded_ctx("settings_save_failed", "Save failed", e))?
         .map_err(|e| coded_ctx("settings_save_failed", "Save failed", e))?;
+    }
+    {
+        let mut roots = settings.shared_folders.clone();
+        if !settings.download_folder.is_empty() {
+            roots.push(settings.download_folder.clone());
+        }
+        let mut explicit_additions = added_shared_folders.clone();
+        if !settings.download_folder.is_empty()
+            && normalized_path_components(std::path::Path::new(&settings.download_folder))
+                != normalized_path_components(std::path::Path::new(&old_settings.download_folder))
+        {
+            explicit_additions.push(settings.download_folder.clone());
+        }
+        let registry = state.approved_roots.clone();
+        tokio::task::spawn_blocking(move || registry.update_roots(&roots, &explicit_additions))
+            .await
+            .map_err(|e| {
+                coded_ctx(
+                    "settings_root_registry_task_failed",
+                    "Root approval failed",
+                    e,
+                )
+            })?
+            .map_err(|e| coded_ctx("settings_root_registry_failed", "Root approval failed", e))?;
     }
     {
         let mut config = state.config.write().await;
@@ -1558,12 +1637,14 @@ mod tests {
         settings
             .pending_share_states
             .insert("/library/parent/other/pending.bin".to_string(), false);
-        settings
-            .pending_file_priorities
-            .insert("/library/parent/child/pending.bin".to_string(), "high".to_string());
-        settings
-            .shared_folder_scan_cursors
-            .insert("/library/parent/child".to_string(), "child-cursor".to_string());
+        settings.pending_file_priorities.insert(
+            "/library/parent/child/pending.bin".to_string(),
+            "high".to_string(),
+        );
+        settings.shared_folder_scan_cursors.insert(
+            "/library/parent/child".to_string(),
+            "child-cursor".to_string(),
+        );
 
         prune_removed_shared_folder_state(&mut settings, &removed, &new_folders);
 
@@ -1585,5 +1666,65 @@ mod tests {
         assert!(settings
             .shared_folder_scan_cursors
             .contains_key("/library/parent/child"));
+    }
+
+    #[test]
+    fn renderer_settings_cannot_replace_backend_owned_fields() {
+        let mut authoritative = AppSettings::default();
+        authoritative.shared_folders = vec!["/trusted/share".into()];
+        authoritative.default_shared_folder_seeded = true;
+        authoritative
+            .pending_share_states
+            .insert("/trusted/share/pending.bin".into(), false);
+        authoritative
+            .pending_file_priorities
+            .insert("/trusted/share/pending.bin".into(), "release".into());
+        authoritative
+            .shared_folder_scan_cursors
+            .insert("/trusted/share".into(), "cursor-7".into());
+
+        let mut renderer = serde_json::to_value(&authoritative).unwrap();
+        let object = renderer.as_object_mut().unwrap();
+        object.insert("nickname".into(), serde_json::json!("Allowed change"));
+        object.insert(
+            "shared_folders".into(),
+            serde_json::json!(["/renderer/injected"]),
+        );
+        object.insert(
+            "default_shared_folder_seeded".into(),
+            serde_json::json!(false),
+        );
+        object.insert(
+            "pending_share_states".into(),
+            serde_json::json!({"/renderer/injected/file": true}),
+        );
+        object.insert(
+            "pending_file_priorities".into(),
+            serde_json::json!({"/renderer/injected/file": "high"}),
+        );
+        object.insert(
+            "shared_folder_scan_cursors".into(),
+            serde_json::json!({"/renderer/injected": "stolen"}),
+        );
+
+        let merged = merge_renderer_settings(renderer, &authoritative).unwrap();
+        assert_eq!(merged.nickname, "Allowed change");
+        assert_eq!(merged.shared_folders, authoritative.shared_folders);
+        assert_eq!(
+            merged.default_shared_folder_seeded,
+            authoritative.default_shared_folder_seeded
+        );
+        assert_eq!(
+            merged.pending_share_states,
+            authoritative.pending_share_states
+        );
+        assert_eq!(
+            merged.pending_file_priorities,
+            authoritative.pending_file_priorities
+        );
+        assert_eq!(
+            merged.shared_folder_scan_cursors,
+            authoritative.shared_folder_scan_cursors
+        );
     }
 }

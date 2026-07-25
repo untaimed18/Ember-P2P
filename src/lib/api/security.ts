@@ -25,6 +25,20 @@ export interface IpFilterApplyResult {
   entryCount: number;
 }
 
+export interface SecurityPolicyState {
+  loaded: boolean;
+  resetRequired: boolean;
+  reason?: string;
+}
+
+export async function getSecurityPolicyState(): Promise<SecurityPolicyState> {
+  return invoke('get_security_policy_state');
+}
+
+export async function acknowledgeSecurityPolicyReset(): Promise<void> {
+  return invoke('acknowledge_security_policy_reset');
+}
+
 export async function getIpFilterStats(): Promise<IpFilterStats> {
   return invoke('get_ip_filter_stats');
 }

@@ -25,7 +25,8 @@ export async function startDownload(
    */
   extraSources?: string[],
   /** Optional Ember content BLAKE3 hex for download completion verify. */
-  emberFileHash?: string
+  emberFileHash?: string,
+  expectedAich?: string,
 ): Promise<StartDownloadResponse> {
   // A source address identifies a peer, not the file. Never let a source-bearing
   // result bypass the mandatory content hash used to identify and verify it.
@@ -40,7 +41,12 @@ export async function startDownload(
     peerPort,
     extraSources: extraSources ?? null,
     emberFileHash: emberFileHash?.trim() ? emberFileHash.trim() : null,
+    expectedAich: expectedAich ?? null,
   });
+}
+
+export async function takePendingDownloadOverflowNotice(): Promise<number> {
+  return invoke('take_pending_download_overflow_notice');
 }
 
 export async function pauseTransfer(transferId: string): Promise<void> {

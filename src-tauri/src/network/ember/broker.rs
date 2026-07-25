@@ -30,7 +30,6 @@ fn emit_event(tx: &mpsc::Sender<BrokerEvent>, event: BrokerEvent) {
 }
 
 const MAX_ACTIVE_ATTEMPTS: usize = 8;
-const PUNCH_TIMEOUT: Duration = Duration::from_secs(20);
 const RELAY_TIMEOUT: Duration = Duration::from_secs(30);
 const ATTEMPT_COOLDOWN: Duration = Duration::from_secs(120);
 const ATTEMPT_RESET: Duration = Duration::from_secs(600);
@@ -68,13 +67,11 @@ impl std::fmt::Debug for BrokerConnection {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ConnectionMethod {
-    HolePunch,
     PeerRelay,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum AttemptPhase {
-    HolePunch,
     FindRelay,
     RelayConnect,
 }
@@ -88,16 +85,11 @@ struct ConnectionAttempt {
     phase: AttemptPhase,
     started: Instant,
     phase_started: Instant,
-    our_nat: NatType,
 }
 
 impl ConnectionAttempt {
     fn is_expired(&self) -> bool {
-        let timeout = match self.phase {
-            AttemptPhase::HolePunch => PUNCH_TIMEOUT,
-            AttemptPhase::FindRelay | AttemptPhase::RelayConnect => RELAY_TIMEOUT,
-        };
-        self.phase_started.elapsed() > timeout
+        self.phase_started.elapsed() > RELAY_TIMEOUT
     }
 }
 
@@ -167,14 +159,6 @@ pub struct ConnectionBroker {
 /// Events emitted by the broker for the main network loop to act on.
 #[derive(Debug)]
 pub enum BrokerEvent {
-    /// Request a hole-punch coordination via rendezvous server.
-    StartPunch {
-        attempt_key: String,
-        source_ip: Ipv4Addr,
-        source_port: u16,
-        our_external_addr: SocketAddr,
-        our_nat_type: NatType,
-    },
     /// Request relay from a peer or server.
     StartRelay {
         attempt_key: String,
@@ -194,8 +178,6 @@ pub enum BrokerEvent {
         source_port: u16,
         reason: String,
     },
-    /// Spawned punch task reports failure -- broker should escalate to relay.
-    PunchFailed { attempt_key: String, reason: String },
     /// Spawned relay task reports failure -- broker should emit ConnectionFailed.
     RelayFailed { attempt_key: String, reason: String },
 }
@@ -238,7 +220,7 @@ impl ConnectionBroker {
         source_ip: Ipv4Addr,
         source_port: u16,
         our_nat: NatType,
-        our_external_addr: Option<SocketAddr>,
+        _our_external_addr: Option<SocketAddr>,
     ) -> bool {
         // Reject obviously-unroutable targets *before* mutating any state.
         // Without this, a peer port of 0 or a bogus IP (0.0.0.0, loopback,
@@ -296,12 +278,9 @@ impl ConnectionBroker {
         let now = Instant::now();
         self.cooldowns.insert(source_key, (now, cooldown_count + 1));
 
-        // Decide starting phase based on NAT type
-        let start_phase = if our_nat.is_punchable() && our_external_addr.is_some() {
-            AttemptPhase::HolePunch
-        } else {
-            AttemptPhase::FindRelay
-        };
+        // Anonymous LowID sources have no registered Ember identity to sign
+        // a v2 punch request, so the broker starts directly at relay.
+        let start_phase = AttemptPhase::FindRelay;
 
         let attempt = ConnectionAttempt {
             transfer_id: transfer_id.to_string(),
@@ -311,7 +290,6 @@ impl ConnectionBroker {
             phase: start_phase,
             started: now,
             phase_started: now,
-            our_nat,
         };
 
         info!(
@@ -421,21 +399,10 @@ impl ConnectionBroker {
         }
     }
 
-    /// Called when either punch or relay succeeds.
-    ///
-    /// `method` lets us distinguish punch successes from relay successes
-    /// (peer or server) so the diagnostics counters reflect what actually
-    /// carried the connection.
-    pub fn mark_succeeded(&mut self, attempt_key: &str, method: ConnectionMethod) {
+    /// Called when a relay succeeds.
+    pub fn mark_succeeded(&mut self, attempt_key: &str, _method: ConnectionMethod) {
         self.attempts.remove(attempt_key);
-        match method {
-            ConnectionMethod::HolePunch => {
-                self.stats.punch_successes = self.stats.punch_successes.saturating_add(1);
-            }
-            ConnectionMethod::PeerRelay => {
-                self.stats.relay_successes = self.stats.relay_successes.saturating_add(1);
-            }
-        }
+        self.stats.relay_successes = self.stats.relay_successes.saturating_add(1);
     }
 
     /// Add a relay-capable peer discovered via EPX. `expires_at_unix` must
@@ -501,8 +468,7 @@ impl ConnectionBroker {
         self.relay_candidates
             .iter()
             .filter(|c| {
-                c.last_seen.elapsed() < RELAY_CANDIDATE_PICK_MAX_AGE
-                    && c.expires_at_unix > now_unix
+                c.last_seen.elapsed() < RELAY_CANDIDATE_PICK_MAX_AGE && c.expires_at_unix > now_unix
             })
             .min_by_key(|c| (c.relay_sessions, c.last_seen.elapsed().as_secs()))
     }
@@ -517,20 +483,9 @@ impl ConnectionBroker {
             .collect();
 
         for key in expired {
-            if let Some(attempt) = self.attempts.get(&key) {
-                match attempt.phase {
-                    AttemptPhase::HolePunch => {
-                        info!(
-                            "Broker: punch timed out for {key} (our_nat={:?}), trying relay",
-                            attempt.our_nat
-                        );
-                        self.punch_failed(&key, "timeout").await;
-                    }
-                    AttemptPhase::FindRelay | AttemptPhase::RelayConnect => {
-                        info!("Broker: relay timed out for {key}");
-                        self.relay_failed(&key, "timeout").await;
-                    }
-                }
+            if self.attempts.contains_key(&key) {
+                info!("Broker: relay timed out for {key}");
+                self.relay_failed(&key, "timeout").await;
             }
         }
 
@@ -643,7 +598,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn symmetric_nat_skips_punch() {
+    async fn symmetric_nat_starts_relay() {
         let (tx, mut rx) = mpsc::channel(16);
         let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
 
@@ -658,14 +613,13 @@ mod tests {
             )
             .await;
 
-        // Should emit StartRelay, not StartPunch
         if let Some(event) = rx.recv().await {
             assert!(matches!(event, BrokerEvent::StartRelay { .. }));
         }
     }
 
     #[tokio::test]
-    async fn punchable_nat_starts_punch() {
+    async fn punchable_nat_without_target_identity_starts_relay() {
         let (tx, mut rx) = mpsc::channel(16);
         let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
 
@@ -681,7 +635,7 @@ mod tests {
             .await;
 
         if let Some(event) = rx.recv().await {
-            assert!(matches!(event, BrokerEvent::StartPunch { .. }));
+            assert!(matches!(event, BrokerEvent::StartRelay { .. }));
         }
     }
 
@@ -698,12 +652,30 @@ mod tests {
         let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
         let future_expiry = unix_now() + 600;
 
-        broker.add_relay_candidate(Ipv4Addr::new(1, 1, 1, 1), 4662, [1u8; 32], None, future_expiry);
-        broker.add_relay_candidate(Ipv4Addr::new(2, 2, 2, 2), 4663, [2u8; 32], None, future_expiry);
+        broker.add_relay_candidate(
+            Ipv4Addr::new(1, 1, 1, 1),
+            4662,
+            [1u8; 32],
+            None,
+            future_expiry,
+        );
+        broker.add_relay_candidate(
+            Ipv4Addr::new(2, 2, 2, 2),
+            4663,
+            [2u8; 32],
+            None,
+            future_expiry,
+        );
         assert_eq!(broker.relay_candidate_count(), 2);
 
         // Duplicate is deduplicated
-        broker.add_relay_candidate(Ipv4Addr::new(1, 1, 1, 1), 4662, [3u8; 32], None, future_expiry);
+        broker.add_relay_candidate(
+            Ipv4Addr::new(1, 1, 1, 1),
+            4662,
+            [3u8; 32],
+            None,
+            future_expiry,
+        );
         assert_eq!(broker.relay_candidate_count(), 2);
         assert_eq!(
             broker
@@ -751,7 +723,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn punch_failure_escalates_to_relay() {
+    async fn anonymous_lowid_emits_only_one_relay_event() {
         let (tx, mut rx) = mpsc::channel(16);
         let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
 
@@ -766,15 +738,11 @@ mod tests {
             )
             .await;
 
-        // Drain punch event
-        let _ = rx.recv().await;
-
-        let key = "t4:10.20.30.40:4662";
-        broker.punch_failed(key, "peer unreachable").await;
-
-        if let Some(event) = rx.recv().await {
-            assert!(matches!(event, BrokerEvent::StartRelay { .. }));
-        }
+        assert!(matches!(
+            rx.recv().await,
+            Some(BrokerEvent::StartRelay { .. })
+        ));
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

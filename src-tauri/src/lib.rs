@@ -29,6 +29,61 @@ use sharing::manager::TransferManager;
 use storage::config::AppConfig;
 use storage::database::Database;
 
+#[cfg(target_os = "windows")]
+fn repair_legacy_data_acls(data_dir: &std::path::Path) {
+    const REPAIR_MARKER: &str = ".acl-repair-v2";
+    let marker = data_dir.join(REPAIR_MARKER);
+    if marker.exists() {
+        return;
+    }
+
+    let mut complete = true;
+    if let Err(error) = security::restrict_file_permissions_checked(data_dir) {
+        eprintln!(
+            "Failed to repair Ember data directory ACL at {}: {error}",
+            data_dir.display()
+        );
+        complete = false;
+    }
+
+    match std::fs::read_dir(data_dir) {
+        Ok(entries) => {
+            let mut count = 0usize;
+            for entry in entries.flatten() {
+                if entry.file_name() == REPAIR_MARKER {
+                    continue;
+                }
+                count += 1;
+                if count > 4096 {
+                    eprintln!("Ember data ACL repair stopped at its safety limit");
+                    complete = false;
+                    break;
+                }
+                if let Err(error) = security::restrict_file_permissions_checked(&entry.path()) {
+                    eprintln!(
+                        "Failed to repair ACL for {}: {error}",
+                        entry.path().display()
+                    );
+                    complete = false;
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!(
+                "Failed to enumerate Ember data for ACL repair at {}: {error}",
+                data_dir.display()
+            );
+            complete = false;
+        }
+    }
+
+    if complete {
+        if let Err(error) = security::atomic_write(&marker, b"2\n", true) {
+            eprintln!("Failed to persist Ember ACL repair marker: {error}");
+        }
+    }
+}
+
 async fn reconcile_shared_files(network_tx: &mpsc::Sender<network::NetworkCommand>) -> bool {
     let (tx, rx) = tokio::sync::oneshot::channel();
     if tokio::time::timeout(
@@ -89,26 +144,75 @@ pub fn run() {
     // initializer). We don't care about that case, hence `let _ =`.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let log_dir = storage::paths::resolve_data_dir();
-    let _ = std::fs::create_dir_all(&log_dir);
-    security::cleanup_old_logs(&log_dir, 7);
-    let file_appender = tracing_appender::rolling::daily(&log_dir, "ember.log");
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+    let data_dir = storage::paths::resolve_data_dir();
+    let _ = std::fs::create_dir_all(&data_dir);
+    #[cfg(target_os = "windows")]
+    repair_legacy_data_acls(&data_dir);
 
+    let log_dir = data_dir.join("logs");
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let verbose_diagnostics = std::env::var("EMBER_VERBOSE_DIAGNOSTICS")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    // Logs now live in their own directory so a stale/locked file can never
+    // block access to the rest of the application data directory.
+    security::cleanup_old_logs(&data_dir, 7);
+
+    let file_logging = match std::fs::create_dir_all(&log_dir) {
+        Ok(()) => {
+            #[cfg(target_os = "windows")]
+            if let Err(error) = security::restrict_file_permissions_checked(&log_dir) {
+                eprintln!("Failed to restrict Ember log directory ACL: {error}");
+            }
+
+            security::cleanup_old_logs(&log_dir, 7);
+            if let Ok(entries) = std::fs::read_dir(&log_dir) {
+                for entry in entries.flatten() {
+                    if entry.file_name().to_string_lossy().starts_with("ember.log") {
+                        let _ = security::restrict_file_permissions_checked(&entry.path());
+                    }
+                }
+            }
+
+            tracing_appender::rolling::RollingFileAppender::builder()
+                .rotation(tracing_appender::rolling::Rotation::DAILY)
+                .filename_prefix("ember.log")
+                .build(&log_dir)
+                .map(|appender| tracing_appender::non_blocking(appender))
+                .map_err(|error| error.to_string())
+        }
+        Err(error) => Err(error.to_string()),
+    };
+    let (file_writer, log_guard) = match file_logging {
+        Ok((writer, guard)) => (Some(writer), Some(guard)),
+        Err(error) => {
+            eprintln!(
+                "File logging is unavailable at {}: {error}; continuing with console logging",
+                log_dir.display()
+            );
+            (None, None)
+        }
+    };
+    let file_layer = file_writer.map(|writer| {
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(security::logging::PrivacyMakeWriter::new(
+                writer,
+                verbose_diagnostics,
+            ))
+    });
 
     tracing_subscriber::registry()
         .with(env_filter)
-        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_ansi(false)
-                .with_writer(non_blocking),
-        )
+        .with(tracing_subscriber::fmt::layer().with_writer(
+            security::logging::PrivacyMakeWriter::new(std::io::stdout, verbose_diagnostics),
+        ))
+        .with(file_layer)
         .init();
 
     // Keep the guard alive for the entire app lifetime
-    let _log_guard = _guard;
+    let _log_guard = log_guard;
 
     // Multi-instance harness path: when `EMBER_DATA_DIR` is set, every
     // launched process is meant to be an *isolated* node (own config,
@@ -165,6 +269,7 @@ pub fn run() {
         },
     );
     builder
+        .manage(commands::updater::UpdaterService::default())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
@@ -236,6 +341,27 @@ pub fn run() {
                 e
             })?;
             let settings = config.settings.clone();
+            let data_dir = storage::paths::resolve_data_dir_with_app(&app_handle);
+            std::fs::create_dir_all(&data_dir)?;
+            if !settings.download_folder.is_empty() {
+                std::fs::create_dir_all(
+                    std::path::PathBuf::from(&settings.download_folder).join("Downloads"),
+                )?;
+                std::fs::create_dir_all(
+                    std::path::PathBuf::from(&settings.download_folder).join("Temp"),
+                )?;
+            }
+            let mut configured_roots = settings.shared_folders.clone();
+            if !settings.download_folder.is_empty() {
+                configured_roots.push(settings.download_folder.clone());
+            }
+            let approved_roots = security::filesystem::initialize_approved_roots(
+                &data_dir,
+                &configured_roots,
+            )
+            .map_err(|error| anyhow::anyhow!("Failed to load approved filesystem roots: {error}"))?;
+            storage::share_intent::initialize(&data_dir)
+                .map_err(|error| anyhow::anyhow!("Failed to load durable share intent: {error}"))?;
             // Load the persistent identity once before commands or the network
             // task can run. Re-reading/creating it independently at several
             // call sites allowed concurrent first-run callers to generate
@@ -253,6 +379,31 @@ pub fn run() {
             // user once the webview has mounted (the file is preserved as a .bak).
             let corrupt_backup = config.corrupt_backup.clone();
             let db_corrupt_backup = db.corrupt_backup.clone();
+            let mut policy_failures = Vec::new();
+            if db_corrupt_backup.is_some() {
+                policy_failures.push(
+                    "The policy database was corrupt and was replaced; prior bans cannot be trusted"
+                        .to_string(),
+                );
+            }
+            if let Err(error) = db.validate_security_policy() {
+                policy_failures.push(format!("Persisted ban policy could not be validated: {error}"));
+            }
+            if let Err(error) =
+                network::ember::reputation::ReputationManager::load_checked(
+                    &data_dir.join("reputation.json"),
+                )
+            {
+                policy_failures.push(error);
+            }
+            let security_policy = Arc::new(if policy_failures.is_empty() {
+                security::policy::SecurityPolicyGate::ready(data_dir.clone())
+            } else {
+                security::policy::SecurityPolicyGate::blocked(
+                    data_dir.clone(),
+                    policy_failures.join("; "),
+                )
+            });
 
             // Honour the "launch maximized" preference. The window is
             // created at its configured size (per `tauri.conf.json`); we
@@ -366,12 +517,15 @@ pub fn run() {
             app.manage(AppState {
                 network_tx,
                 db: db.clone(),
+                approved_roots: approved_roots.clone(),
+                security_policy: security_policy.clone(),
                 identity: identity.clone(),
                 config: Arc::new(RwLock::new(config)),
                 settings_save_lock: Arc::new(tokio::sync::Mutex::new(())),
                 local_index: local_index.clone(),
                 bandwidth_limiter: bandwidth_limiter.clone(),
                 transfer_manager: transfer_manager.clone(),
+                download_admission: Arc::new(tokio::sync::Mutex::new(())),
                 shutdown_complete,
                 bw_shutdown: bw_shutdown.clone(),
                 scanning_count: scanning_count.clone(),
@@ -419,6 +573,14 @@ pub fn run() {
                         "db-corrupt-recovered",
                         serde_json::json!({ "backup_path": bak.to_string_lossy().to_string() }),
                     );
+                });
+            }
+            if !security_policy.is_loaded() {
+                let emit_handle = app_handle.clone();
+                let status = security_policy.status();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    let _ = emit_handle.emit("security-policy-reset-required", status);
                 });
             }
 
@@ -611,7 +773,10 @@ pub fn run() {
                         // and re-shared files the user had explicitly
                         // unshared.
                         file.priority = storage::known_files::priority_u8_to_str(record.upload_priority).to_string();
-                        file.shared = record.is_shared;
+                        file.shared = storage::share_intent::effective_shared(
+                            &record.file_hash,
+                            record.is_shared,
+                        );
                         file.alltime_requests = record.all_time_requested;
                         file.alltime_accepted = record.all_time_accepted;
                         file.alltime_transferred = record.all_time_transferred;
@@ -758,6 +923,17 @@ pub fn run() {
                             updated.ember_file_hash = ember_file_hash;
                             updated.size = hashed_size;
                             updated.modified_at = hashed_modified_at;
+                            if let Ok(bytes) = hex::decode(&updated.hash) {
+                                if bytes.len() == 16 {
+                                    let mut hash = [0u8; 16];
+                                    hash.copy_from_slice(&bytes);
+                                    updated.shared =
+                                        storage::share_intent::effective_shared(
+                                            &hash,
+                                            updated.shared,
+                                        );
+                                }
+                            }
                             let still_shared = {
                                 let state = startup_app.state::<AppState>();
                                 let cfg = state.config.read().await;
@@ -936,6 +1112,7 @@ pub fn run() {
             let bw_uss_flag = uss_enabled_flag.clone();
             let net_spam = spam_filter.clone();
             let net_identity = identity.clone();
+            let net_security_policy = security_policy.clone();
             let net_handle_err = app_handle.clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = network::start_network(
@@ -943,6 +1120,7 @@ pub fn run() {
                     network_rx,
                     settings,
                     net_identity,
+                    net_security_policy,
                     net_index,
                     net_fresh_part_hashes,
                     net_db,
@@ -1005,6 +1183,7 @@ pub fn run() {
             commands::transfers::pause_transfers_batch,
             commands::transfers::resume_transfers_batch,
             commands::transfers::stop_transfers_batch,
+            commands::transfers::take_pending_download_overflow_notice,
             commands::transfers::cancel_transfers_batch,
             commands::transfers::pause_transfer,
             commands::transfers::resume_transfer,
@@ -1024,7 +1203,7 @@ pub fn run() {
             commands::transfers::open_file,
             commands::transfers::open_transfer_file_location,
             commands::transfers::recover_archive,
-            commands::sharing::add_shared_folder,
+            commands::sharing::pick_shared_folder,
             commands::sharing::remove_shared_folder,
             commands::sharing::get_shared_files,
             commands::sharing::get_shared_file_count,
@@ -1106,6 +1285,8 @@ pub fn run() {
             commands::settings::set_close_behavior,
             commands::settings::take_pending_close_request,
             commands::settings::open_ember_website,
+            commands::security::get_security_policy_state,
+            commands::security::acknowledge_security_policy_reset,
             commands::security::get_ip_filter_stats,
             commands::security::add_ip_filter_range,
             commands::security::remove_ip_filter_range,
@@ -1138,7 +1319,10 @@ pub fn run() {
             commands::deeplink::take_pending_deep_links,
             commands::deeplink::list_pending_deep_links,
             commands::deeplink::ack_pending_deep_link,
+            commands::deeplink::preview_deep_link,
             commands::deeplink::open_collection_file,
+            commands::updater::secure_updater_check,
+            commands::updater::secure_updater_install,
         ])
         .on_window_event(|window, event| {
             // Title-bar X handler. Decides whether to fully exit, hide to
@@ -1258,7 +1442,10 @@ pub fn run() {
                     const SHUTDOWN_SEND_WAIT: std::time::Duration =
                         std::time::Duration::from_secs(2);
                     let start = std::time::Instant::now();
-                    let mut command = network::NetworkCommand::Shutdown;
+                    let shutdown_deadline = start + SHUTDOWN_WAIT;
+                    let mut command = network::NetworkCommand::Shutdown {
+                        deadline: tokio::time::Instant::from_std(shutdown_deadline),
+                    };
                     let shutdown_sent = loop {
                         match tx.try_send(command) {
                             Ok(()) => {
@@ -1299,7 +1486,13 @@ pub fn run() {
                         }
                         std::thread::sleep(std::time::Duration::from_millis(200));
                     }
-                    info!("Network shutdown complete");
+                    if flag.load(std::sync::atomic::Ordering::Acquire) {
+                        info!("Network shutdown complete");
+                    } else {
+                        tracing::error!(
+                            "Shutdown deadline reached before authoritative network writers completed; result is truncated"
+                        );
+                    }
 
                     // Wait for in-flight discovery/hash workers to finish or
                     // abort after a short grace window. Prevents scans from
@@ -1310,8 +1503,7 @@ pub fn run() {
                         let bg = state.background_scans.clone();
                         let rt = tauri::async_runtime::handle();
                         rt.block_on(async move {
-                            let deadline = std::time::Instant::now()
-                                + std::time::Duration::from_secs(5);
+                            let deadline = shutdown_deadline;
                             while scanning.load(std::sync::atomic::Ordering::Relaxed) > 0
                                 && std::time::Instant::now() < deadline
                             {
@@ -1338,8 +1530,8 @@ pub fn run() {
                         let rt = tauri::async_runtime::handle();
                         let spam = state.spam_filter.clone();
                         rt.block_on(async move {
-                            match tokio::time::timeout(
-                                std::time::Duration::from_secs(2),
+                            match tokio::time::timeout_at(
+                                tokio::time::Instant::from_std(shutdown_deadline),
                                 spam.write(),
                             )
                             .await

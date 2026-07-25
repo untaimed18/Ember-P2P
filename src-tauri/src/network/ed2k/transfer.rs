@@ -24,9 +24,6 @@ use super::sources::SourceManager;
 
 const READ_TIMEOUT_SECS: u64 = super::dead_sources::DOWNLOADTIMEOUT_SECS as u64;
 
-/// Maximum decompressed part size (PARTSIZE + margin = 10 MiB)
-const MAX_DECOMPRESSED_PART: usize = 10 * 1024 * 1024;
-
 /// Maximum accepted on-wire ed2k packet length for a download connection.
 /// The largest legitimate single packet is a file's hashset (16 bytes/part:
 /// ~1.7 MiB even for a 1 TB file) or one ~180 KiB block, so 2 MiB is a wide
@@ -74,10 +71,195 @@ pub(crate) fn epx_result_to_entries(
     (entries, aich_roots)
 }
 
-#[derive(Debug)]
+const MAX_DECOMPRESSED_COMPRESSED_PART: usize = 10 * 1024 * 1024;
+const MAX_PENDING_COMPRESSED_BLOCKS: usize = 16;
+const MAX_PENDING_COMPRESSED_BYTES: usize = 4 * 1024 * 1024;
+
 struct PendingCompressedBlock {
-    compressed_total_size: u32,
-    compressed: Vec<u8>,
+    declared_total: usize,
+    bytes: Vec<u8>,
+}
+
+/// Shared bounded reassembly used by both download paths. Declared lengths
+/// never drive allocation; only bytes actually received do.
+#[derive(Default)]
+pub(super) struct CompressedPartAccumulator {
+    pending: HashMap<u64, PendingCompressedBlock>,
+    pending_bytes: usize,
+}
+
+impl CompressedPartAccumulator {
+    pub(super) fn append(
+        &mut self,
+        start: u64,
+        requested_end: Option<u64>,
+        declared_total: u32,
+        chunk: &[u8],
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let requested_end =
+            requested_end.ok_or_else(|| anyhow::anyhow!("unsolicited compressed part start"))?;
+        let expected_len = requested_end
+            .checked_sub(start)
+            .filter(|len| *len > 0)
+            .ok_or_else(|| anyhow::anyhow!("invalid outstanding compressed-part range"))?
+            as usize;
+        if expected_len > MAX_DECOMPRESSED_COMPRESSED_PART {
+            anyhow::bail!("outstanding compressed-part range exceeds limit");
+        }
+        let declared_total = declared_total as usize;
+        let max_packed = expected_len
+            .saturating_add(expected_len / 10)
+            .saturating_add(1024)
+            .min(MAX_DECOMPRESSED_COMPRESSED_PART);
+        if declared_total == 0 || declared_total > max_packed {
+            anyhow::bail!("compressed part declared size outside requested-range budget");
+        }
+        if chunk.is_empty() {
+            anyhow::bail!("compressed part carried an empty fragment");
+        }
+        if !self.pending.contains_key(&start) && self.pending.len() >= MAX_PENDING_COMPRESSED_BLOCKS
+        {
+            anyhow::bail!("too many concurrent compressed parts");
+        }
+        let existing_len = self
+            .pending
+            .get(&start)
+            .map(|entry| {
+                if entry.declared_total != declared_total {
+                    Err(anyhow::anyhow!(
+                        "compressed part changed declared packed size"
+                    ))
+                } else {
+                    Ok(entry.bytes.len())
+                }
+            })
+            .transpose()?
+            .unwrap_or(0);
+        if chunk.len() > declared_total.saturating_sub(existing_len) {
+            self.remove(start);
+            anyhow::bail!("compressed part fragments exceed declared packed size");
+        }
+        if self.pending_bytes.saturating_add(chunk.len()) > MAX_PENDING_COMPRESSED_BYTES {
+            anyhow::bail!("aggregate compressed-part reassembly budget exhausted");
+        }
+
+        let entry = self
+            .pending
+            .entry(start)
+            .or_insert_with(|| PendingCompressedBlock {
+                declared_total,
+                bytes: Vec::new(),
+            });
+        entry
+            .bytes
+            .try_reserve(chunk.len())
+            .map_err(|_| anyhow::anyhow!("compressed-part allocation failed"))?;
+        entry.bytes.extend_from_slice(chunk);
+        self.pending_bytes += chunk.len();
+        if entry.bytes.len() < declared_total {
+            return Ok(None);
+        }
+
+        let packed = self
+            .pending
+            .remove(&start)
+            .expect("completed compressed block remains present")
+            .bytes;
+        self.pending_bytes = self.pending_bytes.saturating_sub(packed.len());
+        let decompressed = decompress_compressed_part_bounded(&packed, expected_len)?;
+        if decompressed.is_empty() || decompressed.len() > expected_len {
+            anyhow::bail!("decompressed part is outside its requested range");
+        }
+        Ok(Some(decompressed))
+    }
+
+    fn remove(&mut self, start: u64) {
+        if let Some(entry) = self.pending.remove(&start) {
+            self.pending_bytes = self.pending_bytes.saturating_sub(entry.bytes.len());
+        }
+    }
+}
+
+fn decompress_compressed_part_bounded(compressed: &[u8], limit: usize) -> anyhow::Result<Vec<u8>> {
+    fn decode<R: std::io::Read>(mut decoder: R, limit: usize) -> anyhow::Result<Vec<u8>> {
+        let mut output = Vec::new();
+        let mut buffer = [0u8; 8192];
+        loop {
+            let read = decoder.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            if output.len().saturating_add(read) > limit {
+                anyhow::bail!("decompressed part exceeds requested range");
+            }
+            output.extend_from_slice(&buffer[..read]);
+        }
+        Ok(output)
+    }
+
+    decode(ZlibDecoder::new(compressed), limit)
+        .or_else(|_| decode(DeflateDecoder::new(compressed), limit))
+}
+
+#[cfg(test)]
+mod compressed_part_bounds_tests {
+    use super::*;
+    use flate2::{write::ZlibEncoder, Compression};
+    use std::io::Write;
+
+    fn packed(data: &[u8]) -> Vec<u8> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn fragmented_emule_compressed_part_round_trips() {
+        let plain = vec![0x5a; 180 * 1024];
+        let packed = packed(&plain);
+        let split = packed.len() / 2;
+        let mut accumulator = CompressedPartAccumulator::default();
+        assert!(accumulator
+            .append(
+                100,
+                Some(100 + plain.len() as u64),
+                packed.len() as u32,
+                &packed[..split],
+            )
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            accumulator
+                .append(
+                    100,
+                    Some(100 + plain.len() as u64),
+                    packed.len() as u32,
+                    &packed[split..],
+                )
+                .unwrap()
+                .unwrap(),
+            plain
+        );
+        assert_eq!(accumulator.pending_bytes, 0);
+    }
+
+    #[test]
+    fn rejects_unsolicited_or_overrun_compressed_parts() {
+        let mut accumulator = CompressedPartAccumulator::default();
+        assert!(accumulator.append(10, None, 10, b"abc").is_err());
+        assert!(accumulator.append(10, Some(20), 2, b"abc").is_err());
+        assert_eq!(accumulator.pending_bytes, 0);
+    }
+
+    #[test]
+    fn declared_total_does_not_preallocate() {
+        let mut accumulator = CompressedPartAccumulator::default();
+        accumulator
+            .append(0, Some(1024 * 1024), 1024 * 1024, b"x")
+            .unwrap();
+        assert!(accumulator.pending[&0].bytes.capacity() < 4096);
+        assert_eq!(accumulator.pending_bytes, 1);
+    }
 }
 
 pub struct Ed2kDownload {
@@ -133,6 +315,8 @@ pub struct Ed2kDownload {
     /// Trusted AICH master from EPX / `aich_cache` when known before any
     /// peer HashSet2 arrives. Seeded so recovery does not wait on the wire.
     pub trusted_aich_master: Option<[u8; 20]>,
+    /// Explicit AICH pin from the selected link/collection.
+    pub expected_aich_master: Option<[u8; 20]>,
     /// GeoIP reader for country code lookups
     pub geoip: crate::geoip::GeoIpReader,
     /// Expected Ember content BLAKE3 (slice 18). All-zero skips verify.
@@ -235,19 +419,9 @@ pub enum DownloadEvent {
         ip: std::net::Ipv4Addr,
         tcp_port: u16,
     },
-    /// Incoming friend request from an Ember peer.
-    ///
-    /// `verified` reflects the strongest identity claim that could be
-    /// established by the time the request was emitted:
-    ///   - `true` iff the peer advertised an Ed25519 public key whose
-    ///     BLAKE3 prefix matches their advertised `ember_hash` (the
-    ///     cheap offline identity-binding check in
-    ///     `crate::network::ember::crypto::verify_ember_hash_binding`).
-    ///     On paths that run `friend_connect::perform_ember_auth` this
-    ///     additionally implies signature-based proof of possession.
-    ///   - `false` when no public key was advertised, or the key was
-    ///     present but the binding check failed (mismatches are dropped
-    ///     before reaching this event in the emit paths).
+    /// Legacy parser-only friend request. The network dispatcher drops this
+    /// variant; secure v2 requests arrive as `UploadEventKind` instead.
+    #[allow(dead_code)]
     EmberFriendRequest {
         ember_hash: [u8; 16],
         nickname: String,
@@ -261,7 +435,8 @@ pub enum DownloadEvent {
         ip: std::net::IpAddr,
         port: u16,
     },
-    /// Incoming Ember chat message from a friend on a download connection.
+    /// Legacy parser-only chat event. Generic download chat is dropped.
+    #[allow(dead_code)]
     EmberChatMessage {
         ember_hash: [u8; 16],
         message: String,
@@ -670,6 +845,17 @@ impl Ed2kDownload {
         let _ = event_tx.try_send(DownloadEvent::Verifying {
             transfer_id: self.transfer_id.clone(),
         });
+        if let Some(expected_aich) = self.expected_aich_master {
+            use sha1::Digest;
+            let actual: [u8; 20] = sha1::Sha1::digest([]).into();
+            if actual != expected_aich {
+                anyhow::bail!(
+                    "Expected AICH hash mismatch: expected {}, got {}",
+                    hex::encode(expected_aich),
+                    hex::encode(actual)
+                );
+            }
+        }
         let final_path = finalize_zero_ed2k_file(
             &self.transfer_id,
             &self.file_name,
@@ -1399,7 +1585,7 @@ impl Ed2kDownload {
                         }
                     }
                 }
-                (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) => {
+                (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) if super::LEGACY_FRIEND_AUTH_ENABLED => {
                     if let Some(eh) = peer_ember_hash {
                         let nick = std::str::from_utf8(&pl).unwrap_or("").to_string();
                         // `verified` requires PoP (Ed25519 challenge-
@@ -1543,7 +1729,12 @@ impl Ed2kDownload {
                         // `ember_auth_verified = false` so
                         // `DownloadEvent::EmberFriendRequest.verified`
                         // falls back to the binding-only signal.
-                        if !ember_auth_verified && ember_hash_binding_verified {
+                        // Legacy PoP is parser-only in v2.  Never sign a
+                        // peer-selected nonce on a generic transfer stream.
+                        if super::LEGACY_FRIEND_AUTH_ENABLED
+                            && !ember_auth_verified
+                            && ember_hash_binding_verified
+                        {
                             if let (Some(peer_pk), Some(peer_eh)) =
                                 (peer_ember_pubkey, peer_ember_hash)
                             {
@@ -1572,8 +1763,7 @@ impl Ed2kDownload {
                                         // was previously emitted
                                         // unconditionally on `is_ember`).
                                         if !mesh_discovered_emitted {
-                                            if let std::net::IpAddr::V4(v4) =
-                                                self.source_addr.ip()
+                                            if let std::net::IpAddr::V4(v4) = self.source_addr.ip()
                                             {
                                                 let peer_tcp = self.source_addr.port();
                                                 if peer_tcp > 0
@@ -1734,7 +1924,6 @@ impl Ed2kDownload {
                 false
             };
         // Friend request deferred until PoP (membership oracle otherwise).
-        let is_ember_friend = peer_is_ember && peer_is_friend;
 
         // Send file request in eMule order:
         // 1) OP_REQUESTFILENAME
@@ -2095,7 +2284,9 @@ impl Ed2kDownload {
                         }
                     }
                 }
-                (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) if peer_is_ember => {
+                (OP_EMULEPROT, OP_EMBER_FRIEND_REQ)
+                    if super::LEGACY_FRIEND_AUTH_ENABLED && peer_is_ember =>
+                {
                     if let Some(eh) = peer_ember_hash {
                         let nick = std::str::from_utf8(&payload).unwrap_or("").to_string();
                         // Prefer the full PoP signal over the
@@ -2201,7 +2392,12 @@ impl Ed2kDownload {
                         // loop. Same buffering rationale: captured
                         // non-AUTH frames are drained on subsequent
                         // iterations of this file-status-wait loop.
-                        if !ember_auth_verified && ember_hash_binding_verified {
+                        // Secure friend-stream v2 is the only live friend
+                        // authenticator; generic eD2K must not expose v1 PoP.
+                        if super::LEGACY_FRIEND_AUTH_ENABLED
+                            && !ember_auth_verified
+                            && ember_hash_binding_verified
+                        {
                             if let (Some(peer_pk), Some(peer_eh)) =
                                 (peer_ember_pubkey, peer_ember_hash)
                             {
@@ -2230,8 +2426,7 @@ impl Ed2kDownload {
                                         // normally emitted right after
                                         // the initial handshake).
                                         if !mesh_discovered_emitted {
-                                            if let std::net::IpAddr::V4(v4) =
-                                                self.source_addr.ip()
+                                            if let std::net::IpAddr::V4(v4) = self.source_addr.ip()
                                             {
                                                 let peer_tcp = self.source_addr.port();
                                                 if peer_tcp > 0
@@ -2317,24 +2512,9 @@ impl Ed2kDownload {
                     }
                 }
                 (OP_EMULEPROT, OP_EMBER_CHAT_MSG)
-                    if is_ember_friend
-                        && ember_auth_verified
-                        && payload.len() <= crate::network::ember::crypto::MAX_CHAT_WIRE_LEN =>
-                {
-                    if let (Some(eh), Some(pk)) = (peer_ember_hash, peer_ember_pubkey) {
-                        if let Some(msg) = crate::network::ember::crypto::decrypt_chat_payload(
-                            &self.ed25519_secret_key,
-                            &pk,
-                            &payload,
-                        ) {
-                            let _ = event_tx
-                                .send(DownloadEvent::EmberChatMessage {
-                                    ember_hash: eh,
-                                    message: msg,
-                                })
-                                .await;
-                        }
-                    }
+                | (OP_EMULEPROT, OP_EMBER_BROWSE_REQ)
+                | (OP_EMULEPROT, OP_EMBER_BROWSE_RES) => {
+                    debug!("Dropping friend-only opcode on generic eD2K transfer");
                 }
                 _ => {
                     debug!("Ignoring packet proto=0x{proto:02X} op=0x{opcode:02X}");
@@ -3118,7 +3298,7 @@ impl Ed2kDownload {
                 // Track how many blocks received per request for pipeline refill
                 let mut blocks_received_in_current_req: usize = 0;
                 let mut completed_reqs: usize = 0;
-                let mut pending_compressed: HashMap<u64, PendingCompressedBlock> = HashMap::new();
+                let mut pending_compressed = CompressedPartAccumulator::default();
                 let data_loop_start = std::time::Instant::now();
                 let mut got_any_data = false;
                 const INITIAL_DATA_TIMEOUT_SECS: u64 = 60;
@@ -3426,9 +3606,14 @@ impl Ed2kDownload {
                                 );
                             }
 
-                            let Some(decompressed) = append_compressed_chunk(
-                                &mut pending_compressed,
+                            let requested_end = batches.iter().take(sent_idx).flatten().find_map(
+                                |(requested_start, requested_end)| {
+                                    (*requested_start == start).then_some(*requested_end)
+                                },
+                            );
+                            let Some(decompressed) = pending_compressed.append(
                                 start,
+                                requested_end,
                                 compressed_total_size,
                                 compressed,
                             )?
@@ -3758,7 +3943,9 @@ impl Ed2kDownload {
                                 }
                             }
                         }
-                        (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) if peer_is_ember => {
+                        (OP_EMULEPROT, OP_EMBER_FRIEND_REQ)
+                            if super::LEGACY_FRIEND_AUTH_ENABLED && peer_is_ember =>
+                        {
                             if let Some(eh) = peer_ember_hash {
                                 let nick = std::str::from_utf8(&payload).unwrap_or("").to_string();
                                 // By the time we reach the data loop
@@ -3858,24 +4045,9 @@ impl Ed2kDownload {
                             }
                         }
                         (OP_EMULEPROT, OP_EMBER_CHAT_MSG)
-                            if is_ember_friend
-                                && ember_auth_verified
-                                && payload.len() <= crate::network::ember::crypto::MAX_CHAT_WIRE_LEN =>
-                        {
-                            if let (Some(eh), Some(pk)) = (peer_ember_hash, peer_ember_pubkey) {
-                                if let Some(msg) = crate::network::ember::crypto::decrypt_chat_payload(
-                                    &self.ed25519_secret_key,
-                                    &pk,
-                                    &payload,
-                                ) {
-                                    let _ = event_tx
-                                        .send(DownloadEvent::EmberChatMessage {
-                                            ember_hash: eh,
-                                            message: msg,
-                                        })
-                                        .await;
-                                }
-                            }
+                        | (OP_EMULEPROT, OP_EMBER_BROWSE_REQ)
+                        | (OP_EMULEPROT, OP_EMBER_BROWSE_RES) => {
+                            debug!("Dropping friend-only opcode on generic eD2K transfer");
                         }
                         _ => {
                             debug!(
@@ -4321,6 +4493,22 @@ impl Ed2kDownload {
                 "Final hash verification failed — .part and .part.met preserved for retry"
             );
         }
+        if let Some(expected_aich) = self.expected_aich_master {
+            let aich_path = part_path.clone();
+            let actual = tokio::task::spawn_blocking(move || {
+                super::aich::AICHRecoveryHashSet::build_from_file(&aich_path)
+                    .map(|set| set.root_hash)
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("AICH verification task failed: {error}"))??;
+            if actual != expected_aich {
+                anyhow::bail!(
+                    "Expected AICH hash mismatch: expected {}, got {}",
+                    hex::encode(expected_aich),
+                    hex::encode(actual)
+                );
+            }
+        }
 
         // Verification passed — safe to move file and clean up resume state.
         // Flip every part's verified flag (covers single-part < PARTSIZE
@@ -4330,9 +4518,11 @@ impl Ed2kDownload {
         {
             let pp = part_path.clone();
             let fp = final_path.clone();
-            let actual_final = tokio::task::spawn_blocking(move || move_part_to_final(&pp, &fp))
-                .await
-                .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
+            let root = self.download_dir.clone();
+            let actual_final =
+                tokio::task::spawn_blocking(move || move_part_to_final_approved(&pp, &fp, &root))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
             *completed_path_out = Some(actual_final.to_string_lossy().into_owned());
         }
         tracker.delete_met();
@@ -4342,69 +4532,6 @@ impl Ed2kDownload {
 
     async fn acquire_download_bandwidth(&self, bytes: u64) {
         self.bandwidth_limiter.acquire_download(bytes).await;
-    }
-}
-
-/// Per-connection cap on concurrent in-flight compressed blocks. Mirrors
-/// the `multi_source.rs` constant and defends against a hostile peer
-/// opening many distinct `start` offsets to multiply our buffer memory.
-const MAX_PENDING_COMPRESSED_BLOCKS: usize = 16;
-
-fn append_compressed_chunk(
-    pending: &mut HashMap<u64, PendingCompressedBlock>,
-    start: u64,
-    total_packed_size: u32,
-    chunk: &[u8],
-) -> anyhow::Result<Option<Vec<u8>>> {
-    let total_packed = total_packed_size as usize;
-    if total_packed == 0 {
-        anyhow::bail!("compressed part advertised zero packed size");
-    }
-    if total_packed > MAX_DECOMPRESSED_PART {
-        anyhow::bail!("packed size {total_packed} exceeds limit");
-    }
-    if !pending.contains_key(&start) && pending.len() >= MAX_PENDING_COMPRESSED_BLOCKS {
-        anyhow::bail!(
-            "too many concurrent compressed blocks from peer ({} open, max {})",
-            pending.len(),
-            MAX_PENDING_COMPRESSED_BLOCKS
-        );
-    }
-    let entry = pending
-        .entry(start)
-        .or_insert_with(|| PendingCompressedBlock {
-            compressed_total_size: total_packed_size,
-            compressed: Vec::with_capacity(total_packed),
-        });
-    if entry.compressed_total_size != total_packed_size {
-        let old_size = entry.compressed_total_size;
-        let _ = entry;
-        pending.remove(&start);
-        anyhow::bail!(
-            "compressed block at start={start}: size changed from {old_size} to {total_packed_size}",
-        );
-    }
-    entry.compressed.extend_from_slice(chunk);
-    let accumulated = entry.compressed.len();
-    let max_compressed = total_packed + total_packed / 10 + 1024;
-    if accumulated > max_compressed {
-        pending.remove(&start);
-        anyhow::bail!(
-            "accumulated compressed data ({accumulated}) exceeds safety limit ({max_compressed}) for start={start}",
-        );
-    }
-    if accumulated >= total_packed {
-        // Decompress exactly the declared packed size. The accumulation cap
-        // above tolerates a little over-run before bailing, but feeding those
-        // trailing padding bytes to the zlib stream can yield a wrong
-        // decompressed length (and a mis-sized .part write). eMule sends
-        // exactly `total_packed` compressed bytes per block.
-        let data = &entry.compressed[..total_packed];
-        let decompressed = decompress_ed2k_part(data)?;
-        pending.remove(&start);
-        Ok(Some(decompressed))
-    } else {
-        Ok(None)
     }
 }
 
@@ -4469,56 +4596,6 @@ fn outstanding_requests_for_speed_with_remaining(
     ((blocks + 2) / 3).max(1)
 }
 
-fn decompress_ed2k_part(compressed: &[u8]) -> anyhow::Result<Vec<u8>> {
-    use std::io::Read;
-    let zlib_result: anyhow::Result<Vec<u8>> = (|| {
-        let mut decoder = ZlibDecoder::new(compressed);
-        let mut out = Vec::new();
-        let mut buf = [0u8; 8192];
-        loop {
-            let n = decoder.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            out.extend_from_slice(&buf[..n]);
-            if out.len() > MAX_DECOMPRESSED_PART {
-                anyhow::bail!("decompressed part exceeds size limit");
-            }
-        }
-        Ok(out)
-    })();
-    if let Ok(data) = zlib_result {
-        return Ok(data);
-    }
-    let deflate_result: anyhow::Result<Vec<u8>> = (|| {
-        let mut decoder = DeflateDecoder::new(compressed);
-        let mut out = Vec::new();
-        let mut buf = [0u8; 8192];
-        loop {
-            let n = decoder.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            out.extend_from_slice(&buf[..n]);
-            if out.len() > MAX_DECOMPRESSED_PART {
-                anyhow::bail!("decompressed part exceeds size limit");
-            }
-        }
-        Ok(out)
-    })();
-    if let Ok(data) = deflate_result {
-        return Ok(data);
-    }
-    tracing::debug!(
-        "decompress failed: len={}, first_bytes={:02X?}, zlib_err={}, deflate_err={}",
-        compressed.len(),
-        &compressed[..compressed.len().min(16)],
-        zlib_result.as_ref().unwrap_err(),
-        deflate_result.as_ref().unwrap_err(),
-    );
-    Err(zlib_result.unwrap_err())
-}
-
 /// Writes an empty `.part`, verifies ed2k hash ([`super::hash::empty_ed2k_file_md4`]), moves to Downloads.
 pub(super) async fn finalize_zero_ed2k_file(
     transfer_id: &str,
@@ -4539,9 +4616,22 @@ pub(super) async fn finalize_zero_ed2k_file(
     let safe_name = crate::security::sanitize_filename(file_name);
     let part_path = temp_dir.join(format!("{transfer_id}.part"));
     let final_path = completed_dir.join(&safe_name);
-    let _ = tokio::fs::remove_file(&part_path).await;
-    let _ = tokio::fs::remove_file(part_path.with_extension("part.met")).await;
-    tokio::fs::write(&part_path, []).await?;
+    let allowed = vec![download_dir.to_string_lossy().into_owned()];
+    for stale in [&part_path, &part_path.with_extension("part.met")] {
+        if stale.exists() {
+            let verified = crate::security::filesystem::verify_existing_path(stale, &allowed)?;
+            std::fs::remove_file(verified)?;
+        }
+    }
+    {
+        let part = part_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let file = crate::security::filesystem::create_new_nofollow(&part)?;
+            file.sync_all()
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("zero-byte create task failed: {error}"))??;
+    }
     let verify_path = part_path.clone();
     let expected = hex::encode(file_hash);
     let ok = tokio::task::spawn_blocking(move || {
@@ -4554,9 +4644,11 @@ pub(super) async fn finalize_zero_ed2k_file(
     }
     let pp = part_path.clone();
     let fp = final_path.clone();
-    let actual_final = tokio::task::spawn_blocking(move || move_part_to_final(&pp, &fp))
-        .await
-        .map_err(|e| anyhow::anyhow!("rename task: {e}"))??;
+    let root = download_dir.to_path_buf();
+    let actual_final =
+        tokio::task::spawn_blocking(move || move_part_to_final_approved(&pp, &fp, &root))
+            .await
+            .map_err(|e| anyhow::anyhow!("rename task: {e}"))??;
     Ok(actual_final)
 }
 
@@ -4598,6 +4690,21 @@ pub(crate) fn move_part_to_final(
         "Could not allocate a unique completed filename for {}",
         target.display()
     )
+}
+
+/// Approved-root wrapper used by production completion/recovery paths. The
+/// compatibility helper above remains pure for eMule move semantics and unit
+/// tests; this wrapper binds both source and destination to the unchanged
+/// configured download root immediately before the name claim.
+pub(crate) fn move_part_to_final_approved(
+    part_path: &std::path::Path,
+    target: &std::path::Path,
+    download_root: &std::path::Path,
+) -> anyhow::Result<std::path::PathBuf> {
+    let allowed = vec![download_root.to_string_lossy().into_owned()];
+    let verified_part = crate::security::filesystem::verify_existing_path(part_path, &allowed)?;
+    let verified_target = crate::security::filesystem::verify_output_path(target, &allowed)?;
+    move_part_to_final(&verified_part, &verified_target)
 }
 
 fn dedup_candidate(base: &std::path::Path, suffix: u32) -> std::path::PathBuf {

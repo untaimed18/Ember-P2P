@@ -1754,4 +1754,37 @@ mod buddy_hash_wire_tests {
             other => panic!("unexpected message: {other:?}"),
         }
     }
+
+    #[test]
+    fn packed_kad_search_response_round_trips_emule_framing() {
+        let results = (0..150)
+            .map(|index| SearchResultEntry {
+                id: KadId([0x55; 16]),
+                tags: vec![
+                    KadTag {
+                        name: TagName::Id(TAG_FILENAME),
+                        value: TagValue::String(
+                            "normal-emule-result-with-repeated-content.bin".repeat(2),
+                        ),
+                    },
+                    KadTag {
+                        name: TagName::Id(TAG_FILESIZE),
+                        value: TagValue::Uint64(1024 + index),
+                    },
+                ],
+            })
+            .collect();
+        let encoded = encode_packet(&KadMessage::SearchRes {
+            sender_id: KadId([1; 16]),
+            target: KadId([2; 16]),
+            results,
+        })
+        .unwrap();
+        assert_eq!(encoded[0], OP_KADEMLIAPACKEDPROT);
+        assert_eq!(encoded[1], KADEMLIA2_SEARCH_RES);
+        match decode_packet(&encoded).unwrap() {
+            KadMessage::SearchRes { results, .. } => assert_eq!(results.len(), 150),
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
 }

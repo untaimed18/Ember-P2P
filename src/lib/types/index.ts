@@ -102,6 +102,7 @@ export interface Transfer {
   client_software?: string;
   country_code?: string;
   user_hash?: string;
+  expected_aich?: string;
   /** Upload-direction only: hex bitmap of ED2K parts fully served to this
    *  peer during the current session (byte index = part / 8, bit = part % 8,
    *  LSB-first within each byte). Drives the chunked "Up Status" parts bar —

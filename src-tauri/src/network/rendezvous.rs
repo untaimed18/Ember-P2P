@@ -1,5 +1,7 @@
 use std::net::Ipv4Addr;
 
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{Key as ChaChaKey, XChaCha20Poly1305, XNonce};
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
@@ -9,7 +11,7 @@ use tracing::{debug, info, warn};
 // Rendezvous-protocol Ed25519 signing. Mirrors the verification helpers
 // in `rendezvous-server/src/main.rs`. The server pins each id to its
 // pubkey on first `/register` and refuses any later `/register`,
-// `/unregister`, `/punch` POST, or `/punch/{id}` poll that doesn't
+// `/unregister`, or `/v3/punch/*` action that doesn't
 // carry a valid signature for that pinned pubkey — closing the squat
 // attack where an attacker could compute a victim's id (just SHA256
 // of the friend's BLAKE3 hash, both public) and POST a fake address
@@ -20,11 +22,12 @@ use tracing::{debug, info, warn};
 const RDV_DOMAIN: &[u8] = b"ember-rdv-v1";
 const OP_REGISTER: u8 = 0x01;
 const OP_UNREGISTER: u8 = 0x02;
-const OP_RELAY_TICKET_OFFER: u8 = 0x08;
-const OP_RELAY_TICKET_POLL: u8 = 0x09;
-const OP_RELAY_TICKET_ACCEPT: u8 = 0x0a;
-const OP_RELAY_TICKET_STATUS: u8 = 0x0b;
-const OP_RELAY_TICKET_POLL_V3: u8 = 0x0c;
+const OP_RELAY_TICKET_ACCEPT: u8 = 0x09;
+const OP_RELAY_TICKET_STATUS: u8 = 0x0a;
+const OP_CAPABILITY_REGISTER: u8 = 0x0c;
+const OP_CAPABILITY_LOOKUP: u8 = 0x0d;
+const OP_RELAY_MAILBOX_OFFER: u8 = 0x0e;
+const OP_RELAY_MAILBOX_POLL: u8 = 0x0f;
 /// The initiator gives the responder this total window to accept an offered
 /// ticket. The network loop polls frequently enough to leave multiple
 /// attempts inside this period, even when one request reaches its timeout.
@@ -36,20 +39,9 @@ pub(crate) const FRIEND_RELAY_TICKET_POLL_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(1);
 pub(crate) const FRIEND_RELAY_TICKET_ACTION_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(10);
-/// Per-request candidates match the bounded response page because each pair
-/// has at most one live ticket. This prevents dense offer sets from creating
-/// a cursor backlog for any candidate slice.
-pub(crate) const FRIEND_RELAY_TICKET_POLL_CANDIDATES_PER_REQUEST: usize = 16;
-pub(crate) const FRIEND_RELAY_TICKET_PARALLEL_POLL_REQUESTS: usize = 8;
-/// Legacy v2 shares its server's 60/min general budget with initiator status
-/// reads, so one responder poll every ten seconds leaves reliable headroom.
-pub(crate) const FRIEND_RELAY_TICKET_LEGACY_POLL_INTERVAL: std::time::Duration =
-    std::time::Duration::from_secs(10);
-/// Eight 16-candidate requests each second cover this many friends in under
-/// the 45-second initiator wait. Larger lists remain usable for ordinary
-/// discovery, but relay-offer discovery is intentionally capped and logged.
-pub(crate) const FRIEND_RELAY_TICKET_SUPPORTED_FRIENDS: usize = 4_096;
 const RELAY_TICKET_READ_NONCE_DOMAIN: &[u8] = b"ember-relay-ticket-read-nonce-v1\0";
+const RELAY_MAILBOX_ENVELOPE_VERSION: u8 = 1;
+const RELAY_MAILBOX_NONCE_LEN: usize = 24;
 
 pub(crate) fn is_transient_relay_ticket_read_error(error: &str) -> bool {
     [
@@ -63,10 +55,6 @@ pub(crate) fn is_transient_relay_ticket_read_error(error: &str) -> bool {
     ]
     .iter()
     .any(|status| error.contains(status))
-}
-
-pub(crate) fn is_v3_relay_ticket_poll_unsupported(error: &str) -> bool {
-    error == "relay ticket poll v3 unsupported"
 }
 
 fn now_unix_secs() -> i64 {
@@ -163,74 +151,6 @@ fn sign_unregister(secret: &[u8; 32], id_raw: &[u8; 32], ts: i64) -> Signature {
     signing_key_from_secret(secret).sign(&m)
 }
 
-fn build_relay_ticket_offer_msg(
-    initiator_id: &[u8; 32],
-    responder_id: &[u8; 32],
-    purpose: &str,
-    nonce: &[u8; 16],
-    ts: i64,
-) -> Vec<u8> {
-    let purpose_bytes = purpose.as_bytes();
-    let mut m =
-        Vec::with_capacity(RDV_DOMAIN.len() + 1 + 32 + 32 + 1 + purpose_bytes.len() + 16 + 8);
-    m.extend_from_slice(RDV_DOMAIN);
-    m.push(OP_RELAY_TICKET_OFFER);
-    m.extend_from_slice(initiator_id);
-    m.extend_from_slice(responder_id);
-    m.push(purpose_bytes.len() as u8);
-    m.extend_from_slice(purpose_bytes);
-    m.extend_from_slice(nonce);
-    m.extend_from_slice(&ts.to_le_bytes());
-    m
-}
-
-fn build_relay_ticket_poll_v2_msg(responder_id: &[u8; 32], nonce: &[u8; 16], ts: i64) -> Vec<u8> {
-    let mut m = Vec::with_capacity(RDV_DOMAIN.len() + 1 + 32 + 16 + 8);
-    m.extend_from_slice(RDV_DOMAIN);
-    m.push(OP_RELAY_TICKET_POLL);
-    m.extend_from_slice(responder_id);
-    m.extend_from_slice(nonce);
-    m.extend_from_slice(&ts.to_le_bytes());
-    m
-}
-
-fn build_relay_ticket_poll_v3_msg(
-    responder_id: &[u8; 32],
-    friend_candidates: &[[u8; 32]],
-    cursor: Option<&[u8; 32]>,
-    nonce: &[u8; 16],
-    ts: i64,
-) -> Vec<u8> {
-    let mut m = Vec::with_capacity(
-        RDV_DOMAIN.len()
-            + 1
-            + 32
-            + 2
-            + friend_candidates.len() * 32
-            + 1
-            + cursor.map_or(0, |_| 32)
-            + 16
-            + 8,
-    );
-    m.extend_from_slice(RDV_DOMAIN);
-    m.push(OP_RELAY_TICKET_POLL_V3);
-    m.extend_from_slice(responder_id);
-    m.extend_from_slice(&(friend_candidates.len() as u16).to_le_bytes());
-    for candidate in friend_candidates {
-        m.extend_from_slice(candidate);
-    }
-    match cursor {
-        Some(cursor) => {
-            m.push(1);
-            m.extend_from_slice(cursor);
-        }
-        None => m.push(0),
-    }
-    m.extend_from_slice(nonce);
-    m.extend_from_slice(&ts.to_le_bytes());
-    m
-}
-
 fn build_relay_ticket_action_msg(
     operation: u8,
     identity_id: &[u8; 32],
@@ -243,6 +163,83 @@ fn build_relay_ticket_action_msg(
     m.push(operation);
     m.extend_from_slice(identity_id);
     m.extend_from_slice(ticket_id);
+    m.extend_from_slice(nonce);
+    m.extend_from_slice(&ts.to_le_bytes());
+    m
+}
+
+fn build_capability_register_msg(
+    capability: &[u8; 32],
+    epoch: i64,
+    port: u16,
+    ip4: [u8; 4],
+    pubkey: &[u8; 32],
+    peer_pubkey: &[u8; 32],
+    ts: i64,
+) -> Vec<u8> {
+    let mut m = Vec::with_capacity(RDV_DOMAIN.len() + 1 + 32 + 8 + 2 + 4 + 32 + 32 + 8);
+    m.extend_from_slice(RDV_DOMAIN);
+    m.push(OP_CAPABILITY_REGISTER);
+    m.extend_from_slice(capability);
+    m.extend_from_slice(&epoch.to_le_bytes());
+    m.extend_from_slice(&port.to_le_bytes());
+    m.extend_from_slice(&ip4);
+    m.extend_from_slice(pubkey);
+    m.extend_from_slice(peer_pubkey);
+    m.extend_from_slice(&ts.to_le_bytes());
+    m
+}
+
+fn build_capability_lookup_msg(
+    capability: &[u8; 32],
+    epoch: i64,
+    requester_id: &[u8; 32],
+    requester_pubkey: &[u8; 32],
+    nonce: &[u8; 16],
+    ts: i64,
+) -> Vec<u8> {
+    let mut m = Vec::with_capacity(RDV_DOMAIN.len() + 1 + 32 + 8 + 32 + 32 + 16 + 8);
+    m.extend_from_slice(RDV_DOMAIN);
+    m.push(OP_CAPABILITY_LOOKUP);
+    m.extend_from_slice(capability);
+    m.extend_from_slice(&epoch.to_le_bytes());
+    m.extend_from_slice(requester_id);
+    m.extend_from_slice(requester_pubkey);
+    m.extend_from_slice(nonce);
+    m.extend_from_slice(&ts.to_le_bytes());
+    m
+}
+
+fn build_relay_mailbox_offer_msg(
+    initiator_id: &[u8; 32],
+    responder_id: &[u8; 32],
+    capability: &[u8; 32],
+    epoch: i64,
+    ticket_id: &[u8; 32],
+    envelope: &[u8],
+    nonce: &[u8; 16],
+    ts: i64,
+) -> Vec<u8> {
+    let mut m = Vec::with_capacity(RDV_DOMAIN.len() + 1 + 32 * 4 + 8 + 4 + envelope.len() + 16 + 8);
+    m.extend_from_slice(RDV_DOMAIN);
+    m.push(OP_RELAY_MAILBOX_OFFER);
+    m.extend_from_slice(initiator_id);
+    m.extend_from_slice(responder_id);
+    m.extend_from_slice(capability);
+    m.extend_from_slice(&epoch.to_le_bytes());
+    m.extend_from_slice(ticket_id);
+    m.extend_from_slice(&(envelope.len() as u32).to_le_bytes());
+    m.extend_from_slice(envelope);
+    m.extend_from_slice(nonce);
+    m.extend_from_slice(&ts.to_le_bytes());
+    m
+}
+
+fn build_relay_mailbox_poll_msg(responder_id: &[u8; 32], nonce: &[u8; 16], ts: i64) -> Vec<u8> {
+    let mut m = Vec::with_capacity(RDV_DOMAIN.len() + 1 + 32 + 16 + 8);
+    m.extend_from_slice(RDV_DOMAIN);
+    m.push(OP_RELAY_MAILBOX_POLL);
+    m.extend_from_slice(responder_id);
     m.extend_from_slice(nonce);
     m.extend_from_slice(&ts.to_le_bytes());
     m
@@ -376,8 +373,7 @@ pub async fn register(
     external_ip: Ipv4Addr,
     pubkey: &[u8; 32],
     secret_key: &[u8; 32],
-    noise_pub: Option<&[u8; 32]>,
-    ember_port: Option<u16>,
+    friend_identities: &[([u8; 16], [u8; 32])],
 ) -> Result<(), String> {
     require_https(base_url)?;
     let url = format!("{}/register", base_url.trim_end_matches('/'));
@@ -386,7 +382,7 @@ pub async fn register(
     let ts = current_timestamp();
     let signed_ip4 = external_ip.octets();
     let sig = sign_register(secret_key, pubkey, &id_raw, port, signed_ip4, ts);
-    let mut body = serde_json::json!({
+    let body = serde_json::json!({
         "id": id,
         "port": port,
         "ip": external_ip.to_string(),
@@ -394,26 +390,6 @@ pub async fn register(
         "ts": ts,
         "sig": hex::encode(sig.to_bytes()),
     });
-    // Publish our X25519 Noise key so DHT-enabled peers can bootstrap
-    // from us via `/bootstrap`. Deliberately NOT part of the signed
-    // message: it's our own key, and the DHT re-verifies every contact's
-    // Ed25519 binding on first PING, so an unsigned value is safe (a wrong
-    // key only fails a handshake). Callers pass `None` when the Ember DHT
-    // is disabled so we don't advertise a contact that can't be dialled.
-    if let Some(nk) = noise_pub {
-        body["noise_pub"] = serde_json::Value::String(hex::encode(nk));
-    }
-    // Advertise the UDP port our Ember Noise transport listens on. The
-    // signed `port` above is our eMule TCP port (used for friend-presence
-    // dialling); Ember runs over the shared KAD UDP socket on a *different*
-    // port, so the `/bootstrap` pool must hand peers this value instead.
-    // Unsigned for the same reason as `noise_pub`: it only scopes a port on
-    // our own signed IP, and a wrong value just fails a handshake. Only sent
-    // alongside a Noise key (the two together make us bootstrap-eligible);
-    // a zero port is meaningless and dropped.
-    if let (Some(_), Some(ep)) = (noise_pub, ember_port.filter(|p| *p != 0)) {
-        body["ember_port"] = serde_json::Value::from(ep);
-    }
     let resp = client(base_url)
         .await?
         .post(&url)
@@ -427,10 +403,125 @@ pub async fn register(
         // success message at info and the identifying bits at debug.
         info!("Rendezvous: registration succeeded on port {port}");
         debug!("Rendezvous: registered {}… (ip={})", &id[..8], external_ip);
+        // Public presence is never indexed by the stable Friend ID. Register
+        // one opaque rotating capability for each friend whose public key is
+        // available; old/hash-only relationships simply fail closed until a
+        // v2 identity exchange supplies that key.
+        let epoch = crate::network::ember::crypto::pairwise_capability_epoch(ts);
+        for (_, friend_pubkey) in friend_identities {
+            let Some(capability) =
+                crate::network::ember::crypto::derive_pairwise_presence_capability(
+                    secret_key,
+                    friend_pubkey,
+                    pubkey,
+                    epoch,
+                )
+            else {
+                continue;
+            };
+            if let Err(error) = register_pairwise_presence(
+                base_url,
+                &capability,
+                epoch,
+                port,
+                external_ip,
+                pubkey,
+                friend_pubkey,
+                secret_key,
+            )
+            .await
+            {
+                debug!("Pairwise presence registration failed: {error}");
+            }
+        }
         Ok(())
     } else {
         let status = resp.status();
         Err(format!("rendezvous register returned {status}"))
+    }
+}
+
+pub(crate) async fn fetch_identity_pubkey(
+    base_url: &str,
+    ember_hash: &[u8; 16],
+) -> Result<Option<[u8; 32]>, String> {
+    let id = hashed_id(ember_hash);
+    let url = format!("{}/v3/identity/{id}", base_url.trim_end_matches('/'));
+    let resp = client(base_url)
+        .await?
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("rendezvous identity lookup failed: {e}"))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        return Err(format!(
+            "rendezvous identity lookup returned {}",
+            resp.status()
+        ));
+    }
+    let body: serde_json::Value =
+        serde_json::from_slice(&read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await?)
+            .map_err(|e| format!("rendezvous identity lookup bad body: {e}"))?;
+    let mut pubkey = [0u8; 32];
+    if hex::decode_to_slice(body["pubkey"].as_str().unwrap_or_default(), &mut pubkey).is_err()
+        || !pubkey_matches_id(&pubkey, &id)
+    {
+        return Err("rendezvous identity lookup returned an invalid identity binding".to_string());
+    }
+    Ok(Some(pubkey))
+}
+
+async fn register_pairwise_presence(
+    base_url: &str,
+    capability: &[u8; 32],
+    epoch: i64,
+    port: u16,
+    external_ip: Ipv4Addr,
+    pubkey: &[u8; 32],
+    peer_pubkey: &[u8; 32],
+    secret_key: &[u8; 32],
+) -> Result<(), String> {
+    use ed25519_dalek::Signer;
+    let ts = current_timestamp();
+    let signed = build_capability_register_msg(
+        capability,
+        epoch,
+        port,
+        external_ip.octets(),
+        pubkey,
+        peer_pubkey,
+        ts,
+    );
+    let sig = signing_key_from_secret(secret_key).sign(&signed);
+    let resp = client(base_url)
+        .await?
+        .post(format!(
+            "{}/v3/presence/register",
+            base_url.trim_end_matches('/')
+        ))
+        .json(&serde_json::json!({
+            "capability": hex::encode(capability),
+            "epoch": epoch,
+            "port": port,
+            "ip": external_ip.to_string(),
+            "pubkey": hex::encode(pubkey),
+            "peer_pubkey": hex::encode(peer_pubkey),
+            "ts": ts,
+            "sig": hex::encode(sig.to_bytes()),
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("pairwise presence register failed: {e}"))?;
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "pairwise presence register returned {}",
+            resp.status()
+        ))
     }
 }
 
@@ -472,34 +563,84 @@ const MAX_LOOKUP_SIG_AGE_SECS: i64 = 600;
 
 pub async fn lookup(
     base_url: &str,
+    our_ember_hash: &[u8; 16],
+    our_pubkey: &[u8; 32],
+    our_secret_key: &[u8; 32],
     friend_hash: &[u8; 16],
 ) -> Result<Option<(Ipv4Addr, u16)>, String> {
     require_https(base_url)?;
-    let id = hashed_id(friend_hash);
-    let id_raw = sha256_id_raw(friend_hash);
-    let url = format!("{}/lookup/{}", base_url.trim_end_matches('/'), id);
-    let resp = client(base_url)
-        .await?
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("rendezvous lookup failed: {e}"))?;
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+    let Some(friend_pubkey) = fetch_identity_pubkey(base_url, friend_hash).await? else {
         return Ok(None);
+    };
+    let requester_id = hashed_id(our_ember_hash);
+    let requester_raw = sha256_id_raw(our_ember_hash);
+    let friend_id = hashed_id(friend_hash);
+    let now = current_timestamp();
+    let current_epoch = crate::network::ember::crypto::pairwise_capability_epoch(now);
+    let mut successful: Option<(reqwest::Response, [u8; 32], i64)> = None;
+    for epoch in [current_epoch, current_epoch - 1] {
+        let Some(capability) = crate::network::ember::crypto::derive_pairwise_presence_capability(
+            our_secret_key,
+            &friend_pubkey,
+            &friend_pubkey,
+            epoch,
+        ) else {
+            return Ok(None);
+        };
+        let nonce = random_nonce();
+        let ts = current_timestamp();
+        let signed =
+            build_capability_lookup_msg(&capability, epoch, &requester_raw, our_pubkey, &nonce, ts);
+        use ed25519_dalek::Signer;
+        let sig = signing_key_from_secret(our_secret_key).sign(&signed);
+        let resp = client(base_url)
+            .await?
+            .post(format!(
+                "{}/v3/presence/lookup",
+                base_url.trim_end_matches('/')
+            ))
+            .json(&serde_json::json!({
+                "capability": hex::encode(capability),
+                "epoch": epoch,
+                "requester_id": requester_id,
+                "requester_pubkey": hex::encode(our_pubkey),
+                "nonce": hex::encode(nonce),
+                "ts": ts,
+                "sig": hex::encode(sig.to_bytes()),
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("pairwise presence lookup failed: {e}"))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            continue;
+        }
+        if !resp.status().is_success() {
+            return Err(format!(
+                "pairwise presence lookup returned {}",
+                resp.status()
+            ));
+        }
+        successful = Some((resp, capability, epoch));
+        break;
     }
-    if !resp.status().is_success() {
-        let status = resp.status();
-        return Err(format!("rendezvous lookup returned {status}"));
-    }
+    let Some((resp, capability, epoch)) = successful else {
+        return Ok(None);
+    };
     let bytes = read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await?;
     let body: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|e| format!("rendezvous lookup bad body: {e}"))?;
+    if body["acknowledged"].as_bool() != Some(true)
+        || body["capability"].as_str() != Some(hex::encode(capability).as_str())
+        || body["epoch"].as_i64() != Some(epoch)
+    {
+        return Err("pairwise presence lookup acknowledgement mismatch".to_string());
+    }
     let ip_str = body["ip"].as_str().unwrap_or_default();
     let raw_port = body["port"].as_u64().unwrap_or_default();
     if raw_port == 0 || raw_port > u16::MAX as u64 {
         debug!(
             "Rendezvous: lookup for {}… returned invalid port: {}",
-            &id[..8],
+            &friend_id[..8],
             raw_port
         );
         return Ok(None);
@@ -536,14 +677,14 @@ pub async fn lookup(
     if !pubkey_ok || !sig_ok {
         warn!(
             "Rendezvous: lookup for {}… missing/malformed auth fields; refusing to connect",
-            &id[..8]
+            &friend_id[..8]
         );
         return Ok(None);
     }
-    if !pubkey_matches_id(&pubkey, &id) {
+    if pubkey != friend_pubkey || !pubkey_matches_id(&pubkey, &friend_id) {
         warn!(
             "Rendezvous: lookup for {}… pubkey does not derive to requested id; refusing to connect (server may be compromised)",
-            &id[..8]
+            &friend_id[..8]
         );
         return Ok(None);
     }
@@ -551,31 +692,44 @@ pub async fn lookup(
     if (now - ts).abs() > MAX_LOOKUP_SIG_AGE_SECS {
         warn!(
             "Rendezvous: lookup for {}… returned a stale signed registration (ts={}); refusing to connect",
-            &id[..8],
+            &friend_id[..8],
             ts
         );
         return Ok(None);
     }
 
     if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
-        let msg = build_register_msg(&id_raw, port, ip.octets(), &pubkey, ts);
+        let msg = build_capability_register_msg(
+            &capability,
+            epoch,
+            port,
+            ip.octets(),
+            &pubkey,
+            our_pubkey,
+            ts,
+        );
         if !ed25519_verify_lookup(&pubkey, &msg, &sig) {
             warn!(
                 "Rendezvous: lookup for {}… signature verification failed; refusing to connect (server may be compromised)",
-                &id[..8]
+                &friend_id[..8]
             );
             return Ok(None);
         }
         if port > 0 && is_routable_public_v4(ip) {
             // Friend IP/port is effectively PII — keep it at debug rather than
             // info so it doesn't land in user-shared log bundles by default.
-            debug!("Rendezvous: found {}… at {}:{}", &id[..8], ip, port);
+            debug!(
+                "Rendezvous: pairwise presence found for {}… at {}:{}",
+                &friend_id[..8],
+                ip,
+                port
+            );
             return Ok(Some((ip, port)));
         }
         if port > 0 {
             warn!(
                 "Rendezvous: lookup for {}… returned non-public IP ({}); refusing to connect",
-                &id[..8],
+                &friend_id[..8],
                 ip
             );
             return Ok(None);
@@ -583,7 +737,7 @@ pub async fn lookup(
     }
     debug!(
         "Rendezvous: lookup for {}… returned unparseable data",
-        &id[..8]
+        &friend_id[..8]
     );
     Ok(None)
 }
@@ -657,6 +811,72 @@ mod lookup_filter_tests {
         assert!(is_routable_public_v4(Ipv4Addr::new(1, 1, 1, 1)));
         assert!(is_routable_public_v4(Ipv4Addr::new(93, 184, 216, 34)));
     }
+
+    #[test]
+    fn relay_mailbox_poll_contains_only_self_identity() {
+        let self_id = [0x11; 32];
+        let nonce = [0x22; 16];
+        let message = build_relay_mailbox_poll_msg(&self_id, &nonce, 7);
+        assert_eq!(message.len(), RDV_DOMAIN.len() + 1 + 32 + 16 + 8);
+        assert_eq!(
+            &message[RDV_DOMAIN.len() + 1..RDV_DOMAIN.len() + 1 + 32],
+            &self_id
+        );
+        let friend_canary = [0xAB; 32];
+        assert!(!message
+            .windows(friend_canary.len())
+            .any(|window| window == friend_canary));
+    }
+
+    #[test]
+    fn relay_mailbox_envelope_is_recipient_bound_and_tamper_evident() {
+        let alice = SigningKey::from_bytes(&[7; 32]);
+        let bob = SigningKey::from_bytes(&[9; 32]);
+        let alice_pub = alice.verifying_key().to_bytes();
+        let bob_pub = bob.verifying_key().to_bytes();
+        let alice_hash =
+            crate::network::ember::crypto::node_id_from_public_key(&alice.verifying_key());
+        let bob_hash = crate::network::ember::crypto::node_id_from_public_key(&bob.verifying_key());
+        let epoch = 5;
+        let capability = crate::network::ember::crypto::derive_pairwise_presence_capability(
+            &alice.to_bytes(),
+            &bob_pub,
+            &bob_pub,
+            epoch,
+        )
+        .unwrap();
+        let ticket_id = "55".repeat(32);
+        let envelope = encrypt_relay_mailbox_envelope(
+            &alice_hash,
+            &alice_pub,
+            &bob_hash,
+            &bob_pub,
+            &capability,
+            epoch,
+            &ticket_id,
+            &alice.to_bytes(),
+        )
+        .unwrap();
+        let initiator = decrypt_relay_mailbox_envelope(
+            &bob_hash,
+            &bob.to_bytes(),
+            &capability,
+            &ticket_id,
+            &envelope,
+        )
+        .unwrap();
+        assert_eq!(initiator, hashed_id(&alice_hash));
+        let mut tampered = envelope;
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(decrypt_relay_mailbox_envelope(
+            &bob_hash,
+            &bob.to_bytes(),
+            &capability,
+            &ticket_id,
+            &tampered,
+        )
+        .is_err());
+    }
 }
 
 /// Unregister our presence from the rendezvous server (graceful shutdown).
@@ -709,10 +929,128 @@ pub struct PendingFriendRelayTicket {
     pub initiator_id: String,
 }
 
-/// One bounded, candidate-filtered page of pending ticket offers.
+/// One bounded page of authenticated self-mailbox offers.
 pub struct FriendRelayTicketPollPage {
     pub tickets: Vec<PendingFriendRelayTicket>,
-    pub next_cursor: Option<String>,
+}
+
+fn relay_mailbox_aad(responder_raw: &[u8; 32], capability: &[u8; 32]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(RDV_DOMAIN.len() + 32 + 32);
+    aad.extend_from_slice(RDV_DOMAIN);
+    aad.extend_from_slice(responder_raw);
+    aad.extend_from_slice(capability);
+    aad
+}
+
+fn encrypt_relay_mailbox_envelope(
+    initiator_ember_hash: &[u8; 16],
+    initiator_pubkey: &[u8; 32],
+    responder_ember_hash: &[u8; 16],
+    responder_pubkey: &[u8; 32],
+    capability: &[u8; 32],
+    epoch: i64,
+    ticket_id: &str,
+    secret_key: &[u8; 32],
+) -> Result<Vec<u8>, String> {
+    let key = crate::network::ember::crypto::derive_pairwise_capability(
+        secret_key,
+        responder_pubkey,
+        b"relay-mailbox",
+        epoch,
+    )
+    .ok_or_else(|| "could not derive responder mailbox key".to_string())?;
+    let plaintext = serde_json::to_vec(&serde_json::json!({
+        "initiator_id": hashed_id(initiator_ember_hash),
+        "initiator_pubkey": hex::encode(initiator_pubkey),
+        "ticket_id": ticket_id,
+        "purpose": "friend",
+        "epoch": epoch,
+    }))
+    .map_err(|e| format!("could not serialize relay mailbox offer: {e}"))?;
+    let responder_raw = sha256_id_raw(responder_ember_hash);
+    let aad = relay_mailbox_aad(&responder_raw, capability);
+    let mut nonce = [0u8; RELAY_MAILBOX_NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce);
+    let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(&key));
+    let ciphertext = cipher
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: &plaintext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| "could not encrypt relay mailbox offer".to_string())?;
+    let mut envelope = Vec::with_capacity(1 + 8 + 32 + RELAY_MAILBOX_NONCE_LEN + ciphertext.len());
+    envelope.push(RELAY_MAILBOX_ENVELOPE_VERSION);
+    envelope.extend_from_slice(&epoch.to_le_bytes());
+    envelope.extend_from_slice(initiator_pubkey);
+    envelope.extend_from_slice(&nonce);
+    envelope.extend_from_slice(&ciphertext);
+    Ok(envelope)
+}
+
+fn decrypt_relay_mailbox_envelope(
+    responder_ember_hash: &[u8; 16],
+    responder_secret_key: &[u8; 32],
+    capability: &[u8; 32],
+    expected_ticket_id: &str,
+    envelope: &[u8],
+) -> Result<String, String> {
+    const HEADER: usize = 1 + 8 + 32 + RELAY_MAILBOX_NONCE_LEN;
+    if envelope.len() < HEADER + 16 || envelope[0] != RELAY_MAILBOX_ENVELOPE_VERSION {
+        return Err("invalid relay mailbox envelope".to_string());
+    }
+    let epoch = i64::from_le_bytes(
+        envelope[1..9]
+            .try_into()
+            .map_err(|_| "invalid relay mailbox epoch")?,
+    );
+    let sender_pubkey: [u8; 32] = envelope[9..41]
+        .try_into()
+        .map_err(|_| "invalid relay mailbox sender key")?;
+    let key = crate::network::ember::crypto::derive_pairwise_capability(
+        responder_secret_key,
+        &sender_pubkey,
+        b"relay-mailbox",
+        epoch,
+    )
+    .ok_or_else(|| "could not derive relay mailbox key".to_string())?;
+    let responder_pubkey = signing_key_from_secret(responder_secret_key)
+        .verifying_key()
+        .to_bytes();
+    let expected_capability = crate::network::ember::crypto::derive_pairwise_presence_capability(
+        responder_secret_key,
+        &sender_pubkey,
+        &responder_pubkey,
+        epoch,
+    )
+    .ok_or_else(|| "could not derive relay mailbox capability".to_string())?;
+    if expected_capability != *capability {
+        return Err("relay mailbox capability mismatch".to_string());
+    }
+    let aad = relay_mailbox_aad(&sha256_id_raw(responder_ember_hash), capability);
+    let plaintext = XChaCha20Poly1305::new(ChaChaKey::from_slice(&key))
+        .decrypt(
+            XNonce::from_slice(&envelope[41..HEADER]),
+            Payload {
+                msg: &envelope[HEADER..],
+                aad: &aad,
+            },
+        )
+        .map_err(|_| "relay mailbox authentication failed".to_string())?;
+    let body: serde_json::Value = serde_json::from_slice(&plaintext)
+        .map_err(|_| "invalid relay mailbox plaintext".to_string())?;
+    let initiator_id = body["initiator_id"].as_str().unwrap_or_default();
+    if body["purpose"].as_str() != Some("friend")
+        || body["epoch"].as_i64() != Some(epoch)
+        || body["ticket_id"].as_str() != Some(expected_ticket_id)
+        || body["initiator_pubkey"].as_str() != Some(hex::encode(sender_pubkey).as_str())
+        || !pubkey_matches_id(&sender_pubkey, initiator_id)
+    {
+        return Err("relay mailbox signed context mismatch".to_string());
+    }
+    Ok(initiator_id.to_owned())
 }
 
 fn sign_relay_ticket_message(secret: &[u8; 32], message: &[u8]) -> Signature {
@@ -743,6 +1081,7 @@ pub async fn offer_friend_relay_ticket(
     base_url: &str,
     initiator_ember_hash: &[u8; 16],
     responder_ember_hash: &[u8; 16],
+    initiator_pubkey: &[u8; 32],
     secret_key: &[u8; 32],
 ) -> Result<FriendRelayTicketOffer, String> {
     require_https(base_url)?;
@@ -750,19 +1089,54 @@ pub async fn offer_friend_relay_ticket(
     let responder_id = hashed_id(responder_ember_hash);
     let initiator_raw = sha256_id_raw(initiator_ember_hash);
     let responder_raw = sha256_id_raw(responder_ember_hash);
-    let purpose = "friend";
+    let responder_pubkey = fetch_identity_pubkey(base_url, responder_ember_hash)
+        .await?
+        .ok_or_else(|| "relay responder has no registered v2 identity".to_string())?;
     let ts = current_timestamp();
+    let epoch = crate::network::ember::crypto::pairwise_capability_epoch(ts);
+    let capability = crate::network::ember::crypto::derive_pairwise_presence_capability(
+        secret_key,
+        &responder_pubkey,
+        &responder_pubkey,
+        epoch,
+    )
+    .ok_or_else(|| "could not derive relay responder capability".to_string())?;
+    let mut ticket_raw = [0u8; 32];
+    OsRng.fill_bytes(&mut ticket_raw);
+    let ticket_id = hex::encode(ticket_raw);
+    let envelope = encrypt_relay_mailbox_envelope(
+        initiator_ember_hash,
+        initiator_pubkey,
+        responder_ember_hash,
+        &responder_pubkey,
+        &capability,
+        epoch,
+        &ticket_id,
+        secret_key,
+    )?;
     let nonce = random_nonce();
-    let signed = build_relay_ticket_offer_msg(&initiator_raw, &responder_raw, purpose, &nonce, ts);
+    let signed = build_relay_mailbox_offer_msg(
+        &initiator_raw,
+        &responder_raw,
+        &capability,
+        epoch,
+        &ticket_raw,
+        &envelope,
+        &nonce,
+        ts,
+    );
     let sig = sign_relay_ticket_message(secret_key, &signed);
-    let url = format!("{}/v2/relay-tickets/offer", base_url.trim_end_matches('/'));
+    let url = format!("{}/v4/relay-mailbox/offer", base_url.trim_end_matches('/'));
     let resp = client(base_url)
         .await?
         .post(&url)
         .json(&serde_json::json!({
             "initiator_id": initiator_id,
             "responder_id": responder_id,
-            "purpose": purpose,
+            "capability": hex::encode(capability),
+            "epoch": epoch,
+            "ticket_id": ticket_id,
+            "envelope": hex::encode(envelope),
             "ts": ts,
             "nonce": hex::encode(nonce),
             "sig": hex::encode(sig.to_bytes()),
@@ -776,7 +1150,10 @@ pub async fn offer_friend_relay_ticket(
     let body: serde_json::Value =
         serde_json::from_slice(&read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await?)
             .map_err(|e| format!("relay ticket offer bad body: {e}"))?;
-    let ticket_id = canonical_ticket_id(body["ticket_id"].as_str().unwrap_or_default())?;
+    let returned_ticket_id = canonical_ticket_id(body["ticket_id"].as_str().unwrap_or_default())?;
+    if returned_ticket_id != ticket_id {
+        return Err("relay ticket offer acknowledgement mismatch".to_string());
+    }
     let initiator_token = body["initiator_token"]
         .as_str()
         .unwrap_or_default()
@@ -791,75 +1168,10 @@ pub async fn offer_friend_relay_ticket(
 
 /// Poll tickets addressed to this registered identity. The server never
 /// returns a responder bearer token here; the client must explicitly accept a
-/// known friend's offer first. The network poller owns the one-time v3→v2
-/// mode switch so one unsupported v3 route cannot fan out into parallel v2
-/// requests against an older server.
+/// known friend's offer first. The request contains only the responder's own
+/// mailbox ID; sender identity and purpose remain inside the authenticated
+/// encrypted envelope and are filtered locally.
 pub async fn poll_friend_relay_tickets(
-    base_url: &str,
-    responder_ember_hash: &[u8; 16],
-    friend_candidates: &[[u8; 16]],
-    cursor: Option<&str>,
-    round_timestamp: i64,
-    secret_key: &[u8; 32],
-) -> Result<FriendRelayTicketPollPage, String> {
-    require_https(base_url)?;
-    if friend_candidates.len() > FRIEND_RELAY_TICKET_POLL_CANDIDATES_PER_REQUEST {
-        return Err(format!(
-            "too many friend relay ticket candidates (max {})",
-            FRIEND_RELAY_TICKET_POLL_CANDIDATES_PER_REQUEST
-        ));
-    }
-    let responder_id = hashed_id(responder_ember_hash);
-    let responder_raw = sha256_id_raw(responder_ember_hash);
-    let mut candidate_raw: Vec<[u8; 32]> = friend_candidates.iter().map(sha256_id_raw).collect();
-    candidate_raw.sort_unstable();
-    candidate_raw.dedup();
-    let cursor = match cursor {
-        Some(cursor) => Some(canonical_ticket_id(cursor)?),
-        None => None,
-    };
-    let cursor_raw = cursor.as_deref().map(ticket_id_raw).transpose()?;
-    // All pages dispatched in one v3 round share this timestamp. The server
-    // treats same-(identity, nonce, timestamp) pages as concurrent,
-    // idempotent reads, so arrival order cannot reject a candidate slice.
-    let ts = round_timestamp;
-    let mut nonce_scope = Vec::with_capacity(b"poll".len() + responder_raw.len());
-    nonce_scope.extend_from_slice(b"poll-v3");
-    nonce_scope.extend_from_slice(&responder_raw);
-    let nonce = stable_relay_ticket_read_nonce(secret_key, &nonce_scope);
-    let signed = build_relay_ticket_poll_v3_msg(
-        &responder_raw,
-        &candidate_raw,
-        cursor_raw.as_ref(),
-        &nonce,
-        ts,
-    );
-    let sig = sign_relay_ticket_message(secret_key, &signed);
-    let url = format!("{}/v3/relay-tickets/poll", base_url.trim_end_matches('/'));
-    let resp = client(base_url)
-        .await?
-        .post(&url)
-        .json(&serde_json::json!({
-            "responder_id": responder_id,
-            "friend_candidates": candidate_raw.iter().map(hex::encode).collect::<Vec<_>>(),
-            "cursor": cursor,
-            "ts": ts,
-            "nonce": hex::encode(nonce),
-            "sig": hex::encode(sig.to_bytes()),
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("relay ticket poll: {e}"))?;
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        return Err("relay ticket poll v3 unsupported".to_string());
-    }
-    if !resp.status().is_success() {
-        return Err(format!("relay ticket poll: status {}", resp.status()));
-    }
-    parse_friend_relay_ticket_poll_response(resp).await
-}
-
-pub(crate) async fn poll_friend_relay_tickets_v2_compat(
     base_url: &str,
     responder_ember_hash: &[u8; 16],
     secret_key: &[u8; 32],
@@ -868,13 +1180,13 @@ pub(crate) async fn poll_friend_relay_tickets_v2_compat(
     let responder_id = hashed_id(responder_ember_hash);
     let responder_raw = sha256_id_raw(responder_ember_hash);
     let ts = current_timestamp();
-    // Older servers expect each v2 request to have a distinct signed nonce.
-    // Reusing the v3 stable nonce across parallel fallback attempts produces
-    // duplicate signed payloads and conflicts in their replay cache.
-    let nonce = random_nonce();
-    let signed = build_relay_ticket_poll_v2_msg(&responder_raw, &nonce, ts);
+    let mut nonce_scope = Vec::with_capacity(b"poll".len() + responder_raw.len());
+    nonce_scope.extend_from_slice(b"mailbox-v4");
+    nonce_scope.extend_from_slice(&responder_raw);
+    let nonce = stable_relay_ticket_read_nonce(secret_key, &nonce_scope);
+    let signed = build_relay_mailbox_poll_msg(&responder_raw, &nonce, ts);
     let sig = sign_relay_ticket_message(secret_key, &signed);
-    let url = format!("{}/v2/relay-tickets/poll", base_url.trim_end_matches('/'));
+    let url = format!("{}/v4/relay-mailbox/poll", base_url.trim_end_matches('/'));
     let resp = client(base_url)
         .await?
         .post(&url)
@@ -886,48 +1198,59 @@ pub(crate) async fn poll_friend_relay_tickets_v2_compat(
         }))
         .send()
         .await
-        .map_err(|e| format!("relay ticket v2 fallback poll: {e}"))?;
+        .map_err(|e| format!("relay ticket poll: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!(
-            "relay ticket v2 fallback poll: status {}",
-            resp.status()
-        ));
+        return Err(format!("relay ticket poll: status {}", resp.status()));
     }
-    parse_friend_relay_ticket_poll_response(resp).await
+    parse_friend_relay_mailbox_response(resp, responder_ember_hash, secret_key).await
 }
 
-async fn parse_friend_relay_ticket_poll_response(
+async fn parse_friend_relay_mailbox_response(
     resp: reqwest::Response,
+    responder_ember_hash: &[u8; 16],
+    secret_key: &[u8; 32],
 ) -> Result<FriendRelayTicketPollPage, String> {
     let body: serde_json::Value =
         serde_json::from_slice(&read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await?)
-            .map_err(|e| format!("relay ticket poll bad body: {e}"))?;
-    let tickets = body["tickets"]
+            .map_err(|e| format!("relay mailbox poll bad body: {e}"))?;
+    let items = body["tickets"]
         .as_array()
-        .ok_or_else(|| "relay ticket poll missing tickets".to_string())?;
-    let mut results = Vec::with_capacity(tickets.len());
-    for ticket in tickets {
-        let ticket_id = ticket["ticket_id"].as_str().unwrap_or_default();
-        let initiator_id = ticket["initiator_id"].as_str().unwrap_or_default();
-        let purpose = ticket["purpose"].as_str().unwrap_or_default();
-        if purpose != "friend" {
+        .ok_or_else(|| "relay mailbox poll missing tickets".to_string())?;
+    let mut tickets = Vec::with_capacity(items.len());
+    for item in items {
+        let ticket_id = canonical_ticket_id(item["ticket_id"].as_str().unwrap_or_default())?;
+        let mut capability = [0u8; 32];
+        if hex::decode_to_slice(
+            item["capability"].as_str().unwrap_or_default(),
+            &mut capability,
+        )
+        .is_err()
+        {
             continue;
         }
-        let ticket_id = canonical_ticket_id(ticket_id)?;
-        validate_ticket_response_field(initiator_id, "initiator_id")?;
-        results.push(PendingFriendRelayTicket {
+        let envelope = match hex::decode(item["envelope"].as_str().unwrap_or_default()) {
+            Ok(envelope) => envelope,
+            Err(_) => continue,
+        };
+        let initiator_id = match decrypt_relay_mailbox_envelope(
+            responder_ember_hash,
+            secret_key,
+            &capability,
+            &ticket_id,
+            &envelope,
+        ) {
+            Ok(id) => id,
+            Err(error) => {
+                debug!("Ignoring unauthenticated relay mailbox item: {error}");
+                continue;
+            }
+        };
+        tickets.push(PendingFriendRelayTicket {
             ticket_id,
-            initiator_id: initiator_id.to_owned(),
+            initiator_id,
         });
     }
-    let next_cursor = match body["next_cursor"].as_str() {
-        Some(cursor) => Some(canonical_ticket_id(cursor)?),
-        None => None,
-    };
-    Ok(FriendRelayTicketPollPage {
-        tickets: results,
-        next_cursor,
-    })
+    Ok(FriendRelayTicketPollPage { tickets })
 }
 
 /// Accept a ticket after the caller has verified its initiator is a known
@@ -1043,26 +1366,19 @@ mod relay_ticket_tests {
     use super::*;
 
     #[test]
-    fn relay_ticket_operation_codes_are_stable() {
-        assert_eq!(OP_RELAY_TICKET_OFFER, 0x07);
-        assert_eq!(OP_RELAY_TICKET_POLL, 0x08);
+    fn current_privacy_operation_codes_are_stable() {
         assert_eq!(OP_RELAY_TICKET_ACCEPT, 0x09);
         assert_eq!(OP_RELAY_TICKET_STATUS, 0x0a);
-        assert_eq!(OP_RELAY_TICKET_POLL_V3, 0x0b);
+        assert_eq!(OP_CAPABILITY_REGISTER, 0x0c);
+        assert_eq!(OP_CAPABILITY_LOOKUP, 0x0d);
+        assert_eq!(OP_RELAY_MAILBOX_OFFER, 0x0e);
+        assert_eq!(OP_RELAY_MAILBOX_POLL, 0x0f);
     }
 
     #[test]
     fn responder_poll_has_multiple_attempts_inside_initiator_wait() {
         assert!(
             FRIEND_RELAY_TICKET_RESPONDER_POLL_INTERVAL + FRIEND_RELAY_TICKET_POLL_TIMEOUT
-                < FRIEND_RELAY_TICKET_INITIATOR_WAIT
-        );
-        let pages = FRIEND_RELAY_TICKET_SUPPORTED_FRIENDS
-            .div_ceil(FRIEND_RELAY_TICKET_POLL_CANDIDATES_PER_REQUEST);
-        let rounds = pages.div_ceil(FRIEND_RELAY_TICKET_PARALLEL_POLL_REQUESTS);
-        assert!(
-            FRIEND_RELAY_TICKET_RESPONDER_POLL_INTERVAL.max(FRIEND_RELAY_TICKET_POLL_TIMEOUT)
-                * (rounds as u32)
                 < FRIEND_RELAY_TICKET_INITIATOR_WAIT
         );
     }
@@ -1087,17 +1403,16 @@ mod relay_ticket_tests {
     }
 
     #[test]
-    fn poll_v3_signature_binds_candidates_and_cursor() {
+    fn mailbox_poll_signature_binds_only_responder_nonce_and_time() {
         let responder = [1u8; 32];
-        let candidates = [[2u8; 32], [3u8; 32]];
         let nonce = [4u8; 16];
-        let first = build_relay_ticket_poll_v3_msg(&responder, &candidates, None, &nonce, 5);
-        let paged =
-            build_relay_ticket_poll_v3_msg(&responder, &candidates, Some(&[6u8; 32]), &nonce, 5);
-        let filtered = build_relay_ticket_poll_v3_msg(&responder, &[[2u8; 32]], None, &nonce, 5);
-        assert_ne!(first, paged);
-        assert_ne!(first, filtered);
-        assert_ne!(first, build_relay_ticket_poll_v2_msg(&responder, &nonce, 5));
+        let first = build_relay_mailbox_poll_msg(&responder, &nonce, 5);
+        assert_ne!(first, build_relay_mailbox_poll_msg(&[2u8; 32], &nonce, 5));
+        assert_ne!(
+            first,
+            build_relay_mailbox_poll_msg(&responder, &[5u8; 16], 5)
+        );
+        assert_ne!(first, build_relay_mailbox_poll_msg(&responder, &nonce, 6));
     }
 
     #[test]
@@ -1111,21 +1426,5 @@ mod relay_ticket_tests {
         assert!(!is_transient_relay_ticket_read_error(
             "relay ticket status: status 403 Forbidden"
         ));
-    }
-
-    #[test]
-    fn legacy_fallback_is_explicit_and_rate_safe() {
-        assert!(is_v3_relay_ticket_poll_unsupported(
-            "relay ticket poll v3 unsupported"
-        ));
-        assert!(!is_v3_relay_ticket_poll_unsupported(
-            "relay ticket poll: status 403 Forbidden"
-        ));
-        let legacy_polls = FRIEND_RELAY_TICKET_INITIATOR_WAIT
-            .as_secs()
-            .div_ceil(FRIEND_RELAY_TICKET_LEGACY_POLL_INTERVAL.as_secs());
-        // Old servers have a shared 60/min budget; status checks account for
-        // at most one per second of the 45-second initiator wait.
-        assert!(legacy_polls + FRIEND_RELAY_TICKET_INITIATOR_WAIT.as_secs() < 60);
     }
 }

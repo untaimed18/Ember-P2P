@@ -7,7 +7,53 @@ use crate::app_state::AppState;
 use crate::commands::errors::{await_reply, bounded_send, coded, coded_ctx, CMD_REPLY_TIMEOUT};
 use crate::network::NetworkCommand;
 use crate::sharing::manager::TransferControl;
+use crate::storage::database::Database;
 use crate::types::*;
+
+/// One safety budget shared by every download admission path.
+pub(crate) const MAX_PENDING_DOWNLOADS: usize = 10_000;
+pub(crate) const MAX_PENDING_REMAINING_BYTES: u64 = 64 * 1024 * 1024 * 1024 * 1024;
+
+fn budget_allows(current_count: usize, current_remaining: u64, additions: &[u64]) -> bool {
+    current_count.saturating_add(additions.len()) <= MAX_PENDING_DOWNLOADS
+        && current_remaining
+            .saturating_add(additions.iter().copied().fold(0u64, u64::saturating_add))
+            <= MAX_PENDING_REMAINING_BYTES
+}
+
+pub(crate) fn pending_download_usage(
+    manager: &crate::sharing::manager::TransferManager,
+) -> (usize, u64) {
+    manager
+        .active
+        .values()
+        .chain(manager.queue.iter())
+        .filter(|transfer| transfer.direction == TransferDirection::Download)
+        .fold((0usize, 0u64), |(count, bytes), transfer| {
+            let completed = transfer.completed_size.max(transfer.transferred);
+            (
+                count.saturating_add(1),
+                bytes.saturating_add(transfer.total_size.saturating_sub(completed)),
+            )
+        })
+}
+
+pub(crate) fn ensure_pending_download_budget(
+    manager: &crate::sharing::manager::TransferManager,
+    additions: &[u64],
+) -> Result<(), String> {
+    let (count, remaining) = pending_download_usage(manager);
+    if budget_allows(count, remaining, additions) {
+        return Ok(());
+    }
+    Err(coded_ctx(
+        "transfers_pending_budget_exceeded",
+        "Pending download safety budget exceeded",
+        format!(
+            "max {MAX_PENDING_DOWNLOADS} rows and {MAX_PENDING_REMAINING_BYTES} aggregate remaining bytes"
+        ),
+    ))
+}
 
 async fn db_blocking<F>(f: F)
 where
@@ -136,6 +182,7 @@ pub(crate) async fn start_promoted_downloads(state: &AppState, promoted: &[Trans
                 // them from SM when workers start.
                 extra_sources: Vec::new(),
                 ember_file_hash: String::new(),
+                expected_aich: transfer.expected_aich.clone(),
                 transfer_id: transfer.id.clone(),
                 control,
                 discovery_only: false,
@@ -197,6 +244,29 @@ async fn cleanup_partial_files(download_folder: &str, transfer_id: &str) {
     let temp_dir = std::path::PathBuf::from(download_folder).join("Temp");
     let part_path = temp_dir.join(format!("{transfer_id}.part"));
     let met_path = temp_dir.join(format!("{transfer_id}.part.met"));
+    let allowed = vec![download_folder.to_string()];
+    let part_path = if part_path.exists() {
+        match crate::security::filesystem::verify_existing_path(&part_path, &allowed) {
+            Ok(path) => path,
+            Err(error) => {
+                tracing::warn!("Refusing to delete unverified part path: {error}");
+                return;
+            }
+        }
+    } else {
+        part_path
+    };
+    let met_path = if met_path.exists() {
+        match crate::security::filesystem::verify_existing_path(&met_path, &allowed) {
+            Ok(path) => path,
+            Err(error) => {
+                tracing::warn!("Refusing to delete unverified part metadata path: {error}");
+                return;
+            }
+        }
+    } else {
+        met_path
+    };
     tokio::join!(
         delete_with_retry(&part_path, 6, 500),
         delete_with_retry(&met_path, 6, 500),
@@ -226,6 +296,7 @@ async fn cleanup_partial_files(download_folder: &str, transfer_id: &str) {
 pub async fn sweep_orphan_part_files(
     download_folder: &str,
     known_ids: &std::collections::HashSet<String>,
+    db: &Database,
 ) {
     let temp_dir = std::path::PathBuf::from(download_folder).join("Temp");
     if !temp_dir.is_dir() {
@@ -261,10 +332,24 @@ pub async fn sweep_orphan_part_files(
             // Not an Ember-managed file; leave it alone.
             continue;
         }
-        if known_ids.contains(uuid_str) {
+        if known_ids.contains(uuid_str) || db.incomplete_download_owns_partial(uuid_str) {
             skipped_known += 1;
             continue;
         }
+        let path = match crate::security::filesystem::verify_existing_path(
+            &path,
+            &[download_folder.to_string()],
+        ) {
+            Ok(path) => path,
+            Err(error) => {
+                failed += 1;
+                tracing::warn!(
+                    "Orphan sweep: refusing changed/unapproved path {}: {error}",
+                    path.display()
+                );
+                continue;
+            }
+        };
         match tokio::fs::remove_file(&path).await {
             Ok(()) => {
                 if is_met {
@@ -311,11 +396,24 @@ pub async fn start_download(
     extra_sources: Option<Vec<String>>,
     // Optional Ember content BLAKE3 hex from search results / library.
     ember_file_hash: Option<String>,
+    expected_aich: Option<String>,
 ) -> Result<StartDownloadResponse, String> {
+    let _download_admission = state.download_admission.lock().await;
     let file_name = crate::security::sanitize_filename(&file_name);
 
     if file_hash.len() != 32 || hex::decode(&file_hash).is_err() {
         return Err(coded("transfers_invalid_file_hash", "Invalid file hash"));
+    }
+    let expected_aich = expected_aich
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    if expected_aich.as_ref().is_some_and(|value| {
+        value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }) {
+        return Err(coded(
+            "transfers_invalid_expected_aich",
+            "Expected AICH must be a 40-character hexadecimal SHA-1 root",
+        ));
     }
 
     if !peer_ip.is_empty() {
@@ -440,6 +538,7 @@ pub async fn start_download(
         client_software: String::new(),
         country_code: None,
         user_hash: None,
+        expected_aich: expected_aich.clone(),
         completed_path: None,
         up_part_status: None,
         up_part_count: None,
@@ -449,11 +548,23 @@ pub async fn start_download(
     let active_now = {
         let mut manager = state.transfer_manager.write().await;
         if let Some(existing_id) = manager.pending_transfer_id_for_hash(&file_hash) {
+            if let Some(expected) = expected_aich.as_deref() {
+                let existing_pin = manager
+                    .get_transfer(&existing_id)
+                    .and_then(|transfer| transfer.expected_aich.as_deref());
+                if existing_pin != Some(expected) {
+                    return Err(coded(
+                        "transfers_existing_download_aich_mismatch",
+                        "This file is already queued without the same trusted AICH pin; cancel it and add the AICH link again",
+                    ));
+                }
+            }
             return Ok(StartDownloadResponse {
                 transfer_id: existing_id,
                 already_queued: true,
             });
         }
+        ensure_pending_download_budget(&manager, &[file_size])?;
         let active_now = manager.enqueue(transfer.clone());
         manager.register_control(&transfer_id, control.clone());
         active_now
@@ -485,6 +596,7 @@ pub async fn start_download(
             peer_port,
             extra_sources: parsed_extras,
             ember_file_hash: ember_file_hash.unwrap_or_default(),
+            expected_aich,
             transfer_id: transfer_id.clone(),
             control,
             discovery_only,
@@ -525,11 +637,37 @@ pub async fn start_download(
     })
 }
 
+/// Consume the startup overflow count once so the app shell can present a
+/// user-visible migration notice without repeating it on every route change.
+#[tauri::command]
+pub async fn take_pending_download_overflow_notice(
+    state: tauri::State<'_, AppState>,
+) -> Result<usize, String> {
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.acknowledge_pending_download_overflow())
+        .await
+        .map_err(|error| {
+            coded_ctx(
+                "transfers_overflow_notice_task_failed",
+                "Failed to read queue migration notice",
+                error,
+            )
+        })?
+        .map_err(|error| {
+            coded_ctx(
+                "transfers_overflow_notice_failed",
+                "Failed to read queue migration notice",
+                error,
+            )
+        })
+}
+
 /// Upper bound on how many transfer IDs a single batch command will act on.
 /// The UI can only ever select what's on screen, so this is generous; it
 /// exists purely to stop a buggy or hostile caller from handing us an
 /// unbounded list that would tie up the transfer manager lock in a long loop.
 const MAX_BATCH_TRANSFER_IDS: usize = 500;
+const MAX_BATCH_TRANSFER_ID_BYTES: usize = 256 * 1024;
 
 fn check_batch_size(transfer_ids: &[String]) -> Result<(), String> {
     if transfer_ids.len() > MAX_BATCH_TRANSFER_IDS {
@@ -538,6 +676,24 @@ fn check_batch_size(transfer_ids: &[String]) -> Result<(), String> {
             "Too many transfers in a single request",
             transfer_ids.len(),
         ));
+    }
+    let mut total = 0usize;
+    for id in transfer_ids {
+        if id.len() > 128 {
+            return Err(coded_ctx(
+                "transfers_invalid_transfer_id",
+                "Transfer id is too long",
+                id.len(),
+            ));
+        }
+        total = total.saturating_add(id.len());
+        if total > MAX_BATCH_TRANSFER_ID_BYTES {
+            return Err(coded_ctx(
+                "transfers_batch_bytes_too_large",
+                "Transfer id batch is too large",
+                total,
+            ));
+        }
     }
     Ok(())
 }
@@ -854,106 +1010,22 @@ fn resolve_transfer_reveal_path(
     };
     let part_path = temp_dir.join(format!("{}.part", transfer.id));
 
-    let (candidate, base_dir) = if final_path.is_file() {
-        (final_path, completed_dir)
+    let candidate = if final_path.is_file() {
+        final_path
     } else if part_path.is_file() {
-        (part_path, temp_dir)
+        part_path
     } else {
         return Err(coded("transfers_file_not_found", "File not found on disk"));
     };
 
-    let canonical = candidate
-        .canonicalize()
-        .map_err(|e| coded_ctx("transfers_invalid_path", "Invalid path", e))?;
-    let canonical_base = base_dir
-        .canonicalize()
-        .map_err(|e| coded_ctx("transfers_invalid_base", "Invalid base", e))?;
-    if !canonical.starts_with(&canonical_base) {
-        return Err(coded(
-            "transfers_path_escapes_dir",
-            "File path escapes download directory",
-        ));
-    }
-    Ok(canonical)
-}
-
-#[cfg(windows)]
-fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
-    use std::os::windows::process::CommandExt;
-    // NTFS paths cannot contain `"` but a crafted / non-NTFS path could.
-    // Reject it outright so we never interpolate user-controlled quote
-    // characters into the raw command line below.
-    let path_str = path.to_str().ok_or_else(|| {
-        coded(
-            "transfers_path_non_utf8",
-            "Path contains non-UTF8 characters",
-        )
-    })?;
-    if path_str.contains('"') || path_str.contains('\0') {
-        return Err(coded(
-            "transfers_path_unsupported_chars",
-            "Path contains unsupported characters",
-        ));
-    }
-    // explorer.exe doesn't understand \\?\-prefixed long paths — strip it so
-    // the /select, argument resolves against the user-visible namespace.
-    let clean = path_str.strip_prefix(r"\\?\").unwrap_or(path_str);
-    let raw = format!(r#"/select,"{clean}""#);
-    std::process::Command::new("explorer")
-        .raw_arg(raw)
-        .spawn()
+    crate::security::filesystem::verify_existing_path(&candidate, &[download_folder.to_string()])
         .map_err(|e| {
             coded_ctx(
-                "transfers_open_explorer_failed",
-                "Failed to open File Explorer",
+                "transfers_invalid_path",
+                "Invalid or changed download path",
                 e,
             )
-        })?;
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
-    let path_str = path
-        .to_str()
-        .ok_or_else(|| coded("transfers_invalid_path_encoding", "Invalid path encoding"))?;
-    std::process::Command::new("open")
-        .args(["-R", path_str])
-        .spawn()
-        .map_err(|e| {
-            coded_ctx(
-                "transfers_reveal_finder_failed",
-                "Failed to reveal in Finder",
-                e,
-            )
-        })?;
-    Ok(())
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
-    use std::process::Command;
-    let path_str = path
-        .to_str()
-        .ok_or_else(|| coded("transfers_invalid_path_encoding", "Invalid path encoding"))?;
-    for cmd in ["nautilus", "dolphin", "nemo"] {
-        if Command::new(cmd)
-            .args(["--select", path_str])
-            .spawn()
-            .is_ok()
-        {
-            return Ok(());
-        }
-    }
-    if let Some(parent) = path.parent() {
-        opener::open(parent.to_string_lossy().as_ref())
-            .map_err(|e| coded_ctx("transfers_open_folder_failed", "Failed to open folder", e))?;
-        return Ok(());
-    }
-    Err(coded(
-        "transfers_open_location_failed",
-        "Could not open file location",
-    ))
+        })
 }
 
 #[tauri::command]
@@ -976,7 +1048,8 @@ pub async fn open_transfer_file_location(
     // freeze unrelated IPC commands.
     tokio::task::spawn_blocking(move || {
         let path = resolve_transfer_reveal_path(&transfer, &dl_folder)?;
-        reveal_in_file_manager(&path)
+        crate::security::filesystem::reveal_in_file_manager(&path)
+            .map_err(|e| coded_ctx("transfers_open_explorer_failed", "Failed to reveal file", e))
     })
     .await
     .map_err(|e| coded_ctx("transfers_reveal_task_failed", "Reveal task failed", e))??;
@@ -998,12 +1071,6 @@ pub async fn open_file(
     let transfer =
         transfer.ok_or_else(|| coded("transfers_transfer_not_found", "Transfer not found"))?;
     let safe_name = crate::security::sanitize_filename(&transfer.file_name);
-    if crate::security::is_dangerous_extension(&safe_name) {
-        return Err(coded(
-            "transfers_dangerous_file_type",
-            "Cannot open potentially dangerous file types. Please use a dedicated application.",
-        ));
-    }
     let download_dir = std::path::PathBuf::from(&dl_folder).join("Downloads");
     // Prefer the exact path recorded at completion time. Falling back to
     // `Downloads/<name>` is only correct when no dedup suffix was applied;
@@ -1020,20 +1087,26 @@ pub async fn open_file(
                 "Download has not finished yet",
             ));
         }
-        let canonical = file_path
-            .canonicalize()
-            .map_err(|e| coded_ctx("transfers_invalid_path", "Invalid path", e))?;
-        let canonical_base = download_dir
-            .canonicalize()
-            .map_err(|e| coded_ctx("transfers_invalid_base", "Invalid base", e))?;
-        if !canonical.starts_with(&canonical_base) {
-            return Err(coded(
-                "transfers_path_escapes_dir",
-                "File path escapes download directory",
-            ));
+        let canonical = crate::security::filesystem::verify_existing_path(&file_path, &[dl_folder])
+            .map_err(|e| {
+                coded_ctx(
+                    "transfers_invalid_path",
+                    "Invalid or changed download path",
+                    e,
+                )
+            })?;
+        if crate::security::filesystem::passive_type_agrees(&transfer.file_name, &canonical) {
+            opener::open(&canonical)
+                .map_err(|e| coded_ctx("transfers_open_file_failed", "Failed to open file", e))
+        } else {
+            crate::security::filesystem::reveal_in_file_manager(&canonical).map_err(|e| {
+                coded_ctx(
+                    "transfers_reveal_unsafe_file_failed",
+                    "This file type was revealed instead of opened",
+                    e,
+                )
+            })
         }
-        opener::open(&canonical)
-            .map_err(|e| coded_ctx("transfers_open_file_failed", "Failed to open file", e))
     })
     .await
     .map_err(|e| coded_ctx("transfers_open_task_failed", "Open task failed", e))??;
@@ -1584,12 +1657,30 @@ pub async fn recover_archive(
     state: tauri::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<String, String> {
-    let (transfer_info, dl_folder) = {
+    static RECOVERY_CONCURRENCY: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    let permit = RECOVERY_CONCURRENCY
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| {
+            coded(
+                "transfers_recovery_unavailable",
+                "Archive recovery unavailable",
+            )
+        })?;
+
+    let (transfer_info, dl_folder, control) = {
         let (mgr, cfg) = tokio::join!(state.transfer_manager.read(), state.config.read(),);
         let t = mgr
             .get_transfer(&transfer_id)
             .map(|t| (t.file_name.clone(), t.total_size, t.id.clone()));
-        (t, cfg.settings.download_folder.clone())
+        (
+            t,
+            cfg.settings.download_folder.clone(),
+            mgr.get_control(&transfer_id),
+        )
     };
     let (file_name, file_size, transfer_id_clone) =
         transfer_info.ok_or_else(|| coded("transfers_transfer_not_found", "Transfer not found"))?;
@@ -1611,35 +1702,113 @@ pub async fn recover_archive(
             "Part file not found — download may not have started",
         ));
     }
-    let canonical_part = part_path
-        .canonicalize()
-        .map_err(|e| coded_ctx("transfers_part_path_invalid", "Invalid part file path", e))?;
-    let canonical_temp = std::path::PathBuf::from(&dl_folder)
-        .join("Temp")
-        .canonicalize()
-        .map_err(|e| coded_ctx("transfers_temp_path_invalid", "Invalid temp folder", e))?;
-    if !canonical_part.starts_with(&canonical_temp) {
-        return Err(coded(
-            "transfers_part_path_escapes_temp",
-            "Part file path escapes the temp folder",
-        ));
-    }
-
-    let pp = canonical_part.clone();
-    let filled_ranges = tokio::task::spawn_blocking(move || {
-        let tracker = crate::network::ed2k::part_tracker::PartTracker::new(file_size, &pp);
-        tracker.filled_ranges()
-    })
-    .await
+    let canonical_part =
+        crate::security::filesystem::verify_existing_path(&part_path, &[dl_folder.clone()])
+            .map_err(|e| {
+                coded_ctx(
+                    "transfers_part_path_invalid",
+                    "Invalid or changed part path",
+                    e,
+                )
+            })?;
+    let canonical_temp = crate::security::filesystem::verify_existing_path(
+        &std::path::PathBuf::from(&dl_folder).join("Temp"),
+        &[dl_folder.clone()],
+    )
     .map_err(|e| {
         coded_ctx(
-            "transfers_part_tracker_task_failed",
-            "PartTracker task failed",
+            "transfers_temp_path_invalid",
+            "Invalid or changed temp folder",
             e,
         )
     })?;
+    crate::security::filesystem::ensure_not_reparse(&canonical_temp)
+        .map_err(|e| coded_ctx("transfers_temp_path_reparse", "Unsafe temp folder", e))?;
 
-    if filled_ranges.is_empty() {
+    let pp = canonical_part.clone();
+    let expected_file_hash = {
+        let bytes = hex::decode(
+            state
+                .transfer_manager
+                .read()
+                .await
+                .get_transfer(&transfer_id)
+                .map(|transfer| transfer.file_hash.clone())
+                .unwrap_or_default(),
+        )
+        .map_err(|_| coded("transfers_invalid_file_hash", "Invalid transfer hash"))?;
+        if bytes.len() != 16 {
+            return Err(coded(
+                "transfers_invalid_file_hash",
+                "Invalid transfer hash",
+            ));
+        }
+        let mut hash = [0u8; 16];
+        hash.copy_from_slice(&bytes);
+        hash
+    };
+    let verified_ranges =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(u64, u64)>> {
+            use md4::{Digest, Md4};
+            use std::io::{Read, Seek};
+            let tracker = crate::network::ed2k::part_tracker::PartTracker::new(file_size, &pp);
+            let flags = tracker.verified_parts();
+            let hashes = tracker.part_hashes();
+            let mut file = std::fs::File::open(&pp)?;
+            let mut ranges = Vec::new();
+            for (index, verified) in flags.into_iter().enumerate() {
+                if !verified {
+                    continue;
+                }
+                let start = index as u64 * crate::network::ed2k::hash::PARTSIZE;
+                let end = (start + crate::network::ed2k::hash::PARTSIZE).min(file_size);
+                let Some(expected) = hashes.get(index) else {
+                    // A single-part transfer can have no hashset. Only accept its
+                    // range after a complete file-level ED2K verification.
+                    if index == 0
+                        && end == file_size
+                        && crate::network::ed2k::hash::ed2k_hash_file(&pp)?
+                            == hex::encode(expected_file_hash)
+                    {
+                        ranges.push((start, end));
+                    }
+                    continue;
+                };
+                file.seek(std::io::SeekFrom::Start(start))?;
+                let mut take = (&mut file).take(end - start);
+                let mut hasher = Md4::new();
+                let mut buffer = [0u8; 64 * 1024];
+                loop {
+                    let read = take.read(&mut buffer)?;
+                    if read == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..read]);
+                }
+                let actual: [u8; 16] = hasher.finalize().into();
+                if &actual == expected {
+                    ranges.push((start, end));
+                }
+            }
+            Ok(ranges)
+        })
+        .await
+        .map_err(|e| {
+            coded_ctx(
+                "transfers_part_tracker_task_failed",
+                "PartTracker task failed",
+                e,
+            )
+        })?
+        .map_err(|e| {
+            coded_ctx(
+                "transfers_part_verify_failed",
+                "Part verification failed",
+                e,
+            )
+        })?;
+
+    if verified_ranges.is_empty() {
         return Err(coded(
             "transfers_no_parts_for_recovery",
             "No completed parts available for recovery",
@@ -1647,16 +1816,42 @@ pub async fn recover_archive(
     }
 
     let fname = file_name.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    let recovery = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         crate::network::ed2k::archive_recovery::recover_archive(
             &canonical_part,
             &fname,
-            &filled_ranges,
+            &verified_ranges,
+            &canonical_temp,
+            control.as_deref(),
         )
-    })
-    .await
-    .map_err(|e| coded_ctx("transfers_recovery_task_failed", "Recovery task failed", e))?
-    .map_err(|e| coded_ctx("transfers_recovery_failed", "Recovery failed", e))?;
+    });
+    let result = tokio::time::timeout(std::time::Duration::from_secs(130), recovery)
+        .await
+        .map_err(|_| coded("transfers_recovery_timed_out", "Archive recovery timed out"))?
+        .map_err(|e| coded_ctx("transfers_recovery_task_failed", "Recovery task failed", e))?
+        .map_err(|e| coded_ctx("transfers_recovery_failed", "Recovery failed", e))?;
 
     Ok(result.to_string_lossy().to_string())
+}
+
+#[cfg(test)]
+mod ipc_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn one_budget_rejects_n_plus_one_for_every_admission_source() {
+        assert!(budget_allows(MAX_PENDING_DOWNLOADS - 1, 0, &[1],));
+        // A direct request racing a collection/deep-link batch is serialized;
+        // whichever owns the final slot wins and the combined N+1 transaction
+        // is rejected by this shared predicate.
+        assert!(!budget_allows(MAX_PENDING_DOWNLOADS - 1, 0, &[1, 1],));
+    }
+
+    #[test]
+    fn aggregate_remaining_bytes_are_saturating_and_bounded() {
+        assert!(budget_allows(0, MAX_PENDING_REMAINING_BYTES - 1, &[1],));
+        assert!(!budget_allows(0, MAX_PENDING_REMAINING_BYTES - 1, &[2],));
+        assert!(!budget_allows(0, u64::MAX, &[u64::MAX]));
+    }
 }

@@ -33,6 +33,12 @@ pub type SharedFriendHashes = Arc<RwLock<std::collections::HashSet<[u8; 16]>>>;
 pub struct AppState {
     pub network_tx: mpsc::Sender<NetworkCommand>,
     pub db: Arc<Database>,
+    /// Handle-bound approved filesystem roots used by every destructive or
+    /// executable filesystem action.
+    pub approved_roots: Arc<crate::security::filesystem::ApprovedRootRegistry>,
+    /// Network/upload startup remains closed while security policy recovery
+    /// requires explicit user acknowledgement.
+    pub security_policy: Arc<crate::security::policy::SecurityPolicyGate>,
     /// Process-wide persistent identity loaded exactly once during setup.
     pub identity: Arc<NodeIdentity>,
     pub config: Arc<RwLock<AppConfig>>,
@@ -42,6 +48,10 @@ pub struct AppState {
     pub local_index: Arc<RwLock<LocalIndex>>,
     pub bandwidth_limiter: Arc<BandwidthLimiter>,
     pub transfer_manager: Arc<RwLock<TransferManager>>,
+    /// Serializes every pending-download admission transaction (direct IPC,
+    /// collection batches, deep links, and startup migration) so count and
+    /// remaining-byte checks cannot race at N+1.
+    pub download_admission: Arc<tokio::sync::Mutex<()>>,
     /// Signaled by the network task after it finishes saving nodes.dat on shutdown.
     pub shutdown_complete: Arc<std::sync::atomic::AtomicBool>,
     pub bw_shutdown: Arc<std::sync::atomic::AtomicBool>,

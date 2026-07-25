@@ -2,24 +2,225 @@
 pub mod firewall;
 
 pub mod antileech;
+pub mod filesystem;
+pub mod policy;
+
+pub mod logging {
+    use std::io::{self, Write};
+    use std::sync::OnceLock;
+
+    use rand::{rngs::OsRng, RngCore};
+    use regex::{Captures, Regex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone)]
+    pub struct PrivacyMakeWriter<M> {
+        inner: M,
+        verbose: bool,
+    }
+
+    impl<M> PrivacyMakeWriter<M> {
+        pub fn new(inner: M, verbose: bool) -> Self {
+            Self { inner, verbose }
+        }
+    }
+
+    pub struct PrivacyWriter<W: Write> {
+        inner: Option<W>,
+        buffer: Vec<u8>,
+        verbose: bool,
+    }
+
+    impl<W: Write> Write for PrivacyWriter<W> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.buffer.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<W: Write> Drop for PrivacyWriter<W> {
+        fn drop(&mut self) {
+            let Some(mut inner) = self.inner.take() else {
+                return;
+            };
+            let raw = String::from_utf8_lossy(&self.buffer);
+            let rendered = if self.verbose {
+                raw.into_owned()
+            } else {
+                redact_normal_log(&raw)
+            };
+            let _ = inner.write_all(rendered.as_bytes());
+            let _ = inner.flush();
+        }
+    }
+
+    impl<'a, M> MakeWriter<'a> for PrivacyMakeWriter<M>
+    where
+        M: MakeWriter<'a>,
+        M::Writer: Write,
+    {
+        type Writer = PrivacyWriter<M::Writer>;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            PrivacyWriter {
+                inner: Some(self.inner.make_writer()),
+                buffer: Vec::with_capacity(512),
+                verbose: self.verbose,
+            }
+        }
+    }
+
+    fn pseudonym(value: &str) -> String {
+        static KEY: OnceLock<[u8; 32]> = OnceLock::new();
+        let key = KEY.get_or_init(|| {
+            let mut key = [0u8; 32];
+            OsRng.fill_bytes(&mut key);
+            key
+        });
+        let digest = blake3::keyed_hash(key, value.as_bytes());
+        hex::encode(&digest.as_bytes()[..6])
+    }
+
+    fn replace_regex(
+        input: String,
+        regex: &'static OnceLock<Regex>,
+        pattern: &str,
+        kind: &'static str,
+    ) -> String {
+        regex
+            .get_or_init(|| Regex::new(pattern).expect("static log redaction regex"))
+            .replace_all(&input, |caps: &Captures<'_>| {
+                format!("<{kind}:{}>", pseudonym(&caps[0]))
+            })
+            .into_owned()
+    }
+
+    pub fn redact_normal_log(input: &str) -> String {
+        static WINDOWS_PATH: OnceLock<Regex> = OnceLock::new();
+        static HEX_ID: OnceLock<Regex> = OnceLock::new();
+        static IPV4: OnceLock<Regex> = OnceLock::new();
+        static IPV6: OnceLock<Regex> = OnceLock::new();
+        static PEER_TEXT: OnceLock<Regex> = OnceLock::new();
+
+        let had_newline = input.ends_with('\n');
+        let mut value = input
+            .trim_end_matches(['\r', '\n'])
+            .replace(['\r', '\n'], "\\n");
+        value = PEER_TEXT
+            .get_or_init(|| {
+                Regex::new(
+                    r#"(?i)(?:\b(?:nick(?:name)?|query|search(?:_term)?)\s*=\s*|\b(?:search|query)[^'"\r\n]{0,48})['"][^'"\r\n]*['"]"#,
+                )
+                .expect("static peer-text regex")
+            })
+            .replace_all(&value, |caps: &Captures<'_>| {
+                format!("<text:{}>", pseudonym(&caps[0]))
+            })
+            .into_owned();
+        value = replace_regex(
+            value,
+            &WINDOWS_PATH,
+            r#"(?i)\b[A-Z]:\\[^\r\n\t,;)"']+"#,
+            "path",
+        );
+        value = replace_regex(value, &HEX_ID, r"(?i)\b[0-9a-f]{32,128}\b", "id");
+        value = IPV6
+            .get_or_init(|| {
+                Regex::new(r"(?i)(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}").expect("static IPv6 regex")
+            })
+            .replace_all(&value, |caps: &Captures<'_>| {
+                let candidate = &caps[0];
+                if candidate.parse::<std::net::Ipv6Addr>().is_ok() {
+                    format!("<ip:{}>", pseudonym(candidate))
+                } else {
+                    candidate.to_string()
+                }
+            })
+            .into_owned();
+        value = IPV4
+            .get_or_init(|| Regex::new(r"\b(?:\d{1,3}\.){3}\d{1,3}\b").unwrap())
+            .replace_all(&value, |caps: &Captures<'_>| {
+                let candidate = &caps[0];
+                if candidate.parse::<std::net::Ipv4Addr>().is_ok() {
+                    format!("<ip:{}>", pseudonym(candidate))
+                } else {
+                    candidate.to_string()
+                }
+            })
+            .into_owned();
+        if had_newline {
+            value.push('\n');
+        }
+        value
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn normal_log_snapshot_contains_no_raw_privacy_canaries() {
+            let ip = "198.51.100.77";
+            let hash = "0123456789abcdef0123456789abcdef";
+            let path = r"C:\Users\Canary Name\private\secret-file.bin";
+            let line = format!(
+                "peer={ip}:4662 hash={hash} path={path}, nick='Canary Nick' query=\"rare term\"\n"
+            );
+            let redacted = redact_normal_log(&line);
+            assert!(!redacted.contains(ip));
+            assert!(!redacted.contains(hash));
+            assert!(!redacted.contains(path));
+            assert!(!redacted.contains("Canary Nick"));
+            assert!(!redacted.contains("rare term"));
+            assert!(redacted.contains("<ip:"));
+            assert!(redacted.contains("<id:"));
+            assert!(redacted.contains("<path:"));
+        }
+
+        #[test]
+        fn peer_newlines_cannot_inject_log_records() {
+            let redacted = redact_normal_log("nick='bad\nforged WARN record'\n");
+            assert_eq!(redacted.matches('\n').count(), 1);
+            assert!(!redacted.contains("forged WARN record"));
+        }
+    }
+}
 
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Monotonic counter used to generate unique temp paths within this process,
-/// so concurrent atomic writes to different finals never collide on the same
-/// temp file (even when two callers target the same parent directory).
-static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Non-queuing resource guard for expensive IPC operations. A compromised
+/// renderer cannot build an unbounded waiter backlog: concurrent attempts fail
+/// immediately and the flag is released on every return/panic unwind.
+pub struct SingleFlightGuard<'a>(&'a AtomicBool);
+
+impl Drop for SingleFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+pub fn try_begin_single_flight(flag: &AtomicBool) -> Option<SingleFlightGuard<'_>> {
+    flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .ok()
+        .map(|_| SingleFlightGuard(flag))
+}
 
 fn unique_tmp_path(final_path: &Path) -> PathBuf {
-    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    use rand::RngCore;
+    let mut random = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut random);
     let pid = std::process::id();
     let parent = final_path.parent().unwrap_or_else(|| Path::new("."));
     let stem = final_path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "file".to_string());
-    parent.join(format!(".{stem}.{pid}.{seq}.tmp"))
+    parent.join(format!(".{stem}.{pid}.{}.tmp", hex::encode(random)))
 }
 
 const DANGEROUS_EXTENSIONS: &[&str] = &[
@@ -538,26 +739,70 @@ fn is_bare_drive_letter(normalized: &str) -> bool {
 }
 
 /// Restrict file permissions to the current user only (platform-specific).
-pub fn restrict_file_permissions(path: &Path) {
+/// The checked form is used for security state so ACL failures are surfaced
+/// rather than silently publishing sensitive bytes with inherited access.
+pub fn restrict_file_permissions_checked(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        let mode = if std::fs::metadata(path)?.is_dir() {
+            0o700
+        } else {
+            0o600
+        };
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
     }
     #[cfg(target_os = "windows")]
     {
         let path_str = path.to_string_lossy().to_string();
         use std::os::windows::process::CommandExt;
-        let _ = std::process::Command::new("icacls")
-            .args([
-                &path_str,
-                "/inheritance:r",
-                "/grant:r",
-                &format!("{}:(F)", whoami()),
-                "/q",
-            ])
-            .creation_flags(0x08000000) // CREATE_NO_WINDOW
-            .output();
+        let user = whoami()?;
+        let run_icacls = |args: &[&str]| -> std::io::Result<()> {
+            let output = std::process::Command::new("icacls")
+                .arg(&path_str)
+                .args(args)
+                .creation_flags(0x08000000) // CREATE_NO_WINDOW
+                .output()?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(format!(
+                    "icacls failed for {}: {}",
+                    path.display(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )))
+            }
+        };
+
+        // Bootstrap access before reading metadata. The previous faulty ACL
+        // operation may have left an existing file with no usable ACEs; the
+        // owner can still repair its DACL even when ordinary file access is
+        // denied.
+        let bootstrap_grant = format!("{user}:F");
+        run_icacls(&["/grant:r", bootstrap_grant.as_str(), "/q"])?;
+
+        let grant = if std::fs::metadata(path)?.is_dir() {
+            format!("{user}:(OI)(CI)F")
+        } else {
+            bootstrap_grant
+        };
+
+        // Remove inherited ACEs, then re-assert the explicit grant.
+        // Combining `/inheritance:r` and `/grant:r` in one invocation left
+        // some existing Windows files with an empty DACL, locking out the
+        // current user.
+        run_icacls(&["/inheritance:r", "/q"])?;
+        run_icacls(&["/grant:r", grant.as_str(), "/q"])?;
+    }
+    Ok(())
+}
+
+pub fn restrict_file_permissions(path: &Path) {
+    if let Err(error) = restrict_file_permissions_checked(path) {
+        tracing::warn!(
+            "Failed to restrict permissions on {}: {error}",
+            path.display()
+        );
     }
 }
 
@@ -570,57 +815,59 @@ pub fn restrict_file_permissions(path: &Path) {
 pub fn atomic_write(final_path: &Path, data: &[u8], restrict: bool) -> std::io::Result<()> {
     use std::io::Write;
 
-    let tmp = unique_tmp_path(final_path);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mode = if restrict { 0o600 } else { 0o644 };
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(mode)
-            .open(&tmp)?;
-        if let Err(e) = f.write_all(data) {
+    let (tmp, mut f) = {
+        let mut opened = None;
+        for _ in 0..32 {
+            let candidate = unique_tmp_path(final_path);
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options
+                    .mode(if restrict { 0o600 } else { 0o644 })
+                    .custom_flags(libc::O_NOFOLLOW);
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+                options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+            }
+            match options.open(&candidate) {
+                Ok(file) => {
+                    opened = Some((candidate, file));
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        opened.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "could not allocate random atomic-write temp file",
+            )
+        })?
+    };
+    if restrict {
+        if let Err(error) = restrict_file_permissions_checked(&tmp) {
             drop(f);
             let _ = std::fs::remove_file(&tmp);
-            return Err(e);
-        }
-        if let Err(e) = f.sync_all() {
-            drop(f);
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
-        }
-        drop(f);
-    }
-    #[cfg(not(unix))]
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp)?;
-        if let Err(e) = f.write_all(data) {
-            drop(f);
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
-        }
-        // Propagate `sync_all` failures rather than swallowing them. The
-        // previous `let _ = f.sync_all()` could leave the OS-level file
-        // page-cache holding bytes that aren't durable, then the rename
-        // below would publish a half-flushed file. On a power loss the
-        // user would see truncated/empty `known.met`, `clients.met`, etc.
-        if let Err(e) = f.sync_all() {
-            drop(f);
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
-        }
-        drop(f);
-        if restrict {
-            restrict_file_permissions(&tmp);
+            return Err(error);
         }
     }
+    if let Err(e) = f.write_all(data) {
+        drop(f);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = f.sync_all() {
+        drop(f);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    drop(f);
 
     if let Err(e) = std::fs::rename(&tmp, final_path) {
         #[cfg(target_os = "windows")]
@@ -704,15 +951,21 @@ pub fn write_file_restricted(path: &Path, data: &[u8]) -> std::io::Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-fn whoami() -> String {
+fn whoami() -> std::io::Result<String> {
     use std::os::windows::process::CommandExt;
-    std::process::Command::new("whoami")
+    let output = std::process::Command::new("whoami")
         .creation_flags(0x08000000)
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s: String| s.trim().to_string())
-        .unwrap_or_else(|| std::env::var("USERNAME").unwrap_or_else(|_| "CURRENTUSER".to_string()))
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::other("whoami failed"));
+    }
+    let user = String::from_utf8(output.stdout)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let user = user.trim();
+    if user.is_empty() {
+        return Err(std::io::Error::other("whoami returned an empty account"));
+    }
+    Ok(user.to_string())
 }
 
 /// Clean up log files older than the given number of days.
@@ -899,6 +1152,19 @@ pub fn sanitize_display_name(name: &str) -> String {
     }
 }
 
+/// Strip non-printing/reordering characters from network-originated UI text
+/// while preserving ordinary RTL letters and punctuation. Call this before
+/// deriving a filename extension or media type so invisible suffix tricks
+/// cannot influence security- or behavior-relevant classification.
+pub fn sanitize_remote_text(text: &str, max_chars: usize) -> String {
+    text.chars()
+        .filter(|c| !c.is_control() && *c != '\0' && !is_invisible_or_bidi_control(*c))
+        .take(max_chars)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 /// Sanitize free-form chat text from the local user before
 /// sending. Mirrors `sanitize_display_name` but preserves newlines
 /// (the chat textarea allows Shift+Enter), and does NOT default to
@@ -979,6 +1245,28 @@ mod tests {
     }
 
     #[test]
+    fn remote_text_strips_bidi_controls_but_preserves_real_rtl() {
+        assert_eq!(
+            sanitize_remote_text("report\u{202E}fdp.exe\u{200B}", 128),
+            "reportfdp.exe"
+        );
+        assert_eq!(
+            sanitize_remote_text("ملف عربي — קובץ עברי", 128),
+            "ملف عربي — קובץ עברי"
+        );
+        assert_eq!(sanitize_remote_text("a\u{0000}\nb\tc", 128), "abc");
+    }
+
+    #[test]
+    fn single_flight_rejects_overlap_and_releases_on_drop() {
+        let flag = AtomicBool::new(false);
+        let first = try_begin_single_flight(&flag).expect("first request starts");
+        assert!(try_begin_single_flight(&flag).is_none());
+        drop(first);
+        assert!(try_begin_single_flight(&flag).is_some());
+    }
+
+    #[test]
     fn sanitize_chat_text_keeps_newlines_strips_overrides() {
         // L20: chat text preserves whitespace newlines but drops
         // override / zero-width formatting.
@@ -995,5 +1283,56 @@ mod tests {
         // Cap respected.
         let big = "x".repeat(8_000);
         assert_eq!(sanitize_chat_text(&big).len(), 4096);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn restricted_windows_directory_keeps_current_user_access() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-acl-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        restrict_file_permissions_checked(&dir).unwrap();
+
+        let file = dir.join("ember.log.test");
+        std::fs::write(&file, b"log").expect("restricted directory must remain writable");
+        restrict_file_permissions_checked(&file).unwrap();
+        assert_eq!(
+            std::fs::read(&file).expect("restricted file must remain readable"),
+            b"log"
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn repairs_windows_file_left_with_empty_inherited_acl() {
+        use std::os::windows::process::CommandExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "ember-acl-repair-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("ember.db-wal");
+        std::fs::write(&file, b"state").unwrap();
+
+        // Reproduce the old bug: removing inheritance from a file with no
+        // explicit user ACE leaves it inaccessible.
+        let output = std::process::Command::new("icacls")
+            .arg(&file)
+            .args(["/inheritance:r", "/q"])
+            .creation_flags(0x08000000)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+
+        restrict_file_permissions_checked(&file).expect("ACL repair must restore owner access");
+        assert_eq!(std::fs::read(&file).unwrap(), b"state");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

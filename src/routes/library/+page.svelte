@@ -741,13 +741,11 @@
   async function handleAddFolder() {
     error = null;
     try {
-      const { open } = await import('@tauri-apps/plugin-dialog');
-      const selected = await open({ directory: true, multiple: false });
+      const selected = await addSharedFolder();
       if (!mounted || !selected) return;
       stoppedByUser = false;
       scanning = true;
       scanTruncated = false;
-      await addSharedFolder(selected as string);
       if (mounted) await refresh();
     } catch (e: unknown) {
       // On success the scanning banner is cleared by the background
@@ -2057,28 +2055,10 @@
     const uniquePaths = [...new Set(paths.filter((p) => typeof p === 'string' && p.length > 0))];
     if (uniquePaths.length === 0) return;
 
-    // Backend `add_shared_folder` will reject non-directories and already-shared paths.
-    // We let it arbitrate and surface per-path errors here.
-    let added = 0;
-    const failures: string[] = [];
-    for (const path of uniquePaths) {
-      try {
-        await addSharedFolder(path);
-        added++;
-      } catch (e: unknown) {
-        failures.push(`${path}: ${toErr(e)}`);
-      }
-    }
-    if (added > 0) {
-      stoppedByUser = false;
-      scanning = true;
-      scanTruncated = false;
-      const base = added === 1 ? m.library_added_folder_one() : m.library_added_folder_other({ count: added });
-      toastSuccess(failures.length ? m.library_added_with_skipped({ base, skipped: failures.length }) : base);
-      if (mounted) await refresh();
-    } else if (failures.length > 0) {
-      toastWarning(failures[0]);
-    }
+    // OS drag/drop paths are visible to the renderer and therefore are not
+    // filesystem authorization. Re-open the trusted native picker so the user
+    // explicitly confirms the folder without restoring raw-path IPC authority.
+    await handleAddFolder();
   }
 
   // A collection opened from the OS is handed over in FIFO order. Consume it
@@ -3087,15 +3067,15 @@
             <div class="details-meta-grid">
               {#if selectedMedia.title}
                 <span class="meta-label">{m.library_meta_title()}</span>
-                <span class="meta-value"><bdi>{selectedMedia.title}</bdi></span>
+                <span class="meta-value"><bdi dir="auto">{selectedMedia.title}</bdi></span>
               {/if}
               {#if selectedMedia.artist}
                 <span class="meta-label">{m.library_meta_artist()}</span>
-                <span class="meta-value"><bdi>{selectedMedia.artist}</bdi></span>
+                <span class="meta-value"><bdi dir="auto">{selectedMedia.artist}</bdi></span>
               {/if}
               {#if selectedMedia.album}
                 <span class="meta-label">{m.library_meta_album()}</span>
-                <span class="meta-value"><bdi>{selectedMedia.album}</bdi></span>
+                <span class="meta-value"><bdi dir="auto">{selectedMedia.album}</bdi></span>
               {/if}
               {#if selectedMedia.duration}
                 <span class="meta-label">{m.library_meta_duration()}</span>
@@ -3177,14 +3157,14 @@
                   <div class="comment-label">{m.library_peer_comments()}</div>
                   {#each commentInfo.peer_comments as pc, i (i)}
                     <div class="comment-peer-item">
-                      <span class="comment-peer-name"><bdi>{pc.user_name}</bdi></span>
+                      <span class="comment-peer-name"><bdi dir="auto">{pc.user_name}</bdi></span>
                       <span class="comment-peer-stars">
                         {#each [1,2,3,4,5] as s}
                           <span class="star-display">{s <= pc.rating ? '\u2605' : '\u2606'}</span>
                         {/each}
                       </span>
                       {#if pc.comment}
-                        <span class="comment-peer-text"><bdi>{pc.comment}</bdi></span>
+                        <span class="comment-peer-text"><bdi dir="auto">{pc.comment}</bdi></span>
                       {/if}
                     </div>
                   {/each}

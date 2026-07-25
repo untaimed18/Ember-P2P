@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::mem::size_of;
 
 use tracing::debug;
 
@@ -7,6 +8,15 @@ use super::types::*;
 
 const MAX_ENTRIES_PER_KEY: usize = 1000;
 const MAX_TOTAL_ENTRIES: usize = 50_000;
+const MAX_TOTAL_RETAINED_BYTES: usize = 64 * 1024 * 1024;
+const MAX_RETAINED_BYTES_PER_KEY: usize = 4 * 1024 * 1024;
+const MAX_RETAINED_BYTES_PER_PUBLISHER_PER_KEY: usize = 2 * 1024 * 1024;
+const MAX_RETAINED_BYTES_PER_ENTRY: usize = 64 * 1024;
+const MAX_STORED_TAGS: usize = 64;
+const MAX_STORED_TAG_NAME_BYTES: usize = 256;
+const MAX_STORED_STRING_BYTES: usize = 8 * 1024;
+const MAX_STORED_FILENAME_BYTES: usize = 4 * 1024;
+const MAX_STORED_BLOB_BYTES: usize = 8 * 1024;
 // eMule caps one keyword-publish batch at 150 files. Mirroring that as the
 // maximum contribution from one verified KAD identity prevents one publisher
 // monopolising an entire 1000-entry keyword bucket while accepting a complete
@@ -30,12 +40,75 @@ pub struct StoredEntry {
     pub ttl_secs: i64,
     /// The KAD ID of the node that published this entry (used for dedup).
     pub source_id: KadId,
+    retained_bytes: usize,
 }
 
 impl StoredEntry {
     pub fn is_expired(&self, now: i64) -> bool {
         now.saturating_sub(self.stored_at) >= self.ttl_secs
     }
+}
+
+/// Normalize spare capacities before retention, then account for every byte
+/// retained by the entry. Capacities (not lengths) make counter updates exact;
+/// the conservative inline `size_of` component also includes allocator-backed
+/// field headers and the accounting field itself.
+fn normalize_and_size_tags(mut tags: Vec<KadTag>) -> Option<(Vec<KadTag>, usize)> {
+    if tags.len() > MAX_STORED_TAGS {
+        return None;
+    }
+    for tag in &mut tags {
+        match &mut tag.name {
+            TagName::Id(_) => {}
+            TagName::Str(name) => {
+                if name.len() > MAX_STORED_TAG_NAME_BYTES {
+                    return None;
+                }
+                name.shrink_to_fit();
+            }
+        }
+        match &mut tag.value {
+            TagValue::String(value) => {
+                let limit = if matches!(tag.name, TagName::Id(TAG_FILENAME)) {
+                    MAX_STORED_FILENAME_BYTES
+                } else {
+                    MAX_STORED_STRING_BYTES
+                };
+                if value.len() > limit {
+                    return None;
+                }
+                value.shrink_to_fit();
+            }
+            TagValue::Blob(value) | TagValue::Bsob(value) => {
+                if value.len() > MAX_STORED_BLOB_BYTES {
+                    return None;
+                }
+                value.shrink_to_fit();
+            }
+            _ => {}
+        }
+    }
+    tags.shrink_to_fit();
+
+    let mut bytes =
+        size_of::<StoredEntry>().checked_add(tags.capacity().checked_mul(size_of::<KadTag>())?)?;
+    for tag in &tags {
+        if let TagName::Str(name) = &tag.name {
+            bytes = bytes.checked_add(name.capacity())?;
+        }
+        match &tag.value {
+            TagValue::String(value) => bytes = bytes.checked_add(value.capacity())?,
+            TagValue::Blob(value) | TagValue::Bsob(value) => {
+                bytes = bytes.checked_add(value.capacity())?
+            }
+            _ => {}
+        }
+    }
+    (bytes <= MAX_RETAINED_BYTES_PER_ENTRY).then_some((tags, bytes))
+}
+
+fn retained_bytes(entries: &[StoredEntry]) -> usize {
+    entries.iter().map(|entry| entry.retained_bytes).sum()
 }
 
 /// eMule `CIndexed::AddKeyword` minimum-content gate for a single
@@ -60,6 +133,7 @@ pub struct DhtStore {
     source_entries: HashMap<KadId, Vec<StoredEntry>>,
     notes_entries: HashMap<KadId, Vec<StoredEntry>>,
     total_count: usize,
+    total_retained_bytes: usize,
     local_id: KadId,
 }
 
@@ -70,6 +144,7 @@ impl DhtStore {
             source_entries: HashMap::new(),
             notes_entries: HashMap::new(),
             total_count: 0,
+            total_retained_bytes: 0,
             local_id: KadId::zero(),
         }
     }
@@ -106,8 +181,12 @@ impl DhtStore {
         let now = chrono::Utc::now().timestamp();
 
         let len_before = bucket.len();
+        let bytes_before = retained_bytes(bucket);
         bucket.retain(|e| !e.is_expired(now));
         self.total_count = self.total_count.saturating_sub(len_before - bucket.len());
+        self.total_retained_bytes = self
+            .total_retained_bytes
+            .saturating_sub(bytes_before.saturating_sub(retained_bytes(bucket)));
         let mut sender_entry_count = bucket
             .iter()
             .filter(|entry| entry.source_id == *sender_id)
@@ -127,12 +206,43 @@ impl DhtStore {
             if !keyword_entry_has_min_content(&entry.tags) {
                 continue;
             }
+            let Some((tags, entry_bytes)) = normalize_and_size_tags(entry.tags) else {
+                continue;
+            };
+            let key_bytes = retained_bytes(bucket);
+            let publisher_bytes: usize = bucket
+                .iter()
+                .filter(|stored| stored.source_id == *sender_id)
+                .map(|stored| stored.retained_bytes)
+                .sum();
             if let Some(pos) = bucket
                 .iter()
                 .position(|e| e.id == entry.id && e.source_id == *sender_id)
             {
-                bucket[pos].tags = entry.tags;
+                let old_bytes = bucket[pos].retained_bytes;
+                if key_bytes
+                    .saturating_sub(old_bytes)
+                    .saturating_add(entry_bytes)
+                    > MAX_RETAINED_BYTES_PER_KEY
+                    || publisher_bytes
+                        .saturating_sub(old_bytes)
+                        .saturating_add(entry_bytes)
+                        > MAX_RETAINED_BYTES_PER_PUBLISHER_PER_KEY
+                    || self
+                        .total_retained_bytes
+                        .saturating_sub(old_bytes)
+                        .saturating_add(entry_bytes)
+                        > MAX_TOTAL_RETAINED_BYTES
+                {
+                    continue;
+                }
+                bucket[pos].tags = tags;
                 bucket[pos].stored_at = now;
+                bucket[pos].retained_bytes = entry_bytes;
+                self.total_retained_bytes = self
+                    .total_retained_bytes
+                    .saturating_sub(old_bytes)
+                    .saturating_add(entry_bytes);
             } else {
                 // Skip *this* new entry when full, but keep scanning the rest
                 // of the batch: later entries may be updates to existing records
@@ -149,14 +259,24 @@ impl DhtStore {
                 if bucket.len() >= MAX_ENTRIES_PER_KEY {
                     continue;
                 }
+                if key_bytes.saturating_add(entry_bytes) > MAX_RETAINED_BYTES_PER_KEY
+                    || publisher_bytes.saturating_add(entry_bytes)
+                        > MAX_RETAINED_BYTES_PER_PUBLISHER_PER_KEY
+                    || self.total_retained_bytes.saturating_add(entry_bytes)
+                        > MAX_TOTAL_RETAINED_BYTES
+                {
+                    continue;
+                }
                 bucket.push(StoredEntry {
                     id: entry.id,
-                    tags: entry.tags,
+                    tags,
                     stored_at: now,
                     ttl_secs: KEYWORD_TTL_SECS,
                     source_id: *sender_id,
+                    retained_bytes: entry_bytes,
                 });
                 self.total_count += 1;
+                self.total_retained_bytes += entry_bytes;
                 sender_entry_count += 1;
             }
         }
@@ -211,11 +331,18 @@ impl DhtStore {
         let now = chrono::Utc::now().timestamp();
 
         let len_before = bucket.len();
-        bucket.retain(|e| !e.is_expired(now) && e.id != sender_id);
+        let bytes_before = retained_bytes(bucket);
+        bucket.retain(|e| !e.is_expired(now));
         let removed = len_before - bucket.len();
         self.total_count = self.total_count.saturating_sub(removed);
+        self.total_retained_bytes = self
+            .total_retained_bytes
+            .saturating_sub(bytes_before.saturating_sub(retained_bytes(bucket)));
+        let existing_pos = bucket.iter().position(|entry| entry.id == sender_id);
 
-        if self.total_count >= MAX_TOTAL_ENTRIES || bucket.len() >= MAX_ENTRIES_PER_KEY {
+        if existing_pos.is_none()
+            && (self.total_count >= MAX_TOTAL_ENTRIES || bucket.len() >= MAX_ENTRIES_PER_KEY)
+        {
             // Don't leave behind an empty `target -> Vec::new()` key for a
             // brand-new target that got rejected outright by the global/
             // per-key cap — see the matching comment in
@@ -234,6 +361,7 @@ impl DhtStore {
         let ip_u32 = u32::from_be_bytes(sender_ip.octets());
         let ip_count = bucket
             .iter()
+            .filter(|entry| entry.id != sender_id)
             .filter(|e| {
                 e.tags.iter().any(|t| {
                     matches!(&t.name, TagName::Id(TAG_SOURCEIP))
@@ -276,50 +404,110 @@ impl DhtStore {
             });
         }
 
-        bucket.push(StoredEntry {
+        let Some((tags, entry_bytes)) = normalize_and_size_tags(tags) else {
+            if bucket.is_empty() {
+                self.source_entries.remove(target);
+            }
+            return self.compute_load();
+        };
+        let old_bytes = existing_pos
+            .map(|pos| bucket[pos].retained_bytes)
+            .unwrap_or(0);
+        if retained_bytes(bucket)
+            .saturating_sub(old_bytes)
+            .saturating_add(entry_bytes)
+            > MAX_RETAINED_BYTES_PER_KEY
+            || self
+                .total_retained_bytes
+                .saturating_sub(old_bytes)
+                .saturating_add(entry_bytes)
+                > MAX_TOTAL_RETAINED_BYTES
+        {
+            if bucket.is_empty() {
+                self.source_entries.remove(target);
+            }
+            return self.compute_load();
+        }
+        let stored = StoredEntry {
             id: sender_id,
             tags,
-            stored_at: chrono::Utc::now().timestamp(),
+            stored_at: now,
             ttl_secs: SOURCE_TTL_SECS,
             source_id: sender_id,
-        });
-        self.total_count += 1;
+            retained_bytes: entry_bytes,
+        };
+        if let Some(pos) = existing_pos {
+            bucket[pos] = stored;
+        } else {
+            bucket.push(stored);
+            self.total_count += 1;
+        }
+        self.total_retained_bytes = self
+            .total_retained_bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(entry_bytes);
 
         self.compute_load()
     }
 
+    #[cfg(test)]
     pub fn search_keywords(&self, target: &KadId) -> Vec<SearchResultEntry> {
-        let now = chrono::Utc::now().timestamp();
-        self.keyword_entries
-            .get(target)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter(|e| !e.is_expired(now))
-                    .map(|e| SearchResultEntry {
-                        id: e.id,
-                        tags: e.tags.clone(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.search_keywords_page(target, 0, usize::MAX, |_, _| true)
     }
 
+    #[cfg(test)]
     pub fn search_sources(&self, target: &KadId) -> Vec<SearchResultEntry> {
+        self.search_sources_page(target, 0, usize::MAX, |_, _| true)
+    }
+
+    fn search_page<F>(
+        entries: Option<&Vec<StoredEntry>>,
+        start: usize,
+        limit: usize,
+        mut predicate: F,
+    ) -> Vec<SearchResultEntry>
+    where
+        F: FnMut(&KadId, &[KadTag]) -> bool,
+    {
         let now = chrono::Utc::now().timestamp();
-        self.source_entries
-            .get(target)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter(|e| !e.is_expired(now))
-                    .map(|e| SearchResultEntry {
-                        id: e.id,
-                        tags: e.tags.clone(),
-                    })
-                    .collect()
+        entries
+            .into_iter()
+            .flatten()
+            .filter(|entry| !entry.is_expired(now))
+            .filter(|entry| predicate(&entry.id, &entry.tags))
+            .skip(start)
+            .take(limit)
+            .map(|entry| SearchResultEntry {
+                id: entry.id,
+                tags: entry.tags.clone(),
             })
-            .unwrap_or_default()
+            .collect()
+    }
+
+    pub fn search_keywords_page<F>(
+        &self,
+        target: &KadId,
+        start: usize,
+        limit: usize,
+        predicate: F,
+    ) -> Vec<SearchResultEntry>
+    where
+        F: FnMut(&KadId, &[KadTag]) -> bool,
+    {
+        Self::search_page(self.keyword_entries.get(target), start, limit, predicate)
+    }
+
+    pub fn search_sources_page<F>(
+        &self,
+        target: &KadId,
+        start: usize,
+        limit: usize,
+        predicate: F,
+    ) -> Vec<SearchResultEntry>
+    where
+        F: FnMut(&KadId, &[KadTag]) -> bool,
+    {
+        Self::search_page(self.source_entries.get(target), start, limit, predicate)
     }
 
     pub fn store_notes_entry(&mut self, target: &KadId, sender_id: KadId, tags: Vec<KadTag>) -> u8 {
@@ -345,11 +533,18 @@ impl DhtStore {
         let now = chrono::Utc::now().timestamp();
 
         let len_before = bucket.len();
-        bucket.retain(|e| !e.is_expired(now) && e.id != sender_id);
+        let bytes_before = retained_bytes(bucket);
+        bucket.retain(|e| !e.is_expired(now));
         let removed = len_before - bucket.len();
         self.total_count = self.total_count.saturating_sub(removed);
+        self.total_retained_bytes = self
+            .total_retained_bytes
+            .saturating_sub(bytes_before.saturating_sub(retained_bytes(bucket)));
+        let existing_pos = bucket.iter().position(|entry| entry.id == sender_id);
 
-        if self.total_count >= MAX_TOTAL_ENTRIES || bucket.len() >= MAX_NOTES_PER_FILE {
+        if existing_pos.is_none()
+            && (self.total_count >= MAX_TOTAL_ENTRIES || bucket.len() >= MAX_NOTES_PER_FILE)
+        {
             // See the matching comment in `store_keyword_entries`/
             // `store_source_entry`: don't leave an empty bucket key behind
             // for a brand-new target rejected by the cap.
@@ -359,63 +554,110 @@ impl DhtStore {
             return self.compute_load();
         }
 
-        bucket.push(StoredEntry {
+        let Some((tags, entry_bytes)) = normalize_and_size_tags(tags) else {
+            if bucket.is_empty() {
+                self.notes_entries.remove(target);
+            }
+            return self.compute_load();
+        };
+        let old_bytes = existing_pos
+            .map(|pos| bucket[pos].retained_bytes)
+            .unwrap_or(0);
+        if retained_bytes(bucket)
+            .saturating_sub(old_bytes)
+            .saturating_add(entry_bytes)
+            > MAX_RETAINED_BYTES_PER_KEY
+            || self
+                .total_retained_bytes
+                .saturating_sub(old_bytes)
+                .saturating_add(entry_bytes)
+                > MAX_TOTAL_RETAINED_BYTES
+        {
+            if bucket.is_empty() {
+                self.notes_entries.remove(target);
+            }
+            return self.compute_load();
+        }
+        let stored = StoredEntry {
             id: sender_id,
             tags,
-            stored_at: chrono::Utc::now().timestamp(),
+            stored_at: now,
             ttl_secs: NOTES_TTL_SECS,
             source_id: sender_id,
-        });
-        self.total_count += 1;
+            retained_bytes: entry_bytes,
+        };
+        if let Some(pos) = existing_pos {
+            bucket[pos] = stored;
+        } else {
+            bucket.push(stored);
+            self.total_count += 1;
+        }
+        self.total_retained_bytes = self
+            .total_retained_bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(entry_bytes);
 
         self.compute_load()
     }
 
+    #[cfg(test)]
     pub fn search_notes(&self, target: &KadId) -> Vec<SearchResultEntry> {
-        let now = chrono::Utc::now().timestamp();
-        self.notes_entries
-            .get(target)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter(|e| !e.is_expired(now))
-                    .map(|e| SearchResultEntry {
-                        id: e.id,
-                        tags: e.tags.clone(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.search_notes_page(target, 0, usize::MAX, |_, _| true)
+    }
+
+    pub fn search_notes_page<F>(
+        &self,
+        target: &KadId,
+        start: usize,
+        limit: usize,
+        predicate: F,
+    ) -> Vec<SearchResultEntry>
+    where
+        F: FnMut(&KadId, &[KadTag]) -> bool,
+    {
+        Self::search_page(self.notes_entries.get(target), start, limit, predicate)
     }
 
     pub fn cleanup_expired(&mut self) {
         let now = chrono::Utc::now().timestamp();
-        let mut removed = 0usize;
+        let count_before = self.total_count;
+        let bytes_before = self.total_retained_bytes;
 
         for entries in self.keyword_entries.values_mut() {
-            let before = entries.len();
             entries.retain(|e| !e.is_expired(now));
-            removed += before - entries.len();
         }
         self.keyword_entries.retain(|_, v| !v.is_empty());
 
         for entries in self.source_entries.values_mut() {
-            let before = entries.len();
             entries.retain(|e| !e.is_expired(now));
-            removed += before - entries.len();
         }
         self.source_entries.retain(|_, v| !v.is_empty());
 
         for entries in self.notes_entries.values_mut() {
-            let before = entries.len();
             entries.retain(|e| !e.is_expired(now));
-            removed += before - entries.len();
         }
         self.notes_entries.retain(|_, v| !v.is_empty());
 
-        self.total_count = self.total_count.saturating_sub(removed);
+        self.total_count = self
+            .keyword_entries
+            .values()
+            .chain(self.source_entries.values())
+            .chain(self.notes_entries.values())
+            .map(Vec::len)
+            .sum();
+        self.total_retained_bytes = self
+            .keyword_entries
+            .values()
+            .chain(self.source_entries.values())
+            .chain(self.notes_entries.values())
+            .map(|entries| retained_bytes(entries))
+            .sum();
+        let removed = count_before.saturating_sub(self.total_count);
         if removed > 0 {
-            debug!("DHT store cleanup: removed {removed} expired entries");
+            debug!(
+                "DHT store cleanup: removed {removed} expired entries ({} retained bytes)",
+                bytes_before.saturating_sub(self.total_retained_bytes)
+            );
         }
     }
 
@@ -428,7 +670,8 @@ impl DhtStore {
     /// our receive-side handlers also treat `load >= 100` as an
     /// informational bucket-full signal (see PublishRes handling).
     fn compute_load(&self) -> u8 {
-        let ratio = self.total_count as f64 / MAX_TOTAL_ENTRIES as f64;
+        let ratio = (self.total_count as f64 / MAX_TOTAL_ENTRIES as f64)
+            .max(self.total_retained_bytes as f64 / MAX_TOTAL_RETAINED_BYTES as f64);
         (ratio * 100.0).min(100.0) as u8
     }
 }
@@ -565,6 +808,60 @@ mod keyword_store_tests {
         let sender = KadId([0x66; 16]);
         store.store_keyword_entries(&target, vec![entry(1)], &sender);
         assert_eq!(store.search_keywords(&target).len(), 1);
+    }
+
+    #[test]
+    fn retained_byte_counter_tracks_replace_and_expiry_exactly() {
+        let mut store = DhtStore::new();
+        let target = KadId([0x70; 16]);
+        let sender = KadId([0x71; 16]);
+        store.store_keyword_entries(&target, vec![entry(1)], &sender);
+        let first = store.keyword_entries[&target][0].retained_bytes;
+        assert_eq!(store.total_retained_bytes, first);
+
+        let mut replacement = entry(1);
+        replacement.tags.push(KadTag {
+            name: TagName::Str("format".to_string()),
+            value: TagValue::String("application/octet-stream".repeat(20)),
+        });
+        store.store_keyword_entries(&target, vec![replacement], &sender);
+        let second = store.keyword_entries[&target][0].retained_bytes;
+        assert!(second > first);
+        assert_eq!(store.total_retained_bytes, second);
+
+        store.keyword_entries.get_mut(&target).unwrap()[0].stored_at = 0;
+        store.cleanup_expired();
+        assert_eq!(store.total_count, 0);
+        assert_eq!(store.total_retained_bytes, 0);
+    }
+
+    #[test]
+    fn rejects_oversized_stored_fields_without_leaving_bucket() {
+        let mut store = DhtStore::new();
+        let target = KadId([0x72; 16]);
+        let sender = KadId([0x73; 16]);
+        let mut oversized = entry(1);
+        oversized.tags[0].value = TagValue::String("x".repeat(MAX_STORED_FILENAME_BYTES + 1));
+        store.store_keyword_entries(&target, vec![oversized], &sender);
+        assert!(!store.keyword_entries.contains_key(&target));
+        assert_eq!(store.total_retained_bytes, 0);
+    }
+
+    #[test]
+    fn keyword_publish_and_search_keep_emule_batch_and_page_sizes() {
+        let mut store = DhtStore::new();
+        let target = KadId([0x74; 16]);
+        store.store_keyword_entries(&target, (0..150).map(entry).collect(), &KadId([0x75; 16]));
+        store.store_keyword_entries(&target, (150..300).map(entry).collect(), &KadId([0x76; 16]));
+        assert_eq!(
+            store.keyword_entries[&target]
+                .iter()
+                .filter(|entry| entry.source_id == KadId([0x75; 16]))
+                .count(),
+            150
+        );
+        let page = store.search_keywords_page(&target, 25, 200, |_, _| true);
+        assert_eq!(page.len(), 200);
     }
 }
 

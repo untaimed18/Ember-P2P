@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use tauri::Emitter;
 use tauri::Manager;
+use tauri_plugin_dialog::DialogExt;
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -16,11 +17,41 @@ const MAX_PATH_LEN: usize = 4 * 1024;
 /// Maximum file-id count in a single batch sharing operation. Bounds
 /// the IPC payload and the per-call DB transaction size.
 const MAX_BATCH_IDS: usize = 10_000;
+const MAX_BATCH_PATH_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SCAN_MISSING_RESULTS: usize = 10_000;
 /// Upper bound on the number of paths accepted by `remove_missing_files` in a
 /// single IPC call. Generous enough for any realistic library while bounding a
 /// compromised-webview payload (and the per-call stat loop / index lock hold).
 const MAX_REMOVE_MISSING_PATHS: usize = 200_000;
+
+fn check_path_batch(paths: &[String], max_count: usize) -> Result<(), String> {
+    if paths.len() > max_count {
+        return Err(coded_ctx(
+            "sharing_batch_too_large",
+            format!("Too many paths in one batch (max {max_count})"),
+            paths.len(),
+        ));
+    }
+    let mut total = 0usize;
+    for path in paths {
+        if path.len() > MAX_PATH_LEN {
+            return Err(coded_ctx(
+                "sharing_file_path_too_long",
+                format!("File path exceeds {MAX_PATH_LEN} bytes"),
+                path.len(),
+            ));
+        }
+        total = total.saturating_add(path.len());
+        if total > MAX_BATCH_PATH_BYTES {
+            return Err(coded_ctx(
+                "sharing_batch_bytes_too_large",
+                format!("Path batch exceeds {MAX_BATCH_PATH_BYTES} bytes"),
+                total,
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// Result of a missing-file filesystem probe. `paths` is capped; when
 /// `truncated` is true, `total_missing` is still the full count so the UI can
@@ -41,6 +72,8 @@ impl Drop for ScanGuard {
 }
 
 static RELOAD_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static RELOAD_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static MEDIA_METADATA_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 async fn remove_cancel_flag_if_current(
     flags: &Arc<RwLock<std::collections::HashMap<String, Arc<AtomicBool>>>>,
@@ -473,14 +506,8 @@ async fn persist_share_mutation(
         .cloned()
         .map(|path| (path, shared))
         .collect::<Vec<_>>();
-    if let Err(e) = persist_pending_intents(
-        state,
-        &pending_updates,
-        &[],
-        &mutation.hashed_paths,
-        &[],
-    )
-    .await
+    if let Err(e) =
+        persist_pending_intents(state, &pending_updates, &[], &mutation.hashed_paths, &[]).await
     {
         // The known.met half already committed. Compensate it before rolling
         // back the optimistic index so a failed config write cannot leave the
@@ -628,18 +655,29 @@ pub(crate) async fn serve_media_request(
         let indexed_paths = index
             .all_files()
             .iter()
-            .map(|file| crate::search::index::normalize_path_key(&file.path))
-            .collect::<HashSet<_>>();
+            .map(|file| {
+                (
+                    crate::search::index::normalize_path_key(&file.path),
+                    file.name.clone(),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
         (allowed_dirs, indexed_paths)
     };
     let result = tokio::task::spawn_blocking(move || {
-        let canonical = std::path::Path::new(&file_path).canonicalize()?;
+        let canonical = crate::security::filesystem::verify_existing_path(
+            std::path::Path::new(&file_path),
+            &allowed_dirs,
+        )?;
+        let indexed_name = indexed_paths.get(&crate::search::index::normalize_path_key(
+            &canonical.to_string_lossy(),
+        ));
         if !canonical.is_file()
-            || !crate::security::is_path_within_dirs(&canonical, &allowed_dirs)
-            || !indexed_paths.contains(&crate::search::index::normalize_path_key(
-                &canonical.to_string_lossy(),
-            ))
-            || crate::security::is_dangerous_extension(&canonical.to_string_lossy())
+            || indexed_name.is_none()
+            || !crate::security::filesystem::passive_type_agrees(
+                indexed_name.map(String::as_str).unwrap_or_default(),
+                &canonical,
+            )
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -754,7 +792,8 @@ fn resolve_from_known(files: &mut Vec<FileInfo>, known: &KnownFileList) -> Vec<F
             // to "normal" and re-shared a file the user had explicitly
             // unshared.
             file.priority = priority_u8_to_str(record.upload_priority).to_string();
-            file.shared = record.is_shared;
+            file.shared =
+                crate::storage::share_intent::effective_shared(&record.file_hash, record.is_shared);
             // The Library's Top Uploads panel and all-time activity columns
             // are populated from these persisted known.met counters. Restore
             // them with the hash instead of showing an empty Library until the
@@ -962,9 +1001,7 @@ pub(crate) async fn prune_pending_intents_for_hashed(state: &AppState) {
     if share_stale.is_empty() && priority_stale.is_empty() {
         return;
     }
-    if let Err(e) =
-        persist_pending_intents(state, &[], &[], &share_stale, &priority_stale).await
-    {
+    if let Err(e) = persist_pending_intents(state, &[], &[], &share_stale, &priority_stale).await {
         warn!(
             "Failed to prune {} stale pending intents: {e}",
             share_stale.len() + priority_stale.len()
@@ -1031,7 +1068,6 @@ pub(crate) async fn persist_scan_cursors(
 /// All discovery and hashing runs in a background task:
 ///   Phase 1: discover files (metadata only) → show in UI via event
 ///   Phase 2: hash files one at a time → update UI + publish to KAD
-#[tauri::command]
 pub async fn add_shared_folder(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
@@ -1163,6 +1199,31 @@ pub async fn add_shared_folder(
     .await
     .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?
     .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?;
+    {
+        let mut roots = {
+            let config = state.config.read().await;
+            let mut roots = config.settings.shared_folders.clone();
+            if !config.settings.download_folder.is_empty() {
+                roots.push(config.settings.download_folder.clone());
+            }
+            roots
+        };
+        roots.push(canonical_str.clone());
+        let registry = state.approved_roots.clone();
+        let approved = canonical_str.clone();
+        tokio::task::spawn_blocking(move || {
+            registry.update_roots(&roots, std::slice::from_ref(&approved))
+        })
+        .await
+        .map_err(|e| {
+            coded_ctx(
+                "sharing_root_registry_task_failed",
+                "Root approval failed",
+                e,
+            )
+        })?
+        .map_err(|e| coded_ctx("sharing_root_registry_failed", "Root approval failed", e))?;
+    }
     // The addition is durable on disk now; commit it in-memory and to the live
     // upload list. Both re-checks stay idempotent against a concurrent add of
     // the same path.
@@ -1387,6 +1448,16 @@ pub async fn add_shared_folder(
                     updated_file.ember_file_hash = ember_file_hash;
                     updated_file.size = hashed_size;
                     updated_file.modified_at = hashed_modified_at;
+                    if let Ok(bytes) = hex::decode(&updated_file.hash) {
+                        if bytes.len() == 16 {
+                            let mut hash = [0u8; 16];
+                            hash.copy_from_slice(&bytes);
+                            updated_file.shared = crate::storage::share_intent::effective_shared(
+                                &hash,
+                                updated_file.shared,
+                            );
+                        }
+                    }
 
                     let still_shared = {
                         let cfg = config.read().await;
@@ -1542,6 +1613,53 @@ pub async fn add_shared_folder(
     Ok(())
 }
 
+/// Open a trusted native directory picker and add the selected folder.
+///
+/// The renderer never receives authority to submit an arbitrary path to the
+/// sharing mutator: the only registered IPC command obtains its path directly
+/// from the OS picker. The selected path is returned solely so the Library can
+/// update its display; it cannot be replayed as authorization.
+#[tauri::command]
+pub async fn pick_shared_folder(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    if window.label() != "main" {
+        return Err(coded(
+            "sharing_picker_wrong_window",
+            "Shared folders can only be selected from the main window",
+        ));
+    }
+    let picker_app = app.clone();
+    let selected = tokio::task::spawn_blocking(move || {
+        picker_app
+            .dialog()
+            .file()
+            .set_title("Choose a folder to share")
+            .blocking_pick_folder()
+            .map(|folder| {
+                folder.into_path().map_err(|error| {
+                    coded_ctx(
+                        "sharing_invalid_picker_path",
+                        "Invalid selected folder",
+                        error,
+                    )
+                })
+            })
+            .transpose()
+    })
+    .await
+    .map_err(|error| coded_ctx("sharing_picker_task_failed", "Folder picker failed", error))??;
+
+    let Some(path) = selected else {
+        return Ok(None);
+    };
+    let display_path = path.to_string_lossy().into_owned();
+    add_shared_folder(app, state, display_path.clone()).await?;
+    Ok(Some(display_path))
+}
+
 #[tauri::command]
 pub async fn remove_shared_folder(
     app: tauri::AppHandle,
@@ -1647,6 +1765,33 @@ pub async fn remove_shared_folder(
         .await
         .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?
         .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?;
+    }
+    {
+        let roots = {
+            let config = state.config.read().await;
+            let mut roots: Vec<String> = config
+                .settings
+                .shared_folders
+                .iter()
+                .filter(|root| !paths_equal_ignore_case(root, &canonical_path))
+                .cloned()
+                .collect();
+            if !config.settings.download_folder.is_empty() {
+                roots.push(config.settings.download_folder.clone());
+            }
+            roots
+        };
+        let registry = state.approved_roots.clone();
+        tokio::task::spawn_blocking(move || registry.update_roots(&roots, &[]))
+            .await
+            .map_err(|e| {
+                coded_ctx(
+                    "sharing_root_registry_task_failed",
+                    "Root revocation failed",
+                    e,
+                )
+            })?
+            .map_err(|e| coded_ctx("sharing_root_registry_failed", "Root revocation failed", e))?;
     }
     {
         let mut config = state.config.write().await;
@@ -1813,6 +1958,13 @@ pub async fn get_file_media_metadata(
     state: tauri::State<'_, AppState>,
     file_path: String,
 ) -> Result<Option<crate::types::MediaMetadata>, String> {
+    let _single_flight = crate::security::try_begin_single_flight(&MEDIA_METADATA_IN_FLIGHT)
+        .ok_or_else(|| {
+            coded(
+                "sharing_media_request_in_flight",
+                "Another media metadata request is already running",
+            )
+        })?;
     if file_path.len() > MAX_PATH_LEN {
         return Err(coded_ctx(
             "sharing_file_path_too_long",
@@ -2020,9 +2172,7 @@ pub async fn set_file_priority(
         // path while it was still hashing, or a later rehash would revert the
         // user's choice. Best-effort: a stale entry is also swept by the
         // post-scan prune.
-        if let Err(e) =
-            persist_pending_intents(&state, &[], &[], &[], &[file_path.clone()]).await
-        {
+        if let Err(e) = persist_pending_intents(&state, &[], &[], &[], &[file_path.clone()]).await {
             warn!("Failed to clear pending priority intent for {file_path}: {e}");
         }
     } else {
@@ -2053,13 +2203,7 @@ pub async fn batch_set_priority(
     file_paths: Vec<String>,
     priority: String,
 ) -> Result<u32, String> {
-    if file_paths.len() > MAX_BATCH_IDS {
-        return Err(coded_ctx(
-            "sharing_batch_too_large",
-            format!("Too many file_paths in one batch (max {MAX_BATCH_IDS})"),
-            MAX_BATCH_IDS,
-        ));
-    }
+    check_path_batch(&file_paths, MAX_BATCH_IDS)?;
     let valid = ["verylow", "low", "normal", "high", "release", "auto"];
     if !valid.contains(&priority.as_str()) {
         return Err(coded_ctx(
@@ -2126,13 +2270,7 @@ pub async fn batch_share(
     state: tauri::State<'_, AppState>,
     file_paths: Vec<String>,
 ) -> Result<u32, String> {
-    if file_paths.len() > MAX_BATCH_IDS {
-        return Err(coded_ctx(
-            "sharing_batch_too_large",
-            format!("Too many file_paths in one batch (max {MAX_BATCH_IDS})"),
-            MAX_BATCH_IDS,
-        ));
-    }
+    check_path_batch(&file_paths, MAX_BATCH_IDS)?;
     let (snapshot, mutation) = {
         let mut index = state.local_index.write().await;
         let snapshot = index.all_files().to_vec();
@@ -2160,13 +2298,7 @@ pub async fn batch_unshare(
     state: tauri::State<'_, AppState>,
     file_paths: Vec<String>,
 ) -> Result<u32, String> {
-    if file_paths.len() > MAX_BATCH_IDS {
-        return Err(coded_ctx(
-            "sharing_batch_too_large",
-            format!("Too many file_paths in one batch (max {MAX_BATCH_IDS})"),
-            MAX_BATCH_IDS,
-        ));
-    }
+    check_path_batch(&file_paths, MAX_BATCH_IDS)?;
     let (snapshot, mutation) = {
         let mut index = state.local_index.write().await;
         let snapshot = index.all_files().to_vec();
@@ -2191,6 +2323,13 @@ pub async fn reload_shared_files(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    let reload_flight =
+        crate::security::try_begin_single_flight(&RELOAD_IN_FLIGHT).ok_or_else(|| {
+            coded(
+                "sharing_reload_in_flight",
+                "A shared-file reload is already running",
+            )
+        })?;
     // Manual reload / resume always clear the pause latch. The FS watcher
     // never reaches this path while paused (it checks hashing_paused first).
     state.hashing_paused.store(false, Ordering::Relaxed);
@@ -2238,6 +2377,7 @@ pub async fn reload_shared_files(
     }
 
     let scan_handle = tokio::spawn(async move {
+        let _reload_flight = reload_flight;
         let _coordination_guard = scan_coordination.lock().await;
         scanning.fetch_add(1, Ordering::Relaxed);
         let _scan_guard = ScanGuard(scanning.clone());
@@ -2415,6 +2555,16 @@ pub async fn reload_shared_files(
                     updated_file.ember_file_hash = ember_file_hash;
                     updated_file.size = hashed_size;
                     updated_file.modified_at = hashed_modified_at;
+                    if let Ok(bytes) = hex::decode(&updated_file.hash) {
+                        if bytes.len() == 16 {
+                            let mut hash = [0u8; 16];
+                            hash.copy_from_slice(&bytes);
+                            updated_file.shared = crate::storage::share_intent::effective_shared(
+                                &hash,
+                                updated_file.shared,
+                            );
+                        }
+                    }
 
                     let still_shared = {
                         let cfg = config.read().await;
@@ -2782,15 +2932,8 @@ pub async fn delete_shared_file(
             if !path.is_file() {
                 return Err(coded("sharing_path_not_file", "Path is not a file"));
             }
-            let canonical = path
-                .canonicalize()
-                .map_err(|e| coded_ctx("sharing_invalid_path", "Invalid path", e))?;
-            if !crate::security::is_path_within_dirs(&canonical, &allowed_dirs) {
-                return Err(coded(
-                    "sharing_file_not_in_shared",
-                    "File is not within a shared or download folder",
-                ));
-            }
+            let canonical = crate::security::filesystem::verify_existing_path(path, &allowed_dirs)
+                .map_err(|e| coded_ctx("sharing_invalid_path", "Invalid or changed path", e))?;
             let indexed_canonical =
                 std::path::Path::new(&indexed_path)
                     .canonicalize()
@@ -2906,13 +3049,7 @@ pub async fn remove_missing_files(
     if paths.is_empty() {
         return Ok(0);
     }
-    if paths.len() > MAX_REMOVE_MISSING_PATHS {
-        return Err(coded_ctx(
-            "sharing_too_many_paths",
-            format!("Too many paths in one call (max {MAX_REMOVE_MISSING_PATHS})"),
-            MAX_REMOVE_MISSING_PATHS,
-        ));
-    }
+    check_path_batch(&paths, MAX_REMOVE_MISSING_PATHS)?;
     // Drop empty / over-long entries up front: they can't name a real shared
     // file and we don't want to spend a stat() syscall on an attacker-sized path.
     let to_check: Vec<String> = paths
@@ -3009,29 +3146,47 @@ pub async fn open_shared_file(
         let config = state.config.read().await;
         shared_access_dirs(&config)
     };
+    let (declared_name, indexed_path) = {
+        let index = state.local_index.read().await;
+        let file = index.get_by_path(&file_path).ok_or_else(|| {
+            coded(
+                "sharing_file_not_in_index",
+                "File is not in the shared-file index",
+            )
+        })?;
+        (file.name.clone(), file.path.clone())
+    };
 
     tokio::task::spawn_blocking(move || {
         let path = std::path::Path::new(&file_path);
         if !path.exists() {
             return Err(coded("sharing_file_not_exist", "File does not exist"));
         }
-        let canonical = path
-            .canonicalize()
-            .map_err(|e| coded_ctx("sharing_invalid_path", "Invalid path", e))?;
-        if !crate::security::is_path_within_dirs(&canonical, &allowed_dirs) {
+        let canonical = crate::security::filesystem::verify_existing_path(path, &allowed_dirs)
+            .map_err(|e| coded_ctx("sharing_invalid_path", "Invalid or changed path", e))?;
+        let indexed_canonical = crate::security::filesystem::verify_existing_path(
+            std::path::Path::new(&indexed_path),
+            &allowed_dirs,
+        )
+        .map_err(|e| coded_ctx("sharing_file_not_in_index", "Indexed path changed", e))?;
+        if canonical != indexed_canonical {
             return Err(coded(
-                "sharing_file_not_in_shared",
-                "File is not within a shared or download folder",
+                "sharing_file_not_in_index",
+                "File is not the indexed Library entry",
             ));
         }
-        if crate::security::is_dangerous_extension(&canonical.to_string_lossy()) {
-            return Err(coded(
-                "sharing_dangerous_file",
-                "Cannot open potentially dangerous file types",
-            ));
+        if crate::security::filesystem::passive_type_agrees(&declared_name, &canonical) {
+            opener::open(&canonical)
+                .map_err(|e| coded_ctx("sharing_open_file_failed", "Failed to open file", e))?;
+        } else {
+            crate::security::filesystem::reveal_in_file_manager(&canonical).map_err(|e| {
+                coded_ctx(
+                    "sharing_reveal_unsafe_file_failed",
+                    "This file type was revealed instead of opened",
+                    e,
+                )
+            })?;
         }
-        opener::open(&canonical)
-            .map_err(|e| coded_ctx("sharing_open_file_failed", "Failed to open file", e))?;
         Ok(())
     })
     .await
@@ -3065,19 +3220,12 @@ pub async fn resolve_media_asset_path(
         if !path.is_file() {
             return Err(coded("sharing_not_a_file", "Path is not a file"));
         }
-        let canonical = path
-            .canonicalize()
-            .map_err(|e| coded_ctx("sharing_invalid_path", "Invalid path", e))?;
-        if !crate::security::is_path_within_dirs(&canonical, &allowed_dirs) {
-            return Err(coded(
-                "sharing_file_not_in_shared",
-                "File is not within a shared or download folder",
-            ));
-        }
-        if crate::security::is_dangerous_extension(&canonical.to_string_lossy()) {
+        let canonical = crate::security::filesystem::verify_existing_path(path, &allowed_dirs)
+            .map_err(|e| coded_ctx("sharing_invalid_path", "Invalid or changed path", e))?;
+        if !crate::security::filesystem::passive_type_agrees(&file_path, &canonical) {
             return Err(coded(
                 "sharing_dangerous_file",
-                "Cannot open potentially dangerous file types",
+                "File type is not approved for in-app media",
             ));
         }
         Ok(canonical.to_string_lossy().into_owned())
@@ -3109,16 +3257,9 @@ pub async fn open_shared_folder(
         if !folder.exists() {
             return Err(coded("sharing_folder_not_exist", "Folder does not exist"));
         }
-        let canonical = folder
-            .canonicalize()
-            .map_err(|e| coded_ctx("sharing_invalid_path", "Invalid path", e))?;
-        if !crate::security::is_path_within_dirs(&canonical, &allowed_dirs) {
-            return Err(coded(
-                "sharing_folder_not_in_shared",
-                "Folder is not within a shared or download directory",
-            ));
-        }
-        opener::open(&canonical)
+        let canonical = crate::security::filesystem::verify_existing_path(folder, &allowed_dirs)
+            .map_err(|e| coded_ctx("sharing_invalid_path", "Invalid or changed path", e))?;
+        crate::security::filesystem::reveal_in_file_manager(&canonical)
             .map_err(|e| coded_ctx("sharing_open_folder_failed", "Failed to open folder", e))?;
         Ok(())
     })
@@ -3257,5 +3398,14 @@ mod tests {
             parse_single_range(Some("bytes=-1"), 1024),
             Ok(Some((1023, 1023)))
         );
+    }
+
+    #[test]
+    fn path_batches_enforce_count_item_and_aggregate_byte_caps() {
+        assert!(check_path_batch(&["a".into(), "b".into()], 2).is_ok());
+        assert!(check_path_batch(&["a".into(), "b".into()], 1).is_err());
+        assert!(check_path_batch(&["x".repeat(MAX_PATH_LEN + 1)], 1).is_err());
+        let many = vec!["x".repeat(MAX_PATH_LEN); MAX_BATCH_PATH_BYTES / MAX_PATH_LEN + 1];
+        assert!(check_path_batch(&many, many.len()).is_err());
     }
 }

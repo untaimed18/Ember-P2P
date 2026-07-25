@@ -14,6 +14,7 @@ pub mod messages;
 pub mod multi_source;
 pub mod part_tracker;
 pub mod preview;
+pub mod secure_stream;
 pub mod server;
 pub mod server_crypt;
 pub mod server_list;
@@ -24,3 +25,7 @@ pub mod tcp_obfuscation;
 pub mod transfer;
 pub mod upload;
 pub mod write_coordinator;
+
+/// Legacy Ember PoP/friend opcodes remain parseable for compatibility tests,
+/// but are never a live authorization or signing path.
+pub(crate) const LEGACY_FRIEND_AUTH_ENABLED: bool = false;

@@ -103,10 +103,9 @@ pub struct FloodProtection {
     outgoing_counters: HashMap<IpAddr, (u32, Instant)>,
     recent_ips: HashMap<IpAddr, Instant>,
     /// K21: per-IP compressed-packet counter within a 1-second window so
-    /// we can decline to decompress over-quota traffic. Tracks (count,
-    /// window_start). 10 compressed packets/sec is far more than any
-    /// legit eMule client ever sends us but cheap to enforce.
-    compressed_counters: HashMap<IpAddr, (u32, Instant)>,
+    /// we can decline to decompress over-quota traffic. Tracks
+    /// (packet_count, compressed_wire_bytes, window_start).
+    compressed_counters: HashMap<IpAddr, (u32, usize, Instant)>,
 }
 
 impl FloodProtection {
@@ -126,8 +125,9 @@ impl FloodProtection {
     /// K21: returns true when `ip` has exceeded its compressed-packet
     /// decompression budget for the current 1-second window. Callers
     /// should drop the packet (skip decompression) when this is true.
-    pub fn over_compressed_budget(&mut self, ip: IpAddr) -> bool {
+    pub fn over_compressed_budget(&mut self, ip: IpAddr, wire_bytes: usize) -> bool {
         const MAX_COMPRESSED_PER_SEC: u32 = 10;
+        const MAX_COMPRESSED_BYTES_PER_SEC: usize = 64 * 1024;
         const MAX_COMPRESSED_ENTRIES: usize = 10_000;
         let now = Instant::now();
         if self.compressed_counters.len() >= MAX_COMPRESSED_ENTRIES
@@ -136,7 +136,7 @@ impl FloodProtection {
             if let Some(oldest) = self
                 .compressed_counters
                 .iter()
-                .min_by_key(|(_, (_, t))| *t)
+                .min_by_key(|(_, (_, _, t))| *t)
                 .map(|(k, _)| *k)
             {
                 self.compressed_counters.remove(&oldest);
@@ -144,15 +144,16 @@ impl FloodProtection {
                 return true;
             }
         }
-        let entry = self.compressed_counters.entry(ip).or_insert((0, now));
-        if now.saturating_duration_since(entry.1).as_secs() >= 1 {
+        let entry = self.compressed_counters.entry(ip).or_insert((0, 0, now));
+        if now.saturating_duration_since(entry.2).as_secs() >= 1 {
             entry.0 = 1;
-            entry.1 = now;
-            false
+            entry.1 = wire_bytes;
+            entry.2 = now;
         } else {
-            entry.0 += 1;
-            entry.0 > MAX_COMPRESSED_PER_SEC
+            entry.0 = entry.0.saturating_add(1);
+            entry.1 = entry.1.saturating_add(wire_bytes);
         }
+        entry.0 > MAX_COMPRESSED_PER_SEC || entry.1 > MAX_COMPRESSED_BYTES_PER_SEC
     }
 
     /// Layer 1 only: per-(IP, opcode) request-flood check within
@@ -503,7 +504,7 @@ impl FloodProtection {
             .retain(|_, last| now.saturating_duration_since(*last).as_secs() < TRACKER_EXPIRY_SECS);
         // K21: compressed-packet budget table follows the same 60s cleanup.
         self.compressed_counters
-            .retain(|_, (_, last)| now.saturating_duration_since(*last).as_secs() < 60);
+            .retain(|_, (_, _, last)| now.saturating_duration_since(*last).as_secs() < 60);
     }
 }
 
@@ -584,12 +585,20 @@ mod kad_protection_tests {
         let mut fp = FloodProtection::new();
         let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
         for _ in 0..10 {
-            assert!(!fp.over_compressed_budget(ip));
+            assert!(!fp.over_compressed_budget(ip, 1400));
         }
         assert!(
-            fp.over_compressed_budget(ip),
+            fp.over_compressed_budget(ip, 1400),
             "11th compressed packet must trip the budget"
         );
+    }
+
+    #[test]
+    fn compressed_byte_budget_is_independent_of_packet_count() {
+        let mut fp = FloodProtection::new();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8));
+        assert!(!fp.over_compressed_budget(ip, 32 * 1024));
+        assert!(fp.over_compressed_budget(ip, 32 * 1024 + 1));
     }
 
     /// outgoing_requests is multiset: sending N requests to the same

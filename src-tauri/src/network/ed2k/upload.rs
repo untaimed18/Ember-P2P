@@ -58,9 +58,61 @@ pub struct EmberSessionHandle {
     /// from this — reusing the same identity key already bound to
     /// `ember_hash` rather than negotiating or persisting a separate one.
     peer_ember_pubkey: [u8; 32],
+    /// Registration in the process-wide v2 revocation index.  Every secure
+    /// connection gets one, including authenticated duplicate connections
+    /// that do not win the canonical outbound-routing slot.
+    secure_registration: Option<Arc<SecureSessionRegistration>>,
 }
 
 static NEXT_EMBER_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+type SecureRevocationIndex =
+    std::sync::Mutex<HashMap<[u8; 16], HashMap<u64, tokio::sync::watch::Sender<bool>>>>;
+static SECURE_REVOCATION_INDEX: std::sync::OnceLock<SecureRevocationIndex> =
+    std::sync::OnceLock::new();
+
+struct SecureSessionRegistration {
+    ember_hash: [u8; 16],
+    session_id: u64,
+}
+
+impl Drop for SecureSessionRegistration {
+    fn drop(&mut self) {
+        let Some(index) = SECURE_REVOCATION_INDEX.get() else {
+            return;
+        };
+        let mut index = index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(sessions) = index.get_mut(&self.ember_hash) {
+            sessions.remove(&self.session_id);
+            if sessions.is_empty() {
+                index.remove(&self.ember_hash);
+            }
+        }
+    }
+}
+
+/// Close every authenticated v2 stream for a removed friend, including
+/// non-canonical duplicates that were intentionally excluded from
+/// [`EmberSessionMap`].  Returns the number of sessions signalled.
+pub fn revoke_all_secure_sessions(ember_hash: [u8; 16]) -> usize {
+    let Some(index) = SECURE_REVOCATION_INDEX.get() else {
+        return 0;
+    };
+    let senders: Vec<_> = {
+        let index = index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        index
+            .get(&ember_hash)
+            .map(|sessions| sessions.values().cloned().collect())
+            .unwrap_or_default()
+    };
+    for sender in &senders {
+        let _ = sender.send(true);
+    }
+    senders.len()
+}
 
 /// How stale a session's last confirmed inbound activity may be before
 /// [`EmberSessionHandle::is_fresh`] stops trusting it. Deliberately well
@@ -77,15 +129,41 @@ const EMBER_SESSION_FRESH_SECS: i64 = 180;
 impl EmberSessionHandle {
     pub fn new(tx: tokio::sync::mpsc::Sender<Vec<u8>>, peer_ember_pubkey: [u8; 32]) -> Self {
         let (shutdown, _) = tokio::sync::watch::channel(false);
+        let session_id = NEXT_EMBER_SESSION_ID.fetch_add(1, Ordering::Relaxed);
         Self {
             tx,
-            session_id: NEXT_EMBER_SESSION_ID.fetch_add(1, Ordering::Relaxed),
+            session_id,
             last_activity: Arc::new(std::sync::atomic::AtomicI64::new(
                 chrono::Utc::now().timestamp(),
             )),
             shutdown,
             peer_ember_pubkey,
+            secure_registration: None,
         }
+    }
+
+    pub fn new_secure(
+        tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+        peer_ember_pubkey: [u8; 32],
+        ember_hash: [u8; 16],
+    ) -> Self {
+        let mut handle = Self::new(tx, peer_ember_pubkey);
+        let index = SECURE_REVOCATION_INDEX.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+        index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(ember_hash)
+            .or_default()
+            .insert(handle.session_id, handle.shutdown.clone());
+        handle.secure_registration = Some(Arc::new(SecureSessionRegistration {
+            ember_hash,
+            session_id: handle.session_id,
+        }));
+        handle
+    }
+
+    pub fn is_secure_v2(&self) -> bool {
+        self.secure_registration.is_some()
     }
 
     /// The peer's PoP-verified Ed25519 identity public key for this
@@ -111,9 +189,14 @@ impl EmberSessionHandle {
         self.shutdown.subscribe()
     }
 
-    /// Record confirmed inbound activity from the peer (any received
-    /// packet, including a bare keepalive — see the reader loops' own
-    /// `last_inbound` tracking, which this mirrors).
+    /// Record confirmed inbound activity from the peer. Call this on
+    /// *any* successfully received packet while this handle is the
+    /// live Ember session for that peer — including ordinary eD2K
+    /// file-serve traffic such as `OP_REQUESTPARTS`, not only Ember
+    /// CHAT/BROWSE/KEEPALIVE. Without that, a friend who is only
+    /// downloading from us looks stale after `EMBER_SESSION_FRESH_SECS`
+    /// and the periodic sweep / chat reconnect path will `close()` the
+    /// socket mid-upload.
     pub fn touch(&self) {
         self.last_activity.store(
             chrono::Utc::now().timestamp(),
@@ -144,6 +227,28 @@ impl EmberSessionHandle {
 }
 
 pub type EmberSessionMap = Arc<RwLock<HashMap<[u8; 16], EmberSessionHandle>>>;
+
+fn friend_privileges_allowed(
+    secure_v2_authenticated: bool,
+    live_friend_member: bool,
+    owns_canonical_slot: bool,
+) -> bool {
+    secure_v2_authenticated && live_friend_member && owns_canonical_slot
+}
+
+async fn live_secure_friend_member(
+    friend_hashes: &Arc<RwLock<std::collections::HashSet<[u8; 16]>>>,
+    peer_ember_hash: Option<[u8; 16]>,
+    secure_v2_authenticated: bool,
+) -> bool {
+    if !secure_v2_authenticated {
+        return false;
+    }
+    match peer_ember_hash {
+        Some(hash) => friend_hashes.read().await.contains(&hash),
+        None => false,
+    }
+}
 
 /// Remove `hash`'s entry from `sessions` if present but stale (see
 /// [`EmberSessionHandle::is_fresh`]), returning `true` if it was evicted.
@@ -268,6 +373,7 @@ enum ConnInit {
     InboundStream {
         reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
         writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+        secure_peer: Option<super::secure_stream::SecurePeerIdentity>,
     },
 }
 
@@ -338,6 +444,36 @@ struct UploadSlotGuard {
     active_count: Arc<std::sync::atomic::AtomicUsize>,
     slot_notify: Arc<tokio::sync::Notify>,
     armed: bool,
+}
+
+struct ConnectionAdmissionGuard {
+    total: Arc<std::sync::atomic::AtomicUsize>,
+    per_ip: Arc<parking_lot::Mutex<HashMap<IpAddr, usize>>>,
+    ip: IpAddr,
+}
+
+impl ConnectionAdmissionGuard {
+    fn new(
+        total: Arc<std::sync::atomic::AtomicUsize>,
+        per_ip: Arc<parking_lot::Mutex<HashMap<IpAddr, usize>>>,
+        ip: IpAddr,
+    ) -> Self {
+        Self { total, per_ip, ip }
+    }
+}
+
+impl Drop for ConnectionAdmissionGuard {
+    fn drop(&mut self) {
+        self.total
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        let mut counts = self.per_ip.lock();
+        if let Some(count) = counts.get_mut(&self.ip) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.ip);
+            }
+        }
+    }
 }
 
 impl UploadSlotGuard {
@@ -573,6 +709,10 @@ pub struct UdpFirewallCheckRequest {
 }
 
 const CLIENT_TIMEOUT_SECS: u64 = 120;
+/// One wall-clock budget covers transport discrimination, optional
+/// obfuscation/secure-stream negotiation, and receipt of the first complete
+/// eD2K frame.
+const INBOUND_PREAUTH_DEADLINE_SECS: u64 = 15;
 /// Per-step timeout for the *outbound* callback-serve handshake (TCP connect,
 /// Hello/EmuleInfo round-trips). Much tighter than [`CLIENT_TIMEOUT_SECS`]:
 /// a callback peer that doesn't answer promptly isn't worth a long stall on a
@@ -636,6 +776,9 @@ const MAX_CONNECTIONS_PER_IP: usize = 3;
 const MAX_QUEUE_ENTRIES_PER_IP: usize = 3;
 /// Maximum total concurrent TCP connections to the upload server
 const MAX_TOTAL_CONNECTIONS: usize = 100;
+/// Trusted configured-server port tests can still enter while ordinary
+/// pre-auth capacity is saturated.
+const RESERVED_PORT_TEST_CONNECTIONS: usize = 4;
 /// Maximum number of peers waiting in the upload queue
 const MAX_UPLOAD_QUEUE_SIZE: usize = 500;
 /// eMule SESSIONMAXTRANS: max bytes uploaded per session before rotating slots (opcodes.h:97).
@@ -1057,6 +1200,7 @@ pub enum UploadEventKind {
     /// signature proof-of-possession.
     EmberFriendRequest {
         ember_hash: [u8; 16],
+        pubkey: Option<[u8; 32]>,
         nickname: String,
         peer_ip: String,
         peer_port: u16,
@@ -1188,7 +1332,7 @@ struct UploadHandler {
     upload_event_tx: tokio::sync::mpsc::Sender<UploadEvent>,
     upload_queue: Arc<tokio::sync::Mutex<Vec<QueueEntry>>>,
     ip_connection_counts:
-        Arc<tokio::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
+        Arc<parking_lot::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
     total_connections: Arc<std::sync::atomic::AtomicUsize>,
     source_manager: Arc<RwLock<SourceManager>>,
     comment_manager: Arc<RwLock<CommentManager>>,
@@ -2042,7 +2186,7 @@ pub async fn start_upload_server(
         max_concurrent_uploads,
         upload_event_tx,
         upload_queue,
-        ip_connection_counts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        ip_connection_counts: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         total_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         source_manager,
         comment_manager,
@@ -2242,11 +2386,16 @@ pub async fn start_upload_server(
                         // multiple handlers each observe `< MAX` and increment
                         // past MAX_TOTAL_CONNECTIONS.
                         let reserved = {
+                            let connection_limit = if is_server_port_test_ip {
+                                MAX_TOTAL_CONNECTIONS + RESERVED_PORT_TEST_CONNECTIONS
+                            } else {
+                                MAX_TOTAL_CONNECTIONS
+                            };
                             let mut cur = server
                                 .total_connections
                                 .load(std::sync::atomic::Ordering::Relaxed);
                             loop {
-                                if cur >= MAX_TOTAL_CONNECTIONS {
+                                if cur >= connection_limit {
                                     break false;
                                 }
                                 match server.total_connections.compare_exchange_weak(
@@ -2270,9 +2419,14 @@ pub async fn start_upload_server(
                         // release the global slot reserved just above so the
                         // reservation isn't leaked.
                         {
-                            let mut counts = server.ip_connection_counts.lock().await;
+                            let mut counts = server.ip_connection_counts.lock();
                             let count = counts.entry(peer_addr.ip()).or_insert(0);
-                            if *count >= MAX_CONNECTIONS_PER_IP {
+                            let per_ip_limit = if is_server_port_test_ip {
+                                MAX_CONNECTIONS_PER_IP + RESERVED_PORT_TEST_CONNECTIONS
+                            } else {
+                                MAX_CONNECTIONS_PER_IP
+                            };
+                            if *count >= per_ip_limit {
                                 debug!("Rejecting connection from {peer_addr}: per-IP limit reached");
                                 drop(counts);
                                 server
@@ -2283,6 +2437,11 @@ pub async fn start_upload_server(
                             }
                             *count += 1;
                         }
+                        let admission_guard = ConnectionAdmissionGuard::new(
+                            server.total_connections.clone(),
+                            server.ip_connection_counts.clone(),
+                            peer_addr.ip(),
+                        );
                         let _ = stream.set_nodelay(true);
                         // Cap the kernel TCP send buffer so our sender-side
                         // `uploaded` counter (which advances when bytes are
@@ -2303,6 +2462,7 @@ pub async fn start_upload_server(
                         }
                         debug!("Incoming ED2K connection from {peer_addr}");
                         tokio::spawn(async move {
+                            let _admission_guard = admission_guard;
                             let result = std::panic::AssertUnwindSafe(
                                 server.handle_connection(stream, peer_addr)
                             ).catch_unwind().await;
@@ -2320,14 +2480,6 @@ pub async fn start_upload_server(
                                 }
                                 Err(_panic) => {
                                     error!("Connection handler panicked for {peer_addr}");
-                                }
-                            }
-                            server.total_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                            let mut counts = server.ip_connection_counts.lock().await;
-                            if let Some(count) = counts.get_mut(&peer_addr.ip()) {
-                                *count = count.saturating_sub(1);
-                                if *count == 0 {
-                                    counts.remove(&peer_addr.ip());
                                 }
                             }
                         });
@@ -2420,7 +2572,7 @@ pub async fn start_upload_server(
                     continue;
                 }
                 {
-                    let mut counts = server.ip_connection_counts.lock().await;
+                    let mut counts = server.ip_connection_counts.lock();
                     let count = counts.entry(peer_ip).or_insert(0);
                     if *count >= MAX_CONNECTIONS_PER_IP {
                         debug!(
@@ -2435,9 +2587,15 @@ pub async fn start_upload_server(
                     }
                     *count += 1;
                 }
+                let admission_guard = ConnectionAdmissionGuard::new(
+                    server.total_connections.clone(),
+                    server.ip_connection_counts.clone(),
+                    peer_ip,
+                );
 
                 let server = server.clone();
                 tokio::spawn(async move {
+                    let _admission_guard = admission_guard;
                     let result = std::panic::AssertUnwindSafe(server.connect_and_serve(req))
                         .catch_unwind()
                         .await;
@@ -2460,16 +2618,6 @@ pub async fn start_upload_server(
                         }
                         Err(_panic) => {
                             error!("Callback-serve handler panicked for {peer_ip}");
-                        }
-                    }
-                    server
-                        .total_connections
-                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    let mut counts = server.ip_connection_counts.lock().await;
-                    if let Some(count) = counts.get_mut(&peer_ip) {
-                        *count = count.saturating_sub(1);
-                        if *count == 0 {
-                            counts.remove(&peer_ip);
                         }
                     }
                 });
@@ -2584,7 +2732,7 @@ pub async fn start_upload_server(
                     continue;
                 }
                 {
-                    let mut counts = server.ip_connection_counts.lock().await;
+                    let mut counts = server.ip_connection_counts.lock();
                     let count = counts.entry(peer_ip).or_insert(0);
                     if *count >= MAX_CONNECTIONS_PER_IP {
                         debug!(
@@ -2598,9 +2746,15 @@ pub async fn start_upload_server(
                     }
                     *count += 1;
                 }
+                let admission_guard = ConnectionAdmissionGuard::new(
+                    server.total_connections.clone(),
+                    server.ip_connection_counts.clone(),
+                    peer_ip,
+                );
 
                 let server = server.clone();
                 tokio::spawn(async move {
+                    let _admission_guard = admission_guard;
                     let result = std::panic::AssertUnwindSafe(
                         server.handle_inbound_stream(peer_addr, req.reader, req.writer),
                     )
@@ -2620,14 +2774,6 @@ pub async fn start_upload_server(
                         }
                         Err(_panic) => {
                             error!("Punch/relay-adopted stream handler panicked for {peer_addr}");
-                        }
-                    }
-                    server.total_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    let mut counts = server.ip_connection_counts.lock().await;
-                    if let Some(count) = counts.get_mut(&peer_ip) {
-                        *count = count.saturating_sub(1);
-                        if *count == 0 {
-                            counts.remove(&peer_ip);
                         }
                     }
                 });
@@ -2727,23 +2873,15 @@ impl UploadHandler {
                 // pool so it never stalls a Tokio worker. Fail closed (reject) on a
                 // join error.
                 let path_for_check = path.clone();
-                let in_allowed = tokio::task::spawn_blocking(move || {
-                    std::fs::canonicalize(&path_for_check)
-                        .map(|canon| crate::security::is_path_within_dirs(&canon, &allowed))
-                        .unwrap_or(false)
+                let verified_path = tokio::task::spawn_blocking(move || {
+                    crate::security::filesystem::verify_existing_path(&path_for_check, &allowed)
                 })
                 .await
-                .unwrap_or(false);
-                if !in_allowed {
-                    tracing::debug!(
-                        "Rejecting resolve for file not within shared/download roots: {}",
-                        hash_hex
-                    );
-                    return None;
-                }
+                .ok()
+                .and_then(Result::ok)?;
                 return Some(ResolvedUploadFile {
                     name: file.name,
-                    path,
+                    path: verified_path,
                     size: file.size,
                     aich_hash_hex: file.aich_hash,
                     is_partial,
@@ -2774,10 +2912,17 @@ impl UploadHandler {
         if !part_path.exists() {
             return None;
         }
+        let allowed = vec![self.download_folder.to_string_lossy().into_owned()];
+        let verified_part = tokio::task::spawn_blocking(move || {
+            crate::security::filesystem::verify_existing_path(&part_path, &allowed)
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)?;
 
         Some(ResolvedUploadFile {
             name: transfer.file_name,
-            path: part_path,
+            path: verified_part,
             size: transfer.total_size,
             aich_hash_hex: String::new(),
             is_partial: true,
@@ -3118,7 +3263,15 @@ impl UploadHandler {
         stream: TcpStream,
         peer_addr: SocketAddr,
     ) -> anyhow::Result<()> {
-        self.run_session(peer_addr, ConnInit::Inbound(stream)).await
+        self.run_session(
+            peer_addr,
+            ConnInit::Inbound(stream),
+            Some(
+                tokio::time::Instant::now()
+                    + std::time::Duration::from_secs(INBOUND_PREAUTH_DEADLINE_SECS),
+            ),
+        )
+        .await
     }
 
     /// Serve an already-established, transport-encrypted stream handed to us
@@ -3134,8 +3287,19 @@ impl UploadHandler {
         reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
         writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
     ) -> anyhow::Result<()> {
-        self.run_session(peer_addr, ConnInit::InboundStream { reader, writer })
-            .await
+        self.run_session(
+            peer_addr,
+            ConnInit::InboundStream {
+                reader,
+                writer,
+                secure_peer: None,
+            },
+            Some(
+                tokio::time::Instant::now()
+                    + std::time::Duration::from_secs(INBOUND_PREAUTH_DEADLINE_SECS),
+            ),
+        )
+        .await
     }
 
     /// eMule `AddUpNextClient` for disconnected HighID winners: dial the peer,
@@ -3303,34 +3467,32 @@ impl UploadHandler {
             self.push_grant_in_flight.lock().await.remove(&identity);
             return;
         }
-        {
-            let mut counts = self.ip_connection_counts.lock().await;
+        let per_ip_reserved = {
+            let mut counts = self.ip_connection_counts.lock();
             let count = counts.entry(ip).or_insert(0);
             if *count >= MAX_CONNECTIONS_PER_IP {
-                drop(counts);
-                self.total_connections
-                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                self.push_grant_dials
-                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                self.push_grant_in_flight.lock().await.remove(&identity);
-                debug!("AddUpNextClient: dropping dial to {peer_addr}: per-IP limit reached");
-                return;
+                false
+            } else {
+                *count += 1;
+                true
             }
-            *count += 1;
+        };
+        if !per_ip_reserved {
+            self.total_connections
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.push_grant_dials
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.push_grant_in_flight.lock().await.remove(&identity);
+            debug!("AddUpNextClient: dropping dial to {peer_addr}: per-IP limit reached");
+            return;
         }
+        let _admission_guard = ConnectionAdmissionGuard::new(
+            self.total_connections.clone(),
+            self.ip_connection_counts.clone(),
+            ip,
+        );
 
         let result = self.connect_and_serve(req).await;
-        {
-            let mut counts = self.ip_connection_counts.lock().await;
-            if let Some(count) = counts.get_mut(&ip) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    counts.remove(&ip);
-                }
-            }
-        }
-        self.total_connections
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         self.push_grant_dials
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         self.push_grant_in_flight.lock().await.remove(&identity);
@@ -3537,7 +3699,7 @@ impl UploadHandler {
                 push_grant_accepted,
             };
             return self
-                .run_session(peer_addr, ConnInit::OutboundServe(Box::new(state)))
+                .run_session(peer_addr, ConnInit::OutboundServe(Box::new(state)), None)
                 .await;
         }
     }
@@ -3549,7 +3711,12 @@ impl UploadHandler {
     /// The handshake preamble differs by direction; everything from the EmuleInfo
     /// exchange through the serve loop and teardown is byte-for-byte identical,
     /// so both paths converge into the same code below.
-    async fn run_session(&self, peer_addr: SocketAddr, init: ConnInit) -> anyhow::Result<()> {
+    async fn run_session(
+        &self,
+        peer_addr: SocketAddr,
+        init: ConnInit,
+        preauth_deadline: Option<tokio::time::Instant>,
+    ) -> anyhow::Result<()> {
         // Outbound callbacks are dialed by us for a known peer, so they skip the
         // inbound-only steps: the ban precheck, the buddy/KAD/server/Path-B
         // stream diversions, the abuse-request counter, and the inbound EmuleInfo
@@ -3590,6 +3757,7 @@ impl UploadHandler {
         let mut outbound_first_packet: Option<(u8, u8, Vec<u8>)> = None;
         let mut push_grant_file_hash: Option<[u8; 16]> = None;
         let mut push_grant_accepted: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = None;
+        let mut secure_v2_peer: Option<super::secure_stream::SecurePeerIdentity> = None;
         let (mut reader, mut writer, hello_data, peer_user_hash, mut hello_caps) = match init {
             ConnInit::OutboundServe(state) => {
                 let OutboundServeState {
@@ -3608,15 +3776,78 @@ impl UploadHandler {
                 (reader, writer, hello_data, peer_user_hash, hello_caps)
             }
             ConnInit::InboundStream {
-                reader: boxed_reader,
+                reader: mut boxed_reader,
                 writer: boxed_writer,
+                secure_peer: preauthenticated_peer,
             } => {
-                let mut rd = StreamReader::Boxed(boxed_reader);
-                let mut wr = StreamWriter::Boxed(boxed_writer);
+                let (mut rd, mut wr, first_inner_byte) = if let Some(peer) = preauthenticated_peer {
+                    secure_v2_peer = Some(peer);
+                    (
+                        StreamReader::Boxed(boxed_reader),
+                        StreamWriter::Boxed(boxed_writer),
+                        None,
+                    )
+                } else {
+                    let first = match tokio::time::timeout_at(
+                        preauth_deadline.expect("inbound streams have a pre-auth deadline"),
+                        boxed_reader.read_u8(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(byte)) => byte,
+                        Ok(Err(e)) if is_connection_closed(&e) => {
+                            info!("Punch/relay-adopted connection from {peer_addr} closed immediately");
+                            return Ok(());
+                        }
+                        Ok(Err(e)) => {
+                            info!(
+                                "Punch/relay-adopted connection read failed from {peer_addr}: {e}"
+                            );
+                            return Ok(());
+                        }
+                        Err(_) => {
+                            info!("Timeout waiting for stream preamble from punch/relay peer {peer_addr}");
+                            return Ok(());
+                        }
+                    };
+                    if super::secure_stream::is_preamble_first_byte(first) {
+                        let secure = tokio::time::timeout_at(
+                            preauth_deadline.expect("inbound streams have a pre-auth deadline"),
+                            super::secure_stream::accept_after_first(
+                                boxed_reader,
+                                boxed_writer,
+                                first,
+                                self.ember_hash,
+                                self.ed25519_public_key,
+                                self.ed25519_secret_key,
+                            ),
+                        )
+                        .await
+                        .map_err(|_| anyhow::anyhow!("secure-stream negotiation timed out"))??;
+                        secure_v2_peer = Some(secure.peer);
+                        (
+                            StreamReader::Boxed(secure.reader),
+                            StreamWriter::Boxed(secure.writer),
+                            None,
+                        )
+                    } else {
+                        (
+                            StreamReader::Boxed(boxed_reader),
+                            StreamWriter::Boxed(boxed_writer),
+                            Some(first),
+                        )
+                    }
+                };
 
-                let (proto, opcode, hd) = match tokio::time::timeout(
-                    std::time::Duration::from_secs(CLIENT_TIMEOUT_SECS),
-                    read_packet_async_inner(&mut rd),
+                let (proto, opcode, hd) = match tokio::time::timeout_at(
+                    preauth_deadline.expect("inbound streams have a pre-auth deadline"),
+                    async {
+                        if let Some(first) = first_inner_byte {
+                            read_packet_with_first_byte(&mut rd, first).await
+                        } else {
+                            read_packet_async_inner(&mut rd).await
+                        }
+                    },
                 )
                 .await
                 {
@@ -3689,14 +3920,58 @@ impl UploadHandler {
                 let mut raw_reader = tokio::io::BufReader::new(reader);
                 let mut raw_writer = tokio::io::BufWriter::new(writer);
 
+                let first_byte = match tokio::time::timeout_at(
+                    preauth_deadline.expect("inbound TCP has a pre-auth deadline"),
+                    raw_reader.read_u8(),
+                )
+                .await
+                {
+                    Ok(Ok(byte)) => byte,
+                    Ok(Err(e)) if is_connection_closed(&e) => {
+                        info!("Probe connection from {peer_addr} (closed immediately)");
+                        return Ok(());
+                    }
+                    Ok(Err(e)) => return Err(e.into()),
+                    Err(_) => {
+                        info!("Timeout waiting for TCP stream discriminator from {peer_addr}");
+                        return Ok(());
+                    }
+                };
+                if super::secure_stream::is_preamble_first_byte(first_byte) {
+                    let secure = tokio::time::timeout_at(
+                        preauth_deadline.expect("inbound TCP has a pre-auth deadline"),
+                        super::secure_stream::accept_after_first(
+                            Box::new(raw_reader),
+                            Box::new(raw_writer),
+                            first_byte,
+                            self.ember_hash,
+                            self.ed25519_public_key,
+                            self.ed25519_secret_key,
+                        ),
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("secure-stream negotiation timed out"))??;
+                    return Box::pin(self.run_session(
+                        peer_addr,
+                        ConnInit::InboundStream {
+                            reader: secure.reader,
+                            writer: secure.writer,
+                            secure_peer: Some(secure.peer),
+                        },
+                        preauth_deadline,
+                    ))
+                    .await;
+                }
+
                 // Negotiate obfuscation with full handshake response.
-                let negotiation = match tokio::time::timeout(
-                    std::time::Duration::from_secs(CLIENT_TIMEOUT_SECS),
-                    tcp_obfuscation::negotiate_incoming(
+                let negotiation = match tokio::time::timeout_at(
+                    preauth_deadline.expect("inbound TCP has a pre-auth deadline"),
+                    tcp_obfuscation::negotiate_incoming_with_first_byte(
                         &mut raw_reader,
                         &mut raw_writer,
                         &self.user_hash,
                         true,
+                        first_byte,
                     ),
                 )
                 .await
@@ -3741,8 +4016,11 @@ impl UploadHandler {
                         } else {
                             std::time::Duration::from_secs(15)
                         };
-                        let first_pkt = tokio::time::timeout(
-                            probe_timeout,
+                        let first_frame_deadline = preauth_deadline
+                            .expect("inbound TCP has a pre-auth deadline")
+                            .min(tokio::time::Instant::now() + probe_timeout);
+                        let first_pkt = tokio::time::timeout_at(
+                            first_frame_deadline,
                             read_packet_async_inner(&mut obf_reader),
                         )
                         .await;
@@ -3895,8 +4173,12 @@ impl UploadHandler {
                     NegotiationResult::Plain { first_byte } => {
                         let mut rd = StreamReader::Plain(raw_reader);
                         let mut wr = StreamWriter::Plain(raw_writer);
-                        let (proto, opcode, hd) =
-                            read_packet_with_first_byte(&mut rd, first_byte).await?;
+                        let (proto, opcode, hd) = tokio::time::timeout_at(
+                            preauth_deadline.expect("inbound TCP has a pre-auth deadline"),
+                            read_packet_with_first_byte(&mut rd, first_byte),
+                        )
+                        .await
+                        .map_err(|_| anyhow::anyhow!("first eD2K frame timed out"))??;
 
                         if (proto == OP_EDONKEYHEADER || proto == OP_EMULEPROT)
                             && opcode == OP_PORTTEST
@@ -4028,6 +4310,16 @@ impl UploadHandler {
                 (reader, writer, hello_data, peer_user_hash, hello_caps)
             }
         };
+
+        let secure_v2_authenticated = secure_v2_peer.is_some();
+        if let Some(peer) = secure_v2_peer {
+            // Noise IK plus the v2 prologue is authoritative.  Inner eD2K
+            // Hello/EmuleInfo fields remain byte-compatible metadata and may
+            // not replace the authenticated Ember identity.
+            hello_caps.is_ember = true;
+            hello_caps.ember_hash = Some(peer.ember_hash);
+            hello_caps.ember_pubkey = Some(peer.ed25519_public_key);
+        }
 
         let peer_source_exchange_ver = hello_caps.source_exchange_ver.max(1);
         let peer_secure_ident_level = hello_caps.secure_ident_level;
@@ -4428,6 +4720,11 @@ impl UploadHandler {
             if proto2 == OP_EMULEPROT && opcode2 == OP_EMULEINFO {
                 let incoming_caps = parse_emule_info(&payload2);
                 merge_caps(&mut hello_caps, incoming_caps);
+                if let Some(peer) = secure_v2_peer {
+                    hello_caps.is_ember = true;
+                    hello_caps.ember_hash = Some(peer.ember_hash);
+                    hello_caps.ember_pubkey = Some(peer.ed25519_public_key);
+                }
                 peer_ember_hash = hello_caps.ember_hash;
                 peer_secure_ident_level = hello_caps.secure_ident_level;
                 ul_client_software = client_software_from_caps(&hello_caps);
@@ -4453,17 +4750,6 @@ impl UploadHandler {
             }
         }
 
-        // Send `OP_EMBER_HELLO` so other Ember peers can detect us out-of-
-        // band from the public Hello / EmuleInfo (which we deliberately
-        // keep byte-identical to vanilla eMule to avoid anti-leecher queue
-        // bans). Vanilla eMule peers ignore unknown OP_EMULEPROT opcodes
-        // (`ListenSocket.cpp` ProcessExtPacket default branch), so sending
-        // it unconditionally is safe — it's invisible to non-Ember peers.
-        // The peer's reply (`OP_EMBER_HELLOANSWER`) is handled in the
-        // main packet-processing loop further down, where we'll also
-        // recognise it as authoritative proof of Ember-ness and learn the
-        // peer's mod_version / ember_hash / ember_pubkey.
-        let mut ul_sent_ember_hello = false;
         // Session-scoped Ember identity-binding flag. Set when the
         // peer advertises an Ed25519 pubkey whose BLAKE3 prefix
         // matches their claimed `ember_hash`
@@ -4474,7 +4760,7 @@ impl UploadHandler {
         // machine below (`ember_auth_state`) provides the full PoP
         // signal; we prefer that when available and fall back to
         // this binding flag only if auth never completes.
-        let mut ember_hash_binding_verified = false;
+        let mut ember_hash_binding_verified = secure_v2_authenticated;
         // Reactive Ember Ed25519 challenge-response state machine.
         // Driven by inbound `OP_EMBER_AUTH_CHALLENGE` /
         // `OP_EMBER_AUTH_RESPONSE` packets dispatched from the
@@ -4484,14 +4770,12 @@ impl UploadHandler {
         // their `ember_hash`. See `super::ember_auth` for the full
         // state diagram and tests.
         let mut ember_auth_state = super::ember_auth::EmberAuthState::default();
-        {
-            // Advertise our Ed25519 pubkey alongside the ember_hash so
-            // the peer can run `verify_ember_hash_binding` on our side
-            // of the handshake (confirms our hash is bound to a key we
-            // actually own) and so `friend_connect::perform_ember_auth`
-            // has a verifier to challenge us with. Previously this
-            // site passed `None`, which silently disabled Ember
-            // identity verification on every upload session.
+        let mut ul_sent_ember_hello = secure_v2_authenticated;
+        if !secure_v2_authenticated {
+            // Preserve the existing generic eMule byte stream exactly:
+            // legacy Ember Hello remains an ignorable extension packet.
+            // Its auth challenge/response opcodes are parsed and dropped
+            // below, never signed and never consulted for privileges.
             let nickname = self.nickname_snapshot().await;
             let payload =
                 build_ember_hello(&self.ember_hash, &nickname, Some(&self.ed25519_public_key));
@@ -4598,7 +4882,7 @@ impl UploadHandler {
         // `is_ember` flag from an unauthenticated OP_EMBER_HELLO — mirrors
         // the EPX-send gate immediately above. The `OP_EMBER_AUTH_RESPONSE`
         // handler below emits the same event once PoP completes.
-        if hello_caps.is_ember && ember_auth_state.is_verified() {
+        if hello_caps.is_ember && secure_v2_authenticated {
             if let std::net::IpAddr::V4(v4) = peer_addr.ip() {
                 if hello_caps.tcp_port > 0 && !crate::security::is_special_use_v4(v4) {
                     let _ = self
@@ -4690,16 +4974,67 @@ impl UploadHandler {
         // we cannot prove are the friend.
         let mut owns_ember_slot = false;
         // Set alongside `owns_ember_slot` when we claim the `ember_sessions`
-        // slot below, so the CHAT/BROWSE/KEEPALIVE arms further down can
-        // `.touch()` it on every subsequent inbound packet — keeping the
-        // liveness timestamp `EmberSessionHandle::is_fresh()` checks against
-        // fresh for as long as this session is actually receiving traffic.
+        // slot below. Touched on *every* subsequent inbound packet (including
+        // OP_REQUESTPARTS / ordinary eD2K file-serve traffic, not just Ember
+        // CHAT/BROWSE/KEEPALIVE) so `EmberSessionHandle::is_fresh()` stays
+        // true for as long as this TCP session is actually receiving traffic.
+        // Without that, a friend who is only downloading from us would look
+        // "stale" after `EMBER_SESSION_FRESH_SECS` and the periodic sweep /
+        // SendChatMessage reconnect would `close()` the socket mid-upload.
         let mut ember_session_handle: Option<EmberSessionHandle> = None;
         // Becomes active only after this connection has proven ownership of a
         // friend slot. A caller that retires the slot (for example, cancelling
         // an in-flight browse) wakes the select below so this socket closes
         // immediately instead of waiting for the passive timeout.
         let mut ember_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>> = None;
+
+        if secure_v2_authenticated {
+            if let (Some(eh), Some(pk)) = (peer_ember_hash, hello_caps.ember_pubkey) {
+                // Register every authenticated v2 connection for immediate
+                // revocation, even when another connection already owns the
+                // canonical outbound-routing slot.
+                let handle = EmberSessionHandle::new_secure(outbound_tx.clone(), pk, eh);
+                ember_shutdown_rx = Some(handle.subscribe_shutdown());
+                ember_session_handle = Some(handle.clone());
+
+                if is_friend {
+                    let mut sessions = self.ember_sessions.write().await;
+                    if let Some(stale) = sessions.get(&eh).filter(|existing| !existing.is_fresh()) {
+                        stale.close();
+                        sessions.remove(&eh);
+                    }
+                    if !sessions.contains_key(&eh) {
+                        sessions.insert(eh, handle);
+                        owns_ember_slot = true;
+                    }
+                    drop(sessions);
+
+                    let _ = self
+                        .upload_event_tx
+                        .send(UploadEvent {
+                            transfer_id: String::new(),
+                            kind: UploadEventKind::FriendSeen {
+                                ember_hash: eh,
+                                ip: peer_addr.ip(),
+                                port: peer_addr.port(),
+                            },
+                        })
+                        .await;
+                    let nickname = self.nickname_snapshot().await;
+                    if write_packet_async(
+                        &mut writer,
+                        OP_EMULEPROT,
+                        OP_EMBER_FRIEND_REQ,
+                        nickname.as_bytes(),
+                    )
+                    .await
+                    .is_ok()
+                    {
+                        friend_request_sent = true;
+                    }
+                }
+            }
+        }
 
         // Now handle file requests in a loop
         let mut current_file_hash: Option<[u8; 16]> = None;
@@ -4928,6 +5263,37 @@ impl UploadHandler {
         // underlying cause.
         let session_result: anyhow::Result<()> = async {
         loop {
+            if secure_v2_authenticated {
+                if let Some(eh) = peer_ember_hash {
+                    let live_member = self.friend_hashes.read().await.contains(&eh);
+                    if is_friend && !live_member {
+                        // Membership is the live authorization source.  Do not
+                        // let a session-local flag or queued priority snapshot
+                        // survive friend removal.
+                        is_friend = false;
+                        is_ember_friend = false;
+                        info!("Friend {} removed; closing secure v2 stream", hex::encode(eh));
+                        break;
+                    }
+                    if !is_friend && live_member {
+                        // A secure friend request may be accepted while this
+                        // authenticated stream is still open.  Promote it only
+                        // after the shared membership set reflects that user
+                        // action.
+                        is_friend = true;
+                        is_ember_friend = true;
+                        if !owns_ember_slot {
+                            if let Some(handle) = ember_session_handle.as_ref().cloned() {
+                                let mut sessions = self.ember_sessions.write().await;
+                                if !sessions.contains_key(&eh) {
+                                    sessions.insert(eh, handle);
+                                    owns_ember_slot = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             // eMule: terminate upload sessions when the network is disconnected.
             if self.network_disconnected.load(std::sync::atomic::Ordering::Relaxed) {
                 debug!("Terminating upload session with {peer_addr}: network disconnected");
@@ -5067,7 +5433,7 @@ impl UploadHandler {
             // been rebuilt since we last sent. Gated on PoP so we never
             // push source/mesh hints to an unverified Ember claim.
             if hello_caps.is_ember
-                && ember_auth_state.is_verified()
+                && secure_v2_authenticated
                 && last_epx_resend.elapsed() >= EPX_RESEND_INTERVAL
             {
                 let current_gen = self
@@ -5314,6 +5680,12 @@ impl UploadHandler {
                             // Re-send OP_QUEUERANKING if rank changed, rate-limited to once per 5 min
                             if last_rank_resend.elapsed().as_secs() >= 300 {
                                 last_rank_resend = std::time::Instant::now();
+                                let is_verified_friend = live_secure_friend_member(
+                                    &self.friend_hashes,
+                                    peer_ember_hash,
+                                    secure_v2_authenticated,
+                                )
+                                .await;
                                 let cm = self.credit_manager.read().await;
                                 let idx_snap = self.local_index.read().await;
                                 let queue = self.upload_queue.lock().await;
@@ -5326,8 +5698,7 @@ impl UploadHandler {
                                 // `ember_auth_state` can advance from
                                 // `NotStarted` → `Verified` mid-session as
                                 // the peer's CHALLENGE/RESPONSE arrives.
-                                let is_verified_friend = is_friend && ember_auth_state.is_verified();
-                                let ember_verified = ember_auth_state.is_verified();
+                                let ember_verified = secure_v2_authenticated;
                                 let my_score = score_queue_entry(
                                     &cm, &idx_snap, &peer_user_hash,
                                     current_file_hash.unwrap_or([0u8; 16]),
@@ -5393,6 +5764,15 @@ impl UploadHandler {
                     }
                 }
             };
+
+            // Refresh friend-session liveness on any inbound packet while we
+            // own the Ember slot. File-serve traffic (OP_REQUESTPARTS, etc.)
+            // is the common case for a friend who is downloading from us and
+            // must keep the handle fresh — see the `ember_session_handle`
+            // comment above.
+            if let Some(h) = &ember_session_handle {
+                h.touch();
+            }
 
             match (proto, opcode) {
                 (OP_EMULEPROT, OP_PUBLICKEY) if payload.len() >= 2 => {
@@ -6007,7 +6387,12 @@ impl UploadHandler {
                         // scoring site because `ember_auth_state` can
                         // advance mid-session as the peer's auth packets
                         // arrive.
-                        let is_verified_friend = is_friend && ember_auth_state.is_verified();
+                        let is_verified_friend = live_secure_friend_member(
+                            &self.friend_hashes,
+                            peer_ember_hash,
+                            secure_v2_authenticated,
+                        )
+                        .await;
                         // Global scoring lock order: credit manager → local
                         // index → upload queue. Every scoring path follows this
                         // order so concurrent rank/admission work cannot form an
@@ -6063,7 +6448,7 @@ impl UploadHandler {
                             if is_verified_friend {
                                 queue[pos].is_friend_slot = true;
                             }
-                            let ember_verified = ember_auth_state.is_verified();
+                            let ember_verified = secure_v2_authenticated;
                             queue[pos].ember_verified |= ember_verified;
                             if !same_session {
                                 queue[pos].ember_pubkey = hello_caps.ember_pubkey;
@@ -6123,7 +6508,7 @@ impl UploadHandler {
                             // peer holds a verified friend slot. Scoring newcomers with
                             // wait=0 made almost everyone get OP_QUEUEFULL.
                             let new_fh = current_file_hash.unwrap_or([0u8; 16]);
-                            let ember_verified = ember_auth_state.is_verified();
+                            let ember_verified = secure_v2_authenticated;
                             let peer_ip = peer_ip_u32(Some(peer_addr));
                             let new_combined = combined_file_prio_and_credit(
                                 &cm,
@@ -6218,7 +6603,7 @@ impl UploadHandler {
                         } else {
                             let new_fh = current_file_hash.unwrap_or([0u8; 16]);
                             let join_time = queue_join_time;
-                            let ember_verified = ember_auth_state.is_verified();
+                            let ember_verified = secure_v2_authenticated;
                             queue.push(queue_entry_from_hello(
                                 queue_identity.clone(),
                                 peer_addr,
@@ -7123,7 +7508,7 @@ impl UploadHandler {
                             // starts from the last real upload, not
                             // from the last handshake.
                             if let Some(pk) = hello_caps.ember_pubkey {
-                                let verified = ember_auth_state.is_verified();
+                                let verified = secure_v2_authenticated;
                                 cm.add_ember_uploaded(pk, batch_credited_bytes, verified);
                             }
                         }
@@ -7237,7 +7622,12 @@ impl UploadHandler {
                     // (re-queued, then immediately re-granted via their score, but
                     // with a needless stall) — eMule keeps the friend uploading
                     // continuously.
-                    let is_verified_friend = is_friend && ember_auth_state.is_verified();
+                    let is_verified_friend = live_secure_friend_member(
+                        &self.friend_hashes,
+                        peer_ember_hash,
+                        secure_v2_authenticated,
+                    )
+                    .await;
                     let session_expired = queue_has_waiters
                         && !is_verified_friend
                         && (uploaded >= SESSIONMAXTRANS
@@ -7262,8 +7652,7 @@ impl UploadHandler {
                             // See queue-insertion site above: friend
                             // priority only counts when PoP has landed
                             // on this session.
-                            let is_verified_friend = is_friend && ember_auth_state.is_verified();
-                            let ember_verified = ember_auth_state.is_verified();
+                            let ember_verified = secure_v2_authenticated;
                             let my_score = score_queue_entry(
                                 &cm, &idx_snap, &peer_user_hash, my_fh,
                                 queue_wait_at_grant, Some(peer_addr),
@@ -7320,7 +7709,7 @@ impl UploadHandler {
                         // differentiate peers that walk away
                         // mid-transfer from peers we rotate out.
                         if let Some(pk) = hello_caps.ember_pubkey {
-                            let verified = ember_auth_state.is_verified();
+                            let verified = secure_v2_authenticated;
                             let completed = !preempted;
                             let mut cm = self.credit_manager.write().await;
                             cm.record_ember_session(pk, uploaded, session_secs, completed, verified);
@@ -7381,7 +7770,12 @@ impl UploadHandler {
                             // and the flag is still true, they re-enter
                             // with friend priority; if auth never
                             // completed, they re-enter as a regular peer.
-                            let is_verified_friend = is_friend && ember_auth_state.is_verified();
+                            let is_verified_friend = live_secure_friend_member(
+                                &self.friend_hashes,
+                                peer_ember_hash,
+                                secure_v2_authenticated,
+                            )
+                            .await;
                             let cm = self.credit_manager.read().await;
                             let idx_snap = self.local_index.read().await;
                             let mut queue = self.upload_queue.lock().await;
@@ -7438,7 +7832,7 @@ impl UploadHandler {
                                 // queue entry keeps that fact through
                                 // re-admission (a session change
                                 // already reset it to `false` above).
-                                if ember_auth_state.is_verified() {
+                                if secure_v2_authenticated {
                                     entry.ember_verified = true;
                                 }
                                 if !same_session {
@@ -7456,13 +7850,13 @@ impl UploadHandler {
                                     queue_join_time,
                                     &hello_caps,
                                     is_verified_friend,
-                                    ember_auth_state.is_verified(),
+                                    secure_v2_authenticated,
                                 ));
                                 true
                             } else if queue.len() < HARD_UPLOAD_QUEUE_SIZE {
                                 // eMule soft→hard: CombinedFilePrioAndCredit (no wait)
                                 let new_fh = current_file_hash.unwrap_or([0u8; 16]);
-                                let ember_verified = ember_auth_state.is_verified();
+                                let ember_verified = secure_v2_authenticated;
                                 let peer_ip = peer_ip_u32(Some(peer_addr));
                                 let new_combined = combined_file_prio_and_credit(
                                     &cm,
@@ -7555,7 +7949,7 @@ impl UploadHandler {
                     // aborted session so the reliability multiplier
                     // reflects the churn.
                     if let Some(pk) = hello_caps.ember_pubkey {
-                        let verified = ember_auth_state.is_verified();
+                        let verified = secure_v2_authenticated;
                         let session_secs = session_start
                             .map(|t| t.elapsed().as_secs())
                             .unwrap_or(0);
@@ -8196,7 +8590,7 @@ impl UploadHandler {
                         // accounting / queue scoring attribute uploads
                         // to the victim. Mod_version/nickname keep
                         // updating because they're cosmetic.
-                        let identity_changed = ember_auth_state.is_verified()
+                        let identity_changed = secure_v2_authenticated
                             && (
                                 (ident.ed25519_pubkey.is_some()
                                     && hello_caps.ember_pubkey.is_some()
@@ -8323,7 +8717,7 @@ impl UploadHandler {
                 // `ember_auth_state.is_verified()`, and TCP must not be
                 // weaker than the Noise_IK UDP ExchangeData path.
                 (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE)
-                    if hello_caps.is_ember && ember_auth_state.is_verified() =>
+                    if hello_caps.is_ember && secure_v2_authenticated =>
                 {
                     self.sx_overhead.record_download((6 + payload.len()) as u64);
                     if epx_packets_received >= crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION {
@@ -8351,7 +8745,7 @@ impl UploadHandler {
                     }
                 }
 
-                (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) if hello_caps.is_ember => {
+                (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) if secure_v2_authenticated => {
                     // L21: refuse a friend request whose claimed
                     // sender hash matches our own. PoP from a remote
                     // peer can never succeed for our own identity, so
@@ -8379,7 +8773,7 @@ impl UploadHandler {
                         // "Verified" in the recipient's UI/DB.
                         // Binding is still tracked separately for the
                         // log line below.
-                        let verified = ember_auth_state.is_verified();
+                        let verified = secure_v2_authenticated;
                         info!(
                             "Received friend request from {peer_addr} (nick='{}', hash={}, verified={verified}, pop={}, binding={ember_hash_binding_verified})",
                             nick, hex::encode(eh), verified,
@@ -8388,6 +8782,7 @@ impl UploadHandler {
                             transfer_id: String::new(),
                             kind: UploadEventKind::EmberFriendRequest {
                                 ember_hash: eh,
+                                pubkey: hello_caps.ember_pubkey,
                                 nickname: nick,
                                 peer_ip: peer_addr.ip().to_string(),
                                 peer_port: peer_addr.port(),
@@ -8410,38 +8805,16 @@ impl UploadHandler {
                 // the reader task, which is safe because the
                 // dispatcher is the sole writer on this session.
                 (OP_EMULEPROT, OP_EMBER_AUTH_CHALLENGE) => {
-                    match super::ember_auth::handle_challenge(
-                        &mut ember_auth_state,
-                        &payload,
-                        &self.ed25519_public_key,
-                        &self.ed25519_secret_key,
-                    ) {
-                        Ok(out) => {
-                            if let Some(challenge_payload) = out.our_challenge_payload {
-                                let _ = write_packet_async(
-                                    &mut writer,
-                                    OP_EMULEPROT,
-                                    OP_EMBER_AUTH_CHALLENGE,
-                                    &challenge_payload,
-                                ).await;
-                            }
-                            if let Some(response_payload) = out.our_response_payload {
-                                let _ = write_packet_async(
-                                    &mut writer,
-                                    OP_EMULEPROT,
-                                    OP_EMBER_AUTH_RESPONSE,
-                                    &response_payload,
-                                ).await;
-                            }
-                            debug!("Ember auth (responder): replied to {peer_addr}'s CHALLENGE; awaiting RESPONSE");
-                        }
-                        Err(e) => {
-                            tracing::warn!("Ember auth (responder): rejected CHALLENGE from {peer_addr}: {e:?}");
-                        }
-                    }
+                    // V1 signed attacker-selected nonces and was usable as a
+                    // live cross-session signing oracle.  Parsing remains for
+                    // wire compatibility, but no network path signs or
+                    // authorizes this opcode in secure-stream v2.
+                    debug!("Ignoring retired Ember v1 auth challenge from {peer_addr}");
                 }
 
-                (OP_EMULEPROT, OP_EMBER_AUTH_RESPONSE) => {
+                (OP_EMULEPROT, OP_EMBER_AUTH_RESPONSE)
+                    if super::LEGACY_FRIEND_AUTH_ENABLED =>
+                {
                     let outcome = match (hello_caps.ember_pubkey.as_ref(), peer_ember_hash.as_ref()) {
                         (Some(pk), Some(eh)) => super::ember_auth::handle_response(
                             &mut ember_auth_state,
@@ -8603,6 +8976,10 @@ impl UploadHandler {
                     }
                 }
 
+                (OP_EMULEPROT, OP_EMBER_AUTH_RESPONSE) => {
+                    debug!("Ignoring retired Ember v1 auth response from {peer_addr}");
+                }
+
                 // The four privilege-bearing Ember friend opcodes below
                 // (CHAT, BROWSE_REQ, BROWSE_RES, KEEPALIVE) are gated on
                 // the composite `is_verified_ember_friend` flag: the
@@ -8646,8 +9023,13 @@ impl UploadHandler {
                 // `_` arm below) instead — it remains fully alive for
                 // ordinary eD2K file-serving, which is unrelated to
                 // friend-session ownership and must not be torn down.
-                (OP_EMULEPROT, OP_EMBER_CHAT_MSG) if is_ember_friend && owns_ember_slot && ember_auth_state.is_verified() => {
-                    if let Some(h) = &ember_session_handle { h.touch(); }
+                (OP_EMULEPROT, OP_EMBER_CHAT_MSG)
+                    if friend_privileges_allowed(
+                        secure_v2_authenticated,
+                        is_ember_friend,
+                        owns_ember_slot,
+                    ) =>
+                {
                     if let Some(eh) = peer_ember_hash {
                         if !self.friend_hashes.read().await.contains(&eh) {
                             debug!("Ignoring chat from removed friend {}", hex::encode(eh));
@@ -8674,8 +9056,13 @@ impl UploadHandler {
                     }
                 }
 
-                (OP_EMULEPROT, OP_EMBER_BROWSE_REQ) if is_ember_friend && owns_ember_slot && ember_auth_state.is_verified() => {
-                    if let Some(h) = &ember_session_handle { h.touch(); }
+                (OP_EMULEPROT, OP_EMBER_BROWSE_REQ)
+                    if friend_privileges_allowed(
+                        secure_v2_authenticated,
+                        is_ember_friend,
+                        owns_ember_slot,
+                    ) =>
+                {
                     if let Some(eh) = peer_ember_hash {
                         if !self.friend_hashes.read().await.contains(&eh) {
                             debug!("Ignoring browse request from removed friend {}", hex::encode(eh));
@@ -8690,8 +9077,13 @@ impl UploadHandler {
                     }
                 }
 
-                (OP_EMULEPROT, OP_EMBER_BROWSE_RES) if is_ember_friend && owns_ember_slot && ember_auth_state.is_verified() => {
-                    if let Some(h) = &ember_session_handle { h.touch(); }
+                (OP_EMULEPROT, OP_EMBER_BROWSE_RES)
+                    if friend_privileges_allowed(
+                        secure_v2_authenticated,
+                        is_ember_friend,
+                        owns_ember_slot,
+                    ) =>
+                {
                     if let (Some(eh), Some(session)) = (peer_ember_hash, ember_session_handle.as_ref()) {
                         if !self.friend_hashes.read().await.contains(&eh) {
                             debug!("Ignoring browse response from removed friend {}", hex::encode(eh));
@@ -8709,9 +9101,7 @@ impl UploadHandler {
                     }
                 }
 
-                (OP_EMULEPROT, OP_EMBER_KEEPALIVE) if is_ember_friend && ember_auth_state.is_verified() => {
-                    if let Some(h) = &ember_session_handle { h.touch(); }
-                }
+                (OP_EMULEPROT, OP_EMBER_KEEPALIVE) if is_ember_friend && secure_v2_authenticated => {}
 
                 _ => {
                     debug!(
@@ -8785,7 +9175,7 @@ impl UploadHandler {
         // channel is full (the send after this point drops on
         // `let _`).
         if let (Some(pk), Some(start)) = (hello_caps.ember_pubkey, session_start) {
-            let verified = ember_auth_state.is_verified();
+            let verified = secure_v2_authenticated;
             let session_secs = start.elapsed().as_secs();
             let completed = uploaded > 0;
             let mut cm = self.credit_manager.write().await;
@@ -9964,6 +10354,35 @@ mod ember_session_handle_tests {
         assert!(handle.is_fresh(), "touch() must reset staleness");
     }
 
+    /// Regression for friend uploads lasting longer than
+    /// `EMBER_SESSION_FRESH_SECS`: if `touch()` is only called on Ember
+    /// chat/browse/keepalive (and never on OP_REQUESTPARTS), the periodic
+    /// stale sweep would `close()` an otherwise healthy upload session.
+    /// The upload reader now touches on every inbound packet; this test
+    /// locks in that repeated file-serve-style activity keeps the handle
+    /// fresh indefinitely.
+    #[tokio::test]
+    async fn repeated_touches_keep_handle_fresh_across_freshness_window() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let handle = EmberSessionHandle::new(tx, [0u8; 32]);
+
+        // Simulate several "OP_REQUESTPARTS arrived" events spaced just
+        // under the freshness window — the same pattern a sustained
+        // friend download produces on our upload socket.
+        for _ in 0..3 {
+            handle.backdate_for_test(EMBER_SESSION_FRESH_SECS - 1);
+            assert!(
+                handle.is_fresh(),
+                "activity just inside the freshness window must still count"
+            );
+            handle.touch();
+        }
+        assert!(
+            handle.is_fresh(),
+            "sustained inbound file-serve traffic must keep the Ember session fresh"
+        );
+    }
+
     #[tokio::test]
     async fn close_notifies_the_session_owner() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
@@ -10022,5 +10441,68 @@ mod ember_session_handle_tests {
             !evicted,
             "evicting an absent hash must report false, not panic"
         );
+    }
+
+    #[test]
+    fn two_v1_sessions_or_nonmembers_never_gain_friend_privileges() {
+        // Even if two legacy sessions independently complete/replay their old
+        // PoP transcript, neither supplies the v2-authenticated bit consumed
+        // by authorization.
+        assert!(!crate::network::ed2k::LEGACY_FRIEND_AUTH_ENABLED);
+        assert!(!friend_privileges_allowed(false, true, true));
+        assert!(!friend_privileges_allowed(false, true, true));
+        assert!(!friend_privileges_allowed(true, false, true));
+        assert!(!friend_privileges_allowed(true, true, false));
+        assert!(friend_privileges_allowed(true, true, true));
+    }
+
+    #[tokio::test]
+    async fn friend_removal_revokes_every_matching_secure_session() {
+        let hash = [0xD7; 16];
+        let (tx_a, _rx_a) = tokio::sync::mpsc::channel(1);
+        let (tx_b, _rx_b) = tokio::sync::mpsc::channel(1);
+        let a = EmberSessionHandle::new_secure(tx_a, [1; 32], hash);
+        let b = EmberSessionHandle::new_secure(tx_b, [1; 32], hash);
+        let mut shutdown_a = a.subscribe_shutdown();
+        let mut shutdown_b = b.subscribe_shutdown();
+
+        assert!(revoke_all_secure_sessions(hash) >= 2);
+        shutdown_a.changed().await.unwrap();
+        shutdown_b.changed().await.unwrap();
+        assert!(*shutdown_a.borrow());
+        assert!(*shutdown_b.borrow());
+    }
+
+    #[test]
+    fn connection_admission_guard_releases_all_counters() {
+        let total = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let per_ip = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let ip: IpAddr = "203.0.113.20".parse().unwrap();
+        per_ip.lock().insert(ip, 1);
+        {
+            let _guard = ConnectionAdmissionGuard::new(total.clone(), per_ip.clone(), ip);
+            assert_eq!(total.load(std::sync::atomic::Ordering::Relaxed), 1);
+        }
+        assert_eq!(total.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(!per_ip.lock().contains_key(&ip));
+    }
+
+    #[test]
+    fn port_test_reserve_does_not_expand_ordinary_capacity() {
+        assert_eq!(MAX_TOTAL_CONNECTIONS, 100);
+        assert!(RESERVED_PORT_TEST_CONNECTIONS > 0);
+        assert!(INBOUND_PREAUTH_DEADLINE_SECS < CLIENT_TIMEOUT_SECS);
+    }
+
+    #[tokio::test]
+    async fn emule_port_test_frame_remains_wire_compatible() {
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        writer.write_all(&[OP_EMULEPROT]).await.unwrap();
+        writer.write_all(&2u32.to_le_bytes()).await.unwrap();
+        writer.write_all(&[OP_PORTTEST, 0x12]).await.unwrap();
+        let (protocol, opcode, payload) = read_packet_async_inner(&mut reader).await.unwrap();
+        assert_eq!(protocol, OP_EMULEPROT);
+        assert_eq!(opcode, OP_PORTTEST);
+        assert_eq!(payload, [0x12]);
     }
 }

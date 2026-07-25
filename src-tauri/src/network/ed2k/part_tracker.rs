@@ -416,22 +416,6 @@ impl PartTracker {
         (start, end)
     }
 
-    /// Return byte ranges that are fully downloaded (inverse of gap list).
-    pub fn filled_ranges(&self) -> Vec<(u64, u64)> {
-        let mut filled = Vec::new();
-        let mut pos: u64 = 0;
-        for &(gs, ge) in &self.gaps {
-            if gs > pos {
-                filled.push((pos, gs));
-            }
-            pos = ge;
-        }
-        if pos < self.file_size {
-            filled.push((pos, self.file_size));
-        }
-        filled
-    }
-
     /// Total completed bytes.
     pub fn completed_bytes(&self) -> u64 {
         let gap_bytes: u64 = self.gaps.iter().map(|(s, e)| e - s).sum();

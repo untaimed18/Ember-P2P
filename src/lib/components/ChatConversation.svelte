@@ -399,7 +399,7 @@
         </svg>
       </div>
       <span class="conv-name">
-        <span class="sr-only">{m.chat_friend_with_prefix()} </span><bdi>{friendName || friendHash.slice(0, 8) + '\u2026'}</bdi>
+        <span class="sr-only">{m.chat_friend_with_prefix()} </span><bdi dir="auto">{friendName || friendHash.slice(0, 8) + '\u2026'}</bdi>
       </span>
       {#if isOnline}
         <span class="conv-status online" title={m.chat_online_title()} aria-label={m.chat_online_aria()}>
@@ -469,7 +469,7 @@
             style spoofing class). The text is still rendered exactly as
             written; only its bidi influence is scoped to this element.
           -->
-          <div class="bubble-text"><bdi>{msg.message}</bdi></div>
+          <div class="bubble-text"><bdi dir="auto">{msg.message}</bdi></div>
           <div class="bubble-time">{formatTime(msg.timestamp)}</div>
         </div>
       {/each}

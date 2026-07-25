@@ -55,6 +55,10 @@ flate2 = "1"
 hex = "0.4"
 reqwest = { version = "0.13", features = ["rustls", "stream", "json"], default-features = false }
 sha2 = "0.10"
+base64 = "0.22"
+minisign-verify = "0.2.5"
+semver = "1"
+url = "2"
 igd-next = { version = "0.17", features = ["aio_tokio"] }
 socket2 = "0.6"
 tracing-appender = "0.2"
@@ -115,6 +119,15 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 # `sha2` version already uses — 0.13 upgrades to `digest` 0.11 and would
 # pull in a second, incompatible hashing stack.
 hkdf = "0.12"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
 
 [profile.release]
 strip = true

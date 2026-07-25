@@ -439,11 +439,13 @@ impl ReputationManager {
         // silently wipe the entire peer-reputation/ban database on next
         // launch (a corrupt-JSON `load()` falls back to `Self::new()`,
         // un-banning every flooder/abuser with no error surfaced).
-        crate::security::atomic_write(path, json.as_bytes(), false)
+        crate::security::atomic_write(path, json.as_bytes(), true)
             .map_err(|e| format!("reputation write: {e}"))
     }
 
-    /// Load reputation data from disk. Returns a new manager on any error.
+    /// Strictly load reputation data from disk. Missing is a valid first-run
+    /// state; read/parse failures are returned so startup policy can keep
+    /// network and upload admission closed.
     ///
     /// Loaded entries are normalized: `score` is clamped to
     /// `[MIN_REPUTATION, MAX_REPUTATION]` and `banned_until` is
@@ -453,18 +455,17 @@ impl ReputationManager {
     /// enforced by `apply_event`/`record_event` (e.g. setting
     /// `banned_until = u64::MAX` for a permanent ban, or
     /// `score = i32::MAX` to whitewash a known-bad peer).
-    pub fn load(path: &Path) -> Self {
+    pub fn load_checked(path: &Path) -> Result<Self, String> {
         let data = match std::fs::read_to_string(path) {
             Ok(d) => d,
             // A missing file is the expected first-run state, not a
             // problem worth logging.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::new(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::new()),
             Err(e) => {
-                tracing::warn!(
-                    "reputation load failed to read {}: {e}; starting fresh",
+                return Err(format!(
+                    "reputation load failed to read {}: {e}",
                     path.display()
-                );
-                return Self::new();
+                ));
             }
         };
 
@@ -477,11 +478,10 @@ impl ReputationManager {
                 Err(_) => match serde_json::from_str::<Vec<PeerReputation>>(&data) {
                     Ok(e) => (e, Vec::new(), None),
                     Err(e) => {
-                        tracing::warn!(
-                            "reputation load failed to parse {}: {e}; starting fresh",
+                        return Err(format!(
+                            "reputation load failed to parse {}: {e}",
                             path.display()
-                        );
-                        return Self::new();
+                        ));
                     }
                 },
             };
@@ -545,7 +545,7 @@ impl ReputationManager {
         if mgr.ips.len() > MAX_TRACKED_IPS {
             mgr.evict_stale_ips();
         }
-        mgr
+        Ok(mgr)
     }
 
     fn evict_stale_ips(&mut self) {
@@ -774,7 +774,7 @@ mod tests {
         mgr.record_event(&[30u8; 16], ReputationEvent::SuccessfulHandshake);
         mgr.save(&path).expect("save reputation");
 
-        let loaded = ReputationManager::load(&path);
+        let loaded = ReputationManager::load_checked(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(loaded.tracked_count(), 1);
@@ -796,7 +796,7 @@ mod tests {
         std::fs::write(&path, serde_json::to_string(&persisted).unwrap())
             .expect("write persisted reputation");
 
-        let loaded = ReputationManager::load(&path);
+        let loaded = ReputationManager::load_checked(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
         assert!(
@@ -813,7 +813,7 @@ mod tests {
         std::fs::write(&path, serde_json::to_string(&vec![peer]).unwrap())
             .expect("write legacy reputation");
 
-        let loaded = ReputationManager::load(&path);
+        let loaded = ReputationManager::load_checked(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(loaded.tracked_count(), 1);
@@ -841,13 +841,14 @@ mod tests {
     }
 
     #[test]
-    fn load_returns_fresh_manager_on_corrupt_file() {
+    fn strict_load_rejects_corrupt_file() {
         let path = unique_temp_path("corrupt");
         std::fs::write(&path, b"not valid json{{{").expect("write corrupt reputation");
 
-        let loaded = ReputationManager::load(&path);
+        assert!(
+            ReputationManager::load_checked(&path).is_err(),
+            "startup loader must fail closed on corrupt reputation state"
+        );
         let _ = std::fs::remove_file(&path);
-
-        assert_eq!(loaded.tracked_count(), 0);
     }
 }

@@ -57,6 +57,11 @@
 //!   should check `state.is_verified()` at the appropriate gate
 //!   (e.g. friend-slot priority, EmberFriendRequest emit).
 
+// Secure-stream v2 deliberately leaves this implementation available only
+// for legacy parser/adversarial tests. No live authorization path constructs
+// or advances this state machine anymore.
+#![allow(dead_code)]
+
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use rand::RngCore;

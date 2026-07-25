@@ -1,8 +1,7 @@
 <script lang="ts">
-  // Headless handler for OS-delivered deep links. It renders nothing; it just
-  // drains the backend's pending-deep-link buffer (populated from the launch
-  // args or a second instance's argv) and routes each payload into the same
-  // flows the in-app UI already uses:
+  // Handler for OS-delivered deep links. It drains the backend's durable
+  // buffer and presents an in-app confirmation before network side effects,
+  // then routes confirmed payloads into the same flows the UI already uses:
   //   - ed2k://|file|...        -> queue a download
   //   - ed2k://|server|ip|port  -> add + connect to the ed2k server
   //   - ed2k://|serverlist|url  -> download a server.met list
@@ -17,7 +16,10 @@
     ackPendingDeepLink,
     listPendingDeepLinks,
     openCollectionFile,
+    previewDeepLink,
+    type DeepLinkPreview,
   } from '$lib/api/deeplink';
+  import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import { presentIncomingCollection } from '$lib/stores/collection';
   import { toastSuccess, toastError } from '$lib/stores/toast';
   import { translateError } from '$lib/i18n';
@@ -43,13 +45,81 @@
     }
   }
 
+  function formatSize(bytes: number): string {
+    if (!Number.isFinite(bytes) || bytes < 0) return '0 B';
+    if (bytes < 1024) return `${bytes} B`;
+    const units = ['KiB', 'MiB', 'GiB', 'TiB'];
+    let value = bytes;
+    let unit = -1;
+    do {
+      value /= 1024;
+      unit++;
+    } while (value >= 1024 && unit < units.length - 1);
+    return `${value.toFixed(value >= 10 ? 1 : 2)} ${units[unit]}`;
+  }
+
+  function deepLinkConfirmationMessage(preview: DeepLinkPreview): string {
+    if (preview.kind === 'file') {
+      return `${preview.name ?? ''}\n${formatSize(preview.size ?? 0)}\n${preview.hash ?? ''}`;
+    }
+    if (preview.kind === 'server') return preview.endpoint ?? '';
+    if (preview.kind === 'serverList') return preview.host ?? '';
+    return preview.name ?? '';
+  }
+
+  let confirmOpen = false;
+  let confirmMessage = '';
+  let confirmResolver: ((confirmed: boolean) => void) | null = null;
+
+  function requestConfirmation(preview: DeepLinkPreview): Promise<boolean> {
+    if (destroyed) return Promise.resolve(false);
+    confirmMessage = deepLinkConfirmationMessage(preview);
+    confirmOpen = true;
+    return new Promise((resolve) => {
+      confirmResolver = resolve;
+    });
+  }
+
+  function resolveConfirmation(confirmed: boolean) {
+    const resolve = confirmResolver;
+    confirmResolver = null;
+    confirmOpen = false;
+    resolve?.(confirmed);
+  }
+
   async function handlePayload(raw: string): Promise<boolean> {
     const payload = raw.trim();
-    const lower = payload.toLowerCase();
+    let preview: DeepLinkPreview;
     try {
-      if (lower.startsWith('ed2k://|file|')) {
+      preview = await previewDeepLink(payload);
+    } catch (e: unknown) {
+      // Parsing/validation errors are permanent for this immutable durable
+      // payload. Surface once, then acknowledge so malformed links cannot
+      // occupy all queue slots forever.
+      if (!destroyed) toastError(translateError(e));
+      return !destroyed;
+    }
+
+    if (preview.kind !== 'collection') {
+      const confirmed = await requestConfirmation(preview);
+      if (destroyed) return false;
+      // Explicit cancellation is a terminal user decision and is therefore
+      // acknowledged without executing the network/filesystem action.
+      if (!confirmed) return true;
+    }
+
+    try {
+      if (preview.kind === 'file') {
         const info = await parseEd2kLink(payload);
-        const res = await startDownload(info.hash, info.name, info.size, '', 0);
+        const res = await startDownload(
+          info.hash,
+          info.name,
+          info.size,
+          '',
+          0,
+          undefined,
+          info.aich,
+        );
         if (!destroyed) {
           toastSuccess(
             res.already_queued
@@ -57,7 +127,7 @@
               : m.search_queued_name({ name: info.name }),
           );
         }
-      } else if (lower.startsWith('ed2k://|server|')) {
+      } else if (preview.kind === 'server') {
         const segs = ed2kSegments(payload); // ['server', ip, port]
         const ip = segs[1] ?? '';
         const port = parseInt(segs[2] ?? '', 10);
@@ -79,7 +149,7 @@
         }
         const msg = await connectToServer(ip, port);
         if (!destroyed) toastSuccess(msg);
-      } else if (lower.startsWith('ed2k://|serverlist|')) {
+      } else if (preview.kind === 'serverList') {
         const segs = ed2kSegments(payload); // ['serverlist', url]
         const url = segs[1] ?? '';
         if (!isAllowedServerListUrl(url)) {
@@ -90,7 +160,7 @@
         }
         const msg = await downloadServerMet(url);
         if (!destroyed) toastSuccess(msg);
-      } else if (!lower.startsWith('ed2k://') && lower.endsWith('.emulecollection')) {
+      } else if (preview.kind === 'collection') {
         const coll = await openCollectionFile(payload);
         if (destroyed) return false;
         const presented = presentIncomingCollection(coll);
@@ -209,8 +279,20 @@
     return () => {
       mounted = false;
       destroyed = true;
+      resolveConfirmation(false);
       clearTimeout(ackRetryTimer);
       if (unlisten) unlisten();
     };
   });
 </script>
+
+<ConfirmDialog
+  bind:open={confirmOpen}
+  title={m.confirm_default_title()}
+  message={confirmMessage}
+  confirmLabel={m.confirm_default_button()}
+  cancelLabel={m.common_cancel()}
+  isolateMessage={true}
+  onconfirm={() => resolveConfirmation(true)}
+  oncancel={() => resolveConfirmation(false)}
+/>

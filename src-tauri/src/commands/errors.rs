@@ -59,11 +59,26 @@ pub fn coded_ctx(
     message: impl Into<String>,
     context: impl std::fmt::Display,
 ) -> String {
+    let raw = context.to_string();
+    let mut safe: String = raw
+        .chars()
+        .filter(|ch| {
+            !ch.is_control()
+                && !matches!(
+                    *ch as u32,
+                    0x200B..=0x200F | 0x202A..=0x202E | 0x2066..=0x2069 | 0xFEFF
+                )
+        })
+        .take(512)
+        .collect();
+    if raw.chars().count() > 512 {
+        safe.push('…');
+    }
     serde_json::to_string(&CodedError {
         __coded: true,
         code,
         message: message.into(),
-        context: Some(context.to_string()),
+        context: Some(safe),
     })
     .unwrap_or_else(|_| code.to_string())
 }
@@ -109,5 +124,24 @@ pub async fn await_reply<T>(
         Ok(Ok(value)) => Ok(value),
         Ok(Err(_)) => Err(coded(dropped_code, dropped_message)),
         Err(_) => Err(coded("network_timeout", "The network is not responding")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coded_context_cannot_inject_lines_or_bidi_controls() {
+        let encoded = coded_ctx(
+            "test",
+            "Test failed",
+            "peer text\nforged warning\u{202e}txt",
+        );
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        let context = value["context"].as_str().unwrap();
+        assert!(!context.contains('\n'));
+        assert!(!context.contains('\u{202e}'));
+        assert!(context.contains("peer text"));
     }
 }

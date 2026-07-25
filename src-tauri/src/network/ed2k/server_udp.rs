@@ -745,6 +745,7 @@ fn apply_udp_string_tag(
     comment: &mut Option<String>,
     media: &mut crate::types::MediaMetadata,
 ) {
+    let value = crate::security::sanitize_remote_text(&value, 8192);
     if name_id == 0x01 {
         *file_name = value;
         return;

@@ -12,6 +12,7 @@ use tracing::{debug, info, warn};
 
 use super::ember_auth::{sign_auth_nonce, verify_auth_nonce};
 use super::messages::*;
+use super::secure_stream;
 use super::upload::{EmberSessionHandle, EmberSessionMap, UploadEvent, UploadEventKind};
 use crate::network::ember::crypto;
 use crate::network::ember::crypto::{decrypt_chat_payload, MAX_CHAT_WIRE_LEN};
@@ -121,8 +122,23 @@ pub async fn run_friend_session_over_transport(
     ed25519_pubkey: Option<[u8; 32]>,
     ed25519_secret_key: Option<[u8; 32]>,
 ) -> anyhow::Result<FriendSessionHandle> {
-    let mut reader = tokio::io::BufReader::new(raw_r);
-    let mut writer = tokio::io::BufWriter::new(raw_w);
+    let our_pk =
+        ed25519_pubkey.ok_or_else(|| anyhow::anyhow!(secure_stream::UPGRADE_REQUIRED_ERROR))?;
+    let our_sk =
+        ed25519_secret_key.ok_or_else(|| anyhow::anyhow!(secure_stream::UPGRADE_REQUIRED_ERROR))?;
+    let secure = secure_stream::initiate(
+        raw_r,
+        raw_w,
+        our_ember_hash,
+        expected_ember_hash,
+        our_pk,
+        our_sk,
+    )
+    .await?;
+    let peer_pk = secure.peer.ed25519_public_key;
+    let peer_ember_hash = secure.peer.ember_hash;
+    let mut reader = tokio::io::BufReader::new(secure.reader);
+    let mut writer = tokio::io::BufWriter::new(secure.writer);
 
     let hello_options = HelloOptions {
         udp_port,
@@ -157,8 +173,7 @@ pub async fn run_friend_session_over_transport(
         e
     })?;
 
-    let pk_ref = ed25519_pubkey.as_ref();
-    let emule_payload = build_emule_info(udp_port, false, Some(&our_ember_hash), pk_ref);
+    let emule_payload = build_emule_info(udp_port, false, Some(&our_ember_hash), None);
     write_packet(&mut writer, OP_EMULEPROT, OP_EMULEINFO, &emule_payload).await?;
 
     let (proto, opcode, payload) = read_packet_with_timeout(&mut reader, 15)
@@ -167,50 +182,18 @@ pub async fn run_friend_session_over_transport(
     if proto == OP_EMULEPROT && (opcode == OP_EMULEINFOANSWER || opcode == OP_EMULEINFO) {
         merge_caps(&mut hello_caps, parse_emule_info(&payload));
         if opcode == OP_EMULEINFO {
-            let answer = build_emule_info(udp_port, false, Some(&our_ember_hash), pk_ref);
+            let answer = build_emule_info(udp_port, false, Some(&our_ember_hash), None);
             write_packet(&mut writer, OP_EMULEPROT, OP_EMULEINFOANSWER, &answer).await?;
         }
     }
 
-    // Synchronous Ember-Hello round-trip. Without this,
-    // `hello_caps.is_ember` stays false (the public Hello / EmuleInfo
-    // no longer signals Ember-ness), the bail below always fires,
-    // and friend sessions can't open at all. This also populates
-    // `hello_caps.ember_pubkey`, which gates the `perform_ember_auth`
-    // call below.
-    exchange_ember_hello(
-        &mut reader,
-        &mut writer,
-        &our_ember_hash,
-        &our_nickname,
-        ed25519_pubkey.as_ref(),
-        &mut hello_caps,
-        addr,
-    )
-    .await?;
-
-    if !hello_caps.is_ember {
-        anyhow::bail!("remote peer is not an Ember client");
-    }
-    let peer_ember_hash = hello_caps
-        .ember_hash
-        .ok_or_else(|| anyhow::anyhow!("Ember peer has no ember_hash"))?;
-
-    // Identity guard (see the function doc): refuse a session whose peer
-    // identifies as someone other than the friend the caller asked us to
-    // dial. Runs before the duplicate-session check and the expensive PoP
-    // round trip so a stale/reused address is rejected as cheaply as
-    // possible. PoP below still proves possession of the claimed hash; this
-    // check is what prevents a *wrong but otherwise-valid* friend from
-    // standing in for the one we intended to reach.
-    if peer_ember_hash != expected_ember_hash {
-        anyhow::bail!(
-            "dialed {} expecting friend {} but peer identifies as {}; refusing session",
-            addr,
-            hex::encode(expected_ember_hash),
-            hex::encode(peer_ember_hash)
-        );
-    }
+    // The outer Noise IK handshake is now the sole privilege-bearing
+    // identity proof.  Do not run the legacy nonce-signing exchange inside
+    // the stream: keeping two authenticators would preserve the v1 live
+    // signing oracle and create ambiguous downgrade semantics.
+    hello_caps.is_ember = true;
+    hello_caps.ember_hash = Some(peer_ember_hash);
+    hello_caps.ember_pubkey = Some(peer_pk);
 
     // Early duplicate-session check. As soon as we know the peer's
     // ember_hash (from `exchange_ember_hello` above) we can tell whether
@@ -234,7 +217,7 @@ pub async fn run_friend_session_over_transport(
             // so would hand back a handle whose writes vanish, exactly the
             // "blocked re-dial" this freshness check exists to prevent.
             // Falling through here re-dials for real instead.
-            if existing.is_fresh() {
+            if existing.is_fresh() && existing.is_secure_v2() {
                 info!(
                     "Friend session for {} already exists after Ember-Hello; skipping duplicate handshake",
                     hex::encode(peer_ember_hash)
@@ -248,61 +231,6 @@ pub async fn run_friend_session_over_transport(
         }
     }
 
-    // Ember auth challenge-response. Now that `OP_EMBER_HELLO` is
-    // exchanged above, `hello_caps.ember_pubkey` is populated and
-    // this branch performs a real Ed25519 proof-of-possession round
-    // trip — verifies BLAKE3(peer_pk)[0..16] == peer_ember_hash and
-    // that the peer can sign a fresh nonce with the matching secret
-    // key. A failure here propagates as `?` and aborts the friend
-    // session, so a peer that fails PoP never gets friend-session
-    // privileges (chat, browse, etc.).
-    //
-    // V1 hardening (M1): if the peer didn't advertise an Ed25519
-    // pubkey at all (legacy / spoofed `OP_EMBER_HELLO` from a
-    // vanilla eMule), we refuse to open the friend session
-    // entirely — the only thing we'd have to bind chat/browse to
-    // is the unproven 16-byte hash claim. Pre-V1 we used to
-    // continue with `ember_hash_binding_verified=false`; that
-    // window let an attacker iterate Ember hashes from EPX dumps,
-    // dial us, and claim an existing friend's hash without ever
-    // proving possession. Closing the door here is safe: every
-    // honest Ember client builds its hash from its own pubkey so
-    // it always advertises one in the same `OP_EMBER_HELLO`.
-    let our_have_keys = ed25519_pubkey.is_some() && ed25519_secret_key.is_some();
-    let peer_pk = match hello_caps.ember_pubkey {
-        Some(pk) => pk,
-        None => {
-            anyhow::bail!(
-                "remote peer {} did not advertise an Ed25519 pubkey in OP_EMBER_HELLO; refusing friend session",
-                hex::encode(peer_ember_hash)
-            );
-        }
-    };
-    let mut deferred_auth_packets = std::collections::VecDeque::new();
-    let ember_pop_verified = if our_have_keys {
-        let our_pk = ed25519_pubkey.unwrap();
-        let our_sk = ed25519_secret_key.unwrap();
-        perform_ember_auth_buffered(
-            &mut reader,
-            &mut writer,
-            &our_pk,
-            &our_sk,
-            &peer_pk,
-            Some(&peer_ember_hash),
-            addr,
-            &mut deferred_auth_packets,
-        )
-        .await?;
-        true
-    } else {
-        // We can't drive the challenge-response without our own
-        // identity. Refuse rather than silently downgrading.
-        anyhow::bail!(
-            "local node has no Ed25519 identity; refusing friend session with {}",
-            hex::encode(peer_ember_hash)
-        );
-    };
-
     let is_friend = friend_hashes.read().await.contains(&peer_ember_hash);
     if !is_friend {
         anyhow::bail!(
@@ -311,13 +239,7 @@ pub async fn run_friend_session_over_transport(
         );
     }
 
-    // Verification flag passed into the spawned reader task below
-    // so any `OP_EMBER_FRIEND_REQ` we receive on this session
-    // reports an honest `verified` value to the UI. By the time we
-    // reach this line PoP has already succeeded (otherwise we
-    // bailed above), so this is `true`. Kept as a named binding
-    // for clarity at the use sites below.
-    let ember_hash_binding_verified = ember_pop_verified;
+    let ember_hash_binding_verified = true;
 
     // Reserve the session slot atomically BEFORE we send our friend
     // request. If another concurrent dial raced us and claimed the
@@ -326,11 +248,12 @@ pub async fn run_friend_session_over_transport(
     // duplicate request from the racing connection too) — return
     // the winner's handle instead and drop this socket cleanly.
     let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
-    let ember_session_handle = EmberSessionHandle::new(outbound_tx.clone(), peer_pk);
+    let ember_session_handle =
+        EmberSessionHandle::new_secure(outbound_tx.clone(), peer_pk, peer_ember_hash);
     {
         let mut sessions = ember_sessions.write().await;
         match sessions.get(&peer_ember_hash) {
-            Some(existing) if existing.is_fresh() => {
+            Some(existing) if existing.is_fresh() && existing.is_secure_v2() => {
                 info!(
                     "Friend session for {} already exists (post-auth race); skipping duplicate",
                     hex::encode(peer_ember_hash)
@@ -402,12 +325,7 @@ pub async fn run_friend_session_over_transport(
     let session_ul_event_tx = ul_event_tx.clone();
     let session_friend_hashes = friend_hashes.clone();
     let mut session_shutdown = ember_session_handle.subscribe_shutdown();
-    // `ember_pop_verified` (true, or we'd have bailed above) implies
-    // `our_have_keys`, so this can't panic; `ed25519_secret_key` is
-    // `Option<[u8; 32]>` (`Copy`), so unwrapping a copy here doesn't
-    // disturb the original binding used earlier.
-    let session_our_ed25519_secret =
-        ed25519_secret_key.expect("ember_pop_verified implies our_have_keys");
+    let session_our_ed25519_secret = our_sk;
     let session_peer_ember_pubkey = peer_pk;
     tokio::spawn(async move {
         const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(90);
@@ -437,11 +355,6 @@ pub async fn run_friend_session_over_transport(
         let (pkt_tx, mut pkt_rx) =
             tokio::sync::mpsc::channel::<std::io::Result<(u8, u8, Vec<u8>)>>(8);
         let reader_task = tokio::spawn(async move {
-            while let Some(packet) = deferred_auth_packets.pop_front() {
-                if pkt_tx.send(Ok(packet)).await.is_err() {
-                    return;
-                }
-            }
             loop {
                 let res = read_packet_inner(&mut reader).await;
                 let is_err = res.is_err();
@@ -492,6 +405,13 @@ pub async fn run_friend_session_over_transport(
                             // session as fresh for as long as it's
                             // actually exchanging traffic.
                             session_ember_session_handle.touch();
+                            if !session_friend_hashes.read().await.contains(&peer_ember_hash) {
+                                info!(
+                                    "Friend {} removed; dropping inbound packet and terminating secure session",
+                                    hex::encode(peer_ember_hash)
+                                );
+                                break;
+                            }
                             match (proto, opcode) {
                                 (OP_EMULEPROT, OP_EMBER_CHAT_MSG) => {
                                     if payload.len() <= MAX_CHAT_WIRE_LEN {
@@ -546,6 +466,7 @@ pub async fn run_friend_session_over_transport(
                                         transfer_id: String::new(),
                                         kind: UploadEventKind::EmberFriendRequest {
                                             ember_hash: peer_ember_hash,
+                                            pubkey: Some(peer_pk),
                                             nickname: nick,
                                             peer_ip: addr.ip().to_string(),
                                             peer_port: addr.port(),
@@ -650,7 +571,7 @@ pub async fn run_friend_session_over_transport(
     Ok(handle)
 }
 
-/// Number of `/punch/{id}` polls to make after registering, and the delay
+/// Number of signed `/v2/punch/poll` requests to make after registering, and the delay
 /// between them. A friend's own offline-retry loop fires independently of
 /// ours (there is no request/response coupling before this point — see
 /// [`punch_friend`]), so this window exists purely to catch two
@@ -742,7 +663,11 @@ pub async fn connect_friend_with_fallback(
         (ctx.nat_type, ctx.external_addr, ctx.quic_endpoint.clone())
     };
 
-    if let (Some(endpoint), Some(ext_addr)) = (quic_endpoint.as_ref(), our_external_addr) {
+    if let (Some(endpoint), Some(ext_addr), Some(punch_secret)) = (
+        quic_endpoint.as_ref(),
+        our_external_addr,
+        ed25519_secret_key.as_ref(),
+    ) {
         if our_nat_type != crate::network::ember::nat::NatType::Symmetric {
             match punch_friend(
                 &rendezvous_url,
@@ -751,6 +676,7 @@ pub async fn connect_friend_with_fallback(
                 expected_ember_hash,
                 ext_addr,
                 our_nat_type,
+                punch_secret,
             )
             .await
             {
@@ -806,6 +732,9 @@ pub async fn connect_friend_with_fallback(
         &rendezvous_url,
         our_ember_hash,
         expected_ember_hash,
+        ed25519_pubkey
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("server relay requires local v2 identity"))?,
         &relay_secret,
     )
     .await
@@ -869,10 +798,8 @@ async fn punch_friend(
     friend_ember_hash: [u8; 16],
     our_external_addr: SocketAddr,
     our_nat_type: crate::network::ember::nat::NatType,
+    secret_key: &[u8; 32],
 ) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
-    let our_id = format!("{:0>64}", hex::encode(our_ember_hash));
-    let target_id = format!("{:0>64}", hex::encode(friend_ember_hash));
-
     // Register the port our QUIC endpoint is actually bound to, not
     // `our_external_addr.port()` — that address comes from the KAD UDP
     // STUN probe (a *different* socket than the QUIC endpoint the friend
@@ -884,18 +811,64 @@ async fn punch_friend(
         .unwrap_or_else(|_| our_external_addr.port());
     crate::network::ember::relay::register_punch(
         rendezvous_url,
-        &our_id,
-        &target_id,
+        &our_ember_hash,
+        &friend_ember_hash,
         advertise_port,
         our_nat_type.as_u8(),
+        secret_key,
     )
     .await?;
 
     for _ in 0..FRIEND_PUNCH_POLL_ATTEMPTS {
         tokio::time::sleep(FRIEND_PUNCH_POLL_INTERVAL).await;
-        match crate::network::ember::relay::poll_punch(rendezvous_url, &our_id).await {
+        match crate::network::ember::relay::poll_punch(rendezvous_url, &our_ember_hash, secret_key)
+            .await
+        {
             Ok(Some(info)) => {
+                let expected_capability = match crate::network::rendezvous::fetch_identity_pubkey(
+                    rendezvous_url,
+                    &friend_ember_hash,
+                )
+                .await?
+                .and_then(|pubkey| {
+                    let owner_pubkey = ed25519_dalek::SigningKey::from_bytes(secret_key)
+                        .verifying_key()
+                        .to_bytes();
+                    crate::network::ember::crypto::derive_pairwise_presence_capability(
+                        secret_key,
+                        &pubkey,
+                        &owner_pubkey,
+                        info.epoch,
+                    )
+                }) {
+                    Some(capability) => capability,
+                    None => continue,
+                };
+                if info.from_id != crate::network::rendezvous::hashed_id(&friend_ember_hash)
+                    || info.capability != expected_capability
+                {
+                    let _ = crate::network::ember::relay::ack_punch(
+                        rendezvous_url,
+                        &our_ember_hash,
+                        &info.punch_id,
+                        &info.capability,
+                        info.epoch,
+                        secret_key,
+                    )
+                    .await;
+                    continue;
+                }
+                let peer_nat = crate::network::ember::nat::NatType::from_u8(info.nat_type);
                 let Ok(ip) = info.ip.parse::<std::net::IpAddr>() else {
+                    let _ = crate::network::ember::relay::ack_punch(
+                        rendezvous_url,
+                        &our_ember_hash,
+                        &info.punch_id,
+                        &info.capability,
+                        info.epoch,
+                        secret_key,
+                    )
+                    .await;
                     continue;
                 };
                 let routable = match ip {
@@ -907,12 +880,36 @@ async fn punch_friend(
                         "Friend punch: ignoring non-routable target {ip}:{}",
                         info.port
                     );
+                    let _ = crate::network::ember::relay::ack_punch(
+                        rendezvous_url,
+                        &our_ember_hash,
+                        &info.punch_id,
+                        &info.capability,
+                        info.epoch,
+                        secret_key,
+                    )
+                    .await;
                     continue;
                 }
                 let peer_addr = SocketAddr::new(ip, info.port);
-                return super::super::ember::broker::punch_quic(endpoint, peer_addr, None)
-                    .await
-                    .map_err(|e| format!("QUIC punch to {peer_addr} failed: {e}"));
+                debug!("Friend punch: signed peer at {peer_addr} reports NAT {peer_nat:?}");
+                match super::super::ember::broker::punch_quic(endpoint, peer_addr, None).await {
+                    Ok(streams) => {
+                        crate::network::ember::relay::ack_punch(
+                            rendezvous_url,
+                            &our_ember_hash,
+                            &info.punch_id,
+                            &info.capability,
+                            info.epoch,
+                            secret_key,
+                        )
+                        .await?;
+                        return Ok(streams);
+                    }
+                    Err(error) => {
+                        debug!("Friend QUIC punch to {peer_addr} failed: {error}");
+                    }
+                }
             }
             Ok(None) => {}
             Err(e) => debug!("Friend punch poll error: {e}"),
@@ -931,12 +928,14 @@ async fn relay_friend(
     rendezvous_url: &str,
     our_ember_hash: [u8; 16],
     friend_ember_hash: [u8; 16],
+    our_pubkey: &[u8; 32],
     secret_key: &[u8; 32],
 ) -> Result<crate::network::ember::relay::WsStream, String> {
     let offer = crate::network::rendezvous::offer_friend_relay_ticket(
         rendezvous_url,
         &our_ember_hash,
         &friend_ember_hash,
+        our_pubkey,
         secret_key,
     )
     .await?;
@@ -1000,7 +999,6 @@ use super::multi_source::parse_browse_response;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::network::ed2k::ember_auth::sign_auth_nonce;
 
     /// With an empty `rendezvous_url`, `connect_friend_with_fallback` must
     /// behave exactly like the old TCP-only `open_and_run_friend_session`
@@ -1068,6 +1066,8 @@ mod tests {
         let our_sk = SigningKey::generate(&mut OsRng);
         let our_pk_bytes = our_sk.verifying_key().to_bytes();
         let our_sk_bytes = our_sk.to_bytes();
+        let our_ember_hash =
+            crate::network::ember::crypto::node_id_from_public_key(&our_sk.verifying_key());
 
         let peer_sk = SigningKey::generate(&mut OsRng);
         let peer_pk_bytes = peer_sk.verifying_key().to_bytes();
@@ -1076,7 +1076,7 @@ mod tests {
 
         let (client, server) = tokio::io::duplex(8192);
         let (client_r, client_w) = tokio::io::split(client);
-        let (mut server_r, mut server_w) = tokio::io::split(server);
+        let (mut server_r, server_w) = tokio::io::split(server);
 
         let ember_sessions: EmberSessionMap =
             Arc::new(RwLock::new(std::collections::HashMap::new()));
@@ -1092,7 +1092,7 @@ mod tests {
             addr,
             peer_ember_hash,
             [0x11; 16],
-            [0x22; 16],
+            our_ember_hash,
             "tester".to_string(),
             0,
             4662,
@@ -1108,6 +1108,19 @@ mod tests {
         // Mock peer: plays the responder side of the handshake so the
         // client-side function under test runs its real success path.
         let mock_peer = async {
+            let first = server_r.read_u8().await.unwrap();
+            let secure = super::secure_stream::accept_after_first(
+                Box::new(server_r),
+                Box::new(server_w),
+                first,
+                peer_ember_hash,
+                peer_pk_bytes,
+                peer_sk.to_bytes(),
+            )
+            .await
+            .unwrap();
+            let mut server_r = secure.reader;
+            let mut server_w = secure.writer;
             let (proto, opcode, _) = read_packet_inner(&mut server_r).await.unwrap();
             assert_eq!((proto, opcode), (OP_EDONKEYHEADER, OP_HELLO));
             let hello_answer = build_hello_answer_with_buddy_opts(
@@ -1138,41 +1151,6 @@ mod tests {
             )
             .await
             .unwrap();
-
-            let (proto, opcode, _) = read_packet_inner(&mut server_r).await.unwrap();
-            assert_eq!((proto, opcode), (OP_EMULEPROT, OP_EMBER_HELLO));
-            let ember_hello = build_ember_hello(&peer_ember_hash, "peer", Some(&peer_pk_bytes));
-            write_packet(
-                &mut server_w,
-                OP_EMULEPROT,
-                OP_EMBER_HELLOANSWER,
-                &ember_hello,
-            )
-            .await
-            .unwrap();
-
-            let (proto, opcode, our_nonce) = read_packet_inner(&mut server_r).await.unwrap();
-            assert_eq!((proto, opcode), (OP_EMULEPROT, OP_EMBER_AUTH_CHALLENGE));
-            let mut peer_nonce = [0u8; 32];
-            OsRng.fill_bytes(&mut peer_nonce);
-            write_packet(
-                &mut server_w,
-                OP_EMULEPROT,
-                OP_EMBER_AUTH_CHALLENGE,
-                &peer_nonce,
-            )
-            .await
-            .unwrap();
-            let sig = sign_auth_nonce(&peer_sk, &our_nonce);
-            let mut resp = Vec::with_capacity(96);
-            resp.extend_from_slice(&peer_pk_bytes);
-            resp.extend_from_slice(&sig.to_bytes());
-            write_packet(&mut server_w, OP_EMULEPROT, OP_EMBER_AUTH_RESPONSE, &resp)
-                .await
-                .unwrap();
-
-            let (proto, opcode, _) = read_packet_inner(&mut server_r).await.unwrap();
-            assert_eq!((proto, opcode), (OP_EMULEPROT, OP_EMBER_AUTH_RESPONSE));
 
             let (proto, opcode, _) = read_packet_inner(&mut server_r).await.unwrap();
             assert_eq!((proto, opcode), (OP_EMULEPROT, OP_EMBER_FRIEND_REQ));
@@ -1218,6 +1196,8 @@ mod tests {
         let our_sk = SigningKey::generate(&mut OsRng);
         let our_pk_bytes = our_sk.verifying_key().to_bytes();
         let our_sk_bytes = our_sk.to_bytes();
+        let our_ember_hash =
+            crate::network::ember::crypto::node_id_from_public_key(&our_sk.verifying_key());
 
         let peer_sk = SigningKey::generate(&mut OsRng);
         let peer_pk_bytes = peer_sk.verifying_key().to_bytes();
@@ -1226,7 +1206,7 @@ mod tests {
 
         let (client, server) = tokio::io::duplex(8192);
         let (client_r, client_w) = tokio::io::split(client);
-        let (mut server_r, mut server_w) = tokio::io::split(server);
+        let (mut server_r, server_w) = tokio::io::split(server);
 
         let ember_sessions: EmberSessionMap =
             Arc::new(RwLock::new(std::collections::HashMap::new()));
@@ -1256,7 +1236,7 @@ mod tests {
             addr,
             peer_ember_hash,
             [0x11; 16],
-            [0x22; 16],
+            our_ember_hash,
             "tester".to_string(),
             0,
             4662,
@@ -1270,6 +1250,19 @@ mod tests {
         ));
 
         let mock_peer = async {
+            let first = server_r.read_u8().await.unwrap();
+            let secure = super::secure_stream::accept_after_first(
+                Box::new(server_r),
+                Box::new(server_w),
+                first,
+                peer_ember_hash,
+                peer_pk_bytes,
+                peer_sk.to_bytes(),
+            )
+            .await
+            .unwrap();
+            let mut server_r = secure.reader;
+            let mut server_w = secure.writer;
             let (proto, opcode, _) = read_packet_inner(&mut server_r).await.unwrap();
             assert_eq!((proto, opcode), (OP_EDONKEYHEADER, OP_HELLO));
             let hello_answer = build_hello_answer_with_buddy_opts(
@@ -1300,41 +1293,6 @@ mod tests {
             )
             .await
             .unwrap();
-
-            let (proto, opcode, _) = read_packet_inner(&mut server_r).await.unwrap();
-            assert_eq!((proto, opcode), (OP_EMULEPROT, OP_EMBER_HELLO));
-            let ember_hello = build_ember_hello(&peer_ember_hash, "peer", Some(&peer_pk_bytes));
-            write_packet(
-                &mut server_w,
-                OP_EMULEPROT,
-                OP_EMBER_HELLOANSWER,
-                &ember_hello,
-            )
-            .await
-            .unwrap();
-
-            let (proto, opcode, our_nonce) = read_packet_inner(&mut server_r).await.unwrap();
-            assert_eq!((proto, opcode), (OP_EMULEPROT, OP_EMBER_AUTH_CHALLENGE));
-            let mut peer_nonce = [0u8; 32];
-            OsRng.fill_bytes(&mut peer_nonce);
-            write_packet(
-                &mut server_w,
-                OP_EMULEPROT,
-                OP_EMBER_AUTH_CHALLENGE,
-                &peer_nonce,
-            )
-            .await
-            .unwrap();
-            let sig = sign_auth_nonce(&peer_sk, &our_nonce);
-            let mut resp = Vec::with_capacity(96);
-            resp.extend_from_slice(&peer_pk_bytes);
-            resp.extend_from_slice(&sig.to_bytes());
-            write_packet(&mut server_w, OP_EMULEPROT, OP_EMBER_AUTH_RESPONSE, &resp)
-                .await
-                .unwrap();
-
-            let (proto, opcode, _) = read_packet_inner(&mut server_r).await.unwrap();
-            assert_eq!((proto, opcode), (OP_EMULEPROT, OP_EMBER_AUTH_RESPONSE));
 
             let (proto, opcode, _) = read_packet_inner(&mut server_r).await.unwrap();
             assert_eq!((proto, opcode), (OP_EMULEPROT, OP_EMBER_FRIEND_REQ));
@@ -1418,6 +1376,7 @@ async fn read_packet_inner<R: AsyncReadExt + Unpin + ?Sized>(
 /// latency to friend-connect; long enough to absorb normal-internet
 /// jitter for the small handful of packets that may queue ahead of the
 /// Ember hello.
+#[allow(dead_code)]
 const EMBER_HELLO_TIMEOUT_SECS: u64 = 5;
 /// Cap on the number of unrelated packets we'll consume while looking
 /// for the peer's Ember hello. A well-behaved Ember peer sends its
@@ -1425,6 +1384,7 @@ const EMBER_HELLO_TIMEOUT_SECS: u64 = 5;
 /// packets are normal (e.g. `OP_SECIDENTSTATE`); a higher count may
 /// indicate the peer is racing in unrelated traffic. Bounded so a
 /// chatty peer can't pin us in this loop.
+#[allow(dead_code)]
 const EMBER_HELLO_MAX_LOOKAHEAD: usize = 4;
 
 /// Drives a synchronous `OP_EMBER_HELLO` exchange right after the
@@ -1444,6 +1404,7 @@ const EMBER_HELLO_MAX_LOOKAHEAD: usize = 4;
 /// Ember peers that don't speak this opcode just hit the timeout and
 /// the handshake proceeds without `ember_pubkey` set — the downstream
 /// `is_ember` check at the call sites then bails cleanly.
+#[allow(dead_code)]
 async fn exchange_ember_hello<R, W>(
     reader: &mut R,
     writer: &mut W,

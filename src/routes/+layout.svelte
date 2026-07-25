@@ -26,8 +26,13 @@
     takePendingCloseRequest,
   } from '$lib/api/settings';
   import { checkForUpdates, isUpdateCheckDue } from '$lib/stores/updater';
+  import {
+    acknowledgeSecurityPolicyReset,
+    getSecurityPolicyState,
+  } from '$lib/api/security';
   import { clearAllToasts, toastWarning } from '$lib/stores/toast';
   import { emberDevToolsEnabled } from '$lib/stores/devTools';
+  import { takePendingDownloadOverflowNotice } from '$lib/api/transfers';
   import type { AppSettings } from '$lib/types';
   import { onMount } from 'svelte';
   import { page } from '$app/stores';
@@ -50,6 +55,22 @@
   let showWizard = $state(false);
   let wizardSettings: AppSettings | null = $state(null);
   let showCloseDialog = $state(false);
+  let policyResetReason = $state<string | null>(null);
+  let policyResetPending = $state(false);
+  let policyResetError = $state('');
+
+  async function acknowledgePolicyReset() {
+    policyResetPending = true;
+    policyResetError = '';
+    try {
+      await acknowledgeSecurityPolicyReset();
+      policyResetReason = null;
+    } catch (error) {
+      policyResetError = translateError(error, m.layout_policy_reset_failed());
+    } finally {
+      policyResetPending = false;
+    }
+  }
 
   async function onWizardComplete(updated: AppSettings) {
     setAppSettings(updated);
@@ -133,6 +154,7 @@
     let unlistenClose: UnlistenFn | null = null;
     let unlistenConfigCorrupt: UnlistenFn | null = null;
     let unlistenDbCorrupt: UnlistenFn | null = null;
+    let unlistenPolicyReset: UnlistenFn | null = null;
 
     // Register before consuming the native latch. A close can be prevented by
     // Tauri before this async registration resolves; the backend records that
@@ -176,6 +198,24 @@
       .then((fn) => { if (mounted) unlistenDbCorrupt = fn; else fn(); })
       .catch((e) => console.error('Failed to register db-corrupt listener:', e));
 
+    listen<{ loaded: boolean; resetRequired: boolean; reason?: string }>(
+      'security-policy-reset-required',
+      (event) => {
+        if (!mounted) return;
+        policyResetReason = event.payload?.reason || m.layout_policy_reset_unknown_reason();
+      },
+    )
+      .then((fn) => { if (mounted) unlistenPolicyReset = fn; else fn(); })
+      .catch((e) => console.error('Failed to register security-policy listener:', e));
+
+    void getSecurityPolicyState()
+      .then((status) => {
+        if (mounted && status.resetRequired) {
+          policyResetReason = status.reason || m.layout_policy_reset_unknown_reason();
+        }
+      })
+      .catch((e) => console.error('Failed to read security-policy state:', e));
+
     const revealApp = () => {
       if (!mounted || !splashVisible) return;
       splashExiting = true;
@@ -197,6 +237,14 @@
           stopPoll = startStatsPoll();
           stopTransferPoll = startTransferPoll();
           initialized = true;
+          try {
+            const migrated = await takePendingDownloadOverflowNotice();
+            if (mounted && migrated > 0) {
+              toastWarning(`${migrated} older queued download(s) exceeded the safety budget and were quarantined. No files were deleted.`);
+            }
+          } catch (e) {
+            console.error('Failed to read pending-download migration notice:', e);
+          }
 
           // Fetch settings with bounded exponential-backoff retries.
           //
@@ -305,6 +353,7 @@
       if (unlistenClose) unlistenClose();
       if (unlistenConfigCorrupt) unlistenConfigCorrupt();
       if (unlistenDbCorrupt) unlistenDbCorrupt();
+      if (unlistenPolicyReset) unlistenPolicyReset();
     };
   });
 </script>
@@ -385,6 +434,28 @@
   oncancel={handleCloseCancel}
 />
 
+{#if policyResetReason}
+  <div class="policy-reset-backdrop" role="presentation">
+    <div
+      class="policy-reset-dialog"
+      role="alertdialog"
+      aria-modal="true"
+      aria-labelledby="policy-reset-title"
+      aria-describedby="policy-reset-description"
+    >
+      <h2 id="policy-reset-title">{m.layout_policy_reset_title()}</h2>
+      <p id="policy-reset-description">{m.layout_policy_reset_body()}</p>
+      <p class="policy-reset-reason">{policyResetReason}</p>
+      {#if policyResetError}<p class="policy-reset-error">{policyResetError}</p>{/if}
+      <button disabled={policyResetPending} onclick={acknowledgePolicyReset}>
+        {policyResetPending
+          ? m.layout_policy_reset_working()
+          : m.layout_policy_reset_acknowledge()}
+      </button>
+    </div>
+  </div>
+{/if}
+
 <style>
   .skip-to-content {
     position: absolute;
@@ -439,6 +510,39 @@
     flex-direction: column;
     min-height: 0;
     overflow: hidden;
+  }
+
+  .policy-reset-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 20000;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+    background: color-mix(in srgb, #000 72%, transparent);
+  }
+
+  .policy-reset-dialog {
+    width: min(560px, 100%);
+    padding: 24px;
+    border: 1px solid var(--danger);
+    border-radius: var(--radius-lg);
+    background: var(--surface-raised);
+    box-shadow: var(--shadow-lg);
+  }
+
+  .policy-reset-dialog h2 {
+    margin: 0 0 12px;
+  }
+
+  .policy-reset-reason,
+  .policy-reset-error {
+    overflow-wrap: anywhere;
+    color: var(--danger);
+  }
+
+  .policy-reset-dialog button {
+    margin-top: 12px;
   }
 
   .init-loading {
