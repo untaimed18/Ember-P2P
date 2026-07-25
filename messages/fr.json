@@ -2101,6 +2101,7 @@
   "deeplink_pending_other": "{count} liens sont en attente de vérification.",
   "deeplink_review_pending": "Examiner",
   "error_transfers_invalid_expected_aich": "Le hachage d’intégrité AICH doit comporter exactement 40 caractères hexadécimaux.",
+  "error_deeplink_terminal_invalid": "Lien profond non pris en charge ou mal formé",
   "layout_download_overflow_notice_one": "1 ancien téléchargement en file d'attente a dépassé le budget de sécurité et a été mis en quarantaine. Aucun fichier n'a été supprimé.",
   "layout_download_overflow_notice_other": "{count} anciens téléchargements en file d'attente ont dépassé le budget de sécurité et ont été mis en quarantaine. Aucun fichier n'a été supprimé."
 }

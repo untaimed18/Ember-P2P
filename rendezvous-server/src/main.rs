@@ -936,9 +936,20 @@ struct RelayTicketStore {
     /// Pending (unaccepted) offers only — mailbox rotation never scans accepted slots.
     pending_by_responder: HashMap<String, BTreeMap<String, String>>,
     mailbox_cursors: HashMap<String, String>,
+    /// Last page served for an idempotent poll `(nonce, ts)`. Retries with the
+    /// same read credentials must observe the same offers without advancing the
+    /// round-robin cursor again.
+    mailbox_page_cache: HashMap<String, MailboxServedPage>,
     initiator_counts: HashMap<String, usize>,
     accepted_responder_counts: HashMap<String, usize>,
     expirations: VecDeque<(Instant, String)>,
+}
+
+struct MailboxServedPage {
+    nonce: [u8; 16],
+    ts: i64,
+    ticket_ids: Vec<String>,
+    expires_at: Instant,
 }
 
 fn select_mailbox_candidate(
@@ -1090,8 +1101,83 @@ impl RelayTicketStore {
     }
 
     fn mailbox_page_ids(&mut self, responder_id: &str, now: Instant) -> Vec<String> {
+        self.mailbox_page_ids_inner(responder_id, now, true)
+    }
+
+    /// Select a mailbox page without advancing the round-robin cursor. Used for
+    /// idempotent retries after a process restart dropped the served-page cache.
+    fn mailbox_peek_page_ids(&self, responder_id: &str, now: Instant) -> Vec<String> {
+        // Reborrow as mutable via interior selection that does not write cursors.
+        // Implemented by duplicating the scan with a local-only last_scanned.
+        let Some(by_initiator) = self.pending_by_responder.get(responder_id) else {
+            return Vec::new();
+        };
+        let cursor = self.mailbox_cursors.get(responder_id).cloned();
+        let mut selected = Vec::with_capacity(MAX_RELAY_MAILBOX_RESULTS);
+        let mut last_scanned = None;
+        let mut scanned = 0usize;
+
+        if let Some(cursor) = cursor {
+            use std::ops::Bound::{Excluded, Included, Unbounded};
+            for (initiator, ticket_id) in by_initiator.range((Excluded(cursor.clone()), Unbounded))
+            {
+                if !select_mailbox_candidate(
+                    &self.tickets,
+                    initiator,
+                    ticket_id,
+                    now,
+                    &mut scanned,
+                    &mut last_scanned,
+                    &mut selected,
+                ) {
+                    break;
+                }
+            }
+            if scanned < MAX_RELAY_MAILBOX_SCAN_PER_POLL
+                && selected.len() < MAX_RELAY_MAILBOX_RESULTS
+            {
+                for (initiator, ticket_id) in by_initiator.range((Unbounded, Included(cursor))) {
+                    if !select_mailbox_candidate(
+                        &self.tickets,
+                        initiator,
+                        ticket_id,
+                        now,
+                        &mut scanned,
+                        &mut last_scanned,
+                        &mut selected,
+                    ) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            for (initiator, ticket_id) in by_initiator {
+                if !select_mailbox_candidate(
+                    &self.tickets,
+                    initiator,
+                    ticket_id,
+                    now,
+                    &mut scanned,
+                    &mut last_scanned,
+                    &mut selected,
+                ) {
+                    break;
+                }
+            }
+        }
+        let _ = last_scanned;
+        selected
+    }
+
+    fn mailbox_page_ids_inner(
+        &mut self,
+        responder_id: &str,
+        now: Instant,
+        advance_cursor: bool,
+    ) -> Vec<String> {
         let Some(by_initiator) = self.pending_by_responder.get(responder_id) else {
             self.mailbox_cursors.remove(responder_id);
+            self.mailbox_page_cache.remove(responder_id);
             return Vec::new();
         };
         let cursor = self.mailbox_cursors.get(responder_id).cloned();
@@ -1148,11 +1234,54 @@ impl RelayTicketStore {
             }
         }
 
-        if let Some(last_scanned) = last_scanned {
-            self.mailbox_cursors
-                .insert(responder_id.to_owned(), last_scanned);
+        if advance_cursor {
+            if let Some(last_scanned) = last_scanned {
+                self.mailbox_cursors
+                    .insert(responder_id.to_owned(), last_scanned);
+            }
         }
         selected
+    }
+
+    fn store_mailbox_page(
+        &mut self,
+        responder_id: &str,
+        nonce: [u8; 16],
+        ts: i64,
+        ticket_ids: Vec<String>,
+        now: Instant,
+    ) {
+        self.mailbox_page_cache.insert(
+            responder_id.to_owned(),
+            MailboxServedPage {
+                nonce,
+                ts,
+                ticket_ids,
+                expires_at: now + POLL_READ_NONCE_TTL,
+            },
+        );
+    }
+
+    fn cached_mailbox_page(
+        &mut self,
+        responder_id: &str,
+        nonce: &[u8; 16],
+        ts: i64,
+        now: Instant,
+    ) -> Option<Vec<String>> {
+        let stale = self
+            .mailbox_page_cache
+            .get(responder_id)
+            .is_some_and(|entry| entry.expires_at <= now);
+        if stale {
+            self.mailbox_page_cache.remove(responder_id);
+        }
+        let entry = self.mailbox_page_cache.get(responder_id)?;
+        if entry.nonce == *nonce && entry.ts == ts {
+            Some(entry.ticket_ids.clone())
+        } else {
+            None
+        }
     }
 }
 
@@ -2984,7 +3113,15 @@ async fn punch_poll_impl(
     prune_expired_punches(&mut punches, now);
     let key = punches
         .iter()
-        .filter(|((candidate, _), entry)| candidate == &target && punch_available(entry, now))
+        .filter(|((candidate, _), entry)| {
+            candidate == &target
+                && punch_available(entry, now)
+                // v4 clients must only observe IP-bound registrations. Serving a
+                // legacy entry on /v4/punch/poll would force the desktop to either
+                // fail open (previous bug) or 404 mid-handshake.
+                && (version == RendezvousVersion::LegacyV3
+                    || entry.proof_version == RendezvousVersion::IpBoundV4)
+        })
         .min_by_key(|(_, entry)| entry.created_at)
         .map(|(key, _)| key.clone())
         .or_else(|| {
@@ -2992,7 +3129,11 @@ async fn punch_poll_impl(
             // the oldest lease rather than 404 mid-handshake.
             punches
                 .iter()
-                .filter(|((candidate, _), _)| candidate == &target)
+                .filter(|((candidate, _), entry)| {
+                    candidate == &target
+                        && (version == RendezvousVersion::LegacyV3
+                            || entry.proof_version == RendezvousVersion::IpBoundV4)
+                })
                 .min_by_key(|(_, entry)| entry.created_at)
                 .map(|(key, _)| key.clone())
         })
@@ -3261,16 +3402,35 @@ async fn relay_mailbox_poll(
     }
     let signed = build_relay_mailbox_poll_msg(&responder_raw, &nonce, body.ts);
     verify_signed_relay_identity_signature(&state, &body.responder_id, &signed, &sig).await?;
-    idempotent_read_status(
-        remember_ticket_poll_nonce(&state, responder_raw, nonce, body.ts).await,
-    )?;
+    let admission = remember_ticket_poll_nonce(&state, responder_raw, nonce, body.ts).await;
+    idempotent_read_status(admission)?;
 
     let now = Instant::now();
     let responder_id = body.responder_id.to_lowercase();
     let mut tickets = state.relay_tickets.write().await;
     prune_expired_relay_tickets(&mut tickets, now);
+    let page_ids = match admission {
+        IdempotentReadAdmission::Idempotent => tickets
+            .cached_mailbox_page(&responder_id, &nonce, body.ts, now)
+            .unwrap_or_else(|| {
+                // Process restart dropped the cache: peek without advancing so a
+                // lost-response retry cannot skip an unread page.
+                tickets.mailbox_peek_page_ids(&responder_id, now)
+            }),
+        IdempotentReadAdmission::New => {
+            let page = tickets.mailbox_page_ids(&responder_id, now);
+            tickets.store_mailbox_page(&responder_id, nonce, body.ts, page.clone(), now);
+            page
+        }
+        IdempotentReadAdmission::Replay
+        | IdempotentReadAdmission::NonceConflict
+        | IdempotentReadAdmission::Full => {
+            // idempotent_read_status already rejected these admissions.
+            unreachable!("rejected mailbox poll admission reached page selection");
+        }
+    };
     let mut items = Vec::new();
-    for ticket_id in tickets.mailbox_page_ids(&responder_id, now) {
+    for ticket_id in page_ids {
         if let Some(ticket) = tickets.tickets.get(&ticket_id) {
             items.push(RelayMailboxPollItem {
                 ticket_id,
@@ -5011,6 +5171,41 @@ mod relay_ticket_tests {
             second.first(),
             Some(&format!("{:064x}", 108)),
             "the ninth offer must not remain hidden behind the first page"
+        );
+    }
+
+    #[test]
+    fn mailbox_idempotent_page_cache_does_not_readvance_cursor() {
+        let responder_id = "55".repeat(32);
+        let mut tickets = RelayTicketStore::default();
+        for index in 0..9 {
+            tickets.insert(
+                format!("{:064x}", index + 100),
+                ticket_with_parties(&format!("{index:064x}"), &responder_id, false),
+            );
+        }
+        let now = Instant::now();
+        let nonce = [0x42; 16];
+        let ts = 1_700_000_000_i64;
+        let first = tickets.mailbox_page_ids(&responder_id, now);
+        tickets.store_mailbox_page(&responder_id, nonce, ts, first.clone(), now);
+        let cached = tickets
+            .cached_mailbox_page(&responder_id, &nonce, ts, now)
+            .expect("cached page");
+        assert_eq!(cached, first);
+        // A lost-response retry must replay the same page; advancing again would
+        // hide the first eight offers until wrap-around.
+        let peek = tickets.mailbox_peek_page_ids(&responder_id, now);
+        assert_ne!(
+            peek.first(),
+            first.first(),
+            "cursor already advanced after the first New poll"
+        );
+        assert_eq!(
+            tickets
+                .cached_mailbox_page(&responder_id, &nonce, ts, now)
+                .as_ref(),
+            Some(&first)
         );
     }
 

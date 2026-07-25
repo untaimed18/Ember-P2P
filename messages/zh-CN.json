@@ -2095,6 +2095,7 @@
   "deeplink_pending_other": "有 {count} 个链接等待查看。",
   "deeplink_review_pending": "查看",
   "error_transfers_invalid_expected_aich": "AICH 完整性哈希必须恰好为 40 个十六进制字符。",
+  "error_deeplink_terminal_invalid": "不支持或格式错误的深层链接",
   "layout_download_overflow_notice_one": "1 个较早排队的下载超出安全限额并已隔离。未删除任何文件。",
   "layout_download_overflow_notice_other": "{count} 个较早排队的下载超出安全限额并已隔离。未删除任何文件。"
 }

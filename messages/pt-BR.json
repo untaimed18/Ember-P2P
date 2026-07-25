@@ -2101,6 +2101,7 @@
   "deeplink_pending_other": "{count} links aguardam revisão.",
   "deeplink_review_pending": "Revisar",
   "error_transfers_invalid_expected_aich": "O hash de integridade AICH deve ter exatamente 40 caracteres hexadecimais.",
+  "error_deeplink_terminal_invalid": "Link profundo não suportado ou malformado",
   "layout_download_overflow_notice_one": "1 download antigo na fila excedeu o orçamento de segurança e foi colocado em quarentena. Nenhum arquivo foi excluído.",
   "layout_download_overflow_notice_other": "{count} downloads antigos na fila excederam o orçamento de segurança e foram colocados em quarentena. Nenhum arquivo foi excluído."
 }

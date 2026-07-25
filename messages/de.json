@@ -2101,6 +2101,7 @@
   "deeplink_pending_other": "{count} Links warten auf Überprüfung.",
   "deeplink_review_pending": "Überprüfen",
   "error_transfers_invalid_expected_aich": "Der AICH-Integritätshash muss aus genau 40 Hexadezimalzeichen bestehen.",
+  "error_deeplink_terminal_invalid": "Nicht unterstützter oder ungültiger Deep Link",
   "layout_download_overflow_notice_one": "1 älterer Download in der Warteschlange hat das Sicherheitslimit überschritten und wurde unter Quarantäne gestellt. Es wurden keine Dateien gelöscht.",
   "layout_download_overflow_notice_other": "{count} ältere Downloads in der Warteschlange haben das Sicherheitslimit überschritten und wurden unter Quarantäne gestellt. Es wurden keine Dateien gelöscht."
 }

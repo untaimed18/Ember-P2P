@@ -736,61 +736,79 @@ pub async fn register_punch_with_ip(
 }
 
 /// Verify initiator register proof returned by punch poll before dialing.
-pub fn verify_punch_register_proof(info: &PunchInfo) -> Result<(), String> {
+pub fn verify_punch_register_proof(
+    info: &PunchInfo,
+    protocol: crate::network::rendezvous::RendezvousProtocol,
+) -> Result<(), String> {
     use ed25519_dalek::{Signature, VerifyingKey};
-    if info.proof_version == 3 {
-        return Ok(());
+    match protocol {
+        crate::network::rendezvous::RendezvousProtocol::LegacyV3 => {
+            // Legacy polls never carried an IP-bound register proof. Accept only
+            // the expected wire version so a v3 client cannot be confused by a
+            // spoofed proof_version field into skipping checks it does not have.
+            if info.proof_version != 3 {
+                return Err("punch proof: legacy poll requires proof_version 3".to_string());
+            }
+            Ok(())
+        }
+        crate::network::rendezvous::RendezvousProtocol::IpBoundV4 => {
+            // IpBoundV4's threat model includes a lying rendezvous. Never fail
+            // open on a claimed legacy proof_version — require the IP-bound
+            // signature over the dial endpoint.
+            if info.proof_version != 4 {
+                return Err(
+                    "punch proof: v4 poll requires IP-bound proof_version 4".to_string(),
+                );
+            }
+            verify_punch_proof_freshness(
+                info.register_ts,
+                info.epoch,
+                crate::network::rendezvous::current_timestamp(),
+            )?;
+            if info.from_id.len() != 64 || !info.from_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err("punch proof: invalid from_id".to_string());
+            }
+            let mut from_raw = [0u8; 32];
+            hex::decode_to_slice(&info.from_id, &mut from_raw)
+                .map_err(|_| "punch proof: invalid from_id".to_string())?;
+            if !crate::network::rendezvous::pubkey_matches_id(&info.from_pubkey, &info.from_id) {
+                return Err("punch proof: from_pubkey does not match from_id".to_string());
+            }
+            let ip: IpAddr = info
+                .ip
+                .parse()
+                .map_err(|_| "punch proof: invalid ip".to_string())?;
+            if matches!(ip, IpAddr::V6(_)) {
+                return Err("punch proof: IPv6 unsupported".to_string());
+            }
+            let Ok(target_raw) = hex::decode(&info.target_id_raw_hex) else {
+                return Err("punch proof: missing target binding".to_string());
+            };
+            if target_raw.len() != 32 {
+                return Err("punch proof: invalid target binding".to_string());
+            }
+            let mut target = [0u8; 32];
+            target.copy_from_slice(&target_raw);
+            let signed = build_punch_register_message(
+                crate::network::rendezvous::RendezvousProtocol::IpBoundV4,
+                &from_raw,
+                &target,
+                &info.capability,
+                info.epoch,
+                info.port,
+                ip,
+                info.nat_type,
+                &info.register_nonce,
+                info.register_ts,
+            );
+            let Ok(vk) = VerifyingKey::from_bytes(&info.from_pubkey) else {
+                return Err("punch proof: invalid from_pubkey".to_string());
+            };
+            let signature = Signature::from_bytes(&info.register_sig);
+            vk.verify_strict(&signed, &signature)
+                .map_err(|_| "punch proof: register signature invalid".to_string())
+        }
     }
-    if info.proof_version != 4 {
-        return Err("punch proof: unsupported proof version".to_string());
-    }
-    verify_punch_proof_freshness(
-        info.register_ts,
-        info.epoch,
-        crate::network::rendezvous::current_timestamp(),
-    )?;
-    if info.from_id.len() != 64 || !info.from_id.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err("punch proof: invalid from_id".to_string());
-    }
-    let mut from_raw = [0u8; 32];
-    hex::decode_to_slice(&info.from_id, &mut from_raw)
-        .map_err(|_| "punch proof: invalid from_id".to_string())?;
-    if !crate::network::rendezvous::pubkey_matches_id(&info.from_pubkey, &info.from_id) {
-        return Err("punch proof: from_pubkey does not match from_id".to_string());
-    }
-    let ip: IpAddr = info
-        .ip
-        .parse()
-        .map_err(|_| "punch proof: invalid ip".to_string())?;
-    if matches!(ip, IpAddr::V6(_)) {
-        return Err("punch proof: IPv6 unsupported".to_string());
-    }
-    let Ok(target_raw) = hex::decode(&info.target_id_raw_hex) else {
-        return Err("punch proof: missing target binding".to_string());
-    };
-    if target_raw.len() != 32 {
-        return Err("punch proof: invalid target binding".to_string());
-    }
-    let mut target = [0u8; 32];
-    target.copy_from_slice(&target_raw);
-    let signed = build_punch_register_message(
-        crate::network::rendezvous::RendezvousProtocol::IpBoundV4,
-        &from_raw,
-        &target,
-        &info.capability,
-        info.epoch,
-        info.port,
-        ip,
-        info.nat_type,
-        &info.register_nonce,
-        info.register_ts,
-    );
-    let Ok(vk) = VerifyingKey::from_bytes(&info.from_pubkey) else {
-        return Err("punch proof: invalid from_pubkey".to_string());
-    };
-    let signature = Signature::from_bytes(&info.register_sig);
-    vk.verify_strict(&signed, &signature)
-        .map_err(|_| "punch proof: register signature invalid".to_string())
 }
 
 fn verify_punch_proof_freshness(register_ts: i64, epoch: i64, now: i64) -> Result<(), String> {
@@ -916,7 +934,7 @@ pub async fn poll_punch(
         from_pubkey,
         target_id_raw_hex: hex::encode(target_raw),
     };
-    verify_punch_register_proof(&info)?;
+    verify_punch_register_proof(&info, protocol)?;
     Ok(Some(info))
 }
 
@@ -2152,11 +2170,44 @@ mod tests {
             from_pubkey: public,
             target_id_raw_hex: hex::encode(target_raw),
         };
-        verify_punch_register_proof(&info).expect("v4 server proof verifies");
+        verify_punch_register_proof(
+            &info,
+            crate::network::rendezvous::RendezvousProtocol::IpBoundV4,
+        )
+        .expect("v4 server proof verifies");
 
         let mut tampered = info;
         tampered.port += 1;
-        assert!(verify_punch_register_proof(&tampered).is_err());
+        assert!(verify_punch_register_proof(
+            &tampered,
+            crate::network::rendezvous::RendezvousProtocol::IpBoundV4,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn v4_punch_poll_rejects_legacy_proof_version_fail_open() {
+        let info = PunchInfo {
+            punch_id: "11".repeat(32),
+            from_id: "22".repeat(32),
+            ip: "8.8.8.8".to_string(),
+            port: 4662,
+            nat_type: 1,
+            capability: [0xA5; 32],
+            epoch: 1,
+            proof_version: 3,
+            register_ts: 0,
+            register_nonce: [0; 16],
+            register_sig: [0; 64],
+            from_pubkey: [0; 32],
+            target_id_raw_hex: hex::encode([0x42; 32]),
+        };
+        let err = verify_punch_register_proof(
+            &info,
+            crate::network::rendezvous::RendezvousProtocol::IpBoundV4,
+        )
+        .expect_err("v4 must not accept proof_version 3");
+        assert!(err.contains("proof_version 4"));
     }
 
     #[test]

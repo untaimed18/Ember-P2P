@@ -1762,6 +1762,7 @@ pub async fn recover_archive(
         .map_err(|e| coded_ctx("transfers_temp_path_reparse", "Unsafe temp folder", e))?;
 
     let pp = canonical_part.clone();
+    let archive_allowed = vec![dl_folder.clone()];
     let expected_file_hash = {
         let bytes = hex::decode(
             state
@@ -1790,7 +1791,13 @@ pub async fn recover_archive(
             let tracker = crate::network::ed2k::part_tracker::PartTracker::new(file_size, &pp);
             let flags = tracker.verified_parts();
             let hashes = tracker.part_hashes();
-            let mut file = std::fs::File::open(&pp)?;
+            // Pin the .part through the approved Temp parent so a symlink swap
+            // after verify_existing_path cannot redirect recovery reads.
+            let (_, mut file) = crate::security::filesystem::open_existing_approved(
+                &pp,
+                &archive_allowed,
+                false,
+            )?;
             let mut ranges = Vec::new();
             for (index, verified) in flags.into_iter().enumerate() {
                 if !verified {
@@ -1803,7 +1810,7 @@ pub async fn recover_archive(
                     // range after a complete file-level ED2K verification.
                     if index == 0
                         && end == file_size
-                        && crate::network::ed2k::hash::ed2k_hash_file(&pp)?
+                        && crate::network::ed2k::hash::ed2k_hash_open_file(&mut file)?
                             == hex::encode(expected_file_hash)
                     {
                         ranges.push((start, end));

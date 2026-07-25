@@ -1,3 +1,11 @@
+<script module lang="ts">
+  // Survive DeepLinkHandler remount (wizard dismiss / locale reload). Instance
+  // Sets would reset and auto-open the same durable queue entry again.
+  export const completedDeepLinkIds = new Set<string>();
+  export const failedDeepLinkIds = new Set<string>();
+  export const deferredDeepLinkIds = new Set<string>();
+</script>
+
 <script lang="ts">
   // Handler for OS-delivered deep links. It drains the backend's durable
   // buffer and presents an in-app confirmation before network side effects,
@@ -32,6 +40,10 @@
 
   type ConfirmDecision = 'accept' | 'reject' | 'defer';
   type HandleResult = 'done' | 'defer' | 'fail';
+
+  const completedIds = completedDeepLinkIds;
+  const failedIds = failedDeepLinkIds;
+  const deferredIds = deferredDeepLinkIds;
 
   // Parse the `|`-delimited body of an ed2k link, dropping the trailing empty
   // segment(s) the `…|/` terminator produces. e.g.
@@ -75,8 +87,8 @@
     return preview.name ?? '';
   }
 
-  let confirmOpen = false;
-  let confirmMessage = '';
+  let confirmOpen = $state(false);
+  let confirmMessage = $state('');
   let confirmResolver: ((decision: ConfirmDecision) => void) | null = null;
 
   function requestConfirmation(preview: DeepLinkPreview): Promise<ConfirmDecision> {
@@ -189,19 +201,8 @@
 
   let processing = false;
   let rerun = false;
-  // A completed side effect stays here until its durable ack succeeds. A
-  // retry therefore performs only the acknowledgement, never another
-  // download/connect/navigation.
-  const completedIds = new Set<string>();
-  // Failed entries remain durable for a later app/session retry, but must not
-  // immediately re-toast in a tight drain loop.
-  const failedIds = new Set<string>();
-  // Escape/overlay dismissals remain durable but are excluded from automatic
-  // drains until the user explicitly chooses Review. Keeping them separate
-  // from failures also lets newly-arrived/later queued links continue.
-  const deferredIds = new Set<string>();
-  let deferredCount = 0;
-  let reviewRequestedId: string | null = null;
+  let deferredCount = $state(deferredIds.size);
+  let reviewRequestedId = $state<string | null>(null);
   let ackRetryTimer: ReturnType<typeof setTimeout> | undefined;
   // Set on unmount so an in-flight drain stops routing payloads (goto/toasts)
   // into a component that no longer exists.

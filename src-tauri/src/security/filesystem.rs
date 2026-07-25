@@ -1423,7 +1423,10 @@ pub fn prepare_approved_subdir(
         if object_identity(&verified_root)? != root_identity
             || !opened_child_parent_matches(&directory, &verified_root)?
         {
-            let _ = delete_opened_file(&directory);
+            // Do not delete the opened directory on mismatch: after a junction
+            // swap of the approved root, that handle may point at an
+            // attacker-chosen path. Leaving an orphan under our real root is
+            // preferable to deleting outside the approved tree.
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "approved root changed during directory create/open",

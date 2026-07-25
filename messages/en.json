@@ -515,6 +515,7 @@
   "deeplink_pending_other": "{count} links are waiting for review.",
   "deeplink_review_pending": "Review",
   "error_transfers_invalid_expected_aich": "The AICH integrity hash must be exactly 40 hexadecimal characters.",
+  "error_deeplink_terminal_invalid": "Unsupported or malformed deep link",
   "library_drop_confirm_title": "Confirm shared folder",
   "library_drop_confirm_one": "You dropped \"{name}\". Ember will open a system folder picker next so you can confirm that folder before it is shared.",
   "library_drop_confirm_other": "You dropped {count} folders ({summary}). Ember will open a system folder picker next so you can confirm a folder before it is shared.",

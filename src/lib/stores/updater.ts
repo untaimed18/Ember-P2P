@@ -45,6 +45,12 @@ interface SecureUpdateInfo {
   date: string | null;
 }
 
+interface SecureUpdateCheckResult {
+  update: SecureUpdateInfo | null;
+  pendingRetained: boolean;
+  error?: string | null;
+}
+
 type SecureUpdateProgress =
   | { event: 'Started'; data: { contentLength: number } }
   | { event: 'Progress'; data: { chunkLength: number } }
@@ -220,15 +226,15 @@ export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<
   // dispose the first check's result (or the currently-available pending).
   if (installInFlight || checkInFlight) return false;
   checkInFlight = true;
-  // Keep an existing `available` pending until the new check succeeds, so a
-  // failed/empty re-check doesn't wipe the Install button's resource.
-  const keepPendingUntilSuccess = pending;
   recordCheckedNow();
   updater.update((s) => ({ ...s, phase: 'checking', error: null }));
   try {
-    const found = await invoke<SecureUpdateInfo | null>('secure_updater_check');
+    const result = await invoke<SecureUpdateCheckResult>('secure_updater_check');
+    const found = result.update;
     if (found) {
-      await disposePending();
+      // Native retention is authoritative: empty re-checks and check errors that
+      // still keep a verified artifact re-offer UpdateInfo so Install survives
+      // even after a prior IPC failure cleared the local pending flag.
       pending = true;
       const securityEpoch = normalizeSecurityEpoch(found.securityEpoch);
       updater.set({
@@ -239,37 +245,32 @@ export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<
         date: found.date,
         downloaded: 0,
         total: null,
-        error: null,
+        error: opts.silent ? null : (result.error ?? null),
         // Unknown/malformed epoch metadata must fail visible, never reuse a
         // potentially stale dismissal identity.
         dismissed: isUpdateDismissed(securityEpoch, found.version),
       });
       return true;
     }
-    if (keepPendingUntilSuccess && pending) {
-      // Empty re-check: keep the Install resource rather than wiping a
-      // previously-available update (manifest flap / transient empty).
+    await disposePending();
+    if (result.error && !opts.silent) {
+      retryAction = 'check';
       updater.update((s) => ({
         ...s,
-        phase: 'available',
-        error: null,
+        phase: 'error',
+        error: result.error ?? null,
       }));
-      return true;
+      return false;
     }
-    await disposePending();
     updater.set({ ...INITIAL, phase: opts.silent ? 'idle' : 'uptodate' });
     return false;
   } catch (e) {
     retryAction = 'check';
-    if (keepPendingUntilSuccess && pending) {
-      // Re-check failed but we still have a usable Update resource — restore
-      // the available phase instead of disposing it.
-      updater.update((s) => ({
-        ...s,
-        phase: 'available',
-        error: opts.silent ? s.error : toMessage(e),
-      }));
-    } else if (opts.silent) {
+    // Hard invoke failures (IPC) leave native state unknown — fail closed on
+    // the Install affordance rather than offering a possibly-cleared artifact.
+    // A later successful check rehydrates from pendingRetained + update metadata.
+    await disposePending();
+    if (opts.silent) {
       updater.set({ ...INITIAL, phase: 'idle' });
     } else {
       updater.update((s) => ({ ...s, phase: 'error', error: toMessage(e) }));

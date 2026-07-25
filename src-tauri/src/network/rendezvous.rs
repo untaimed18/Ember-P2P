@@ -105,7 +105,7 @@ pub(crate) const FRIEND_RELAY_TICKET_INITIATOR_WAIT: std::time::Duration =
 pub(crate) const FRIEND_RELAY_TICKET_RESPONDER_POLL_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(1);
 pub(crate) const FRIEND_RELAY_TICKET_POLL_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(1);
+    std::time::Duration::from_secs(3);
 pub(crate) const FRIEND_RELAY_TICKET_ACTION_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(10);
 const RELAY_TICKET_READ_NONCE_DOMAIN: &[u8] = b"ember-relay-ticket-read-nonce-v1\0";
@@ -1478,6 +1478,9 @@ pub async fn poll_friend_relay_tickets(
     require_https(base_url)?;
     let responder_id = hashed_id(responder_ember_hash);
     let responder_raw = sha256_id_raw(responder_ember_hash);
+    // Keep (nonce, ts) stable across a single logical poll attempt so a lost
+    // HTTP response can be retried as an Idempotent read of the same mailbox
+    // page instead of advancing the server cursor again.
     let ts = current_timestamp();
     let mut nonce_scope = Vec::with_capacity(b"poll".len() + responder_raw.len());
     nonce_scope.extend_from_slice(b"mailbox-v4");
@@ -1486,22 +1489,42 @@ pub async fn poll_friend_relay_tickets(
     let signed = build_relay_mailbox_poll_msg(&responder_raw, &nonce, ts);
     let sig = sign_relay_ticket_message(secret_key, &signed);
     let url = format!("{}/v4/relay-mailbox/poll", base_url.trim_end_matches('/'));
-    let resp = client(base_url)
-        .await?
-        .post(&url)
-        .json(&serde_json::json!({
-            "responder_id": responder_id,
-            "ts": ts,
-            "nonce": hex::encode(nonce),
-            "sig": hex::encode(sig.to_bytes()),
-        }))
-        .send()
+    let body = serde_json::json!({
+        "responder_id": responder_id,
+        "ts": ts,
+        "nonce": hex::encode(nonce),
+        "sig": hex::encode(sig.to_bytes()),
+    });
+
+    let mut last_error = None;
+    for attempt in 0..2 {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            async {
+                let resp = client(base_url)
+                    .await?
+                    .post(&url)
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|e| format!("relay ticket poll: {e}"))?;
+                if !resp.status().is_success() {
+                    return Err(format!("relay ticket poll: status {}", resp.status()));
+                }
+                parse_friend_relay_mailbox_response(resp, responder_ember_hash, secret_key).await
+            },
+        )
         .await
-        .map_err(|e| format!("relay ticket poll: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("relay ticket poll: status {}", resp.status()));
+        {
+            Ok(Ok(page)) => return Ok(page),
+            Ok(Err(error)) => last_error = Some(error),
+            Err(_) => last_error = Some("friend relay mailbox poll timed out".to_string()),
+        }
+        if attempt == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
-    parse_friend_relay_mailbox_response(resp, responder_ember_hash, secret_key).await
+    Err(last_error.unwrap_or_else(|| "relay ticket poll failed".to_string()))
 }
 
 async fn parse_friend_relay_mailbox_response(

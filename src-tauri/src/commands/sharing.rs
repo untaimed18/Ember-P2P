@@ -665,15 +665,17 @@ pub(crate) async fn serve_media_request(
         (allowed_dirs, indexed_paths)
     };
     let result = tokio::task::spawn_blocking(move || {
-        let canonical = crate::security::filesystem::verify_existing_path(
+        // Open through the approved parent handle so a final-component symlink
+        // swap between containment check and read cannot redirect the bytes.
+        let (canonical, mut file) = crate::security::filesystem::open_existing_approved(
             std::path::Path::new(&file_path),
             &allowed_dirs,
+            false,
         )?;
         let indexed_name = indexed_paths.get(&crate::search::index::normalize_path_key(
             &canonical.to_string_lossy(),
         ));
-        if !canonical.is_file()
-            || indexed_name.is_none()
+        if indexed_name.is_none()
             || !crate::security::filesystem::passive_type_agrees(
                 indexed_name.map(String::as_str).unwrap_or_default(),
                 &canonical,
@@ -684,7 +686,6 @@ pub(crate) async fn serve_media_request(
                 "media path is not currently authorized",
             ));
         }
-        let mut file = std::fs::File::open(&canonical)?;
         let length = file.metadata()?.len();
         let selected_range = parse_single_range(range.as_deref(), length)
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid range"))?;

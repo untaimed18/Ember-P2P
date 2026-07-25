@@ -49,6 +49,9 @@ struct PendingUpdate {
     platform: SignedPlatform,
     rollback_path: PathBuf,
     candidate_state: RollbackState,
+    /// UI-facing metadata retained with the installable artifact so a later
+    /// empty/failed re-check can still rehydrate the Install affordance.
+    info: UpdateInfo,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -78,6 +81,17 @@ pub struct UpdateInfo {
     security_epoch: u64,
     notes: Option<String>,
     date: Option<String>,
+}
+
+/// Result of a secure update check, including whether a previously staged
+/// installable artifact is still retained after floor/retention logic.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecureUpdateCheckResult {
+    update: Option<UpdateInfo>,
+    pending_retained: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -798,12 +812,13 @@ async fn secure_check(app: &AppHandle) -> Result<Option<(UpdateInfo, PendingUpda
         date: manifest.pub_date,
     };
     Ok(Some((
-        info,
+        info.clone(),
         PendingUpdate {
             update,
             platform,
             rollback_path,
             candidate_state,
+            info,
         },
     )))
 }
@@ -875,12 +890,16 @@ fn public_failure(operation: &str, error: anyhow::Error) -> String {
 pub async fn secure_updater_check(
     app: AppHandle,
     service: State<'_, UpdaterService>,
-) -> Result<Option<UpdateInfo>, String> {
+) -> Result<SecureUpdateCheckResult, String> {
     let _operation = service.operation.lock().await;
     match secure_check(&app).await {
         Ok(Some((info, pending))) => {
             *service.pending.lock().await = Some(pending);
-            Ok(Some(info))
+            Ok(SecureUpdateCheckResult {
+                update: Some(info),
+                pending_retained: true,
+                error: None,
+            })
         }
         Ok(None) => {
             let mut pending = service.pending.lock().await;
@@ -888,7 +907,13 @@ pub async fn secure_updater_check(
                 pending.take();
                 return Err(public_failure("check", error));
             }
-            Ok(None)
+            Ok(SecureUpdateCheckResult {
+                // Re-offer retained metadata so the UI can restore Install even
+                // after a prior IPC failure cleared its local pending flag.
+                update: pending.as_ref().map(|pending| pending.info.clone()),
+                pending_retained: pending.is_some(),
+                error: None,
+            })
         }
         Err(error) => {
             let mut pending = service.pending.lock().await;
@@ -908,7 +933,14 @@ pub async fn secure_updater_check(
                 );
                 pending.take();
             }
-            Err(public_failure("check", error))
+            // Return structured retention state so the UI cannot keep offering
+            // Install after native pending was cleared, and can restore it when
+            // native still holds a verified artifact.
+            Ok(SecureUpdateCheckResult {
+                update: pending.as_ref().map(|pending| pending.info.clone()),
+                pending_retained: pending.is_some(),
+                error: Some(public_failure("check", error)),
+            })
         }
     }
 }

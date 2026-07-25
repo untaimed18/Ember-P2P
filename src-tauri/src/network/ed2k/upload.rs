@@ -8586,10 +8586,16 @@ impl UploadHandler {
                             } else if file.is_partial {
                                 Err(anyhow::anyhow!("AICH unavailable for partial file"))
                             } else {
-                                let path = file.path.clone();
+                                // Hash the already-pinned upload handle. Reopening
+                                // by path would allow a post-resolve symlink swap
+                                // to poison the AICH cache under this MD4 key.
+                                let mut opened = file.opened;
                                 let res = tokio::task::spawn_blocking(move || {
-                                    crate::network::ed2k::aich::AICHRecoveryHashSet::build_from_file(&path)
-                                }).await?;
+                                    crate::network::ed2k::aich::AICHRecoveryHashSet::build_from_open_file(
+                                        &mut opened,
+                                    )
+                                })
+                                .await?;
                                 if let Ok(ref hs) = res {
                                     let mut cache = self.aich_cache.lock().await;
                                     cache.insert(hash_hex.clone(), hs.clone());
