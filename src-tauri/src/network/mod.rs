@@ -24296,6 +24296,7 @@ pub async fn start_network(
                         &mut state,
                         &transfer_manager,
                         &source_manager,
+                        &local_index,
                         &entries,
                         &[],
                         &[],

@@ -133,7 +133,7 @@ pub async fn punch_quic(
 
 /// Session counters for the LowID-to-LowID broker. Owned by
 /// `ConnectionBroker` so the state machine itself is the source of truth
-/// for what counts as an "attempt" or "failure" — consumers should
+/// for what counts as an "attempt" or "failure" ??? consumers should
 /// snapshot via `ConnectionBroker::stats()` rather than incrementing
 /// from the outside.
 #[derive(Debug, Default, Clone, Copy)]
@@ -222,24 +222,6 @@ impl ConnectionBroker {
         our_nat: NatType,
         _our_external_addr: Option<SocketAddr>,
     ) -> bool {
-        // Reject obviously-unroutable targets *before* mutating any state.
-        // Without this, a peer port of 0 or a bogus IP (0.0.0.0, loopback,
-        // broadcast, multicast) would still burn an active-attempt slot,
-        // register a cooldown penalty against that source, and emit a
-        // punch/relay event that is guaranteed to fail downstream.
-        if source_port == 0
-            || source_ip.is_unspecified()
-            || source_ip.is_loopback()
-            || source_ip.is_broadcast()
-            || source_ip.is_multicast()
-        {
-            debug!(
-                "Broker: rejecting LowID attempt for unroutable target {}:{}",
-                source_ip, source_port
-            );
-            return false;
-        }
-
         let source_key = (source_ip, source_port);
 
         // Check cooldown
@@ -299,87 +281,25 @@ impl ConnectionBroker {
 
         self.attempts.insert(attempt_key.clone(), attempt);
 
-        match start_phase {
-            AttemptPhase::HolePunch => {
-                if let Some(ext_addr) = our_external_addr {
-                    self.stats.punch_attempts = self.stats.punch_attempts.saturating_add(1);
-                    emit_event(
-                        &self.event_tx,
-                        BrokerEvent::StartPunch {
-                            attempt_key,
-                            source_ip,
-                            source_port,
-                            our_external_addr: ext_addr,
-                            our_nat_type: our_nat,
-                        },
-                    );
-                }
-            }
-            AttemptPhase::FindRelay => {
-                let relay_candidate = self.pick_relay_candidate();
-                let relay_addr = relay_candidate.map(|c| (c.ip, c.port));
-                let relay_attestation_hash = relay_candidate.map(|c| c.attestation_hash);
-                let relay_ember_hash = relay_candidate.and_then(|c| c.ember_hash);
-                self.stats.relay_attempts = self.stats.relay_attempts.saturating_add(1);
-                emit_event(
-                    &self.event_tx,
-                    BrokerEvent::StartRelay {
-                        attempt_key,
-                        source_ip,
-                        source_port,
-                        file_hash,
-                        relay_addr,
-                        relay_attestation_hash,
-                        relay_ember_hash,
-                    },
-                );
-            }
-            _ => {}
-        }
-
-        true
-    }
-
-    /// Called when a hole-punch attempt fails -- escalate to relay.
-    ///
-    /// Idempotent across the two independent triggers that can fire for the
-    /// same attempt: the periodic `tick()` timeout sweep and the spawned
-    /// punch task's `PunchFailed` event. Only the first call (while the
-    /// attempt is still in the `HolePunch` phase) escalates; a later
-    /// duplicate is ignored so we never emit a second `StartRelay` or
-    /// double-count a punch failure.
-    pub async fn punch_failed(&mut self, attempt_key: &str, reason: &str) {
         let relay_candidate = self.pick_relay_candidate();
         let relay_addr = relay_candidate.map(|c| (c.ip, c.port));
         let relay_attestation_hash = relay_candidate.map(|c| c.attestation_hash);
         let relay_ember_hash = relay_candidate.and_then(|c| c.ember_hash);
-        if let Some(attempt) = self.attempts.get_mut(attempt_key) {
-            if attempt.phase != AttemptPhase::HolePunch {
-                debug!(
-                    "Broker: ignoring duplicate punch-failed for {attempt_key} (already in {:?})",
-                    attempt.phase
-                );
-                return;
-            }
-            info!("Broker: punch failed for {attempt_key}: {reason}");
-            self.stats.punch_failures = self.stats.punch_failures.saturating_add(1);
-            attempt.phase = AttemptPhase::FindRelay;
-            attempt.phase_started = Instant::now();
+        self.stats.relay_attempts = self.stats.relay_attempts.saturating_add(1);
+        emit_event(
+            &self.event_tx,
+            BrokerEvent::StartRelay {
+                attempt_key,
+                source_ip,
+                source_port,
+                file_hash,
+                relay_addr,
+                relay_attestation_hash,
+                relay_ember_hash,
+            },
+        );
 
-            self.stats.relay_attempts = self.stats.relay_attempts.saturating_add(1);
-            emit_event(
-                &self.event_tx,
-                BrokerEvent::StartRelay {
-                    attempt_key: attempt_key.to_string(),
-                    source_ip: attempt.source_ip,
-                    source_port: attempt.source_port,
-                    file_hash: attempt.file_hash,
-                    relay_addr,
-                    relay_attestation_hash,
-                    relay_ember_hash,
-                },
-            );
-        }
+        true
     }
 
     /// Called when a relay attempt fails.
@@ -407,7 +327,7 @@ impl ConnectionBroker {
 
     /// Add a relay-capable peer discovered via EPX. `expires_at_unix` must
     /// come from the verified `RelayAttestation` this candidate was
-    /// admitted with (see `verify_relay_attestation` at the call site) —
+    /// admitted with (see `verify_relay_attestation` at the call site) ???
     /// it is the caller's job to have already checked the signature.
     pub fn add_relay_candidate(
         &mut self,
@@ -455,7 +375,7 @@ impl ConnectionBroker {
     /// Pick the best available relay candidate (fewest sessions, most recent).
     ///
     /// Filters on both the age-based `RELAY_CANDIDATE_PICK_MAX_AGE` window
-    /// *and* the candidate's own signed `expires_at_unix` — the age window
+    /// *and* the candidate's own signed `expires_at_unix` ??? the age window
     /// alone is only an upper bound (aligned to the max ERAT TTL); a
     /// short-TTL attestation can expire well before it, and picking an
     /// already-expired candidate just wastes a relay attempt that the
@@ -692,7 +612,7 @@ mod tests {
 
     /// A candidate whose signed `expires_at_unix` has already passed must
     /// never be picked, even though it's well within the age-based
-    /// `RELAY_CANDIDATE_PICK_MAX_AGE` window — the age window is only an
+    /// `RELAY_CANDIDATE_PICK_MAX_AGE` window ??? the age window is only an
     /// upper bound (aligned to the max ERAT TTL), not a substitute for
     /// checking the attestation's own shorter-lived expiry.
     #[test]
@@ -743,80 +663,5 @@ mod tests {
             Some(BrokerEvent::StartRelay { .. })
         ));
         assert!(rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn duplicate_punch_failed_does_not_double_escalate() {
-        // The periodic timeout sweep and the spawned punch task's
-        // PunchFailed event can both fire for the same attempt. Only the
-        // first should escalate; the second must be a no-op (no second
-        // StartRelay, no double-counted failure).
-        let (tx, mut rx) = mpsc::channel(16);
-        let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
-
-        broker
-            .attempt_low_to_low(
-                "t5",
-                [5u8; 16],
-                Ipv4Addr::new(10, 20, 30, 40),
-                4662,
-                NatType::PortRestricted,
-                Some("5.6.7.8:9999".parse().unwrap()),
-            )
-            .await;
-        // Drain the initial StartPunch.
-        let _ = rx.recv().await;
-
-        let key = "t5:10.20.30.40:4662";
-        broker.punch_failed(key, "timeout").await;
-        broker.punch_failed(key, "task reported failure").await;
-
-        // Exactly one StartRelay should have been emitted.
-        let first = rx.recv().await;
-        assert!(matches!(first, Some(BrokerEvent::StartRelay { .. })));
-        assert!(
-            rx.try_recv().is_err(),
-            "duplicate punch_failed emitted a second event"
-        );
-
-        // And the failure was counted once, with a single relay attempt.
-        let stats = broker.stats();
-        assert_eq!(stats.punch_failures, 1);
-        assert_eq!(stats.relay_attempts, 1);
-    }
-
-    #[tokio::test]
-    async fn rejects_unroutable_targets_without_burning_state() {
-        let (tx, mut rx) = mpsc::channel(16);
-        let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
-
-        let bad_targets = [
-            (Ipv4Addr::new(10, 20, 30, 40), 0u16), // port 0
-            (Ipv4Addr::UNSPECIFIED, 4662),         // 0.0.0.0
-            (Ipv4Addr::LOCALHOST, 4662),           // 127.0.0.1
-            (Ipv4Addr::BROADCAST, 4662),           // 255.255.255.255
-            (Ipv4Addr::new(224, 0, 0, 1), 4662),   // multicast
-        ];
-
-        for (i, (ip, port)) in bad_targets.iter().enumerate() {
-            let accepted = broker
-                .attempt_low_to_low(
-                    &format!("bad{i}"),
-                    [0u8; 16],
-                    *ip,
-                    *port,
-                    NatType::PortRestricted,
-                    Some("5.6.7.8:9999".parse().unwrap()),
-                )
-                .await;
-            assert!(!accepted, "{ip}:{port} should be rejected");
-        }
-
-        // No events, no attempts, and no cooldown penalties were recorded.
-        assert!(rx.try_recv().is_err(), "unroutable target emitted an event");
-        assert_eq!(broker.active_attempts(), 0);
-        let stats = broker.stats();
-        assert_eq!(stats.punch_attempts, 0);
-        assert_eq!(stats.relay_attempts, 0);
     }
 }
