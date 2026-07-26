@@ -742,14 +742,6 @@
                 : $networkStats.kad_users_estimate.toLocaleString()}
             </span>
           </div>
-          <div class="stat-tile">
-            <span class="stat-label" title={m.kad_stat_ember_peers_title()}>{m.kad_stat_ember_peers()}</span>
-            <span class="stat-value stat-numeric">{($networkStats.ember_peers ?? 0).toLocaleString()}</span>
-          </div>
-          <div class="stat-tile">
-            <span class="stat-label" title={m.kad_stat_epx_sources_title()}>{m.kad_stat_epx_sources()}</span>
-            <span class="stat-value stat-numeric">{($networkStats.epx_sources_received ?? 0).toLocaleString()}</span>
-          </div>
         </div>
 
         <div class="stat-group">
@@ -1529,7 +1521,7 @@
   }
 
   .kad-lower {
-    flex: 0 0 38%;
+    flex: 1 1 32%;
     max-height: 42%;
     display: flex;
     flex-direction: column;
@@ -1774,7 +1766,17 @@
     color: var(--danger);
   }
 
-  @media (max-width: 1050px) {
+  /* Short laptop viewports: give the contact map more of the column and
+     keep the lower pane from claiming a fixed ~38% that forces page scroll. */
+  @media (max-height: 900px) {
+    .kad-lower {
+      flex: 0 1 28%;
+      max-height: 34%;
+      min-height: 100px;
+    }
+  }
+
+  @media (max-width: 1200px) {
     .kad-layout {
       padding: 10px;
       gap: 10px;
@@ -1787,7 +1789,7 @@
 
     .kad-upper-right {
       width: 100%;
-      max-height: 45%;
+      max-height: 42%;
       flex-direction: row;
       align-items: stretch;
     }
@@ -1800,7 +1802,7 @@
     .kad-lower {
       flex: 1;
       max-height: none;
-      min-height: 180px;
+      min-height: 160px;
     }
   }
 

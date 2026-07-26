@@ -27,6 +27,7 @@
   import type { Transfer, SourceInfo, UploadQueueClient, KnownClient } from '$lib/types';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
+  import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
 
   function countryFlagSrc(code: string | undefined): string | null {
     if (!code || code.length !== 2) return null;
@@ -216,6 +217,7 @@
   let suppressHeaderClickUntil = 0;
 
   let mounted = false;
+  let viewportCompactCleanup: (() => void) | null = null;
   onMount(() => {
     mounted = true;
     // Wrap `localStorage` reads at mount in try/catch. Browser storage
@@ -239,6 +241,11 @@
     loadStoredColumnWidths();
     loadStoredColumnSetup(savedAdvancedCols === '0');
     syncAdvancedDlState();
+    applyViewportDownloadCompact();
+    const compactMq = window.matchMedia(MQ_MAX_LG);
+    const onCompactMq = () => applyViewportDownloadCompact();
+    compactMq.addEventListener('change', onCompactMq);
+    viewportCompactCleanup = () => compactMq.removeEventListener('change', onCompactMq);
 
     // One-shot fetch of the upload-queue and known-clients snapshots so
     // the bottom-tab labels show their counts immediately on page load,
@@ -367,6 +374,8 @@
 
   onDestroy(() => {
     mounted = false;
+    viewportCompactCleanup?.();
+    viewportCompactCleanup = null;
     sourceUnlisten?.();
     searchUnlisten?.();
     infoTimers.forEach(clearTimeout);
@@ -912,7 +921,7 @@
       if (ember && ember.includes(q)) return true;
       if (kc.last_known_ip && kc.last_known_ip.toLowerCase().includes(q)) return true;
       if (kc.country_code && kc.country_code.toLowerCase().includes(q)) return true;
-      const nick = ember ? friendNickById[ember] : undefined;
+      const nick = (ember ? friendNickById[ember] : undefined) || kc.nickname;
       if (nick && nick.toLowerCase().includes(q)) return true;
       return false;
     });
@@ -2000,6 +2009,9 @@
   }
 
   function toggleAdvancedDlCols() {
+    // Manual advanced toggle owns the preference — drop the viewport
+    // snapshot so a later widen doesn't undo the user's choice.
+    preAutoCompactHidden = null;
     applyDownloadColumnPreset(showAdvancedDlCols);
   }
 
@@ -2206,7 +2218,33 @@
       hiddenColumns.downloads[key] = compact;
     }
     if (persist) persistColumnSetup('downloads');
-    else syncAdvancedDlState();
+    else showAdvancedDlCols = !compact;
+  }
+
+  /** Snapshot of download column visibility before viewport auto-compact.
+   *  Restored when the window grows again. Cleared only when the user
+   *  overrides auto-compact (advanced-column toggle / advanced preset /
+   *  reset layout) so a later widen keeps their choice. Edits to
+   *  non-advanced columns while narrow are merged into the snapshot. */
+  let preAutoCompactHidden: Record<string, boolean> | null = null;
+
+  function applyViewportDownloadCompact() {
+    const narrow = window.matchMedia(MQ_MAX_LG).matches;
+    if (narrow) {
+      if (preAutoCompactHidden) return;
+      // Already compact — nothing to snapshot/restore.
+      if (DOWNLOAD_ADVANCED_COLUMN_KEYS.every((key) => isColumnHidden('downloads', key))) {
+        return;
+      }
+      preAutoCompactHidden = { ...hiddenColumns.downloads };
+      applyDownloadColumnPreset(true, false);
+    } else if (preAutoCompactHidden) {
+      hiddenColumns.downloads = { ...preAutoCompactHidden };
+      preAutoCompactHidden = null;
+      showAdvancedDlCols = DOWNLOAD_ADVANCED_COLUMN_KEYS.every(
+        (key) => !isColumnHidden('downloads', key),
+      );
+    }
   }
 
   function canToggleColumn(table: TableKey, columnKey: string): boolean {
@@ -2215,11 +2253,22 @@
 
   function toggleColumnVisibility(table: TableKey, columnKey: string) {
     if (!canToggleColumn(table, columnKey)) return;
-    hiddenColumns[table][columnKey] = !isColumnHidden(table, columnKey);
+    const nextHidden = !isColumnHidden(table, columnKey);
+    hiddenColumns[table][columnKey] = nextHidden;
+    if (table === 'downloads' && preAutoCompactHidden) {
+      if ((DOWNLOAD_ADVANCED_COLUMN_KEYS as readonly string[]).includes(columnKey)) {
+        // User overrode auto-compact — keep their choice on widen.
+        preAutoCompactHidden = null;
+      } else {
+        // Keep non-advanced edits when restoring the pre-narrow layout.
+        preAutoCompactHidden = { ...preAutoCompactHidden, [columnKey]: nextHidden };
+      }
+    }
     persistColumnSetup(table);
   }
 
   function resetColumnLayout(table: TableKey) {
+    if (table === 'downloads') preAutoCompactHidden = null;
     hiddenColumns[table] = createDefaultHidden(TABLE_COLUMNS[table]);
     columnOrder[table] = createDefaultOrder(TABLE_COLUMNS[table]);
     persistColumnSetup(table);
@@ -3621,7 +3670,7 @@
             {#each displayedKnownClients as kc (kc.user_hash)}
               {@const emberKey = kc.ember_hash?.toLowerCase()}
               {@const isFriend = kc.is_friend || (!!emberKey && friendHashSet.has(emberKey))}
-              {@const friendNick = emberKey ? friendNickById[emberKey] : undefined}
+              {@const friendNick = (emberKey ? friendNickById[emberKey] : undefined) || (kc.nickname || undefined)}
               <tr
                 class="client-row"
                 class:client-row-friend={isFriend}

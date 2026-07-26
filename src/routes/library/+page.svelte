@@ -50,6 +50,7 @@
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
   import { inertBackground, trapTabKey } from '$lib/a11y';
+  import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
 
   let folders: string[] = $state([]);
   let folderPriorities: Record<string, string> = $state({});
@@ -2099,6 +2100,10 @@
       if (saved) {
         const val = parseInt(saved, 10);
         if (!isNaN(val)) sidebarWidth = Math.max(120, Math.min(400, val));
+      } else if (window.matchMedia(MQ_MAX_LG).matches) {
+        // First visit on a mid-size window: start the folder rail narrower
+        // so the file table keeps usable width (user can still drag wider).
+        sidebarWidth = 148;
       }
     } catch (e) {
       console.warn('library: localStorage unavailable for sidebar width', e);
@@ -3733,8 +3738,8 @@
 
   /* --- Detail drawer (right side) --- */
   .detail-drawer {
-    width: 420px;
-    min-width: 360px;
+    width: min(420px, 38vw);
+    min-width: 0;
     max-width: 520px;
     flex-shrink: 0;
     display: flex;
@@ -4845,14 +4850,23 @@
     .inline-stats { display: none; }
   }
 
-  @media (max-width: 760px) {
+  /* Overlay the detail drawer earlier so the file table keeps usable width
+     on 16" / mid laptop layouts (shared breakpoint --bp-lg ≈ 1200). */
+  @media (max-width: 1200px) {
     .shared-layout { position: relative; }
     .detail-drawer {
       position: absolute;
       inset: 0 0 0 auto;
-      width: min(90vw, 420px);
+      width: min(90vw, 400px);
       min-width: 0;
       z-index: 20;
+      box-shadow: var(--shadow-panel-left);
+    }
+  }
+
+  @media (max-width: 760px) {
+    .detail-drawer {
+      width: min(90vw, 420px);
     }
   }
 

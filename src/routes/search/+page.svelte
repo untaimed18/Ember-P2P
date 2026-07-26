@@ -3933,6 +3933,24 @@
     background: none;
   }
 
+  @media (max-width: 1200px) {
+    .search-area {
+      padding: 10px 14px 8px;
+      gap: 8px;
+    }
+
+    .filter-text-group {
+      min-width: 0;
+      max-width: none;
+      flex: 1 1 100%;
+    }
+
+    .filter-primary-row,
+    .filter-advanced-row {
+      gap: 8px 10px;
+    }
+  }
+
   @media (max-width: 980px) {
     .filter-text-group {
       max-width: none;
@@ -3956,10 +3974,19 @@
       align-items: stretch;
     }
 
+    .filter-group {
+      flex: 1 1 140px;
+      min-width: 0;
+    }
+
     .results-info {
       flex-direction: column;
       align-items: flex-start;
       gap: 8px;
+    }
+
+    .file-details-panel {
+      max-height: min(280px, 36vh);
     }
   }
 </style>

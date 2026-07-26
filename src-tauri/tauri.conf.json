@@ -14,8 +14,8 @@
     "windows": [
       {
         "title": "Ember",
-        "width": 1920,
-        "height": 1200,
+        "width": 1400,
+        "height": 900,
         "minWidth": 900,
         "minHeight": 600,
         "center": true

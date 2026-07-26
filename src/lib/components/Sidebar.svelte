@@ -9,6 +9,7 @@
   import { totalUnread, toggleDock as toggleChatDock, chatDockOpen } from '$lib/stores/chatTabs';
   import * as m from '$lib/paraglide/messages';
   import { emberDevToolsEnabled } from '$lib/stores/devTools';
+  import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
   import { onMount } from 'svelte';
 
   let aboutOpen = $state(false);
@@ -16,8 +17,15 @@
 
   // Persist collapsed state across sessions. Read synchronously on
   // script init so the first render doesn't briefly flash expanded
-  // for a user who prefers collapsed.
+  // for a user who prefers collapsed — and so a narrow window that
+  // would auto-collapse doesn't flash expanded before onMount.
   const STORAGE_COLLAPSED = 'sidebar-collapsed';
+  // When the user manually expands while the window is still narrow,
+  // don't fight them with auto-collapse until they collapse again or
+  // the window grows past the auto-collapse threshold.
+  const STORAGE_PINNED_EXPANDED = 'sidebar-pinned-expanded';
+  const AUTO_COLLAPSE_MQ = MQ_MAX_LG;
+
   function loadCollapsed(): boolean {
     try {
       return localStorage.getItem(STORAGE_COLLAPSED) === '1';
@@ -25,11 +33,77 @@
       return false;
     }
   }
-  let isCollapsed = $state(loadCollapsed());
+  function loadPinnedExpanded(): boolean {
+    try {
+      return localStorage.getItem(STORAGE_PINNED_EXPANDED) === '1';
+    } catch {
+      return false;
+    }
+  }
+  function initialCollapsed(): boolean {
+    const pinned = loadPinnedExpanded();
+    if (typeof window !== 'undefined') {
+      try {
+        if (window.matchMedia(AUTO_COLLAPSE_MQ).matches && !pinned) {
+          return true;
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+    return loadCollapsed();
+  }
+  let isCollapsed = $state(initialCollapsed());
+  let userPinnedExpanded = $state(loadPinnedExpanded());
+
+  function persistCollapsed(collapsed: boolean) {
+    try {
+      localStorage.setItem(STORAGE_COLLAPSED, collapsed ? '1' : '0');
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function persistPinnedExpanded(pinned: boolean) {
+    userPinnedExpanded = pinned;
+    try {
+      localStorage.setItem(STORAGE_PINNED_EXPANDED, pinned ? '1' : '0');
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function setCollapsed(collapsed: boolean, opts: { fromUser?: boolean } = {}) {
+    isCollapsed = collapsed;
+    if (opts.fromUser) {
+      persistCollapsed(collapsed);
+      // Manual expand while narrow = pin open; manual collapse clears the pin.
+      persistPinnedExpanded(!collapsed && window.matchMedia(AUTO_COLLAPSE_MQ).matches);
+    }
+  }
 
   function toggleCollapsed() {
-    isCollapsed = !isCollapsed;
-    try { localStorage.setItem(STORAGE_COLLAPSED, isCollapsed ? '1' : '0'); } catch { /* ignore */ }
+    setCollapsed(!isCollapsed, { fromUser: true });
+  }
+
+  function applyAutoCollapse() {
+    const narrow = window.matchMedia(AUTO_COLLAPSE_MQ).matches;
+    if (narrow) {
+      // Temporary collapse only — do not overwrite the persisted preference
+      // used when the window is wide again.
+      if (!userPinnedExpanded && !isCollapsed) {
+        isCollapsed = true;
+      }
+    } else {
+      if (userPinnedExpanded) {
+        persistPinnedExpanded(false);
+      }
+      // Restore the user's saved preference after leaving the narrow band.
+      const preferCollapsed = loadCollapsed();
+      if (isCollapsed !== preferCollapsed) {
+        isCollapsed = preferCollapsed;
+      }
+    }
   }
 
   let activeDownloadCount = $derived(
@@ -179,8 +253,15 @@
   }
 
   onMount(() => {
+    applyAutoCollapse();
+    const mq = window.matchMedia(AUTO_COLLAPSE_MQ);
+    const onMq = () => applyAutoCollapse();
+    mq.addEventListener('change', onMq);
     window.addEventListener('keydown', onShortcutKey);
-    return () => window.removeEventListener('keydown', onShortcutKey);
+    return () => {
+      mq.removeEventListener('change', onMq);
+      window.removeEventListener('keydown', onShortcutKey);
+    };
   });
 </script>
 

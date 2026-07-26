@@ -2333,6 +2333,9 @@
     gap: 20px;
     padding: 8px 24px 20px;
     max-width: 1200px;
+    width: 100%;
+    box-sizing: border-box;
+    min-width: 0;
   }
 
   .settings-nav {
@@ -3180,11 +3183,19 @@
     color: var(--danger);
   }
 
+  @media (max-width: 1200px) {
+    .settings-layout {
+      padding: 8px 16px 16px;
+      gap: 14px;
+    }
+  }
+
   @media (max-width: 980px) {
     .settings-layout {
       grid-template-columns: 1fr;
       gap: 12px;
       padding: 12px;
+      max-width: none;
     }
 
     .settings-nav {
@@ -3192,6 +3203,8 @@
       flex-direction: row;
       flex-wrap: wrap;
       padding: 8px;
+      overflow-x: auto;
+      max-width: 100%;
     }
 
     .settings-nav-title {
@@ -3202,6 +3215,7 @@
       width: auto;
       padding: 7px 10px;
       font-size: 12px;
+      flex-shrink: 0;
     }
   }
 

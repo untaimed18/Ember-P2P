@@ -51,6 +51,17 @@
   --sidebar-width: 220px;
   --statusbar-height: 32px;
 
+  /* Shared layout breakpoints (CSS px). Keep numeric values in sync with
+     `src/lib/layoutBreakpoints.ts` — `@media` cannot read custom properties,
+     so stylesheets still write `1200px` / `980px` / `760px` literally; JS
+     matchMedia callers import the TS constants.
+     --bp-lg: laptop / mid windows — collapse chrome, prefer compact tables
+     --bp-md: stacked side panels / horizontal settings nav
+     --bp-sm: overlay drawers, stacked rails */
+  --bp-lg: 1200px;
+  --bp-md: 980px;
+  --bp-sm: 760px;
+
   --radius-sm: 5px;
   --radius-md: 7px;
   --radius-lg: 10px;

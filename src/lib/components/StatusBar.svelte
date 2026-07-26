@@ -115,7 +115,7 @@
       {m.statusbar_epx_label()}
       <span class="dot {epxStatus($networkStats)}" aria-label={epxStatusLabel(epxStatus($networkStats))}></span>
     </span>
-    <span class="status-label" title={sharedTitle(sharedCount, sharedBytes)}>
+    <span class="status-label status-shared" title={sharedTitle(sharedCount, sharedBytes)}>
       {m.statusbar_shared_label()}
       <span class="shared-count">{sharedCount.toLocaleString()}</span>
       <span class="shared-size">({formatBytes(sharedBytes)})</span>
@@ -139,7 +139,7 @@
       <span class="sr-only">{m.statusbar_download_sr()}</span>
       {formatSpeed($networkStats.download_speed)}
     </span>
-    <span class="status-item muted" title={m.statusbar_total_transferred({ up: formatBytes($networkStats.total_uploaded), down: formatBytes($networkStats.total_downloaded) })} aria-label={m.statusbar_total_transferred({ up: formatBytes($networkStats.total_uploaded), down: formatBytes($networkStats.total_downloaded) })}>
+    <span class="status-item muted status-totals" title={m.statusbar_total_transferred({ up: formatBytes($networkStats.total_uploaded), down: formatBytes($networkStats.total_downloaded) })} aria-label={m.statusbar_total_transferred({ up: formatBytes($networkStats.total_uploaded), down: formatBytes($networkStats.total_downloaded) })}>
       <span aria-hidden="true">↑</span> {formatBytes($networkStats.total_uploaded)} / <span aria-hidden="true">↓</span> {formatBytes($networkStats.total_downloaded)}
     </span>
   </div>
@@ -153,15 +153,22 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
+    gap: 12px;
     padding: 0 16px;
     font-size: 12px;
     flex-shrink: 0;
+    overflow: hidden;
   }
 
   .status-left, .status-right {
     display: flex;
     align-items: center;
     gap: 16px;
+    min-width: 0;
+  }
+
+  .status-right {
+    flex-shrink: 0;
   }
 
   .status-label {
@@ -170,6 +177,7 @@
     gap: 6px;
     color: var(--text-secondary);
     cursor: default;
+    white-space: nowrap;
   }
 
   .dot {
@@ -217,6 +225,7 @@
 
   .status-item {
     color: var(--text-secondary);
+    white-space: nowrap;
   }
 
   .status-item.upload {
@@ -229,5 +238,33 @@
 
   .status-item.muted {
     color: var(--text-muted);
+  }
+
+  /* Laptop / mid-width: keep connection dots + live rates; tuck secondary
+     size labels and session totals behind tooltips-only (title still set). */
+  @media (max-width: 1200px) {
+    .statusbar {
+      padding: 0 10px;
+      gap: 8px;
+    }
+
+    .status-left, .status-right {
+      gap: 10px;
+    }
+
+    .shared-size,
+    .status-totals {
+      display: none;
+    }
+  }
+
+  @media (max-width: 980px) {
+    .status-shared {
+      display: none;
+    }
+
+    .status-left, .status-right {
+      gap: 8px;
+    }
   }
 </style>

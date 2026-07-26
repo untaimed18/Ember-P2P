@@ -286,7 +286,7 @@
     top: 0;
     right: 0;
     bottom: 0;
-    width: 420px;
+    width: min(420px, 40vw);
     max-width: 100vw;
     background: var(--bg-primary);
     border-left: 1px solid var(--border);
