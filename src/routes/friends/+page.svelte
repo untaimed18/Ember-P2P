@@ -279,33 +279,33 @@
       const hash = validFriendHash(event.payload?.user_hash);
       if (!hash) return;
       const reason = typeof event.payload?.reason === 'string' ? event.payload.reason : 'error';
-      if (failedSearchToastsShown.has(hash)) return;
-      failedSearchToastsShown.add(hash);
       const f = friends.find(fr => fr.user_hash === hash);
       const name = f ? (f.nickname || hash.slice(0, 8) + '\u2026') : hash.slice(0, 8) + '\u2026';
-      let msg: string;
+      // Reconnect sweeps run on their own, so "offline / unreachable / not
+      // found" outcomes are not events the user asked about — the friend card
+      // already shows presence. Only surface outcomes they can act on.
+      let msg: string | null;
       switch (reason) {
         case 'firewalled':
           msg = m.friends_search_firewalled({ name });
-          break;
-        case 'not_found':
-          msg = m.friends_search_not_found({ name });
-          break;
-        case 'timeout':
-          msg = m.friends_search_timeout({ name });
-          break;
-        case 'refused':
-          msg = m.friends_search_refused({ name });
           break;
         case 'secure_v2_required':
           msg = m.error_secure_friend_v2_required();
           break;
         default:
-          msg = m.friends_search_generic({ name });
+          msg = null;
       }
+      if (!msg) return;
+      // Dedupe after picking the message so a silent sweep result can't
+      // suppress the actionable toast that follows it.
+      if (failedSearchToastsShown.has(hash)) return;
+      failedSearchToastsShown.add(hash);
       toastWarning(msg);
     }).then(fn => { if (destroyed) fn(); else unlistenFns.push(fn); })
       .catch((e) => console.error('friends: failed to register ember:friend-search-failed listener', e));
+
+    window.addEventListener('pointerdown', onCardMenuPointerDown, true);
+    window.addEventListener('keydown', onCardMenuKeydown, true);
 
     return () => {
       destroyed = true;
@@ -313,6 +313,8 @@
       clearTimeout(copyTimer);
       clearTimeout(myHashCopyTimer);
       clearTimeout(recheckTimer);
+      window.removeEventListener('pointerdown', onCardMenuPointerDown, true);
+      window.removeEventListener('keydown', onCardMenuKeydown, true);
       unlistenFns.forEach(fn => fn());
     };
   });
@@ -475,6 +477,34 @@
     return new Date(ts * 1000).toLocaleDateString(undefined, {
       year: 'numeric', month: 'short', day: 'numeric',
     });
+  }
+
+  // The per-card overflow menu is a native `<details>`, matching the toolbar
+  // menu on the Transfers page. `<details>` only closes on its own summary, so
+  // selecting an item, clicking elsewhere, or pressing Escape closes it here.
+  function closeCardMenu(from: HTMLElement) {
+    (from.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open');
+  }
+
+  function closeCardMenus(keepContaining?: Element | null) {
+    for (const el of document.querySelectorAll<HTMLDetailsElement>('.card-more[open]')) {
+      if (keepContaining && el.contains(keepContaining)) continue;
+      el.open = false;
+    }
+  }
+
+  function onCardMenuPointerDown(e: PointerEvent) {
+    const target = e.target instanceof Element ? e.target : null;
+    closeCardMenus(target);
+  }
+
+  function onCardMenuKeydown(e: KeyboardEvent) {
+    if (e.key !== 'Escape') return;
+    // Only swallow Escape when a menu is actually open, so dialogs and the
+    // nickname editor keep their own Escape handling.
+    if (!document.querySelector('.card-more[open]')) return;
+    closeCardMenus();
+    e.stopPropagation();
   }
 
   async function copyHash(hash: string) {
@@ -775,111 +805,86 @@
       <p class="empty-sub">{m.friends_no_matches_sub()}</p>
     </div>
   {:else}
+    <!--
+      Compact friend row. Presence is stated once (the avatar dot) because the
+      section headers above already group online vs offline, and unread is
+      stated once as a dot on Chat with the count in the status line. Reference
+      data (Friend ID, last address, added date) and the secondary actions live
+      in the overflow menu so the resting card is name + status + Chat.
+    -->
     {#snippet friendCard(f: FriendInfo, isOnline: boolean)}
       {@const presence = friendPresence(f)}
+      {@const unread = unreadCounts.get(f.user_hash) ?? 0}
+      {@const searching = searchingFriends.has(f.user_hash) || reconnectingFriends.has(f.user_hash)}
       {@const truncatedId = `${f.user_hash.slice(0, 8)}\u2026${f.user_hash.slice(-6)}`}
       {@const lastAddr = f.last_ip && f.last_port > 0 ? `${f.last_ip}:${f.last_port}` : (f.last_ip || '')}
-      <div class="friend-card" class:editing={editingHash === f.user_hash} class:online={isOnline} class:has-unread-card={!!unreadCounts.get(f.user_hash)}>
-        <div class="card-header-row">
-          <div class="card-avatar" class:avatar-online={presence === 'online'} class:avatar-offline={presence === 'offline'}>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-              <circle cx="12" cy="8" r="4"/>
-              <path d="M4 21c0-4.418 3.582-8 8-8s8 3.582 8 8"/>
-            </svg>
-            <span class="status-dot" class:dot-online={presence === 'online'} class:dot-offline={presence === 'offline'}></span>
-          </div>
-          <div class="card-identity">
-            {#if editingHash === f.user_hash}
-              <input
-                type="text"
-                class="edit-input"
-                bind:value={editNickname}
-                onkeydown={editKeydown}
-                onblur={saveEdit}
-                maxlength="64"
-                placeholder={m.friends_nickname_edit_placeholder()}
-                use:autoFocus
-                aria-label={m.friends_nickname_edit_placeholder()}
-              />
-            {:else}
+      {@const shortName = f.nickname || f.user_hash.slice(0, 8)}
+      <div class="friend-card" class:editing={editingHash === f.user_hash}>
+        <div class="card-avatar">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="8" r="4"/>
+            <path d="M4 21c0-4.418 3.582-8 8-8s8 3.582 8 8"/>
+          </svg>
+          <span class="status-dot" class:dot-online={presence === 'online'} class:dot-offline={presence === 'offline'}></span>
+        </div>
+
+        <div class="card-identity">
+          {#if editingHash === f.user_hash}
+            <input
+              type="text"
+              class="edit-input"
+              bind:value={editNickname}
+              onkeydown={editKeydown}
+              onblur={saveEdit}
+              maxlength="64"
+              placeholder={m.friends_nickname_edit_placeholder()}
+              use:autoFocus
+              aria-label={m.friends_nickname_edit_placeholder()}
+            />
+          {:else}
+            <div class="card-name-row">
               <button class="nick-btn" onclick={() => startEdit(f)} title={m.friends_edit_nickname_title()}>
                 <!-- `<bdi>` isolates the peer-supplied nickname from
                      the surrounding UI direction. -->
                 {#if f.nickname}<bdi dir="auto">{f.nickname}</bdi>{:else}{m.friends_no_nickname()}{/if}
               </button>
-            {/if}
-            <span class="card-status-label">
-              {#if searchingFriends.has(f.user_hash)}
-                <span class="status-searching">{m.friends_status_searching()}</span>
-              {:else if !f.mutual}
-                <span class="status-pending">{m.friends_status_waiting_accept()}</span>
-              {:else if presence === 'online'}
-                <span class="status-online">{m.friends_status_online()}</span>
-              {:else if f.last_seen}
-                {m.friends_status_last_seen({ when: formatLastSeen(f.last_seen) })}
-              {:else}
-                {m.friends_status_added({ when: formatDate(f.added_at) })}
-              {/if}
               {#if f.mutual && isOnline}
-                <span class="status-encrypted" title={m.friends_encrypted_chat_title()}>
+                <!-- Icon only: the encryption guarantee is identical for every
+                     mutual online friend, so spelling it out on each card was
+                     pure repetition. Wording stays in the tooltip. -->
+                <span class="lock-glyph" title={m.friends_encrypted_chat_title()} aria-label={m.friends_encrypted_chat()}>
                   <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <rect x="3.5" y="7" width="9" height="6.5" rx="1.5"/>
                     <path d="M5.5 7V5.5a2.5 2.5 0 0 1 5 0V7"/>
                   </svg>
-                  {m.friends_encrypted_chat()}
                 </span>
               {/if}
-            </span>
-            <div class="card-meta">
-              <span class="card-id" title={f.user_hash}>{truncatedId}</span>
-              {#if lastAddr}
-                <span class="card-meta-sep" aria-hidden="true">·</span>
-                <span class="card-addr" title={m.friends_last_address({ addr: lastAddr })}>{m.friends_last_address({ addr: lastAddr })}</span>
-              {/if}
             </div>
-            {#if unreadCounts.get(f.user_hash)}
-              <span class="card-unread-preview">
-                {(unreadCounts.get(f.user_hash) ?? 0) === 1
-                  ? m.friends_unread_one()
-                  : m.friends_unread_other({ count: unreadCounts.get(f.user_hash) ?? 0 })}
+          {/if}
+          <!-- Exactly one status line, highest-priority state wins. -->
+          <span class="card-substatus">
+            {#if searching}
+              <span class="status-searching">{m.friends_status_searching()}</span>
+            {:else if !f.mutual}
+              <span class="status-pending">{m.friends_status_waiting_accept()}</span>
+            {:else if unread > 0}
+              <span class="status-unread">
+                {unread === 1 ? m.friends_unread_one() : m.friends_unread_other({ count: unread })}
               </span>
-            {/if}
-          </div>
-          <button
-            class="icon-btn copy-hash-btn"
-            onclick={() => copyHash(f.user_hash)}
-            title={copiedHash === f.user_hash ? m.friends_copied_title() : m.friends_copy_id_title()}
-            aria-label={copiedHash === f.user_hash ? m.friends_copied_id_aria() : m.friends_copy_id_aria({ name: f.nickname || f.user_hash.slice(0, 8) })}
-          >
-            {#if copiedHash === f.user_hash}
-              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <polyline points="3 8 7 12 13 4"/>
-              </svg>
+            {:else if presence === 'online'}
+              <span class="status-online">{m.friends_status_online()}</span>
+            {:else if f.last_seen}
+              {m.friends_status_last_seen({ when: formatLastSeen(f.last_seen) })}
             {:else}
-              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                <rect x="5" y="5" width="9" height="9" rx="1.5"/>
-                <path d="M3 11V3a1.5 1.5 0 011.5-1.5H11"/>
-              </svg>
+              {m.friends_status_added({ when: formatDate(f.added_at) })}
             {/if}
-          </button>
-          <button
-            class="icon-btn danger remove-btn"
-            onclick={() => confirmRemoveFriend(f)}
-            title={m.friends_remove_title()}
-            aria-label={m.friends_remove_aria({ name: f.nickname || f.user_hash.slice(0, 8) })}
-          >
-            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-              <line x1="4" y1="4" x2="12" y2="12"/>
-              <line x1="12" y1="4" x2="4" y2="12"/>
-            </svg>
-          </button>
+          </span>
         </div>
 
-        <div class="card-actions-bar">
+        <div class="card-controls">
           <button
-            class="action-btn chat-action"
-            class:has-unread={unreadCounts.get(f.user_hash)}
-            class:primary-action={f.mutual}
+            class="chat-btn"
+            class:has-unread={unread > 0}
             onclick={() => openChat(f)}
             disabled={!f.mutual}
             title={f.mutual ? (isOnline ? m.friends_encrypted_chat_title() : m.friends_action_chat()) : m.friends_action_waiting_accept()}
@@ -887,42 +892,73 @@
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
               <path d="M2 3h12v8H5l-3 3z"/>
             </svg>
-            {m.friends_action_chat()}
-            {#if unreadCounts.get(f.user_hash)}
-              <span class="unread-badge">{unreadCounts.get(f.user_hash)}</span>
-            {/if}
+            <span class="chat-btn-label">{m.friends_action_chat()}</span>
+            {#if unread > 0}<span class="unread-dot" aria-hidden="true"></span>{/if}
           </button>
-          <button
-            class="action-btn browse-action"
-            onclick={() => openBrowse(f)}
-            disabled={!f.mutual || !isOnline || browseDisabled}
-            title={browseDisabled
-              ? m.settings_friend_browse_disabled()
-              : !f.mutual
-              ? m.friends_action_waiting_accept()
-              : isOnline
-                ? m.friends_action_browse_files()
-                : m.friends_action_browse_offline()}
-          >
-            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M2 4h5l2 2h5v7H2z"/>
-            </svg>
-            {m.friends_action_browse()}
-          </button>
-          {#if f.mutual && !isOnline}
-            <button
-              class="action-btn reconnect-action"
-              onclick={() => handleRetrySearch(f)}
-              disabled={searchingFriends.has(f.user_hash) || reconnectingFriends.has(f.user_hash)}
-              title={m.friends_action_reconnect_title()}
-            >
-              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9"/>
-                <polyline points="13.5 2 13.5 5 10.5 5"/>
+
+          <details class="card-more">
+            <summary class="card-more-btn" title={m.common_more()} aria-haspopup="menu" aria-label={m.common_more()}>
+              <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                <circle cx="3.5" cy="8" r="1.4"/>
+                <circle cx="8" cy="8" r="1.4"/>
+                <circle cx="12.5" cy="8" r="1.4"/>
               </svg>
-              {searchingFriends.has(f.user_hash) || reconnectingFriends.has(f.user_hash) ? m.friends_status_searching() : m.friends_action_reconnect()}
-            </button>
-          {/if}
+            </summary>
+            <div class="card-more-menu" role="menu">
+              <button
+                type="button"
+                role="menuitem"
+                onclick={(e) => { closeCardMenu(e.currentTarget); openBrowse(f); }}
+                disabled={!f.mutual || !isOnline || browseDisabled}
+                title={browseDisabled
+                  ? m.settings_friend_browse_disabled()
+                  : !f.mutual
+                  ? m.friends_action_waiting_accept()
+                  : isOnline
+                    ? m.friends_action_browse_files()
+                    : m.friends_action_browse_offline()}
+              >{m.friends_action_browse_files()}</button>
+              {#if f.mutual && !isOnline}
+                <button
+                  type="button"
+                  role="menuitem"
+                  onclick={(e) => { closeCardMenu(e.currentTarget); handleRetrySearch(f); }}
+                  disabled={searching}
+                  title={m.friends_action_reconnect_title()}
+                >{searching ? m.friends_status_searching() : m.friends_action_reconnect()}</button>
+              {/if}
+              <!-- The ID lives on the action that uses it, so the reference
+                   value is one hover away without sitting on every card.
+                   Deliberately does NOT close the menu: the label flips to
+                   "Copied!" for 1.5s, which the user could not see otherwise. -->
+              <button
+                type="button"
+                role="menuitem"
+                class="menu-item-stacked"
+                onclick={() => copyHash(f.user_hash)}
+                title={f.user_hash}
+                aria-label={copiedHash === f.user_hash
+                  ? m.friends_copied_id_aria()
+                  : m.friends_copy_id_aria({ name: shortName })}
+              >
+                <span>{copiedHash === f.user_hash ? m.friends_copied_title() : m.friends_copy_id_title()}</span>
+                <span class="menu-item-sub">{truncatedId}</span>
+              </button>
+              <div class="card-more-facts">
+                {#if lastAddr}
+                  <span class="card-more-fact">{m.friends_last_address({ addr: lastAddr })}</span>
+                {/if}
+                <span class="card-more-fact">{m.friends_status_added({ when: formatDate(f.added_at) })}</span>
+              </div>
+              <button
+                type="button"
+                role="menuitem"
+                class="menu-item-danger"
+                onclick={(e) => { closeCardMenu(e.currentTarget); confirmRemoveFriend(f); }}
+                aria-label={m.friends_remove_aria({ name: shortName })}
+              >{m.friends_remove_title()}</button>
+            </div>
+          </details>
         </div>
       </div>
     {/snippet}
@@ -1326,12 +1362,16 @@
     gap: 10px;
   }
 
+  /* Single row: avatar · identity · controls. No `overflow: hidden` — the
+     overflow menu is absolutely positioned and must escape the card. */
   .friend-card {
     background: var(--bg-surface);
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
-    padding: 0;
-    overflow: hidden;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 10px;
     transition: border-color var(--transition-normal), box-shadow var(--transition-normal);
   }
 
@@ -1345,16 +1385,9 @@
     box-shadow: 0 0 0 2px var(--accent-dim);
   }
 
-  .card-header-row {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    padding: 14px 14px 10px;
-  }
-
   .card-avatar {
-    width: 40px;
-    height: 40px;
+    width: 34px;
+    height: 34px;
     flex-shrink: 0;
     border-radius: 50%;
     background: var(--accent-dim);
@@ -1365,8 +1398,8 @@
   }
 
   .card-avatar svg {
-    width: 20px;
-    height: 20px;
+    width: 18px;
+    height: 18px;
   }
 
   .card-identity {
@@ -1374,16 +1407,33 @@
     min-width: 0;
     display: flex;
     flex-direction: column;
-    gap: 2px;
+    gap: 1px;
   }
 
-  .card-status-label {
+  .card-name-row {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    min-width: 0;
+  }
+
+  .lock-glyph {
+    display: inline-flex;
+    color: var(--accent);
+    flex-shrink: 0;
+  }
+
+  .lock-glyph svg {
+    width: 11px;
+    height: 11px;
+  }
+
+  .card-substatus {
     font-size: 11px;
     color: var(--text-muted);
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 6px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .status-online {
@@ -1391,43 +1441,9 @@
     font-weight: 600;
   }
 
-  .status-encrypted {
-    display: inline-flex;
-    align-items: center;
-    gap: 3px;
+  .status-unread {
     color: var(--accent);
     font-weight: 600;
-  }
-
-  .status-encrypted svg {
-    width: 11px;
-    height: 11px;
-  }
-
-  .card-meta {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 4px;
-    font-size: 11px;
-    color: var(--text-muted);
-    min-width: 0;
-  }
-
-  .card-id {
-    font-family: var(--font-mono);
-    letter-spacing: 0.2px;
-  }
-
-  .card-meta-sep {
-    opacity: 0.5;
-  }
-
-  .card-addr {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    max-width: 100%;
   }
 
   .nick-btn {
@@ -1472,87 +1488,70 @@
     box-shadow: 0 0 0 2px var(--accent-dim);
   }
 
-  /* Same touch/keyboard reasoning as `.copy-hash-btn` above. */
-  .remove-btn {
-    opacity: 0.55;
-    transition: opacity var(--transition-fast), background var(--transition-fast), color var(--transition-fast);
-  }
-
-  .friend-card:hover .remove-btn,
-  .friend-card:focus-within .remove-btn,
-  .remove-btn:focus-visible {
-    opacity: 1;
-  }
-
-
   @keyframes badge-pulse {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.5; }
   }
 
-  .card-actions-bar {
+  /* --- Card controls: one primary action plus an overflow menu --- */
+  .card-controls {
     display: flex;
-    border-top: 1px solid var(--border);
+    align-items: center;
+    gap: 2px;
+    flex-shrink: 0;
   }
 
-  .action-btn {
-    flex: 1;
+  .chat-btn {
     display: inline-flex;
     align-items: center;
-    justify-content: center;
-    gap: 6px;
-    padding: 9px 8px;
-    border: none;
-    background: transparent;
-    color: var(--text-muted);
+    gap: 5px;
+    padding: 5px 10px;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--accent);
     font-size: 11px;
     font-weight: 600;
     font-family: inherit;
     cursor: pointer;
-    position: relative;
     transition: background var(--transition-fast), color var(--transition-fast);
   }
 
-  .action-btn + .action-btn {
-    border-left: 1px solid var(--border);
+  .chat-btn:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--accent) 20%, transparent);
   }
 
-  .action-btn:hover:not(:disabled) {
-    background: var(--bg-hover);
-    color: var(--text-primary);
-  }
-
-  .action-btn:disabled {
-    opacity: 0.35;
+  .chat-btn:disabled {
+    background: transparent;
+    color: var(--text-muted);
+    opacity: 0.5;
     cursor: not-allowed;
   }
 
-  .action-btn svg {
+  .chat-btn svg {
     width: 13px;
     height: 13px;
     flex-shrink: 0;
   }
 
-  .action-btn.has-unread {
-    color: var(--accent);
+  /* Unread is a presence cue here; the count is in the status line. */
+  .unread-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--accent);
+    flex-shrink: 0;
   }
 
-  .action-btn.primary-action:not(:disabled) {
-    color: var(--accent);
-    font-weight: 600;
+  .card-more {
+    position: relative;
   }
 
-  .action-btn.primary-action:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--accent) 12%, transparent);
-  }
-
-  .icon-btn {
-    width: 28px;
-    height: 28px;
-    padding: 0;
-    border: none;
+  .card-more > summary {
+    list-style: none;
+    width: 26px;
+    height: 26px;
     border-radius: var(--radius-sm);
-    background: transparent;
     color: var(--text-muted);
     cursor: pointer;
     display: inline-flex;
@@ -1561,18 +1560,89 @@
     transition: background var(--transition-fast), color var(--transition-fast);
   }
 
-  .icon-btn:hover {
+  .card-more > summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .card-more > summary:hover,
+  .card-more[open] > summary {
     background: var(--bg-hover);
     color: var(--text-primary);
   }
 
-  .icon-btn.danger:hover {
+  .card-more > summary svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  .card-more-menu {
+    position: absolute;
+    right: 0;
+    top: calc(100% + 4px);
+    z-index: 20;
+    min-width: 190px;
+    padding: 4px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    box-shadow: var(--shadow-md);
+    display: flex;
+    flex-direction: column;
+  }
+
+  .card-more-menu button {
+    text-align: left;
+    font-size: 12px;
+    font-family: inherit;
+    padding: 6px 10px;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-primary);
+    cursor: pointer;
+  }
+
+  .card-more-menu button:hover:not(:disabled) {
+    background: var(--bg-hover);
+  }
+
+  .card-more-menu button:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .menu-item-stacked {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+
+  .menu-item-sub {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.2px;
+    color: var(--text-muted);
+  }
+
+  .menu-item-danger:hover:not(:disabled) {
     color: var(--danger);
   }
 
-  .icon-btn svg {
-    width: 14px;
-    height: 14px;
+  /* Reference facts, not actions — separated so they don't read as
+     clickable rows in the menu. */
+  .card-more-facts {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin: 4px 0;
+    padding: 6px 10px;
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .card-more-fact {
+    font-size: 10px;
+    color: var(--text-muted);
   }
 
   /* --- Empty state --- */
@@ -1626,17 +1696,6 @@
     position: relative;
   }
 
-  .avatar-online {
-    border: 2px solid var(--success);
-  }
-
-  /* Offline avatars use a muted neutral border instead of red.
-     Reserving --danger for actual errors stops "offline" from reading
-     as "broken" and keeps the page calm when most friends are offline. */
-  .avatar-offline {
-    border: 2px solid var(--border-light);
-    opacity: 0.85;
-  }
 
   .status-dot {
     position: absolute;
@@ -1656,18 +1715,6 @@
     background: var(--text-muted);
   }
 
-  .friend-card.online {
-    border-left: 3px solid var(--success);
-  }
-
-  .friend-card.has-unread-card {
-    border-left: 3px solid var(--accent);
-    background: color-mix(in srgb, var(--accent) 4%, var(--bg-surface));
-  }
-
-  .friend-card.online.has-unread-card {
-    border-left: 3px solid var(--accent);
-  }
 
   /* --- Section dividers --- */
   .section-divider {
@@ -1705,14 +1752,6 @@
     color: var(--text-muted);
   }
 
-  /* --- Card-level unread preview --- */
-  .card-unread-preview {
-    font-size: 11px;
-    color: var(--accent);
-    font-weight: 500;
-    margin-top: 1px;
-  }
-
   .status-searching {
     color: var(--warning);
     font-weight: 500;
@@ -1734,37 +1773,6 @@
     .status-searching {
       animation: none;
     }
-  }
-
-  /* --- Copy hash button in header ---
-     Always present (not opacity 0) so touch users and keyboard
-     navigation can reach it without first triggering hover. Faded by
-     default to avoid competing with primary content; resolves to full
-     opacity on hover OR focus-within so keyboard tabbing reveals it. */
-  .copy-hash-btn {
-    opacity: 0.55;
-    transition: opacity var(--transition-fast), background var(--transition-fast), color var(--transition-fast);
-  }
-
-  .friend-card:hover .copy-hash-btn,
-  .friend-card:focus-within .copy-hash-btn,
-  .copy-hash-btn:focus-visible {
-    opacity: 1;
-  }
-
-  .unread-badge {
-    min-width: 14px;
-    height: 14px;
-    border-radius: 7px;
-    background: var(--danger);
-    color: var(--on-danger);
-    font-size: 9px;
-    font-weight: 700;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    padding: 0 3px;
-    line-height: 1;
   }
 
   /* --- Friend requests section --- */
