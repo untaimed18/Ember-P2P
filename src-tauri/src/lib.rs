@@ -214,6 +214,37 @@ pub fn run() {
     // Keep the guard alive for the entire app lifetime
     let _log_guard = log_guard;
 
+    // Route panics into the log file. Release builds are linked with
+    // `windows_subsystem = "windows"` (no console), so the default hook's
+    // stderr message goes nowhere and a startup panic is indistinguishable
+    // from "the window opened and instantly closed". Without this, the log
+    // simply stops mid-startup with no cause recorded.
+    let default_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown location>".to_string());
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+        tracing::error!(
+            "PANIC at {location} on thread '{}': {payload}",
+            std::thread::current().name().unwrap_or("unnamed"),
+        );
+        default_panic_hook(info);
+    }));
+
+    tracing::info!(
+        "Ember starting: version={} os={} arch={}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    );
+
     // Multi-instance harness path: when `EMBER_DATA_DIR` is set, every
     // launched process is meant to be an *isolated* node (own config,
     // identity, database, downloads). The `tauri-plugin-single-instance`
