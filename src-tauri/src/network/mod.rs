@@ -8056,12 +8056,58 @@ async fn upload_queue_snapshot(
 /// ever traded credit with — independent of which peers happen to be
 /// connected right now. Friend markers use the Ember node id bound to
 /// each credit row (not the eD2K user hash).
+///
+/// Ember friends often land in `clients.met` via `set_ember_hash`
+/// (reseed / Hello binding) with zero transfer bytes and `ident_ip == 0`.
+/// Their usable address and last-seen live in the friends SQLite table,
+/// so we join that metadata in here before handing rows to the UI.
 async fn known_clients_snapshot(
     credit_manager: &Arc<RwLock<ed2k::credits::CreditManager>>,
     friend_hashes: &crate::app_state::SharedFriendHashes,
     upload_queue: &ed2k::upload::UploadQueueRef,
     geoip: &crate::geoip::GeoIpReader,
+    db: &Arc<Database>,
 ) -> Vec<crate::types::KnownClient> {
+    struct FriendMeta {
+        nickname: String,
+        last_ip: String,
+        last_seen: i64,
+    }
+
+    // Friends table is small; read off the network task so we never hold
+    // the credit lock across a blocking SQLite call.
+    let db_q = db.clone();
+    let friend_meta: std::collections::HashMap<String, FriendMeta> =
+        match tokio::task::spawn_blocking(move || {
+            let mut map = std::collections::HashMap::new();
+            match db_q.get_friends_full() {
+                Ok(rows) => {
+                    for (hash, nick, _added, last_ip, _port, last_seen, _mutual) in rows {
+                        map.insert(
+                            hash.to_lowercase(),
+                            FriendMeta {
+                                nickname: nick,
+                                last_ip,
+                                last_seen,
+                            },
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("known_clients_snapshot: friends lookup failed: {e}");
+                }
+            }
+            map
+        })
+        .await
+        {
+            Ok(map) => map,
+            Err(e) => {
+                tracing::warn!("known_clients_snapshot: friends lookup task failed: {e}");
+                std::collections::HashMap::new()
+            }
+        };
+
     // Live queue bindings fill gaps for peers we verified this session
     // before the credit flush lands (and for older DB rows that predate
     // the ember_hash column).
@@ -8092,35 +8138,55 @@ async fn known_clients_snapshot(
                 ident_state_label(cm.get_current_ident_state(&record.user_hash, record.ident_ip))
                     .to_string();
             let credit_ratio = cm.get_score_ratio(&record.user_hash, record.ident_ip);
-            let last_known_ip = if record.ident_ip != 0 {
+            let ember = record
+                .ember_hash
+                .or_else(|| live_ember.get(&record.user_hash).copied());
+            let is_friend = ember.map(|eh| friends.contains(&eh)).unwrap_or(false);
+            let meta = ember
+                .map(hex::encode)
+                .and_then(|h| friend_meta.get(&h.to_lowercase()));
+
+            let mut last_known_ip = if record.ident_ip != 0 {
                 let octets = record.ident_ip.to_be_bytes();
                 Some(std::net::Ipv4Addr::from(octets).to_string())
             } else {
                 None
             };
-            let country_code = if record.ident_ip != 0 {
-                let octets = record.ident_ip.to_be_bytes();
-                let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::from(octets));
-                crate::geoip::lookup_country(geoip, ip)
-            } else {
-                None
-            };
-            let ember = record
-                .ember_hash
-                .or_else(|| live_ember.get(&record.user_hash).copied());
-            let is_friend = ember.map(|eh| friends.contains(&eh)).unwrap_or(false);
+            if last_known_ip.is_none() {
+                if let Some(m) = meta {
+                    if !m.last_ip.is_empty() {
+                        last_known_ip = Some(m.last_ip.clone());
+                    }
+                }
+            }
+
+            let mut last_seen = record.last_seen;
+            if let Some(m) = meta {
+                if m.last_seen > last_seen {
+                    last_seen = m.last_seen;
+                }
+            }
+
+            let country_code = last_known_ip.as_deref().and_then(|ip_str| {
+                ip_str
+                    .parse::<std::net::IpAddr>()
+                    .ok()
+                    .and_then(|ip| crate::geoip::lookup_country(geoip, ip))
+            });
+
             crate::types::KnownClient {
                 user_hash: hex::encode(record.user_hash),
                 downloaded: record.downloaded,
                 uploaded: record.uploaded,
                 credit_ratio,
-                last_seen: record.last_seen,
+                last_seen,
                 ident_state,
                 last_known_ip,
                 country_code,
                 has_public_key: !record.public_key.is_empty(),
                 ember_hash: ember.map(hex::encode),
                 is_friend,
+                nickname: meta.map(|m| m.nickname.clone()).unwrap_or_default(),
             }
         })
         .collect();
@@ -33738,8 +33804,14 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::GetKnownClientsSnapshot { tx } => {
-            let snap =
-                known_clients_snapshot(credit_manager, friend_hashes, upload_queue, geoip).await;
+            let snap = known_clients_snapshot(
+                credit_manager,
+                friend_hashes,
+                upload_queue,
+                geoip,
+                &db,
+            )
+            .await;
             let _ = tx.send(snap);
         }
 

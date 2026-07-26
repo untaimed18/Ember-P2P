@@ -476,6 +476,8 @@ export interface KnownClient {
   /** Ember node id hex when known; friends are keyed by this, not user_hash. */
   ember_hash: string | null;
   is_friend: boolean;
+  /** Friend nickname from the friends DB when this row is a friend. */
+  nickname?: string;
 }
 
 /** Snapshot of the anti-leech client filter — the eMule-style

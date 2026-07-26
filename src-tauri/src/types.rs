@@ -1105,8 +1105,10 @@ pub struct KnownClient {
     pub last_seen: i64,
     /// "Verified" | "Failed" | "Unknown" | "BadGuy" | "Needed"
     pub ident_state: String,
-    /// Last IPv4 we successfully verified the peer at, or `None` for
-    /// records that exist only because of pre-SecIdent traffic.
+    /// Best-known peer IPv4/IPv6 string for display, or `None` when unknown.
+    /// Prefer SecIdent `ident_ip` when present; otherwise may be filled from
+    /// the friends table (`last_ip`) for Ember friends that have no verified
+    /// credit IP yet — that path is observed/friend-seen, not SecIdent.
     pub last_known_ip: Option<String>,
     /// ISO 3166-1 alpha-2, geoip-resolved from `last_known_ip`.
     pub country_code: Option<String>,
@@ -1119,6 +1121,11 @@ pub struct KnownClient {
     pub ember_hash: Option<String>,
     /// True when `ember_hash` is present in the local friends set.
     pub is_friend: bool,
+    /// Friend nickname from the friends DB when this row's Ember hash
+    /// matches a friends entry (empty otherwise). Surfaced so Known
+    /// Clients can show a readable name even with no transfer history.
+    #[serde(default)]
+    pub nickname: String,
 }
 
 fn default_max_uploads() -> u32 {
