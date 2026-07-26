@@ -435,11 +435,14 @@
       <span class="chats-label">{m.sidebar_chats_label()}</span>
       {#if totalUnreadChats > 0}
         <span
-          class="nav-badge nav-badge-attention chats-badge"
+          class="chats-dot"
+          aria-label={totalUnreadChats === 1
+            ? m.sidebar_chats_unread_title_one()
+            : m.sidebar_chats_unread_title_other({ count: totalUnreadChats })}
           title={totalUnreadChats === 1
             ? m.sidebar_chats_unread_title_one()
             : m.sidebar_chats_unread_title_other({ count: totalUnreadChats })}
-        >{totalUnreadChats > 99 ? '99+' : totalUnreadChats}</span>
+        ></span>
       {/if}
     </button>
     <button
@@ -659,19 +662,23 @@
     position: relative;
   }
 
-  .chats-badge {
+  /* Unread chats are a presence cue, not a work queue: a single accent dot
+     rather than a warning-hued count, which read as "something is wrong".
+     The exact count stays available via the tooltip / aria-label. */
+  .chats-dot {
     margin-left: auto;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--accent);
+    flex-shrink: 0;
   }
 
-  .sidebar.collapsed .chats-badge {
+  .sidebar.collapsed .chats-dot {
     position: absolute;
-    top: 2px;
-    right: 2px;
+    top: 4px;
+    right: 4px;
     margin: 0;
-    min-width: 14px;
-    height: 14px;
-    font-size: 8px;
-    padding: 0 3px;
   }
 
   .sidebar.collapsed .chats-label {
