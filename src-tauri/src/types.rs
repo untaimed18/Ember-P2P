@@ -874,9 +874,6 @@ pub struct AppSettings {
     /// Disable browse-shares responses to friends
     #[serde(default)]
     pub friend_browse_disabled: bool,
-    /// Show a notification when a friend comes online
-    #[serde(default = "default_true")]
-    pub friend_online_notifications: bool,
     /// Maximum number of friends allowed (1–500, default 200)
     #[serde(default = "default_max_friends")]
     pub max_friends: u32,
@@ -1313,7 +1310,6 @@ impl Default for AppSettings {
             friend_require_approval: true,
             friend_chat_disabled: false,
             friend_browse_disabled: false,
-            friend_online_notifications: true,
             friend_session_encryption: true,
             max_friends: default_max_friends(),
             rendezvous_url: default_rendezvous_url(),

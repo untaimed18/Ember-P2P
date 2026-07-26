@@ -558,7 +558,6 @@
       setAppSettings({
         ...cached,
         friend_require_approval: settings.friend_require_approval,
-        friend_online_notifications: settings.friend_online_notifications,
         friend_chat_disabled: settings.friend_chat_disabled,
         friend_browse_disabled: settings.friend_browse_disabled,
         friend_session_encryption: true,
@@ -579,7 +578,6 @@
           const candidate = {
             ...latest,
             friend_require_approval: settings.friend_require_approval,
-            friend_online_notifications: settings.friend_online_notifications,
             friend_chat_disabled: settings.friend_chat_disabled,
             friend_browse_disabled: settings.friend_browse_disabled,
             friend_session_encryption: true,
@@ -591,7 +589,6 @@
             if (originalSettings) {
               const baseline = JSON.parse(originalSettings) as AppSettings;
               baseline.friend_require_approval = result.settings.friend_require_approval;
-              baseline.friend_online_notifications = result.settings.friend_online_notifications;
               baseline.friend_chat_disabled = result.settings.friend_chat_disabled;
               baseline.friend_browse_disabled = result.settings.friend_browse_disabled;
               baseline.friend_session_encryption = true;
@@ -2068,14 +2065,6 @@
               <span class="hint">{m.settings_friend_require_approval_hint()}</span>
             </div>
             <ToggleSwitch bind:checked={settings.friend_require_approval} ariaLabel={m.settings_friend_require_approval()} onchange={() => void applyFriendTogglesLive()} />
-          </div>
-
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_friend_online_notif()}</span>
-              <span class="hint">{m.settings_friend_online_notif_hint()}</span>
-            </div>
-            <ToggleSwitch bind:checked={settings.friend_online_notifications} ariaLabel={m.settings_friend_online_notif()} onchange={() => void applyFriendTogglesLive()} />
           </div>
 
           <div class="field toggle-row">

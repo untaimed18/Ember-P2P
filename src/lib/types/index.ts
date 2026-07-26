@@ -565,8 +565,6 @@ export interface AppSettings {
   friend_chat_disabled: boolean;
   /** Disable browse-shares responses to friends */
   friend_browse_disabled: boolean;
-  /** Show notification when a friend comes online */
-  friend_online_notifications: boolean;
   /** Encrypt friend sessions with RC4 obfuscation */
   friend_session_encryption: boolean;
   /** Maximum number of friends allowed (1–500) */
