@@ -35,6 +35,19 @@ struct ApprovedRoot {
     target_identity: ObjectIdentity,
 }
 
+/// What to do when a recorded root no longer has the identity it was approved
+/// with (folder deleted and recreated, volume re-imaged, path swapped).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityMismatch {
+    /// Surface the error. Used for explicit settings actions, where the user
+    /// is waiting on the result and must be told the root was rejected.
+    Reject,
+    /// Drop the stale approval and carry on. Used at startup: the root becomes
+    /// unapproved (so every operation on it still fails closed) but the
+    /// process must not be unable to launch over it.
+    Revoke,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedRoots {
     version: u32,
@@ -198,6 +211,7 @@ impl ApprovedRootRegistry {
         &self,
         configured_roots: &[String],
         explicit_additions: &[String],
+        on_mismatch: IdentityMismatch,
     ) -> io::Result<(HashMap<String, ApprovedRoot>, HashMap<String, ApprovedRoot>)> {
         let additions: HashSet<String> = explicit_additions
             .iter()
@@ -215,6 +229,14 @@ impl ApprovedRootRegistry {
                         // Offline removable/network roots retain their prior
                         // identity and simply fail every attempted operation
                         // until the same object returns.
+                    }
+                    Err(error) if on_mismatch == IdentityMismatch::Revoke => {
+                        tracing::warn!(
+                            "Revoking approval for {}: {error}. It stays unusable until \
+                             re-approved from Settings.",
+                            configured_path.display()
+                        );
+                        continue;
                     }
                     Err(error) => return Err(error),
                 }
@@ -254,7 +276,8 @@ impl ApprovedRootRegistry {
         configured_roots: &[String],
         explicit_additions: &[String],
     ) -> io::Result<ApprovedRootUpdate> {
-        let (previous, next) = self.build_next(configured_roots, explicit_additions)?;
+        let (previous, next) =
+            self.build_next(configured_roots, explicit_additions, IdentityMismatch::Reject)?;
         Ok(ApprovedRootUpdate {
             registry: self.clone(),
             previous,
@@ -272,7 +295,20 @@ impl ApprovedRootRegistry {
         configured_roots: &[String],
         explicit_additions: &[String],
     ) -> io::Result<()> {
-        let (_, next) = self.build_next(configured_roots, explicit_additions)?;
+        self.update_roots_with_policy(
+            configured_roots,
+            explicit_additions,
+            IdentityMismatch::Reject,
+        )
+    }
+
+    fn update_roots_with_policy(
+        &self,
+        configured_roots: &[String],
+        explicit_additions: &[String],
+        on_mismatch: IdentityMismatch,
+    ) -> io::Result<()> {
+        let (_, next) = self.build_next(configured_roots, explicit_additions, on_mismatch)?;
         self.persist_roots(&next)?;
         *self.roots.write() = next;
         Ok(())
@@ -408,40 +444,29 @@ pub fn initialize_approved_roots(
     let transaction_path = data_dir.join(ROOT_TRANSACTION_FILE);
     let state_exists = state_path.exists();
     let mut roots: HashMap<String, ApprovedRoot> = if state_exists {
-        let data = std::fs::read(&state_path)?;
-        let persisted: PersistedRoots = serde_json::from_slice(&data)
-            .map_err(|error| io_other(format!("parse approved roots: {error}")))?;
-        if persisted.version != ROOT_STATE_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "unsupported approved-root state version {}",
-                    persisted.version
-                ),
-            ));
+        match read_persisted_roots(&state_path) {
+            Ok(roots) => roots,
+            Err(error) => {
+                // Unreadable approval state must not make the app impossible to
+                // launch. Quarantine it and continue with nothing approved: every
+                // root then fails closed until re-approved from Settings, and the
+                // empty set is persisted below so this stays deliberate rather
+                // than looking like a fresh install on the next launch.
+                tracing::error!(
+                    "Approved-root state at {} is unusable ({error}); quarantining it. \
+                     Shared folders and the download folder must be re-approved in Settings.",
+                    state_path.display()
+                );
+                quarantine_file(&state_path);
+                HashMap::new()
+            }
         }
-        persisted
-            .roots
-            .into_iter()
-            .map(|root| (path_key(Path::new(&root.configured)), root))
-            .collect()
     } else {
         HashMap::new()
     };
 
-    match std::fs::read(&transaction_path) {
-        Ok(data) => {
-            let transaction: PersistedRootTransaction = serde_json::from_slice(&data)
-                .map_err(|error| io_other(format!("parse approved-root transaction: {error}")))?;
-            if transaction.version != ROOT_STATE_VERSION
-                || transaction.previous.version != ROOT_STATE_VERSION
-                || transaction.next.version != ROOT_STATE_VERSION
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "unsupported approved-root transaction version",
-                ));
-            }
+    match read_root_transaction(&transaction_path) {
+        Ok(Some(transaction)) => {
             let selected = if configured_root_keys(configured_roots) == transaction.configured_keys
             {
                 transaction.next
@@ -460,8 +485,16 @@ pub fn initialize_approved_roots(
             crate::security::atomic_write(&state_path, &data, true)?;
             let _ = std::fs::remove_file(&transaction_path);
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+        Ok(None) => {}
+        Err(error) => {
+            // Same reasoning as the state file: an unreadable journal leaves the
+            // roots we already loaded in place instead of blocking startup.
+            tracing::error!(
+                "Approved-root transaction journal at {} is unusable ({error}); quarantining it.",
+                transaction_path.display()
+            );
+            quarantine_file(&transaction_path);
+        }
     }
 
     let registry = Arc::new(ApprovedRootRegistry {
@@ -473,9 +506,65 @@ pub fn initialize_approved_roots(
     } else {
         configured_roots.to_vec()
     };
-    registry.update_roots(configured_roots, &additions)?;
+    // Startup revokes roots whose identity changed rather than refusing to run:
+    // a folder that was deleted and recreated (or a re-imaged volume) otherwise
+    // left the app unable to launch at all, with no in-app way to recover.
+    registry.update_roots_with_policy(configured_roots, &additions, IdentityMismatch::Revoke)?;
     *global_slot().write() = Some(registry.clone());
     Ok(registry)
+}
+
+fn read_persisted_roots(state_path: &Path) -> io::Result<HashMap<String, ApprovedRoot>> {
+    let data = std::fs::read(state_path)?;
+    let persisted: PersistedRoots = serde_json::from_slice(&data)
+        .map_err(|error| io_other(format!("parse approved roots: {error}")))?;
+    if persisted.version != ROOT_STATE_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported approved-root state version {}",
+                persisted.version
+            ),
+        ));
+    }
+    Ok(persisted
+        .roots
+        .into_iter()
+        .map(|root| (path_key(Path::new(&root.configured)), root))
+        .collect())
+}
+
+fn read_root_transaction(
+    transaction_path: &Path,
+) -> io::Result<Option<PersistedRootTransaction>> {
+    let data = match std::fs::read(transaction_path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let transaction: PersistedRootTransaction = serde_json::from_slice(&data)
+        .map_err(|error| io_other(format!("parse approved-root transaction: {error}")))?;
+    if transaction.version != ROOT_STATE_VERSION
+        || transaction.previous.version != ROOT_STATE_VERSION
+        || transaction.next.version != ROOT_STATE_VERSION
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported approved-root transaction version",
+        ));
+    }
+    Ok(Some(transaction))
+}
+
+/// Move an unusable state file aside so startup can continue and the original
+/// bytes remain available for diagnosis. Best-effort: if the rename fails there
+/// is nothing further to do, the caller already treats the state as absent.
+fn quarantine_file(path: &Path) {
+    let mut quarantined = path.as_os_str().to_os_string();
+    quarantined.push(".corrupt.bak");
+    if let Err(error) = std::fs::rename(path, PathBuf::from(quarantined)) {
+        tracing::warn!("Failed to quarantine {}: {error}", path.display());
+    }
 }
 
 pub fn approved_roots() -> io::Result<Arc<ApprovedRootRegistry>> {
@@ -2200,6 +2289,120 @@ mod tests {
 
         assert!(moved.join("created.part").exists());
         assert!(!outside.join("created.part").exists());
+        *global_slot().write() = None;
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// A root that no longer has its approved identity (folder deleted and
+    /// recreated, volume re-imaged) used to abort the setup hook, so the app
+    /// could not launch at all and there was no in-app way to recover. Startup
+    /// must revoke the stale approval and keep going; the root stays unusable.
+    #[test]
+    fn startup_revokes_root_with_changed_identity_instead_of_failing() {
+        let _registry_guard = test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-root-identity-revoke-{}-{}",
+            std::process::id(),
+            random_hex()
+        ));
+        let root = base.join("root");
+        let data = base.join("data");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let root_string = root.to_string_lossy().into_owned();
+        initialize_approved_roots(&data, std::slice::from_ref(&root_string)).unwrap();
+
+        // Rewrite the recorded identity so it cannot match what is on disk.
+        // Equivalent to the folder being replaced, but deterministic.
+        let state_path = data.join(ROOT_STATE_FILE);
+        let mut persisted: PersistedRoots =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(persisted.roots.len(), 1);
+        for record in &mut persisted.roots {
+            record.configured_identity.file_id ^= 0xFFFF_FFFF;
+            record.target_identity.file_id ^= 0xFFFF_FFFF;
+        }
+        std::fs::write(&state_path, serde_json::to_vec(&persisted).unwrap()).unwrap();
+
+        let registry = initialize_approved_roots(&data, std::slice::from_ref(&root_string))
+            .expect("startup must survive a root whose identity changed");
+        assert!(
+            registry.verify_root(&root).is_err(),
+            "revoked root must fail closed until it is re-approved"
+        );
+        let reloaded: PersistedRoots =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert!(
+            reloaded.roots.is_empty(),
+            "revocation must be durable, not re-trusted on the next launch"
+        );
+
+        *global_slot().write() = None;
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// An explicit settings action still refuses a root whose identity moved —
+    /// the user is waiting on that result and must be told, not silently
+    /// downgraded.
+    #[test]
+    fn explicit_update_still_rejects_changed_identity() {
+        let _registry_guard = test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-root-identity-reject-{}-{}",
+            std::process::id(),
+            random_hex()
+        ));
+        let root = base.join("root");
+        let data = base.join("data");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let root_string = root.to_string_lossy().into_owned();
+        let registry = initialize_approved_roots(&data, std::slice::from_ref(&root_string)).unwrap();
+
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let recaptured = ApprovedRoot::capture(&root).unwrap();
+        let stale = registry.roots.read().values().next().cloned().unwrap();
+        if recaptured.configured_identity != stale.configured_identity {
+            assert!(
+                registry
+                    .update_roots(std::slice::from_ref(&root_string), &[])
+                    .is_err(),
+                "explicit updates must surface an identity mismatch"
+            );
+        }
+
+        *global_slot().write() = None;
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Unreadable approval state is quarantined instead of blocking launch.
+    #[test]
+    fn corrupt_approved_root_state_is_quarantined_not_fatal() {
+        let _registry_guard = test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-root-state-corrupt-{}-{}",
+            std::process::id(),
+            random_hex()
+        ));
+        let root = base.join("root");
+        let data = base.join("data");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let root_string = root.to_string_lossy().into_owned();
+        initialize_approved_roots(&data, std::slice::from_ref(&root_string)).unwrap();
+
+        let state_path = data.join(ROOT_STATE_FILE);
+        std::fs::write(&state_path, b"{ not valid json").unwrap();
+
+        let registry = initialize_approved_roots(&data, std::slice::from_ref(&root_string))
+            .expect("startup must survive unreadable approval state");
+        assert!(registry.verify_root(&root).is_err());
+        assert!(
+            data.join(format!("{ROOT_STATE_FILE}.corrupt.bak")).exists(),
+            "original bytes must be kept for diagnosis"
+        );
+
         *global_slot().write() = None;
         let _ = std::fs::remove_dir_all(base);
     }
