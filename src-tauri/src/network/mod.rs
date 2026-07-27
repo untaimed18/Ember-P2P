@@ -2038,6 +2038,32 @@ impl NoTransportReason {
     }
 }
 
+/// How long a rendezvous presence registration is treated as fresh.
+const PRESENCE_HEARTBEAT_SECS: u64 = 120;
+
+/// Whether to publish our presence to the rendezvous server on this tick.
+///
+/// Keyed on having registered successfully at least once this session, not on
+/// currently believing we still are. Failure clears the "registered" flag but
+/// leaves this one set, and the initial-registration path is gated on this one
+/// being unset — so keying the refresh on "registered" left no open path at
+/// all, and a single failed heartbeat took the node off the rendezvous server
+/// until the next reconnect.
+fn should_refresh_presence(
+    presence_established: bool,
+    register_in_flight: bool,
+    since_last_register: Option<std::time::Duration>,
+) -> bool {
+    if !presence_established || register_in_flight {
+        return false;
+    }
+    // `None` is the failure case: the clock is cleared whenever an attempt
+    // comes back an error, which is precisely when another is wanted.
+    since_last_register
+        .map(|elapsed| elapsed >= std::time::Duration::from_secs(PRESENCE_HEARTBEAT_SECS))
+        .unwrap_or(true)
+}
+
 /// Pure half of [`request_friend_transfer`]: decide whether to ask `friend` for
 /// `file_hash`, given whether any transport is usable and the requests already
 /// in flight.
@@ -4614,6 +4640,46 @@ mod tests {
     use crate::network::kad::types::{
         KadTag, TagName, TagValue, TAG_DESCRIPTION, TAG_FILENAME, TAG_FILERATING,
     };
+
+    /// Regression: a failed heartbeat clears the "registered" flag and the
+    /// last-register clock, but not `friend_presence_initial_done`. While the
+    /// refresh was gated on "registered" that combination matched no retry
+    /// path at all, so one lost heartbeat dropped the node off the rendezvous
+    /// server for the rest of the session and friends could no longer find it.
+    #[test]
+    fn a_failed_heartbeat_is_retried_rather_than_abandoned() {
+        assert!(should_refresh_presence(true, false, None));
+    }
+
+    #[test]
+    fn presence_is_not_refreshed_before_it_is_established() {
+        // The initial-registration path owns this case; refreshing here too
+        // would put two registrations in flight at once on every startup.
+        assert!(!should_refresh_presence(false, false, None));
+        assert!(!should_refresh_presence(
+            false,
+            false,
+            Some(std::time::Duration::from_secs(9_999))
+        ));
+    }
+
+    #[test]
+    fn presence_refresh_waits_for_the_heartbeat_interval() {
+        let fresh = std::time::Duration::from_secs(PRESENCE_HEARTBEAT_SECS - 1);
+        let due = std::time::Duration::from_secs(PRESENCE_HEARTBEAT_SECS);
+        assert!(!should_refresh_presence(true, false, Some(fresh)));
+        assert!(should_refresh_presence(true, false, Some(due)));
+    }
+
+    #[test]
+    fn presence_refresh_never_doubles_up_on_an_attempt_in_flight() {
+        assert!(!should_refresh_presence(true, true, None));
+        assert!(!should_refresh_presence(
+            true,
+            true,
+            Some(std::time::Duration::from_secs(9_999))
+        ));
+    }
 
     #[test]
     fn disconnected_startup_does_not_admit_mapping_probes() {
@@ -19004,11 +19070,22 @@ pub async fn start_network(
                     rendezvous_register_in_flight = false;
                     rendezvous_register_started_at = None;
                 }
-                if state.rendezvous_registered && !rendezvous_register_in_flight {
-                    let needs_heartbeat = state.rendezvous_last_register
-                        .map(|t| t.elapsed() >= std::time::Duration::from_secs(120))
-                        .unwrap_or(true);
-                    if needs_heartbeat {
+                // Keyed on having established presence at all, not on still
+                // believing we hold it. A failed heartbeat clears
+                // `rendezvous_registered`, and gating the retry on that flag
+                // closed the only door left open: the initial-registration
+                // path above is already shut by `friend_presence_initial_done`,
+                // which failure does not reset. One unlucky heartbeat — a
+                // moment's packet loss to the rendezvous server — therefore
+                // took the node off it for the rest of the session, with
+                // friends unable to find it until a reconnect, and nothing
+                // anywhere saying so. `rendezvous_last_register` is cleared on
+                // failure, so the retry goes out on the next tick.
+                if should_refresh_presence(
+                    state.friend_presence_initial_done,
+                    rendezvous_register_in_flight,
+                    state.rendezvous_last_register.map(|t| t.elapsed()),
+                ) {
                         if let Some(rv_ip) = state.external_ip {
                             let rv_url = settings.rendezvous_url.clone();
                             // Heartbeat must advertise the same *kind* of
@@ -19058,7 +19135,6 @@ pub async fn start_network(
                                 "Rendezvous heartbeat skipped: external_ip not currently known",
                             );
                         }
-                    }
                 }
                 }).catch_unwind().await;
                 if let Err(__p) = __panic_result {
