@@ -18,6 +18,7 @@
     searchingFriends as searchingFriendsStore,
     clearFriendSearch,
     isDiscoverable as isDiscoverableStore,
+    discoverabilityFailed as discoverabilityFailedStore,
     clearUnread,
     beginFriendRequestMutation,
     endFriendRequestMutation,
@@ -157,6 +158,7 @@
   let browseFriendPort = $state(0);
 
   let isDiscoverable = $derived($isDiscoverableStore);
+  let registrationFailed = $derived($discoverabilityFailedStore);
   let processingRequests: Set<string> = $state(new Set());
   let adding = $state(false);
 
@@ -306,6 +308,50 @@
     }
   }
 
+  /**
+   * Backstop for the case where no attempt ever reports back at all.
+   *
+   * A registration that genuinely fails emits `ember:friend-discoverable`
+   * with a reason, and that path shows the warning immediately — this timer
+   * is not how a real fault is meant to surface. What it covers is silence:
+   * an attempt that hangs, or one that never starts because the external IP
+   * has yet to be confirmed. It therefore sits past the backend's 60-second
+   * registration watchdog on purpose, so the UI never reports a fault while
+   * an attempt is still legitimately running. Erring the other way would put
+   * a warning on screen during ordinary startups, and one that cries wolf
+   * costs us the times it is right.
+   */
+  const DISCOVERABILITY_GRACE_MS = 90_000;
+  let undiscoverable = $state(false);
+  /** Deliberately not `$state`. The effect below re-runs on every network
+   *  stats poll, so a reactive handle would restart the countdown each time
+   *  and the grace period would never elapse. */
+  let discoverabilityTimer: ReturnType<typeof setTimeout> | undefined;
+
+  $effect(() => {
+    const stalled = $networkStats.status === 'connected' && !isDiscoverable;
+    if (!stalled) {
+      clearTimeout(discoverabilityTimer);
+      discoverabilityTimer = undefined;
+      undiscoverable = false;
+      return;
+    }
+    // An attempt that came back failed needs no waiting out — the grace
+    // period exists to tell "still trying" apart from "cannot", and the
+    // backend has just answered that question.
+    if (registrationFailed) {
+      clearTimeout(discoverabilityTimer);
+      discoverabilityTimer = undefined;
+      undiscoverable = true;
+      return;
+    }
+    // Left assigned after it fires, so the poll-driven re-runs above see an
+    // armed timer and do not queue another one behind it.
+    discoverabilityTimer ??= setTimeout(() => {
+      undiscoverable = true;
+    }, DISCOVERABILITY_GRACE_MS);
+  });
+
   let recheckTimer: ReturnType<typeof setTimeout> | undefined;
 
   async function handleRecheckFirewall() {
@@ -392,6 +438,7 @@
       clearTimeout(copyTimer);
       clearTimeout(myHashCopyTimer);
       clearTimeout(recheckTimer);
+      clearTimeout(discoverabilityTimer);
       window.removeEventListener('pointerdown', onCardMenuPointerDown, true);
       window.removeEventListener('keydown', onCardMenuKeydown, true);
       unlistenFns.forEach(fn => fn());
@@ -744,6 +791,27 @@
         {/if}
       </div>
     {/if}
+
+    <!-- Only when not firewalled, which is the case that had no signal at
+         all. A firewalled user already has the banner above telling them
+         their reachability is limited, and stacking a second one would bury
+         the advice that is actually actionable. No retry control: the network
+         task is already retrying every ten seconds, so a button would do
+         nothing the app is not doing anyway. -->
+    {#if !isFirewalled && undiscoverable}
+      <div class="banner undiscoverable-banner" role="status">
+        <div class="firewall-banner-content">
+          <svg class="undiscoverable-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="10" cy="10" r="7.5"/>
+            <line x1="5" y1="5" x2="15" y2="15"/>
+          </svg>
+          <div class="firewall-text">
+            <strong>{m.friends_undiscoverable_title()}</strong>
+            {m.friends_undiscoverable_body()}
+          </div>
+        </div>
+      </div>
+    {/if}
   </div>
 
   <!-- Your Friend ID + network status -->
@@ -765,6 +833,8 @@
             <span class="my-id-status firewalled">{m.friends_status_firewalled_short()}</span>
           {:else if isDiscoverable}
             <span class="my-id-status discoverable">{m.friends_status_discoverable()}</span>
+          {:else if undiscoverable}
+            <span class="my-id-status undiscoverable">{m.friends_status_undiscoverable()}</span>
           {/if}
         </div>
       </div>
@@ -1362,6 +1432,11 @@
   .my-id-status.firewalled {
     background: color-mix(in srgb, var(--warning) 16%, transparent);
     color: color-mix(in srgb, var(--warning) 85%, var(--text-primary));
+  }
+
+  .my-id-status.undiscoverable {
+    background: color-mix(in srgb, var(--danger) 14%, transparent);
+    color: color-mix(in srgb, var(--danger) 85%, var(--text-primary));
   }
 
   .my-id-copy {
@@ -2328,6 +2403,34 @@
     justify-content: space-between;
     gap: 14px;
     flex-wrap: wrap;
+  }
+
+  /* Shares the firewall banner's shape but reads as a fault rather than a
+     limitation: being unreachable by friends is a broken state, not a
+     degraded one. */
+  .undiscoverable-banner {
+    background: color-mix(in srgb, var(--danger) 7%, var(--bg-surface));
+    border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--border));
+    color: var(--text-secondary);
+    padding: 12px 16px;
+    border-radius: var(--radius-lg);
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+  }
+
+  .undiscoverable-banner .firewall-text strong {
+    color: var(--danger);
+  }
+
+  .undiscoverable-icon {
+    width: 20px;
+    height: 20px;
+    flex-shrink: 0;
+    color: var(--danger);
+    margin-top: 1px;
   }
 
   .firewall-banner-content {

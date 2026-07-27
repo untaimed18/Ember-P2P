@@ -16,6 +16,14 @@ export const friendRequests = writable<FriendRequestInfo[]>([]);
 export const searchingFriends = writable<Set<string>>(new Set());
 export const isDiscoverable = writable(false);
 /**
+ * Whether a registration attempt has actually come back failed, as opposed to
+ * simply not having succeeded yet. The two look identical through
+ * `isDiscoverable` — both are `false` — but they warrant different treatment:
+ * one is a cold start still settling, the other a confirmed fault the UI can
+ * report straight away.
+ */
+export const discoverabilityFailed = writable(false);
+/**
  * Unsolicited file offers from friends, awaiting a decision. Kept in a store
  * rather than a transient toast because accepting one starts a download, and
  * that is not a choice to lose to a dismissed notification.
@@ -271,9 +279,12 @@ export async function initFriendsStore() {
       }),
     );
     registered.push(
-      await listen<{ discoverable: boolean; nodes: number }>('ember:friend-discoverable', (event) => {
+      await listen<{ discoverable: boolean; nodes: number; reason?: string }>('ember:friend-discoverable', (event) => {
         if (typeof event.payload?.discoverable === 'boolean') {
           isDiscoverable.set(event.payload.discoverable);
+          // The event fires only once an attempt has resolved, so a `false`
+          // here is always a completed failure rather than one in flight.
+          discoverabilityFailed.set(!event.payload.discoverable);
         }
       }),
     );
@@ -409,6 +420,7 @@ export function cleanupFriendsStore() {
   friendRequests.set([]);
   searchingFriends.set(new Set());
   isDiscoverable.set(false);
+  discoverabilityFailed.set(false);
   fileOffers.set([]);
   activeChatHash.set(null);
 }
