@@ -1381,6 +1381,14 @@ pub enum UploadEventKind {
         status: u8,
         nonce: [u8; 16],
     },
+    /// A friend forwarded the relay attestations it knows about. Lets a pair
+    /// with no swarm in common populate their brokers, which is otherwise
+    /// impossible: attestations only ever arrive on EPX exchanges for files
+    /// you are already trading, so an isolated pair starves.
+    EmberRelayOffer {
+        ember_hash: [u8; 16],
+        attestations: Vec<crate::network::ember::RelayAttestation>,
+    },
     /// A friend is offering to send us a file. Surfaced to the UI for an
     /// explicit accept — we never start a download because a peer asked us to.
     EmberFileOffer {
@@ -9759,6 +9767,45 @@ impl UploadHandler {
                                     },
                                 })
                                 .await;
+                        }
+                    }
+                }
+
+                (OP_EMULEPROT, super::messages::OP_EMBER_EXT)
+                    if friend_privileges_allowed(secure_v2_authenticated, is_ember_friend) =>
+                {
+                    if let Some(eh) = peer_ember_hash {
+                        match super::messages::parse_ember_ext(&payload) {
+                            Some((super::messages::EMBER_EXT_RELAY_OFFER, body)) => {
+                                // Parsed here but verified in the network loop,
+                                // which owns the broker. Nothing is trusted at
+                                // this point: a forwarded attestation is just
+                                // bytes until its own signature checks out.
+                                let attestations =
+                                    crate::network::ember::parse_relay_attestation_block(body);
+                                if !attestations.is_empty() {
+                                    let _ = self
+                                        .upload_event_tx
+                                        .send(UploadEvent {
+                                            transfer_id: String::new(),
+                                            kind: UploadEventKind::EmberRelayOffer {
+                                                ember_hash: eh,
+                                                attestations,
+                                            },
+                                        })
+                                        .await;
+                                }
+                            }
+                            // A sub-type this build predates. Ignoring it is
+                            // the whole point of the envelope.
+                            Some((other, _)) => debug!(
+                                "Friend {} sent unknown OP_EMBER_EXT sub-type {other:#04x}",
+                                hex::encode(eh)
+                            ),
+                            None => debug!(
+                                "Friend {} sent an empty OP_EMBER_EXT payload",
+                                hex::encode(eh)
+                            ),
                         }
                     }
                 }

@@ -343,6 +343,10 @@ pub enum SourceStatus {
     /// [`Self::WaitCallback`], which is the eD2K server / KAD-buddy callback:
     /// this one needs no server, no buddy, and no HighID on either side.
     FriendConnect,
+    /// A friend source with no usable transport in either direction, because
+    /// we sit behind a symmetric NAT. Shown rather than dropped so the cause
+    /// is visible; it clears by itself once our reachability changes.
+    Unreachable,
 }
 
 /// Media metadata for a search hit (eMule `FT_MEDIA_*` tags). Each field is
@@ -969,6 +973,22 @@ pub struct AppSettings {
     /// always exists; this only governs whether the UI links to it.
     #[serde(default)]
     pub ember_dev_tools_enabled: bool,
+    /// Whether this node will carry relay traffic for other peers.
+    ///
+    /// Relaying was previously implicit: any node with a public address and a
+    /// bound QUIC port self-signed an attestation and advertised it, with no
+    /// way to decline. That was tolerable while attestations only travelled
+    /// within a file swarm, but they are now forwarded between friends, so a
+    /// reachable node can be asked to relay for pairs it never traded with.
+    /// Defaults to on — relaying is what makes symmetric-NAT pairs work at all
+    /// — but is now a choice rather than an assumption.
+    #[serde(default = "default_relay_for_peers")]
+    pub relay_for_peers: bool,
+    /// Ceiling on concurrent relay sessions carried for other peers. Bounds
+    /// the uplink a generous node donates; `0` is treated as "use the default"
+    /// rather than "relay nothing", which [`Self::relay_for_peers`] expresses.
+    #[serde(default = "default_max_relay_sessions")]
+    pub max_relay_sessions: u32,
     /// What to do when the user closes the main window via the title-bar X.
     ///
     /// - `"ask"` (default): emit a dialog asking the user to choose.
@@ -1282,6 +1302,16 @@ fn default_spam_filter_profile() -> String {
     "balanced".to_string()
 }
 
+fn default_relay_for_peers() -> bool {
+    true
+}
+
+/// Matches the relay manager's historical hard-coded ceiling, so an existing
+/// install behaves identically until the user changes it.
+fn default_max_relay_sessions() -> u32 {
+    4
+}
+
 fn default_close_to_tray_behavior() -> String {
     "ask".to_string()
 }
@@ -1375,6 +1405,8 @@ impl Default for AppSettings {
             rendezvous_bootstrap_pubkey: default_rendezvous_bootstrap_pubkey(),
             ember_native_enabled: false,
             ember_dev_tools_enabled: false,
+            relay_for_peers: default_relay_for_peers(),
+            max_relay_sessions: default_max_relay_sessions(),
             close_to_tray_behavior: default_close_to_tray_behavior(),
             launch_maximized: false,
             auto_check_updates: true,

@@ -1915,6 +1915,22 @@
             <ToggleSwitch bind:checked={settings.filter_servers_by_ip} ariaLabel={m.settings_filter_servers_label()} />
           </div>
 
+          <!--
+            Relaying for other peers. Previously implicit for any reachable
+            node; now a choice, because relay attestations travel between
+            friends and a reachable node can be asked to carry traffic for
+            pairs it never traded with. The session ceiling stays in
+            config.json (`max_relay_sessions`), like max_friends — the
+            on/off decision is the one worth surfacing.
+          -->
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">{m.settings_relay_for_peers_label()}</span>
+              <span class="hint">{m.settings_relay_for_peers_hint()}</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.relay_for_peers} ariaLabel={m.settings_relay_for_peers_label()} />
+          </div>
+
         </div>
       </section>
 

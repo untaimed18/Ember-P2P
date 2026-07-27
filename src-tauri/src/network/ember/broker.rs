@@ -99,6 +99,12 @@ pub struct RelayCandidate {
     pub ip: Ipv4Addr,
     pub port: u16,
     pub attestation_hash: [u8; 32],
+    /// The attestation this candidate was admitted with, kept whole rather
+    /// than reduced to its hash so it can be forwarded to a friend whose own
+    /// swarm never produced one (see `gossipable_attestations`). The hash
+    /// alone is useless to a third party: they cannot verify a signature they
+    /// do not have.
+    pub attestation: super::RelayAttestation,
     pub ember_hash: Option<[u8; 16]>,
     pub last_seen: Instant,
     pub relay_sessions: u32,
@@ -336,18 +342,25 @@ impl ConnectionBroker {
     /// it is the caller's job to have already checked the signature.
     pub fn add_relay_candidate(
         &mut self,
-        ip: Ipv4Addr,
-        port: u16,
-        attestation_hash: [u8; 32],
+        attestation: super::RelayAttestation,
         ember_hash: Option<[u8; 16]>,
-        expires_at_unix: u64,
     ) {
+        // Address, port, expiry and hash all come from the attestation rather
+        // than from separate arguments: they are signed fields, so accepting
+        // them alongside it would create a set of parameters that can
+        // contradict each other and a candidate that does not match the
+        // credential it was admitted with.
+        let ip = attestation.relay_ip;
+        let port = attestation.relay_port;
+        let expires_at_unix = attestation.expires_at_unix;
+        let attestation_hash = super::relay_attestation_hash(&attestation);
         if let Some(existing) = self
             .relay_candidates
             .iter_mut()
             .find(|c| c.ip == ip && c.port == port)
         {
             existing.attestation_hash = attestation_hash;
+            existing.attestation = attestation;
             existing.ember_hash = ember_hash;
             existing.last_seen = Instant::now();
             existing.expires_at_unix = expires_at_unix;
@@ -370,11 +383,34 @@ impl ConnectionBroker {
             ip,
             port,
             attestation_hash,
+            attestation,
             ember_hash,
             last_seen: Instant::now(),
             relay_sessions: 0,
             expires_at_unix,
         });
+    }
+
+    /// Attestations worth forwarding to a friend, newest first and capped at
+    /// the wire limit.
+    ///
+    /// Only unexpired ones are offered: a friend cannot use an attestation
+    /// that its own `verify_relay_attestation` will reject, and sending it
+    /// would just be noise. This is deliberately *all* we know rather than
+    /// only what we signed ourselves — the point is that a pair with no swarm
+    /// in common can still learn relays through whichever of them has peers.
+    pub fn gossipable_attestations(&self, now_unix: u64) -> Vec<super::RelayAttestation> {
+        let mut fresh: Vec<&RelayCandidate> = self
+            .relay_candidates
+            .iter()
+            .filter(|c| c.expires_at_unix > now_unix)
+            .collect();
+        fresh.sort_by_key(|c| c.last_seen.elapsed());
+        fresh
+            .into_iter()
+            .take(super::MAX_RELAY_ATTESTATIONS)
+            .map(|c| c.attestation.clone())
+            .collect()
     }
 
     /// Pick the best available relay candidate (fewest sessions, most recent).
@@ -571,6 +607,24 @@ mod tests {
             .as_secs()
     }
 
+    /// The broker never inspects a signature — admission already verified it
+    /// (`verify_relay_attestation` at the call site), so an unsigned stand-in
+    /// exercises the storage and selection logic faithfully.
+    fn attestation(
+        ip: Ipv4Addr,
+        port: u16,
+        expires_at_unix: u64,
+    ) -> crate::network::ember::RelayAttestation {
+        crate::network::ember::RelayAttestation {
+            ed25519_pubkey: [0u8; 32],
+            relay_ip: ip,
+            relay_port: port,
+            expires_at_unix,
+            capability_bits: crate::network::ember::RELAY_ATTESTATION_CAP_RELAY_V1,
+            signature: [0u8; 64],
+        }
+    }
+
     #[test]
     fn relay_candidate_management() {
         let (tx, _rx) = mpsc::channel(16);
@@ -578,37 +632,31 @@ mod tests {
         let future_expiry = unix_now() + 600;
 
         broker.add_relay_candidate(
-            Ipv4Addr::new(1, 1, 1, 1),
-            4662,
-            [1u8; 32],
+            attestation(Ipv4Addr::new(1, 1, 1, 1), 4662, future_expiry),
             None,
-            future_expiry,
         );
         broker.add_relay_candidate(
-            Ipv4Addr::new(2, 2, 2, 2),
-            4663,
-            [2u8; 32],
+            attestation(Ipv4Addr::new(2, 2, 2, 2), 4663, future_expiry),
             None,
-            future_expiry,
         );
         assert_eq!(broker.relay_candidate_count(), 2);
 
-        // Duplicate is deduplicated
-        broker.add_relay_candidate(
-            Ipv4Addr::new(1, 1, 1, 1),
-            4662,
-            [3u8; 32],
-            None,
-            future_expiry,
-        );
+        // Re-admitting the same relay refreshes the entry rather than adding a
+        // second one, and the stored credential is the newer attestation — not
+        // the one the candidate was first seen with.
+        let refreshed = attestation(Ipv4Addr::new(1, 1, 1, 1), 4662, future_expiry + 60);
+        broker.add_relay_candidate(refreshed.clone(), None);
         assert_eq!(broker.relay_candidate_count(), 2);
+        let stored = broker
+            .relay_candidates
+            .iter()
+            .find(|c| c.ip == Ipv4Addr::new(1, 1, 1, 1) && c.port == 4662)
+            .expect("candidate present");
+        assert_eq!(stored.attestation, refreshed);
+        assert_eq!(stored.expires_at_unix, future_expiry + 60);
         assert_eq!(
-            broker
-                .relay_candidates
-                .iter()
-                .find(|c| c.ip == Ipv4Addr::new(1, 1, 1, 1) && c.port == 4662)
-                .map(|c| c.attestation_hash),
-            Some([3u8; 32])
+            stored.attestation_hash,
+            crate::network::ember::relay_attestation_hash(&refreshed)
         );
 
         let picked = broker.pick_relay_candidate();
@@ -625,26 +673,55 @@ mod tests {
         let (tx, _rx) = mpsc::channel(16);
         let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
 
-        broker.add_relay_candidate(
-            Ipv4Addr::new(9, 9, 9, 9),
-            4662,
-            [9u8; 32],
-            None,
-            unix_now().saturating_sub(1),
-        );
+        let expired = unix_now().saturating_sub(1);
+        broker.add_relay_candidate(attestation(Ipv4Addr::new(9, 9, 9, 9), 4662, expired), None);
         assert_eq!(broker.relay_candidate_count(), 1);
         assert!(broker.pick_relay_candidate().is_none());
 
         // A fresh, unexpired candidate is still pickable.
-        broker.add_relay_candidate(
-            Ipv4Addr::new(8, 8, 8, 8),
-            4662,
-            [8u8; 32],
-            None,
-            unix_now() + 600,
-        );
+        let fresh = unix_now() + 600;
+        broker.add_relay_candidate(attestation(Ipv4Addr::new(8, 8, 8, 8), 4662, fresh), None);
         let picked = broker.pick_relay_candidate();
         assert_eq!(picked.map(|c| c.ip), Some(Ipv4Addr::new(8, 8, 8, 8)));
+    }
+
+    /// What we forward to a friend is everything still valid, not only what we
+    /// signed — a friend with no swarm of its own is exactly who benefits from
+    /// relays we learned elsewhere. Expired entries are withheld because the
+    /// recipient's own verification would reject them anyway.
+    #[test]
+    fn gossipable_attestations_offers_fresh_candidates_only() {
+        let (tx, _rx) = mpsc::channel(16);
+        let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
+        let now = unix_now();
+        let fresh = now + 600;
+        let stale = now.saturating_sub(1);
+
+        broker.add_relay_candidate(attestation(Ipv4Addr::new(1, 1, 1, 1), 4662, fresh), None);
+        broker.add_relay_candidate(attestation(Ipv4Addr::new(2, 2, 2, 2), 4663, stale), None);
+
+        let offer = broker.gossipable_attestations(now);
+        assert_eq!(offer.len(), 1);
+        assert_eq!(offer[0].relay_ip, Ipv4Addr::new(1, 1, 1, 1));
+    }
+
+    /// The offer is capped at the wire limit so a well-connected node cannot
+    /// build a block the receiver will refuse to parse.
+    #[test]
+    fn gossipable_attestations_respects_the_wire_cap() {
+        let (tx, _rx) = mpsc::channel(16);
+        let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
+        let now = unix_now();
+        let fresh = now + 600;
+
+        for i in 0..(crate::network::ember::MAX_RELAY_ATTESTATIONS as u8 + 5) {
+            broker.add_relay_candidate(attestation(Ipv4Addr::new(10, 0, 0, i), 4662, fresh), None);
+        }
+
+        assert_eq!(
+            broker.gossipable_attestations(now).len(),
+            crate::network::ember::MAX_RELAY_ATTESTATIONS
+        );
     }
 
     #[tokio::test]

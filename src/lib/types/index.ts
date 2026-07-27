@@ -127,7 +127,7 @@ export interface Transfer {
 export interface SourceInfo {
   ip: string;
   port: number;
-  status: 'connecting' | 'wait_callback' | 'friend_connect' | 'queued' | 'stalled' | 'queue_full' | 'no_needed_parts' | 'transferring' | 'completed' | 'failed';
+  status: 'connecting' | 'wait_callback' | 'friend_connect' | 'unreachable' | 'queued' | 'stalled' | 'queue_full' | 'no_needed_parts' | 'transferring' | 'completed' | 'failed';
   queue_rank?: number;
   speed: number;
   transferred: number;
@@ -596,6 +596,14 @@ export interface AppSettings {
   ember_native_enabled: boolean;
   /** Advanced: reveal the Ember developer console (`/dev/ember`) links in the UI. */
   ember_dev_tools_enabled: boolean;
+  /** Whether this node carries relay traffic for other peers. Relaying is what
+   *  lets two firewalled peers reach each other, so it defaults on, but it
+   *  spends this node's uplink on strangers and is therefore a choice. */
+  relay_for_peers: boolean;
+  /** Ceiling on concurrent relay sessions carried for others. `0` means use
+   *  the built-in default rather than "relay nothing" — that is
+   *  `relay_for_peers`. */
+  max_relay_sessions: number;
   /** What to do when the user closes the main window via the title-bar X.
    *
    *  - `'ask'` (default): show a dialog letting the user pick.

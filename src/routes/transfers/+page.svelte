@@ -565,6 +565,7 @@
       case 'connecting': return m.transfers_src_connecting();
       case 'wait_callback': return m.transfers_src_wait_callback();
       case 'friend_connect': return m.transfers_src_friend_connect();
+      case 'unreachable': return m.transfers_src_unreachable();
       case 'queued': return s.queue_rank != null && s.queue_rank > 0 ? m.transfers_src_queue_rank({ rank: s.queue_rank }) : m.transfers_src_queued();
       case 'stalled': return m.transfers_src_stalled();
       case 'queue_full': return m.transfers_src_queue_full();
@@ -3027,8 +3028,9 @@
                 {@const queuedCount = visibleSources.filter(s => s.status === 'queued').length}
                 {@const waitCallbackCount = visibleSources.filter(s => s.status === 'wait_callback').length}
                 {@const friendConnectCount = visibleSources.filter(s => s.status === 'friend_connect').length}
+                {@const unreachableCount = visibleSources.filter(s => s.status === 'unreachable').length}
                 {@const connectCount = visibleSources.filter(s => s.status === 'connecting').length}
-                {@const otherCount = visibleSources.length - xferCount - queuedCount - connectCount - waitCallbackCount - friendConnectCount}
+                {@const otherCount = visibleSources.length - xferCount - queuedCount - connectCount - waitCallbackCount - friendConnectCount - unreachableCount}
                 <tr class="source-child-row source-summary-row" in:fade={{ duration: 150 }}>
                   <td class="source-child-cell" colspan={dlColCount}>
                     <span class="source-summary">
@@ -3037,6 +3039,7 @@
                       {#if queuedCount > 0}<span class="ss-chip ss-queued">{m.transfers_chip_queued({ count: queuedCount })}</span>{/if}
                       {#if waitCallbackCount > 0}<span class="ss-chip ss-wait-callback">{m.transfers_chip_wait_callback({ count: waitCallbackCount })}</span>{/if}
                       {#if friendConnectCount > 0}<span class="ss-chip ss-friend-connect">{m.transfers_chip_friend_connect({ count: friendConnectCount })}</span>{/if}
+                      {#if unreachableCount > 0}<span class="ss-chip ss-unreachable">{m.transfers_chip_unreachable({ count: unreachableCount })}</span>{/if}
                       {#if connectCount > 0}<span class="ss-chip ss-connect">{m.transfers_chip_connecting({ count: connectCount })}</span>{/if}
                       {#if otherCount > 0}<span class="ss-chip ss-other">{m.transfers_chip_other({ count: otherCount })}</span>{/if}
                       {#if failedCount > 0}<span class="ss-chip ss-failed">{m.transfers_chip_failed({ count: failedCount })}</span>{/if}
@@ -5305,6 +5308,10 @@
   /* Friend connect-back is a healthy wait on a peer we trust, so it reads as
      accent rather than the warning colour the eD2K/KAD callbacks use. */
   .src-dot-friend_connect { background: var(--accent); box-shadow: 0 0 3px color-mix(in srgb, var(--accent) 45%, transparent); }
+  /* A dead end the user can act on, so it reads as a warning rather than the
+     muted grey of states that simply aren't ready yet. Not danger: nothing
+     failed, and the source recovers on its own once reachability changes. */
+  .src-dot-unreachable { background: var(--warning); box-shadow: 0 0 3px color-mix(in srgb, var(--warning) 45%, transparent); }
   .src-dot-queued { background: var(--warning); box-shadow: 0 0 3px color-mix(in srgb, var(--warning) 45%, transparent); }
   .src-dot-queue_full { background: var(--text-muted); }
   .src-dot-no_needed_parts { background: var(--text-muted); }
@@ -5394,6 +5401,10 @@
     color: var(--accent);
     background: color-mix(in srgb, var(--accent) 12%, transparent);
   }
+  .src-st-unreachable {
+    color: var(--warning);
+    background: color-mix(in srgb, var(--warning) 12%, transparent);
+  }
   .src-st-queued {
     color: var(--warning);
     background: color-mix(in srgb, var(--warning) 12%, transparent);
@@ -5453,6 +5464,7 @@
   .ss-connect { color: var(--warning); background: color-mix(in srgb, var(--warning) 10%, transparent); }
   .ss-wait-callback { color: var(--warning); background: color-mix(in srgb, var(--warning) 12%, transparent); }
   .ss-friend-connect { color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  .ss-unreachable { color: var(--warning); background: color-mix(in srgb, var(--warning) 12%, transparent); }
   .ss-other { color: var(--text-muted); background: color-mix(in srgb, var(--text-muted) 8%, transparent); }
   .ss-failed { color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, transparent); }
 </style>

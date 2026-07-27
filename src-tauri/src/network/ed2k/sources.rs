@@ -87,6 +87,18 @@ pub enum DownloadSourceState {
     /// bounded lifetime, after which the network loop returns the source to
     /// [`Self::Failed`] so ordinary retry resumes.
     FriendConnect,
+    /// This source is a friend, but no transport exists to reach each other:
+    /// we are firewalled behind a symmetric NAT, which re-maps per
+    /// destination, so neither a connect-back nor a coordinated punch can be
+    /// offered (see `friend_xfer_transport_choice`).
+    ///
+    /// Kept as a visible row rather than swept away as [`Self::Failed`],
+    /// because the cause is a property of our own connectivity that the user
+    /// can act on, and a vanishing row explains nothing. Reask timing matches
+    /// `Failed`, so the source recovers by itself once our reachability
+    /// changes — a forwarded port or a fresh STUN classification lets the next
+    /// attempt escalate normally.
+    Unreachable,
     /// Banned by remote peer (DS_BANNED).
     Banned,
 }
@@ -178,9 +190,9 @@ impl DownloadSourceEntry {
         let interval = match &self.state {
             DownloadSourceState::New => return 0,
             DownloadSourceState::NoneNeededParts => (FILEREASKTIME_SECS * 2) as u64,
-            DownloadSourceState::Failed | DownloadSourceState::TooManyConns => {
-                FILEREASKTIME_SECS as u64
-            }
+            DownloadSourceState::Failed
+            | DownloadSourceState::TooManyConns
+            | DownloadSourceState::Unreachable => FILEREASKTIME_SECS as u64,
             DownloadSourceState::OnQueue { .. } => FILEREASKTIME_SECS as u64,
             DownloadSourceState::WaitCallbackKad => FILEREASKTIME_SECS as u64,
             DownloadSourceState::Connecting | DownloadSourceState::Downloading => {
@@ -594,6 +606,17 @@ impl PerFileSourceList {
     pub fn set_friend_connect(&mut self, ip: Ipv4Addr, port: u16, user_hash: Option<[u8; 16]>) {
         if let Some(s) = self.find_mut(ip, port, user_hash) {
             s.state = DownloadSourceState::FriendConnect;
+            s.state_changed = Instant::now();
+        }
+    }
+
+    /// This source is a friend we have no way to reach, and who has no way to
+    /// reach us. Unlike [`Self::set_friend_connect`] nothing is outstanding,
+    /// so the source stays eligible for the ordinary reask cadence and will
+    /// escalate normally the moment our reachability improves.
+    pub fn set_unreachable(&mut self, ip: Ipv4Addr, port: u16, user_hash: Option<[u8; 16]>) {
+        if let Some(s) = self.find_mut(ip, port, user_hash) {
+            s.state = DownloadSourceState::Unreachable;
             s.state_changed = Instant::now();
         }
     }

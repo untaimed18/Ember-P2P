@@ -144,6 +144,33 @@ pub const OP_EMBER_XFER_ACK: u8 = 0xFB;
 pub const OP_EMBER_FILE_OFFER: u8 = 0xFC;
 /// Recipient's answer to [`OP_EMBER_FILE_OFFER`].
 pub const OP_EMBER_FILE_OFFER_ACK: u8 = 0xFD;
+/// Extension envelope: a leading sub-type byte selects the message, so future
+/// friend-session additions cost one byte of payload rather than one of the
+/// two opcodes left in the private `OP_EMULEPROT` range (`0xF0`–`0xFF`, with
+/// `0xF0`–`0xFD` already spent). A peer that predates a sub-type ignores it,
+/// exactly as it would an unknown opcode.
+pub const OP_EMBER_EXT: u8 = 0xFE;
+
+/// [`OP_EMBER_EXT`] sub-type: relay attestations the sender knows about, so a
+/// pair with no swarm in common can still populate their relay brokers. Every
+/// attestation is independently signed and independently verified, so the
+/// sender is a courier rather than an authority.
+pub const EMBER_EXT_RELAY_OFFER: u8 = 0x01;
+
+/// Wrap `body` in an [`OP_EMBER_EXT`] payload under `ext_type`.
+pub fn build_ember_ext(ext_type: u8, body: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(1 + body.len());
+    payload.push(ext_type);
+    payload.extend_from_slice(body);
+    payload
+}
+
+/// Split an [`OP_EMBER_EXT`] payload into its sub-type and body. `None` for an
+/// empty payload, which carries no sub-type to dispatch on.
+pub fn parse_ember_ext(payload: &[u8]) -> Option<(u8, &[u8])> {
+    let (ext_type, body) = payload.split_first()?;
+    Some((*ext_type, body))
+}
 
 // Constants
 pub const EMBLOCKSIZE: u64 = 184_320;
@@ -2625,6 +2652,57 @@ pub fn parse_file_status(payload: &[u8]) -> io::Result<([u8; 16], Vec<bool>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The envelope exists so future friend-session messages cost a sub-type
+    /// byte instead of one of the two opcodes left in the private range, so
+    /// the split has to survive an arbitrary body.
+    #[test]
+    fn ember_ext_envelope_round_trips() {
+        let body = b"\x01\x02\x03payload";
+        let payload = build_ember_ext(EMBER_EXT_RELAY_OFFER, body);
+        let (ext_type, parsed) = parse_ember_ext(&payload).expect("well-formed envelope");
+        assert_eq!(ext_type, EMBER_EXT_RELAY_OFFER);
+        assert_eq!(parsed, body);
+    }
+
+    /// A body-less sub-type is legal; a payload with no sub-type at all is
+    /// not, because there is nothing to dispatch on.
+    #[test]
+    fn ember_ext_rejects_only_the_empty_payload() {
+        let empty_body = build_ember_ext(EMBER_EXT_RELAY_OFFER, &[]);
+        assert_eq!(
+            parse_ember_ext(&empty_body),
+            Some((EMBER_EXT_RELAY_OFFER, &[][..]))
+        );
+        assert_eq!(parse_ember_ext(&[]), None);
+    }
+
+    /// Every opcode in the private range must stay distinct; the envelope was
+    /// added precisely because only `0xFE` and `0xFF` were left.
+    #[test]
+    fn ember_ext_opcode_does_not_collide() {
+        let opcodes = [
+            OP_EMBER_SOURCEEXCHANGE,
+            OP_EMBER_CHAT_MSG,
+            OP_EMBER_BROWSE_REQ,
+            OP_EMBER_BROWSE_RES,
+            OP_EMBER_FRIEND_REQ,
+            OP_EMBER_KEEPALIVE,
+            OP_EMBER_AUTH_CHALLENGE,
+            OP_EMBER_AUTH_RESPONSE,
+            OP_EMBER_HELLO,
+            OP_EMBER_HELLOANSWER,
+            OP_EMBER_XFER_REQ,
+            OP_EMBER_XFER_ACK,
+            OP_EMBER_FILE_OFFER,
+            OP_EMBER_FILE_OFFER_ACK,
+            OP_EMBER_EXT,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for op in opcodes {
+            assert!(seen.insert(op), "duplicate Ember opcode {op:#04x}");
+        }
+    }
 
     #[test]
     fn sx_hybrid_id_roundtrip_lowid_and_highid() {

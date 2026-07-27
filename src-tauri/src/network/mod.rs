@@ -1137,6 +1137,134 @@ fn prune_stale_ember_noise_keys_at(
     map.retain(|_, (_, ts)| now.duration_since(*ts) < KNOWN_EMBER_PEER_TTL);
 }
 
+/// Minimum spacing between relay offers accepted from one friend. Comfortably
+/// under the 30s send cadence, so an honest peer is never throttled, while an
+/// abusive one cannot spend our CPU on signature checks faster than this.
+const FRIEND_RELAY_OFFER_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Cap on tracked relay-offer senders, so peers that offer once and disappear
+/// cannot grow the throttle map without bound.
+const MAX_FRIEND_RELAY_OFFER_TRACKED: usize = 512;
+
+/// Self-sign an attestation advertising this node as a relay, if we are
+/// actually usable as one and the user has not opted out.
+///
+/// Advertising is a choice. Staying silent when relaying is off matters more
+/// than refusing requests later: an unadvertised node is never asked, so peers
+/// spend their attempts on someone who will actually carry the traffic.
+///
+/// Shared by the EPX payload builder and the friend-session relay offer so the
+/// two cannot advertise different things — in particular so that turning the
+/// setting off silences both.
+fn sign_local_relay_attestation(
+    state: &NetworkState,
+    settings: &AppSettings,
+    ed25519_secret_key: &[u8; 32],
+    ed25519_pubkey: [u8; 32],
+) -> Option<ember::RelayAttestation> {
+    if !settings.relay_for_peers {
+        return None;
+    }
+    let relay_ip = state.external_ip?;
+    let relay_port = state.quic_port?;
+    state
+        .connection_broker
+        .as_ref()
+        .and_then(|b| b.quic_endpoint())?;
+    if relay_port == 0
+        || relay_ip.is_multicast()
+        || crate::security::is_special_use_v4(relay_ip)
+    {
+        return None;
+    }
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let signing_key = ember::crypto::signing_key_from_bytes(ed25519_secret_key);
+    Some(ember::sign_relay_attestation(
+        &signing_key,
+        ed25519_pubkey,
+        relay_ip,
+        relay_port,
+        now_unix + ember::RELAY_ATTESTATION_MAX_TTL_SECS,
+        ember::RELAY_ATTESTATION_CAP_RELAY_V1,
+    ))
+}
+
+/// How often a friend is re-offered a relay set that has not otherwise
+/// changed. Comfortably inside [`ember::RELAY_ATTESTATION_MAX_TTL_SECS`] so
+/// their copy is refreshed well before it expires, while still collapsing the
+/// 30s send cadence into one message per bucket.
+const RELAY_OFFER_REFRESH_SECS: u64 = 600;
+
+/// Order-independent fingerprint of a relay offer, used to suppress re-sending
+/// a set a friend already has.
+///
+/// Deliberately keyed on relay *identity* — the signing key and the address it
+/// claims — rather than the attestation hash. The hash covers `expires_at`,
+/// and our own attestation is re-signed with a fresh expiry every time it is
+/// built, so hashing it would change the digest on every tick and defeat the
+/// suppression entirely.
+///
+/// A coarse time bucket is mixed in so an unchanged set is still refreshed
+/// periodically; without it a friend's copy would quietly age out and never be
+/// renewed. XOR over the entries keeps it commutative, so a reordering — which
+/// carries no information — does not count as a change.
+fn relay_offer_digest(attestations: &[ember::RelayAttestation], now_unix: u64) -> u64 {
+    let mut acc: u64 = now_unix / RELAY_OFFER_REFRESH_SECS;
+    for attestation in attestations {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&attestation.ed25519_pubkey, &mut hasher);
+        std::hash::Hash::hash(&attestation.relay_ip.octets(), &mut hasher);
+        std::hash::Hash::hash(&attestation.relay_port, &mut hasher);
+        acc ^= std::hash::Hasher::finish(&hasher);
+    }
+    acc
+}
+
+/// Verify relay attestations and admit the survivors as broker candidates.
+///
+/// Shared by the EPX trailer and the friend-session relay offer, because the
+/// trust model is identical and must stay that way: every attestation is
+/// self-signed by the relay it names and checked here against its signature,
+/// expiry, TTL bound, capability bit and address class. Nothing about *who
+/// handed it over* is consulted, which is exactly what makes it safe for a
+/// friend to forward attestations it did not sign — a courier cannot forge one
+/// and cannot silently alter one.
+fn admit_relay_attestations(
+    state: &mut NetworkState,
+    relay_attestations: &[ember::RelayAttestation],
+    now_unix: u64,
+    label: &str,
+) -> usize {
+    let mut admitted = 0usize;
+    for attestation in relay_attestations {
+        // Our own attestation, handed back to us. It is perfectly valid — we
+        // signed it — so verification would pass and the broker would happily
+        // list us as our own relay, then try to bridge a transfer through
+        // ourselves. Routine now that friends forward the sets they receive.
+        if attestation.ed25519_pubkey == state.local_ed25519_pubkey {
+            continue;
+        }
+        if !ember::verify_relay_attestation(attestation, now_unix) {
+            debug!(
+                "{label}: rejected invalid relay attestation for {}:{}",
+                attestation.relay_ip, attestation.relay_port
+            );
+            continue;
+        }
+        if let Some(ref mut broker) = state.connection_broker {
+            let relay_ember_hash =
+                ember::crypto::verifying_key_from_bytes(&attestation.ed25519_pubkey)
+                    .map(|vk| ember::crypto::node_id_from_public_key(&vk));
+            broker.add_relay_candidate(attestation.clone(), relay_ember_hash);
+            admitted += 1;
+        }
+    }
+    admitted
+}
+
 /// Shared EPX source injection logic used by both DownloadEvent::EmberSources
 /// and UploadEventKind::EmberSources handlers.
 async fn handle_epx_sources(
@@ -1163,28 +1291,7 @@ async fn handle_epx_sources(
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    for attestation in relay_attestations {
-        if !ember::verify_relay_attestation(attestation, now_unix) {
-            debug!(
-                "EPX {label}: rejected invalid relay attestation for {}:{}",
-                attestation.relay_ip, attestation.relay_port
-            );
-            continue;
-        }
-        if let Some(ref mut broker) = state.connection_broker {
-            let hash = ember::relay_attestation_hash(attestation);
-            let relay_ember_hash =
-                ember::crypto::verifying_key_from_bytes(&attestation.ed25519_pubkey)
-                    .map(|vk| ember::crypto::node_id_from_public_key(&vk));
-            broker.add_relay_candidate(
-                attestation.relay_ip,
-                attestation.relay_port,
-                hash,
-                relay_ember_hash,
-                attestation.expires_at_unix,
-            );
-        }
-    }
+    admit_relay_attestations(state, relay_attestations, now_unix, label);
 
     for (file_hash, sources) in entries {
         let matching_ids = {
@@ -1868,8 +1975,10 @@ impl FriendXferTransport {
 /// and a NAT that isn't symmetric — a symmetric NAT re-maps per destination, so
 /// the port we register is not the port the friend would arrive on.
 ///
-/// `None` means we cannot be reached by any method we support, which with relay
-/// deliberately excluded is a genuine dead end: the pair needs port forwarding.
+/// An `Err` means we cannot be reached by any method we support, which with
+/// relay deliberately excluded is a dead end for the pair. The reason is
+/// carried because only one of them is worth telling the user about: see
+/// [`NoTransportReason::is_permanent`].
 fn friend_xfer_transport_choice(
     firewalled: bool,
     advertised_tcp_port: u16,
@@ -1877,21 +1986,56 @@ fn friend_xfer_transport_choice(
     nat_type: ember::nat::NatType,
     external_addr: Option<SocketAddr>,
     rendezvous_registered: bool,
-) -> Option<FriendXferTransport> {
+) -> Result<FriendXferTransport, NoTransportReason> {
     if !firewalled && advertised_tcp_port != 0 {
-        return Some(FriendXferTransport::ConnectBack {
+        return Ok(FriendXferTransport::ConnectBack {
             tcp_port: advertised_tcp_port,
         });
     }
 
-    let quic_port = quic_port.filter(|p| *p != 0)?;
-    if !rendezvous_registered
-        || external_addr.is_none()
-        || nat_type == ember::nat::NatType::Symmetric
-    {
-        return None;
+    // Checked ahead of the transient preconditions so the reported reason is
+    // stable: a symmetric NAT that is also still waiting on its QUIC bind must
+    // not report the transient cause and then flip to the permanent one a
+    // moment later, which would let a startup race decide what the user reads.
+    if nat_type == ember::nat::NatType::Symmetric {
+        return Err(NoTransportReason::SymmetricNat);
     }
-    Some(FriendXferTransport::Punch { quic_port })
+    let Some(quic_port) = quic_port.filter(|p| *p != 0) else {
+        return Err(NoTransportReason::NoQuicPort);
+    };
+    if external_addr.is_none() {
+        return Err(NoTransportReason::NoExternalAddr);
+    }
+    if !rendezvous_registered {
+        return Err(NoTransportReason::NotRegistered);
+    }
+    Ok(FriendXferTransport::Punch { quic_port })
+}
+
+/// Why [`friend_xfer_transport_choice`] could offer the friend no way to reach
+/// us.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoTransportReason {
+    /// A symmetric NAT re-maps per destination, so the port we register is not
+    /// the port the friend would arrive on. Nothing we do at runtime changes
+    /// this; the user has to forward a port.
+    SymmetricNat,
+    /// No QUIC endpoint bound yet.
+    NoQuicPort,
+    /// STUN has not told us our external address yet.
+    NoExternalAddr,
+    /// Not registered at the rendezvous, so the friend's mailbox poll would
+    /// find nothing.
+    NotRegistered,
+}
+
+impl NoTransportReason {
+    /// Whether this will still be true however long we wait. The three
+    /// transient reasons all resolve on their own during startup, so surfacing
+    /// them would only teach users to ignore the warning.
+    fn is_permanent(self) -> bool {
+        matches!(self, NoTransportReason::SymmetricNat)
+    }
 }
 
 /// Pure half of [`request_friend_transfer`]: decide whether to ask `friend` for
@@ -1980,7 +2124,7 @@ async fn request_friend_transfer(
     transfer_id: &str,
     friend: [u8; 16],
     file_hash: [u8; 16],
-) -> bool {
+) -> FriendXferRequestOutcome {
     let now = std::time::Instant::now();
     let key = (friend, file_hash);
     let transport = friend_xfer_transport_choice(
@@ -1992,7 +2136,7 @@ async fn request_friend_transfer(
         state.rendezvous_registered,
     );
     let previous_attempts = match friend_xfer_send_decision(
-        transport.is_some(),
+        transport.is_ok(),
         &state.friend_xfer_attempts,
         friend,
         file_hash,
@@ -2005,7 +2149,12 @@ async fn request_friend_transfer(
                 hex::encode(friend),
                 hex::encode(file_hash)
             );
-            return false;
+            return match transport {
+                Err(reason) if reason.is_permanent() => {
+                    FriendXferRequestOutcome::NoTransport(reason)
+                }
+                _ => FriendXferRequestOutcome::Refused,
+            };
         }
     };
     let transport = transport.expect("a Send decision implies a usable transport");
@@ -2022,7 +2171,7 @@ async fn request_friend_transfer(
             "No live secure session with friend {} to request a transfer on",
             hex::encode(friend)
         );
-        return false;
+        return FriendXferRequestOutcome::Refused;
     };
 
     let mut nonce = [0u8; 16];
@@ -2044,7 +2193,7 @@ async fn request_friend_transfer(
             "Could not queue transfer request to friend {}: {e}",
             hex::encode(friend)
         );
-        return false;
+        return FriendXferRequestOutcome::Refused;
     }
 
     register_or_refresh_pending_friend_callback(pending, friend, file_hash).await;
@@ -2075,7 +2224,19 @@ async fn request_friend_transfer(
         hex::encode(file_hash),
         previous_attempts + 1
     );
-    true
+    FriendXferRequestOutcome::Sent
+}
+
+/// What [`request_friend_transfer`] did. `NoTransport` is separated from the
+/// ordinary refusals (cooldown, no session, already outstanding) because it is
+/// the only one the user can act on, and the only one that parks the source as
+/// [`ed2k::sources::DownloadSourceState::Unreachable`] rather than letting it
+/// be swept away as a plain failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FriendXferRequestOutcome {
+    Sent,
+    Refused,
+    NoTransport(NoTransportReason),
 }
 
 /// Register (or refresh) the expectation that `friend` will dial us for
@@ -2292,7 +2453,7 @@ async fn friend_transfer_request_status(
         state.nat_info.external_addr,
         state.rendezvous_registered,
     )
-    .is_some();
+    .is_ok();
 
     let status = friend_xfer_inbound_status(
         is_friend,
@@ -2431,10 +2592,15 @@ async fn handle_friend_transfer_ack(
 
 /// A dial to `(ip, port)` for `transfer_id` just failed. If that download came
 /// from a friend's file listing, ask the friend to reach us instead of marking
-/// the source dead. Returns whether the request went out, in which case the
-/// caller must leave the dead-source bookkeeping alone — the source is now
-/// parked in [`DownloadSourceState::FriendConnect`] until the friend arrives,
-/// declines, or the attempt times out.
+/// the source dead.
+///
+/// Returns whether the source was parked, in which case the caller must leave
+/// the dead-source bookkeeping alone. Parking means one of two things: the
+/// request went out and the source waits in
+/// [`DownloadSourceState::FriendConnect`] until the friend arrives, declines,
+/// or the attempt times out; or no transport could be offered at all and it
+/// sits in [`DownloadSourceState::Unreachable`], which explains the dead end
+/// in the drawer and clears itself once our reachability changes.
 #[allow(clippy::too_many_arguments)]
 async fn maybe_escalate_to_friend_transfer(
     state: &mut NetworkState,
@@ -2506,13 +2672,42 @@ async fn maybe_escalate_to_friend_transfer(
         }
     };
 
-    if !request_friend_transfer(state, pending, transfer_id, friend, file_hash).await {
-        return false;
-    }
+    // A dead end is parked too, not just a live request. Both cases keep the
+    // row visible and both stop the caller's dead-source bookkeeping; they
+    // differ only in what the row says and whether anything is outstanding.
+    let unreachable = match request_friend_transfer(
+        state,
+        pending,
+        transfer_id,
+        friend,
+        file_hash,
+    )
+    .await
+    {
+        FriendXferRequestOutcome::Sent => false,
+        FriendXferRequestOutcome::NoTransport(reason) => {
+            info!(
+                "No transport to offer friend {} for {}: {reason:?}",
+                hex::encode(friend),
+                hex::encode(file_hash)
+            );
+            true
+        }
+        FriendXferRequestOutcome::Refused => return false,
+    };
 
     if let Some(pfs) = state.per_file_sources.get_mut(transfer_id) {
-        pfs.set_friend_connect(ip, port, None);
+        if unreachable {
+            pfs.set_unreachable(ip, port, None);
+        } else {
+            pfs.set_friend_connect(ip, port, None);
+        }
     }
+    let (parked_status, parked_status_str) = if unreachable {
+        (crate::types::SourceStatus::Unreachable, "unreachable")
+    } else {
+        (crate::types::SourceStatus::FriendConnect, "friend_connect")
+    };
     let ip_s = ip.to_string();
     // Park the *stored* row, not just the live one. The caller stops the
     // originating `"failed"` event here (see its `friend_escalated` guard), so
@@ -2535,7 +2730,7 @@ async fn maybe_escalate_to_friend_transfer(
             crate::types::SourceInfo {
                 ip: ip_s.clone(),
                 port,
-                status: crate::types::SourceStatus::FriendConnect,
+                status: parked_status,
                 queue_rank: None,
                 speed: 0,
                 transferred,
@@ -2554,7 +2749,7 @@ async fn maybe_escalate_to_friend_transfer(
             "transfer_id": transfer_id,
             "ip": ip_s,
             "port": port,
-            "status": "friend_connect",
+            "status": parked_status_str,
             "queue_rank": null,
             "speed": 0,
             "transferred": 0,
@@ -2662,7 +2857,7 @@ mod friend_transfer_tests {
                 Some("93.184.216.34:4670".parse().unwrap()),
                 true,
             ),
-            Some(FriendXferTransport::ConnectBack { tcp_port: 4662 })
+            Ok(FriendXferTransport::ConnectBack { tcp_port: 4662 })
         );
     }
 
@@ -2678,7 +2873,7 @@ mod friend_transfer_tests {
             Some("93.184.216.34:4670".parse().unwrap()),
             true,
         );
-        assert_eq!(choice, Some(FriendXferTransport::Punch { quic_port: 4670 }));
+        assert_eq!(choice, Ok(FriendXferTransport::Punch { quic_port: 4670 }));
         // Punch carries no port on the wire; the friend reads our address from
         // its rendezvous mailbox.
         let choice = choice.unwrap();
@@ -2687,7 +2882,10 @@ mod friend_transfer_tests {
     }
 
     /// Every precondition a punch needs, each removed in turn. With relay
-    /// deliberately excluded, `None` here is a genuine dead end for the pair.
+    /// deliberately excluded, an `Err` here is a genuine dead end for the
+    /// pair. The reason is asserted too, because only `SymmetricNat` is shown
+    /// to the user — misreporting a transient cause as the permanent one would
+    /// tell someone to forward a port they don't need to.
     #[test]
     fn punch_requires_quic_rendezvous_external_addr_and_a_non_symmetric_nat() {
         let addr: SocketAddr = "93.184.216.34:4670".parse().unwrap();
@@ -2701,35 +2899,136 @@ mod friend_transfer_tests {
             Some(addr),
             true
         )
-        .is_some());
+        .is_ok());
         // No QUIC endpoint bound yet.
-        assert!(ok(None, ember::nat::NatType::RestrictedCone, Some(addr), true).is_none());
-        assert!(ok(
-            Some(0),
-            ember::nat::NatType::RestrictedCone,
-            Some(addr),
-            true
-        )
-        .is_none());
+        assert_eq!(
+            ok(None, ember::nat::NatType::RestrictedCone, Some(addr), true),
+            Err(NoTransportReason::NoQuicPort)
+        );
+        assert_eq!(
+            ok(
+                Some(0),
+                ember::nat::NatType::RestrictedCone,
+                Some(addr),
+                true
+            ),
+            Err(NoTransportReason::NoQuicPort)
+        );
         // Not discoverable, so the friend's mailbox poll would find nothing.
-        assert!(ok(
-            Some(4670),
-            ember::nat::NatType::RestrictedCone,
-            Some(addr),
-            false
-        )
-        .is_none());
+        assert_eq!(
+            ok(
+                Some(4670),
+                ember::nat::NatType::RestrictedCone,
+                Some(addr),
+                false
+            ),
+            Err(NoTransportReason::NotRegistered)
+        );
         // No external address to publish.
-        assert!(ok(Some(4670), ember::nat::NatType::RestrictedCone, None, true).is_none());
+        assert_eq!(
+            ok(Some(4670), ember::nat::NatType::RestrictedCone, None, true),
+            Err(NoTransportReason::NoExternalAddr)
+        );
         // Symmetric NAT re-maps per destination, so the port we register is not
         // the port the friend would arrive on.
-        assert!(ok(
-            Some(4670),
-            ember::nat::NatType::Symmetric,
-            Some(addr),
-            true
-        )
-        .is_none());
+        assert_eq!(
+            ok(
+                Some(4670),
+                ember::nat::NatType::Symmetric,
+                Some(addr),
+                true
+            ),
+            Err(NoTransportReason::SymmetricNat)
+        );
+    }
+
+    fn relay_att(pubkey: u8, ip: [u8; 4], port: u16, expires: u64) -> ember::RelayAttestation {
+        ember::RelayAttestation {
+            ed25519_pubkey: [pubkey; 32],
+            relay_ip: Ipv4Addr::from(ip),
+            relay_port: port,
+            expires_at_unix: expires,
+            capability_bits: ember::RELAY_ATTESTATION_CAP_RELAY_V1,
+            signature: [0u8; 64],
+        }
+    }
+
+    /// The digest must ignore `expires_at`. Our own attestation is re-signed
+    /// with a fresh expiry every time the offer is built, so a digest that
+    /// covered it would change on every tick and re-send the same set to every
+    /// friend forever.
+    #[test]
+    fn relay_offer_digest_ignores_expiry_churn() {
+        let now = 1_700_000_000;
+        let early = vec![relay_att(1, [8, 8, 8, 8], 4662, now + 60)];
+        let renewed = vec![relay_att(1, [8, 8, 8, 8], 4662, now + 1800)];
+        assert_eq!(
+            relay_offer_digest(&early, now),
+            relay_offer_digest(&renewed, now)
+        );
+    }
+
+    /// Reordering carries no information, so it must not count as a change.
+    /// A genuinely different relay must.
+    #[test]
+    fn relay_offer_digest_tracks_membership_not_order() {
+        let now = 1_700_000_000;
+        let a = relay_att(1, [8, 8, 8, 8], 4662, now + 600);
+        let b = relay_att(2, [9, 9, 9, 9], 4663, now + 600);
+        assert_eq!(
+            relay_offer_digest(&[a.clone(), b.clone()], now),
+            relay_offer_digest(&[b.clone(), a.clone()], now)
+        );
+        assert_ne!(
+            relay_offer_digest(&[a.clone()], now),
+            relay_offer_digest(&[a, b], now)
+        );
+    }
+
+    /// An unchanged set is still re-offered once per refresh bucket, so a
+    /// friend's copy is renewed before its own TTL runs out.
+    #[test]
+    fn relay_offer_digest_rolls_over_for_periodic_refresh() {
+        let now = 1_700_000_000;
+        let offer = vec![relay_att(1, [8, 8, 8, 8], 4662, now + 1800)];
+        assert_ne!(
+            relay_offer_digest(&offer, now),
+            relay_offer_digest(&offer, now + RELAY_OFFER_REFRESH_SECS)
+        );
+        assert!(
+            RELAY_OFFER_REFRESH_SECS < ember::RELAY_ATTESTATION_MAX_TTL_SECS,
+            "a refresh must land before the friend's copy expires"
+        );
+    }
+
+    /// Only the symmetric-NAT dead end is permanent, and only a permanent
+    /// reason parks the source as `Unreachable`. The transient three all clear
+    /// during startup, so surfacing them would train users to ignore the
+    /// warning.
+    #[test]
+    fn only_symmetric_nat_is_reported_as_a_permanent_dead_end() {
+        assert!(NoTransportReason::SymmetricNat.is_permanent());
+        assert!(!NoTransportReason::NoQuicPort.is_permanent());
+        assert!(!NoTransportReason::NoExternalAddr.is_permanent());
+        assert!(!NoTransportReason::NotRegistered.is_permanent());
+    }
+
+    /// A symmetric NAT that is *also* still waiting on its QUIC bind must
+    /// report the permanent cause, not the transient one — otherwise which
+    /// message the user reads depends on startup timing.
+    #[test]
+    fn symmetric_nat_outranks_a_transient_precondition() {
+        assert_eq!(
+            friend_xfer_transport_choice(
+                true,
+                4662,
+                None,
+                ember::nat::NatType::Symmetric,
+                None,
+                false,
+            ),
+            Err(NoTransportReason::SymmetricNat)
+        );
     }
 
     /// A punch request needs no routable address in the payload, but does need
@@ -7380,6 +7679,24 @@ struct NetworkState {
     relay_manager: Arc<tokio::sync::Mutex<ember::relay::RelayManager>>,
     /// Peer reputation tracking (score, ban, decay)
     reputation: ember::reputation::ReputationManager,
+    /// Digest of the relay offer last delivered to each friend, so a steady
+    /// set is sent once rather than every tick. Pruned to live sessions, which
+    /// also means a friend who reconnects is offered the set again.
+    friend_relay_offer_sent: HashMap<[u8; 16], u64>,
+    /// Our own Ed25519 public key, so relay admission can recognise our own
+    /// attestation coming back to us. Gossip makes that routine: we hand a
+    /// friend our attestation, the friend folds it into the set it forwards,
+    /// and it returns on the next exchange. Admitting it would let the broker
+    /// pick us as our own relay.
+    local_ed25519_pubkey: [u8; 32],
+    /// When each friend's last accepted relay offer was processed.
+    ///
+    /// Verifying an offer costs up to `MAX_RELAY_ATTESTATIONS` Ed25519
+    /// signature checks on the network loop. A friend is authenticated, not
+    /// trusted, so nothing stops a malicious or compromised one from sending
+    /// offers back to back; this throttles the cost to once per
+    /// [`FRIEND_RELAY_OFFER_MIN_INTERVAL`] regardless of how fast they arrive.
+    friend_relay_offer_seen: HashMap<[u8; 16], std::time::Instant>,
     /// Ember-native Noise transport. Always initialised at network
     /// startup so the dispatch decision in `handle_udp_packet` can be
     /// gated purely on `settings.ember_native_enabled` — toggling the
@@ -10641,8 +10958,15 @@ pub async fn start_network(
         friend_nat_context: ember::nat::new_shared_friend_nat_context(),
         connection_broker: None,
         broker_event_rx: None,
-        relay_manager: Arc::new(tokio::sync::Mutex::new(ember::relay::RelayManager::new())),
+        relay_manager: Arc::new(tokio::sync::Mutex::new({
+            let mut mgr = ember::relay::RelayManager::new();
+            mgr.set_policy(settings.relay_for_peers, settings.max_relay_sessions);
+            mgr
+        })),
         reputation,
+        local_ed25519_pubkey: ed25519_pubkey,
+        friend_relay_offer_sent: HashMap::new(),
+        friend_relay_offer_seen: HashMap::new(),
         ember_transport: ember::transport::EmberTransport::new(
             identity.noise_private_key,
             identity.noise_public_key,
@@ -11667,6 +11991,11 @@ pub async fn start_network(
                         &ember_boot_tx,
                         &app_handle,
                     );
+                    state
+                        .relay_manager
+                        .lock()
+                        .await
+                        .set_policy(settings.relay_for_peers, settings.max_relay_sessions);
                     {
                         let mut nick = shared_nickname.write().await;
                         *nick = settings.nickname.clone();
@@ -12688,6 +13017,11 @@ pub async fn start_network(
                             &ember_boot_tx,
                             &app_handle,
                         );
+                        state
+                            .relay_manager
+                            .lock()
+                            .await
+                            .set_policy(settings.relay_for_peers, settings.max_relay_sessions);
                         {
                             let mut nick = shared_nickname.write().await;
                             *nick = settings.nickname.clone();
@@ -14270,6 +14604,62 @@ pub async fn start_network(
                                 }));
                             }
                         }
+                    }
+                }
+
+                // A friend forwarded the relay attestations it knows. Each is
+                // verified against its own signature before admission, so the
+                // friend is trusted only to deliver bytes, not to vouch for
+                // them — the same standard the EPX trailer is held to.
+                if let UploadEventKind::EmberRelayOffer {
+                    ember_hash: relay_eh,
+                    ref attestations,
+                } = event.kind
+                {
+                    let now = std::time::Instant::now();
+                    let too_soon = state
+                        .friend_relay_offer_seen
+                        .get(&relay_eh)
+                        .is_some_and(|last| {
+                            now.saturating_duration_since(*last)
+                                < FRIEND_RELAY_OFFER_MIN_INTERVAL
+                        });
+                    if too_soon {
+                        debug!(
+                            "Ignoring relay offer from friend {} — arrived inside the {}s throttle",
+                            hex::encode(relay_eh),
+                            FRIEND_RELAY_OFFER_MIN_INTERVAL.as_secs()
+                        );
+                    } else if friend_hashes.read().await.contains(&relay_eh) {
+                        state.friend_relay_offer_seen.insert(relay_eh, now);
+                        // Bounded alongside the live-session sweep the sender
+                        // side runs, but capped here too: the throttle map is
+                        // written from an inbound path, so a peer that
+                        // connects, offers once and leaves must not leave a
+                        // permanent entry behind.
+                        if state.friend_relay_offer_seen.len() > MAX_FRIEND_RELAY_OFFER_TRACKED {
+                            state
+                                .friend_relay_offer_seen
+                                .retain(|_, last| {
+                                    now.saturating_duration_since(*last)
+                                        < FRIEND_RELAY_OFFER_MIN_INTERVAL
+                                });
+                        }
+                        let now_unix = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let admitted = admit_relay_attestations(
+                            &mut state,
+                            attestations,
+                            now_unix,
+                            &format!("friend relay offer from {}", hex::encode(relay_eh)),
+                        );
+                        debug!(
+                            "Friend {} offered {} relay attestation(s), admitted {admitted}",
+                            hex::encode(relay_eh),
+                            attestations.len()
+                        );
                     }
                 }
 
@@ -19147,6 +19537,87 @@ pub async fn start_network(
             _ = udp_discovery_health_timer.tick() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
                 if state.stats.status == NetworkStatus::Disconnected { return; }
+
+                // Forward what we know about relays to every live friend
+                // session. This is the only channel that does not depend on
+                // sharing a swarm with the peer, which is exactly the case the
+                // relay broker starves in: attestations otherwise arrive only
+                // on EPX exchanges for files already being traded, so two
+                // friends alone together never accumulate any.
+                //
+                // Re-sent only when the set actually changes. A digest of the
+                // offered attestation hashes is cheaper to compare than the
+                // block and is stable across reorderings that carry no new
+                // information, so a steady-state pair exchanges nothing.
+                {
+                    let now_unix = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let mut offer = state
+                        .connection_broker
+                        .as_ref()
+                        .map(|b| b.gossipable_attestations(now_unix))
+                        .unwrap_or_default();
+                    // Lead with ourselves when we are usable as a relay. We
+                    // are never in our own candidate list — that only holds
+                    // relays learned from others — yet for a friend who has no
+                    // peers at all we may be the only relay they can reach,
+                    // and they cannot discover us any other way.
+                    if let Some(mine) = sign_local_relay_attestation(
+                        &state,
+                        &settings,
+                        &ed25519_secret_key,
+                        ed25519_pubkey,
+                    ) {
+                        offer.truncate(ember::MAX_RELAY_ATTESTATIONS.saturating_sub(1));
+                        offer.insert(0, mine);
+                    }
+                    if !offer.is_empty() {
+                        let digest = relay_offer_digest(&offer, now_unix);
+                        let body = ember::build_relay_attestation_block(&offer);
+                        let payload =
+                            ed2k::messages::build_ember_ext(
+                                ed2k::messages::EMBER_EXT_RELAY_OFFER,
+                                &body,
+                            );
+                        let mut packet = Vec::with_capacity(6 + payload.len());
+                        packet.push(OP_EMULEPROT);
+                        packet.extend_from_slice(&((1 + payload.len()) as u32).to_le_bytes());
+                        packet.push(ed2k::messages::OP_EMBER_EXT);
+                        packet.extend_from_slice(&payload);
+
+                        let live: Vec<([u8; 16], tokio::sync::mpsc::Sender<Vec<u8>>)> = {
+                            let sessions = state.ember_sessions.read().await;
+                            sessions
+                                .iter()
+                                .filter(|(_, h)| h.is_fresh() && h.is_secure_v2())
+                                .map(|(eh, h)| (*eh, h.tx.clone()))
+                                .collect()
+                        };
+                        for (eh, tx) in live {
+                            if state.friend_relay_offer_sent.get(&eh) == Some(&digest) {
+                                continue;
+                            }
+                            if tx.try_send(packet.clone()).is_ok() {
+                                state.friend_relay_offer_sent.insert(eh, digest);
+                            }
+                        }
+                    }
+                    // Prune outside the "we have something to offer" branch:
+                    // when every candidate expires at once the offer goes
+                    // empty, and skipping the sweep then would let entries for
+                    // departed friends accumulate for the life of the process
+                    // — the exact leak this guards against. Also ensures a
+                    // reconnecting friend is offered the set again.
+                    {
+                        let sessions = state.ember_sessions.read().await;
+                        state
+                            .friend_relay_offer_sent
+                            .retain(|eh, _| sessions.contains_key(eh));
+                    }
+                }
+
                 let cur = UdpDiscoveryHealthSnapshot {
                     sent: state.udp_discovery_sent,
                     send_errs: state.udp_discovery_send_errs,
@@ -26264,38 +26735,12 @@ pub async fn start_network(
                     }
                 }
 
-                let local_relay_attestation = if let (Some(relay_ip), Some(relay_port), Some(_)) = (
-                    state.external_ip,
-                    state.quic_port,
-                    state
-                        .connection_broker
-                        .as_ref()
-                        .and_then(|b| b.quic_endpoint()),
-                ) {
-                    if relay_port != 0
-                        && !relay_ip.is_multicast()
-                        && !crate::security::is_special_use_v4(relay_ip)
-                    {
-                        let now_unix = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        let signing_key =
-                            ember::crypto::signing_key_from_bytes(&ed25519_secret_key);
-                        Some(ember::sign_relay_attestation(
-                            &signing_key,
-                            ed25519_pubkey,
-                            relay_ip,
-                            relay_port,
-                            now_unix + ember::RELAY_ATTESTATION_MAX_TTL_SECS,
-                            ember::RELAY_ATTESTATION_CAP_RELAY_V1,
-                        ))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
+                let local_relay_attestation = sign_local_relay_attestation(
+                    &state,
+                    &settings,
+                    &ed25519_secret_key,
+                    ed25519_pubkey,
+                );
                 let local_relay_ip = local_relay_attestation.as_ref().map(|a| a.relay_ip);
 
                 let entries = {
@@ -39557,6 +40002,7 @@ async fn handle_upload_event(
         | UploadEventKind::EmberTransferRequest { .. }
         | UploadEventKind::EmberTransferAck { .. }
         | UploadEventKind::EmberFileOffer { .. }
+        | UploadEventKind::EmberRelayOffer { .. }
         | UploadEventKind::EmberFileOfferAck { .. }
         | UploadEventKind::EmberFriendRequest { .. } => {
             // Handled directly in the network event loop.

@@ -96,6 +96,10 @@ async fn read_json_capped<T: serde::de::DeserializeOwned>(
 /// stalled every LowID-to-LowID transfer past ~512 KiB per direction.
 const RELAY_MAX_BYTES_PER_DIRECTION: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_CONCURRENT_RELAY_SESSIONS: usize = 4;
+/// Hard ceiling on the user-configurable session count. Well above any
+/// sensible donation, low enough that a typo in config.json cannot turn the
+/// node into an unbounded proxy.
+const MAX_RELAY_SESSIONS_CEILING: usize = 64;
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 const RELAY_MAX_DURATION: Duration = Duration::from_secs(7200);
 const MAX_WS_RELAY_FRAME: usize = 16 * 1024;
@@ -191,6 +195,11 @@ pub struct RelayManager {
     recent_request_nonces: HashMap<([u8; 32], [u8; 16]), Instant>,
     next_session_id: u32,
     total_bytes_relayed: u64,
+    /// Whether we carry traffic for other peers at all. Mirrors
+    /// `AppSettings::relay_for_peers`.
+    enabled: bool,
+    /// Concurrent session ceiling, from `AppSettings::max_relay_sessions`.
+    max_sessions: usize,
 }
 
 impl RelayManager {
@@ -201,7 +210,26 @@ impl RelayManager {
             recent_request_nonces: HashMap::new(),
             next_session_id: 1,
             total_bytes_relayed: 0,
+            enabled: true,
+            max_sessions: MAX_CONCURRENT_RELAY_SESSIONS,
         }
+    }
+
+    /// Apply the user's relay policy. Existing sessions are left to finish:
+    /// cutting live transfers mid-flight would punish the peer for a setting
+    /// change they cannot see, and the ceiling is enforced on admission
+    /// anyway, so the count drains naturally.
+    pub fn set_policy(&mut self, enabled: bool, max_sessions: u32) {
+        self.enabled = enabled;
+        // `max_relay_sessions` is config.json-only, so it never passes through
+        // the settings screen's clamps. Bound it here: each session can move
+        // `RELAY_MAX_BYTES_PER_DIRECTION` in each direction, so an absurd
+        // value is a self-inflicted uplink and memory problem rather than a
+        // useful configuration.
+        self.max_sessions = match max_sessions {
+            0 => MAX_CONCURRENT_RELAY_SESSIONS,
+            n => (n as usize).min(MAX_RELAY_SESSIONS_CEILING),
+        };
     }
 
     pub fn set_current_attestation_hash(&mut self, hash: [u8; 32], expires_at_unix: u64) {
@@ -249,10 +277,15 @@ impl RelayManager {
         target_port: u16,
         file_hash: [u8; 16],
     ) -> Option<u32> {
-        if self.sessions.len() >= MAX_CONCURRENT_RELAY_SESSIONS {
+        if !self.enabled {
+            debug!("RelayManager: relaying for other peers is disabled by settings");
+            return None;
+        }
+        if self.sessions.len() >= self.max_sessions {
             debug!(
-                "RelayManager: at capacity ({} sessions)",
-                self.sessions.len()
+                "RelayManager: at capacity ({} of {} sessions)",
+                self.sessions.len(),
+                self.max_sessions
             );
             return None;
         }

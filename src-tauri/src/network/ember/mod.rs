@@ -573,7 +573,34 @@ fn parse_relay_attestation_trailer(data: &[u8], offset: usize) -> Vec<RelayAttes
     if offset >= data.len() {
         return Vec::new();
     }
-    let remaining = &data[offset..];
+    parse_relay_attestation_block(&data[offset..])
+}
+
+/// Serialize attestations as a self-contained block, using the same
+/// magic/version/count framing the EPX trailer carries. One encoder and one
+/// decoder therefore serve both the EPX payload and the friend-session relay
+/// offer, so the two can never drift apart on the wire.
+pub fn build_relay_attestation_block(attestations: &[RelayAttestation]) -> Vec<u8> {
+    let count = attestations.len().min(MAX_RELAY_ATTESTATIONS);
+    let mut buf = Vec::with_capacity(7 + count * RELAY_ATTESTATION_FIXED_SIZE);
+    buf.extend_from_slice(RELAY_ATTESTATION_MAGIC);
+    buf.write_u8(RELAY_ATTESTATION_TRAILER_VERSION).unwrap();
+    buf.write_u16::<LittleEndian>(count as u16).unwrap();
+    for attestation in attestations.iter().take(count) {
+        encode_relay_attestation(&mut buf, attestation);
+    }
+    buf
+}
+
+/// Inverse of [`build_relay_attestation_block`].
+///
+/// Never fails: a malformed or truncated block yields whatever parsed cleanly
+/// before the damage, so one bad entry cannot discard the good ones ahead of
+/// it. Nothing here is trusted — every entry still has to survive
+/// [`verify_relay_attestation`] at the call site, which is what makes it safe
+/// to accept a block forwarded by a third party.
+pub fn parse_relay_attestation_block(data: &[u8]) -> Vec<RelayAttestation> {
+    let remaining = data;
     if remaining.len() < 7 || &remaining[..4] != RELAY_ATTESTATION_MAGIC {
         return Vec::new();
     }
@@ -671,6 +698,45 @@ mod tests {
             expires_at_unix,
             RELAY_ATTESTATION_CAP_RELAY_V1,
         )
+    }
+
+    /// The standalone block the friend-session relay offer carries must round
+    /// trip through the same codec the EPX trailer uses.
+    #[test]
+    fn relay_attestation_block_round_trips() {
+        let now: u64 = 1_700_000_000;
+        let att1 = make_attestation(now + 600);
+        let att2 = make_attestation(now + 900);
+        let block = build_relay_attestation_block(&[att1.clone(), att2.clone()]);
+        assert_eq!(parse_relay_attestation_block(&block), vec![att1, att2]);
+    }
+
+    /// An empty or foreign block yields nothing rather than erroring, so a
+    /// peer sending junk costs us a parse and nothing else.
+    #[test]
+    fn relay_attestation_block_ignores_junk() {
+        assert!(parse_relay_attestation_block(&[]).is_empty());
+        assert!(parse_relay_attestation_block(b"not-an-erat-block").is_empty());
+        assert!(parse_relay_attestation_block(&build_relay_attestation_block(&[])).is_empty());
+    }
+
+    /// The property that makes forwarding safe: a courier cannot alter what it
+    /// carries. Tampering with the relay address of an otherwise-valid
+    /// attestation invalidates the signature, so a malicious friend cannot
+    /// redirect us at a host of its choosing.
+    #[test]
+    fn forwarded_attestation_cannot_be_redirected() {
+        let now: u64 = 1_700_000_000;
+        let honest = make_attestation(now + 600);
+        assert!(verify_relay_attestation(&honest, now));
+
+        let mut tampered = honest.clone();
+        tampered.relay_ip = Ipv4Addr::new(203, 0, 113, 9);
+        assert!(!verify_relay_attestation(&tampered, now));
+
+        let mut retimed = honest;
+        retimed.expires_at_unix = now + RELAY_ATTESTATION_MAX_TTL_SECS;
+        assert!(!verify_relay_attestation(&retimed, now));
     }
 
     #[test]
