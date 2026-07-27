@@ -369,6 +369,34 @@ async fn persist_shared_states(
     Ok(())
 }
 
+async fn persist_friends_only_states(
+    network_tx: &tokio::sync::mpsc::Sender<NetworkCommand>,
+    hashes: &[String],
+    friends_only: bool,
+) -> Result<(), String> {
+    if hashes.is_empty() {
+        return Ok(());
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let updates = hashes
+        .iter()
+        .filter(|hash| !hash.is_empty())
+        .map(|hash| (hash.clone(), friends_only))
+        .collect();
+    bounded_send(
+        network_tx,
+        NetworkCommand::SetFilesFriendsOnly { updates, tx },
+    )
+    .await?;
+    await_reply(
+        rx,
+        "sharing_persist_scope_failed",
+        "Failed to persist file share scope",
+    )
+    .await??;
+    Ok(())
+}
+
 async fn persist_upload_priorities(
     network_tx: &tokio::sync::mpsc::Sender<NetworkCommand>,
     hashes: &[String],
@@ -2290,6 +2318,52 @@ pub async fn batch_share(
     Ok(count)
 }
 
+/// Restrict a batch of files to mutual friends, or return them to the open
+/// network. Returns the count of files actually flipped.
+///
+/// A restricted file stays in the library and keeps its `shared` flag; what
+/// changes is who may see and fetch it. Reconciliation after the write pulls
+/// it out of the ed2k offer list and the KAD publish set, so an already
+/// published file stops being discoverable rather than merely being hidden
+/// from browse.
+#[tauri::command]
+pub async fn set_files_friends_only(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    file_paths: Vec<String>,
+    friends_only: bool,
+) -> Result<u32, String> {
+    check_path_batch(&file_paths, MAX_BATCH_IDS)?;
+    let (snapshot, mutation) = {
+        let mut index = state.local_index.write().await;
+        let snapshot = index.all_files().to_vec();
+        let mutation = index.set_friends_only_by_paths(&file_paths, friends_only);
+        (snapshot, mutation)
+    };
+    let count = mutation.changed_paths as u32;
+    if count > 0 {
+        refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
+        if let Err(e) =
+            persist_friends_only_states(&state.network_tx, &mutation.hashes, friends_only).await
+        {
+            rollback_index_mutation(&state, snapshot).await;
+            return Err(e);
+        }
+        // Republish/re-offer so a newly restricted file is withdrawn from the
+        // server offer list and the KAD publish set immediately.
+        reconcile_shared_files_best_effort(&state.network_tx).await;
+        let _ = app.emit(
+            "shared-files-changed",
+            serde_json::json!({ "friendsOnly": count }),
+        );
+        info!(
+            "Set friends_only={friends_only} on {count}/{} files",
+            file_paths.len()
+        );
+    }
+    Ok(count)
+}
+
 /// Bulk-unshare many files in a single Tauri call. Returns the count of
 /// files actually flipped to unshared.
 #[tauri::command]
@@ -3299,6 +3373,7 @@ mod tests {
             complete_sources: 0,
             folder: String::new(),
             shared: true,
+            friends_only: false,
             shared_kad: false,
             shared_ed2k: false,
         }

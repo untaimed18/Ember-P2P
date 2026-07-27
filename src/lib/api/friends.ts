@@ -38,12 +38,23 @@ export interface FriendRequestInfo {
   verified: boolean;
 }
 
+/**
+ * Delivery state of an outbound message. Received messages are always
+ * `delivered`; only messages we sent can be waiting or abandoned.
+ */
+export type ChatDelivery = 'delivered' | 'queued' | 'failed';
+
 export interface ChatMessage {
   id: number;
   direction: 'sent' | 'received';
   message: string;
   timestamp: number;
   read: boolean;
+  delivery: ChatDelivery;
+}
+
+export interface ChatSendResult {
+  delivery: ChatDelivery;
 }
 
 export async function getFriends(): Promise<FriendInfo[]> {
@@ -66,7 +77,14 @@ export async function getMyEmberHash(): Promise<string> {
   return invoke('get_my_ember_hash');
 }
 
-export async function sendChatMessage(userHashHex: string, message: string): Promise<void> {
+/**
+ * Send a message. Resolves with `queued` rather than rejecting when the friend
+ * is unreachable — the message is stored and flushed on the next session.
+ */
+export async function sendChatMessage(
+  userHashHex: string,
+  message: string,
+): Promise<ChatSendResult> {
   return invoke('send_chat_message', { userHashHex, message });
 }
 
@@ -80,6 +98,27 @@ export async function markMessagesRead(friendHash: string): Promise<void> {
 
 export async function getUnreadMessageCounts(): Promise<[string, number][]> {
   return invoke('get_unread_message_counts');
+}
+
+/** Per-friend count of outbound messages still waiting for a session. */
+export async function getPendingChatCounts(): Promise<Record<string, number>> {
+  return invoke('get_pending_chat_counts');
+}
+
+/**
+ * Offer one of our shared files to a friend. Sends an invitation only — the
+ * friend chooses whether to download it.
+ */
+export async function offerFileToFriend(userHashHex: string, fileHash: string): Promise<void> {
+  return invoke('offer_file_to_friend', { userHashHex, fileHash });
+}
+
+/** Payload of the `ember:file-offer` event. */
+export interface IncomingFileOffer {
+  user_hash: string;
+  file_hash: string;
+  file_name: string;
+  file_size: number;
 }
 
 export async function retryFriendSearch(userHashHex: string): Promise<void> {

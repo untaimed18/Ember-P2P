@@ -306,6 +306,9 @@ pub async fn remove_friend(
     let mut friends = state.friend_hashes.write().await;
     friends.remove(&hash);
     drop(friends);
+    // Drop the mutual grant in the same breath, so browse and friends-only
+    // serving stop immediately rather than at the next restart.
+    state.mutual_friend_hashes.write().await.remove(&hash);
     // Revoke sockets synchronously before waiting on the network task so a
     // saturated command queue can never extend access.  The bounded
     // send/ack below then confirms pending browse/chat/priority state was
@@ -417,6 +420,20 @@ pub struct ChatMessageInfo {
     pub message: String,
     pub timestamp: i64,
     pub read: bool,
+    /// `"delivered"`, `"queued"`, or `"failed"`. Received messages are always
+    /// delivered; only outbound ones can sit in another state.
+    pub delivery: String,
+}
+
+/// Map the stored `chat_messages.delivery` integer to the string the UI uses.
+/// An unrecognised value is reported as delivered so a future state added by a
+/// newer build degrades into "nothing to act on" rather than a false alarm.
+fn delivery_label(delivery: i64) -> String {
+    match delivery {
+        crate::storage::database::CHAT_QUEUED => "queued".to_string(),
+        crate::storage::database::CHAT_FAILED => "failed".to_string(),
+        _ => "delivered".to_string(),
+    }
 }
 
 #[tauri::command]
@@ -424,7 +441,7 @@ pub async fn send_chat_message(
     state: tauri::State<'_, AppState>,
     user_hash_hex: String,
     message: String,
-) -> Result<(), String> {
+) -> Result<ChatSendResult, String> {
     if message.is_empty() || message.len() > 4096 {
         return Err(coded(
             "peers_message_size_invalid",
@@ -456,12 +473,60 @@ pub async fn send_chat_message(
         &state.network_tx,
         NetworkCommand::SendChatMessage {
             ember_hash: hash,
-            message: cleaned,
+            message: cleaned.clone(),
             tx,
         },
     )
     .await?;
-    await_reply(rx, "peers_no_response", "No response").await?
+    match await_reply(rx, "peers_no_response", "No response").await? {
+        Ok(()) => Ok(ChatSendResult {
+            delivery: "delivered".to_string(),
+        }),
+        Err(reason) if chat_failure_is_permanent(&reason) => Err(reason),
+        Err(reason) => {
+            // Every remaining failure means "we could not reach them right
+            // now" — offline, a dial in flight, a dead channel. Keep the
+            // message instead of discarding it, and let the next established
+            // session flush it. Persisting here rather than inside the network
+            // task means one place covers all of those paths.
+            let db = state.db.clone();
+            let friend_hex = canonical.clone();
+            tokio::task::spawn_blocking(move || db.insert_pending_chat_message(&friend_hex, &cleaned))
+                .await
+                .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+                .map_err(|e| coded_ctx("peers_failed_queue_message", "Failed to queue message", e))?;
+            tracing::info!("Queued chat message for offline friend {canonical}: {reason}");
+            Ok(ChatSendResult {
+                delivery: "queued".to_string(),
+            })
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+pub struct ChatSendResult {
+    /// `"delivered"` when the message reached a live session, `"queued"` when
+    /// it was stored for the next time the friend is reachable.
+    pub delivery: String,
+}
+
+/// Whether a chat send failure is worth retrying later.
+///
+/// Only genuinely terminal conditions are excluded from the queue; anything
+/// reachability-related is queued, because retrying is exactly the point.
+///
+/// These strings are produced by the `SendChatMessage` handler in
+/// `network/mod.rs`. Matching is case-insensitive on a distinctive fragment so
+/// a reworded message degrades into "queued and retried" rather than a hang —
+/// and `chat_failure_classification` below pins the exact wording under test
+/// so a rename cannot silently change behaviour.
+fn chat_failure_is_permanent(reason: &str) -> bool {
+    let lowered = reason.to_ascii_lowercase();
+    // Chat switched off, no longer a friend, or a peer key that cannot produce
+    // an envelope. None of these improve by waiting.
+    lowered.contains("chatencryptfailed")
+        || lowered.contains("can only chat with friends")
+        || lowered.contains("chat is disabled")
 }
 
 #[tauri::command]
@@ -486,15 +551,66 @@ pub async fn get_chat_messages(
     Ok(rows
         .into_iter()
         .map(
-            |(id, direction, message, timestamp, read)| ChatMessageInfo {
+            |(id, direction, message, timestamp, read, delivery)| ChatMessageInfo {
                 id,
                 direction,
                 message,
                 timestamp,
                 read,
+                delivery: delivery_label(delivery),
             },
         )
         .collect())
+}
+
+/// Offer one of our shared files to a friend.
+///
+/// This only sends an invitation over the existing friend session. The
+/// recipient decides whether to accept, and if they do they start an ordinary
+/// download — we never push bytes at someone who did not ask.
+#[tauri::command]
+pub async fn offer_file_to_friend(
+    state: tauri::State<'_, AppState>,
+    user_hash_hex: String,
+    file_hash: String,
+) -> Result<(), String> {
+    let canonical = user_hash_hex.to_lowercase();
+    let hash = parse_user_hash(&canonical)?;
+    if !state.friend_hashes.read().await.contains(&hash) {
+        return Err(coded("peers_not_friend", "Can only send files to friends"));
+    }
+    let file = parse_user_hash(&file_hash.to_lowercase())?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    bounded_send(
+        &state.network_tx,
+        NetworkCommand::OfferFileToFriend {
+            ember_hash: hash,
+            file_hash: file,
+            tx,
+        },
+    )
+    .await?;
+    await_reply(rx, "peers_no_response", "No response").await?
+}
+
+/// Per-friend count of outbound messages still waiting for a session, so the
+/// chat dock can show an "unsent" marker without loading each conversation.
+#[tauri::command]
+pub async fn get_pending_chat_counts(
+    state: tauri::State<'_, AppState>,
+) -> Result<std::collections::HashMap<String, i64>, String> {
+    let db = state.db.clone();
+    let rows = tokio::task::spawn_blocking(move || db.pending_chat_counts())
+        .await
+        .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+        .map_err(|e| {
+            coded_ctx(
+                "peers_failed_load_pending_counts",
+                "Failed to load queued message counts",
+                e,
+            )
+        })?;
+    Ok(rows.into_iter().collect())
 }
 
 #[tauri::command]
@@ -627,6 +743,11 @@ pub async fn accept_friend_request(
             return Err(coded_ctx("peers_task_error", "Task error", e));
         }
     };
+
+    // The DB transaction above committed `mutual = 1`, so this friend may now
+    // browse us and reach friends-only files. Mirror that into the live set
+    // the wire checks against, rather than waiting for a restart to reload it.
+    state.mutual_friend_hashes.write().await.insert(hash);
 
     // Reuse the IP/port the requester left in their friend_requests
     // row (captured by `add_friend_request` at receive time). Without
@@ -1988,5 +2109,41 @@ pub async fn ember_dht_run_maintenance(
             kad_bridge_pings_sent: 0,
             error: Some(e),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::chat_failure_is_permanent;
+
+    /// The exact strings the `SendChatMessage` handler returns. Pinned here so
+    /// renaming one on the network side fails this test instead of silently
+    /// turning a permanent failure into a message queued forever.
+    #[test]
+    fn chat_failure_classification_matches_network_wording() {
+        for permanent in [
+            "Chat is disabled in Friends settings",
+            "Can only chat with friends",
+            "ChatEncryptFailed",
+        ] {
+            assert!(
+                chat_failure_is_permanent(permanent),
+                "{permanent:?} must not be queued for retry"
+            );
+        }
+
+        for transient in [
+            "Friend is offline",
+            "Connecting to friend, please retry in a moment",
+            "Auto-connect failed: connection refused",
+            "Connection channel full",
+            "Connection to friend closed",
+            "Failed to send on new connection",
+        ] {
+            assert!(
+                !chat_failure_is_permanent(transient),
+                "{transient:?} must be queued and retried"
+            );
+        }
     }
 }

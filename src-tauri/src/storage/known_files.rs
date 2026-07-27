@@ -39,6 +39,15 @@ const FT_EMBER_SOURCES: u8 = 0xE1;
 // Ember-only tag: streaming BLAKE3 of file contents (hex). Empty when unknown
 // (legacy known.met / not yet hashed). Discovery still keys off eD2K MD4.
 const FT_EMBER_FILE_HASH: u8 = 0xE2;
+// Ember-only tag: presence with a nonzero value means the user restricted an
+// otherwise-shared file to mutual friends. Absent (the common case, and every
+// known.met written before this field existed) means the file is public,
+// which keeps older catalogs behaving exactly as they did.
+//
+// 0xE3 rather than 0xE2: this branch already spends 0xE2 on the content hash
+// above. See the note in the friends-only commit about keeping the two
+// branches on the same id before either ships.
+const FT_EMBER_FRIENDS_ONLY: u8 = 0xE3;
 
 const TAG_STRING: u8 = 0x02;
 const TAG_UINT32: u8 = 0x03;
@@ -72,6 +81,10 @@ pub struct KnownFileRecord {
     /// Defaults to `true` so records from before this field existed keep
     /// behaving exactly as they did (nothing was ever persisted as unshared).
     pub is_shared: bool,
+    /// Whether an otherwise-shared file is restricted to mutual friends.
+    /// Mirrors `FileInfo::friends_only`. Defaults to `false` so records from
+    /// before this field existed keep behaving as public shares.
+    pub friends_only: bool,
     /// Last known complete-source ("Peers") count, refreshed roughly every
     /// 60s by the source-count sync while connected. See `FT_EMBER_SOURCES`.
     pub complete_sources: u32,
@@ -336,6 +349,7 @@ impl KnownFileList {
             last_publish_src: 0,
             last_shared: 0,
             is_shared: true,
+            friends_only: false,
             complete_sources: 0,
         };
 
@@ -402,6 +416,7 @@ impl KnownFileList {
                         }
                         FT_LASTSHARED => record.last_shared = v,
                         FT_EMBER_UNSHARED => record.is_shared = v == 0,
+                        FT_EMBER_FRIENDS_ONLY => record.friends_only = v != 0,
                         FT_EMBER_SOURCES => record.complete_sources = v,
                         _ => {}
                     }
@@ -632,6 +647,7 @@ impl KnownFileList {
             }
             existing.upload_priority = record.upload_priority;
             existing.is_shared = record.is_shared;
+            existing.friends_only = record.friends_only;
             existing.complete_sources = record.complete_sources;
             existing.last_publish_src = record.last_publish_src;
             existing.last_shared = record.last_shared;
@@ -787,6 +803,10 @@ impl KnownFileList {
             }
             if !record.is_shared {
                 write_u32_tag(&mut tags, FT_EMBER_UNSHARED, 1)?;
+                tag_count += 1;
+            }
+            if record.friends_only {
+                write_u32_tag(&mut tags, FT_EMBER_FRIENDS_ONLY, 1)?;
                 tag_count += 1;
             }
             if record.complete_sources > 0 {
@@ -1286,6 +1306,7 @@ mod tests {
             last_publish_src: 0,
             last_shared: 0,
             is_shared: true,
+            friends_only: false,
             complete_sources: 0,
         }
     }
@@ -1498,6 +1519,47 @@ mod tests {
         assert!(
             !loaded.find_by_hash(&hash).unwrap().is_shared,
             "is_shared=false must survive a save/load round trip"
+        );
+    }
+
+    /// Catalogs written before friends-only shares existed carry no tag, and
+    /// must keep loading as public rather than silently restricting files.
+    #[test]
+    fn friends_only_defaults_false_when_tag_absent() {
+        let mut kf = KnownFileList::new();
+        let r = sample_record();
+        let hash = r.file_hash;
+        kf.add_or_update(r);
+        assert!(!kf.find_by_hash(&hash).unwrap().friends_only);
+    }
+
+    /// A friends-only restriction is a privacy decision, so losing it on
+    /// restart would silently republish the file to the open network.
+    #[test]
+    fn friends_only_roundtrips_through_save_and_load() {
+        let mut kf = KnownFileList::new();
+        let mut r = sample_record();
+        r.friends_only = true;
+        let hash = r.file_hash;
+        kf.add_or_update(r);
+
+        let path = std::env::temp_dir().join(format!(
+            "ember_known_met_friends_only_roundtrip_{}_{}.met",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        kf.save(&path).expect("save known.met");
+
+        let loaded = KnownFileList::load(&path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_file_name("known_paths.dat"));
+
+        assert!(
+            loaded.find_by_hash(&hash).unwrap().friends_only,
+            "friends_only=true must survive a save/load round trip"
         );
     }
 

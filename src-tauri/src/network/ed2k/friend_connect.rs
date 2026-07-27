@@ -545,6 +545,40 @@ pub async fn run_friend_session_over_transport(
                                         }).await;
                                     }
                                 }
+                                (OP_EMULEPROT, super::messages::OP_EMBER_FILE_OFFER) => {
+                                    if let Some(offer) =
+                                        super::messages::parse_ember_file_offer(&payload)
+                                    {
+                                        let _ = session_ul_event_tx.send(UploadEvent {
+                                            transfer_id: String::new(),
+                                            kind: UploadEventKind::EmberFileOffer {
+                                                ember_hash: peer_ember_hash,
+                                                offer,
+                                                reply_tx: session_ember_session_handle.tx.clone(),
+                                            },
+                                        }).await;
+                                    } else {
+                                        debug!(
+                                            "Friend {} sent an unparseable OP_EMBER_FILE_OFFER ({} bytes)",
+                                            hex::encode(peer_ember_hash),
+                                            payload.len()
+                                        );
+                                    }
+                                }
+                                (OP_EMULEPROT, super::messages::OP_EMBER_FILE_OFFER_ACK) => {
+                                    if let Some((status, file_hash)) =
+                                        super::messages::parse_ember_file_offer_ack(&payload)
+                                    {
+                                        let _ = session_ul_event_tx.send(UploadEvent {
+                                            transfer_id: String::new(),
+                                            kind: UploadEventKind::EmberFileOfferAck {
+                                                ember_hash: peer_ember_hash,
+                                                status,
+                                                file_hash,
+                                            },
+                                        }).await;
+                                    }
+                                }
                                 (OP_EMULEPROT, OP_EMBER_KEEPALIVE) => {}
                                 _ => {
                                     debug!("Friend session ignoring proto=0x{proto:02X} op=0x{opcode:02X} from {addr}");

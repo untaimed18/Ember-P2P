@@ -648,8 +648,9 @@
                     <span class="hashing-label">{m.common_pending()}</span>
                   {:else if file.shared}
                     <span class="shared-icon shared-yes" title={m.library_shared()}>&#x2713;</span>
-                    {#if file.shared_kad || file.shared_ed2k || file.aich_hash}
+                    {#if file.friends_only || file.shared_kad || file.shared_ed2k || file.aich_hash}
                       <span class="shared-badges">
+                        {#if file.friends_only}<span class="shared-badge friends" title={m.library_friends_only_badge_title()}>{m.library_friends_only_badge()}</span>{/if}
                         {#if file.shared_kad}<span class="shared-badge kad" title={m.library_published_kad()}>KAD</span>{/if}
                         {#if file.shared_ed2k}<span class="shared-badge ed2k" title={m.library_published_ed2k()}>eD2K</span>{/if}
                         {#if file.aich_hash}<span class="shared-badge aich" title={m.library_aich_available()}>AICH</span>{/if}
@@ -934,6 +935,13 @@
     background: color-mix(in srgb, var(--aich-color) 15%, transparent);
     border-color: color-mix(in srgb, var(--aich-color) 30%, transparent);
     color: var(--aich-color);
+  }
+  /* Restricted shares read as a warning rather than a network badge: the
+     other three say where a file reached, this one says where it will not. */
+  .shared-badge.friends {
+    background: color-mix(in srgb, var(--warning) 15%, transparent);
+    border-color: color-mix(in srgb, var(--warning) 32%, transparent);
+    color: var(--warning);
   }
 
   /* Missing files: path no longer resolves on disk. Dim the row and tint the

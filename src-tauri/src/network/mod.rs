@@ -2181,6 +2181,89 @@ fn friend_xfer_inbound_status(
 
 /// Decide how to answer a friend's `OP_EMBER_XFER_REQ`, returning the
 /// `XFER_STATUS_*` code to ack with. Accepting commits us to dialing them.
+/// Replay outbound chat that was queued while a friend was unreachable.
+///
+/// Called whenever a session to `friend` becomes live. Messages go out oldest
+/// first so a conversation replays in the order it was typed, and each row is
+/// only marked delivered after its packet is accepted by the session channel —
+/// a mid-flush disconnect leaves the remainder queued for the next attempt.
+///
+/// Best-effort by design: a failure here simply leaves rows queued, so it
+/// never propagates into the session-establishment path that called it.
+async fn flush_pending_chat(
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    ember_sessions: &ed2k::upload::EmberSessionMap,
+    ed25519_secret_key: &[u8; 32],
+    friend: [u8; 16],
+) {
+    // Bounded so a friend who was offline for a very long time cannot stall
+    // the network task; the rest flush on the next reconnect.
+    const MAX_FLUSH_PER_SESSION: i64 = 200;
+
+    let hash_hex = hex::encode(friend);
+    let db_read = db.clone();
+    let hash_for_read = hash_hex.clone();
+    let pending = tokio::task::spawn_blocking(move || {
+        db_read.pending_chat_messages(&hash_for_read, MAX_FLUSH_PER_SESSION)
+    })
+    .await
+    .ok()
+    .and_then(|r| r.ok())
+    .unwrap_or_default();
+
+    if pending.is_empty() {
+        return;
+    }
+    info!(
+        "Flushing {} queued chat message(s) to friend {hash_hex}",
+        pending.len()
+    );
+
+    for (id, message, _stored_at) in pending {
+        let Some(packet) = ({
+            let sessions = ember_sessions.read().await;
+            sessions
+                .get(&friend)
+                .filter(|h| h.is_fresh() && h.is_secure_v2())
+                .and_then(|sender| {
+                    let peer_pubkey = sender.peer_ember_pubkey();
+                    crate::network::ember::crypto::encrypt_chat_for_peer(
+                        ed25519_secret_key,
+                        &peer_pubkey,
+                        message.as_bytes(),
+                    )
+                    .map(|envelope| (sender.tx.clone(), envelope))
+                })
+        }) else {
+            // Session went away mid-flush. Everything from here stays queued.
+            break;
+        };
+        let (session_tx, envelope) = packet;
+        let mut framed = Vec::with_capacity(6 + envelope.len());
+        framed.push(OP_EMULEPROT);
+        framed.extend_from_slice(&((1 + envelope.len()) as u32).to_le_bytes());
+        framed.push(ed2k::messages::OP_EMBER_CHAT_MSG);
+        framed.extend_from_slice(&envelope);
+        if session_tx.try_send(framed).is_err() {
+            break;
+        }
+        let db_mark = db.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            db_mark.set_chat_delivery(id, crate::storage::database::CHAT_DELIVERED)
+        })
+        .await;
+        let _ = app_handle.emit(
+            "ember:chat-delivery",
+            serde_json::json!({
+                "user_hash": hash_hex,
+                "id": id,
+                "delivery": "delivered",
+            }),
+        );
+    }
+}
+
 async fn friend_transfer_request_status(
     state: &mut NetworkState,
     local_index: &Arc<RwLock<LocalIndex>>,
@@ -2188,12 +2271,22 @@ async fn friend_transfer_request_status(
     request: &ed2k::messages::EmberXferRequest,
     peer_addr: SocketAddr,
     friend_hashes: &Arc<RwLock<HashSet<[u8; 16]>>>,
+    mutual_friend_hashes: &Arc<RwLock<HashSet<[u8; 16]>>>,
 ) -> u8 {
     // Membership is re-read here rather than trusted from the dispatch site:
     // the friend could have been removed while this event sat in the channel.
     let is_friend = friend_hashes.read().await.contains(&friend);
     let hash_hex = hex::encode(request.file_hash);
-    let is_shared = local_index.read().await.get_by_hash(&hash_hex).is_some();
+    // Mere index presence used to be enough here, which would have handed a
+    // friend an escalated transfer for a file we had explicitly unshared.
+    // Require a live share, and a mutual friendship for a restricted one.
+    let is_shared = match local_index.read().await.get_by_hash(&hash_hex) {
+        Some(file) if file.friends_only => {
+            mutual_friend_hashes.read().await.contains(&friend) && file.is_friend_visible()
+        }
+        Some(file) => file.is_friend_visible(),
+        None => false,
+    };
     let now = std::time::Instant::now();
 
     // Whether we could take part in a coordinated punch. Deliberately the same
@@ -3687,6 +3780,7 @@ async fn process_inbound_friend_request(
     db: &Arc<Database>,
     app_handle: &tauri::AppHandle,
     online_friends: &mut HashMap<[u8; 16], i64>,
+    mutual_friend_hashes: &crate::app_state::SharedFriendHashes,
     require_approval: bool,
     req_hash: [u8; 16],
     peer_pubkey: Option<[u8; 32]>,
@@ -3769,6 +3863,9 @@ async fn process_inbound_friend_request(
                 "Auto-confirming friend {} (already added; approval not required)",
                 hash_hex
             );
+            // The DB row is now mutual, so grant browse / friends-only access
+            // on the live set the wire consults.
+            mutual_friend_hashes.write().await.insert(req_hash);
             if !online_friends.contains_key(&req_hash) {
                 online_friends.insert(req_hash, chrono::Utc::now().timestamp());
                 let _ = app_handle.emit(
@@ -4450,6 +4547,7 @@ mod tests {
                 complete_sources: 0,
                 folder: String::new(),
                 shared: false,
+                friends_only: false,
                 shared_kad: false,
                 shared_ed2k: false,
             },
@@ -5653,6 +5751,17 @@ pub enum NetworkCommand {
     SetFilesShared {
         updates: Vec<(String, bool)>,
         tx: oneshot::Sender<Result<usize, String>>,
+    },
+    /// Persist the friends-only scope for a batch of content hashes.
+    SetFilesFriendsOnly {
+        updates: Vec<(String, bool)>,
+        tx: oneshot::Sender<Result<usize, String>>,
+    },
+    /// Offer one of our shared files to a friend over their live session.
+    OfferFileToFriend {
+        ember_hash: [u8; 16],
+        file_hash: [u8; 16],
+        tx: oneshot::Sender<Result<(), String>>,
     },
     GetFileComments {
         file_hash: String,
@@ -7626,9 +7735,12 @@ fn apply_publish_badges(
 ) {
     for f in files {
         let hash = parse_ed2k_hash16(&f.hash);
+        // A friends-only file is never published or offered, so its badges
+        // must stay dark even while both networks are connected.
+        let listable = f.is_public_listable();
         f.shared_kad =
-            f.shared && kad_connected && hash.map(|h| kad_published.contains(&h)).unwrap_or(false);
-        f.shared_ed2k = f.shared
+            listable && kad_connected && hash.map(|h| kad_published.contains(&h)).unwrap_or(false);
+        f.shared_ed2k = listable
             && server_connected
             && hash.map(|h| ed2k_offered.contains(&h)).unwrap_or(false);
     }
@@ -9901,6 +10013,7 @@ pub async fn start_network(
     shared_files: Arc<RwLock<Vec<FileInfo>>>,
     upload_shared_folders: crate::app_state::SharedFolderList,
     friend_hashes: crate::app_state::SharedFriendHashes,
+    mutual_friend_hashes: crate::app_state::SharedFriendHashes,
     uss_rtt_queue: crate::bandwidth::UssRttQueue,
     uss_enabled_flag: crate::bandwidth::UssEnabledFlag,
     spam_filter: Arc<RwLock<crate::search::spam::SpamFilter>>,
@@ -10913,6 +11026,7 @@ pub async fn start_network(
         let ul_udp_fw_tx = udp_fw_check_tx.clone();
         let ul_server_addr = shared_server_addr.clone();
         let ul_friends = friend_hashes.clone();
+        let ul_mutual_friends = mutual_friend_hashes.clone();
         let ul_ember = shared_ember_payload.clone();
         let ul_ember_gen = ember_payload_generation.clone();
         let ul_geoip = geoip.clone();
@@ -10964,6 +11078,7 @@ pub async fn start_network(
                 ul_obfuscation,
                 ul_server_addr,
                 ul_friends,
+                ul_mutual_friends,
                 ul_ember,
                 ul_ember_gen,
                 ul_geoip,
@@ -11545,6 +11660,7 @@ pub async fn start_network(
                         &ember_payload_generation,
                         &geoip,
                         &friend_hashes,
+                        &mutual_friend_hashes,
                         ember_hash,
                         &ul_event_tx,
                         ed25519_pubkey,
@@ -12045,7 +12161,7 @@ pub async fn start_network(
                     index
                         .all_files()
                         .iter()
-                        .filter(|f| f.shared)
+                        .filter(|f| f.is_public_listable())
                         .filter_map(|f| {
                             let hash_bytes = hex::decode(&f.hash).ok()?;
                             if hash_bytes.len() < 16 {
@@ -12565,6 +12681,7 @@ pub async fn start_network(
                             &ember_payload_generation,
                             &geoip,
                             &friend_hashes,
+                            &mutual_friend_hashes,
                             ember_hash,
                             &ul_event_tx,
                             ed25519_pubkey,
@@ -12853,11 +12970,19 @@ pub async fn start_network(
                                             .map(|record| record.is_shared)
                                             .unwrap_or(true),
                                     ),
+                                    // Re-downloading content the user had
+                                    // restricted to friends must not quietly
+                                    // republish it to the open network.
+                                    friends_only: existing
+                                        .as_ref()
+                                        .map(|record| record.friends_only)
+                                        .unwrap_or(false),
                                     complete_sources: existing
                                         .as_ref()
                                         .map(|record| record.complete_sources)
                                         .unwrap_or(0),
                                 };
+                                let completed_friends_only = record.friends_only;
                                 known_files.add_or_update(record.clone());
 
                                 // Auto-share completed download (eMule: CPartFile::PerformFileCompleteEnd)
@@ -12913,6 +13038,7 @@ pub async fn start_network(
                                             .map(|record| record.is_shared)
                                             .unwrap_or(true),
                                     ),
+                                    friends_only: completed_friends_only,
                                     shared_kad: false,
                                     shared_ed2k: false,
                                 };
@@ -12963,7 +13089,7 @@ pub async fn start_network(
                                     *shared_files.write().await = snap;
                                 }
 
-                                if shared_file.shared {
+                                if shared_file.is_public_listable() {
                                     // Publish to KAD
                                     state.publish_manager.add_file(PublishableFile {
                                         file_hash: md4_bytes_to_kad_id(&hash_bytes[..16]),
@@ -13213,6 +13339,7 @@ pub async fn start_network(
                                 &ember_payload_generation,
                                 &geoip,
                                 &friend_hashes,
+                                &mutual_friend_hashes,
                                 ember_hash,
                                 &ul_event_tx,
                                 ed25519_pubkey,
@@ -13970,6 +14097,7 @@ pub async fn start_network(
                         &ember_payload_generation,
                         &geoip,
                         &friend_hashes,
+                        &mutual_friend_hashes,
                         ember_hash,
                         &ul_event_tx,
                         ed25519_pubkey,
@@ -14129,6 +14257,56 @@ pub async fn start_network(
                     }
                 }
 
+                // A friend offered us a file. Surface it for an explicit
+                // accept and immediately ack receipt — the ack says "your
+                // offer arrived", not "I want it", so the sender can drop its
+                // pending state without waiting on a human.
+                if let UploadEventKind::EmberFileOffer { ember_hash: offer_eh, ref offer, ref reply_tx } = event.kind {
+                    if friend_hashes.read().await.contains(&offer_eh) {
+                        let status = if settings.friend_chat_disabled {
+                            // Reuse the chat switch as the "no unsolicited
+                            // contact from friends" control rather than adding
+                            // a second one that could disagree with it.
+                            ed2k::messages::OFFER_STATUS_DECLINED
+                        } else {
+                            ed2k::messages::OFFER_STATUS_ACCEPTED
+                        };
+                        if status == ed2k::messages::OFFER_STATUS_ACCEPTED {
+                            // The name is peer-supplied, so strip the same
+                            // bidi/control primitives chat text goes through
+                            // before it reaches the UI.
+                            let safe_name = crate::security::sanitize_chat_text(&offer.file_name);
+                            let _ = app_handle.emit(
+                                "ember:file-offer",
+                                serde_json::json!({
+                                    "user_hash": hex::encode(offer_eh),
+                                    "file_hash": hex::encode(offer.file_hash),
+                                    "file_name": safe_name,
+                                    "file_size": offer.file_size,
+                                }),
+                            );
+                        }
+                        let ack = ed2k::messages::build_ember_file_offer_ack(status, &offer.file_hash);
+                        let mut framed = Vec::with_capacity(6 + ack.len());
+                        framed.push(OP_EMULEPROT);
+                        framed.extend_from_slice(&((1 + ack.len()) as u32).to_le_bytes());
+                        framed.push(ed2k::messages::OP_EMBER_FILE_OFFER_ACK);
+                        framed.extend_from_slice(&ack);
+                        let _ = reply_tx.try_send(framed);
+                    }
+                }
+
+                if let UploadEventKind::EmberFileOfferAck { ember_hash: ack_eh, status, file_hash } = event.kind {
+                    let _ = app_handle.emit(
+                        "ember:file-offer-ack",
+                        serde_json::json!({
+                            "user_hash": hex::encode(ack_eh),
+                            "file_hash": hex::encode(file_hash),
+                            "accepted": status == ed2k::messages::OFFER_STATUS_ACCEPTED,
+                        }),
+                    );
+                }
+
                 // Inject Ember Peer Exchange sources from upload-side peers
                 if let UploadEventKind::EmberSources { ref entries, ref aich_roots, ref ember_peers, ref relay_attestations } = event.kind {
                     handle_epx_sources(&mut state, &transfer_manager, &source_manager, &local_index, entries, aich_roots, ember_peers, relay_attestations, "upload").await;
@@ -14185,6 +14363,18 @@ pub async fn start_network(
                                     "user_hash": hex::encode(ember_hash),
                                 }),
                             );
+                        }
+                        // The session is live, so anything the user typed
+                        // while this friend was unreachable can go out now.
+                        if still_friend {
+                            flush_pending_chat(
+                                &db,
+                                &app_handle,
+                                &state.ember_sessions,
+                                &ed25519_secret_key,
+                                *ember_hash,
+                            )
+                            .await;
                         }
                         if still_friend && !ip.is_unspecified() && *port > 0 {
                             let hash_hex = hex::encode(ember_hash);
@@ -14290,6 +14480,19 @@ pub async fn start_network(
                                     "port": port,
                                 }),
                             );
+                            // A friend who dials *us* never produces
+                            // `EmberFriendConnected` (that is emitted only by
+                            // the outbound dial path), so without flushing
+                            // here queued chat would sit unsent while the UI
+                            // showed the friend online and new sends worked.
+                            flush_pending_chat(
+                                &db,
+                                &app_handle,
+                                &state.ember_sessions,
+                                &ed25519_secret_key,
+                                *ember_hash,
+                            )
+                            .await;
                         }
                     }
                     _ => {}
@@ -14301,6 +14504,7 @@ pub async fn start_network(
                             &db,
                             &app_handle,
                             &mut state.online_friends,
+                            &mutual_friend_hashes,
                             settings.friend_require_approval,
                             req_hash,
                             pubkey,
@@ -14379,8 +14583,12 @@ pub async fn start_network(
                     supports_ebr1,
                 } = event.kind
                 {
+                    // Mutual, not merely listed. The UI already hides Browse
+                    // until a friendship is mutual, but that is cosmetic: the
+                    // wire has to enforce it, or anyone who learns our Ember
+                    // hash could add us one-sidedly and read our library.
                     if !settings.friend_browse_disabled
-                        && friend_hashes.read().await.contains(&browse_eh)
+                        && mutual_friend_hashes.read().await.contains(&browse_eh)
                     {
                         let hash_hex = hex::encode(browse_eh);
                         let files = {
@@ -14402,7 +14610,13 @@ pub async fn start_network(
                         const MAX_BROWSE_ANSWER_BYTES: usize = 400 * 1024;
                         let mut encoded_entries: Vec<([u8; 16], u64, Vec<u8>, Option<[u8; 20]>)> =
                             Vec::new();
-                        for f in files.iter().filter(|f| f.shared).take(MAX_BROWSE_ANSWER_FILES) {
+                        // Mutual friends see friends-only files alongside
+                        // public ones — that is the whole point of the scope.
+                        for f in files
+                            .iter()
+                            .filter(|f| f.is_friend_visible())
+                            .take(MAX_BROWSE_ANSWER_FILES)
+                        {
                             let Ok(hash_bytes) = hex::decode(&f.hash) else {
                                 continue;
                             };
@@ -14650,6 +14864,7 @@ pub async fn start_network(
                         &request,
                         xfer_peer_addr,
                         &friend_hashes,
+                        &mutual_friend_hashes,
                     )
                     .await;
 
@@ -14968,6 +15183,7 @@ pub async fn start_network(
                         &ember_payload_generation,
                         &geoip,
                         &friend_hashes,
+                        &mutual_friend_hashes,
                         ember_hash,
                         &ul_event_tx,
                         ed25519_pubkey,
@@ -17720,7 +17936,7 @@ pub async fn start_network(
                             let index = local_index.read().await;
                             index.all_files()
                                 .iter()
-                                .filter(|f| f.shared)
+                                .filter(|f| f.is_public_listable())
                                 .filter_map(|f| {
                                     let hash_bytes = hex::decode(&f.hash).ok()?;
                                     if hash_bytes.len() < 16 { return None; }
@@ -22390,6 +22606,7 @@ pub async fn start_network(
                                                 complete_sources: sr.complete_source_count,
                                                 folder: String::new(),
                                                 shared: false,
+                                                friends_only: false,
                                                 shared_kad: false,
                                                 shared_ed2k: false,
                                             },
@@ -23847,6 +24064,7 @@ pub async fn start_network(
                                             complete_sources: sr.complete_source_count,
                                             folder: String::new(),
                                             shared: false,
+                                            friends_only: false,
                                             shared_kad: false,
                                             shared_ed2k: false,
                                         },
@@ -24191,7 +24409,7 @@ pub async fn start_network(
                                 index
                                     .all_files()
                                     .iter()
-                                    .filter(|f| f.shared)
+                                    .filter(|f| f.is_public_listable())
                                     .filter_map(|f| {
                                         let hash_bytes = hex::decode(&f.hash).ok()?;
                                         if hash_bytes.len() < 16 {
@@ -29261,6 +29479,7 @@ fn build_ember_keyword_results(blobs: &[Vec<u8>], keywords: &[String]) -> Vec<Se
                         complete_sources: 0,
                         folder: String::new(),
                         shared: false,
+                        friends_only: false,
                         shared_kad: false,
                         shared_ed2k: false,
                     },
@@ -30515,12 +30734,21 @@ async fn handle_udp_packet_inner(
 
                 let local_file = {
                     let idx = local_index.read().await;
-                    idx.get_by_hash(&hash_hex).map(|file| {
-                        (
-                            file.size,
-                            vec![true; ed2k::messages::ed2k_wire_part_count(file.size) as usize],
-                        )
-                    })
+                    // UDP carries no authenticated peer identity, so this can
+                    // only ever answer for public files. Index presence alone
+                    // used to be enough, which confirmed possession of both
+                    // unshared and friends-only files to any prober.
+                    idx.get_by_hash(&hash_hex)
+                        .filter(|file| file.is_public_listable())
+                        .map(|file| {
+                            (
+                                file.size,
+                                vec![
+                                    true;
+                                    ed2k::messages::ed2k_wire_part_count(file.size) as usize
+                                ],
+                            )
+                        })
                 };
                 let partial_candidate = if local_file.is_none() {
                     let mgr = transfer_manager.read().await;
@@ -33176,6 +33404,7 @@ async fn handle_command(
     ember_payload_generation: &ember::EmberPayloadGeneration,
     geoip: &crate::geoip::GeoIpReader,
     friend_hashes: &crate::app_state::SharedFriendHashes,
+    mutual_friend_hashes: &crate::app_state::SharedFriendHashes,
     ember_hash: [u8; 16],
     ul_event_tx: &mpsc::Sender<upload_server::UploadEvent>,
     ed25519_pubkey: [u8; 32],
@@ -33207,6 +33436,7 @@ async fn handle_command(
         ember_payload_generation,
         geoip,
         friend_hashes,
+        mutual_friend_hashes,
         ember_hash,
         ul_event_tx,
         ed25519_pubkey,
@@ -33249,6 +33479,7 @@ async fn handle_command_inner(
     ember_payload_generation: &ember::EmberPayloadGeneration,
     geoip: &crate::geoip::GeoIpReader,
     friend_hashes: &crate::app_state::SharedFriendHashes,
+    mutual_friend_hashes: &crate::app_state::SharedFriendHashes,
     ember_hash: [u8; 16],
     ul_event_tx: &mpsc::Sender<upload_server::UploadEvent>,
     ed25519_pubkey: [u8; 32],
@@ -34609,7 +34840,10 @@ async fn handle_command_inner(
 
         NetworkCommand::AnnounceFiles { files } => {
             for file in files {
-                if !file.shared {
+                // Friends-only files are never announced to KAD. Publishing a
+                // source or keyword for one would make it discoverable by
+                // search even though browse hides it.
+                if !file.is_public_listable() {
                     continue;
                 }
                 if let Ok(raw_bytes) = hex::decode(&file.hash) {
@@ -36861,6 +37095,137 @@ async fn handle_command_inner(
             let _ = tx.send(Ok(parsed.len()));
         }
 
+        NetworkCommand::OfferFileToFriend {
+            ember_hash: friend_eh,
+            file_hash,
+            tx,
+        } => {
+            if !friend_hashes.read().await.contains(&friend_eh) {
+                let _ = tx.send(Err("Can only send files to friends".into()));
+                return;
+            }
+            // Only offer something we would actually serve. Resolving the
+            // name and size here also means the recipient's prompt describes
+            // the real file rather than anything the sender typed.
+            let hash_hex = hex::encode(file_hash);
+            let entry = {
+                let idx = local_index.read().await;
+                idx.get_by_hash(&hash_hex)
+                    .filter(|f| f.is_friend_visible())
+                    .map(|f| (f.name.clone(), f.size))
+            };
+            let Some((file_name, file_size)) = entry else {
+                let _ = tx.send(Err("File is not shared".into()));
+                return;
+            };
+            // A friends-only file is only offerable to a mutual friend, for
+            // the same reason it is only servable to one.
+            let restricted = {
+                let idx = local_index.read().await;
+                idx.get_by_hash(&hash_hex).is_some_and(|f| f.friends_only)
+            };
+            if restricted && !mutual_friend_hashes.read().await.contains(&friend_eh) {
+                let _ = tx.send(Err("File is restricted to mutual friends".into()));
+                return;
+            }
+            let payload = ed2k::messages::build_ember_file_offer(&ed2k::messages::EmberFileOffer {
+                file_hash,
+                file_size,
+                file_name,
+            });
+            let sessions = state.ember_sessions.read().await;
+            let Some(session) = sessions
+                .get(&friend_eh)
+                .filter(|h| h.is_fresh() && h.is_secure_v2())
+            else {
+                drop(sessions);
+                let _ = tx.send(Err("Friend is offline".into()));
+                return;
+            };
+            let mut framed = Vec::with_capacity(6 + payload.len());
+            framed.push(OP_EMULEPROT);
+            framed.extend_from_slice(&((1 + payload.len()) as u32).to_le_bytes());
+            framed.push(ed2k::messages::OP_EMBER_FILE_OFFER);
+            framed.extend_from_slice(&payload);
+            let result = session.tx.try_send(framed);
+            drop(sessions);
+            match result {
+                Ok(()) => {
+                    info!(
+                        "Offered {hash_hex} to friend {}",
+                        hex::encode(friend_eh)
+                    );
+                    let _ = tx.send(Ok(()));
+                }
+                Err(_) => {
+                    let _ = tx.send(Err("Connection to friend closed".into()));
+                }
+            }
+        }
+
+        NetworkCommand::SetFilesFriendsOnly { updates, tx } => {
+            let mut parsed = Vec::with_capacity(updates.len());
+            let mut error = None;
+            for (file_hash_hex, friends_only) in updates {
+                match hex::decode(&file_hash_hex) {
+                    Ok(bytes) if bytes.len() == 16 => {
+                        let mut hash = [0u8; 16];
+                        hash.copy_from_slice(&bytes);
+                        if known_files.find_by_hash(&hash).is_none() {
+                            error =
+                                Some(format!("No known.met record for file hash {file_hash_hex}"));
+                            break;
+                        }
+                        parsed.push((hash, friends_only));
+                    }
+                    Ok(bytes) => {
+                        error = Some(format!(
+                            "File hash {file_hash_hex} has {} bytes, expected 16",
+                            bytes.len()
+                        ));
+                        break;
+                    }
+                    Err(e) => {
+                        error = Some(format!("Invalid file hash {file_hash_hex}: {e}"));
+                        break;
+                    }
+                }
+            }
+            if let Some(error) = error {
+                let _ = tx.send(Err(error));
+                return;
+            }
+            let before = known_files.clone();
+            for (hash, friends_only) in &parsed {
+                if let Some(record) = known_files.find_by_hash_mut(hash) {
+                    record.friends_only = *friends_only;
+                }
+            }
+            if !parsed.is_empty() {
+                known_files.mark_dirty();
+                // Persist before acknowledging, exactly as SetFilesShared
+                // does. Restricting a file to friends is a privacy decision:
+                // reporting success and then losing it on the next start
+                // would silently republish the file to the open network.
+                let ownership = state.known_met_save_lock.clone().lock_owned().await;
+                let known_path = state.data_dir.join("known.met");
+                let mut snapshot = known_files.clone();
+                let save_result = tokio::task::spawn_blocking(move || {
+                    let _ownership = ownership;
+                    snapshot.save(&known_path)
+                })
+                .await
+                .map_err(|e| format!("known.met share-scope save task failed: {e}"))
+                .and_then(|result| result.map_err(|e| e.to_string()));
+                if let Err(e) = save_result {
+                    *known_files = before;
+                    let _ = tx.send(Err(format!("Failed to persist file share scope: {e}")));
+                    return;
+                }
+            }
+            let _ = tx.send(Ok(parsed.len()));
+        }
+
         NetworkCommand::SharedFilesChangedAck { tx: reconcile_ack } => {
             let all_index_files = {
                 let index = local_index.read().await;
@@ -37033,6 +37398,16 @@ async fn handle_command_inner(
                                 last_publish_src: lps,
                                 last_shared: chrono::Utc::now().timestamp() as u32,
                                 is_shared,
+                                // Fail closed. A rediscovered or rehashed file
+                                // arrives with `friends_only = false` straight
+                                // from `discover_file`, and letting that win
+                                // would quietly republish content the user had
+                                // restricted. Lifting a restriction goes
+                                // through `SetFilesFriendsOnly`, which clears
+                                // the record before any reconcile runs, so an
+                                // intentional unrestrict is unaffected.
+                                friends_only: f.friends_only
+                                    || existing.as_ref().is_some_and(|r| r.friends_only),
                                 complete_sources: sources,
                             });
                             // Real BLAKE3 just landed (or was refreshed) —
@@ -37049,7 +37424,7 @@ async fn handle_command_inner(
             let mut seen_hashes = std::collections::HashSet::new();
             let files: Vec<PublishableFile> = all_index_files
                 .iter()
-                .filter(|f| f.shared)
+                .filter(|f| f.is_public_listable())
                 .filter_map(|f| {
                     if f.hash.is_empty() || !seen_hashes.insert(f.hash.clone()) {
                         return None;
@@ -37155,7 +37530,7 @@ async fn handle_command_inner(
                 let mut seen_offer_hashes = std::collections::HashSet::new();
                 let mut offer_files: Vec<ed2k::server::OfferFile> = all_index_files
                     .iter()
-                    .filter(|f| f.shared)
+                    .filter(|f| f.is_public_listable())
                     .filter_map(|f| {
                         if f.hash.is_empty() || !seen_offer_hashes.insert(f.hash.clone()) {
                             return None;
@@ -39178,6 +39553,8 @@ async fn handle_upload_event(
         | UploadEventKind::PeerAutoBanned { .. }
         | UploadEventKind::EmberTransferRequest { .. }
         | UploadEventKind::EmberTransferAck { .. }
+        | UploadEventKind::EmberFileOffer { .. }
+        | UploadEventKind::EmberFileOfferAck { .. }
         | UploadEventKind::EmberFriendRequest { .. } => {
             // Handled directly in the network event loop.
         }
@@ -39599,6 +39976,7 @@ fn convert_search_results(
                         complete_sources: p.complete_sources_tag,
                         folder: String::new(),
                         shared: false,
+                        friends_only: false,
                         shared_kad: false,
                         shared_ed2k: false,
                     },
@@ -39731,6 +40109,7 @@ fn convert_note_search_results(
                     complete_sources: 0,
                     folder: String::new(),
                     shared: false,
+                    friends_only: false,
                     shared_kad: false,
                     shared_ed2k: false,
                 },

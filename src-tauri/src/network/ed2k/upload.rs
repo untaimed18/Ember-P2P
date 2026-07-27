@@ -270,6 +270,43 @@ async fn live_secure_friend_member(
     }
 }
 
+/// The requesting peer's authenticated identity on a single upload session,
+/// as far as [`UploadHandler::resolve_upload_file`] needs it.
+///
+/// Passing this rather than a precomputed boolean keeps the mutual-friend
+/// lookup lazy: it happens only when the resolved file is actually restricted,
+/// so ordinary public serving takes no extra lock.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct PeerFileAccess {
+    /// Peer Ember hash, once proven. `None` until `OP_EMBER_HELLO` lands, and
+    /// forever on plain eMule sockets.
+    pub ember_hash: Option<[u8; 16]>,
+    /// Whether this session completed the Noise IK secure friend handshake.
+    pub secure_v2_authenticated: bool,
+}
+
+/// True when this peer may reach **private** content on this session: friends
+/// -only files and friend browse answers.
+///
+/// Stricter than [`live_secure_friend_member`] on purpose. Slot priority is a
+/// courtesy we extend to anyone we listed, so a one-sided add earning it is
+/// harmless. Private content is the opposite: honouring a one-sided add there
+/// would let anyone who learns our Ember hash add us and read our friends-only
+/// library. So this additionally requires that the peer added us back.
+async fn mutual_friend_access(
+    mutual_friend_hashes: &Arc<RwLock<std::collections::HashSet<[u8; 16]>>>,
+    peer_ember_hash: Option<[u8; 16]>,
+    secure_v2_authenticated: bool,
+) -> bool {
+    if !secure_v2_authenticated {
+        return false;
+    }
+    match peer_ember_hash {
+        Some(hash) => mutual_friend_hashes.read().await.contains(&hash),
+        None => false,
+    }
+}
+
 /// Configured-server IPs may use reserved admission slots **only** for the
 /// short HighID port-test protocol.  Long-lived upload/friend sessions that
 /// entered via that reserve must be rejected once ordinary capacity is full.
@@ -1344,6 +1381,20 @@ pub enum UploadEventKind {
         status: u8,
         nonce: [u8; 16],
     },
+    /// A friend is offering to send us a file. Surfaced to the UI for an
+    /// explicit accept — we never start a download because a peer asked us to.
+    EmberFileOffer {
+        ember_hash: [u8; 16],
+        offer: super::messages::EmberFileOffer,
+        /// The friend session this arrived on, for the offer ack.
+        reply_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    },
+    /// A friend answered a file offer we sent them.
+    EmberFileOfferAck {
+        ember_hash: [u8; 16],
+        status: u8,
+        file_hash: [u8; 16],
+    },
     EmberFriendDisconnected {
         ember_hash: [u8; 16],
         session_id: u64,
@@ -1532,6 +1583,10 @@ struct UploadHandler {
     ed25519_secret_key: [u8; 32],
     /// Live friend user-hash set for friend-slot priority boost
     friend_hashes: Arc<RwLock<std::collections::HashSet<[u8; 16]>>>,
+    /// Subset of `friend_hashes` that added us back. Gates access to private
+    /// content: friend browse answers and serving friends-only files. A
+    /// one-sided add still earns slot priority but never reaches these.
+    mutual_friend_hashes: Arc<RwLock<std::collections::HashSet<[u8; 16]>>>,
     /// Pre-built Ember Peer Exchange payload (shared, read-only).
     ember_payload: crate::network::ember::SharedEmberPayload,
     /// Generation counter for `ember_payload`; bumped each time the
@@ -2226,6 +2281,10 @@ pub async fn start_upload_server(
     obfuscation_enabled: Arc<std::sync::atomic::AtomicBool>,
     shared_server_addr: Arc<RwLock<Option<SocketAddr>>>,
     friend_hashes: Arc<RwLock<std::collections::HashSet<[u8; 16]>>>,
+    // Subset of `friend_hashes` that added us back. Required for anything
+    // that exposes private content: friend browse answers and serving a
+    // friends-only file.
+    mutual_friend_hashes: Arc<RwLock<std::collections::HashSet<[u8; 16]>>>,
     ember_payload: crate::network::ember::SharedEmberPayload,
     ember_payload_generation: crate::network::ember::EmberPayloadGeneration,
     geoip: crate::geoip::GeoIpReader,
@@ -2332,6 +2391,7 @@ pub async fn start_upload_server(
         ed25519_public_key,
         ed25519_secret_key,
         friend_hashes,
+        mutual_friend_hashes,
         ember_payload,
         ember_payload_generation,
         geoip,
@@ -2949,7 +3009,18 @@ impl UploadHandler {
         }
     }
 
-    async fn resolve_upload_file(&self, file_hash: &[u8; 16]) -> Option<ResolvedUploadFile> {
+    /// Resolve a requested hash to a servable file.
+    ///
+    /// `peer` carries the requester's authenticated identity on *this*
+    /// session and is the sole key to friends-only files. Callers that have
+    /// no cryptographic identity for the peer — plain eMule sockets, the UDP
+    /// reask path, server-driven serves — pass [`PeerFileAccess::ANONYMOUS`]
+    /// and can never reach restricted content.
+    async fn resolve_upload_file(
+        &self,
+        file_hash: &[u8; 16],
+        peer: PeerFileAccess,
+    ) -> Option<ResolvedUploadFile> {
         let hash_hex = hex::encode(file_hash);
         if let Some(file) = {
             let index = self.local_index.read().await;
@@ -2958,8 +3029,8 @@ impl UploadHandler {
             'shared: {
                 // Respect the user's "shared" toggle: unsharing a completed file
                 // stops it from being offered/published (see
-                // `build_shared_files_answer`'s `filter(|f| f.shared)`), but a
-                // peer that already learned the hash before the toggle (KAD
+                // `build_shared_files_answer`'s `is_public_listable` filter),
+                // but a peer that already learned the hash before the toggle (KAD
                 // publish, source exchange, a friend's known-sources cache, …)
                 // could otherwise still pull it straight from the index forever.
                 // Break out (instead of returning) so an in-progress download of
@@ -2967,6 +3038,29 @@ impl UploadHandler {
                 // branch below — `shared` only governs completed, indexed files.
                 if !file.shared {
                     tracing::debug!("Rejecting resolve for unshared file: {}", hash_hex);
+                    break 'shared;
+                }
+                // A friends-only file is served only to an authenticated
+                // mutual friend. Break (rather than return) for the same
+                // reason as the `shared` check above: an in-progress download
+                // of the same hash is still servable from the transfer
+                // manager, which is unrelated to library share scope.
+                //
+                // The membership lookup is deliberately inside this branch so
+                // the overwhelmingly common public-file path never pays for
+                // the lock.
+                if file.friends_only
+                    && !mutual_friend_access(
+                        &self.mutual_friend_hashes,
+                        peer.ember_hash,
+                        peer.secure_v2_authenticated,
+                    )
+                    .await
+                {
+                    tracing::debug!(
+                        "Rejecting resolve for friends-only file from non-friend: {}",
+                        hash_hex
+                    );
                     break 'shared;
                 }
                 let path = PathBuf::from(&file.path);
@@ -3097,7 +3191,7 @@ impl UploadHandler {
             index
                 .all_files()
                 .iter()
-                .filter(|f| f.shared)
+                .filter(|f| f.is_public_listable())
                 .take(MAX_BROWSE_ANSWER_FILES)
                 .map(|f| (f.hash.clone(), f.name.clone(), f.size, f.extension.clone()))
                 .collect()
@@ -5514,7 +5608,7 @@ impl UploadHandler {
             last_part_request = std::time::Instant::now();
             let tid = uuid::Uuid::new_v4().to_string();
             transfer_id = Some(tid.clone());
-            if let Some(resolved) = self.resolve_upload_file(&fh).await {
+            if let Some(resolved) = self.resolve_upload_file(&fh, PeerFileAccess { ember_hash: peer_ember_hash, secure_v2_authenticated }).await {
                 total_size = resolved.size;
                 let _ = self
                     .upload_event_tx
@@ -6061,7 +6155,7 @@ impl UploadHandler {
                                             // returned None and the Uploading list showed a blank
                                             // File column for partial-file seeds.
                                             let file_name = self
-                                                .resolve_upload_file(&hash)
+                                                .resolve_upload_file(&hash, PeerFileAccess { ember_hash: peer_ember_hash, secure_v2_authenticated })
                                                 .await
                                                 .map(|rf| rf.name);
 
@@ -6369,7 +6463,7 @@ impl UploadHandler {
                         current_file_hash = Some(hash);
                         self.sync_queue_file_hash(&queue_identity, hash).await;
 
-                        if let Some(file) = self.resolve_upload_file(&hash).await {
+                        if let Some(file) = self.resolve_upload_file(&hash, PeerFileAccess { ember_hash: peer_ember_hash, secure_v2_authenticated }).await {
                             self.record_share_request_once(&hash, &mut recorded_share_request)
                                 .await;
                             let Some(ed2k_part_count) = ed2k_wire_part_count_u16(file.size) else {
@@ -6495,7 +6589,7 @@ impl UploadHandler {
                         current_file_hash = Some(hash);
                     }
                     if let Some(hash) = current_file_hash {
-                        if let Some(file) = self.resolve_upload_file(&hash).await {
+                        if let Some(file) = self.resolve_upload_file(&hash, PeerFileAccess { ember_hash: peer_ember_hash, secure_v2_authenticated }).await {
                             // eMule ProcessExtendedInfo: bytes after the 16-byte
                             // hash carry the downloader's advertised part status
                             // (ExtendedRequests v1+ — partcount u16 + bitmap).
@@ -6579,7 +6673,7 @@ impl UploadHandler {
                     }
 
                     if let Some(h) = current_file_hash {
-                        if self.resolve_upload_file(&h).await.is_some() {
+                        if self.resolve_upload_file(&h, PeerFileAccess { ember_hash: peer_ember_hash, secure_v2_authenticated }).await.is_some() {
                             self.record_share_request_once(&h, &mut recorded_share_request)
                                 .await;
                         }
@@ -7095,7 +7189,7 @@ impl UploadHandler {
                         // absent from the shared index) report their name instead of a blank
                         // File column in the Uploading list.
                         let file_name = self
-                            .resolve_upload_file(&hash)
+                            .resolve_upload_file(&hash, PeerFileAccess { ember_hash: peer_ember_hash, secure_v2_authenticated })
                             .await
                             .map(|rf| rf.name);
 
@@ -7209,7 +7303,7 @@ impl UploadHandler {
                     // Resolve once and repair both. Only runs on these off-nominal
                     // paths, so there's no cost on the steady-state serve loop.
                     if total_size == 0 || transfer_id.is_none() {
-                        if let Some(file) = self.resolve_upload_file(&hash).await {
+                        if let Some(file) = self.resolve_upload_file(&hash, PeerFileAccess { ember_hash: peer_ember_hash, secure_v2_authenticated }).await {
                             if total_size == 0 {
                                 total_size = file.size;
                             }
@@ -7332,7 +7426,7 @@ impl UploadHandler {
                         last_part_request.elapsed().as_secs(),
                     );
 
-                    let resolved = match self.resolve_upload_file(&hash).await {
+                    let resolved = match self.resolve_upload_file(&hash, PeerFileAccess { ember_hash: peer_ember_hash, secure_v2_authenticated }).await {
                         Some(file) => file,
                         None => {
                             write_packet_async(
@@ -8459,7 +8553,7 @@ impl UploadHandler {
                 (OP_EDONKEYHEADER, OP_HASHSETREQ) if payload.len() >= 16 => {
                     let mut req_hash = [0u8; 16];
                     req_hash.copy_from_slice(&payload[..16]);
-                    if let Some(file) = self.resolve_upload_file(&req_hash).await {
+                    if let Some(file) = self.resolve_upload_file(&req_hash, PeerFileAccess { ember_hash: peer_ember_hash, secure_v2_authenticated }).await {
                         let path = file.path.clone();
                         let file_name = file.name.clone();
                         let file_size = file.size;
@@ -8513,7 +8607,7 @@ impl UploadHandler {
                     let mut cursor = std::io::Cursor::new(&payload[..]);
                     if let Ok(file_ident) = FileIdentifier::read_identifier(&mut cursor) {
                         let options = byteorder::ReadBytesExt::read_u8(&mut cursor).unwrap_or(0);
-                        if let Some(file) = self.resolve_upload_file(&file_ident.md4_hash).await {
+                        if let Some(file) = self.resolve_upload_file(&file_ident.md4_hash, PeerFileAccess { ember_hash: peer_ember_hash, secure_v2_authenticated }).await {
                             let local_ident = FileIdentifier {
                                 md4_hash: file_ident.md4_hash,
                                 file_size: Some(file.size),
@@ -8608,7 +8702,7 @@ impl UploadHandler {
                     ) {
                         Ok(mpreq) => {
                             let hash_hex = hex::encode(mpreq.file_hash);
-                            if let Some(file) = self.resolve_upload_file(&mpreq.file_hash).await {
+                            if let Some(file) = self.resolve_upload_file(&mpreq.file_hash, PeerFileAccess { ember_hash: peer_ember_hash, secure_v2_authenticated }).await {
                             let local_ident = FileIdentifier {
                                 md4_hash: mpreq.file_hash,
                                 file_size: Some(file.size),
@@ -8887,7 +8981,7 @@ impl UploadHandler {
                         };
 
                         let hash_hex = hex::encode(req_hash);
-                        if let Some(file) = self.resolve_upload_file(&req_hash).await {
+                        if let Some(file) = self.resolve_upload_file(&req_hash, PeerFileAccess { ember_hash: peer_ember_hash, secure_v2_authenticated }).await {
                             let cached = {
                                 let mut cache = self.aich_cache.lock().await;
                                 cache.get(&hash_hex)
@@ -8956,7 +9050,7 @@ impl UploadHandler {
                 (OP_EMULEPROT, OP_AICHFILEHASHREQ) if payload.len() >= 16 => {
                     let mut req_hash = [0u8; 16];
                     req_hash.copy_from_slice(&payload[..16]);
-                    if let Some(file) = self.resolve_upload_file(&req_hash).await {
+                    if let Some(file) = self.resolve_upload_file(&req_hash, PeerFileAccess { ember_hash: peer_ember_hash, secure_v2_authenticated }).await {
                         if let Some(aich_hash) = parse_aich_root_hash(&file.aich_hash_hex) {
                             let mut resp = Vec::with_capacity(16 + 20);
                             resp.extend_from_slice(&req_hash);
@@ -9612,6 +9706,52 @@ impl UploadHandler {
                                         ember_hash: eh,
                                         status,
                                         nonce,
+                                    },
+                                })
+                                .await;
+                        }
+                    }
+                }
+
+                (OP_EMULEPROT, OP_EMBER_FILE_OFFER)
+                    if friend_privileges_allowed(secure_v2_authenticated, is_ember_friend) =>
+                {
+                    if let (Some(eh), Some(reply_tx)) =
+                        (peer_ember_hash, ember_session_handle.as_ref().map(|h| h.tx.clone()))
+                    {
+                        if let Some(offer) =
+                            super::messages::parse_ember_file_offer(&payload)
+                        {
+                            let _ = self
+                                .upload_event_tx
+                                .send(UploadEvent {
+                                    transfer_id: String::new(),
+                                    kind: UploadEventKind::EmberFileOffer {
+                                        ember_hash: eh,
+                                        offer,
+                                        reply_tx,
+                                    },
+                                })
+                                .await;
+                        }
+                    }
+                }
+
+                (OP_EMULEPROT, OP_EMBER_FILE_OFFER_ACK)
+                    if friend_privileges_allowed(secure_v2_authenticated, is_ember_friend) =>
+                {
+                    if let Some(eh) = peer_ember_hash {
+                        if let Some((status, file_hash)) =
+                            super::messages::parse_ember_file_offer_ack(&payload)
+                        {
+                            let _ = self
+                                .upload_event_tx
+                                .send(UploadEvent {
+                                    transfer_id: String::new(),
+                                    kind: UploadEventKind::EmberFileOfferAck {
+                                        ember_hash: eh,
+                                        status,
+                                        file_hash,
                                     },
                                 })
                                 .await;

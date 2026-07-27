@@ -7,6 +7,7 @@ import {
   getUnreadMessageCounts,
   isFriendDiscoverable,
   type FriendRequestInfo,
+  type IncomingFileOffer,
 } from '$lib/api/friends';
 
 export const onlineFriends = writable<Set<string>>(new Set());
@@ -14,6 +15,12 @@ export const unreadCounts = writable<Map<string, number>>(new Map());
 export const friendRequests = writable<FriendRequestInfo[]>([]);
 export const searchingFriends = writable<Set<string>>(new Set());
 export const isDiscoverable = writable(false);
+/**
+ * Unsolicited file offers from friends, awaiting a decision. Kept in a store
+ * rather than a transient toast because accepting one starts a download, and
+ * that is not a choice to lose to a dismissed notification.
+ */
+export const fileOffers = writable<IncomingFileOffer[]>([]);
 
 // L19: per-friend timers that automatically clear stale "searching"
 // state. The backend emits `friend-searching` and is supposed to
@@ -186,6 +193,24 @@ export async function initFriendsStore() {
           const next = new Map(m);
           next.set(hash, (next.get(hash) || 0) + 1);
           return next;
+        });
+      }),
+    );
+    registered.push(
+      await listen<IncomingFileOffer>('ember:file-offer', (event) => {
+        const user_hash = validFriendHash(event.payload?.user_hash);
+        const file_hash = validFriendHash(event.payload?.file_hash);
+        if (!user_hash || !file_hash) return;
+        const file_name = safeEventText(event.payload?.file_name, 256);
+        const file_size = Number(event.payload?.file_size) || 0;
+        fileOffers.update((offers) => {
+          // A friend re-offering the same file replaces the earlier prompt
+          // instead of stacking duplicates.
+          const rest = offers.filter(
+            (o) => !(o.user_hash === user_hash && o.file_hash === file_hash),
+          );
+          // Bound the list so a misbehaving friend cannot grow it without end.
+          return [...rest, { user_hash, file_hash, file_name, file_size }].slice(-20);
         });
       }),
     );
@@ -384,5 +409,13 @@ export function cleanupFriendsStore() {
   friendRequests.set([]);
   searchingFriends.set(new Set());
   isDiscoverable.set(false);
+  fileOffers.set([]);
   activeChatHash.set(null);
+}
+
+/** Drop an offer once the user has accepted or dismissed it. */
+export function clearFileOffer(userHash: string, fileHash: string) {
+  fileOffers.update((offers) =>
+    offers.filter((o) => !(o.user_hash === userHash && o.file_hash === fileHash)),
+  );
 }

@@ -529,6 +529,30 @@ pub fn run() {
                 }
                 Arc::new(RwLock::new(set))
             };
+            // Mutual friends are the subset that also added us back. Friend-only
+            // shares and browse answers key off this rather than `friend_hashes`,
+            // so a one-sided add cannot reach private content.
+            let mutual_friend_hashes: app_state::SharedFriendHashes = {
+                let mut set = std::collections::HashSet::new();
+                if let Ok(rows) = db.get_friends_full() {
+                    for row in &rows {
+                        if !row.6 {
+                            continue;
+                        }
+                        if let Ok(bytes) = hex::decode(&row.0) {
+                            if bytes.len() == 16 {
+                                let mut h = [0u8; 16];
+                                h.copy_from_slice(&bytes);
+                                set.insert(h);
+                            }
+                        }
+                    }
+                    if !set.is_empty() {
+                        info!("Loaded {} mutual friends from database", set.len());
+                    }
+                }
+                Arc::new(RwLock::new(set))
+            };
 
             let shared_folder_watcher = sharing::watcher::SharedFoldersWatcher::start(
                 app_handle.clone(),
@@ -576,6 +600,7 @@ pub fn run() {
                 spam_filter: spam_filter.clone(),
                 upload_shared_folders: upload_shared_folders.clone(),
                 friend_hashes: friend_hashes.clone(),
+                mutual_friend_hashes: mutual_friend_hashes.clone(),
                 shared_folder_watcher,
                 background_scans: Arc::new(RwLock::new(std::collections::HashMap::new())),
                 background_scan_seq: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -813,6 +838,10 @@ pub fn run() {
                             &record.file_hash,
                             record.is_shared,
                         );
+                        // Same reasoning for the friends-only scope: losing it
+                        // on a cold start would republish a file the user had
+                        // deliberately kept off the open network.
+                        file.friends_only = record.friends_only;
                         file.alltime_requests = record.all_time_requested;
                         file.alltime_accepted = record.all_time_accepted;
                         file.alltime_transferred = record.all_time_transferred;
@@ -1172,6 +1201,7 @@ pub fn run() {
                     cached_shared_files_net,
                     upload_shared_folders,
                     friend_hashes,
+                    mutual_friend_hashes,
                     uss_rtt_queue,
                     uss_enabled_flag,
                     net_spam,
@@ -1251,6 +1281,7 @@ pub fn run() {
             commands::sharing::batch_set_priority,
             commands::sharing::batch_share,
             commands::sharing::batch_unshare,
+            commands::sharing::set_files_friends_only,
             commands::sharing::reload_shared_files,
             commands::sharing::unshare_file,
             commands::sharing::share_file,
@@ -1279,6 +1310,8 @@ pub fn run() {
             commands::peers::get_chat_messages,
             commands::peers::mark_messages_read,
             commands::peers::get_unread_message_counts,
+            commands::peers::get_pending_chat_counts,
+            commands::peers::offer_file_to_friend,
             commands::peers::get_friend_requests,
             commands::peers::accept_friend_request,
             commands::peers::reject_friend_request,

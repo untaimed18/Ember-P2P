@@ -687,6 +687,55 @@ impl LocalIndex {
         mutation
     }
 
+    /// Restrict (or unrestrict) a batch of paths to mutual friends.
+    ///
+    /// Deliberately independent of `shared`: scope answers "who may see this",
+    /// `shared` answers "is it offered at all". Flipping scope on an unshared
+    /// file is harmless and takes effect if the user shares it again.
+    ///
+    /// Mirrors `set_shared_by_paths`, including its content-level semantics —
+    /// every copy of the same hash moves together, because scope is a property
+    /// of the content we publish, not of one path on disk.
+    pub fn set_friends_only_by_paths(
+        &mut self,
+        paths: &[String],
+        friends_only: bool,
+    ) -> ShareMutation {
+        let keys: HashSet<String> = paths.iter().map(|p| normalize_path_key(p)).collect();
+        let hashes: HashSet<String> = self
+            .files
+            .iter()
+            .filter(|file| keys.contains(&normalize_path_key(&file.path)))
+            .filter_map(|file| (!file.hash.is_empty()).then(|| file.hash.clone()))
+            .collect();
+        let pending_paths: HashSet<String> = self
+            .files
+            .iter()
+            .filter(|file| file.hash.is_empty() && keys.contains(&normalize_path_key(&file.path)))
+            .map(|file| normalize_path_key(&file.path))
+            .collect();
+        let mut mutation = ShareMutation::default();
+        for file in &mut self.files {
+            if (hashes.contains(&file.hash)
+                || (file.hash.is_empty()
+                    && pending_paths.contains(&normalize_path_key(&file.path))))
+                && file.friends_only != friends_only
+            {
+                file.friends_only = friends_only;
+                mutation.changed_paths += 1;
+                if file.hash.is_empty() {
+                    mutation.pending_paths.push(file.path.clone());
+                } else {
+                    mutation.hashed_paths.push(file.path.clone());
+                    if !mutation.hashes.contains(&file.hash) {
+                        mutation.hashes.push(file.hash.clone());
+                    }
+                }
+            }
+        }
+        mutation
+    }
+
     /// Like `upsert_file`, but keeps `path_map`/`hash_map`/`name_tokens`
     /// consistent for the affected slot so no full rebuild is required.
     fn upsert_file_indexed(&mut self, mut file: FileInfo) {
@@ -909,6 +958,7 @@ mod local_index_tests {
                 .rsplit_once(['/', '\\'])
                 .map_or_else(String::new, |(folder, _)| folder.to_string()),
             shared,
+            friends_only: false,
             shared_kad: false,
             shared_ed2k: false,
         }

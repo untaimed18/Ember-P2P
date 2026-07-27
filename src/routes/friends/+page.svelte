@@ -21,6 +21,8 @@
     clearUnread,
     beginFriendRequestMutation,
     endFriendRequestMutation,
+    fileOffers as fileOffersStore,
+    clearFileOffer,
   } from '$lib/stores/friends';
   import { appSettings } from '$lib/stores/settings';
   import { networkStats } from '$lib/stores/network';
@@ -54,6 +56,65 @@
   let unreadCounts: Map<string, number> = $derived($unreadCountsStore);
 
   let friendRequests: FriendRequestInfo[] = $derived($friendRequestsStore);
+  let pendingOffers = $derived($fileOffersStore);
+  /** Offer currently being accepted, so its buttons can be disabled. */
+  let acceptingOffer: string | null = $state(null);
+
+  function offerKey(userHash: string, fileHash: string): string {
+    return `${userHash}:${fileHash}`;
+  }
+
+  function friendLabel(userHash: string): string {
+    const f = friends.find(x => x.user_hash === userHash);
+    return f?.nickname || userHash.slice(0, 8) + '\u2026';
+  }
+
+  function formatOfferSize(bytes: number): string {
+    if (!bytes) return '';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let value = bytes;
+    let unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {
+      value /= 1024;
+      unit++;
+    }
+    return `${value < 10 && unit > 0 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
+  }
+
+  /**
+   * Accept an offer by starting an ordinary download, seeded with the offering
+   * friend as a source. Nothing about the push path bypasses the normal
+   * transfer pipeline.
+   */
+  async function acceptOffer(offer: { user_hash: string; file_hash: string; file_name: string; file_size: number }) {
+    const key = offerKey(offer.user_hash, offer.file_hash);
+    if (acceptingOffer) return;
+    acceptingOffer = key;
+    try {
+      const { startDownload } = await import('$lib/api/transfers');
+      // Seed the friend's last-known address when we have one; the backend
+      // falls back to rendezvous lookup and normal source discovery otherwise.
+      const f = friends.find(x => x.user_hash === offer.user_hash);
+      const ip = f?.last_ip?.trim() ?? '';
+      const port = f?.last_port ?? 0;
+      await startDownload(
+        offer.file_hash,
+        offer.file_name,
+        offer.file_size,
+        ip && port > 0 ? ip : '',
+        ip && port > 0 ? port : 0,
+        undefined,
+        undefined,
+        offer.user_hash,
+      );
+      clearFileOffer(offer.user_hash, offer.file_hash);
+      flash(m.friends_offer_accepted({ name: offer.file_name }));
+    } catch (e: unknown) {
+      error = toErr(e);
+    } finally {
+      acceptingOffer = null;
+    }
+  }
   let failedSearchToastsShown = new Set<string>();
   const FRIEND_HASH_RE = /^[0-9a-f]{32}$/i;
 
@@ -653,6 +714,52 @@
   </div>
 
   <!-- Pending friend requests -->
+  {#if pendingOffers.length > 0}
+    <div class="requests-section">
+      <div class="requests-header">
+        <span class="requests-title">{m.friends_offers_title()}</span>
+        <span class="requests-badge">{pendingOffers.length}</span>
+      </div>
+      <div class="requests-list">
+        {#each pendingOffers as offer (offerKey(offer.user_hash, offer.file_hash))}
+          <div
+            class="request-card"
+            in:fly={{ y: 6, duration: 200 }}
+            out:fade={{ duration: 150 }}
+            animate:flip={{ duration: 200 }}
+          >
+            <div class="request-avatar">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 16V4" />
+                <path d="M7 9l5-5 5 5" />
+                <path d="M4 17v2a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-2" />
+              </svg>
+            </div>
+            <div class="request-info">
+              <span class="request-name"><bdi>{offer.file_name}</bdi></span>
+              <span class="request-hash">
+                {m.friends_offer_from({ name: friendLabel(offer.user_hash) })}
+                {#if offer.file_size}&nbsp;&middot;&nbsp;{formatOfferSize(offer.file_size)}{/if}
+              </span>
+            </div>
+            <div class="request-actions">
+              <button
+                class="req-accept"
+                disabled={acceptingOffer !== null}
+                onclick={() => acceptOffer(offer)}
+              >{m.friends_offer_download()}</button>
+              <button
+                class="req-reject"
+                disabled={acceptingOffer !== null}
+                onclick={() => clearFileOffer(offer.user_hash, offer.file_hash)}
+              >{m.common_dismiss()}</button>
+            </div>
+          </div>
+        {/each}
+      </div>
+    </div>
+  {/if}
+
   {#if friendRequests.length > 0}
     <div class="requests-section">
       <div class="requests-header">

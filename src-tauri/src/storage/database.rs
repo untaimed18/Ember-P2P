@@ -16,6 +16,14 @@ const MAX_DOWNLOAD_HISTORY_ROWS: i64 = 5_000;
 const CHAT_KEY_FILE: &str = "chat-history.key";
 const CHAT_CIPHERTEXT_PREFIX: &str = "EMBRCHAT1:";
 const CHAT_UNAVAILABLE_TEXT: &str = "[Message unavailable]";
+/// `chat_messages.delivery` states. Added in schema v24; every pre-existing
+/// row defaults to `CHAT_DELIVERED` because it was only ever written after a
+/// successful handoff.
+pub const CHAT_DELIVERED: i64 = 0;
+/// Stored locally, still waiting for a session to the friend.
+pub const CHAT_QUEUED: i64 = 1;
+/// Abandoned after exhausting retries; the user can resend explicitly.
+pub const CHAT_FAILED: i64 = 2;
 const CHAT_NONCE_LEN: usize = 24;
 const CHAT_AAD_DOMAIN: &[u8] = b"ember-chat-db-row-v1\0";
 
@@ -382,7 +390,7 @@ impl Database {
         // Ember build. Silently running would invite subtle data corruption
         // (missing columns, renamed tables, semantic changes). Bump this
         // when introducing a new migration.
-        const MAX_SUPPORTED_VERSION: i64 = 23;
+        const MAX_SUPPORTED_VERSION: i64 = 24;
         if version > MAX_SUPPORTED_VERSION {
             anyhow::bail!(
                 "Database schema version {version} is newer than this Ember build supports \
@@ -937,6 +945,32 @@ impl Database {
             // database scan cannot recover old message canaries.
             conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
             info!("Encrypted local chat history (database v23)");
+        }
+
+        if version < 24 {
+            // Outbound chat used to be persisted only after a successful
+            // handoff to a live session, so a message typed while a friend
+            // was unreachable was simply lost. `delivery` lets a send be
+            // stored up front and reconciled later.
+            //
+            // 0 = delivered to the peer's session (and every historical row,
+            //     which is why the default matters), 1 = queued for the next
+            //     time we reach them, 2 = gave up.
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(
+                &tx,
+                "chat_messages",
+                "delivery",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            // Flushing scans by (friend, delivery) and expects oldest-first.
+            tx.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chat_messages_delivery \
+                 ON chat_messages (friend_hash, delivery, id)",
+                [],
+            )?;
+            set_version(&tx, 24)?;
+            tx.commit()?;
         }
 
         Ok(())
@@ -2481,11 +2515,33 @@ impl Database {
         Ok(updated)
     }
 
+    /// Delivery state of an outbound chat message. Received messages are
+    /// always [`ChatDelivery::Delivered`].
     pub fn insert_chat_message(
         &self,
         friend_hash: &str,
         direction: &str,
         message: &str,
+    ) -> anyhow::Result<i64> {
+        self.insert_chat_message_with_delivery(friend_hash, direction, message, CHAT_DELIVERED)
+    }
+
+    /// Store an outbound message that could not be handed to a live session,
+    /// so it can be flushed the next time the friend is reachable.
+    pub fn insert_pending_chat_message(
+        &self,
+        friend_hash: &str,
+        message: &str,
+    ) -> anyhow::Result<i64> {
+        self.insert_chat_message_with_delivery(friend_hash, "sent", message, CHAT_QUEUED)
+    }
+
+    pub fn insert_chat_message_with_delivery(
+        &self,
+        friend_hash: &str,
+        direction: &str,
+        message: &str,
+        delivery: i64,
     ) -> anyhow::Result<i64> {
         // Cap stored message length. Incoming chat text comes straight off
         // the wire from a peer, so bound it here (on a char boundary, so we
@@ -2513,8 +2569,8 @@ impl Database {
         let tx = conn.unchecked_transaction()?;
         let now = chrono::Utc::now().timestamp();
         tx.execute(
-            "INSERT INTO chat_messages (friend_hash, direction, message, timestamp, read) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![friend_hash, direction, CHAT_CIPHERTEXT_PREFIX, now, if direction == "sent" { 1 } else { 0 }],
+            "INSERT INTO chat_messages (friend_hash, direction, message, timestamp, read, delivery) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![friend_hash, direction, CHAT_CIPHERTEXT_PREFIX, now, if direction == "sent" { 1 } else { 0 }, delivery],
         )?;
         let new_id = tx.last_insert_rowid();
         let encrypted =
@@ -2540,16 +2596,78 @@ impl Database {
         Ok(new_id)
     }
 
+    /// Outbound messages still waiting on a session, oldest first, so a flush
+    /// replays them in the order the user typed them.
+    pub fn pending_chat_messages(
+        &self,
+        friend_hash: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<(i64, String, i64)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, message, timestamp FROM chat_messages \
+             WHERE friend_hash = ?1 AND delivery = ?2 AND direction = 'sent' \
+             ORDER BY id ASC LIMIT ?3",
+        )?;
+        let rows: Vec<(i64, String, i64)> = stmt
+            .query_map(params![friend_hash, CHAT_QUEUED, limit], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+        drop(conn);
+        // Decrypt outside the statement borrow, mirroring `get_chat_messages`.
+        Ok(rows
+            .into_iter()
+            .filter_map(|(id, body, ts)| {
+                Self::decrypt_chat_body(&self.chat_key, id, friend_hash, "sent", ts, &body)
+                    .ok()
+                    .map(|plain| (id, plain, ts))
+            })
+            .collect())
+    }
+
+    /// Move a stored outbound message between delivery states.
+    pub fn set_chat_delivery(&self, id: i64, delivery: i64) -> anyhow::Result<usize> {
+        let conn = self.conn.lock();
+        Ok(conn.execute(
+            "UPDATE chat_messages SET delivery = ?1 WHERE id = ?2",
+            params![delivery, id],
+        )?)
+    }
+
+    /// Count of outbound messages still queued, per friend. Drives the
+    /// "unsent" affordance in the chat dock.
+    pub fn pending_chat_counts(&self) -> anyhow::Result<Vec<(String, i64)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT friend_hash, COUNT(*) FROM chat_messages \
+             WHERE delivery = ?1 AND direction = 'sent' GROUP BY friend_hash",
+        )?;
+        let rows = stmt
+            .query_map(params![CHAT_QUEUED], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
     pub fn get_chat_messages(
         &self,
         friend_hash: &str,
         limit: i64,
         before_id: Option<i64>,
-    ) -> anyhow::Result<Vec<(i64, String, String, i64, bool)>> {
+    ) -> anyhow::Result<Vec<(i64, String, String, i64, bool, i64)>> {
         let conn = self.conn.lock();
-        let rows: Vec<(i64, String, String, i64, bool)> = if let Some(bid) = before_id {
+        let rows: Vec<(i64, String, String, i64, bool, i64)> = if let Some(bid) = before_id {
             let mut stmt = conn.prepare(
-                "SELECT id, direction, message, timestamp, read FROM chat_messages WHERE friend_hash = ?1 AND id < ?2 ORDER BY id DESC LIMIT ?3"
+                "SELECT id, direction, message, timestamp, read, delivery FROM chat_messages WHERE friend_hash = ?1 AND id < ?2 ORDER BY id DESC LIMIT ?3"
             )?;
             let mapped = stmt.query_map(params![friend_hash, bid, limit], |row| {
                 Ok((
@@ -2558,12 +2676,13 @@ impl Database {
                     row.get(2)?,
                     row.get(3)?,
                     row.get::<_, i64>(4)? != 0,
+                    row.get::<_, i64>(5)?,
                 ))
             })?;
             mapped.collect::<Result<Vec<_>, _>>()?
         } else {
             let mut stmt = conn.prepare(
-                "SELECT id, direction, message, timestamp, read FROM chat_messages WHERE friend_hash = ?1 ORDER BY id DESC LIMIT ?2"
+                "SELECT id, direction, message, timestamp, read, delivery FROM chat_messages WHERE friend_hash = ?1 ORDER BY id DESC LIMIT ?2"
             )?;
             let mapped = stmt.query_map(params![friend_hash, limit], |row| {
                 Ok((
@@ -2572,12 +2691,13 @@ impl Database {
                     row.get(2)?,
                     row.get(3)?,
                     row.get::<_, i64>(4)? != 0,
+                    row.get::<_, i64>(5)?,
                 ))
             })?;
             mapped.collect::<Result<Vec<_>, _>>()?
         };
         let mut messages = Vec::with_capacity(rows.len());
-        for (id, direction, stored, timestamp, read) in rows {
+        for (id, direction, stored, timestamp, read, delivery) in rows {
             match Self::decrypt_chat_body(
                 &self.chat_key,
                 id,
@@ -2586,7 +2706,7 @@ impl Database {
                 timestamp,
                 &stored,
             ) {
-                Ok(message) => messages.push((id, direction, message, timestamp, read)),
+                Ok(message) => messages.push((id, direction, message, timestamp, read, delivery)),
                 Err(error) => {
                     tracing::warn!(
                         "Chat row {id} for friend {friend_hash} is unavailable; preserving its ciphertext for later recovery: {error}"
@@ -2597,6 +2717,7 @@ impl Database {
                         CHAT_UNAVAILABLE_TEXT.to_string(),
                         timestamp,
                         read,
+                        delivery,
                     ));
                 }
             }
@@ -3079,7 +3200,61 @@ mod tests {
                 |r| r.get(0),
             )
             .expect("version");
-        assert_eq!(version, 23);
+        assert_eq!(version, 24);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// Queued outbound chat has to survive a restart, otherwise the queue is
+    /// no better than the in-memory send it replaced.
+    #[test]
+    fn queued_chat_survives_restart_and_flush_marks_it_delivered() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-chat-queue-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let friend = "aa".repeat(16);
+
+        let id = {
+            let db = Database::open_at(&path).expect("open db");
+            let id = db
+                .insert_pending_chat_message(&friend, "held for later")
+                .expect("queue message");
+            // A delivered message must not be picked up by the flush scan.
+            db.insert_chat_message(&friend, "sent", "already gone")
+                .expect("insert delivered");
+            id
+        };
+
+        let db = Database::open_at(&path).expect("reopen db");
+        let pending = db.pending_chat_messages(&friend, 100).expect("pending");
+        assert_eq!(pending.len(), 1, "only the queued row should be pending");
+        assert_eq!(pending[0].0, id);
+        assert_eq!(pending[0].1, "held for later");
+        assert_eq!(
+            db.pending_chat_counts().expect("counts"),
+            vec![(friend.clone(), 1)]
+        );
+
+        db.set_chat_delivery(id, CHAT_DELIVERED).expect("mark sent");
+        assert!(
+            db.pending_chat_messages(&friend, 100)
+                .expect("pending after")
+                .is_empty(),
+            "a delivered message must leave the queue"
+        );
+        // History still shows both, and the flushed one now reads as delivered.
+        let history = db.get_chat_messages(&friend, 50, None).expect("history");
+        assert_eq!(history.len(), 2);
+        assert!(history.iter().all(|row| row.5 == CHAT_DELIVERED));
+
         drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));

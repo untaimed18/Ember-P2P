@@ -139,6 +139,11 @@ pub const OP_EMBER_HELLOANSWER: u8 = 0xF9;
 /// without an eD2K server or KAD buddy in the path.
 pub const OP_EMBER_XFER_REQ: u8 = 0xFA;
 pub const OP_EMBER_XFER_ACK: u8 = 0xFB;
+/// A friend offering to send us a file we did not ask for. See
+/// [`EmberFileOffer`]; the recipient decides whether to start the download.
+pub const OP_EMBER_FILE_OFFER: u8 = 0xFC;
+/// Recipient's answer to [`OP_EMBER_FILE_OFFER`].
+pub const OP_EMBER_FILE_OFFER_ACK: u8 = 0xFD;
 
 // Constants
 pub const EMBLOCKSIZE: u64 = 184_320;
@@ -871,6 +876,112 @@ pub fn parse_ember_xfer_ack(payload: &[u8]) -> Option<(u8, [u8; 16])> {
     let mut nonce = [0u8; 16];
     nonce.copy_from_slice(&payload[2..18]);
     Some((payload[1], nonce))
+}
+
+/// Longest file name we will carry in a file offer. The name is only a hint
+/// for the recipient's prompt — the hash is what identifies the content — so a
+/// generous but bounded cap keeps a hostile friend from bloating the session.
+pub const EMBER_OFFER_MAX_NAME_LEN: usize = 512;
+/// Minimum wire length of an `OP_EMBER_FILE_OFFER` payload: version + file
+/// hash + size + name length. The name itself follows.
+const EMBER_FILE_OFFER_MIN_LEN: usize = 1 + 16 + 8 + 2;
+/// Wire length of an `OP_EMBER_FILE_OFFER_ACK` payload: version + status +
+/// file hash.
+const EMBER_FILE_OFFER_ACK_LEN: usize = 1 + 1 + 16;
+
+/// The offer reached us and was shown to the user. It does **not** mean the
+/// user wants the file — acceptance of the content is expressed by starting a
+/// download, not by this ack.
+pub const OFFER_STATUS_ACCEPTED: u8 = 0;
+/// The offer was refused outright, e.g. the recipient turned friend messaging
+/// off. Reserved values above this are ignored by current parsers.
+pub const OFFER_STATUS_DECLINED: u8 = 1;
+
+/// A friend telling us about a file they are willing to send.
+///
+/// Purely an invitation: nothing is transferred until the recipient accepts
+/// and starts an ordinary download keyed on `file_hash`, with the sender
+/// already known as a source. That keeps the push flow on the same transfer
+/// machinery (and the same escalation paths) as a pull.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmberFileOffer {
+    pub file_hash: [u8; 16],
+    pub file_size: u64,
+    /// Display name for the prompt. Untrusted: sanitise before showing.
+    pub file_name: String,
+}
+
+/// Build an [`OP_EMBER_FILE_OFFER`] payload. Rides the friend session's Noise
+/// encryption, so like the XFER messages it carries no signature of its own.
+pub fn build_ember_file_offer(offer: &EmberFileOffer) -> Vec<u8> {
+    let name = offer.file_name.as_bytes();
+    let name = if name.len() > EMBER_OFFER_MAX_NAME_LEN {
+        // Truncate on a char boundary so the peer never receives a split
+        // multi-byte sequence.
+        let mut end = EMBER_OFFER_MAX_NAME_LEN;
+        while end > 0 && !offer.file_name.is_char_boundary(end) {
+            end -= 1;
+        }
+        &offer.file_name.as_bytes()[..end]
+    } else {
+        name
+    };
+    let mut buf = Vec::with_capacity(EMBER_FILE_OFFER_MIN_LEN + name.len());
+    buf.push(0x01); // payload version
+    buf.extend_from_slice(&offer.file_hash);
+    buf.extend_from_slice(&offer.file_size.to_le_bytes());
+    buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    buf.extend_from_slice(name);
+    buf
+}
+
+/// Parse an [`OP_EMBER_FILE_OFFER`] payload. Returns `None` for a malformed
+/// payload, an unknown version, a declared name length that overruns the
+/// buffer, or a name that is not valid UTF-8.
+pub fn parse_ember_file_offer(payload: &[u8]) -> Option<EmberFileOffer> {
+    if payload.len() < EMBER_FILE_OFFER_MIN_LEN || payload[0] != 0x01 {
+        return None;
+    }
+    let mut file_hash = [0u8; 16];
+    file_hash.copy_from_slice(&payload[1..17]);
+    let mut size_bytes = [0u8; 8];
+    size_bytes.copy_from_slice(&payload[17..25]);
+    let file_size = u64::from_le_bytes(size_bytes);
+    let name_len = u16::from_le_bytes([payload[25], payload[26]]) as usize;
+    if name_len > EMBER_OFFER_MAX_NAME_LEN {
+        return None;
+    }
+    let start = EMBER_FILE_OFFER_MIN_LEN;
+    let end = start.checked_add(name_len)?;
+    if payload.len() < end {
+        return None;
+    }
+    let file_name = std::str::from_utf8(&payload[start..end]).ok()?.to_string();
+    Some(EmberFileOffer {
+        file_hash,
+        file_size,
+        file_name,
+    })
+}
+
+/// Build an [`OP_EMBER_FILE_OFFER_ACK`] payload echoing the offered hash, so
+/// a reply is unambiguous when several offers are outstanding.
+pub fn build_ember_file_offer_ack(status: u8, file_hash: &[u8; 16]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(EMBER_FILE_OFFER_ACK_LEN);
+    buf.push(0x01); // payload version
+    buf.push(status);
+    buf.extend_from_slice(file_hash);
+    buf
+}
+
+/// Parse an [`OP_EMBER_FILE_OFFER_ACK`] payload into `(status, file_hash)`.
+pub fn parse_ember_file_offer_ack(payload: &[u8]) -> Option<(u8, [u8; 16])> {
+    if payload.len() < EMBER_FILE_OFFER_ACK_LEN || payload[0] != 0x01 {
+        return None;
+    }
+    let mut file_hash = [0u8; 16];
+    file_hash.copy_from_slice(&payload[2..18]);
+    Some((payload[1], file_hash))
 }
 
 /// Parse an EmuleInfo or EmuleInfoAnswer payload into peer capabilities.
@@ -2712,6 +2823,76 @@ mod tests {
         let mut unknown_method = good;
         unknown_method[1] = 0xFE;
         assert_eq!(parse_ember_xfer_req(&unknown_method), None);
+    }
+
+    #[test]
+    fn ember_file_offer_roundtrip() {
+        let offer = EmberFileOffer {
+            file_hash: [0x33u8; 16],
+            file_size: 4_294_967_296, // deliberately over u32 to prove 64-bit sizing
+            file_name: "holiday video.mkv".to_string(),
+        };
+        let payload = build_ember_file_offer(&offer);
+        assert_eq!(parse_ember_file_offer(&payload), Some(offer));
+    }
+
+    #[test]
+    fn ember_file_offer_ack_roundtrip() {
+        let file_hash = [0x44u8; 16];
+        let payload = build_ember_file_offer_ack(OFFER_STATUS_DECLINED, &file_hash);
+        assert_eq!(payload.len(), EMBER_FILE_OFFER_ACK_LEN);
+        assert_eq!(
+            parse_ember_file_offer_ack(&payload),
+            Some((OFFER_STATUS_DECLINED, file_hash))
+        );
+    }
+
+    /// The name is attacker-controlled length-prefixed data, so a declared
+    /// length that overruns the buffer must be rejected rather than panicking
+    /// or reading adjacent bytes.
+    #[test]
+    fn ember_file_offer_rejects_malformed_payloads() {
+        let offer = EmberFileOffer {
+            file_hash: [0x01u8; 16],
+            file_size: 10,
+            file_name: "a.bin".to_string(),
+        };
+        let good = build_ember_file_offer(&offer);
+
+        assert_eq!(parse_ember_file_offer(&[]), None);
+        assert_eq!(parse_ember_file_offer(&good[..good.len() - 1]), None);
+
+        let mut wrong_version = good.clone();
+        wrong_version[0] = 0x02;
+        assert_eq!(parse_ember_file_offer(&wrong_version), None);
+
+        // Declared name length far beyond what the payload actually carries.
+        let mut overrun = good.clone();
+        overrun[25] = 0xFF;
+        overrun[26] = 0x00;
+        assert_eq!(parse_ember_file_offer(&overrun), None);
+
+        // Invalid UTF-8 in the name must not surface as a lossy string.
+        let mut bad_utf8 = good;
+        let name_at = 1 + 16 + 8 + 2;
+        bad_utf8[name_at] = 0xFF;
+        assert_eq!(parse_ember_file_offer(&bad_utf8), None);
+    }
+
+    /// An over-long name is truncated on a char boundary, so a multi-byte
+    /// glyph can never be split across the length prefix.
+    #[test]
+    fn ember_file_offer_truncates_long_names_on_char_boundary() {
+        let offer = EmberFileOffer {
+            file_hash: [0u8; 16],
+            file_size: 1,
+            // 3 bytes per char, so the cap lands mid-character if unguarded.
+            file_name: "日".repeat(400),
+        };
+        let payload = build_ember_file_offer(&offer);
+        let parsed = parse_ember_file_offer(&payload).expect("truncated name still parses");
+        assert!(parsed.file_name.len() <= EMBER_OFFER_MAX_NAME_LEN);
+        assert!(parsed.file_name.chars().all(|c| c == '日'));
     }
 
     /// The opcodes must stay inside the Ember-private `OP_EMULEPROT` range

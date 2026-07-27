@@ -210,6 +210,9 @@ impl FileIndexer {
             complete_sources: 0,
             folder,
             shared: true,
+            // Newly discovered files are public. Any persisted friends-only
+            // restriction is reapplied from known.met once the hash is known.
+            friends_only: false,
             shared_kad: false,
             shared_ed2k: false,
         })

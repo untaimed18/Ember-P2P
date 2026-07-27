@@ -18,6 +18,12 @@ export interface FileInfo {
   complete_sources: number;
   folder: string;
   shared: boolean;
+  /**
+   * Restricts an otherwise-shared file to mutual friends. Such a file is never
+   * offered to a server, published to KAD, or served to a non-friend, so both
+   * network badges stay dark while it is set.
+   */
+  friends_only: boolean;
   shared_kad: boolean;
   shared_ed2k: boolean;
 }

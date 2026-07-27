@@ -19,6 +19,7 @@
     batchSetPriority,
     batchShare,
     batchUnshare,
+    setFilesFriendsOnly,
     republishFile,
     scanMissingFiles,
     removeMissingFiles,
@@ -942,6 +943,16 @@
     for (const f of files) if (checkedPaths.has(f.path) && f.hash && !f.shared) n++;
     return n;
   });
+  let checkedRestrictCount = $derived.by(() => {
+    let n = 0;
+    for (const f of files) if (checkedPaths.has(f.path) && f.hash && f.shared && !f.friends_only) n++;
+    return n;
+  });
+  let checkedUnrestrictCount = $derived.by(() => {
+    let n = 0;
+    for (const f of files) if (checkedPaths.has(f.path) && f.hash && f.shared && f.friends_only) n++;
+    return n;
+  });
   let checkedUnshareCount = $derived.by(() => {
     let n = 0;
     for (const f of files) if (checkedPaths.has(f.path) && f.hash && f.shared) n++;
@@ -1088,6 +1099,36 @@
     try {
       const count = await runBulkBatches(targets, batchUnshare);
       toastSuccess(count === 1 ? m.library_unshared_one() : m.library_unshared_other({ count }));
+    } catch (e: unknown) { error = toErr(e); }
+    finally {
+      await refresh();
+      bulkBusy = false;
+    }
+  }
+
+  /**
+   * Restrict the selection to mutual friends, or lift the restriction.
+   * Only shared, hashed files can carry a scope — an unshared file is not
+   * offered to anyone, and an unhashed one has no content identity to key on.
+   */
+  async function bulkFriendsOnly(friendsOnly: boolean) {
+    if (bulkBusy) return;
+    const checked = getCheckedFiles();
+    const targets = checked.filter(f => !!f.hash && f.shared && f.friends_only !== friendsOnly);
+    if (targets.length === 0) {
+      if (checked.some(f => !f.hash)) toastWarning(m.library_selection_still_hashing());
+      else if (checked.length > 0) toastWarning(m.library_selection_scope_unchanged());
+      else toastWarning(m.library_no_hashed_in_selection());
+      return;
+    }
+    bulkBusy = true;
+    try {
+      const count = await runBulkBatches(targets, paths => setFilesFriendsOnly(paths, friendsOnly));
+      toastSuccess(
+        friendsOnly
+          ? m.library_friends_only_on_count({ count })
+          : m.library_friends_only_off_count({ count }),
+      );
     } catch (e: unknown) { error = toErr(e); }
     finally {
       await refresh();
@@ -1542,6 +1583,28 @@
   let ctxMenu: { x: number; y: number; file: FileInfo } | null = $state(null);
   let ctxPrioritySub = $state(false);
   let ctxCopySub = $state(false);
+  let ctxSendSub = $state(false);
+  /** Friends currently online, so "Send to Friend" only lists reachable ones. */
+  let sendableFriends: { user_hash: string; nickname: string }[] = $state([]);
+
+  /**
+   * Refresh the send targets when the submenu opens. Only mutual, online
+   * friends can receive an offer: the invitation travels over a live friend
+   * session, and a one-sided friendship has no session to travel on.
+   */
+  async function loadSendableFriends() {
+    try {
+      const { getFriends } = await import('$lib/api/friends');
+      const { onlineFriends } = await import('$lib/stores/friends');
+      const { get: getStore } = await import('svelte/store');
+      const online = getStore(onlineFriends);
+      sendableFriends = (await getFriends())
+        .filter(f => f.mutual && online.has(f.user_hash))
+        .map(f => ({ user_hash: f.user_hash, nickname: f.nickname || f.user_hash.slice(0, 8) + '\u2026' }));
+    } catch {
+      sendableFriends = [];
+    }
+  }
   let ctxMenuEl: HTMLDivElement | undefined = $state(undefined);
   let ctxSubmenuLeft = $state(false);
   let ctxSubmenuUp = $state(false);
@@ -1877,6 +1940,24 @@
           await refresh();
           toastSuccess(m.library_shared_named({ name: f.name }));
           break;
+        case 'send_to_friend': {
+          if (!extra) break;
+          const { offerFileToFriend } = await import('$lib/api/friends');
+          await offerFileToFriend(extra, f.hash);
+          toastSuccess(m.library_sent_offer_named({ name: f.name }));
+          break;
+        }
+        case 'friends_only': {
+          const restrict = !f.friends_only;
+          await setFilesFriendsOnly([f.path], restrict);
+          await refresh();
+          toastSuccess(
+            restrict
+              ? m.library_friends_only_on_named({ name: f.name })
+              : m.library_friends_only_off_named({ name: f.name }),
+          );
+          break;
+        }
         case 'republish': {
           if (!f.hash || !f.shared) break;
           await republishFile(f.hash);
@@ -2912,6 +2993,11 @@
         <span class="bulk-sep" aria-hidden="true"></span>
         <button class="tb-btn" disabled={bulkBusy || checkedShareCount === 0} onclick={bulkShare} title={checkedShareCount === 0 ? m.library_bulk_need_hashed() : m.library_bulk_share_title()}>{m.library_bulk_share()}</button>
         <button class="tb-btn" disabled={bulkBusy || checkedUnshareCount === 0} onclick={bulkUnshare} title={checkedUnshareCount === 0 ? m.library_bulk_need_hashed() : m.library_bulk_unshare_title()}>{m.library_bulk_unshare()}</button>
+        {#if checkedUnrestrictCount > 0 && checkedRestrictCount === 0}
+          <button class="tb-btn" disabled={bulkBusy} onclick={() => bulkFriendsOnly(false)} title={m.library_bulk_friends_only_off_title()}>{m.library_bulk_friends_only_off()}</button>
+        {:else}
+          <button class="tb-btn" disabled={bulkBusy || checkedRestrictCount === 0} onclick={() => bulkFriendsOnly(true)} title={checkedRestrictCount === 0 ? m.library_bulk_need_shared() : m.library_bulk_friends_only_on_title()}>{m.library_bulk_friends_only_on()}</button>
+        {/if}
         <button class="tb-btn" disabled={checkedHashedCount === 0} onclick={bulkCopyLinks} title={checkedHashedCount === 0 ? m.library_bulk_need_hashed() : m.library_bulk_copy_links_title()}>{m.library_copy_links()}</button>
         <button class="tb-btn" onclick={openCreateDialogFromSelection} title={m.library_bulk_new_collection_title()}>{m.library_bulk_new_collection()}</button>
         <span class="bulk-spacer"></span>
@@ -3253,6 +3339,29 @@
       </div>
       <div class="ctx-sep"></div>
       {#if ctxMenu.file.shared}
+        <div
+          class="ctx-item ctx-sub-parent"
+          role="menuitem"
+          tabindex="0"
+          onmouseenter={() => { ctxSendSub = true; void loadSendableFriends(); }}
+          onmouseleave={() => ctxSendSub = false}
+          onkeydown={(e) => { if (e.key === 'Enter' || e.key === 'ArrowRight') { ctxSendSub = true; void loadSendableFriends(); } }}
+        >
+          {m.library_send_to_friend()} &raquo;
+          {#if ctxSendSub}
+            <div class="ctx-submenu" class:ctx-submenu-left={ctxSubmenuLeft} class:ctx-submenu-up={ctxSubmenuUp} role="menu">
+              {#if sendableFriends.length === 0}
+                <button class="ctx-item ctx-disabled" role="menuitem" disabled>{m.library_send_no_friends_online()}</button>
+              {:else}
+                {#each sendableFriends as friend (friend.user_hash)}
+                  <button class="ctx-item" role="menuitem" onclick={() => ctxAction('send_to_friend', friend.user_hash)}>
+                    <bdi>{friend.nickname}</bdi>
+                  </button>
+                {/each}
+              {/if}
+            </div>
+          {/if}
+        </div>
         <button
           class="ctx-item"
           role="menuitem"
@@ -3261,6 +3370,13 @@
             ? m.library_republish_title_online()
             : m.library_republish_title_offline()}
         >{m.library_republish_kad()}{$networkStats.status !== 'connected' ? m.library_republish_offline_suffix() : ''}</button>
+        <button
+          class="ctx-item"
+          role="menuitem"
+          class:ctx-checked={ctxMenu.file.friends_only}
+          onclick={() => ctxAction('friends_only')}
+          title={m.library_friends_only_hint()}
+        >{m.library_friends_only_toggle()}</button>
         <button class="ctx-item" role="menuitem" onclick={() => ctxAction('unshare')}>{m.library_unshare_file()}</button>
       {:else}
         <button class="ctx-item" role="menuitem" onclick={() => ctxAction('share')}>{m.library_share_file()}</button>

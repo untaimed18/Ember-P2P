@@ -360,6 +360,7 @@ mod tests {
             last_publish_src: 0,
             last_shared: 0,
             is_shared: false,
+            friends_only: false,
             complete_sources: 0,
         });
         known.save(&base.join("known.met")).unwrap();

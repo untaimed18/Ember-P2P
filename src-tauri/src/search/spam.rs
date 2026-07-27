@@ -1238,6 +1238,7 @@ mod tests {
                 complete_sources: 0,
                 folder: String::new(),
                 shared: false,
+                friends_only: false,
                 shared_kad: false,
                 shared_ed2k: false,
             },

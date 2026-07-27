@@ -48,12 +48,38 @@ pub struct FileInfo {
     /// Whether this file is actively shared (user can toggle off to stop publishing)
     #[serde(default = "default_true")]
     pub shared: bool,
+    /// Restricts an otherwise-shared file to mutual friends. Only meaningful
+    /// while `shared` is true. A friends-only file is never offered to an
+    /// ed2k server, published to KAD, listed in a public browse answer, or
+    /// served to a peer that is not an authenticated mutual friend — hiding
+    /// it from browse alone would still leak it through search.
+    #[serde(default)]
+    pub friends_only: bool,
     /// Whether this file is currently published on KAD (runtime status)
     #[serde(default)]
     pub shared_kad: bool,
     /// Whether this file is currently offered to an ed2k server (runtime status)
     #[serde(default)]
     pub shared_ed2k: bool,
+}
+
+impl FileInfo {
+    /// True when this file may be advertised to the open network: offered to
+    /// an ed2k server, published to KAD, or listed in a public browse answer.
+    /// Every such path must go through this rather than testing `shared`
+    /// directly, otherwise a friends-only file stays hidden from browse but
+    /// remains discoverable by search.
+    #[inline]
+    pub fn is_public_listable(&self) -> bool {
+        self.shared && !self.friends_only
+    }
+
+    /// True when this file may be listed to, or served to, an authenticated
+    /// mutual friend. Friends see public and friends-only shares alike.
+    #[inline]
+    pub fn is_friend_visible(&self) -> bool {
+        self.shared
+    }
 }
 
 fn default_true() -> bool {

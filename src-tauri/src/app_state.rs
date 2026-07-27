@@ -103,6 +103,10 @@ pub struct AppState {
     pub upload_shared_folders: SharedFolderList,
     /// Live friend user-hash set shared with the upload server for friend-slot priority.
     pub friend_hashes: SharedFriendHashes,
+    /// Subset of `friend_hashes` that also added us back. Gates everything that
+    /// exposes private content — friend browse answers and friends-only file
+    /// serving — so a one-sided add grants upload priority but never access.
+    pub mutual_friend_hashes: SharedFriendHashes,
     /// Filesystem watcher over the currently shared folders. `None` if the
     /// OS-level watcher could not be initialised at startup; in that case
     /// the app still works but users must reload manually after changes.

@@ -69,6 +69,7 @@
   let messagesContainerEl: HTMLDivElement | undefined = $state();
   let chatInputEl: HTMLTextAreaElement | undefined = $state();
   let unlisten: UnlistenFn | null = null;
+  let unlistenDelivery: UnlistenFn | null = null;
   let loadGen = 0;
   let msgIdCounter = 0;
 
@@ -119,6 +120,7 @@
       clearUnread(hash);
       const gen = ++loadGen;
       if (unlisten) { unlisten(); unlisten = null; }
+      if (unlistenDelivery) { unlistenDelivery(); unlistenDelivery = null; }
       messages = [];
       // Reset load state for the new conversation. Without this, the
       // previous tab's `loadError` (or stale `loading`/pagination flags)
@@ -149,6 +151,7 @@
     return () => {
       loadGen++;
       if (unlisten) { unlisten(); unlisten = null; }
+      if (unlistenDelivery) { unlistenDelivery(); unlistenDelivery = null; }
       // Save whatever the user has typed-but-not-sent against the
       // hash they were ON when this effect last ran. `inputText`
       // is a $state, so reading it here resolves to the latest
@@ -164,6 +167,7 @@
   async function setupListener(gen: number, hash: string): Promise<boolean> {
     if (gen !== loadGen) return false;
     if (unlisten) { unlisten(); unlisten = null; }
+      if (unlistenDelivery) { unlistenDelivery(); unlistenDelivery = null; }
     let fn: UnlistenFn;
     try {
       fn = await listen<{ user_hash: string; message: string; direction: string; timestamp: number }>('ember:chat-message', (event) => {
@@ -186,6 +190,7 @@
             message: event.payload.message,
             timestamp: event.payload.timestamp,
             read: true,
+            delivery: 'delivered' as const,
           }];
           messages = next.length > MAX_LIVE_MESSAGES
             ? next.slice(next.length - MAX_LIVE_MESSAGES)
@@ -204,6 +209,30 @@
     }
     if (gen !== loadGen) { fn(); return false; }
     unlisten = fn;
+
+    // Queued messages flush oldest-first, so each delivery notice clears the
+    // earliest still-waiting bubble. Matching on order rather than row id also
+    // covers the optimistically-appended bubble, which has no database id yet.
+    try {
+      const deliveryFn = await listen<{ user_hash: string; id: number; delivery: string }>(
+        'ember:chat-delivery',
+        (event) => {
+          if (gen !== loadGen) return;
+          if (event.payload.user_hash !== hash) return;
+          if (event.payload.delivery !== 'delivered') return;
+          const at = messages.findIndex((mm) => mm.direction === 'sent' && mm.delivery === 'queued');
+          if (at === -1) return;
+          const next = [...messages];
+          next[at] = { ...next[at], delivery: 'delivered' };
+          messages = next;
+        },
+      );
+      if (gen !== loadGen) { deliveryFn(); return true; }
+      unlistenDelivery = deliveryFn;
+    } catch (e) {
+      // Non-fatal: bubbles stay marked queued until the pane is reopened.
+      console.warn('ChatConversation: failed to register delivery listener', e);
+    }
     return true;
   }
 
@@ -295,6 +324,7 @@
     const hash = friendHash;
     const gen = ++loadGen;
     if (unlisten) { unlisten(); unlisten = null; }
+      if (unlistenDelivery) { unlistenDelivery(); unlistenDelivery = null; }
     liveError = false;
     const listenerOk = await setupListener(gen, hash);
     if (gen !== loadGen) return;
@@ -347,7 +377,21 @@
     sending = true;
     sendError = null;
     try {
-      await sendChatMessage(h, text);
+      const result = await sendChatMessage(h, text);
+      // A queued send is not echoed back as an `ember:chat-message`, since
+      // nothing reached the peer. Append it here so the user sees what they
+      // typed, marked as waiting, instead of an apparently-vanished message.
+      if (result.delivery === 'queued' && h === friendHash) {
+        messages = [...messages, {
+          id: --msgIdCounter,
+          direction: 'sent' as const,
+          message: text,
+          timestamp: Math.floor(Date.now() / 1000),
+          read: true,
+          delivery: 'queued' as const,
+        }];
+        scrollToBottom();
+      }
       // Only clear the live editor if we're still viewing this friend — on a
       // tab switch the main $effect already stashed/restored drafts, so
       // touching inputText here would wipe the NEW conversation's draft.
@@ -387,6 +431,7 @@
 
   onDestroy(() => {
     if (unlisten) { unlisten(); unlisten = null; }
+    if (unlistenDelivery) { unlistenDelivery(); unlistenDelivery = null; }
   });
 </script>
 
@@ -470,7 +515,14 @@
             written; only its bidi influence is scoped to this element.
           -->
           <div class="bubble-text"><bdi dir="auto">{msg.message}</bdi></div>
-          <div class="bubble-time">{formatTime(msg.timestamp)}</div>
+          <div class="bubble-time">
+            {formatTime(msg.timestamp)}
+            {#if msg.direction === 'sent' && msg.delivery === 'queued'}
+              <span class="bubble-delivery" title={m.chat_delivery_queued_title()}>{m.chat_delivery_queued()}</span>
+            {:else if msg.direction === 'sent' && msg.delivery === 'failed'}
+              <span class="bubble-delivery failed" title={m.chat_delivery_failed_title()}>{m.chat_delivery_failed()}</span>
+            {/if}
+          </div>
         </div>
       {/each}
     {/if}
@@ -714,6 +766,20 @@
     opacity: 0.65;
     margin-top: 4px;
     text-align: right;
+  }
+
+  /* Sits inside the timestamp line so a queued message reads as "sent at X,
+     not yet delivered" rather than as a separate error state. */
+  .bubble-delivery {
+    margin-left: 6px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+  }
+
+  .bubble-delivery.failed {
+    color: var(--danger);
+    opacity: 1;
   }
 
   .conv-error {

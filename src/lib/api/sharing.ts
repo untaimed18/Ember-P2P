@@ -89,6 +89,17 @@ export async function batchUnshare(filePaths: string[]): Promise<number> {
   return invoke('batch_unshare', { filePaths });
 }
 
+/**
+ * Restrict files to mutual friends, or return them to the open network.
+ * Resolves with the number of files whose scope actually changed.
+ */
+export async function setFilesFriendsOnly(
+  filePaths: string[],
+  friendsOnly: boolean,
+): Promise<number> {
+  return invoke('set_files_friends_only', { filePaths, friendsOnly });
+}
+
 export async function unshareFolder(path: string): Promise<void> {
   return invoke('unshare_folder', { path });
 }
