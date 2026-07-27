@@ -46,6 +46,7 @@
   import { updater, checkForUpdates, installUpdate, restartToUpdate } from '$lib/stores/updater';
 
   const appVersion = import.meta.env.VITE_APP_VERSION;
+  const appLicense = import.meta.env.VITE_APP_LICENSE;
 
   function updateSettingsOutcomeMessage(result: UpdateSettingsResult): string {
     switch (result.outcome) {
@@ -2100,21 +2101,32 @@
           </div>
         </div>
         <div class="card-body">
-          <div class="field">
-            <span class="field-label">{m.settings_about_version_label()}</span>
-            <p class="about-value">Ember {appVersion}</p>
-          </div>
-
-          <div class="field">
-            <span class="field-label">{m.settings_about_website_label()}</span>
-            <span class="hint">{m.settings_about_website_hint()}</span>
-            <div class="action-row">
-              <button class="action-btn" onclick={() => void openWebsite()}>
-                {m.settings_about_website_btn()}
+          <div class="about-identity">
+            <div class="about-identity-top">
+              <div class="about-mark" aria-hidden="true">
+                <img src="/icon.png" alt="" width="44" height="44" />
+              </div>
+              <div class="about-identity-copy">
+                <p class="about-wordmark">EMBER</p>
+                <p class="about-tagline">{m.app_tagline()}</p>
+                <p class="about-version-chip">{m.about_dialog_version({ version: appVersion })}</p>
+              </div>
+            </div>
+            <p class="about-description">{m.about_dialog_description()}</p>
+            <p class="about-license">{m.about_dialog_license({ license: appLicense })}</p>
+            <div class="about-website-row">
+              <button type="button" class="about-website-link" onclick={() => void openWebsite()}>
+                <span>{m.settings_about_website_btn()}</span>
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M6.5 3.5H3.5A1.5 1.5 0 0 0 2 5v7.5A1.5 1.5 0 0 0 3.5 14H11a1.5 1.5 0 0 0 1.5-1.5V9.5" />
+                  <path d="M9.5 2H14v4.5" />
+                  <path d="M14 2 7.5 8.5" />
+                </svg>
               </button>
+              <span class="hint about-website-hint">{m.settings_about_website_hint()}</span>
             </div>
             {#if websiteOpenError}
-              <span class="feedback error">{websiteOpenError}</span>
+              <span class="feedback error" role="alert">{websiteOpenError}</span>
             {/if}
           </div>
 
@@ -2127,7 +2139,7 @@
             </div>
             <ToggleSwitch bind:checked={settings.auto_check_updates} ariaLabel={m.settings_auto_check_updates_label()} />
           </div>
-          <div class="field">
+          <div class="field" class:about-frequency-disabled={!settings.auto_check_updates}>
             <label for="update-check-frequency">{m.settings_update_check_frequency_label()}</label>
             <span class="hint">{m.settings_update_check_frequency_hint()}</span>
             <select
@@ -2143,7 +2155,7 @@
 
           <div class="divider"></div>
 
-          <div class="field nested">
+          <div class="about-update-panel">
             <div class="action-row">
               <button
                 class="action-btn"
@@ -2164,21 +2176,33 @@
               {/if}
             </div>
 
-            {#if $updater.phase === 'uptodate'}
-              <span class="feedback success">{m.updater_uptodate()}</span>
-            {:else if $updater.phase === 'available'}
-              <span class="feedback success">{m.updater_available_status({ version: $updater.version ?? '' })}</span>
-            {:else if $updater.phase === 'downloading'}
-              <span class="hint">{aboutPercent !== null ? m.updater_downloading_pct({ pct: aboutPercent }) : m.updater_downloading()}</span>
-            {:else if $updater.phase === 'installing'}
-              <span class="hint">{m.updater_installing()}</span>
-            {:else if $updater.phase === 'ready'}
-              <span class="feedback success">{m.updater_ready_body({ version: $updater.version ?? '' })}</span>
-            {:else if $updater.phase === 'error'}
-              <span class="feedback error">{m.updater_error_body({ detail: $updater.error ?? '' })}</span>
-            {:else}
-              <span class="hint">{m.settings_about_check_hint()}</span>
-            {/if}
+            <div
+              class="about-update-status"
+              class:success={$updater.phase === 'uptodate' || $updater.phase === 'available' || $updater.phase === 'ready'}
+              class:error={$updater.phase === 'error'}
+              class:busy={$updater.phase === 'checking' || $updater.phase === 'downloading' || $updater.phase === 'installing'}
+            >
+              {#if $updater.phase === 'uptodate'}
+                <span class="feedback success">{m.updater_uptodate()}</span>
+              {:else if $updater.phase === 'available'}
+                <span class="feedback success">{m.updater_available_status({ version: $updater.version ?? '' })}</span>
+              {:else if $updater.phase === 'downloading'}
+                <span class="hint">{aboutPercent !== null ? m.updater_downloading_pct({ pct: aboutPercent }) : m.updater_downloading()}</span>
+                {#if aboutPercent !== null}
+                  <div class="about-progress" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={aboutPercent}>
+                    <div class="about-progress-fill" style="width: {aboutPercent}%"></div>
+                  </div>
+                {/if}
+              {:else if $updater.phase === 'installing'}
+                <span class="hint">{m.updater_installing()}</span>
+              {:else if $updater.phase === 'ready'}
+                <span class="feedback success">{m.updater_ready_body({ version: $updater.version ?? '' })}</span>
+              {:else if $updater.phase === 'error'}
+                <span class="feedback error">{m.updater_error_body({ detail: $updater.error ?? '' })}</span>
+              {:else}
+                <span class="hint">{m.settings_about_check_hint()}</span>
+              {/if}
+            </div>
           </div>
         </div>
       </section>
@@ -2675,11 +2699,183 @@
     color: var(--on-accent);
   }
 
-  .about-value {
+  .about-identity {
+    padding: 14px 14px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background:
+      linear-gradient(
+        160deg,
+        color-mix(in srgb, var(--accent) 8%, transparent) 0%,
+        transparent 55%
+      ),
+      var(--bg-surface);
+  }
+
+  .about-identity-top {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    margin-bottom: 12px;
+  }
+
+  .about-mark {
+    width: 44px;
+    height: 44px;
+    border-radius: 10px;
+    overflow: hidden;
+    flex-shrink: 0;
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--border) 70%, transparent);
+  }
+
+  .about-mark img {
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+
+  .about-identity-copy {
+    min-width: 0;
+  }
+
+  .about-wordmark {
+    margin: 0 0 3px;
+    font-size: 18px;
+    font-weight: 800;
+    letter-spacing: 2.5px;
+    color: var(--accent);
+    line-height: 1;
+  }
+
+  .about-tagline {
+    margin: 0 0 8px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.9px;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    line-height: 1.2;
+  }
+
+  .about-version-chip {
+    display: inline-block;
     margin: 0;
+    padding: 2px 8px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--badge-accent-text);
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent);
+    border-radius: 999px;
+    line-height: 1.4;
+  }
+
+  .about-description {
+    margin: 0 0 6px;
+    font-size: 13px;
+    line-height: 1.45;
+    color: var(--text-secondary);
+  }
+
+  .about-license {
+    margin: 0 0 12px;
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+
+  .about-website-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 8px 14px;
+  }
+
+  .about-website-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0;
+    border: none;
+    background: transparent;
+    color: var(--accent);
     font-size: 13px;
     font-weight: 600;
-    color: var(--text-primary);
+    cursor: pointer;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+
+  .about-website-link svg {
+    width: 13px;
+    height: 13px;
+    flex-shrink: 0;
+  }
+
+  .about-website-link:hover {
+    filter: brightness(1.08);
+  }
+
+  .about-website-link:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
+  }
+
+  .about-website-hint {
+    margin: 0;
+  }
+
+  .about-frequency-disabled {
+    opacity: 0.55;
+  }
+
+  .about-update-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .about-update-status {
+    padding: 10px 12px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    background: var(--bg-surface);
+  }
+
+  .about-update-status.success {
+    border-color: color-mix(in srgb, var(--success) 28%, var(--border));
+    background: color-mix(in srgb, var(--success) 8%, var(--bg-surface));
+  }
+
+  .about-update-status.error {
+    border-color: color-mix(in srgb, var(--danger) 28%, var(--border));
+    background: color-mix(in srgb, var(--danger) 8%, var(--bg-surface));
+  }
+
+  .about-update-status.busy {
+    border-color: color-mix(in srgb, var(--accent) 24%, var(--border));
+    background: color-mix(in srgb, var(--accent) 6%, var(--bg-surface));
+  }
+
+  .about-progress {
+    margin-top: 8px;
+    height: 4px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--accent) 16%, var(--bg-input));
+    overflow: hidden;
+  }
+
+  .about-progress-fill {
+    height: 100%;
+    border-radius: inherit;
+    background: var(--accent);
+    transition: width 0.2s ease;
+  }
+
+  .action-btn:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+    pointer-events: none;
   }
 
   .feedback {
