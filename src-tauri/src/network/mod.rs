@@ -4165,6 +4165,7 @@ async fn process_inbound_friend_request(
     verified: bool,
 ) {
     enum FriendRequestDbOutcome {
+        Blocked,
         AlreadyMutual,
         Promoted,
         PromotionSkipped,
@@ -4183,6 +4184,15 @@ async fn process_inbound_friend_request(
     let ip_q = peer_ip.to_string();
     let peer_pubkey_q = peer_pubkey;
     let db_outcome = tokio::task::spawn_blocking(move || {
+        // Cheap early-out so a blocked identity costs nothing beyond this
+        // lookup — no row, no notification, no reply confirming we are here.
+        // Not the enforcement point: `add_friend_request` re-tests inside its
+        // transaction, which is what makes the decision, so a lookup that
+        // errors here merely forgoes the shortcut rather than letting anyone
+        // through.
+        if db_q.is_friend_blocked(&h_q).unwrap_or(false) {
+            return FriendRequestDbOutcome::Blocked;
+        }
         let (is_friend, already_mutual) = db_q
             .get_friends_full()
             .ok()
@@ -4212,7 +4222,9 @@ async fn process_inbound_friend_request(
                 peer_port,
                 verified,
             ) {
-                Ok(()) => FriendRequestDbOutcome::Queued,
+                Ok(true) => FriendRequestDbOutcome::Queued,
+                // Blocked between the check above and the insert.
+                Ok(false) => FriendRequestDbOutcome::Blocked,
                 Err(e) => FriendRequestDbOutcome::Failed(e.to_string()),
             }
         }
@@ -4223,6 +4235,9 @@ async fn process_inbound_friend_request(
     });
 
     match db_outcome {
+        FriendRequestDbOutcome::Blocked => {
+            debug!("Dropping friend request from blocked identity {}", hash_hex);
+        }
         FriendRequestDbOutcome::AlreadyMutual => {
             info!(
                 "Friend {} already mutual — ignoring redundant EmberFriendRequest",
@@ -4241,6 +4256,23 @@ async fn process_inbound_friend_request(
             // The DB row is now mutual, so grant browse / friends-only access
             // on the live set the wire consults.
             mutual_friend_hashes.write().await.insert(req_hash);
+            // `set_friend_mutual` refuses a blocked identity outright, so this
+            // covers only the block that commits after it and before the line
+            // above. Reading after the grant rather than before is what makes
+            // that safe: blocking writes its row before clearing this set, so
+            // either we see the row here, or its teardown has still to run and
+            // will clear the entry itself.
+            let db_b = db.clone();
+            let h_b = hash_hex.clone();
+            let blocked_now = tokio::task::spawn_blocking(move || db_b.is_friend_blocked(&h_b))
+                .await
+                .map(|r| r.unwrap_or(false))
+                .unwrap_or(false);
+            if blocked_now {
+                mutual_friend_hashes.write().await.remove(&req_hash);
+                debug!("Revoked auto-confirm for {} — blocked mid-flight", hash_hex);
+                return;
+            }
             if !online_friends.contains_key(&req_hash) {
                 online_friends.insert(req_hash, chrono::Utc::now().timestamp());
                 let _ = app_handle.emit(

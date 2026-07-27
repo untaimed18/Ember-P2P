@@ -172,6 +172,16 @@ pub struct FriendInfo {
 }
 
 #[derive(serde::Serialize)]
+pub struct BlockedInfo {
+    pub user_hash: String,
+    /// Whatever the user last knew them by, copied out of the friend or
+    /// request row before blocking deleted it. May be empty for an identity
+    /// blocked before a nickname was ever recorded.
+    pub nickname: String,
+    pub blocked_at: i64,
+}
+
+#[derive(serde::Serialize)]
 pub struct FriendRequestInfo {
     pub sender_hash: String,
     pub sender_nickname: String,
@@ -222,6 +232,25 @@ pub async fn add_friend(
             "peers_cannot_add_self",
             "You cannot add yourself as a friend",
         ));
+    }
+
+    // Refuse rather than quietly lifting the block. Adding a blocked identity
+    // is nearly always a code pasted without recognising whose it is, and
+    // silently undoing an earlier decision is the one outcome the user has no
+    // way to notice afterwards.
+    {
+        let db = state.db.clone();
+        let db_hash = canonical.clone();
+        let blocked = tokio::task::spawn_blocking(move || db.is_friend_blocked(&db_hash))
+            .await
+            .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+            .map_err(|e| coded_ctx("peers_failed_block_lookup", "Failed to check blocks", e))?;
+        if blocked {
+            return Err(coded(
+                "peers_identity_blocked",
+                "That identity is blocked. Unblock it first to add them as a friend.",
+            ));
+        }
     }
 
     let max_friends = {
@@ -303,9 +332,14 @@ pub async fn remove_friend(
         .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
         .map_err(|e| coded_ctx("peers_failed_remove_friend", "Failed to remove friend", e))?;
 
-    let mut friends = state.friend_hashes.write().await;
-    friends.remove(&hash);
-    drop(friends);
+    tear_down_friend(&state, hash).await
+}
+
+/// Revoke every live grant held by a friend whose database rows have just
+/// been deleted. Shared by removal and blocking, which differ only in what
+/// they write; the access being withdrawn is identical.
+async fn tear_down_friend(state: &AppState, hash: [u8; 16]) -> Result<(), String> {
+    state.friend_hashes.write().await.remove(&hash);
     // Drop the mutual grant in the same breath, so browse and friends-only
     // serving stop immediately rather than at the next restart.
     state.mutual_friend_hashes.write().await.remove(&hash);
@@ -330,6 +364,66 @@ pub async fn remove_friend(
     )
     .await?;
     Ok(())
+}
+
+/// Block an identity: tear the friendship down and refuse everything that
+/// arrives from them afterwards.
+///
+/// Removal alone was never enough to make someone stop. The row is deleted,
+/// so nothing records the decision, and the same peer can send a fresh
+/// request immediately — which, for a user who has turned approval off, puts
+/// them straight back to mutual without a prompt.
+#[tauri::command]
+pub async fn block_friend(
+    state: tauri::State<'_, AppState>,
+    user_hash_hex: String,
+) -> Result<(), String> {
+    let canonical = user_hash_hex.to_lowercase();
+    let hash = parse_user_hash(&canonical)?;
+
+    let db = state.db.clone();
+    let db_hash = canonical;
+    tokio::task::spawn_blocking(move || db.block_friend(&db_hash))
+        .await
+        .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("peers_failed_block_friend", "Failed to block", e))?;
+
+    tear_down_friend(&state, hash).await
+}
+
+#[tauri::command]
+pub async fn unblock_friend(
+    state: tauri::State<'_, AppState>,
+    user_hash_hex: String,
+) -> Result<(), String> {
+    let canonical = user_hash_hex.to_lowercase();
+    parse_user_hash(&canonical)?;
+
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.unblock_friend(&canonical))
+        .await
+        .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("peers_failed_unblock_friend", "Failed to unblock", e))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_blocked_friends(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<BlockedInfo>, String> {
+    let db = state.db.clone();
+    let rows = tokio::task::spawn_blocking(move || db.get_blocked_friends())
+        .await
+        .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("peers_failed_get_blocked", "Failed to load blocks", e))?;
+    Ok(rows
+        .into_iter()
+        .map(|(user_hash, nickname, blocked_at)| BlockedInfo {
+            user_hash,
+            nickname,
+            blocked_at,
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -748,6 +842,40 @@ pub async fn accept_friend_request(
     // browse us and reach friends-only files. Mirror that into the live set
     // the wire checks against, rather than waiting for a restart to reload it.
     state.mutual_friend_hashes.write().await.insert(hash);
+
+    // Then confirm nothing blocked them while we were granting it. Accept and
+    // block can be in flight together — the request row is on screen for
+    // both — and blocking clears this set as its last act, so an accept that
+    // finished afterwards would put a blocked identity straight back into it.
+    //
+    // Checking *after* the insert is what settles this rather than merely
+    // narrowing it: a block always writes its row before clearing the set, so
+    // either this read sees the row and undoes the grant, or the block's own
+    // teardown has yet to run and will clear it for us. Whichever order the
+    // two land in, the identity ends up out of the set.
+    //
+    // The grant is briefly live in between, for as long as one indexed lookup
+    // takes. Closing that too would mean holding the `mutual_friend_hashes`
+    // write guard across a database read, stalling every browse and
+    // friends-only serving check behind SQLite — a poor trade against a
+    // window this small, which needs accept and block dispatched against one
+    // identity at the same instant to open at all, and which the Friends page
+    // already prevents by disabling one while the other is in flight.
+    {
+        let db = state.db.clone();
+        let db_hash = canonical.clone();
+        let blocked = tokio::task::spawn_blocking(move || db.is_friend_blocked(&db_hash))
+            .await
+            .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+            .map_err(|e| coded_ctx("peers_failed_block_lookup", "Failed to check blocks", e))?;
+        if blocked {
+            tear_down_friend(&state, hash).await?;
+            return Err(coded(
+                "peers_identity_blocked",
+                "That identity is blocked. Unblock it first to add them as a friend.",
+            ));
+        }
+    }
 
     // Reuse the IP/port the requester left in their friend_requests
     // row (captured by `add_friend_request` at receive time). Without

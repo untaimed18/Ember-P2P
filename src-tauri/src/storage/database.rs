@@ -390,7 +390,7 @@ impl Database {
         // Ember build. Silently running would invite subtle data corruption
         // (missing columns, renamed tables, semantic changes). Bump this
         // when introducing a new migration.
-        const MAX_SUPPORTED_VERSION: i64 = 24;
+        const MAX_SUPPORTED_VERSION: i64 = 25;
         if version > MAX_SUPPORTED_VERSION {
             anyhow::bail!(
                 "Database schema version {version} is newer than this Ember build supports \
@@ -970,6 +970,30 @@ impl Database {
                 [],
             )?;
             set_version(&tx, 24)?;
+            tx.commit()?;
+        }
+
+        if version < 25 {
+            // Removing a friend deletes the row, so it cannot also record that
+            // the user wants nothing further from that identity: the same peer
+            // can send another request straight away and, with approval
+            // disabled, be promoted back to mutual without the user ever being
+            // asked. Blocks therefore live in their own table, which outlives
+            // the friendship it ended.
+            //
+            // The nickname is denormalised on purpose. Once the `friends` row
+            // is gone there is nothing left to join against, and a list of
+            // bare 32-character hashes gives the user no way to tell who they
+            // blocked or who to unblock.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS friend_blocks (
+                    user_hash TEXT PRIMARY KEY,
+                    nickname TEXT NOT NULL DEFAULT '',
+                    blocked_at INTEGER NOT NULL DEFAULT 0
+                );",
+            )?;
+            set_version(&tx, 25)?;
             tx.commit()?;
         }
 
@@ -2090,6 +2114,12 @@ impl Database {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         let now = chrono::Utc::now().timestamp();
+        // The command checks first so it can report this properly; repeating
+        // it here closes the window where a block commits in between and
+        // leaves the identity listed as a friend and blocked at once.
+        if Self::blocked_in(&tx, user_hash)? {
+            anyhow::bail!("identity is blocked");
+        }
         tx.execute(
             "INSERT INTO friends (user_hash, nickname, added_at, ed25519_pubkey) \
              VALUES (?1, ?2, ?3, ?4)
@@ -2153,6 +2183,113 @@ impl Database {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// End a friendship and record that the user wants no further contact.
+    ///
+    /// Both halves happen in one transaction because either alone is worse
+    /// than neither: a removal whose block was lost invites the peer straight
+    /// back, and a block whose removal failed leaves them listed as a friend.
+    pub fn block_friend(&self, user_hash: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        // Read the name before deleting the rows that hold it — this is the
+        // user's only handle on the entry afterwards.
+        let nickname: String = tx
+            .query_row(
+                "SELECT nickname FROM friends WHERE user_hash = ?1",
+                params![user_hash],
+                |row| row.get(0),
+            )
+            .or_else(|_| {
+                tx.query_row(
+                    "SELECT sender_nickname FROM friend_requests WHERE sender_hash = ?1",
+                    params![user_hash],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap_or_default();
+        tx.execute(
+            // Re-blocking must not erase what we already knew. By the second
+            // call the friend and request rows are long gone, so the lookup
+            // above finds nothing and would otherwise overwrite a good name
+            // with an empty one. `blocked_at` likewise keeps the date of the
+            // original decision rather than the retry.
+            "INSERT INTO friend_blocks (user_hash, nickname, blocked_at) \
+             VALUES (?1, ?2, ?3) \
+             ON CONFLICT(user_hash) DO UPDATE SET \
+                 nickname = CASE WHEN excluded.nickname != '' \
+                     THEN excluded.nickname ELSE friend_blocks.nickname END",
+            params![user_hash, nickname, chrono::Utc::now().timestamp()],
+        )?;
+        tx.execute(
+            "DELETE FROM chat_messages WHERE friend_hash = ?1",
+            params![user_hash],
+        )?;
+        tx.execute(
+            "DELETE FROM friends WHERE user_hash = ?1",
+            params![user_hash],
+        )?;
+        tx.execute(
+            "DELETE FROM friend_requests WHERE sender_hash = ?1",
+            params![user_hash],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Lift a block. Deliberately does not restore the friendship: the rows
+    /// were deleted when it was applied, so the two have to add each other
+    /// again, which is the same handshake any other pair goes through.
+    pub fn unblock_friend(&self, user_hash: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "DELETE FROM friend_blocks WHERE user_hash = ?1",
+            params![user_hash],
+        )?;
+        Ok(())
+    }
+
+    pub fn is_friend_blocked(&self, user_hash: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        Ok(Self::blocked_in(&conn, user_hash)?)
+    }
+
+    /// The block test as run *inside* an open transaction.
+    ///
+    /// Every path that can grant an identity access has to consult this
+    /// within the same transaction that does the writing. Checking
+    /// beforehand only proves they were not blocked at the time of the
+    /// check: blocking commits from the UI thread, so it can land in the
+    /// window between a caller's test and its insert, and the request or
+    /// friendship would then be written over the top of a live block.
+    fn blocked_in(conn: &Connection, user_hash: &str) -> rusqlite::Result<bool> {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM friend_blocks WHERE user_hash = ?1",
+            params![user_hash],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// `(user_hash, nickname, blocked_at)`, most recently blocked first.
+    pub fn get_blocked_friends(&self) -> anyhow::Result<Vec<(String, String, i64)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT user_hash, nickname, blocked_at FROM friend_blocks \
+             ORDER BY blocked_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
     }
 
     pub fn get_friends(&self) -> anyhow::Result<Vec<(String, String, i64)>> {
@@ -2260,10 +2397,17 @@ impl Database {
         sender_ip: &str,
         sender_port: u16,
         verified: bool,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let mut conn = self.conn.lock();
         let now = chrono::Utc::now().timestamp();
         let tx = conn.transaction()?;
+
+        // Authoritative block test. Callers check first to avoid the work of
+        // queueing and notifying, but this is the one that decides, because
+        // it cannot be raced by a block committing mid-flight.
+        if Self::blocked_in(&tx, sender_hash)? {
+            return Ok(false);
+        }
 
         // M2: cap total inbound `friend_requests` rows. Per-sender
         // UPSERT below already prevents same-hash flooding, but an
@@ -2346,7 +2490,7 @@ impl Database {
             ],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(true)
     }
 
     pub fn get_friend_requests(
@@ -2442,6 +2586,15 @@ impl Database {
             None => anyhow::bail!("friend request not found"),
         };
 
+        // A blocked identity should have no request row to accept, but the
+        // two can cross: the row may already have been on screen when the
+        // block was applied, and the click arrives afterwards. Accepting
+        // writes `mutual = 1`, which would hand back chat and browse while
+        // the block sat there looking effective.
+        if Self::blocked_in(&tx, sender_hash)? {
+            anyhow::bail!("identity is blocked");
+        }
+
         let nickname = request_data.0.clone();
         let now = chrono::Utc::now().timestamp();
 
@@ -2493,10 +2646,15 @@ impl Database {
     ) -> anyhow::Result<usize> {
         let conn = self.conn.lock();
         let now = chrono::Utc::now().timestamp();
+        // Promotion to mutual is the widest grant there is — it opens browse
+        // and friends-only serving — so the block test rides along in the
+        // UPDATE itself. A blocked identity matches no row, and the caller's
+        // "nothing was updated" path already declines to grant anything.
         let updated = if !ip.is_empty() && port > 0 {
             conn.execute(
                 "UPDATE friends SET mutual = 1, last_ip = ?2, last_port = ?3, last_seen = ?4,
-                 ed25519_pubkey = COALESCE(?5, ed25519_pubkey) WHERE user_hash = ?1",
+                 ed25519_pubkey = COALESCE(?5, ed25519_pubkey) WHERE user_hash = ?1
+                 AND NOT EXISTS (SELECT 1 FROM friend_blocks WHERE user_hash = ?1)",
                 params![
                     user_hash,
                     ip,
@@ -2508,7 +2666,8 @@ impl Database {
         } else {
             conn.execute(
                 "UPDATE friends SET mutual = 1,
-                 ed25519_pubkey = COALESCE(?2, ed25519_pubkey) WHERE user_hash = ?1",
+                 ed25519_pubkey = COALESCE(?2, ed25519_pubkey) WHERE user_hash = ?1
+                 AND NOT EXISTS (SELECT 1 FROM friend_blocks WHERE user_hash = ?1)",
                 params![user_hash, ed25519_pubkey.map(|key| key.as_slice())],
             )?
         };
@@ -2918,6 +3077,241 @@ mod tests {
         }
     }
 
+    /// Build a `Database` with just the friends-related tables, enough to
+    /// exercise blocking without a `tauri::AppHandle`.
+    fn friends_only_db() -> Database {
+        let conn = Connection::open_in_memory().expect("open in-memory");
+        conn.execute_batch(
+            "CREATE TABLE friends (
+                user_hash TEXT PRIMARY KEY,
+                nickname TEXT NOT NULL DEFAULT '',
+                added_at INTEGER NOT NULL DEFAULT 0,
+                last_ip TEXT DEFAULT '',
+                last_port INTEGER DEFAULT 0,
+                last_seen INTEGER DEFAULT 0,
+                mutual INTEGER NOT NULL DEFAULT 0,
+                ed25519_pubkey BLOB
+            );
+            CREATE TABLE friend_requests (
+                sender_hash TEXT PRIMARY KEY,
+                sender_nickname TEXT NOT NULL DEFAULT '',
+                received_at INTEGER NOT NULL DEFAULT 0,
+                sender_ip TEXT DEFAULT '',
+                sender_port INTEGER DEFAULT 0,
+                verified INTEGER NOT NULL DEFAULT 0,
+                sender_pubkey BLOB
+            );
+            CREATE TABLE chat_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                friend_hash TEXT NOT NULL,
+                message TEXT NOT NULL
+            );
+            CREATE TABLE friend_blocks (
+                user_hash TEXT PRIMARY KEY,
+                nickname TEXT NOT NULL DEFAULT '',
+                blocked_at INTEGER NOT NULL DEFAULT 0
+            );",
+        )
+        .expect("create schema");
+        Database {
+            conn: Mutex::new(conn),
+            chat_key: Zeroizing::new([0xA5; 32]),
+            corrupt_backup: None,
+        }
+    }
+
+    fn row_count(db: &Database, sql: &str) -> i64 {
+        db.conn
+            .lock()
+            .query_row(sql, [], |r| r.get(0))
+            .expect("count")
+    }
+
+    /// The point of a block is that it outlives the friendship it ended.
+    /// Removal alone deletes the row and with it any record of the decision,
+    /// which is what let a blocked peer re-request their way back in.
+    #[test]
+    fn blocking_ends_the_friendship_and_outlives_it() {
+        let db = friends_only_db();
+        {
+            let conn = db.conn.lock();
+            conn.execute(
+                "INSERT INTO friends (user_hash, nickname, mutual) VALUES ('aa', 'Mallory', 1)",
+                [],
+            )
+            .expect("seed friend");
+            conn.execute(
+                "INSERT INTO chat_messages (friend_hash, message) VALUES ('aa', 'hi')",
+                [],
+            )
+            .expect("seed chat");
+        }
+
+        db.block_friend("aa").expect("block");
+
+        assert_eq!(row_count(&db, "SELECT COUNT(*) FROM friends"), 0);
+        assert_eq!(row_count(&db, "SELECT COUNT(*) FROM chat_messages"), 0);
+        assert!(db.is_friend_blocked("aa").expect("lookup"));
+
+        let blocked = db.get_blocked_friends().expect("list");
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].0, "aa");
+        // Carried across from the deleted friend row: without it the user is
+        // left staring at a bare hash with no way to tell who it was.
+        assert_eq!(blocked[0].1, "Mallory");
+    }
+
+    /// A stranger can be blocked straight from the approval queue, before
+    /// they were ever a friend, so the name has to come from the request.
+    #[test]
+    fn blocking_a_pending_requester_keeps_their_name() {
+        let db = friends_only_db();
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO friend_requests (sender_hash, sender_nickname) \
+                 VALUES ('bb', 'Stranger')",
+                [],
+            )
+            .expect("seed request");
+
+        db.block_friend("bb").expect("block");
+
+        assert_eq!(row_count(&db, "SELECT COUNT(*) FROM friend_requests"), 0);
+        let blocked = db.get_blocked_friends().expect("list");
+        assert_eq!(blocked[0].1, "Stranger");
+    }
+
+    /// Unblocking clears the block and nothing else. The friendship rows were
+    /// deleted when it was applied, so the pair have to add each other again
+    /// rather than silently resuming.
+    #[test]
+    fn unblocking_does_not_restore_the_friendship() {
+        let db = friends_only_db();
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO friends (user_hash, nickname) VALUES ('cc', 'Gone')",
+                [],
+            )
+            .expect("seed friend");
+
+        db.block_friend("cc").expect("block");
+        db.unblock_friend("cc").expect("unblock");
+
+        assert!(!db.is_friend_blocked("cc").expect("lookup"));
+        assert!(db.get_blocked_friends().expect("list").is_empty());
+        assert_eq!(row_count(&db, "SELECT COUNT(*) FROM friends"), 0);
+    }
+
+    /// The check the network loop runs before queueing is only an early-out.
+    /// Blocking commits from the UI thread, so it can land after that check
+    /// and before the insert; the transaction has to refuse on its own.
+    #[test]
+    fn a_block_committed_mid_flight_still_stops_the_request() {
+        let db = friends_only_db();
+        db.block_friend("dd").expect("block");
+
+        let queued = db
+            .add_friend_request("dd", None, "Mallory", "1.2.3.4", 4662, true)
+            .expect("insert");
+
+        assert!(!queued, "blocked identity must not be queued");
+        assert_eq!(row_count(&db, "SELECT COUNT(*) FROM friend_requests"), 0);
+    }
+
+    /// The request row may already be on screen when the block is applied, so
+    /// the accept can arrive afterwards. Letting it through would write
+    /// `mutual = 1` and hand back chat and browse under a live block.
+    #[test]
+    fn accepting_a_request_from_a_blocked_identity_is_refused() {
+        let db = friends_only_db();
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO friend_requests (sender_hash, sender_nickname) \
+                 VALUES ('ee', 'Mallory')",
+                [],
+            )
+            .expect("seed request");
+        // Block without going through `block_friend`, which would delete the
+        // row: this is the racing order, where the row outlives the block.
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO friend_blocks (user_hash, nickname) VALUES ('ee', 'Mallory')",
+                [],
+            )
+            .expect("seed block");
+
+        assert!(db.accept_friend_request("ee").is_err());
+        assert_eq!(row_count(&db, "SELECT COUNT(*) FROM friends"), 0);
+    }
+
+    /// The command checks before calling, so this covers the race: a block
+    /// that commits in between must not leave the identity both listed as a
+    /// friend and blocked.
+    #[test]
+    fn adding_a_blocked_identity_is_refused_by_the_transaction() {
+        let db = friends_only_db();
+        db.block_friend("11").expect("block");
+
+        assert!(db.add_friend("11", "Mallory", None).is_err());
+        assert_eq!(row_count(&db, "SELECT COUNT(*) FROM friends"), 0);
+    }
+
+    /// Auto-confirm promotes a one-sided friend to mutual without prompting,
+    /// which grants browse and friends-only serving. A block has to stop it
+    /// even though the `friends` row is still there.
+    #[test]
+    fn promotion_to_mutual_skips_a_blocked_identity() {
+        let db = friends_only_db();
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO friends (user_hash, nickname, mutual) VALUES ('22', 'Mallory', 0)",
+                [],
+            )
+            .expect("seed friend");
+        db.conn
+            .lock()
+            .execute("INSERT INTO friend_blocks (user_hash) VALUES ('22')", [])
+            .expect("seed block");
+
+        let updated = db
+            .set_friend_mutual("22", "1.2.3.4", 4662, None)
+            .expect("promote");
+
+        assert_eq!(updated, 0, "blocked identity must not be promoted");
+        assert_eq!(
+            row_count(&db, "SELECT COUNT(*) FROM friends WHERE mutual = 1"),
+            0
+        );
+    }
+
+    /// Blocking twice must not erase the name. By the second call the friend
+    /// and request rows are gone, so the lookup finds nothing — easy to hit
+    /// when the first attempt persisted the block but reported an error and
+    /// the user simply tried again.
+    #[test]
+    fn re_blocking_keeps_the_name_from_the_first_time() {
+        let db = friends_only_db();
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO friends (user_hash, nickname) VALUES ('ff', 'Mallory')",
+                [],
+            )
+            .expect("seed friend");
+
+        db.block_friend("ff").expect("first block");
+        db.block_friend("ff").expect("second block");
+
+        let blocked = db.get_blocked_friends().expect("list");
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].1, "Mallory");
+    }
+
     /// Regression: `save_all_credits` MUST act as a full replacement so
     /// records pruned in memory by `CreditManager::cleanup_stale` are
     /// also dropped from the persisted table. Before this was a bare
@@ -3200,7 +3594,7 @@ mod tests {
                 |r| r.get(0),
             )
             .expect("version");
-        assert_eq!(version, 24);
+        assert_eq!(version, 25);
         drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));

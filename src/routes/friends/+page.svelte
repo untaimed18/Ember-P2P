@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { getFriends, addFriend, removeFriend, updateFriendNickname, getMyEmberHash, acceptFriendRequest, rejectFriendRequest, retryFriendSearch, type FriendInfo, type FriendRequestInfo } from '$lib/api/friends';
+  import { getFriends, addFriend, removeFriend, blockFriend, unblockFriend, getBlockedFriends, updateFriendNickname, getMyEmberHash, acceptFriendRequest, rejectFriendRequest, retryFriendSearch, type FriendInfo, type FriendRequestInfo, type BlockedInfo } from '$lib/api/friends';
   import { getNetworkStats, kadRecheckFirewall } from '$lib/api/kad';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import BrowseFriendDialog from '$lib/components/BrowseFriendDialog.svelte';
@@ -44,6 +44,13 @@
 
   let confirmRemoveOpen = $state(false);
   let pendingRemove: FriendInfo | null = $state(null);
+
+  let confirmBlockOpen = $state(false);
+  /** Either a friend or a stranger from the approval queue — blocking works
+   *  the same for both, so only the name and hash are carried. */
+  let pendingBlock: { user_hash: string; nickname: string } | null = $state(null);
+  let blocked: BlockedInfo[] = $state([]);
+  let blockedOpen = $state(false);
 
   let editingHash: string | null = $state(null);
   let editNickname = $state('');
@@ -318,6 +325,7 @@
   onMount(() => {
     destroyed = false;
     loadFriends();
+    loadBlocked();
     loadMyHash();
     getNetworkStats()
       .then(s => { if (!destroyed) isFirewalled = s.firewalled; })
@@ -430,6 +438,72 @@
       error = toErr(e);
     } finally {
       if (!destroyed && seq === loadFriendsSeq) loading = false;
+    }
+  }
+
+  async function loadBlocked() {
+    if (destroyed) return;
+    try {
+      const list = await getBlockedFriends();
+      if (!destroyed) blocked = list;
+    } catch (e: unknown) {
+      // A failed block list must not take the page down with it — the
+      // friends list above is the primary content and loads independently.
+      console.warn('friends: failed to load blocked identities:', e);
+    }
+  }
+
+  function confirmBlock(user_hash: string, nickname: string) {
+    pendingBlock = { user_hash, nickname };
+    confirmBlockOpen = true;
+  }
+
+  async function handleBlock() {
+    if (!pendingBlock) return;
+    const target = pendingBlock;
+    confirmBlockOpen = false;
+    pendingBlock = null;
+    // Holds the accept/reject buttons on any matching request card while this
+    // runs, so the two cannot be dispatched against the same identity at once.
+    processingRequests.add(target.user_hash);
+    processingRequests = new Set(processingRequests);
+    let reportedOk = false;
+    try {
+      await blockFriend(target.user_hash);
+      reportedOk = true;
+      flash(m.friends_blocked({ name: target.nickname || target.user_hash.slice(0, 8) + '\u2026' }));
+    } catch (e: unknown) {
+      error = toErr(e);
+    } finally {
+      await Promise.all([loadFriends(), loadBlocked()]);
+      // Decide from the reloaded list rather than from whether the call
+      // threw. The row is committed before the live teardown is
+      // acknowledged, so a rejection can still mean "blocked, but the
+      // network task did not confirm" — and skipping the cleanup then would
+      // leave an open chat tab and an online marker for someone who is in
+      // fact blocked. A failure earlier than the write leaves no row, and
+      // this correctly does nothing.
+      if (reportedOk || blocked.some(b => b.user_hash === target.user_hash)) {
+        // Blocking subsumes removal, so the same cleanup applies: online
+        // marker, unread badge, in-flight search, chat tab, pending request.
+        onlineFriendsStore.update(s => { const next = new Set(s); next.delete(target.user_hash); return next; });
+        clearUnread(target.user_hash);
+        clearFriendSearch(target.user_hash);
+        removeChatForFriend(target.user_hash);
+        friendRequestsStore.update(reqs => reqs.filter(r => r.sender_hash !== target.user_hash));
+      }
+      processingRequests.delete(target.user_hash);
+      processingRequests = new Set(processingRequests);
+    }
+  }
+
+  async function handleUnblock(b: BlockedInfo) {
+    try {
+      await unblockFriend(b.user_hash);
+      flash(m.friends_unblocked({ name: b.nickname || b.user_hash.slice(0, 8) + '\u2026' }));
+      await loadBlocked();
+    } catch (e: unknown) {
+      error = toErr(e);
     }
   }
 
@@ -609,6 +683,15 @@
   confirmLabel={m.common_remove()}
   danger={true}
   onconfirm={handleRemove}
+/>
+
+<ConfirmDialog
+  bind:open={confirmBlockOpen}
+  title={m.friends_confirm_block_title()}
+  message={m.friends_confirm_block_message({ name: pendingBlock ? (pendingBlock.nickname || pendingBlock.user_hash.slice(0, 8) + '\u2026') : '' })}
+  confirmLabel={m.friends_block()}
+  danger={true}
+  onconfirm={handleBlock}
 />
 
 <BrowseFriendDialog
@@ -807,6 +890,10 @@
             <div class="request-actions">
               <button class="request-accept" onclick={() => handleAcceptRequest(req)} disabled={processingRequests.has(req.sender_hash)}>{m.friends_accept()}</button>
               <button class="request-reject" onclick={() => handleRejectRequest(req)} disabled={processingRequests.has(req.sender_hash)}>{m.friends_reject()}</button>
+              <!-- Rejecting only clears the row; the same stranger can ask
+                   again immediately. Blocking from here is the way to make
+                   a persistent requester stop. -->
+              <button class="request-block" onclick={() => confirmBlock(req.sender_hash, req.sender_nickname)} disabled={processingRequests.has(req.sender_hash)}>{m.friends_block()}</button>
             </div>
           </div>
         {/each}
@@ -1074,6 +1161,13 @@
                 onclick={(e) => { closeCardMenu(e.currentTarget); confirmRemoveFriend(f); }}
                 aria-label={m.friends_remove_aria({ name: shortName })}
               >{m.friends_remove_title()}</button>
+              <button
+                type="button"
+                role="menuitem"
+                class="menu-item-danger"
+                onclick={(e) => { closeCardMenu(e.currentTarget); confirmBlock(f.user_hash, f.nickname); }}
+                aria-label={m.friends_block_aria({ name: shortName })}
+              >{m.friends_block()}</button>
             </div>
           </details>
         </div>
@@ -1103,6 +1197,43 @@
         {/each}
       </div>
     {/if}
+  {/if}
+
+  <!-- Collapsed by default and hidden entirely when empty: a block list is
+       something the user consults deliberately, not standing content. -->
+  {#if blocked.length > 0}
+    <div class="blocked-section">
+      <button
+        type="button"
+        class="blocked-toggle"
+        aria-expanded={blockedOpen}
+        onclick={() => (blockedOpen = !blockedOpen)}
+      >
+        <span class="blocked-chevron" class:open={blockedOpen} aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M9 18l6-6-6-6"/>
+          </svg>
+        </span>
+        <span class="blocked-title">{m.friends_blocked_title()}</span>
+        <span class="blocked-badge">{blocked.length}</span>
+      </button>
+      {#if blockedOpen}
+        <div class="blocked-list">
+          {#each blocked as b (b.user_hash)}
+            <div class="blocked-row">
+              <div class="blocked-info">
+                <!-- Peer-controlled name: same bidi neutralisation as the
+                     friend and request cards. -->
+                <bdi dir="auto" class="blocked-name">{b.nickname || m.friends_unknown_sender()}</bdi>
+                <span class="blocked-hash" title={b.user_hash}>{b.user_hash.slice(0, 8)}&hellip;{b.user_hash.slice(-6)}</span>
+              </div>
+              <button class="ghost" onclick={() => handleUnblock(b)} aria-label={m.friends_unblock_aria({ name: b.nickname || b.user_hash.slice(0, 8) + '\u2026' })}>{m.friends_unblock()}</button>
+            </div>
+          {/each}
+        </div>
+        <p class="blocked-hint">{m.friends_blocked_hint()}</p>
+      {/if}
+    </div>
   {/if}
 </div>
 
@@ -2059,6 +2190,129 @@
   .request-reject:hover {
     color: var(--danger);
     border-color: var(--danger);
+  }
+
+  .request-block {
+    padding: 5px 14px;
+    border: 1px solid transparent;
+    border-radius: var(--radius-md);
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 11px;
+    font-weight: 600;
+    font-family: inherit;
+    cursor: pointer;
+    transition: color var(--transition-fast), border-color var(--transition-fast);
+  }
+
+  .request-block:hover {
+    color: var(--danger);
+    border-color: var(--danger);
+  }
+
+  .request-block:disabled,
+  .request-reject:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  /* --- Blocked identities --- */
+  .blocked-section {
+    margin-top: 20px;
+    border-top: 1px solid var(--border);
+    padding-top: 12px;
+  }
+
+  .blocked-toggle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 6px 2px;
+    border: none;
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 12px;
+    font-weight: 600;
+    font-family: inherit;
+    cursor: pointer;
+    text-align: left;
+  }
+
+  .blocked-toggle:hover {
+    color: var(--text-secondary);
+  }
+
+  .blocked-chevron {
+    display: inline-flex;
+    width: 14px;
+    height: 14px;
+    transition: transform var(--transition-fast);
+  }
+
+  .blocked-chevron.open {
+    transform: rotate(90deg);
+  }
+
+  .blocked-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 18px;
+    height: 18px;
+    border-radius: 9px;
+    background: var(--bg-elevated);
+    color: var(--text-muted);
+    font-size: 10px;
+    font-weight: 700;
+    padding: 0 5px;
+    line-height: 1;
+  }
+
+  .blocked-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 8px;
+  }
+
+  .blocked-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-surface);
+  }
+
+  .blocked-info {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .blocked-name {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .blocked-hash {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--text-muted);
+  }
+
+  .blocked-hint {
+    margin: 8px 2px 0;
+    font-size: 11px;
+    color: var(--text-muted);
   }
 
   /* --- Firewall warning banner --- */

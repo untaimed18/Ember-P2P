@@ -10,6 +10,14 @@ export interface FriendInfo {
   mutual: boolean;
 }
 
+export interface BlockedInfo {
+  user_hash: string;
+  /** Last known name, copied out of the friend or request row before
+   *  blocking deleted it. Empty if none was ever recorded. */
+  nickname: string;
+  blocked_at: number;
+}
+
 export interface FriendRequestInfo {
   sender_hash: string;
   sender_nickname: string;
@@ -67,6 +75,23 @@ export async function addFriend(userHashHex: string, nickname?: string): Promise
 
 export async function removeFriend(userHashHex: string): Promise<void> {
   return invoke('remove_friend', { userHashHex });
+}
+
+/** Remove them and refuse anything further from that identity. Unlike
+ *  `removeFriend`, the decision survives: they cannot request their way
+ *  back in. Deletes the chat history, same as removal. */
+export async function blockFriend(userHashHex: string): Promise<void> {
+  return invoke('block_friend', { userHashHex });
+}
+
+/** Lift a block. Does not restore the friendship — the two have to add
+ *  each other again. */
+export async function unblockFriend(userHashHex: string): Promise<void> {
+  return invoke('unblock_friend', { userHashHex });
+}
+
+export async function getBlockedFriends(): Promise<BlockedInfo[]> {
+  return invoke('get_blocked_friends');
 }
 
 export async function updateFriendNickname(userHashHex: string, nickname: string): Promise<void> {
