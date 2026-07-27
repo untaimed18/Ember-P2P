@@ -3009,6 +3009,30 @@ impl UploadHandler {
         }
     }
 
+    /// True when `file_hash` is restricted to mutual friends and this peer is
+    /// not one — so queueing them could only ever end in a refusal.
+    ///
+    /// [`Self::resolve_upload_file`] is still the authority on whether bytes
+    /// go out; this exists purely so a peer who cannot be served does not sit
+    /// in the waiting list occupying a slot another peer could use.
+    async fn friends_only_and_barred(&self, file_hash: &[u8; 16], peer: PeerFileAccess) -> bool {
+        let restricted = {
+            let index = self.local_index.read().await;
+            index
+                .get_by_hash(&hex::encode(file_hash))
+                .is_some_and(|f| f.friends_only)
+        };
+        if !restricted {
+            return false;
+        }
+        !mutual_friend_access(
+            &self.mutual_friend_hashes,
+            peer.ember_hash,
+            peer.secure_v2_authenticated,
+        )
+        .await
+    }
+
     /// Resolve a requested hash to a servable file.
     ///
     /// `peer` carries the requester's authenticated identity on *this*
@@ -6644,6 +6668,32 @@ impl UploadHandler {
                         let mut hash = [0u8; 16];
                         hash.copy_from_slice(&payload[..16]);
                         current_file_hash = Some(hash);
+                    }
+
+                    // Turn a friends-only request away at the door rather than
+                    // letting it wait for a slot it can never be granted.
+                    // Answering QUEUEFULL reuses the refusal the soft-limit
+                    // path already sends, so the peer backs off and looks
+                    // elsewhere without learning why.
+                    if let Some(h) = current_file_hash {
+                        if self
+                            .friends_only_and_barred(
+                                &h,
+                                PeerFileAccess {
+                                    ember_hash: peer_ember_hash,
+                                    secure_v2_authenticated,
+                                },
+                            )
+                            .await
+                        {
+                            debug!(
+                                "Refusing queue admission for friends-only file {} from {peer_addr}",
+                                hex::encode(h)
+                            );
+                            write_packet_async(&mut writer, OP_EMULEPROT, OP_QUEUEFULL, &[])
+                                .await?;
+                            break;
+                        }
                     }
 
                     // Duplicate OP_STARTUPLOADREQ on an already-granted session.
