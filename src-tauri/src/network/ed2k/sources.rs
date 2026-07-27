@@ -80,6 +80,15 @@ pub enum DownloadSourceState {
     LowToLowIp,
     /// Both sides are Low-ID, but Ember relay/hole-punch is being attempted.
     EmberRelay,
+    /// This source is a friend we cannot dial, and we have asked them over
+    /// their friend session to connect back to us instead
+    /// (`OP_EMBER_XFER_REQ`). No relation to eD2K/KAD ID status: the request
+    /// travels on the friend session and needs no server or buddy.
+    ///
+    /// Unlike [`Self::LowToLowIp`] this is not a dead end — the request has a
+    /// bounded lifetime, after which the network loop returns the source to
+    /// [`Self::Failed`] so ordinary retry resumes.
+    FriendConnect,
     /// Banned by remote peer (DS_BANNED).
     Banned,
 }
@@ -195,6 +204,10 @@ impl DownloadSourceEntry {
             }
             DownloadSourceState::LowToLowIp
             | DownloadSourceState::EmberRelay
+            // Dialing is exactly what failed, so don't re-dial while the
+            // friend's connect-back is outstanding. The network loop clears
+            // this state on ack-decline or attempt timeout.
+            | DownloadSourceState::FriendConnect
             | DownloadSourceState::Banned => return u64::MAX,
         };
         let elapsed = now.saturating_duration_since(self.last_asked).as_secs();
@@ -583,6 +596,62 @@ impl PerFileSourceList {
         }
     }
 
+    /// The peer identity recorded for the source at `(ip, port)` on *this*
+    /// file, if we know one.
+    ///
+    /// Scoped deliberately to a single file's live source list. The
+    /// `SourceManager`-wide `find_user_hash_by_addr` scans every tracked file
+    /// and ignores entry expiry, so an address recycled from a departed peer can
+    /// still resolve to that peer's identity — see the reasoning on
+    /// `unique_user_hash_for_ip`. This list only holds sources the running
+    /// download is actually tracking right now.
+    pub fn source_user_hash_at(&self, ip: Ipv4Addr, port: u16) -> Option<[u8; 16]> {
+        self.sources
+            .iter()
+            .find(|s| s.ip == ip && s.tcp_port == port)
+            .and_then(|s| s.source_user_hash)
+            .filter(|h| *h != [0u8; 16])
+    }
+
+    /// This source is a friend we asked to connect back to us over their
+    /// friend session (`OP_EMBER_XFER_REQ`).
+    pub fn set_friend_connect(&mut self, ip: Ipv4Addr, port: u16, user_hash: Option<[u8; 16]>) {
+        if let Some(s) = self.find_mut(ip, port, user_hash) {
+            s.state = DownloadSourceState::FriendConnect;
+            s.state_changed = Instant::now();
+        }
+    }
+
+    /// Release a source parked in [`DownloadSourceState::FriendConnect`] back
+    /// to ordinary retry, because the friend declined or never dialed.
+    /// A no-op for any other state so a source that meanwhile started
+    /// transferring (the friend's connect-back landed) is left alone.
+    pub fn clear_friend_connect(&mut self, ip: Ipv4Addr, port: u16, user_hash: Option<[u8; 16]>) {
+        if let Some(s) = self.find_mut(ip, port, user_hash) {
+            if matches!(s.state, DownloadSourceState::FriendConnect) {
+                s.state = DownloadSourceState::Failed;
+                s.state_changed = Instant::now();
+            }
+        }
+    }
+
+    /// Sources currently awaiting a friend connect-back, with how long they
+    /// have been waiting. Drives the attempt-timeout sweep in the network
+    /// loop.
+    pub fn friend_connect_sources(&self, now: Instant) -> Vec<(Ipv4Addr, u16, u64)> {
+        self.sources
+            .iter()
+            .filter(|s| matches!(s.state, DownloadSourceState::FriendConnect))
+            .map(|s| {
+                (
+                    s.ip,
+                    s.tcp_port,
+                    now.saturating_duration_since(s.state_changed).as_secs(),
+                )
+            })
+            .collect()
+    }
+
     /// Remote peer has banned us.
     pub fn set_banned(&mut self, ip: Ipv4Addr, port: u16, user_hash: Option<[u8; 16]>) {
         if let Some(s) = self.find_mut(ip, port, user_hash) {
@@ -625,6 +694,7 @@ impl PerFileSourceList {
                         DownloadSourceState::Banned
                             | DownloadSourceState::LowToLowIp
                             | DownloadSourceState::EmberRelay
+                            | DownloadSourceState::FriendConnect
                     )
             })
             .collect();
@@ -665,6 +735,7 @@ impl PerFileSourceList {
                         DownloadSourceState::Banned
                             | DownloadSourceState::LowToLowIp
                             | DownloadSourceState::EmberRelay
+                            | DownloadSourceState::FriendConnect
                     )
                     && !is_banned(s.ip, s.tcp_port)
             })
@@ -2405,6 +2476,81 @@ mod tests {
         // placeholder low-to-low entry to `WaitCallbackKad` for free.
         assert!(!pfs.add_source_with_identity(Ipv4Addr::UNSPECIFIED, 0, 0, Some(uh_a)));
         assert_eq!(pfs.sources.len(), 2);
+    }
+
+    /// A friend we've asked to connect back must not be re-dialed while the
+    /// request is outstanding — dialing is exactly what just failed — but it
+    /// must also not become a permanent dead end like `LowToLowIp`: clearing
+    /// the state returns it to the ordinary reask rotation.
+    #[test]
+    fn friend_connect_parks_source_then_releases_it_for_reask() {
+        let hash = [0x57; 16];
+        let ip = Ipv4Addr::new(8, 8, 8, 8);
+        let mut pfs = PerFileSourceList::new(hash);
+        assert!(pfs.add_source_full(ip, 4662, 0));
+
+        pfs.set_friend_connect(ip, 4662, None);
+        assert!(matches!(
+            pfs.sources[0].state,
+            DownloadSourceState::FriendConnect
+        ));
+        let later = Instant::now() + Duration::from_secs(2000);
+        assert!(
+            pfs.sources_ready_for_reask_at(later).is_empty(),
+            "a source awaiting a friend connect-back must not be re-dialed"
+        );
+        assert_eq!(
+            pfs.friend_connect_sources(Instant::now())
+                .into_iter()
+                .map(|(ip, port, _)| (ip, port))
+                .collect::<Vec<_>>(),
+            vec![(ip, 4662)]
+        );
+
+        pfs.clear_friend_connect(ip, 4662, None);
+        assert!(matches!(pfs.sources[0].state, DownloadSourceState::Failed));
+        assert_eq!(pfs.sources_ready_for_reask_at(later), vec![(ip, 4662)]);
+    }
+
+    /// Friend transfer escalation resolves a failed source's identity through
+    /// this accessor, so it must answer only for the exact address on this file
+    /// and only when an identity was actually recorded — never guess.
+    #[test]
+    fn source_user_hash_at_matches_only_the_exact_address_on_this_file() {
+        let hash = [0x59; 16];
+        let known = Ipv4Addr::new(10, 0, 0, 1);
+        let anonymous = Ipv4Addr::new(10, 0, 0, 2);
+        let peer = [0xC3u8; 16];
+        let mut pfs = PerFileSourceList::new(hash);
+
+        assert!(pfs.add_source_with_identity(known, 4662, 0, Some(peer)));
+        assert!(pfs.add_source_full(anonymous, 4663, 0));
+
+        assert_eq!(pfs.source_user_hash_at(known, 4662), Some(peer));
+        // A source we have no identity for must not borrow another row's.
+        assert_eq!(pfs.source_user_hash_at(anonymous, 4663), None);
+        // Right host, wrong port, and an address this file never tracked.
+        assert_eq!(pfs.source_user_hash_at(known, 5555), None);
+        assert_eq!(pfs.source_user_hash_at(Ipv4Addr::new(10, 0, 0, 9), 4662), None);
+    }
+
+    /// Clearing must only affect a source still waiting. If the friend's
+    /// connect-back already landed and the source is transferring, a late
+    /// decline or timeout sweep must not knock it back to `Failed`.
+    #[test]
+    fn clear_friend_connect_leaves_other_states_alone() {
+        let hash = [0x58; 16];
+        let ip = Ipv4Addr::new(9, 8, 7, 6);
+        let mut pfs = PerFileSourceList::new(hash);
+        assert!(pfs.add_source_full(ip, 4662, 0));
+
+        pfs.set_downloading(ip, 4662, None);
+        pfs.clear_friend_connect(ip, 4662, None);
+        assert!(matches!(
+            pfs.sources[0].state,
+            DownloadSourceState::Downloading
+        ));
+        assert!(pfs.friend_connect_sources(Instant::now()).is_empty());
     }
 
     #[test]

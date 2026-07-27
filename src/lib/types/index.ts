@@ -121,7 +121,7 @@ export interface Transfer {
 export interface SourceInfo {
   ip: string;
   port: number;
-  status: 'connecting' | 'wait_callback' | 'queued' | 'stalled' | 'queue_full' | 'no_needed_parts' | 'transferring' | 'completed' | 'failed';
+  status: 'connecting' | 'wait_callback' | 'friend_connect' | 'queued' | 'stalled' | 'queue_full' | 'no_needed_parts' | 'transferring' | 'completed' | 'failed';
   queue_rank?: number;
   speed: number;
   transferred: number;
@@ -205,6 +205,10 @@ export interface NetworkStats {
   kad_users_estimate: number;
   tcp_status?: string;
   udp_status?: string;
+  /** STUN-probed NAT class. `'Symmetric'` means friend hole-punching cannot
+   *  work, so a firewalled peer needs port forwarding to transfer with a
+   *  firewalled friend. `'Unknown'` before the probe resolves. */
+  nat_type?: string;
   ember_peers: number;
   epx_sources_received: number;
   server_status?: string;
@@ -242,6 +246,17 @@ export interface EmberDiagnostics {
   broker_active_attempts: number;
   broker_relay_candidates: number;
   broker_oldest_attempt_age_secs: number;
+  /** Friend transfers: requests asking a friend to dial us. */
+  friend_xfer_connect_back_requested?: number;
+  /** Friend transfers: requests asking for a coordinated hole-punch. */
+  friend_xfer_punch_requested?: number;
+  friend_xfer_accepted?: number;
+  friend_xfer_declined?: number;
+  /** Connections adopted into a waiting download — proves an end-to-end success. */
+  friend_xfer_connected?: number;
+  friend_xfer_timed_out?: number;
+  friend_xfer_inbound_accepted?: number;
+  friend_xfer_inbound_declined?: number;
   relay_sessions_active: number;
   relay_bytes_relayed: number;
   ember_native_enabled: boolean;

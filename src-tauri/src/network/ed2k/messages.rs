@@ -132,6 +132,13 @@ pub const OP_EMBER_AUTH_RESPONSE: u8 = 0xF7;
 /// standard EmuleInfo exchange completes; replied with `OP_EMBER_HELLOANSWER`.
 pub const OP_EMBER_HELLO: u8 = 0xF8;
 pub const OP_EMBER_HELLOANSWER: u8 = 0xF9;
+/// Friend-to-friend transfer negotiation, carried on an established friend
+/// session (see [`build_ember_xfer_req`]). This is the friend-layer
+/// equivalent of the eD2K server's `OP_CALLBACKREQUEST`: it lets a friend
+/// who cannot accept inbound TCP be asked to dial *us* for a specific file,
+/// without an eD2K server or KAD buddy in the path.
+pub const OP_EMBER_XFER_REQ: u8 = 0xFA;
+pub const OP_EMBER_XFER_ACK: u8 = 0xFB;
 
 // Constants
 pub const EMBLOCKSIZE: u64 = 184_320;
@@ -743,6 +750,127 @@ pub fn parse_ember_hello(payload: &[u8]) -> Option<EmberIdentity> {
         nickname,
         ed25519_pubkey,
     })
+}
+
+/// How the requester wants the friend to establish the data connection for
+/// [`EmberXferRequest`]. The method rides its own wire byte so a peer that
+/// predates a method answers [`XFER_STATUS_DECLINED_METHOD`] rather than
+/// misreading the payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmberXferMethod {
+    /// "You dial me." The requester is reachable and the friend is not, so
+    /// the friend opens a connection to `tcp_port` and serves the upload
+    /// there. The friend-layer analogue of eD2K `OP_CALLBACKREQUESTED`.
+    ConnectBack,
+    /// "Let's punch, now." Neither side can accept an inbound TCP connection,
+    /// so both register with the rendezvous server and QUIC hole-punch. The
+    /// requester registers its punch before sending this, and the friend finds
+    /// the requester's address in its own punch mailbox — so, unlike
+    /// [`Self::ConnectBack`], no address or port travels in the payload and
+    /// `tcp_port` is unused.
+    ///
+    /// This is what makes the punch *coordinated*: the friend session tells
+    /// both sides to register inside the rendezvous server's 30 s punch TTL,
+    /// instead of relying on two independently-scheduled retry loops happening
+    /// to overlap.
+    Punch,
+}
+
+impl EmberXferMethod {
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Self::ConnectBack => 1,
+            Self::Punch => 2,
+        }
+    }
+
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::ConnectBack),
+            2 => Some(Self::Punch),
+            _ => None,
+        }
+    }
+}
+
+pub const XFER_STATUS_ACCEPTED: u8 = 0;
+pub const XFER_STATUS_DECLINED_NOT_SHARED: u8 = 1;
+pub const XFER_STATUS_DECLINED_RATE_LIMITED: u8 = 2;
+pub const XFER_STATUS_DECLINED_METHOD: u8 = 3;
+
+/// Wire length of an `OP_EMBER_XFER_REQ` payload: version + method +
+/// file hash + port + nonce.
+const EMBER_XFER_REQ_LEN: usize = 1 + 1 + 16 + 2 + 16;
+/// Wire length of an `OP_EMBER_XFER_ACK` payload: version + status + nonce.
+const EMBER_XFER_ACK_LEN: usize = 1 + 1 + 16;
+
+/// A friend asking us to connect back so they can download `file_hash` from
+/// us. Parsed from [`OP_EMBER_XFER_REQ`] by [`parse_ember_xfer_req`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmberXferRequest {
+    pub method: EmberXferMethod,
+    pub file_hash: [u8; 16],
+    /// The requester's advertised listening port, i.e. where we should dial
+    /// for [`EmberXferMethod::ConnectBack`].
+    pub tcp_port: u16,
+    /// Correlates the [`OP_EMBER_XFER_ACK`] with this request. The requester
+    /// generates it randomly per attempt and refuses an ack that doesn't
+    /// match the outstanding one, so a duplicate or replayed ack from an
+    /// earlier attempt can't be mistaken for a fresh acceptance.
+    pub nonce: [u8; 16],
+}
+
+/// Build an [`OP_EMBER_XFER_REQ`] payload. Carried inside an established
+/// friend session, so this rides the session's Noise encryption and needs no
+/// signature of its own — session setup already proved both identities.
+pub fn build_ember_xfer_req(req: &EmberXferRequest) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(EMBER_XFER_REQ_LEN);
+    buf.push(0x01); // payload version
+    buf.push(req.method.as_u8());
+    buf.extend_from_slice(&req.file_hash);
+    buf.extend_from_slice(&req.tcp_port.to_le_bytes());
+    buf.extend_from_slice(&req.nonce);
+    buf
+}
+
+/// Parse an [`OP_EMBER_XFER_REQ`] payload. Returns `None` for a malformed
+/// payload, an unknown payload version, or an unrecognised method — the
+/// caller answers [`XFER_STATUS_DECLINED_METHOD`] rather than guessing.
+pub fn parse_ember_xfer_req(payload: &[u8]) -> Option<EmberXferRequest> {
+    if payload.len() < EMBER_XFER_REQ_LEN || payload[0] != 0x01 {
+        return None;
+    }
+    let method = EmberXferMethod::from_u8(payload[1])?;
+    let mut file_hash = [0u8; 16];
+    file_hash.copy_from_slice(&payload[2..18]);
+    let tcp_port = u16::from_le_bytes([payload[18], payload[19]]);
+    let mut nonce = [0u8; 16];
+    nonce.copy_from_slice(&payload[20..36]);
+    Some(EmberXferRequest {
+        method,
+        file_hash,
+        tcp_port,
+        nonce,
+    })
+}
+
+/// Build an [`OP_EMBER_XFER_ACK`] payload echoing the request's nonce.
+pub fn build_ember_xfer_ack(status: u8, nonce: &[u8; 16]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(EMBER_XFER_ACK_LEN);
+    buf.push(0x01); // payload version
+    buf.push(status);
+    buf.extend_from_slice(nonce);
+    buf
+}
+
+/// Parse an [`OP_EMBER_XFER_ACK`] payload into `(status, nonce)`.
+pub fn parse_ember_xfer_ack(payload: &[u8]) -> Option<(u8, [u8; 16])> {
+    if payload.len() < EMBER_XFER_ACK_LEN || payload[0] != 0x01 {
+        return None;
+    }
+    let mut nonce = [0u8; 16];
+    nonce.copy_from_slice(&payload[2..18]);
+    Some((payload[1], nonce))
 }
 
 /// Parse an EmuleInfo or EmuleInfoAnswer payload into peer capabilities.
@@ -2534,6 +2662,79 @@ mod tests {
         assert_eq!(parsed_nopk.ember_hash, hash);
         assert_eq!(parsed_nopk.nickname, "bob");
         assert_eq!(parsed_nopk.ed25519_pubkey, None);
+    }
+
+    #[test]
+    fn ember_xfer_req_roundtrip() {
+        let request = EmberXferRequest {
+            method: EmberXferMethod::ConnectBack,
+            file_hash: [0x7Bu8; 16],
+            tcp_port: 4662,
+            nonce: [0x5Au8; 16],
+        };
+        let payload = build_ember_xfer_req(&request);
+        assert_eq!(payload.len(), EMBER_XFER_REQ_LEN);
+        assert_eq!(parse_ember_xfer_req(&payload), Some(request));
+    }
+
+    #[test]
+    fn ember_xfer_ack_roundtrip() {
+        let nonce = [0x11u8; 16];
+        let payload = build_ember_xfer_ack(XFER_STATUS_DECLINED_NOT_SHARED, &nonce);
+        assert_eq!(payload.len(), EMBER_XFER_ACK_LEN);
+        assert_eq!(
+            parse_ember_xfer_ack(&payload),
+            Some((XFER_STATUS_DECLINED_NOT_SHARED, nonce))
+        );
+    }
+
+    /// A truncated, wrong-version, or unknown-method payload must parse as
+    /// `None` so the receiver declines instead of acting on a guess. An
+    /// unknown method in particular is how a future coordinated-hole-punch
+    /// method reaches an older peer.
+    #[test]
+    fn ember_xfer_req_rejects_malformed_and_unknown_method() {
+        let request = EmberXferRequest {
+            method: EmberXferMethod::ConnectBack,
+            file_hash: [0x01u8; 16],
+            tcp_port: 1,
+            nonce: [0x02u8; 16],
+        };
+        let good = build_ember_xfer_req(&request);
+
+        assert_eq!(parse_ember_xfer_req(&good[..good.len() - 1]), None);
+        assert_eq!(parse_ember_xfer_req(&[]), None);
+
+        let mut wrong_version = good.clone();
+        wrong_version[0] = 0x02;
+        assert_eq!(parse_ember_xfer_req(&wrong_version), None);
+
+        let mut unknown_method = good;
+        unknown_method[1] = 0xFE;
+        assert_eq!(parse_ember_xfer_req(&unknown_method), None);
+    }
+
+    /// The opcodes must stay inside the Ember-private `OP_EMULEPROT` range
+    /// that vanilla eMule ignores, and must not collide with an existing one.
+    #[test]
+    fn ember_xfer_opcodes_are_distinct_and_private() {
+        let taken = [
+            OP_EMBER_SOURCEEXCHANGE,
+            OP_EMBER_CHAT_MSG,
+            OP_EMBER_BROWSE_REQ,
+            OP_EMBER_BROWSE_RES,
+            OP_EMBER_FRIEND_REQ,
+            OP_EMBER_KEEPALIVE,
+            OP_EMBER_AUTH_CHALLENGE,
+            OP_EMBER_AUTH_RESPONSE,
+            OP_EMBER_HELLO,
+            OP_EMBER_HELLOANSWER,
+        ];
+        for op in [OP_EMBER_XFER_REQ, OP_EMBER_XFER_ACK] {
+            assert!(op >= 0xF0, "op 0x{op:02X} is outside the Ember range");
+            assert!(!taken.contains(&op), "op 0x{op:02X} collides");
+        }
+        assert_ne!(OP_EMBER_XFER_REQ, OP_EMBER_XFER_ACK);
     }
 
     /// Anti-leecher contract: the public Hello our `build_hello_with_buddy_opts`

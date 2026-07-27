@@ -312,6 +312,11 @@ pub enum SourceStatus {
     Transferring,
     Completed,
     Failed,
+    /// A friend we cannot dial, which we have asked over their friend session
+    /// to reach us instead (`OP_EMBER_XFER_REQ`). Distinct from
+    /// [`Self::WaitCallback`], which is the eD2K server / KAD-buddy callback:
+    /// this one needs no server, no buddy, and no HighID on either side.
+    FriendConnect,
 }
 
 /// Media metadata for a search hit (eMule `FT_MEDIA_*` tags). Each field is
@@ -410,6 +415,14 @@ pub struct NetworkStats {
     pub tcp_status: String,
     #[serde(default)]
     pub udp_status: String,
+    /// STUN-probed NAT class (`ember::nat::NatType` debug name), or `"Unknown"`
+    /// before the probe resolves. Surfaced because it decides whether friend
+    /// hole-punching can work at all: a symmetric NAT re-maps per destination,
+    /// so the port we register with the rendezvous server is not the port a
+    /// friend would arrive on, and two symmetric peers cannot punch to each
+    /// other at all.
+    #[serde(default)]
+    pub nat_type: String,
     /// Ember Peer Exchange: total unique Ember peers encountered this session
     #[serde(default)]
     pub ember_peers: u32,
@@ -461,6 +474,31 @@ pub struct EmberDiagnostics {
     /// Age in seconds of the longest-running in-flight broker attempt
     /// (0 when idle) — a stuck attempt surfaces as a growing value.
     pub broker_oldest_attempt_age_secs: u64,
+    /// Friend transfers: `OP_EMBER_XFER_REQ`s asking a friend to dial us.
+    #[serde(default)]
+    pub friend_xfer_connect_back_requested: u32,
+    /// Friend transfers: requests asking for a coordinated hole-punch.
+    #[serde(default)]
+    pub friend_xfer_punch_requested: u32,
+    /// Friend transfers: requests a friend accepted.
+    #[serde(default)]
+    pub friend_xfer_accepted: u32,
+    /// Friend transfers: requests a friend declined.
+    #[serde(default)]
+    pub friend_xfer_declined: u32,
+    /// Friend transfers: connections adopted into a waiting download. The only
+    /// counter that proves the mechanism worked end to end.
+    #[serde(default)]
+    pub friend_xfer_connected: u32,
+    /// Friend transfers: requests that timed out without a connection.
+    #[serde(default)]
+    pub friend_xfer_timed_out: u32,
+    /// Friend transfers: inbound requests we accepted (we are the uploader).
+    #[serde(default)]
+    pub friend_xfer_inbound_accepted: u32,
+    /// Friend transfers: inbound requests we declined.
+    #[serde(default)]
+    pub friend_xfer_inbound_declined: u32,
     /// Relay sessions this node is currently bridging for other peers.
     pub relay_sessions_active: u32,
     /// Total bytes this node has relayed for other peers this session
@@ -694,6 +732,7 @@ impl Default for NetworkStats {
             kad_users_estimate: 0,
             tcp_status: String::from("Unknown"),
             udp_status: String::from("Unknown"),
+            nat_type: String::from("Unknown"),
             ember_peers: 0,
             epx_sources_received: 0,
             server_status: String::from("disconnected"),

@@ -23,6 +23,7 @@
     endFriendRequestMutation,
   } from '$lib/stores/friends';
   import { appSettings } from '$lib/stores/settings';
+  import { networkStats } from '$lib/stores/network';
 
   let friends: FriendInfo[] = $state([]);
   let browseDisabled = $derived($appSettings?.friend_browse_disabled === true);
@@ -69,6 +70,15 @@
   let searchingFriends: Set<string> = $derived($searchingFriendsStore);
   let reconnectingFriends = $state(new Set<string>());
   let isFirewalled = $state(false);
+  // A symmetric NAT re-maps per destination, so hole punching cannot get
+  // through and a firewalled friend genuinely cannot be reached without port
+  // forwarding. Every other NAT class can be punched, so the advice differs.
+  //
+  // Read from the shared store rather than a local snapshot: the STUN NAT probe
+  // resolves well after this page mounts and emits no event of its own, so a
+  // one-shot fetch would leave a symmetric user reading the softer advice
+  // indefinitely. The store is polled app-wide from `+layout.svelte`.
+  let isSymmetricNat = $derived($networkStats.nat_type === 'Symmetric');
   let recheckingFirewall = $state(false);
   let recheckError: string | null = $state(null);
 
@@ -579,7 +589,7 @@
           </svg>
           <div class="firewall-text">
             <strong>{m.friends_firewall_title()}</strong>
-            {m.friends_firewall_body()}
+            {isSymmetricNat ? m.friends_firewall_body_symmetric() : m.friends_firewall_body()}
           </div>
         </div>
         <button class="firewall-recheck" onclick={handleRecheckFirewall} disabled={recheckingFirewall}>

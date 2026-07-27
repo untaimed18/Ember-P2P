@@ -514,6 +514,37 @@ pub async fn run_friend_session_over_transport(
                                         },
                                     }).await;
                                 }
+                                (OP_EMULEPROT, OP_EMBER_XFER_REQ) => {
+                                    if let Some(request) = parse_ember_xfer_req(&payload) {
+                                        let _ = session_ul_event_tx.send(UploadEvent {
+                                            transfer_id: String::new(),
+                                            kind: UploadEventKind::EmberTransferRequest {
+                                                ember_hash: peer_ember_hash,
+                                                request,
+                                                reply_tx: session_ember_session_handle.tx.clone(),
+                                                peer_addr: addr,
+                                            },
+                                        }).await;
+                                    } else {
+                                        debug!(
+                                            "Friend {} sent an unparseable OP_EMBER_XFER_REQ ({} bytes)",
+                                            hex::encode(peer_ember_hash),
+                                            payload.len()
+                                        );
+                                    }
+                                }
+                                (OP_EMULEPROT, OP_EMBER_XFER_ACK) => {
+                                    if let Some((status, nonce)) = parse_ember_xfer_ack(&payload) {
+                                        let _ = session_ul_event_tx.send(UploadEvent {
+                                            transfer_id: String::new(),
+                                            kind: UploadEventKind::EmberTransferAck {
+                                                ember_hash: peer_ember_hash,
+                                                status,
+                                                nonce,
+                                            },
+                                        }).await;
+                                    }
+                                }
                                 (OP_EMULEPROT, OP_EMBER_KEEPALIVE) => {}
                                 _ => {
                                     debug!("Friend session ignoring proto=0x{proto:02X} op=0x{opcode:02X} from {addr}");

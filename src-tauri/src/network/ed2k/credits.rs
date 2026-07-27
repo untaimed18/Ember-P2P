@@ -797,6 +797,21 @@ impl CreditManager {
         })
     }
 
+    /// The Ember identity bound to `user_hash`, if we have ever seen one.
+    ///
+    /// Inverse of [`Self::find_user_hash_by_ember`]. `clients.met` persists this
+    /// binding, so it survives a restart — which is what lets a friend source be
+    /// recognised as a friend after relaunch, when the in-memory
+    /// download-to-friend binding is gone.
+    pub fn find_ember_by_user_hash(&self, user_hash: &[u8; 16]) -> Option<[u8; 16]> {
+        if *user_hash == [0u8; 16] {
+            return None;
+        }
+        self.credits
+            .get(user_hash)
+            .and_then(|record| record.ember_hash)
+    }
+
     pub fn set_ident_state(&mut self, user_hash: [u8; 16], state: IdentState) {
         let record = self.get_or_create(user_hash);
         // eMule Verified(): on first-time crypto verification, reset pre-existing
@@ -1952,7 +1967,40 @@ mod tests {
             Some(bound_hash),
             "reverse lookup must work after a restart"
         );
+        // The user_hash → Ember direction must survive the same round trip.
+        // Friend transfer escalation depends on it: after a relaunch the
+        // in-memory download-to-friend binding is gone, so a failed source is
+        // recognised as a friend only by resolving its stored user hash back to
+        // an Ember identity.
+        assert_eq!(
+            loaded.find_ember_by_user_hash(&bound_hash),
+            Some(ember_id),
+            "forward lookup must work after a restart"
+        );
         assert!(loaded.get_record(&unbound_hash).is_none());
+    }
+
+    #[test]
+    fn find_ember_by_user_hash_ignores_unbound_and_sentinel_hashes() {
+        let mut cm = CreditManager::new();
+        let bound = [0x31u8; 16];
+        let unbound = [0x32u8; 16];
+        let ember_id = [0x41u8; 16];
+        cm.set_ember_hash(bound, ember_id);
+        let _ = cm.get_or_create(unbound);
+
+        assert_eq!(cm.find_ember_by_user_hash(&bound), Some(ember_id));
+        assert_eq!(
+            cm.find_ember_by_user_hash(&unbound),
+            None,
+            "a peer we have never bound to an Ember identity is not a friend"
+        );
+        assert_eq!(cm.find_ember_by_user_hash(&[0u8; 16]), None);
+        assert_eq!(
+            cm.find_ember_by_user_hash(&[0x99u8; 16]),
+            None,
+            "an unknown user hash must not resolve"
+        );
     }
 
     /// A pre-v1 (legacy) clients.met — count-prefixed, no ident fields — must

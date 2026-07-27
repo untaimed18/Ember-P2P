@@ -249,9 +249,13 @@ fn friend_privileges_allowed(secure_v2_authenticated: bool, live_friend_member: 
 /// Requires secure friend-stream v2 on the session. Ordinary eMule download
 /// connections from a known friend hash intentionally return `false`: there is
 /// no cryptographically bound live proof on those sockets without re-enabling
-/// legacy PoP, and outbound file dials learn the peer Ember hash only after
-/// the TCP discriminator (too late for Noise IK). UI copy documents that
-/// priority applies only to authenticated Ember secure friend sessions.
+/// legacy PoP, and an outbound file dial to an *anonymous* source learns the
+/// peer Ember hash only after the TCP discriminator (too late for Noise IK).
+/// A friend-transfer dial answering `OP_EMBER_XFER_REQ` is the one exception:
+/// it knows which friend it is calling before connecting, so it negotiates
+/// Noise IK up front (see [`ConnectServeRequest::secure_friend_ember_hash`])
+/// and does qualify. UI copy documents that priority applies only to
+/// authenticated Ember secure friend sessions.
 async fn live_secure_friend_member(
     friend_hashes: &Arc<RwLock<std::collections::HashSet<[u8; 16]>>>,
     peer_ember_hash: Option<[u8; 16]>,
@@ -414,6 +418,14 @@ pub struct InboundStreamRequest {
     pub peer_addr: SocketAddr,
     pub reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
     pub writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+    /// When set, this stream came from a coordinated friend-transfer punch and
+    /// we are the *uploader*: negotiate Noise IK as initiator against this
+    /// Ember hash and take the eD2K serve role instead of the default inbound
+    /// role. See [`UploadServer::serve_punched_friend`].
+    ///
+    /// `None` — every other punch, relay, and broker stream — keeps the
+    /// historical inbound behaviour.
+    pub serve_friend_ember_hash: Option<[u8; 16]>,
 }
 
 /// A fully handshaked outbound connection produced by `connect_and_serve`, handed
@@ -439,6 +451,14 @@ struct OutboundServeState {
     push_grant_file_hash: Option<[u8; 16]>,
     /// See [`ConnectServeRequest::push_grant_accepted`].
     push_grant_accepted: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Set when this dial negotiated Noise IK for
+    /// [`ConnectServeRequest::secure_friend_ember_hash`]. Unlike every other
+    /// outbound dial — which learns the peer's Ember hash only from an
+    /// in-stream `OP_EMBER_HELLO`, far too late to be privilege-bearing — a
+    /// secure friend dial proves the peer's identity before any eD2K byte, so
+    /// the serve loop may treat it as authenticated and grant friend-slot
+    /// upload priority.
+    secure_peer: Option<super::secure_stream::SecurePeerIdentity>,
 }
 
 /// Request from the network task asking the upload listener to dial `peer_addr`
@@ -464,6 +484,15 @@ pub struct ConnectServeRequest {
     /// caller can distinguish pre-grant dial failures (restore seniority) from
     /// post-grant session errors (do not restore).
     pub push_grant_accepted: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// When `Some(ember_hash)`, this dial answers a friend's
+    /// `OP_EMBER_XFER_REQ`: negotiate a Noise IK secure stream against that
+    /// expected identity instead of RC4 obfuscation, so the friend can route
+    /// our connection into the right download by *proven* identity (see
+    /// [`PendingKadCallbackKey::FriendEmber`]) and the transfer is encrypted
+    /// end to end. There is deliberately no plain-TCP fallback: a friend
+    /// transfer that silently downgraded would lose exactly the identity
+    /// binding the routing depends on.
+    pub secure_friend_ember_hash: Option<[u8; 16]>,
 }
 
 struct UploadSlotGuard {
@@ -617,6 +646,12 @@ pub struct KadCallbackParts {
     /// extended-requests version that gates the OP_REQUESTFILENAME part
     /// bitmap — omitting it makes the peer short-read and FIN).
     pub peer_caps: PeerCapabilities,
+    /// Set only when this connection answered our `OP_EMBER_XFER_REQ`, to the
+    /// Ember hash the Noise IK handshake proved. Lets the adoption path retire
+    /// exactly that friend request, instead of assuming any adopted callback
+    /// for the same file was the friend connect-back it was waiting on (a
+    /// genuine server/KAD LowID callback can arrive for the same download).
+    pub friend_ember_hash: Option<[u8; 16]>,
 }
 
 /// Path B (eMule queued-source model) inbound reconnect index.
@@ -700,6 +735,14 @@ pub fn reconnect_index() -> std::sync::Arc<std::sync::RwLock<ReconnectIndex>> {
 pub enum PendingKadCallbackKey {
     SourceIp(std::net::Ipv4Addr),
     SourceUserHash([u8; 16]),
+    /// A friend we asked to connect back via `OP_EMBER_XFER_REQ`, keyed by
+    /// the Ember hash the inbound Noise IK handshake *proves* they own.
+    ///
+    /// Unlike the two keys above — which match on self-reported or
+    /// server-reported metadata and can collide with an unrelated peer — this
+    /// key cannot be spoofed, so its diversion runs even for connections that
+    /// otherwise `skip_diversions` (see `run_session`).
+    FriendEmber([u8; 16]),
 }
 
 #[derive(Debug, Clone)]
@@ -1278,6 +1321,28 @@ pub enum UploadEventKind {
         request_id: String,
         error: String,
         tx: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    /// A friend asked us to connect back so they can download `request.file_hash`
+    /// from us (`OP_EMBER_XFER_REQ`). The friend-layer analogue of an inbound
+    /// eD2K `OP_CALLBACKREQUESTED`, except the ask arrives over the
+    /// already-authenticated friend session instead of via a server.
+    EmberTransferRequest {
+        ember_hash: [u8; 16],
+        request: super::messages::EmberXferRequest,
+        /// The friend session this arrived on, for the `OP_EMBER_XFER_ACK`.
+        reply_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+        /// The address the friend session is actually connected to. The
+        /// connect-back dials *this* IP with the requested port, never an IP
+        /// from the request payload — otherwise a friend could aim our dialer
+        /// at an arbitrary third-party host.
+        peer_addr: SocketAddr,
+    },
+    /// A friend answered our `OP_EMBER_XFER_REQ`. `nonce` is matched against
+    /// the outstanding request before `status` is acted on.
+    EmberTransferAck {
+        ember_hash: [u8; 16],
+        status: u8,
+        nonce: [u8; 16],
     },
     EmberFriendDisconnected {
         ember_hash: [u8; 16],
@@ -2804,11 +2869,27 @@ pub async fn start_upload_server(
                 let server = server.clone();
                 tokio::spawn(async move {
                     let _admission_guard = admission_guard;
-                    let result = std::panic::AssertUnwindSafe(
-                        server.handle_inbound_stream(peer_addr, req.reader, req.writer),
-                    )
-                    .catch_unwind()
-                    .await;
+                    // A coordinated friend-transfer punch makes us the eD2K
+                    // initiator; every other adopted stream keeps the inbound
+                    // role. Deciding here, rather than inside `run_session`,
+                    // keeps the two roles' handshake preambles separate.
+                    let result = match req.serve_friend_ember_hash {
+                        Some(friend) => std::panic::AssertUnwindSafe(
+                            server.serve_punched_friend(
+                                peer_addr,
+                                req.reader,
+                                req.writer,
+                                friend,
+                            ),
+                        )
+                        .catch_unwind()
+                        .await,
+                        None => std::panic::AssertUnwindSafe(
+                            server.handle_inbound_stream(peer_addr, req.reader, req.writer),
+                        )
+                        .catch_unwind()
+                        .await,
+                    };
                     match result {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => {
@@ -3497,6 +3578,7 @@ impl UploadHandler {
             user_hash: (entry.user_hash != [0u8; 16]).then_some(entry.user_hash),
             push_grant_file_hash: Some(entry.file_hash),
             push_grant_accepted: Some(grant_accepted.clone()),
+            secure_friend_ember_hash: None,
         };
 
         info!(
@@ -3603,8 +3685,13 @@ impl UploadHandler {
             .load(std::sync::atomic::Ordering::Relaxed);
         let peer_requires_crypt = (req.crypt_options & 0x04) != 0;
         // eMule: obfuscate when we have a hash to key RC4, our layer is enabled,
-        // and the peer supports (bit0) or requests (bit1) crypt.
-        let want_obf = peer_hash.is_some() && obf_enabled && (req.crypt_options & 0x03) != 0;
+        // and the peer supports (bit0) or requests (bit1) crypt. A secure friend
+        // dial supersedes this entirely — Noise IK already encrypts the stream,
+        // so layering RC4 underneath would only cost CPU.
+        let want_obf = req.secure_friend_ember_hash.is_none()
+            && peer_hash.is_some()
+            && obf_enabled
+            && (req.crypt_options & 0x03) != 0;
 
         let mut try_obf = want_obf;
         let mut fallback_used = false;
@@ -3625,7 +3712,29 @@ impl UploadHandler {
             let mut buf_r = tokio::io::BufReader::new(raw_r);
             let mut buf_w = tokio::io::BufWriter::new(raw_w);
 
-            let (mut reader, mut writer): (StreamReader, StreamWriter) = if try_obf {
+            let mut secure_peer: Option<super::secure_stream::SecurePeerIdentity> = None;
+            let (reader, writer): (StreamReader, StreamWriter) = if let Some(
+                expected_ember_hash,
+            ) = req.secure_friend_ember_hash
+            {
+                let secure = super::secure_stream::initiate(
+                    Box::new(buf_r),
+                    Box::new(buf_w),
+                    self.ember_hash,
+                    expected_ember_hash,
+                    self.ed25519_public_key,
+                    self.ed25519_secret_key,
+                )
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("connect_and_serve {peer_addr}: secure friend dial: {e}")
+                })?;
+                secure_peer = Some(secure.peer);
+                (
+                    StreamReader::Boxed(secure.reader),
+                    StreamWriter::Boxed(secure.writer),
+                )
+            } else if try_obf {
                 let hash = peer_hash.unwrap();
                 match tcp_obfuscation::negotiate_outgoing(&mut buf_r, &mut buf_w, &hash).await {
                     Ok((recv_key, send_key)) => (
@@ -3657,6 +3766,40 @@ impl UploadHandler {
                 (StreamReader::Plain(buf_r), StreamWriter::Plain(buf_w))
             };
 
+            return self
+                .serve_after_transport(
+                    peer_addr,
+                    reader,
+                    writer,
+                    secure_peer,
+                    obf_enabled,
+                    push_grant_file_hash,
+                    push_grant_accepted,
+                )
+                .await;
+        }
+    }
+
+    /// Drive the outbound-serve handshake over an already-connected transport
+    /// and hand the result to [`run_session`].
+    ///
+    /// Split out of [`connect_and_serve`] so the same handshake can run over a
+    /// stream we did not dial: a coordinated friend-transfer hole-punch produces
+    /// QUIC streams rather than a `TcpStream`, but the eD2K choreography from
+    /// `OP_HELLO` onward is identical. We are the initiator either way, so we
+    /// send Hello/EmuleInfo first and read the peer's answers.
+    #[allow(clippy::too_many_arguments)]
+    async fn serve_after_transport(
+        &self,
+        peer_addr: SocketAddr,
+        mut reader: StreamReader,
+        mut writer: StreamWriter,
+        secure_peer: Option<super::secure_stream::SecurePeerIdentity>,
+        obf_enabled: bool,
+        push_grant_file_hash: Option<[u8; 16]>,
+        push_grant_accepted: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> anyhow::Result<()> {
+        {
             // Outbound Hello (we initiate: send OP_HELLO, expect OP_HELLOANSWER).
             let our_client_id = self
                 .external_ip_shared
@@ -3747,7 +3890,8 @@ impl UploadHandler {
 
             let is_obf = matches!(reader, StreamReader::Obfuscated(_));
             info!(
-                "connect_and_serve: established outbound upload session to {peer_addr} (obf={is_obf}, user={})",
+                "Established outbound upload session to {peer_addr} (obf={is_obf}, secure_v2={}, user={})",
+                secure_peer.is_some(),
                 crate::security::short_hash(&peer_user_hash),
             );
 
@@ -3760,11 +3904,57 @@ impl UploadHandler {
                 first_packet,
                 push_grant_file_hash,
                 push_grant_accepted,
+                secure_peer,
             };
-            return self
-                .run_session(peer_addr, ConnInit::OutboundServe(Box::new(state)), None)
-                .await;
+            self.run_session(peer_addr, ConnInit::OutboundServe(Box::new(state)), None)
+                .await
         }
+    }
+
+    /// Serve a friend over a transport we did not dial — the responder half of a
+    /// coordinated friend-transfer hole-punch.
+    ///
+    /// The friend asked us (over their friend session) to reach them via
+    /// `OP_EMBER_XFER_REQ` with [`EmberXferMethod::Punch`], and the punch has
+    /// now produced a bidirectional stream. We negotiate Noise IK as the
+    /// *initiator* against their expected identity — which both encrypts the
+    /// transfer and lets them route our stream into the right download by proven
+    /// identity — and then take the eD2K serve role.
+    ///
+    /// Taking the serve role explicitly is the whole point: every other punched
+    /// stream is handed to the inbound path, and if both peers did that for a
+    /// transfer they would each sit waiting for the other's `OP_HELLO`.
+    async fn serve_punched_friend(
+        &self,
+        peer_addr: SocketAddr,
+        reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+        writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+        expected_ember_hash: [u8; 16],
+    ) -> anyhow::Result<()> {
+        let secure = super::secure_stream::initiate(
+            reader,
+            writer,
+            self.ember_hash,
+            expected_ember_hash,
+            self.ed25519_public_key,
+            self.ed25519_secret_key,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("punched friend serve {peer_addr}: secure handshake: {e}"))?;
+
+        let obf_enabled = self
+            .obfuscation_enabled
+            .load(std::sync::atomic::Ordering::Relaxed);
+        self.serve_after_transport(
+            peer_addr,
+            StreamReader::Boxed(secure.reader),
+            StreamWriter::Boxed(secure.writer),
+            Some(secure.peer),
+            obf_enabled,
+            None,
+            None,
+        )
+        .await
     }
 
     /// Shared upload-session driver for both inbound connections (a peer dialed
@@ -3832,7 +4022,9 @@ impl UploadHandler {
                     first_packet,
                     push_grant_file_hash: pg,
                     push_grant_accepted: pga,
+                    secure_peer,
                 } = *state;
+                secure_v2_peer = secure_peer;
                 outbound_first_packet = first_packet;
                 push_grant_file_hash = pg;
                 push_grant_accepted = pga;
@@ -4464,6 +4656,102 @@ impl UploadHandler {
             return Ok(());
         }
 
+        // Friend-transfer connect-back diversion: a friend we sent
+        // `OP_EMBER_XFER_REQ` to has dialed us so we can download from them
+        // (the friend-layer analogue of an eD2K LowID callback, with no server
+        // or KAD buddy involved).
+        //
+        // This deliberately runs even for connections `skip_diversions`
+        // excludes from the metadata-keyed diversions below. Those match on
+        // self-reported `(ip, user_hash, hello_port)` and can collide with an
+        // unrelated pending entry; this one keys on the Ember hash Noise IK
+        // *proved* the peer owns, which no other peer can claim. It also only
+        // ever fires when we asked this specific friend for this specific
+        // file, so there is no window for an unsolicited adoption.
+        if !outbound {
+            if let Some(peer) = secure_v2_peer {
+                let key = PendingKadCallbackKey::FriendEmber(peer.ember_hash);
+                // Membership is checked *before* consuming the expectation: a
+                // friend removed between our request and their dial must leave
+                // the entry for the sweep to expire, not silently burn it.
+                let expecting_friend = {
+                    let cbs = self.pending_kad_callbacks.lock().await;
+                    cbs.contains_key(&key)
+                } && self.friend_hashes.read().await.contains(&peer.ember_hash);
+                let friend_callback_file = if expecting_friend {
+                    let now = chrono::Utc::now().timestamp();
+                    let mut cbs = self.pending_kad_callbacks.lock().await;
+                    let mut matched = None;
+                    if let Some(entries) = cbs.get_mut(&key) {
+                        entries.retain(|e| now - e.registered_at < PENDING_KAD_CALLBACK_SECS);
+                        // The requester allows only one outstanding
+                        // `OP_EMBER_XFER_REQ` per friend at a time (see
+                        // `request_friend_transfer`), so there is at most one
+                        // entry here and no guessing about which file this
+                        // connection was opened for. Were that invariant ever
+                        // relaxed, this would need the request nonce echoed on
+                        // the data connection to stay unambiguous.
+                        matched = entries.pop().map(|e| e.file_hash);
+                        if entries.is_empty() {
+                            cbs.remove(&key);
+                        }
+                    }
+                    matched
+                } else {
+                    None
+                };
+                if let Some(file_hash) = friend_callback_file {
+                    let (dyn_reader, dyn_writer): (
+                        Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+                        Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+                    ) = match (reader, writer) {
+                        (StreamReader::Boxed(r), StreamWriter::Boxed(w)) => (r, w),
+                        // Unreachable: a secure-v2 session is always Boxed on
+                        // both halves. Bail rather than panic so a future
+                        // transport that breaks the invariant degrades to a
+                        // dropped connection and a retry.
+                        _ => {
+                            warn!(
+                                "Friend transfer connect-back from {peer_addr} was not a boxed secure stream; dropping"
+                            );
+                            return Ok(());
+                        }
+                    };
+                    info!(
+                        "Recognized friend transfer connect-back from {} ({peer_addr}) for file {}",
+                        hex::encode(peer.ember_hash),
+                        hex::encode(file_hash)
+                    );
+                    let peer_v4 = match peer_addr.ip() {
+                        std::net::IpAddr::V4(v4) => v4,
+                        _ => std::net::Ipv4Addr::UNSPECIFIED,
+                    };
+                    let _ = self
+                        .kad_callback_tx
+                        .send(KadCallbackParts {
+                            peer_ip: peer_v4,
+                            peer_port: peer_addr.port(),
+                            peer_hello_port: hello_caps.tcp_port,
+                            peer_user_hash,
+                            file_hash,
+                            reader: dyn_reader,
+                            writer: dyn_writer,
+                            // The secure inbound branch already answered with
+                            // our EmuleInfoAnswer, so the adopting downloader
+                            // must not run the exchange again. A trailing
+                            // `OP_EMULEINFO` from the friend's own outbound
+                            // handshake is merged by the download loop's
+                            // delayed-EmuleInfo arm.
+                            emule_info_done: true,
+                            peer_caps: hello_caps.clone(),
+                            friend_ember_hash: Some(peer.ember_hash),
+                        })
+                        .await;
+                    return Ok(());
+                }
+            }
+        }
+
         // Inbound-only stream diversions (buddy handled above): match this
         // connection against pending KAD/server callbacks and Path-B queued
         // sources. None of these apply to an outbound dial we initiated, so a
@@ -4568,6 +4856,9 @@ impl UploadHandler {
                             PendingKadCallbackKey::SourceUserHash(h) => {
                                 format!("uh={}", crate::security::short_hash(h))
                             }
+                            PendingKadCallbackKey::FriendEmber(h) => {
+                                format!("friend={}", crate::security::short_hash(h))
+                            }
                         })
                         .collect();
                     info!(
@@ -4611,6 +4902,7 @@ impl UploadHandler {
                     writer: dyn_writer,
                     emule_info_done: emule_done,
                     peer_caps: hello_caps.clone(),
+                    friend_ember_hash: None,
                 };
                 let _ = self.kad_callback_tx.send(parts).await;
                 return Ok(());
@@ -4678,6 +4970,7 @@ impl UploadHandler {
                         writer: dyn_writer,
                         emule_info_done: emule_done,
                         peer_caps: hello_caps.clone(),
+                        friend_ember_hash: None,
                     };
                     let _ = self.kad_callback_tx.send(parts).await;
                     return Ok(());
@@ -4748,6 +5041,7 @@ impl UploadHandler {
                     writer: dyn_writer,
                     emule_info_done: emule_done,
                     peer_caps: hello_caps.clone(),
+                    friend_ember_hash: None,
                 };
                 let _ = self.kad_callback_tx.send(parts).await;
                 return Ok(());
@@ -9266,6 +9560,61 @@ impl UploadHandler {
                                     entries,
                                 },
                             }).await;
+                        }
+                    }
+                }
+
+                (OP_EMULEPROT, OP_EMBER_XFER_REQ)
+                    if friend_privileges_allowed(secure_v2_authenticated, is_ember_friend) =>
+                {
+                    if let Some(eh) = peer_ember_hash {
+                        if !self.friend_hashes.read().await.contains(&eh) {
+                            debug!(
+                                "Ignoring transfer request from removed friend {}",
+                                hex::encode(eh)
+                            );
+                        } else if let Some(request) = parse_ember_xfer_req(&payload) {
+                            let _ = self
+                                .upload_event_tx
+                                .send(UploadEvent {
+                                    transfer_id: String::new(),
+                                    kind: UploadEventKind::EmberTransferRequest {
+                                        ember_hash: eh,
+                                        request,
+                                        reply_tx: outbound_tx.clone(),
+                                        peer_addr,
+                                    },
+                                })
+                                .await;
+                        } else {
+                            // Malformed, or a method this build predates. We
+                            // cannot echo a nonce we failed to parse, so the
+                            // requester falls back to its own attempt timeout.
+                            debug!(
+                                "Friend {} sent an unparseable OP_EMBER_XFER_REQ ({} bytes)",
+                                hex::encode(eh),
+                                payload.len()
+                            );
+                        }
+                    }
+                }
+
+                (OP_EMULEPROT, OP_EMBER_XFER_ACK)
+                    if friend_privileges_allowed(secure_v2_authenticated, is_ember_friend) =>
+                {
+                    if let Some(eh) = peer_ember_hash {
+                        if let Some((status, nonce)) = parse_ember_xfer_ack(&payload) {
+                            let _ = self
+                                .upload_event_tx
+                                .send(UploadEvent {
+                                    transfer_id: String::new(),
+                                    kind: UploadEventKind::EmberTransferAck {
+                                        ember_hash: eh,
+                                        status,
+                                        nonce,
+                                    },
+                                })
+                                .await;
                         }
                     }
                 }

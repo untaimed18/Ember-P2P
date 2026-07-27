@@ -1873,6 +1873,9 @@ pub async fn run_quic_accept_loop(
                         inner: init_send,
                         _guard: session_guard.clone(),
                     }),
+                    // We are the relay *target*, i.e. the peer being reached;
+                    // the initiator drives the eD2K handshake.
+                    serve_friend_ember_hash: None,
                 };
                 if let Err(e) = cb_tx.try_send(req) {
                     debug!("QUIC accept: dropping relay-target stream from {remote}: {e}");
@@ -1895,6 +1898,11 @@ pub async fn run_quic_accept_loop(
                         inner: init_send,
                         _guard: session_guard.clone(),
                     }),
+                    // The peer that dialed us drives the eD2K handshake, so an
+                    // accepted punch is always the inbound role. The serve role
+                    // belongs to whichever side *initiated* a transfer punch,
+                    // and that side never arrives through this accept loop.
+                    serve_friend_ember_hash: None,
                 };
                 if let Err(e) = cb_tx.try_send(req) {
                     debug!("QUIC accept: dropping direct stream from {remote}: {e}");
