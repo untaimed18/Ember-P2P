@@ -70,8 +70,6 @@ pub enum DownloadSourceState {
     NoneNeededParts,
     /// Transient failure (DS_ERROR). Reasked after FILEREASKTIME.
     Failed,
-    /// Waiting for Low-ID callback via server (DS_WAITCALLBACK).
-    WaitCallback,
     /// Waiting for Low-ID callback via Kad buddy (DS_WAITCALLBACKKAD).
     WaitCallbackKad,
     /// Too many connections, retry later (DS_TOOMANYCONNS).
@@ -184,9 +182,7 @@ impl DownloadSourceEntry {
                 FILEREASKTIME_SECS as u64
             }
             DownloadSourceState::OnQueue { .. } => FILEREASKTIME_SECS as u64,
-            DownloadSourceState::WaitCallback | DownloadSourceState::WaitCallbackKad => {
-                FILEREASKTIME_SECS as u64
-            }
+            DownloadSourceState::WaitCallbackKad => FILEREASKTIME_SECS as u64,
             DownloadSourceState::Connecting | DownloadSourceState::Downloading => {
                 // Watchdog: if a source has been `Connecting` /
                 // `Downloading` far longer than any legitimate handshake
@@ -257,10 +253,6 @@ impl PerFileSourceList {
             file_hash,
             sources: Vec::new(),
         }
-    }
-
-    pub fn file_hash(&self) -> [u8; 16] {
-        self.file_hash
     }
 
     pub fn has_source(&self, ip: Ipv4Addr, tcp_port: u16) -> bool {
@@ -498,22 +490,6 @@ impl PerFileSourceList {
             .filter(|s| !s.ip.is_unspecified() && s.tcp_port != 0)
             .map(|s| (s.ip, s.tcp_port, s.udp_port))
             .collect()
-    }
-
-    /// Mark a source as waiting for Low-ID callback via server.
-    pub fn set_wait_callback(&mut self, ip: Ipv4Addr, port: u16, user_hash: Option<[u8; 16]>) {
-        if let Some(s) = self.find_mut(ip, port, user_hash) {
-            s.state = DownloadSourceState::WaitCallback;
-            s.state_changed = Instant::now();
-        }
-    }
-
-    /// Mark a source as waiting for Low-ID callback via Kad buddy.
-    pub fn set_wait_callback_kad(&mut self, ip: Ipv4Addr, port: u16, user_hash: Option<[u8; 16]>) {
-        if let Some(s) = self.find_mut(ip, port, user_hash) {
-            s.state = DownloadSourceState::WaitCallbackKad;
-            s.state_changed = Instant::now();
-        }
     }
 
     /// Record KAD callback buddy metadata and transition to `WaitCallbackKad`.

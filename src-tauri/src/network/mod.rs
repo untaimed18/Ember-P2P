@@ -911,11 +911,6 @@ const KNOWN_EMBER_PEER_TTL: std::time::Duration = std::time::Duration::from_secs
 /// rebuilds have a diverse pool to rotate from while still keeping
 /// per-session memory bounded (≈12 KB worst case).
 const MAX_KNOWN_EMBER_PEERS: usize = 500;
-/// Hard cap on the `ember_capable_peers` hint set. It records every KAD source
-/// that advertised Ember capability and was previously cleared only at
-/// shutdown, so a long session with many searches could grow it without bound.
-/// Once full we stop adding (the set is only a best-effort dialing hint).
-const MAX_EMBER_CAPABLE_PEERS: usize = 4000;
 
 /// Hard cap on `ember_noise_keys` size. Each entry is roughly 50 bytes
 /// (key + timestamp + map overhead), so the same 500-entry cap bounds
@@ -1211,14 +1206,11 @@ async fn handle_epx_sources(
                 debug!(
                     "EPX source {ip}:{port} advertised relay-capable; not treating flag as relay admission (attestation trailer required)"
                 );
-                if state.ember_capable_peers.len() < MAX_EMBER_CAPABLE_PEERS {
-                    state.ember_capable_peers.insert((ip, port));
-                }
             }
             // Skip LowID↔LowID for plain firewalled sources (no Ember relay
             // path). When `SOURCE_FLAG_RELAY_CAPABLE` is set (Ember DHT / EPX
-            // slice 15), keep the source so PFS can hit `low_to_low` and the
-            // broker can punch/relay.
+            // slice 15), keep the source so it stays eligible for the
+            // KAD-callback broker path instead of being dropped outright.
             if flags & ember::SOURCE_FLAG_FIREWALLED != 0
                 && (state.firewalled || state.low_id)
                 && flags & ember::SOURCE_FLAG_RELAY_CAPABLE == 0
@@ -2340,6 +2332,7 @@ async fn friend_transfer_request_status(
 #[allow(clippy::too_many_arguments)]
 async fn handle_friend_transfer_ack(
     state: &mut NetworkState,
+    transfer_manager: &Arc<RwLock<TransferManager>>,
     pending: &upload_server::PendingKadCallbacks,
     app_handle: &tauri::AppHandle,
     settings: &AppSettings,
@@ -2411,7 +2404,8 @@ async fn handle_friend_transfer_ack(
             if !registered {
                 state.friend_xfer_attempts.remove(&key);
                 drop_pending_friend_callback(pending, friend, key.1).await;
-                release_friend_connect_sources(state, app_handle, &transfer_id);
+                release_friend_connect_sources(state, transfer_manager, app_handle, &transfer_id)
+                    .await;
             }
         }
         return;
@@ -2432,7 +2426,7 @@ async fn handle_friend_transfer_ack(
 
     state.friend_xfer_attempts.remove(&key);
     drop_pending_friend_callback(pending, friend, key.1).await;
-    release_friend_connect_sources(state, app_handle, &transfer_id);
+    release_friend_connect_sources(state, transfer_manager, app_handle, &transfer_id).await;
 }
 
 /// A dial to `(ip, port)` for `transfer_id` just failed. If that download came
@@ -2519,11 +2513,46 @@ async fn maybe_escalate_to_friend_transfer(
     if let Some(pfs) = state.per_file_sources.get_mut(transfer_id) {
         pfs.set_friend_connect(ip, port, None);
     }
+    let ip_s = ip.to_string();
+    // Park the *stored* row, not just the live one. The caller stops the
+    // originating `"failed"` event here (see its `friend_escalated` guard), so
+    // nothing downstream will move this row off the state the failed dial left
+    // it in — and the drawer drops a `Failed` row entirely rather than showing
+    // a source that is healthily waiting for the friend to reach us.
+    {
+        let mut mgr = transfer_manager.write().await;
+        // `update_source_detail` overwrites `transferred` unconditionally;
+        // carry the existing value so parking the row doesn't reset the
+        // byte count this source already contributed.
+        let transferred = mgr
+            .get_source_details(transfer_id)
+            .into_iter()
+            .find(|s| s.ip == ip_s && s.port == port)
+            .map(|s| s.transferred)
+            .unwrap_or(0);
+        mgr.update_source_detail(
+            transfer_id,
+            crate::types::SourceInfo {
+                ip: ip_s.clone(),
+                port,
+                status: crate::types::SourceStatus::FriendConnect,
+                queue_rank: None,
+                speed: 0,
+                transferred,
+                client_software: String::new(),
+                peer_name: String::new(),
+                available_parts: None,
+                total_parts: None,
+                country_code: None,
+                user_hash: None,
+            },
+        );
+    }
     let _ = app_handle.emit(
         "transfer-source-detail",
         serde_json::json!({
             "transfer_id": transfer_id,
-            "ip": ip.to_string(),
+            "ip": ip_s,
             "port": port,
             "status": "friend_connect",
             "queue_rank": null,
@@ -3120,17 +3149,64 @@ async fn drop_pending_friend_callback(
 /// Return every source of `transfer_id` parked in
 /// [`DownloadSourceState::FriendConnect`] to ordinary retry, and refresh the
 /// UI rows so they stop showing a connect-back that is no longer coming.
-fn release_friend_connect_sources(
+async fn release_friend_connect_sources(
     state: &mut NetworkState,
+    transfer_manager: &Arc<RwLock<TransferManager>>,
     app_handle: &tauri::AppHandle,
     transfer_id: &str,
 ) {
-    let Some(pfs) = state.per_file_sources.get_mut(transfer_id) else {
-        return;
+    let released: Vec<(Ipv4Addr, u16)> = {
+        let Some(pfs) = state.per_file_sources.get_mut(transfer_id) else {
+            return;
+        };
+        pfs.friend_connect_sources(std::time::Instant::now())
+            .into_iter()
+            .map(|(ip, port, _)| {
+                pfs.clear_friend_connect(ip, port, None);
+                (ip, port)
+            })
+            .collect()
     };
-    let waiting = pfs.friend_connect_sources(std::time::Instant::now());
-    for (ip, port, _) in waiting {
-        pfs.clear_friend_connect(ip, port, None);
+    if released.is_empty() {
+        return;
+    }
+    // Mirror the emitted `"failed"` onto the stored row.
+    // `maybe_escalate_to_friend_transfer` parked it as `FriendConnect`, so
+    // without this the drawer would re-read that stale row on refresh and go on
+    // showing a connect-back that is no longer coming.
+    {
+        let mut mgr = transfer_manager.write().await;
+        let existing = mgr.get_source_details(transfer_id);
+        for (ip, port) in &released {
+            let ip_s = ip.to_string();
+            // `update_source_detail` overwrites `transferred` unconditionally;
+            // carry the existing value so releasing the row doesn't reset the
+            // byte count this source already contributed.
+            let transferred = existing
+                .iter()
+                .find(|s| s.ip == ip_s && s.port == *port)
+                .map(|s| s.transferred)
+                .unwrap_or(0);
+            mgr.update_source_detail(
+                transfer_id,
+                crate::types::SourceInfo {
+                    ip: ip_s,
+                    port: *port,
+                    status: crate::types::SourceStatus::Failed,
+                    queue_rank: None,
+                    speed: 0,
+                    transferred,
+                    client_software: String::new(),
+                    peer_name: String::new(),
+                    available_parts: None,
+                    total_parts: None,
+                    country_code: None,
+                    user_hash: None,
+                },
+            );
+        }
+    }
+    for (ip, port) in released {
         let _ = app_handle.emit(
             "transfer-source-detail",
             serde_json::json!({
@@ -7304,19 +7380,6 @@ struct NetworkState {
     relay_manager: Arc<tokio::sync::Mutex<ember::relay::RelayManager>>,
     /// Peer reputation tracking (score, ban, decay)
     reputation: ember::reputation::ReputationManager,
-    /// Set of peers `(ip, tcp_port)` we have observed advertising the
-    /// `"ember"` capability tag (`EMBER_CAP_RELAY_PUNCH_V1`) in a KAD
-    /// source publish. Both broker call sites gate on this — peers
-    /// that haven't advertised the tag get marked `low_to_low` and
-    /// skipped, instead of burning ~46 s of broker time per attempt
-    /// trying to talk Ember relay protocol to a vanilla eMule client
-    /// that doesn't understand it.
-    ///
-    /// Lazily populated by `extract_kad_sources` callers; cleared on
-    /// process shutdown. KAD source publishes have a 5-hour TTL and
-    /// our routing table is repopulated at startup, so the cache
-    /// rebuilds quickly on each session.
-    ember_capable_peers: HashSet<(Ipv4Addr, u16)>,
     /// Ember-native Noise transport. Always initialised at network
     /// startup so the dispatch decision in `handle_udp_packet` can be
     /// gated purely on `settings.ember_native_enabled` — toggling the
@@ -8100,11 +8163,6 @@ fn finalize_removed_searches_with_keyword_results(
                 let all = extract_kad_sources(entries);
                 for s in &all {
                     if !s.ip.is_unspecified() && s.tcp_port != 0 {
-                        if s.is_ember_capable
-                            && state.ember_capable_peers.len() < MAX_EMBER_CAPABLE_PEERS
-                        {
-                            state.ember_capable_peers.insert((s.ip, s.tcp_port));
-                        }
                         if let Some(npub) = s.ember_noise_pub {
                             // Cache under UDP port: Ember Noise runs on the
                             // shared KAD UDP socket, not eMule TCP.
@@ -8151,11 +8209,6 @@ fn finalize_removed_searches_with_keyword_results(
                 let all = extract_kad_sources(entries);
                 for s in &all {
                     if !s.ip.is_unspecified() && s.tcp_port != 0 {
-                        if s.is_ember_capable
-                            && state.ember_capable_peers.len() < MAX_EMBER_CAPABLE_PEERS
-                        {
-                            state.ember_capable_peers.insert((s.ip, s.tcp_port));
-                        }
                         if let Some(npub) = s.ember_noise_pub {
                             // Cache under UDP port: Ember Noise runs on the
                             // shared KAD UDP socket, not eMule TCP.
@@ -10590,7 +10643,6 @@ pub async fn start_network(
         broker_event_rx: None,
         relay_manager: Arc::new(tokio::sync::Mutex::new(ember::relay::RelayManager::new())),
         reputation,
-        ember_capable_peers: HashSet::new(),
         ember_transport: ember::transport::EmberTransport::new(
             identity.noise_private_key,
             identity.noise_public_key,
@@ -13672,54 +13724,7 @@ pub async fn start_network(
                                 "no_needed_parts" => pfs.set_none_needed_parts(v4, port, None),
                                 "parts_busy" => pfs.set_parts_busy(v4, port, None),
                                 "duplicate" => pfs.clear_duplicate_route(v4, port, None),
-                                "wait_callback" => pfs.set_wait_callback(v4, port, None),
-                                "wait_callback_kad" => pfs.set_wait_callback_kad(v4, port, None),
                                 "too_many_conns" => pfs.set_too_many_conns(v4, port, None),
-                                "low_to_low" => {
-                                    let file_hash = pfs.file_hash();
-                                    // Gate the broker on prior Ember-capability evidence.
-                                    // Vanilla eMule peers don't speak our relay protocol on
-                                    // the other end, so attempting hole-punch + relay
-                                    // burns ~16 s + 30 s with no possibility of success.
-                                    // The `ember_capable_peers` set is populated by
-                                    // `extract_kad_sources` whenever a peer publishes the
-                                    // `"ember"` source tag (see `kad/publish.rs`). Peers
-                                    // we've never seen a tag from get marked as plain
-                                    // `low_to_low` and skipped — same outcome as before
-                                    // these features existed, no time wasted.
-                                    let ember_capable =
-                                        state.ember_capable_peers.contains(&(v4, port));
-                                    let broker_started = if !ember_capable {
-                                        debug!(
-                                            "Skipping LowID-to-LowID broker for {}:{} — \
-                                             peer has not advertised Ember capability \
-                                             (KAD ember tag or DHT RELAY_CAPABLE)",
-                                            v4, port,
-                                        );
-                                        false
-                                    } else if let Some(ref mut broker) = state.connection_broker {
-                                        // IP from the confirmed STUN mapping (proves we're
-                                        // actually reachable at *some* port), but the port we
-                                        // advertise to the peer must be our QUIC bind port —
-                                        // the peer's hole-punch dials that socket, not the KAD
-                                        // UDP socket `nat_info.external_addr` was probed on.
-                                        let ext = state.nat_info.external_addr.map(|addr| {
-                                            SocketAddr::new(addr.ip(), state.quic_port.unwrap_or(state.tcp_port))
-                                        });
-                                        broker.attempt_low_to_low(
-                                            transfer_id, file_hash, v4, port,
-                                            state.nat_info.nat_type, ext,
-                                        ).await
-                                    } else {
-                                        false
-                                    };
-                                    if broker_started {
-                                        pfs.set_ember_relay(v4, port, None);
-                                    } else {
-                                        pfs.set_low_to_low(v4, port, None);
-                                    }
-                                }
-                                "banned" => pfs.set_banned(v4, port, None),
                                 _ => {}
                             }
                         }
@@ -13792,6 +13797,17 @@ pub async fn start_network(
                                     }
                                 }
                             }
+                        }
+                        // Escalated to a friend connect-back: the source is
+                        // parked, not failed. Stop the event here — same soft
+                        // defer as `parts_busy` above — so `handle_download_event`
+                        // can't overwrite the `FriendConnect` row with `Failed`
+                        // and emit a trailing `"failed"` that makes the drawer
+                        // drop the row. Skipping the reputation block below is
+                        // deliberate: we are not treating this as the friend's
+                        // fault.
+                        if friend_escalated {
+                            continue;
                         }
                     }
                     // Reputation: record handshake success; only score real
@@ -14938,6 +14954,7 @@ pub async fn start_network(
                 {
                     handle_friend_transfer_ack(
                         &mut state,
+                        &transfer_manager,
                         &pending_kad_callbacks,
                         &app_handle,
                         &settings,
@@ -15679,17 +15696,12 @@ pub async fn start_network(
                     for (sid, transfer_id, fh, cursor, new_entries) in to_stream {
                         let new_cursor = cursor + new_entries.len();
                         let all = extract_kad_sources(&new_entries);
-                        // Learn Ember capability / Noise keys from every
-                        // response, mirroring the completion handler so the
-                        // broker/native-dial caches fill regardless of which
-                        // path (stream vs completion) sees a peer first.
+                        // Learn Noise keys from every response, mirroring the
+                        // completion handler so the native-dial cache fills
+                        // regardless of which path (stream vs completion)
+                        // sees a peer first.
                         for s in &all {
                             if !s.ip.is_unspecified() && s.tcp_port != 0 {
-                                if s.is_ember_capable
-                                    && state.ember_capable_peers.len() < MAX_EMBER_CAPABLE_PEERS
-                                {
-                                    state.ember_capable_peers.insert((s.ip, s.tcp_port));
-                                }
                                 if let Some(npub) = s.ember_noise_pub {
                                     // Cache under UDP port: Ember Noise runs on
                                     // the shared KAD UDP socket, not eMule TCP.
@@ -15963,21 +15975,14 @@ pub async fn start_network(
                     } else if let Some((_, tx)) = state.pending_source_searches.remove(&sid) {
                         let sources = if let Some(search) = state.search_manager.get(&sid) {
                             let all = extract_kad_sources(&search.results);
-                            // Remember any peer that advertised Ember capability so
-                            // future broker attempts for them are unlocked. We update
-                            // the cache *before* filtering self-sources because we want
-                            // to learn about peers from every search response, not just
-                            // ones we end up handing back to the caller. The Noise-pubkey
-                            // cache is fed off the same iteration so `ember_ping_peer`
-                            // can dial the peer's Ember-native UDP transport without
-                            // needing the harness to copy hex from devtools.
+                            // Learn each peer's Noise pubkey so `ember_ping_peer` can
+                            // dial its Ember-native UDP transport without needing the
+                            // harness to copy hex from devtools. We update the cache
+                            // *before* filtering self-sources because we want to learn
+                            // about peers from every search response, not just ones we
+                            // end up handing back to the caller.
                             for s in &all {
                                 if !s.ip.is_unspecified() && s.tcp_port != 0 {
-                                    if s.is_ember_capable
-                                        && state.ember_capable_peers.len() < MAX_EMBER_CAPABLE_PEERS
-                                    {
-                                        state.ember_capable_peers.insert((s.ip, s.tcp_port));
-                                    }
                                     // Cache the Noise key under the peer's UDP
                                     // port: Ember's Noise transport runs over
                                     // UDP (the shared KAD socket), so every
@@ -16064,19 +16069,13 @@ pub async fn start_network(
                         let kad_sources = if let Some(search) = state.search_manager.get(&sid) {
                             let all = extract_kad_sources(&search.results);
                             // Same cache update as the pending_source_searches branch:
-                            // record every peer that advertised Ember capability so the
-                            // broker dispatch sites can unblock them, and learn the peer's
-                            // Noise pubkey so Ember-native dialing doesn't require a
-                            // separate exchange. Doing this in both branches (rather
-                            // than once inside `extract_kad_sources`) keeps that helper
-                            // a pure function with no `state` dependency.
+                            // learn the peer's Noise pubkey so Ember-native dialing
+                            // doesn't require a separate exchange. Doing this in both
+                            // branches (rather than once inside `extract_kad_sources`)
+                            // keeps that helper a pure function with no `state`
+                            // dependency.
                             for s in &all {
                                 if !s.ip.is_unspecified() && s.tcp_port != 0 {
-                                    if s.is_ember_capable
-                                        && state.ember_capable_peers.len() < MAX_EMBER_CAPABLE_PEERS
-                                    {
-                                        state.ember_capable_peers.insert((s.ip, s.tcp_port));
-                                    }
                                     // Cache the Noise key under the peer's UDP
                                     // port: Ember's Noise transport runs over
                                     // UDP (the shared KAD socket), so every
@@ -19307,7 +19306,13 @@ pub async fn start_network(
                                 hex::encode(key.1)
                             );
                             drop_pending_friend_callback(&pending_kad_callbacks, key.0, key.1).await;
-                            release_friend_connect_sources(&mut state, &app_handle, &transfer_id);
+                            release_friend_connect_sources(
+                                &mut state,
+                                &transfer_manager,
+                                &app_handle,
+                                &transfer_id,
+                            )
+                            .await;
                         }
                         // Past the retry ceiling the entry is useless: drop it
                         // so a much later attempt (after the friend has been
@@ -22951,6 +22956,18 @@ pub async fn start_network(
                                                 let pfs = state.per_file_sources
                                                     .entry(tid.clone())
                                                     .or_insert_with(|| ed2k::sources::PerFileSourceList::new(file_hash));
+                                                // Identity-only rows: a classic ed2k-server LowID
+                                                // entry carries no routable address, so IP and port
+                                                // both stay zero and the user hash is the only key
+                                                // (`register_lowid_source` stores the same way).
+                                                // These sources deliberately do *not* reach the
+                                                // Ember broker: a relay request needs a dialable
+                                                // `target_ip:target_port`, and the relay-side SSRF
+                                                // guard (`is_public_relay_target`) rejects
+                                                // `0.0.0.0:0` on both its port and address checks.
+                                                // Brokering them would require discovering an
+                                                // address first — i.e. a KAD buddy record, which is
+                                                // already the path that reaches `attempt_low_to_low`.
                                                 for uh in &lowid_unreachable_hashes {
                                                     pfs.add_source_with_identity(Ipv4Addr::UNSPECIFIED, 0, 0, Some(*uh));
                                                     pfs.set_low_to_low(Ipv4Addr::UNSPECIFIED, 0, Some(*uh));
@@ -25447,7 +25464,13 @@ pub async fn start_network(
                                 .friend_xfer_attempts
                                 .remove(&(friend_eh, cb_file_hash));
                             for tid in matching_tids.clone() {
-                                release_friend_connect_sources(&mut state, &app_handle, &tid);
+                                release_friend_connect_sources(
+                                    &mut state,
+                                    &transfer_manager,
+                                    &app_handle,
+                                    &tid,
+                                )
+                                .await;
                             }
                         }
 
@@ -26314,8 +26337,7 @@ pub async fn start_network(
                                     .map(|s| {
                                         let mut flags = 0u8;
                                         if matches!(s.state,
-                                            ed2k::sources::DownloadSourceState::WaitCallback
-                                            | ed2k::sources::DownloadSourceState::WaitCallbackKad
+                                            ed2k::sources::DownloadSourceState::WaitCallbackKad
                                             | ed2k::sources::DownloadSourceState::LowToLowIp
                                         ) {
                                             flags |= ember::SOURCE_FLAG_FIREWALLED;
@@ -26379,8 +26401,7 @@ pub async fn start_network(
                                     .map(|s| {
                                         let mut flags = 0u8;
                                         if matches!(s.state,
-                                            ed2k::sources::DownloadSourceState::WaitCallback
-                                            | ed2k::sources::DownloadSourceState::WaitCallbackKad
+                                            ed2k::sources::DownloadSourceState::WaitCallbackKad
                                             | ed2k::sources::DownloadSourceState::LowToLowIp
                                         ) {
                                             flags |= ember::SOURCE_FLAG_FIREWALLED;
@@ -26652,17 +26673,6 @@ pub async fn start_network(
                                 if state.ip_filter.is_blocked(ip) || state.banned_ips.contains(&ip)
                                 {
                                     continue;
-                                }
-                                // Slice 15: Ember DHT firewalled/relay-capable
-                                // sources must gate the LowID broker the same
-                                // way KAD `"ember"` tags do.
-                                if flags
-                                    & (ember::SOURCE_FLAG_RELAY_CAPABLE
-                                        | ember::SOURCE_FLAG_FIREWALLED)
-                                    != 0
-                                    && state.ember_capable_peers.len() < MAX_EMBER_CAPABLE_PEERS
-                                {
-                                    state.ember_capable_peers.insert((ip, tcp_port));
                                 }
                                 let connect_options =
                                     if flags & ember::SOURCE_FLAG_OBFUSCATION != 0 {
@@ -38982,10 +38992,6 @@ async fn handle_download_event(
             let source_status = match status.as_str() {
                 "connecting" => crate::types::SourceStatus::Connecting,
                 "wait_callback" | "wait_callback_kad" => crate::types::SourceStatus::WaitCallback,
-                // Without this arm a parked friend source fell through to
-                // `Failed`, so the stored row the drawer re-reads on refresh
-                // showed (and filtered out) a source that was healthily waiting.
-                "friend_connect" => crate::types::SourceStatus::FriendConnect,
                 "stalled" => crate::types::SourceStatus::Stalled,
                 "queued" => crate::types::SourceStatus::Queued,
                 "queue_full" => crate::types::SourceStatus::QueueFull,
@@ -40146,12 +40152,12 @@ struct KadSource {
     /// Type-2: eD2K server TCP port.
     ed2k_server_port: u16,
     /// `true` if this peer advertised `EMBER_CAP_RELAY_PUNCH_V1` in the
-    /// KAD source publish (string tag `"ember"`). Other Ember peers gate
-    /// LowID-to-LowID broker attempts on this — see the broker call
-    /// sites in this file. Defaults to `false` for any source we
-    /// haven't seen the tag from (vanilla eMule peers, type-2 LowID
-    /// sources from the ed2k server, or older Ember peers from before
-    /// this tag existed).
+    /// KAD source publish (string tag `"ember"`). The KAD-callback path
+    /// gates its LowID-to-LowID broker attempt on this — see the
+    /// `attempt_low_to_low` call site in this file. Defaults to `false`
+    /// for any source we haven't seen the tag from (vanilla eMule peers,
+    /// type-2 LowID sources from the ed2k server, or older Ember peers
+    /// from before this tag existed).
     is_ember_capable: bool,
     /// Ember Noise X25519 static public key, when the source publish
     /// carried [`kad::publish::EMBER_NOISE_PUB_TAG`]. Cached by the
