@@ -481,12 +481,6 @@ pub struct EmberDiagnostics {
     pub epx_events_received: u32,
     /// Total unique Ember peers tracked in the mesh discovery cache.
     pub ember_peers_known: u32,
-    /// LowID broker: QUIC hole-punch attempts scheduled this session.
-    pub broker_punch_attempts: u32,
-    /// LowID broker: hole-punch connections that reached the transfer path.
-    pub broker_punch_successes: u32,
-    /// LowID broker: hole-punch failures reported before relay fallback.
-    pub broker_punch_failures: u32,
     /// LowID broker: peer/server relay attempts scheduled this session.
     pub broker_relay_attempts: u32,
     /// LowID broker: relay connections that reached the transfer path.

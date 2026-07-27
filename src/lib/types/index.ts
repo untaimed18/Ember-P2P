@@ -243,9 +243,6 @@ export type DegradedReason = 'stale' | 'limited' | 'establishing';
 export interface EmberDiagnostics {
   epx_events_received: number;
   ember_peers_known: number;
-  broker_punch_attempts: number;
-  broker_punch_successes: number;
-  broker_punch_failures: number;
   broker_relay_attempts: number;
   broker_relay_successes: number;
   broker_relay_failures: number;

@@ -138,15 +138,20 @@ pub async fn punch_quic(
 /// from the outside.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct BrokerStats {
-    pub punch_attempts: u32,
-    pub punch_successes: u32,
-    pub punch_failures: u32,
     pub relay_attempts: u32,
     pub relay_successes: u32,
     pub relay_failures: u32,
 }
 
-/// Orchestrates LowID-to-LowID connections: hole-punch first, relay fallback.
+/// Orchestrates LowID-to-LowID connections by relaying through a third peer.
+///
+/// Despite the name, no hole punch is attempted here. The sources this path
+/// serves are anonymous LowID rows discovered via KAD or a server: they carry
+/// no registered Ember identity, so there is no key to sign a v2 punch request
+/// with and nothing for the far side to verify. `attempt_low_to_low` therefore
+/// starts at [`AttemptPhase::FindRelay`] unconditionally — see the comment
+/// there. Friend-to-friend transfers, which *do* have a proven identity, run
+/// their own connect-back/punch negotiation over the friend session instead.
 pub struct ConnectionBroker {
     attempts: HashMap<String, ConnectionAttempt>,
     cooldowns: HashMap<(Ipv4Addr, u16), (Instant, u32)>,

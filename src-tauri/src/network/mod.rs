@@ -35187,9 +35187,6 @@ async fn handle_command_inner(
             }
             if let Some(ref broker) = state.connection_broker {
                 let bs = broker.stats();
-                diag.broker_punch_attempts = bs.punch_attempts;
-                diag.broker_punch_successes = bs.punch_successes;
-                diag.broker_punch_failures = bs.punch_failures;
                 diag.broker_relay_attempts = bs.relay_attempts;
                 diag.broker_relay_successes = bs.relay_successes;
                 diag.broker_relay_failures = bs.relay_failures;
