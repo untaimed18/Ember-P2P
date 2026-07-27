@@ -9669,6 +9669,18 @@ pub async fn start_network(
     let mut last_hardcoded_bootstrap_ts: i64 = 0;
     let mut hardcoded_bootstrap_backoff_shift: u32 = 0;
     let mut publish_timer = tokio::time::interval(std::time::Duration::from_secs(60));
+    // Punch mailbox polling ticks fast but only *works* when there is something
+    // to answer — see the arm's gate. The rendezvous server keeps a punch
+    // registration for only 30 s (`PUNCH_TTL`), so this used to ride the 60 s
+    // `publish_timer`: a friend's registration routinely expired before we ever
+    // looked, which is why friend hole-punching was documented as purely
+    // best-effort.
+    let mut punch_poll_timer = tokio::time::interval(std::time::Duration::from_secs(3));
+    punch_poll_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // Idle cadence for the same poll, preserving the old behaviour when there is
+    // no reason to hurry so an idle client does not poll every 3 s.
+    const PUNCH_POLL_IDLE_SECS: u64 = 60;
+    let mut last_punch_poll: Option<tokio::time::Instant> = None;
     publish_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // eMule's Kad publish driver wakes every KADEMLIAPUBLISHTIME (2s)
     // and starts at most one due source/keyword/note store per tick while
@@ -16844,6 +16856,17 @@ pub async fn start_network(
                     state.publish_manager.firewalled,
                     state.routing_table.len(),
                 );
+                } // end routing-table guard: publish diagnostics only
+
+                // Rendezvous / friend-presence work deliberately sits OUTSIDE
+                // the routing-table guard above. Friend discovery and hole
+                // punching go through the rendezvous server and have nothing to
+                // do with Kademlia, but while they were nested in the `else`
+                // branch a client with an empty KAD routing table — KAD
+                // disabled, or simply not bootstrapped yet — never sent a
+                // presence heartbeat and never answered a punch, so friends
+                // silently could not reach it.
+                //
                 // Rendezvous heartbeat: re-register every 2 minutes to keep
                 // our presence alive on the rendezvous server.
                 //
@@ -16920,6 +16943,28 @@ pub async fn start_network(
                         }
                     }
                 }
+
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'publish_timer' panicked: {}", describe_panic(&*__p));
+                }
+            }
+
+            // Punch mailbox responder. Split out of `publish_timer` so it can
+            // run on a cadence shorter than the rendezvous server's 30 s punch
+            // TTL, and so it no longer depends on the KAD routing table.
+            _ = punch_poll_timer.tick() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
+                // Only actually poll on the idle cadence for now; there is
+                // nothing yet that needs the fast path.
+                let now = tokio::time::Instant::now();
+                let idle_due = last_punch_poll.is_none_or(|last| {
+                    now.duration_since(last) >= std::time::Duration::from_secs(PUNCH_POLL_IDLE_SECS)
+                });
+                if !idle_due {
+                    return;
+                }
+                last_punch_poll = Some(now);
 
                 // Poll signed v2 punch requests addressed to our registered
                 // Ember identity. Only known friends are accepted; anonymous
@@ -17118,10 +17163,9 @@ pub async fn start_network(
                     }
                 }
 
-                } // end is_empty guard
                 }).catch_unwind().await;
                 if let Err(__p) = __panic_result {
-                    error!("Network loop arm 'publish_timer' panicked: {}", describe_panic(&*__p));
+                    error!("Network loop arm 'punch_poll_timer' panicked: {}", describe_panic(&*__p));
                 }
             }
 
