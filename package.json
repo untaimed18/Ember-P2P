@@ -13,6 +13,7 @@
     "tauri": "tauri",
     "bump-version": "node scripts/bump-version.mjs",
     "verify:release": "node scripts/verify-release-policy.mjs",
+    "test:locales": "node --test scripts/locales.test.mjs",
     "test:release-policy": "node --test scripts/*.test.mjs",
     "postinstall": "node -e \"const fs=require('fs'),p=require('path'),s=p.join('node_modules','circle-flags','flags'),d=p.join('static','flags');if(!fs.existsSync(s)){process.exit(0);}fs.mkdirSync(d,{recursive:true});fs.readdirSync(s).filter(f=>f.endsWith('.svg')).forEach(f=>fs.copyFileSync(p.join(s,f),p.join(d,f)));console.log('Copied flag SVGs to static/flags/');\""
   },

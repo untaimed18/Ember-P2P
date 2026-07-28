@@ -595,7 +595,7 @@
   "friends_blocked": "Blocked {name}",
   "friends_unblocked": "Unblocked {name}",
   "friends_blocked_title": "Blocked",
-  "friends_blocked_hint": "Blocked identities cannot send you friend requests. Unblocking does not restore the friendship \u2014 you would need to add each other again.",
+  "friends_blocked_hint": "Blocked identities cannot send you friend requests. Unblocking does not restore the friendship — you would need to add each other again.",
   "friends_unblock": "Unblock",
   "friends_unblock_aria": "Unblock {name}",
   "friends_action_chat": "Chat",
