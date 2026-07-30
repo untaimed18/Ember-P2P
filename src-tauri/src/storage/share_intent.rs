@@ -352,6 +352,7 @@ mod tests {
             file_size: 4,
             file_path: base.join("unshared.bin").to_string_lossy().into_owned(),
             aich_hash: String::new(),
+            ember_file_hash: String::new(),
             modified_at: 1,
             all_time_transferred: 0,
             all_time_requested: 0,

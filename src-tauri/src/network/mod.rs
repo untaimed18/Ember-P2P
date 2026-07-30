@@ -175,6 +175,11 @@ struct ServerConnectResult {
     addr: SocketAddr,
     ip: String,
     port: u16,
+    /// Our own TCP port as sent in this attempt's `OP_LOGINREQUEST` — NOT
+    /// the server's `port` above. Recorded into
+    /// `NetworkState::server_login_tcp_port` on success so a later
+    /// STUN-confirmed remap can detect it needs a reconnect.
+    login_tcp_port: u16,
     result: Result<(Ed2kServerConnection, ServerSession), String>,
 }
 
@@ -568,6 +573,41 @@ fn apply_udp_mapping_keepalive(
         );
     }
     true
+}
+
+/// Minimum gap between mapping-keep-alive-triggered eD2k reconnects (see the
+/// `tcp_map_ka_result_rx` arm). The two-hit confirmation gate already makes
+/// back-to-back *different* confirmed values ~40s apart at best; this is an
+/// explicit floor on top of that so a pathologically unstable mapping can't
+/// reconnect-thrash the server session faster than this.
+const TCP_REMAP_RECONNECT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether the mapping keep-alive should force a reconnect to the currently
+/// connected eD2k server to push a STUN-confirmed TCP port remap that
+/// arrived after login. eD2k has no "update my port" message once logged
+/// in, so a remap confirmed later (the common case — confirmation needs two
+/// keep-alive cycles, ~40s, which can easily land after an
+/// already-in-progress login) would otherwise sit unused until some
+/// unrelated reconnect. Only reconnects when it can actually help (still
+/// LowID, actually connected, no reconnect already in flight), only for a
+/// value the server doesn't already have on file, and never faster than
+/// `TCP_REMAP_RECONNECT_COOLDOWN` — a per-value cooldown already falls out
+/// of the two-hit confirmation gate, but this adds an explicit floor so a
+/// pathologically unstable mapping can't reconnect-thrash the session.
+fn should_reconnect_for_tcp_remap(
+    low_id: bool,
+    server_connected: bool,
+    reconnect_in_flight: bool,
+    confirmed_port: Option<u16>,
+    server_login_tcp_port: Option<u16>,
+    cooldown_elapsed: bool,
+) -> bool {
+    low_id
+        && server_connected
+        && !reconnect_in_flight
+        && cooldown_elapsed
+        && confirmed_port.is_some()
+        && confirmed_port != server_login_tcp_port
 }
 
 /// Outcome of one TCP STUN observation against the current TCP
@@ -7630,6 +7670,22 @@ struct NetworkState {
     low_id: bool,
     /// Our server-assigned client ID
     server_client_id: u32,
+    /// The TCP port we advertised in `OP_LOGINREQUEST` for the current
+    /// session. eD2k has no "update my port" message once logged in — the
+    /// server only learns a new port by us reconnecting — so this lets the
+    /// mapping keep-alive notice a STUN-confirmed remap that arrived *after*
+    /// login and trigger a reconnect while still LowID (see the
+    /// `tcp_map_ka_result_rx` arm). `None` while disconnected; irrelevant
+    /// then since the reconnect check is gated on `server_connected`.
+    server_login_tcp_port: Option<u16>,
+    /// Last time the mapping keep-alive triggered a reconnect to push a
+    /// newly confirmed TCP port to the server (see `tcp_map_ka_result_rx`).
+    /// A per-value cooldown already falls out of the two-hit confirmation
+    /// gate (`tcp_port_confirmation`), but this adds an explicit floor so a
+    /// pathologically unstable mapping (a "confirmed" port that keeps
+    /// changing every couple of cycles) can't reconnect-thrash the server
+    /// session.
+    last_tcp_remap_reconnect_at: Option<std::time::Instant>,
     /// Background server connection task (non-blocking)
     pending_server_connect: Option<tokio::task::JoinHandle<ServerConnectResult>>,
     /// Shared set of user hashes expected as incoming buddy connections (checked by upload listener)
@@ -9131,6 +9187,7 @@ async fn initiate_server_connect(
             addr,
             ip,
             port,
+            login_tcp_port: tcp_port,
             result: result.map(|(conn, session, _)| (conn, session)),
         }
     }));
@@ -11040,6 +11097,8 @@ pub async fn start_network(
         udp_fw_node_search: None,
         low_id: false,
         server_client_id: 0,
+        server_login_tcp_port: None,
+        last_tcp_remap_reconnect_at: None,
         pending_server_connect: None,
         pending_buddy_hashes: pending_buddy_hashes.clone(),
         shared_buddy_info: shared_buddy_info.clone(),
@@ -24342,6 +24401,7 @@ pub async fn start_network(
                                 addr,
                                 ip,
                                 port,
+                                login_tcp_port: tcp_port,
                                 result: result.map(|(conn, session, _)| (conn, session)),
                             }
                         }));
@@ -24971,7 +25031,7 @@ pub async fn start_network(
             } => {
                 state.pending_server_connect = None;
                 match result {
-                    Ok(ServerConnectResult { addr, ip, port, result: Ok((mut conn, session)) }) => {
+                    Ok(ServerConnectResult { addr, ip, port, login_tcp_port, result: Ok((mut conn, session)) }) => {
                         // Check server IP against IP filter (eMule: FilterServerByIP)
                         if settings.filter_servers_by_ip {
                             let server_ipv4 = match addr.ip() {
@@ -25022,6 +25082,7 @@ pub async fn start_network(
                         ));
                         state.low_id = is_low;
                         state.server_client_id = session.client_id;
+                        state.server_login_tcp_port = Some(login_tcp_port);
                         state.server_list.record_success(&ip, port);
                         state.server_connected = true;
                         state.server_reconnect_failures = 0;
@@ -26540,6 +26601,38 @@ pub async fn start_network(
                 }
                 if apply_tcp_mapping_keepalive(&mut state, result.hold_ok, result.mapped, &app_handle) {
                     mapping_ka_cycle_success = true;
+                }
+                // A reconnect that fails just falls back to the existing
+                // backoff-driven auto-reconnect (which will use the
+                // now-current `advertised_tcp_port` anyway) — see
+                // `should_reconnect_for_tcp_remap` for the full rationale.
+                let cooldown_elapsed = state
+                    .last_tcp_remap_reconnect_at
+                    .is_none_or(|at| at.elapsed() >= TCP_REMAP_RECONNECT_COOLDOWN);
+                if should_reconnect_for_tcp_remap(
+                    state.low_id,
+                    state.server_connected,
+                    state.pending_server_connect.is_some(),
+                    state.external_tcp_port,
+                    state.server_login_tcp_port,
+                    cooldown_elapsed,
+                ) {
+                    if let Some(addr) = state.server_addr {
+                        info!(
+                            "STUN keepalive: public TCP port confirmed as {:?} (server has {:?}) while LowID — reconnecting to eD2k server for a fresh HighID check",
+                            state.external_tcp_port, state.server_login_tcp_port
+                        );
+                        state.last_tcp_remap_reconnect_at = Some(std::time::Instant::now());
+                        initiate_server_connect(
+                            &mut state,
+                            &settings,
+                            &app_handle,
+                            &shared_server_addr,
+                            addr.ip().to_string(),
+                            addr.port(),
+                        )
+                        .await;
+                    }
                 }
                 if !udp_map_ka_in_flight && !tcp_map_ka_in_flight && !mapping_ka_cycle_success {
                     if state.stats.stun_keepalive_active {
