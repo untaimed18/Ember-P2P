@@ -650,8 +650,27 @@ pub fn build_emule_info(
 ) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
 
-    // m_uCurVersionShort (eMule writes its short version byte here; 0x32 = 50)
-    buf.write_u8(0x32).unwrap();
+    // eMule's `m_byEmuleVersion` sentinel meaning "my real version is in the
+    // Hello's CT_EMULE_VERSION tag, not here" — which is exactly true for us.
+    //
+    // `SendMuleInfoPacket` writes `m_uCurVersionShort` in this slot, but a
+    // modern eMule only ever sends MuleInfo to a peer whose Hello was *not* a
+    // mule hello (`ListenSocket.cpp`: `if (GetHashType() == SO_EMULE &&
+    // !bIsMuleHello)`), so between two modern clients this packet never
+    // appears and the receiver keeps the `0x99` its Hello handler stored
+    // (`BaseClient.cpp`: `m_byEmuleVersion = 0x99` on CT_EMULE_VERSION).
+    // Because we do send MuleInfo on some paths, writing a real version byte
+    // here *overwrites* that 0x99 via `ProcessMuleInfoPacket` and leaves the
+    // peer holding "claims eMule, version > 0.30.0, mule version set but not
+    // 0x99" — the exact signature anti-leecher mods punish as a spoofed eMule
+    // (eMuleAI `Shield.cpp` PR_FAKEMULEVERSION; reported upstream as
+    // eMuleAI issue #154). Sending the sentinel keeps this field agreeing
+    // with the Hello instead of contradicting it, and is safe on every
+    // consumer: the `< 0x25` legacy downgrades don't apply, `>= 0x28` sets
+    // shared-directories exactly as the Hello path does, the version-string
+    // builder takes the `!= 0x99` branch and reports our Hello version, and
+    // `IsEmuleClient()` (`!= 0`) stays true.
+    buf.write_u8(0x99).unwrap();
     // EMULE_PROTOCOL marker
     buf.write_u8(0x01).unwrap();
 
@@ -3076,7 +3095,12 @@ mod tests {
     fn emule_info_has_exactly_seven_tags() {
         let payload = build_emule_info(4672, true, None, None);
         // Layout: version(1) + protocol(1) + tag_count(u32) + tags
-        assert_eq!(payload[0], 0x32, "version byte");
+        assert_eq!(
+            payload[0], 0x99,
+            "version byte must be eMule's 'version is in the Hello tag' sentinel; \
+             a real version byte here overwrites the receiver's 0x99 and trips \
+             anti-leecher fake-eMule detection"
+        );
         assert_eq!(payload[1], 0x01, "protocol marker");
         let tag_count = u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]);
         assert_eq!(tag_count, 7, "must match eMule SendMuleInfoPacket exactly");
