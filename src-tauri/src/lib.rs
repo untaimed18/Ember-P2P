@@ -1311,6 +1311,7 @@ pub fn run() {
             commands::peers::get_my_ember_hash,
             commands::peers::send_chat_message,
             commands::peers::get_chat_messages,
+            commands::peers::is_chat_locked,
             commands::peers::mark_messages_read,
             commands::peers::get_unread_message_counts,
             commands::peers::get_pending_chat_counts,

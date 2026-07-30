@@ -145,11 +145,15 @@ pub const OP_EMBER_FILE_OFFER: u8 = 0xFC;
 /// Recipient's answer to [`OP_EMBER_FILE_OFFER`].
 pub const OP_EMBER_FILE_OFFER_ACK: u8 = 0xFD;
 /// Extension envelope: a leading sub-type byte selects the message, so future
-/// friend-session additions cost one byte of payload rather than one of the
-/// two opcodes left in the private `OP_EMULEPROT` range (`0xF0`–`0xFF`, with
-/// `0xF0`–`0xFD` already spent). A peer that predates a sub-type ignores it,
-/// exactly as it would an unknown opcode.
-pub const OP_EMBER_EXT: u8 = 0xFE;
+/// friend-session additions cost one byte of payload rather than an opcode.
+///
+/// This takes the last free code in the `OP_EMULEPROT` space, which is what
+/// makes the envelope necessary rather than merely tidy — there is no second
+/// one to spend. `0xF0`–`0xFD` are Ember's, and `0xFE` is eMule's
+/// [`OP_PORTTEST`]: this constant was originally assigned there, colliding with
+/// a live eMule opcode that stock clients dispatch mid-session. A peer that
+/// predates a sub-type ignores it, exactly as it would an unknown opcode.
+pub const OP_EMBER_EXT: u8 = 0xFF;
 
 /// [`OP_EMBER_EXT`] sub-type: relay attestations the sender knows about, so a
 /// pair with no swarm in common can still populate their relay brokers. Every
@@ -923,6 +927,12 @@ pub const OFFER_STATUS_ACCEPTED: u8 = 0;
 /// The offer was refused outright, e.g. the recipient turned friend messaging
 /// off. Reserved values above this are ignored by current parsers.
 pub const OFFER_STATUS_DECLINED: u8 = 1;
+/// The recipient is rate-limiting offers and never showed this one to anyone.
+///
+/// Distinct from [`OFFER_STATUS_DECLINED`] because the sender reports the two
+/// differently: a decline is a decision, whereas this only means "too fast",
+/// and telling the user their friend refused would be wrong.
+pub const OFFER_STATUS_THROTTLED: u8 = 2;
 
 /// A friend telling us about a file they are willing to send.
 ///
@@ -2677,10 +2687,37 @@ mod tests {
         assert_eq!(parse_ember_ext(&[]), None);
     }
 
-    /// Every opcode in the private range must stay distinct; the envelope was
-    /// added precisely because only `0xFE` and `0xFF` were left.
+    /// Every opcode we send under `OP_EMULEPROT` must stay distinct — from each
+    /// other *and* from eMule's, which is the half this test originally missed.
+    /// It compared the Ember constants only, so `OP_EMBER_EXT` sat on `0xFE`
+    /// alongside `OP_PORTTEST` and the test passed. Stock eMule dispatches that
+    /// opcode mid-session, and we broadcast the envelope to every live friend,
+    /// so the eMule table below is the part that matters.
     #[test]
     fn ember_ext_opcode_does_not_collide() {
+        let emule_opcodes = [
+            OP_EMULEINFO,
+            OP_EMULEINFOANSWER,
+            OP_COMPRESSEDPART,
+            OP_QUEUERANKING,
+            OP_MULTIPACKET,
+            OP_MULTIPACKETANSWER,
+            OP_AICHREQUEST,
+            OP_AICHANSWER,
+            OP_AICHFILEHASHANS,
+            OP_AICHFILEHASHREQ,
+            OP_COMPRESSEDPART_I64,
+            OP_SENDINGPART_I64,
+            OP_REQUESTPARTS_I64,
+            OP_MULTIPACKET_EXT,
+            OP_FWCHECKUDPREQ,
+            OP_KAD_FWTCPCHECK_ACK,
+            OP_MULTIPACKET_EXT2,
+            OP_MULTIPACKETANSWER_EXT2,
+            OP_PORTTEST,
+            OP_HASHSETREQUEST2,
+            OP_HASHSETANSWER2,
+        ];
         let opcodes = [
             OP_EMBER_SOURCEEXCHANGE,
             OP_EMBER_CHAT_MSG,
@@ -2701,6 +2738,12 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for op in opcodes {
             assert!(seen.insert(op), "duplicate Ember opcode {op:#04x}");
+        }
+        for op in emule_opcodes {
+            assert!(
+                !seen.contains(&op),
+                "Ember opcode {op:#04x} collides with an eMule opcode"
+            );
         }
     }
 

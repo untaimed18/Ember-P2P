@@ -3072,11 +3072,15 @@ impl UploadHandler {
                     tracing::debug!("Rejecting resolve for unshared file: {}", hash_hex);
                     break 'shared;
                 }
-                // A friends-only file is served only to an authenticated
-                // mutual friend. Break (rather than return) for the same
-                // reason as the `shared` check above: an in-progress download
-                // of the same hash is still servable from the transfer
-                // manager, which is unrelated to library share scope.
+                // A friends-only file is served only to an authenticated mutual
+                // friend. Unlike the `shared` check above this returns outright
+                // instead of breaking: `shared` governs whether the library
+                // offers a completed file, so falling through to an in-progress
+                // download of the same hash is reasonable, but friends-only is a
+                // restriction on the *content*. Breaking here handed the bytes
+                // to the transfer-manager branch below, which has no membership
+                // check, so any anonymous peer holding the hash could pull a
+                // restricted file for as long as a download of it was live.
                 //
                 // The membership lookup is deliberately inside this branch so
                 // the overwhelmingly common public-file path never pays for
@@ -3093,7 +3097,7 @@ impl UploadHandler {
                         "Rejecting resolve for friends-only file from non-friend: {}",
                         hash_hex
                     );
-                    break 'shared;
+                    return None;
                 }
                 let path = PathBuf::from(&file.path);
                 let is_partial = path.extension().map(|e| e == "part").unwrap_or(false);

@@ -1049,6 +1049,62 @@ pub struct PunchInfo {
     pub target_id_raw_hex: String,
 }
 
+#[cfg(test)]
+mod dial_error_tests {
+    use super::*;
+
+    /// The distinction the failure counter depends on. A refusal means the relay
+    /// answered and is working; only unreachable or protocol-breaking outcomes
+    /// are its fault. Getting this backwards would evict the busiest relays
+    /// first, and let one unreachable source empty the candidate list.
+    #[test]
+    fn only_unreachable_or_misbehaving_dials_blame_the_relay() {
+        assert!(RelayDialError::unreachable("handshake failed").relay_at_fault);
+        assert!(!RelayDialError::refused("at capacity").relay_at_fault);
+        // Carries its text through for logging either way.
+        assert_eq!(RelayDialError::refused("at capacity").to_string(), "at capacity");
+    }
+}
+
+/// Why a relay dial failed, and whether the relay is answerable for it.
+#[derive(Debug, Clone)]
+pub struct RelayDialError {
+    pub reason: String,
+    /// `true` only when the relay was unreachable or broke the protocol.
+    ///
+    /// A relay that answers correctly is working, even when the answer is no:
+    /// "at capacity" is what a *popular* relay says, and "bad target" is about
+    /// the source we asked it to reach, not about the relay. Counting those as
+    /// the relay's failures would evict the busiest and most useful relays
+    /// first, and one unreachable source could walk the whole candidate list
+    /// and empty it.
+    pub relay_at_fault: bool,
+}
+
+impl RelayDialError {
+    /// The relay could not be reached, did not answer, or misbehaved.
+    fn unreachable(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            relay_at_fault: true,
+        }
+    }
+
+    /// The relay answered properly and declined.
+    fn refused(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            relay_at_fault: false,
+        }
+    }
+}
+
+impl std::fmt::Display for RelayDialError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
 /// Connect to a relay-capable peer over QUIC and negotiate a relay session.
 /// Returns the QUIC streams on success.
 pub async fn connect_to_peer_relay(
@@ -1062,17 +1118,20 @@ pub async fn connect_to_peer_relay(
     requester_ember_hash: &[u8; 16],
     requester_secret_key: &[u8; 32],
     pin: Option<(&[u8], &[u8], [u8; 16])>,
-) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
+) -> Result<(quinn::SendStream, quinn::RecvStream), RelayDialError> {
     info!("Relay: connecting to peer relay at {relay_addr}");
 
+    // The pinned handshake is where a fabricated attestation comes apart: it
+    // names an address whose occupant cannot present the signing identity. That
+    // makes this failure the relay's, and the one worth counting.
     let conn = super::quic::connect_pinned(endpoint, relay_addr, "ember-relay", pin)
         .await
-        .map_err(|e| format!("relay QUIC handshake failed: {e}"))?;
+        .map_err(|e| RelayDialError::unreachable(format!("relay QUIC handshake failed: {e}")))?;
 
     let (mut send, mut recv) = tokio::time::timeout(RELAY_CONTROL_TIMEOUT, conn.open_bi())
         .await
-        .map_err(|_| "relay open_bi timed out".to_string())?
-        .map_err(|e| format!("relay open_bi failed: {e}"))?;
+        .map_err(|_| RelayDialError::unreachable("relay open_bi timed out"))?
+        .map_err(|e| RelayDialError::unreachable(format!("relay open_bi failed: {e}")))?;
 
     let session_id = rand::random::<u32>();
     let request = build_relay_request_v2(
@@ -1088,8 +1147,8 @@ pub async fn connect_to_peer_relay(
 
     tokio::time::timeout(RELAY_CONTROL_TIMEOUT, send.write_all(&request))
         .await
-        .map_err(|_| "relay write request timed out".to_string())?
-        .map_err(|e| format!("relay write request: {e}"))?;
+        .map_err(|_| RelayDialError::unreachable("relay write request timed out"))?
+        .map_err(|e| RelayDialError::unreachable(format!("relay write request: {e}")))?;
 
     // Read header first (always 7 bytes: msg_type | session_id | payload_len),
     // then drain the payload by length so we don't desynchronize the
@@ -1098,29 +1157,37 @@ pub async fn connect_to_peer_relay(
     // to avoid reading an attacker-chosen huge `payload_len` into
     // memory.
     let mut resp_header = [0u8; 7];
-    read_relay_control(&mut recv, &mut resp_header, "relay read response").await?;
+    read_relay_control(&mut recv, &mut resp_header, "relay read response")
+        .await
+        .map_err(RelayDialError::unreachable)?;
     let payload_len = u16::from_le_bytes([resp_header[5], resp_header[6]]) as usize;
     if payload_len > 64 * 1024 {
-        return Err(format!(
+        return Err(RelayDialError::unreachable(format!(
             "relay response payload_len {payload_len} exceeds 64 KiB cap"
-        ));
+        )));
     }
     let mut payload_buf = vec![0u8; payload_len];
     if payload_len > 0 {
-        read_relay_control(&mut recv, &mut payload_buf, "relay read response payload").await?;
+        read_relay_control(&mut recv, &mut payload_buf, "relay read response payload")
+            .await
+            .map_err(RelayDialError::unreachable)?;
     }
     let mut full = Vec::with_capacity(7 + payload_len);
     full.extend_from_slice(&resp_header);
     full.extend_from_slice(&payload_buf);
 
-    let (msg_type, returned_sid, payload) =
-        decode_relay_message(&full).ok_or_else(|| "invalid relay response".to_string())?;
+    let (msg_type, returned_sid, payload) = decode_relay_message(&full)
+        .ok_or_else(|| RelayDialError::unreachable("invalid relay response"))?;
 
     if msg_type == MSG_RELAY_REJECT {
         // Payload is a single reason byte (see `build_relay_reject`):
         // 0x01 capacity, 0x02 bad target, 0x03 auth/attestation, 0x04 bad PoP.
+        //
+        // All of these are a working relay answering us, so none is counted
+        // against it. Capacity in particular is what the most-used relays say,
+        // and a bad target is a statement about the source we named.
         let reason = payload.first().copied();
-        return Err(match reason {
+        return Err(RelayDialError::refused(match reason {
             Some(REJECT_CAPACITY) => "relay peer rejected request: at capacity".to_string(),
             Some(REJECT_BAD_TARGET) => {
                 "relay peer rejected request: invalid/non-public target".to_string()
@@ -1133,19 +1200,21 @@ pub async fn connect_to_peer_relay(
             }
             Some(other) => format!("relay peer rejected request: reason 0x{other:02X}"),
             None => "relay peer rejected request".to_string(),
-        });
+        }));
     }
     if msg_type != MSG_RELAY_ACCEPT {
-        return Err(format!("unexpected relay response type: {msg_type}"));
+        return Err(RelayDialError::unreachable(format!(
+            "unexpected relay response type: {msg_type}"
+        )));
     }
     // The relay echoes back our session ID; a mismatch here means either a
     // desynchronized/multiplexed response on this connection or a relay
     // implementation that doesn't preserve it — either way we can't trust
     // the ACCEPT actually corresponds to the request we just sent.
     if returned_sid != session_id {
-        return Err(format!(
+        return Err(RelayDialError::unreachable(format!(
             "relay accept echoed mismatched session id: expected {session_id}, got {returned_sid}"
-        ));
+        )));
     }
 
     info!("Relay: peer relay accepted at {relay_addr}, session {session_id}");

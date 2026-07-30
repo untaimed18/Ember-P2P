@@ -843,6 +843,12 @@ fn resolve_from_known(files: &mut Vec<FileInfo>, known: &KnownFileList) -> Vec<F
             file.priority = priority_u8_to_str(record.upload_priority).to_string();
             file.shared =
                 crate::storage::share_intent::effective_shared(&record.file_hash, record.is_shared);
+            // Restore the friends-only restriction from the same record. The
+            // in-memory carry-over in `preserve_runtime_state` only helps when a
+            // live row already exists; a cold rediscovery has nothing to carry
+            // from, and leaving this false would publish a restricted file to
+            // the open network until the next restart put the flag back.
+            file.friends_only = record.friends_only;
             // The Library's Top Uploads panel and all-time activity columns
             // are populated from these persisted known.met counters. Restore
             // them with the hash instead of showing an empty Library until the

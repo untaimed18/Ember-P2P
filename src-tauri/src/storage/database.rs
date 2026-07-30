@@ -5,7 +5,7 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key as ChaChaKey, XChaCha20Poly1305, XNonce};
 use rand::{rngs::OsRng, RngCore};
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
-use tracing::info;
+use tracing::{info, warn};
 use zeroize::Zeroizing;
 
 use crate::storage::paths;
@@ -24,6 +24,13 @@ pub const CHAT_DELIVERED: i64 = 0;
 pub const CHAT_QUEUED: i64 = 1;
 /// Abandoned after exhausting retries; the user can resend explicitly.
 pub const CHAT_FAILED: i64 = 2;
+/// How long an outbound message may sit queued before it is abandoned.
+///
+/// A friend who is merely offline for a while should still receive what was
+/// typed to them, so this is generous — but it has to be finite, or a message
+/// to someone who never returns is retried on every reconnect forever and
+/// counted as unsent for the life of the database.
+const CHAT_QUEUE_MAX_AGE_SECS: i64 = 7 * 24 * 60 * 60;
 const CHAT_NONCE_LEN: usize = 24;
 const CHAT_AAD_DOMAIN: &[u8] = b"ember-chat-db-row-v1\0";
 
@@ -32,7 +39,10 @@ pub struct Database {
     /// Dedicated random key for chat-history encryption. It is stored beside
     /// the database through `secret_store` (DPAPI on Windows) and zeroized
     /// when the last Database handle is dropped.
-    chat_key: Zeroizing<[u8; 32]>,
+    /// `None` when chat is locked — the key could not be recovered, so history
+    /// stays sealed and nothing new is stored, while the rest of the database
+    /// works normally. See [`Self::load_or_create_chat_key`].
+    chat_key: Option<Zeroizing<[u8; 32]>>,
     /// Set when `ember.db` was corrupt at open time and replaced after backup.
     /// Startup surfaces a non-silent notice (same pattern as config recovery).
     pub corrupt_backup: Option<std::path::PathBuf>,
@@ -136,7 +146,7 @@ impl Database {
 
         let db = Self {
             conn: Mutex::new(conn),
-            chat_key: Zeroizing::new(chat_key),
+            chat_key: chat_key.map(Zeroizing::new),
             corrupt_backup: None,
         };
         db.run_migrations()?;
@@ -145,10 +155,20 @@ impl Database {
         Ok(db)
     }
 
+    /// `Ok(None)` means chat is *locked*: the key could not be recovered, so
+    /// history stays sealed and no new messages can be stored — but the rest of
+    /// the database opens normally.
+    ///
+    /// This used to abort startup. Refusing to rotate the key or drop history is
+    /// right, but taking the whole application down with it was not: downloads,
+    /// the library and every setting became unreachable because chat history
+    /// could not be read, and the explanation went only to the log. The key file
+    /// is deliberately never overwritten here, so restoring it from backup still
+    /// recovers the history afterwards.
     fn load_or_create_chat_key(
         db_path: &std::path::Path,
         conn: &Connection,
-    ) -> anyhow::Result<[u8; 32]> {
+    ) -> anyhow::Result<Option<[u8; 32]>> {
         let key_path = db_path
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
@@ -156,28 +176,36 @@ impl Database {
         match std::fs::read(&key_path) {
             Ok(stored) => {
                 let was_protected = crate::storage::secret_store::is_protected(&stored);
-                let plaintext = crate::storage::secret_store::unprotect(&stored).map_err(|e| {
-                    anyhow::anyhow!(
-                        "Chat history encryption key could not be recovered. Restore {} under \
-                         the original Windows account, or restore it from backup; history will \
-                         not be opened or replaced automatically: {e}",
-                        key_path.display()
-                    )
-                })?;
-                let key: [u8; 32] = plaintext.try_into().map_err(|bytes: Vec<u8>| {
-                    anyhow::anyhow!(
-                        "Chat history encryption key has invalid length {} (expected 32). \
-                         Refusing to open history.",
-                        bytes.len()
-                    )
-                })?;
+                let plaintext = match crate::storage::secret_store::unprotect(&stored) {
+                    Ok(plaintext) => plaintext,
+                    Err(e) => {
+                        warn!(
+                            "Chat history is locked: the key at {} could not be recovered \
+                             ({e}). Restore it under the original Windows account, or from \
+                             backup. Nothing has been rotated or deleted.",
+                            key_path.display()
+                        );
+                        return Ok(None);
+                    }
+                };
+                if plaintext.len() != 32 {
+                    warn!(
+                        "Chat history is locked: the key at {} has invalid length {} \
+                         (expected 32). Nothing has been rotated or deleted.",
+                        key_path.display(),
+                        plaintext.len()
+                    );
+                    return Ok(None);
+                }
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&plaintext);
                 // Transparently wrap a legacy restricted plaintext key. Never
                 // rewrite a key that failed unprotect/validation.
                 if !was_protected {
                     let protected = crate::storage::secret_store::protect(&key)?;
                     crate::security::atomic_write(&key_path, &protected, true)?;
                 }
-                Ok(key)
+                Ok(Some(key))
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 // Losing this file must never silently rotate the key while
@@ -201,23 +229,52 @@ impl Database {
                         )
                         .unwrap_or(false);
                 if has_encrypted_rows {
-                    anyhow::bail!(
-                        "Chat history encryption key is missing at {}. Restore the key from \
-                         backup; refusing to generate a replacement or expose/drop history.",
+                    // Lock rather than rotate. Writing a new key here would make
+                    // the existing history permanently unreadable even if the
+                    // original key were restored later, so the file is left
+                    // untouched and chat stays sealed until it comes back.
+                    warn!(
+                        "Chat history is locked: the key is missing at {} while encrypted \
+                         history exists. Restore it from backup to read it again. Nothing \
+                         has been rotated or deleted.",
                         key_path.display()
                     );
+                    return Ok(None);
                 }
                 let mut key = [0u8; 32];
                 OsRng.fill_bytes(&mut key);
                 let protected = crate::storage::secret_store::protect(&key)?;
                 crate::security::atomic_write(&key_path, &protected, true)?;
-                Ok(key)
+                Ok(Some(key))
             }
-            Err(error) => Err(anyhow::anyhow!(
-                "Failed to read chat history encryption key at {}: {error}",
-                key_path.display()
-            )),
+            Err(error) => {
+                // Unreadable for some other reason (permissions, I/O). Same
+                // treatment: seal chat, leave the file alone, open everything
+                // else.
+                warn!(
+                    "Chat history is locked: failed to read the key at {}: {error}",
+                    key_path.display()
+                );
+                Ok(None)
+            }
         }
+    }
+
+    /// Whether chat history is sealed because its key could not be recovered.
+    ///
+    /// Everything else in the database works; this exists so the UI can say why
+    /// chat is empty and unusable instead of leaving the user guessing.
+    pub fn chat_locked(&self) -> bool {
+        self.chat_key.is_none()
+    }
+
+    fn require_chat_key(&self) -> anyhow::Result<&[u8; 32]> {
+        self.chat_key.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Chat history is locked: its encryption key could not be recovered. \
+                 Restore the key file from backup to read or send messages."
+            )
+        })
     }
 
     fn chat_row_aad(id: i64, friend_hash: &str, direction: &str, timestamp: i64) -> Vec<u8> {
@@ -913,7 +970,7 @@ impl Database {
                     // A partially prepared/manual database must authenticate,
                     // not merely carry the marker, before migration completes.
                     Self::decrypt_chat_body(
-                        &self.chat_key,
+                        self.require_chat_key()?,
                         id,
                         &friend_hash,
                         &direction,
@@ -923,7 +980,7 @@ impl Database {
                     stored
                 } else {
                     Self::encrypt_chat_body(
-                        &self.chat_key,
+                        self.require_chat_key()?,
                         id,
                         &friend_hash,
                         &direction,
@@ -2105,20 +2162,26 @@ impl Database {
         Ok(())
     }
 
+    /// `Ok(false)` means the identity is blocked and nothing was written.
     pub fn add_friend(
         &self,
         user_hash: &str,
         nickname: &str,
         ed25519_pubkey: Option<&[u8; 32]>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         let now = chrono::Utc::now().timestamp();
         // The command checks first so it can report this properly; repeating
         // it here closes the window where a block commits in between and
         // leaves the identity listed as a friend and blocked at once.
+        //
+        // `Ok(false)` rather than an error, matching `add_friend_request`: the
+        // caller needs to tell "blocked" from a genuine save failure so it can
+        // name the right reason. Bailing here surfaced the race as "Failed to
+        // save friend: identity is blocked".
         if Self::blocked_in(&tx, user_hash)? {
-            anyhow::bail!("identity is blocked");
+            return Ok(false);
         }
         tx.execute(
             "INSERT INTO friends (user_hash, nickname, added_at, ed25519_pubkey) \
@@ -2133,7 +2196,7 @@ impl Database {
             ],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(true)
     }
 
     pub fn get_friend_public_keys(&self) -> anyhow::Result<Vec<([u8; 16], [u8; 32])>> {
@@ -2732,8 +2795,14 @@ impl Database {
             params![friend_hash, direction, CHAT_CIPHERTEXT_PREFIX, now, if direction == "sent" { 1 } else { 0 }, delivery],
         )?;
         let new_id = tx.last_insert_rowid();
-        let encrypted =
-            Self::encrypt_chat_body(&self.chat_key, new_id, friend_hash, direction, now, message)?;
+        let encrypted = Self::encrypt_chat_body(
+            self.require_chat_key()?,
+            new_id,
+            friend_hash,
+            direction,
+            now,
+            message,
+        )?;
         tx.execute(
             "UPDATE chat_messages SET message = ?1 WHERE id = ?2",
             params![encrypted, new_id],
@@ -2762,6 +2831,12 @@ impl Database {
         friend_hash: &str,
         limit: i64,
     ) -> anyhow::Result<Vec<(i64, String, i64)>> {
+        // Nothing can be sent while chat is locked, and these rows must not be
+        // marked failed either: the key may yet be restored, and abandoning
+        // them would throw away messages that are still perfectly recoverable.
+        if self.chat_key.is_none() {
+            return Ok(Vec::new());
+        }
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, message, timestamp FROM chat_messages \
@@ -2781,14 +2856,32 @@ impl Database {
         drop(stmt);
         drop(conn);
         // Decrypt outside the statement borrow, mirroring `get_chat_messages`.
-        Ok(rows
-            .into_iter()
-            .filter_map(|(id, body, ts)| {
-                Self::decrypt_chat_body(&self.chat_key, id, friend_hash, "sent", ts, &body)
-                    .ok()
-                    .map(|plain| (id, plain, ts))
-            })
-            .collect())
+        let mut out = Vec::with_capacity(rows.len());
+        let mut undecryptable = Vec::new();
+        for (id, body, ts) in rows {
+            match Self::decrypt_chat_body(self.require_chat_key()?, id, friend_hash, "sent", ts, &body) {
+                Ok(plain) => out.push((id, plain, ts)),
+                // Cannot be sent and never will be, so record that rather than
+                // skipping it. Skipping left the row queued while
+                // `pending_chat_counts` went on counting it, so the unsent
+                // total never reached zero and nothing could clear it.
+                Err(_) => undecryptable.push(id),
+            }
+        }
+        if !undecryptable.is_empty() {
+            tracing::warn!(
+                "Marking {} undecryptable queued chat message(s) for {friend_hash} as failed",
+                undecryptable.len()
+            );
+            let conn = self.conn.lock();
+            for id in undecryptable {
+                let _ = conn.execute(
+                    "UPDATE chat_messages SET delivery = ?1 WHERE id = ?2",
+                    params![CHAT_FAILED, id],
+                );
+            }
+        }
+        Ok(out)
     }
 
     /// Move a stored outbound message between delivery states.
@@ -2815,6 +2908,41 @@ impl Database {
             .filter_map(|r| r.ok())
             .collect();
         Ok(rows)
+    }
+
+    /// Abandon outbound messages that have been queued too long, across every
+    /// conversation.
+    ///
+    /// Deliberately global and eager rather than filtered at each read. Nothing
+    /// used to assign [`CHAT_FAILED`] at all, so a message to a friend who never
+    /// returned stayed queued for the life of the database. Expiring it lazily
+    /// on flush only moved the problem: the flush runs per friend and only when
+    /// one reconnects, so the conversation, the unsent badge and the queue
+    /// itself could each hold a different view of the same row. One writer that
+    /// every reader observes keeps them agreeing.
+    pub fn expire_stale_queued_chat(&self) -> anyhow::Result<usize> {
+        // Never while chat is locked. `pending_chat_messages` deliberately
+        // refuses to flush *or* fail queued sends in that state, because a
+        // restored key can still deliver them; abandoning them here would take
+        // that back and mark as failed the very rows that recovery would have
+        // rescued. The ceiling resumes applying once the key is back.
+        if self.chat_key.is_none() {
+            return Ok(0);
+        }
+        let cutoff = chrono::Utc::now().timestamp() - CHAT_QUEUE_MAX_AGE_SECS;
+        let conn = self.conn.lock();
+        let expired = conn.execute(
+            "UPDATE chat_messages SET delivery = ?1 \
+             WHERE delivery = ?2 AND direction = 'sent' AND timestamp < ?3",
+            params![CHAT_FAILED, CHAT_QUEUED, cutoff],
+        )?;
+        if expired > 0 {
+            tracing::info!(
+                "Gave up on {expired} chat message(s) queued longer than {} days",
+                CHAT_QUEUE_MAX_AGE_SECS / 86_400
+            );
+        }
+        Ok(expired)
     }
 
     pub fn get_chat_messages(
@@ -2855,10 +2983,28 @@ impl Database {
             })?;
             mapped.collect::<Result<Vec<_>, _>>()?
         };
+        // Locked: every row is sealed, so report them all as unavailable in one
+        // go rather than warning once per row for a condition that is a property
+        // of the database, not of any individual message.
+        let Some(chat_key) = self.chat_key.as_deref() else {
+            return Ok(rows
+                .into_iter()
+                .map(|(id, direction, _stored, timestamp, read, delivery)| {
+                    (
+                        id,
+                        direction,
+                        CHAT_UNAVAILABLE_TEXT.to_string(),
+                        timestamp,
+                        read,
+                        delivery,
+                    )
+                })
+                .collect());
+        };
         let mut messages = Vec::with_capacity(rows.len());
         for (id, direction, stored, timestamp, read, delivery) in rows {
             match Self::decrypt_chat_body(
-                &self.chat_key,
+                chat_key,
                 id,
                 friend_hash,
                 &direction,
@@ -3072,7 +3218,7 @@ mod tests {
         .expect("create schema");
         Database {
             conn: Mutex::new(conn),
-            chat_key: Zeroizing::new([0xA5; 32]),
+            chat_key: Some(Zeroizing::new([0xA5; 32])),
             corrupt_backup: None,
         }
     }
@@ -3104,7 +3250,11 @@ mod tests {
             CREATE TABLE chat_messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 friend_hash TEXT NOT NULL,
-                message TEXT NOT NULL
+                direction TEXT NOT NULL DEFAULT 'sent',
+                message TEXT NOT NULL,
+                timestamp INTEGER NOT NULL DEFAULT 0,
+                read INTEGER NOT NULL DEFAULT 0,
+                delivery INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE friend_blocks (
                 user_hash TEXT PRIMARY KEY,
@@ -3115,7 +3265,7 @@ mod tests {
         .expect("create schema");
         Database {
             conn: Mutex::new(conn),
-            chat_key: Zeroizing::new([0xA5; 32]),
+            chat_key: Some(Zeroizing::new([0xA5; 32])),
             corrupt_backup: None,
         }
     }
@@ -3204,6 +3354,144 @@ mod tests {
         assert_eq!(row_count(&db, "SELECT COUNT(*) FROM friends"), 0);
     }
 
+    /// A database whose chat key cannot be recovered must still be usable. It
+    /// previously refused to open at all, so an unreadable key file took
+    /// downloads, the library and every setting with it — and said so only in a
+    /// log. History is sealed instead: rows read as unavailable, sends are
+    /// refused, and the ciphertext is left intact so restoring the key recovers
+    /// it.
+    #[test]
+    fn a_locked_chat_key_seals_history_instead_of_failing() {
+        let conn = Connection::open_in_memory().expect("open in-memory");
+        conn.execute_batch(
+            "CREATE TABLE chat_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                friend_hash TEXT NOT NULL,
+                direction TEXT NOT NULL DEFAULT 'sent',
+                message TEXT NOT NULL,
+                timestamp INTEGER NOT NULL DEFAULT 0,
+                read INTEGER NOT NULL DEFAULT 0,
+                delivery INTEGER NOT NULL DEFAULT 0
+            );",
+        )
+        .expect("create schema");
+        let locked = Database {
+            conn: Mutex::new(conn),
+            chat_key: None,
+            corrupt_backup: None,
+        };
+        assert!(locked.chat_locked());
+
+        // Seed a row that only the real key could open.
+        let ciphertext = format!("{CHAT_CIPHERTEXT_PREFIX}bm90LXJlYWxseS1jaXBoZXJ0ZXh0");
+        locked
+            .conn
+            .lock()
+            .execute(
+                "INSERT INTO chat_messages (friend_hash, direction, message, timestamp) \
+                 VALUES ('aa', 'received', ?1, 1)",
+                params![ciphertext],
+            )
+            .expect("seed row");
+
+        // Reads succeed, reporting the row as unavailable rather than erroring.
+        let messages = locked.get_chat_messages("aa", 50, None).expect("read");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].2, CHAT_UNAVAILABLE_TEXT);
+
+        // Writes are refused, so nothing is stored under a key we do not have.
+        assert!(locked.insert_chat_message("aa", "sent", "hello").is_err());
+
+        // The queue reports nothing, and crucially does not abandon rows that a
+        // restored key could still send.
+        assert!(locked
+            .pending_chat_messages("aa", 10)
+            .expect("pending")
+            .is_empty());
+
+        // The ciphertext is untouched, so restoring the key recovers it.
+        let stored: String = locked
+            .conn
+            .lock()
+            .query_row("SELECT message FROM chat_messages", [], |r| r.get(0))
+            .expect("read raw");
+        assert_eq!(stored, ciphertext);
+
+        // And the age sweep leaves queued sends alone while locked, or it would
+        // abandon exactly the rows a restored key could still deliver.
+        locked
+            .conn
+            .lock()
+            .execute(
+                "INSERT INTO chat_messages (friend_hash, direction, message, timestamp, delivery) \
+                 VALUES ('aa', 'sent', 'x', ?1, ?2)",
+                params![
+                    chrono::Utc::now().timestamp() - CHAT_QUEUE_MAX_AGE_SECS - 60,
+                    CHAT_QUEUED
+                ],
+            )
+            .expect("seed stale queued");
+        assert_eq!(locked.expire_stale_queued_chat().expect("sweep"), 0);
+        assert_eq!(
+            row_count(
+                &locked,
+                &format!("SELECT COUNT(*) FROM chat_messages WHERE delivery = {CHAT_QUEUED}")
+            ),
+            1,
+            "a locked database must not abandon queued sends"
+        );
+    }
+
+    /// Nothing used to assign `CHAT_FAILED`, so a message to a friend who never
+    /// came back was queued forever, counted as unsent forever, and retried on
+    /// every reconnect. The sweep has to be global: expiring only on flush left
+    /// the conversation, the badge and the queue each holding a different view
+    /// of the same row, because a flush runs per friend and only on reconnect.
+    #[test]
+    fn chat_queued_past_the_age_limit_is_given_up_on() {
+        let db = friends_only_db();
+        let now = chrono::Utc::now().timestamp();
+        {
+            let conn = db.conn.lock();
+            // One well past the ceiling, one comfortably inside it.
+            conn.execute(
+                "INSERT INTO chat_messages (friend_hash, direction, message, timestamp, delivery) \
+                 VALUES ('aa', 'sent', 'x', ?1, ?2)",
+                params![now - CHAT_QUEUE_MAX_AGE_SECS - 60, CHAT_QUEUED],
+            )
+            .expect("seed stale");
+            conn.execute(
+                "INSERT INTO chat_messages (friend_hash, direction, message, timestamp, delivery) \
+                 VALUES ('aa', 'sent', 'y', ?1, ?2)",
+                params![now - 60, CHAT_QUEUED],
+            )
+            .expect("seed fresh");
+        }
+
+        assert_eq!(db.expire_stale_queued_chat().expect("sweep"), 1);
+
+        // Both views agree afterwards: one row still queued, one abandoned.
+        assert_eq!(
+            row_count(
+                &db,
+                &format!("SELECT COUNT(*) FROM chat_messages WHERE delivery = {CHAT_QUEUED}")
+            ),
+            1
+        );
+        assert_eq!(
+            row_count(
+                &db,
+                &format!("SELECT COUNT(*) FROM chat_messages WHERE delivery = {CHAT_FAILED}")
+            ),
+            1
+        );
+        let counts = db.pending_chat_counts().expect("counts");
+        assert_eq!(counts, vec![("aa".to_string(), 1)]);
+
+        // Idempotent: a second sweep finds nothing left to abandon.
+        assert_eq!(db.expire_stale_queued_chat().expect("sweep again"), 0);
+    }
+
     /// The check the network loop runs before queueing is only an early-out.
     /// Blocking commits from the UI thread, so it can land after that check
     /// and before the insert; the transaction has to refuse on its own.
@@ -3256,8 +3544,18 @@ mod tests {
         let db = friends_only_db();
         db.block_friend("11").expect("block");
 
-        assert!(db.add_friend("11", "Mallory", None).is_err());
+        // `Ok(false)`, not an error: the caller has to tell a block from a
+        // genuine save failure so it can name the reason the user must act on.
+        assert_eq!(
+            db.add_friend("11", "Mallory", None).expect("no db error"),
+            false,
+            "a blocked identity must be refused, not written"
+        );
         assert_eq!(row_count(&db, "SELECT COUNT(*) FROM friends"), 0);
+        assert!(
+            db.add_friend("22", "Friend", None).expect("no db error"),
+            "an unblocked identity must still be added"
+        );
     }
 
     /// Auto-confirm promotes a one-sided friend to mutual without prompting,
@@ -3386,7 +3684,7 @@ mod tests {
         .expect("create schema");
         Database {
             conn: Mutex::new(conn),
-            chat_key: Zeroizing::new([0xA5; 32]),
+            chat_key: Some(Zeroizing::new([0xA5; 32])),
             corrupt_backup: None,
         }
     }
@@ -3886,7 +4184,7 @@ mod tests {
         let good = db
             .insert_chat_message(&friend, "received", "keep-me")
             .unwrap();
-        let correct_key = *db.chat_key;
+        let correct_key = **db.chat_key.as_ref().expect("test db has a chat key");
         let stored_before: String = db
             .conn
             .lock()
@@ -3901,7 +4199,7 @@ mod tests {
 
         let wrong_key_db = Database {
             conn: Mutex::new(Connection::open(&path).unwrap()),
-            chat_key: Zeroizing::new([0x5A; 32]),
+            chat_key: Some(Zeroizing::new([0x5A; 32])),
             corrupt_backup: None,
         };
         let unavailable = wrong_key_db.get_chat_messages(&friend, 10, None).unwrap();
@@ -3922,7 +4220,7 @@ mod tests {
 
         let recovered_db = Database {
             conn: Mutex::new(Connection::open(&path).unwrap()),
-            chat_key: Zeroizing::new(correct_key),
+            chat_key: Some(Zeroizing::new(correct_key)),
             corrupt_backup: None,
         };
         let recovered = recovered_db.get_chat_messages(&friend, 10, None).unwrap();

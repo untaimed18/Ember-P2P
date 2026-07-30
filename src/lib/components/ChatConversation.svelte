@@ -417,6 +417,60 @@
     }
   }
 
+  function startOfDay(ts: number): number {
+    const d = new Date(ts * 1000);
+    d.setHours(0, 0, 0, 0);
+    return d.getTime();
+  }
+
+  /** `Today`, `Yesterday`, or a written date for anything older. */
+  function dayLabel(ts: number): string {
+    const today = startOfDay(Math.floor(Date.now() / 1000));
+    const day = startOfDay(ts);
+    const dayMs = 86_400_000;
+    if (day === today) return m.chat_day_today();
+    if (day === today - dayMs) return m.chat_day_yesterday();
+    const d = new Date(ts * 1000);
+    const sameYear = d.getFullYear() === new Date().getFullYear();
+    return d.toLocaleDateString(undefined, {
+      weekday: 'short',
+      month: 'short',
+      day: 'numeric',
+      ...(sameYear ? {} : { year: 'numeric' }),
+    });
+  }
+
+  /**
+   * Messages annotated for display: where a new day starts, and where a run of
+   * consecutive messages from the same author begins and ends.
+   *
+   * Runs are what make a conversation readable — one block per turn instead of
+   * a uniform ladder of identically-spaced bubbles, each repeating a timestamp
+   * that almost always matches the one above it.
+   */
+  let rows = $derived.by(() => {
+    // Day boundaries once per message, rather than recomputed for every
+    // neighbour comparison. `null` means the row carries no usable date — a
+    // zero timestamp is "unknown", and must not produce a 1970 separator.
+    const days = messages.map((msg) => (msg.timestamp > 0 ? startOfDay(msg.timestamp) : null));
+    return messages.map((msg, i) => {
+      const day = days[i];
+      const hasNext = i + 1 < messages.length;
+      const newDay = day !== null && (i === 0 || days[i - 1] !== day);
+      const sameAuthorAsPrev = i > 0 && messages[i - 1].direction === msg.direction;
+      const sameAuthorAsNext = hasNext && messages[i + 1].direction === msg.direction;
+      // An undated row neither opens nor closes a day, so it stays with its run.
+      const sameDayAsNext =
+        hasNext && (day === null || days[i + 1] === null || days[i + 1] === day);
+      return {
+        msg,
+        daySeparator: newDay ? dayLabel(msg.timestamp) : null,
+        startsRun: newDay || !sameAuthorAsPrev,
+        endsRun: !sameAuthorAsNext || !sameDayAsNext,
+      };
+    });
+  });
+
   function formatTime(ts: number): string {
     if (!ts) return '';
     const d = new Date(ts * 1000);
@@ -462,12 +516,18 @@
           <span>{m.chat_offline_label()}</span>
         </span>
       {/if}
-      <span class="conv-status encrypted" title={m.chat_encrypted_title()} aria-label={m.chat_encrypted_aria()}>
+      <!--
+        Icon only. Its label read "Encrypted in transit + locally", which in a
+        ~420px dock consumed more width than the friend's name and squeezed it
+        to an ellipsis on every conversation. A padlock is understood without
+        being spelled out, and the full explanation is still one hover away in
+        the tooltip and unchanged for screen readers.
+      -->
+      <span class="conv-status encrypted icon-only" title={m.chat_encrypted_title()} aria-label={m.chat_encrypted_aria()}>
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <rect x="3.5" y="7" width="9" height="6.5" rx="1.5"/>
           <path d="M5.5 7V5.5a2.5 2.5 0 0 1 5 0V7"/>
         </svg>
-        <span>{m.chat_encrypted_label()}</span>
       </span>
     </div>
   </div>
@@ -505,8 +565,19 @@
           {/if}
         </div>
       {/if}
-      {#each messages as msg (msg.id)}
-        <div class="conv-bubble" class:sent={msg.direction === 'sent'} class:received={msg.direction === 'received'}>
+      {#each rows as row (row.msg.id)}
+        {#if row.daySeparator}
+          <div class="conv-day">{row.daySeparator}</div>
+        {/if}
+        {@const pending = row.msg.direction === 'sent' && row.msg.delivery === 'queued'}
+        {@const failed = row.msg.direction === 'sent' && row.msg.delivery === 'failed'}
+        <div
+          class="conv-bubble"
+          class:sent={row.msg.direction === 'sent'}
+          class:received={row.msg.direction === 'received'}
+          class:starts-run={row.startsRun}
+          class:ends-run={row.endsRun}
+        >
           <!--
             `<bdi>` isolates the message body from the surrounding UI's
             text direction so a peer-supplied RTL/LTR override character
@@ -514,15 +585,22 @@
             style spoofing class). The text is still rendered exactly as
             written; only its bidi influence is scoped to this element.
           -->
-          <div class="bubble-text"><bdi dir="auto">{msg.message}</bdi></div>
-          <div class="bubble-time">
-            {formatTime(msg.timestamp)}
-            {#if msg.direction === 'sent' && msg.delivery === 'queued'}
-              <span class="bubble-delivery" title={m.chat_delivery_queued_title()}>{m.chat_delivery_queued()}</span>
-            {:else if msg.direction === 'sent' && msg.delivery === 'failed'}
-              <span class="bubble-delivery failed" title={m.chat_delivery_failed_title()}>{m.chat_delivery_failed()}</span>
-            {/if}
-          </div>
+          <div class="bubble-text"><bdi dir="auto">{row.msg.message}</bdi></div>
+          <!--
+            Once per run, not once per message: within a burst the timestamps
+            repeat the same minute and add nothing. Delivery state is per
+            message though, so a queued or failed one always shows its own.
+          -->
+          {#if row.endsRun || pending || failed}
+            <div class="bubble-time">
+              {formatTime(row.msg.timestamp)}
+              {#if pending}
+                <span class="bubble-delivery" title={m.chat_delivery_queued_title()}>{m.chat_delivery_queued()}</span>
+              {:else if failed}
+                <span class="bubble-delivery failed" title={m.chat_delivery_failed_title()}>{m.chat_delivery_failed()}</span>
+              {/if}
+            </div>
+          {/if}
         </div>
       {/each}
     {/if}
@@ -625,6 +703,16 @@
     height: 11px;
   }
 
+  .conv-status.icon-only {
+    padding: 4px;
+    gap: 0;
+  }
+
+  .conv-status.icon-only svg {
+    width: 12px;
+    height: 12px;
+  }
+
   .conv-status.online {
     background: color-mix(in srgb, var(--success) 16%, transparent);
     color: var(--success);
@@ -646,7 +734,9 @@
     padding: 16px;
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    /* Tight by default; `.starts-run` reopens the gap where the speaker
+       changes, so spacing carries meaning instead of being uniform. */
+    gap: 2px;
   }
 
   .conv-loading,
@@ -733,6 +823,26 @@
     cursor: default;
   }
 
+  /* Day markers break the list into the units people actually recall
+     conversations in, and give a long history somewhere for the eye to rest. */
+  .conv-day {
+    align-self: center;
+    margin: 10px 0 4px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    background: var(--bg-tertiary);
+    color: var(--text-muted);
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.4px;
+    text-transform: uppercase;
+    flex-shrink: 0;
+  }
+
+  .conv-day:first-child {
+    margin-top: 0;
+  }
+
   .conv-bubble {
     max-width: 80%;
     padding: 8px 12px;
@@ -743,10 +853,28 @@
     overflow-wrap: anywhere;
   }
 
+  /* Consecutive messages from one author read as a single block: the gap only
+     opens where the speaker changes, and the corners facing a neighbour in the
+     same run flatten so the bubbles visibly belong together. */
+  .conv-bubble.starts-run:not(:first-child) {
+    margin-top: 8px;
+  }
+
   .conv-bubble.sent {
     align-self: flex-end;
     background: var(--accent);
     color: var(--on-accent);
+  }
+
+  .conv-bubble.sent:not(.starts-run) {
+    border-top-right-radius: 6px;
+  }
+
+  .conv-bubble.sent:not(.ends-run) {
+    border-bottom-right-radius: 6px;
+  }
+
+  .conv-bubble.sent.ends-run {
     border-bottom-right-radius: 4px;
   }
 
@@ -754,6 +882,17 @@
     align-self: flex-start;
     background: var(--bg-tertiary);
     color: var(--text-primary);
+  }
+
+  .conv-bubble.received:not(.starts-run) {
+    border-top-left-radius: 6px;
+  }
+
+  .conv-bubble.received:not(.ends-run) {
+    border-bottom-left-radius: 6px;
+  }
+
+  .conv-bubble.received.ends-run {
     border-bottom-left-radius: 4px;
   }
 

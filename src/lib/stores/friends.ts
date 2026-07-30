@@ -279,12 +279,18 @@ export async function initFriendsStore() {
       }),
     );
     registered.push(
-      await listen<{ discoverable: boolean; nodes: number; reason?: string }>('ember:friend-discoverable', (event) => {
+      await listen<{ discoverable: boolean; nodes: number; reason?: string; initial?: boolean }>('ember:friend-discoverable', (event) => {
         if (typeof event.payload?.discoverable === 'boolean') {
           isDiscoverable.set(event.payload.discoverable);
-          // The event fires only once an attempt has resolved, so a `false`
-          // here is always a completed failure rather than one in flight.
-          discoverabilityFailed.set(!event.payload.discoverable);
+          // Only an *initial* registration failure counts as confirmed: it
+          // means presence was never established. A failed heartbeat also
+          // reports `discoverable: false`, but it is retried on the next tick
+          // and is usually a moment's packet loss, so treating it as proof put
+          // a fault banner on screen for nothing. Those fall through to the
+          // page's grace period, which reports them only if they persist.
+          discoverabilityFailed.set(
+            !event.payload.discoverable && event.payload.initial === true,
+          );
         }
       }),
     );

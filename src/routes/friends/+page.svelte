@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { getFriends, addFriend, removeFriend, blockFriend, unblockFriend, getBlockedFriends, updateFriendNickname, getMyEmberHash, acceptFriendRequest, rejectFriendRequest, retryFriendSearch, type FriendInfo, type FriendRequestInfo, type BlockedInfo } from '$lib/api/friends';
+  import { getFriends, addFriend, removeFriend, blockFriend, unblockFriend, getBlockedFriends, isChatLocked, updateFriendNickname, getMyEmberHash, acceptFriendRequest, rejectFriendRequest, retryFriendSearch, type FriendInfo, type FriendRequestInfo, type BlockedInfo } from '$lib/api/friends';
   import { getNetworkStats, kadRecheckFirewall } from '$lib/api/kad';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import BrowseFriendDialog from '$lib/components/BrowseFriendDialog.svelte';
@@ -52,6 +52,10 @@
   let pendingBlock: { user_hash: string; nickname: string } | null = $state(null);
   let blocked: BlockedInfo[] = $state([]);
   let blockedOpen = $state(false);
+  /** Chat history sealed because its key could not be recovered. Worth saying
+   *  plainly: the app otherwise looks healthy, so conversations reading as
+   *  empty and sends failing would be a mystery. */
+  let chatLocked = $state(false);
 
   let editingHash: string | null = $state(null);
   let editNickname = $state('');
@@ -105,7 +109,7 @@
       const f = friends.find(x => x.user_hash === offer.user_hash);
       const ip = f?.last_ip?.trim() ?? '';
       const port = f?.last_port ?? 0;
-      await startDownload(
+      const res = await startDownload(
         offer.file_hash,
         offer.file_name,
         offer.file_size,
@@ -116,7 +120,14 @@
         offer.user_hash,
       );
       clearFileOffer(offer.user_hash, offer.file_hash);
-      flash(m.friends_offer_accepted({ name: offer.file_name }));
+      // The backend reports an offer we already hold as `already_queued`
+      // rather than an error, so saying "downloading" would claim something
+      // new started when nothing did.
+      flash(
+        res?.already_queued
+          ? m.search_already_queued_name({ name: offer.file_name })
+          : m.friends_offer_accepted({ name: offer.file_name }),
+      );
     } catch (e: unknown) {
       error = toErr(e);
     } finally {
@@ -373,6 +384,9 @@
     loadFriends();
     loadBlocked();
     loadMyHash();
+    isChatLocked()
+      .then(v => { if (!destroyed) chatLocked = v; })
+      .catch((e) => console.warn('friends: failed to read chat lock state:', e));
     getNetworkStats()
       .then(s => { if (!destroyed) isFirewalled = s.firewalled; })
       .catch((e) => { console.warn('friends: initial getNetworkStats failed:', e); });
@@ -515,14 +529,20 @@
     processingRequests.add(target.user_hash);
     processingRequests = new Set(processingRequests);
     let reportedOk = false;
+    // Held rather than assigned to `error` straight away: the reload below
+    // calls `loadFriends`, which clears `error` as its own first act, so a
+    // message set here would be wiped before it ever painted — leaving a failed
+    // block indistinguishable from one that did nothing.
+    let failure: string | null = null;
     try {
       await blockFriend(target.user_hash);
       reportedOk = true;
       flash(m.friends_blocked({ name: target.nickname || target.user_hash.slice(0, 8) + '\u2026' }));
     } catch (e: unknown) {
-      error = toErr(e);
+      failure = toErr(e);
     } finally {
       await Promise.all([loadFriends(), loadBlocked()]);
+      if (failure) error = failure;
       // Decide from the reloaded list rather than from whether the call
       // threw. The row is committed before the live teardown is
       // acknowledged, so a rejection can still mean "blocked, but the
@@ -789,6 +809,21 @@
         {#if recheckError}
           <span class="firewall-recheck-error" role="status">{m.friends_firewall_recheck_failed({ error: recheckError })}</span>
         {/if}
+      </div>
+    {/if}
+
+    {#if chatLocked}
+      <div class="banner undiscoverable-banner" role="alert">
+        <div class="firewall-banner-content">
+          <svg class="undiscoverable-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="4" y="9" width="12" height="8" rx="1.5"/>
+            <path d="M7 9V6.5a3 3 0 0 1 6 0V9"/>
+          </svg>
+          <div class="firewall-text">
+            <strong>{m.friends_chat_locked_title()}</strong>
+            {m.friends_chat_locked_body()}
+          </div>
+        </div>
       </div>
     {/if}
 

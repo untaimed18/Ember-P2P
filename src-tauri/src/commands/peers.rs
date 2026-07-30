@@ -115,11 +115,30 @@ pub struct EmberDhtMaintenanceResult {
 const MAX_FRIEND_NICKNAME_LEN: usize = 64;
 
 fn parse_user_hash(hex_str: &str) -> Result<[u8; 16], String> {
+    parse_16_byte_hash(
+        hex_str,
+        "peers_user_hash_invalid",
+        "User hash must be 32 hex characters (16 bytes)",
+    )
+}
+
+/// Same shape as a user hash but reported as a file hash, so a malformed one
+/// does not tell the user to check a field they never touched.
+fn parse_file_hash(hex_str: &str) -> Result<[u8; 16], String> {
+    parse_16_byte_hash(
+        hex_str,
+        "peers_file_hash_invalid",
+        "File hash must be 32 hex characters (16 bytes)",
+    )
+}
+
+fn parse_16_byte_hash(
+    hex_str: &str,
+    code: &'static str,
+    message: &'static str,
+) -> Result<[u8; 16], String> {
     if hex_str.len() != 32 || !hex_str.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(coded(
-            "peers_user_hash_invalid",
-            "User hash must be 32 hex characters (16 bytes)",
-        ));
+        return Err(coded(code, message));
     }
     let bytes = hex::decode(hex_str)
         .map_err(|_| coded("peers_invalid_hex_string", "Invalid hex string"))?;
@@ -277,19 +296,34 @@ pub async fn add_friend(
         db.add_friend(&db_hash, &db_nick, friend_pubkey.as_ref())
     })
     .await;
-    if let Err(e) = db_result
+    match db_result
         .as_ref()
         .map_err(|e| e.to_string())
         .and_then(|r| r.as_ref().map_err(|e| e.to_string()))
     {
-        if newly_inserted {
-            state.friend_hashes.write().await.remove(&hash);
+        Err(e) => {
+            if newly_inserted {
+                state.friend_hashes.write().await.remove(&hash);
+            }
+            return Err(coded_ctx(
+                "peers_failed_save_friend",
+                "Failed to save friend",
+                e,
+            ));
         }
-        return Err(coded_ctx(
-            "peers_failed_save_friend",
-            "Failed to save friend",
-            e,
-        ));
+        // Blocked between this command's own check and the insert. Reported as
+        // the block it is rather than as a save failure, which is what the user
+        // has to act on.
+        Ok(false) => {
+            if newly_inserted {
+                state.friend_hashes.write().await.remove(&hash);
+            }
+            return Err(coded(
+                "peers_identity_blocked",
+                "That identity is blocked. Unblock it first to add them as a friend.",
+            ));
+        }
+        Ok(true) => {}
     }
 
     // Friend is already persisted to the DB above; the network task
@@ -562,6 +596,24 @@ pub async fn send_chat_message(
     if !state.friend_hashes.read().await.contains(&hash) {
         return Err(coded("peers_not_friend", "Can only chat with friends"));
     }
+    // Refuse before anything goes over the wire. The database rejects the write
+    // while chat is locked, but the network path runs first and independently:
+    // the message would reach the friend, this command would report it
+    // delivered, and it would then vanish on reload because nothing could store
+    // it. Declining outright is what the locked banner already promises.
+    {
+        let db = state.db.clone();
+        let locked = tokio::task::spawn_blocking(move || db.chat_locked())
+            .await
+            .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?;
+        if locked {
+            return Err(coded(
+                "peers_chat_locked",
+                "Chat history is locked because its encryption key could not be recovered. \
+                 Restore the key file from backup to send messages.",
+            ));
+        }
+    }
     let (tx, rx) = tokio::sync::oneshot::channel();
     bounded_send(
         &state.network_tx,
@@ -623,6 +675,20 @@ fn chat_failure_is_permanent(reason: &str) -> bool {
         || lowered.contains("chat is disabled")
 }
 
+/// Whether chat history is sealed because its encryption key could not be
+/// recovered.
+///
+/// The rest of the app opens and works normally in that state, so without
+/// asking, the UI would show every conversation as empty and every send as
+/// failing with no indication why.
+#[tauri::command]
+pub async fn is_chat_locked(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.chat_locked())
+        .await
+        .map_err(|e| coded_ctx("peers_task_error", "Task error", e))
+}
+
 #[tauri::command]
 pub async fn get_chat_messages(
     state: tauri::State<'_, AppState>,
@@ -673,7 +739,7 @@ pub async fn offer_file_to_friend(
     if !state.friend_hashes.read().await.contains(&hash) {
         return Err(coded("peers_not_friend", "Can only send files to friends"));
     }
-    let file = parse_user_hash(&file_hash.to_lowercase())?;
+    let file = parse_file_hash(&file_hash.to_lowercase())?;
     let (tx, rx) = tokio::sync::oneshot::channel();
     bounded_send(
         &state.network_tx,

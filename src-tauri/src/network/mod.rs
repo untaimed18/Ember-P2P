@@ -1142,6 +1142,12 @@ fn prune_stale_ember_noise_keys_at(
 /// abusive one cannot spend our CPU on signature checks faster than this.
 const FRIEND_RELAY_OFFER_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Floor between unsolicited file offers accepted from one friend. Longer than
+/// the relay-offer throttle because each offer that gets through raises a
+/// prompt the user has to answer, so the cost of a flood is their attention
+/// rather than a signature check.
+const FRIEND_FILE_OFFER_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Cap on tracked relay-offer senders, so peers that offer once and disappear
 /// cannot grow the throttle map without bound.
 const MAX_FRIEND_RELAY_OFFER_TRACKED: usize = 512;
@@ -1232,10 +1238,14 @@ fn relay_offer_digest(attestations: &[ember::RelayAttestation], now_unix: u64) -
 /// handed it over* is consulted, which is exactly what makes it safe for a
 /// friend to forward attestations it did not sign — a courier cannot forge one
 /// and cannot silently alter one.
+/// `introduced_by` identifies the peer that handed us this set, so the broker
+/// can bound any one of them. It plays no part in whether an attestation is
+/// accepted — that is decided by its own signature alone.
 fn admit_relay_attestations(
     state: &mut NetworkState,
     relay_attestations: &[ember::RelayAttestation],
     now_unix: u64,
+    introduced_by: Option<[u8; 16]>,
     label: &str,
 ) -> usize {
     let mut admitted = 0usize;
@@ -1258,7 +1268,7 @@ fn admit_relay_attestations(
             let relay_ember_hash =
                 ember::crypto::verifying_key_from_bytes(&attestation.ed25519_pubkey)
                     .map(|vk| ember::crypto::node_id_from_public_key(&vk));
-            broker.add_relay_candidate(attestation.clone(), relay_ember_hash);
+            broker.add_relay_candidate(attestation.clone(), relay_ember_hash, introduced_by);
             admitted += 1;
         }
     }
@@ -1291,7 +1301,11 @@ async fn handle_epx_sources(
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    admit_relay_attestations(state, relay_attestations, now_unix, label);
+    // `None`: this layer has no Ember identity for the exchanging peer, and
+    // unlike a friend's forward, reaching this path at all requires sharing a
+    // swarm with us. The per-introducer cap targets gossip, which removed that
+    // barrier; EPX candidates stay bounded by the global cap as before.
+    admit_relay_attestations(state, relay_attestations, now_unix, None, label);
 
     for (file_hash, sources) in entries {
         let matching_ids = {
@@ -2384,6 +2398,23 @@ async fn flush_pending_chat(
     let db_read = db.clone();
     let hash_for_read = hash_hex.clone();
     let pending = tokio::task::spawn_blocking(move || {
+        // Abandon anything past the age ceiling before reading, in the same
+        // blocking hop. The periodic sweep runs only hourly, and a reconnect can
+        // land inside that window — so relying on it alone would deliver text
+        // typed over a week ago, which is precisely what the ceiling exists to
+        // prevent. Expiring here keeps one writer for the state while making the
+        // flush self-consistent whenever it happens to run.
+        // Logged rather than discarded, and deliberately not fatal: a failure
+        // here means the age ceiling goes unenforced for this flush, so some
+        // over-age messages may still go out — but refusing to flush at all
+        // would hold back every legitimate queued message over a transient
+        // database error, which is the worse outcome of the two.
+        if let Err(e) = db_read.expire_stale_queued_chat() {
+            tracing::warn!(
+                "Could not expire over-age queued chat before flushing to \
+                 {hash_for_read}; the age limit is unenforced this round: {e}"
+            );
+        }
         db_read.pending_chat_messages(&hash_for_read, MAX_FLUSH_PER_SESSION)
     })
     .await
@@ -2428,10 +2459,28 @@ async fn flush_pending_chat(
             break;
         }
         let db_mark = db.clone();
-        let _ = tokio::task::spawn_blocking(move || {
+        // A mark that silently failed left the row queued, so the next session
+        // with this friend sent the same message again and they saw it twice.
+        // We cannot un-send it, so log loudly rather than discarding the result.
+        match tokio::task::spawn_blocking(move || {
             db_mark.set_chat_delivery(id, crate::storage::database::CHAT_DELIVERED)
         })
-        .await;
+        .await
+        {
+            Ok(Ok(0)) => tracing::warn!(
+                "Chat message {id} to {hash_hex} was sent but matched no row to mark \
+                 delivered; it may be re-sent on the next session"
+            ),
+            Ok(Err(e)) => tracing::warn!(
+                "Chat message {id} to {hash_hex} was sent but could not be marked \
+                 delivered ({e}); it may be re-sent on the next session"
+            ),
+            Err(e) => tracing::warn!(
+                "Chat message {id} to {hash_hex} was sent but the marking task failed \
+                 ({e}); it may be re-sent on the next session"
+            ),
+            Ok(Ok(_)) => {}
+        }
         let _ = app_handle.emit(
             "ember:chat-delivery",
             serde_json::json!({
@@ -2639,49 +2688,53 @@ async fn maybe_escalate_to_friend_transfer(
     ip: Ipv4Addr,
     port: u16,
 ) -> bool {
-    let friend = match state.transfer_friend_hint.get(transfer_id).copied() {
-        Some(friend) => friend,
-        // No binding recorded for this download. Fall back to asking who this
-        // source actually *is*: `sources.met` remembers its ed2k user hash and
-        // `clients.met` remembers the Ember identity bound to that hash, so a
-        // friend is still recognisable as one.
-        //
-        // This covers the two cases the browse-dialog binding misses. A restart
-        // clears `transfer_friend_hint` (it is in-memory, and the resume path
-        // carries no friend hash), and a friend's source can arrive by any other
-        // route — an eD2K link they sent, a search hit, KAD, peer exchange —
-        // without ever going through the friend browse listing.
-        None => {
-            // Resolve the identity from *this download's* own source row rather
-            // than a `SourceManager`-wide address lookup. The wide lookup scans
-            // every tracked file and ignores entry expiry, so an address
-            // recycled from a departed peer would still resolve to that peer —
-            // and we would go on to ask an uninvolved friend for a file because
-            // a stranger inherited their old address.
-            let peer_user_hash = state
-                .per_file_sources
-                .get(transfer_id)
-                .and_then(|pfs| pfs.source_user_hash_at(ip, port));
-            let resolved = match peer_user_hash {
-                Some(uh) => credit_manager.read().await.find_ember_by_user_hash(&uh),
-                None => None,
-            };
-            let Some(candidate) = resolved else {
-                return false;
-            };
-            if !friend_hashes.read().await.contains(&candidate) {
+    // Who this particular source is, where we can tell. `sources.met` remembers
+    // its ed2k user hash and `clients.met` the Ember identity bound to that
+    // hash, so a friend stays recognisable however the source reached us — an
+    // eD2K link, a search hit, KAD, peer exchange — and across the restart that
+    // clears the in-memory browse binding.
+    //
+    // Resolved from *this download's* own source row rather than a
+    // `SourceManager`-wide address lookup: the wide lookup scans every tracked
+    // file and ignores entry expiry, so an address recycled from a departed peer
+    // would still resolve to that peer.
+    let source_identity = {
+        let peer_user_hash = state
+            .per_file_sources
+            .get(transfer_id)
+            .and_then(|pfs| pfs.source_user_hash_at(ip, port));
+        match peer_user_hash {
+            Some(uh) => credit_manager.read().await.find_ember_by_user_hash(&uh),
+            None => None,
+        }
+    };
+
+    let friend = match source_identity {
+        // We know whose source this is, so it decides — and it takes precedence
+        // over the per-transfer binding deliberately. That binding says only
+        // that the *download* came from a friend's listing, and a download
+        // collects sources from KAD, servers and peer exchange too. Letting it
+        // speak for a source we can positively identify as someone else charged
+        // a stranger's failure to the friend's attempt budget and parked the
+        // stranger's row as though it were awaiting the friend's dial-back,
+        // which froze it out of reask until the request timed out.
+        Some(id) => {
+            if !friend_hashes.read().await.contains(&id) {
                 return false;
             }
             debug!(
                 "Recognised source {ip}:{port} on {transfer_id} as friend {} by stored identity",
-                hex::encode(candidate)
+                hex::encode(id)
             );
-            // Cache it so later failures on this download skip the lookup.
-            state
-                .transfer_friend_hint
-                .insert(transfer_id.to_string(), candidate);
-            candidate
+            id
         }
+        // No identity recorded for this address, so we cannot rule out that it
+        // is the friend the download came from — which is exactly the gap the
+        // browse binding exists to cover.
+        None => match state.transfer_friend_hint.get(transfer_id).copied() {
+            Some(friend) => friend,
+            None => return false,
+        },
     };
     let file_hash = {
         let mgr = transfer_manager.read().await;
@@ -2740,7 +2793,7 @@ async fn maybe_escalate_to_friend_transfer(
     // nothing downstream will move this row off the state the failed dial left
     // it in — and the drawer drops a `Failed` row entirely rather than showing
     // a source that is healthily waiting for the friend to reach us.
-    {
+    let transferred = {
         let mut mgr = transfer_manager.write().await;
         // `update_source_detail` overwrites `transferred` unconditionally;
         // carry the existing value so parking the row doesn't reset the
@@ -2768,7 +2821,8 @@ async fn maybe_escalate_to_friend_transfer(
                 user_hash: None,
             },
         );
-    }
+        transferred
+    };
     let _ = app_handle.emit(
         "transfer-source-detail",
         serde_json::json!({
@@ -2778,7 +2832,10 @@ async fn maybe_escalate_to_friend_transfer(
             "status": parked_status_str,
             "queue_rank": null,
             "speed": 0,
-            "transferred": 0,
+            // The same value the stored row keeps. Sending 0 here undid the
+            // preservation immediately above: the drawer took the event as
+            // truth and blanked the byte count until something refetched.
+            "transferred": transferred,
             "client_software": "",
             "peer_name": "",
             "available_parts": null,
@@ -7777,10 +7834,16 @@ struct NetworkState {
     relay_manager: Arc<tokio::sync::Mutex<ember::relay::RelayManager>>,
     /// Peer reputation tracking (score, ban, decay)
     reputation: ember::reputation::ReputationManager,
-    /// Digest of the relay offer last delivered to each friend, so a steady
-    /// set is sent once rather than every tick. Pruned to live sessions, which
-    /// also means a friend who reconnects is offered the set again.
-    friend_relay_offer_sent: HashMap<[u8; 16], u64>,
+    /// Digest of the relay offer last delivered to each friend, so a steady set
+    /// is sent once rather than every tick.
+    ///
+    /// Keyed by `(session_id, digest)` rather than digest alone. Pruning to live
+    /// sessions was supposed to re-offer the set to a friend who reconnects, but
+    /// a reconnect reinstates the same Ember hash, so the entry survived and the
+    /// friend waited out the refresh bucket — up to ten minutes — before hearing
+    /// anything. The session id changes on every new session, which is exactly
+    /// the event that should invalidate this.
+    friend_relay_offer_sent: HashMap<[u8; 16], (u64, u64)>,
     /// Our own Ed25519 public key, so relay admission can recognise our own
     /// attestation coming back to us. Gossip makes that routine: we hand a
     /// friend our attestation, the friend folds it into the set it forwards,
@@ -7795,6 +7858,9 @@ struct NetworkState {
     /// offers back to back; this throttles the cost to once per
     /// [`FRIEND_RELAY_OFFER_MIN_INTERVAL`] regardless of how fast they arrive.
     friend_relay_offer_seen: HashMap<[u8; 16], std::time::Instant>,
+    /// Last unsolicited file offer accepted from each friend, throttling the
+    /// prompts one of them can raise. See [`FRIEND_FILE_OFFER_MIN_INTERVAL`].
+    friend_file_offer_seen: HashMap<[u8; 16], std::time::Instant>,
     /// Ember-native Noise transport. Always initialised at network
     /// startup so the dispatch decision in `handle_udp_packet` can be
     /// gated purely on `settings.ember_native_enabled` — toggling the
@@ -11065,6 +11131,7 @@ pub async fn start_network(
         local_ed25519_pubkey: ed25519_pubkey,
         friend_relay_offer_sent: HashMap::new(),
         friend_relay_offer_seen: HashMap::new(),
+        friend_file_offer_seen: HashMap::new(),
         ember_transport: ember::transport::EmberTransport::new(
             identity.noise_private_key,
             identity.noise_public_key,
@@ -11676,6 +11743,13 @@ pub async fn start_network(
     const UDP_SOURCE_BURST_PER_TICK: usize = 3;
     let mut cleanup_timer = tokio::time::interval(std::time::Duration::from_secs(300));
     cleanup_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    /// How often the queued-chat expiry sweep runs. The age ceiling it enforces
+    /// is measured in days, so this only has to be small relative to that.
+    const CHAT_EXPIRY_SWEEP_INTERVAL: std::time::Duration =
+        std::time::Duration::from_secs(60 * 60);
+    // `None` so the first cleanup tick sweeps, clearing anything left queued by
+    // a previous run before the user has a chance to look at it.
+    let mut last_chat_expiry_sweep: Option<std::time::Instant> = None;
     let mut small_timer = tokio::time::interval(std::time::Duration::from_secs(1));
     small_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // eMule main loop calls Kademlia::Process very frequently; ~100ms matches typical tick cadence.
@@ -14751,6 +14825,7 @@ pub async fn start_network(
                             &mut state,
                             attestations,
                             now_unix,
+                            Some(relay_eh),
                             &format!("friend relay offer from {}", hex::encode(relay_eh)),
                         );
                         debug!(
@@ -14766,7 +14841,38 @@ pub async fn start_network(
                 // offer arrived", not "I want it", so the sender can drop its
                 // pending state without waiting on a human.
                 if let UploadEventKind::EmberFileOffer { ember_hash: offer_eh, ref offer, ref reply_tx } = event.kind {
-                    if friend_hashes.read().await.contains(&offer_eh) {
+                    // Throttled like inbound transfer requests and relay
+                    // offers. Each accepted offer raises a prompt in the UI, so
+                    // without a floor between them a friend — or something that
+                    // has taken over their client — can bury the user under
+                    // dialogs, and every one of them is a decision they have to
+                    // make. Declining outright rather than dropping keeps the
+                    // sender's request from hanging until its own timeout.
+                    let offer_now = std::time::Instant::now();
+                    let offer_too_soon = state
+                        .friend_file_offer_seen
+                        .get(&offer_eh)
+                        .is_some_and(|last| {
+                            offer_now.saturating_duration_since(*last)
+                                < FRIEND_FILE_OFFER_MIN_INTERVAL
+                        });
+                    if offer_too_soon {
+                        debug!(
+                            "Declining file offer from friend {} — inside the {}s throttle",
+                            hex::encode(offer_eh),
+                            FRIEND_FILE_OFFER_MIN_INTERVAL.as_secs()
+                        );
+                        let ack = ed2k::messages::build_ember_file_offer_ack(
+                            ed2k::messages::OFFER_STATUS_THROTTLED,
+                            &offer.file_hash,
+                        );
+                        let mut framed = Vec::with_capacity(6 + ack.len());
+                        framed.push(OP_EMULEPROT);
+                        framed.extend_from_slice(&((1 + ack.len()) as u32).to_le_bytes());
+                        framed.push(ed2k::messages::OP_EMBER_FILE_OFFER_ACK);
+                        framed.extend_from_slice(&ack);
+                        let _ = reply_tx.try_send(framed);
+                    } else if friend_hashes.read().await.contains(&offer_eh) {
                         let status = if settings.friend_chat_disabled {
                             // Reuse the chat switch as the "no unsolicited
                             // contact from friends" control rather than adding
@@ -14776,6 +14882,26 @@ pub async fn start_network(
                             ed2k::messages::OFFER_STATUS_ACCEPTED
                         };
                         if status == ed2k::messages::OFFER_STATUS_ACCEPTED {
+                            // Charged only when a prompt is actually raised.
+                            // What the throttle protects is the user's
+                            // attention, so an offer that never reaches them —
+                            // because unsolicited contact is switched off —
+                            // costs nothing and must not consume the budget.
+                            // Stamping it regardless made the next offer inside
+                            // the window answer "too many at once" when the
+                            // truthful answer was the same steady refusal.
+                            state.friend_file_offer_seen.insert(offer_eh, offer_now);
+                            // Bounded here as well as by the periodic sweep:
+                            // this map is written from an inbound path, so a
+                            // peer that connects, offers once and leaves must
+                            // not leave an entry behind for the life of the
+                            // process.
+                            if state.friend_file_offer_seen.len() > MAX_FRIEND_RELAY_OFFER_TRACKED {
+                                state.friend_file_offer_seen.retain(|_, last| {
+                                    offer_now.saturating_duration_since(*last)
+                                        < FRIEND_FILE_OFFER_MIN_INTERVAL
+                                });
+                            }
                             // The name is peer-supplied, so strip the same
                             // bidi/control primitives chat text goes through
                             // before it reaches the UI.
@@ -14807,6 +14933,10 @@ pub async fn start_network(
                             "user_hash": hex::encode(ack_eh),
                             "file_hash": hex::encode(file_hash),
                             "accepted": status == ed2k::messages::OFFER_STATUS_ACCEPTED,
+                            // Kept apart from `accepted` so the sender does not
+                            // report a rate-limited offer as a refusal — nobody
+                            // on the other end has seen it, let alone decided.
+                            "throttled": status == ed2k::messages::OFFER_STATUS_THROTTLED,
                         }),
                     );
                 }
@@ -15029,6 +15159,17 @@ pub async fn start_network(
                 if let UploadEventKind::EmberChatMessage { ember_hash: chat_eh, ref message } = event.kind {
                     if !friend_hashes.read().await.contains(&chat_eh) {
                         debug!("Dropping secure chat event after friend removal");
+                        continue;
+                    }
+                    // Nothing can be stored while chat is locked, and surfacing
+                    // a message we cannot keep is worse than not surfacing it:
+                    // it would appear, contradict the banner explaining that
+                    // chat is unusable, and disappear on the next reload.
+                    if db.chat_locked() {
+                        debug!(
+                            "Dropping inbound chat from {} — history is locked",
+                            hex::encode(chat_eh)
+                        );
                         continue;
                     }
                     if !settings.friend_chat_disabled {
@@ -19678,6 +19819,21 @@ pub async fn start_network(
                         &ed25519_secret_key,
                         ed25519_pubkey,
                     ) {
+                        // Register the hash before advertising it. A friend that
+                        // acts on this attestation presents its hash when dialling
+                        // us as a relay, and `accepts_attestation_hash` refuses
+                        // anything it was never told to expect. Signing mints a
+                        // fresh expiry each tick, so the hash differs every time
+                        // and the EPX path cannot cover it: without this the offer
+                        // advertised a relay that answers every taker with
+                        // REJECT_AUTH, and a node with no swarm traffic — the one
+                        // this feature is for — never registered a hash at all.
+                        let hash = ember::relay_attestation_hash(&mine);
+                        state
+                            .relay_manager
+                            .lock()
+                            .await
+                            .set_current_attestation_hash(hash, mine.expires_at_unix);
                         offer.truncate(ember::MAX_RELAY_ATTESTATIONS.saturating_sub(1));
                         offer.insert(0, mine);
                     }
@@ -19695,20 +19851,24 @@ pub async fn start_network(
                         packet.push(ed2k::messages::OP_EMBER_EXT);
                         packet.extend_from_slice(&payload);
 
-                        let live: Vec<([u8; 16], tokio::sync::mpsc::Sender<Vec<u8>>)> = {
+                        let live: Vec<([u8; 16], u64, tokio::sync::mpsc::Sender<Vec<u8>>)> = {
                             let sessions = state.ember_sessions.read().await;
                             sessions
                                 .iter()
                                 .filter(|(_, h)| h.is_fresh() && h.is_secure_v2())
-                                .map(|(eh, h)| (*eh, h.tx.clone()))
+                                .map(|(eh, h)| (*eh, h.session_id(), h.tx.clone()))
                                 .collect()
                         };
-                        for (eh, tx) in live {
-                            if state.friend_relay_offer_sent.get(&eh) == Some(&digest) {
+                        for (eh, session_id, tx) in live {
+                            if state.friend_relay_offer_sent.get(&eh)
+                                == Some(&(session_id, digest))
+                            {
                                 continue;
                             }
                             if tx.try_send(packet.clone()).is_ok() {
-                                state.friend_relay_offer_sent.insert(eh, digest);
+                                state
+                                    .friend_relay_offer_sent
+                                    .insert(eh, (session_id, digest));
                             }
                         }
                     }
@@ -19937,6 +20097,29 @@ pub async fn start_network(
                         now.saturating_duration_since(*last).as_secs()
                             < FRIEND_XFER_INBOUND_MIN_INTERVAL_SECS
                     });
+                    state.friend_file_offer_seen.retain(|_, last| {
+                        now.saturating_duration_since(*last) < FRIEND_FILE_OFFER_MIN_INTERVAL
+                    });
+                }
+
+                // Abandon chat that has been queued past its age limit. Done on
+                // a slow cadence from here rather than inside the flush, so a
+                // conversation the user never reopens still resolves and the
+                // queue, the badge and the message list cannot disagree about
+                // the same row. Hourly: the ceiling is measured in days, and the
+                // predicate scans `chat_messages`.
+                if last_chat_expiry_sweep
+                    .map(|at: std::time::Instant| at.elapsed() >= CHAT_EXPIRY_SWEEP_INTERVAL)
+                    .unwrap_or(true)
+                {
+                    last_chat_expiry_sweep = Some(std::time::Instant::now());
+                    let db_expire = db.clone();
+                    if let Ok(Err(e)) =
+                        tokio::task::spawn_blocking(move || db_expire.expire_stale_queued_chat())
+                            .await
+                    {
+                        debug!("Queued-chat expiry sweep failed: {e}");
+                    }
                 }
 
                 // Disarm the punch serve role once the punch that justified it
@@ -20234,6 +20417,8 @@ pub async fn start_network(
                                             if let Err(send_err) = broker_tx.try_send(ember::broker::BrokerEvent::RelayFailed {
                                                 attempt_key: attempt_key_owned,
                                                 reason: "no QUIC endpoint".into(),
+                                                // Our endpoint, not their fault.
+                                                relay_at_fault: false,
                                             }) {
                                                 tracing::debug!("Broker: dropping relay failure event (queue full/closed): {send_err}");
                                             }
@@ -20280,6 +20465,8 @@ pub async fn start_network(
                                             if let Err(send_err) = broker_tx.try_send(ember::broker::BrokerEvent::RelayFailed {
                                                 attempt_key: attempt_key_owned,
                                                 reason: "missing relay attestation hash".into(),
+                                                // Missing on our side, before we ever dialled.
+                                                relay_at_fault: false,
                                             }) {
                                                 tracing::debug!("Broker: dropping relay failure event (queue full/closed): {send_err}");
                                             }
@@ -20315,9 +20502,15 @@ pub async fn start_network(
                                             Err(e) => {
                                                 tracing::debug!("Broker: peer relay failed: {e}");
                                                 if let Err(send_err) = broker_tx.try_send(ember::broker::BrokerEvent::RelayFailed {
-                                                    attempt_key: attempt_key_owned,
-                                                    reason: e,
-                                                }) {
+                                                        attempt_key: attempt_key_owned,
+                                                        // Attribution comes from the
+                                                        // dial itself: unreachable or
+                                                        // misbehaving counts against
+                                                        // the relay, a proper refusal
+                                                        // does not.
+                                                        relay_at_fault: e.relay_at_fault,
+                                                        reason: e.reason,
+                                                    }) {
                                                     tracing::debug!("Broker: dropping relay failure event (queue full/closed): {send_err}");
                                                 }
                                             }
@@ -20333,6 +20526,8 @@ pub async fn start_network(
                                         if let Err(send_err) = broker_tx.try_send(ember::broker::BrokerEvent::RelayFailed {
                                             attempt_key: attempt_key_owned,
                                             reason: "anonymous LowID sources cannot use server relay".into(),
+                                            // No relay was involved at all.
+                                            relay_at_fault: false,
                                         }) {
                                             tracing::debug!("Broker: dropping relay failure event (queue full/closed): {send_err}");
                                         }
@@ -20450,9 +20645,9 @@ pub async fn start_network(
                                     pfs.set_low_to_low(source_ip, source_port, None);
                                 }
                             }
-                            ember::broker::BrokerEvent::RelayFailed { ref attempt_key, ref reason } => {
+                            ember::broker::BrokerEvent::RelayFailed { ref attempt_key, ref reason, relay_at_fault } => {
                                 if let Some(ref mut broker) = state.connection_broker {
-                                    broker.relay_failed(attempt_key, reason).await;
+                                    broker.relay_failed(attempt_key, reason, relay_at_fault).await;
                                 }
                             }
                         }
@@ -26468,6 +26663,15 @@ pub async fn start_network(
                             serde_json::json!({
                                 "discoverable": false,
                                 "reason": "rendezvous_error",
+                                // Distinguishes "never established presence"
+                                // from "held it and lost a heartbeat". Only the
+                                // former justifies telling the user outright
+                                // that friends cannot find them; a dropped
+                                // heartbeat is retried on the next tick and is
+                                // usually nothing, so the UI lets its own grace
+                                // period decide instead of reacting to one
+                                // missed beat.
+                                "initial": result.initial,
                             }),
                         );
                     }
@@ -39551,6 +39755,15 @@ async fn handle_download_event(
                 "no_needed_parts" => crate::types::SourceStatus::NoNeededParts,
                 "transferring" => crate::types::SourceStatus::Transferring,
                 "completed" => crate::types::SourceStatus::Completed,
+                // Parked states, mapped explicitly rather than left to the
+                // catch-all. `maybe_escalate_to_friend_transfer` writes these
+                // rows itself and the caller stops the originating event, so
+                // nothing reaches this match with them today — but the fallback
+                // is `Failed`, and the drawer drops a `Failed` row entirely, so
+                // any future path that did emit one would silently delete a
+                // source that is waiting perfectly healthily.
+                "friend_connect" => crate::types::SourceStatus::FriendConnect,
+                "unreachable" => crate::types::SourceStatus::Unreachable,
                 _ => crate::types::SourceStatus::Failed,
             };
             // Every event here comes from a real download worker

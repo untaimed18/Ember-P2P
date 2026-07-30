@@ -85,6 +85,10 @@ struct ConnectionAttempt {
     phase: AttemptPhase,
     started: Instant,
     phase_started: Instant,
+    /// Which relay this attempt was handed to, so its outcome can be charged
+    /// back to that candidate. Without this the broker learned nothing from a
+    /// failure and would pick the same dead relay again immediately.
+    relay: Option<(Ipv4Addr, u16)>,
 }
 
 impl ConnectionAttempt {
@@ -106,6 +110,21 @@ pub struct RelayCandidate {
     /// do not have.
     pub attestation: super::RelayAttestation,
     pub ember_hash: Option<[u8; 16]>,
+    /// Consecutive failed relay attempts against this candidate, reset by any
+    /// success.
+    ///
+    /// An attestation only proves that whoever signed it *claims* the address;
+    /// nothing proves they hold it. The pinned QUIC handshake catches the lie,
+    /// but only at the moment of use — so without recording the outcome the
+    /// broker kept choosing a candidate that could never work, and preferring
+    /// it, since [`Self::pick_relay_candidate`] ranks fewest-sessions first and
+    /// a fabricated entry has carried none.
+    pub failures: u32,
+    /// Which peer handed us this attestation, or `None` when we saw it on a
+    /// swarm exchange rather than a friend's forward. Used only to bound one
+    /// introducer's share of the list, never to decide trust — that rests
+    /// entirely on the attestation's own signature.
+    pub introduced_by: Option<[u8; 16]>,
     pub last_seen: Instant,
     pub relay_sessions: u32,
     /// Signed expiry of the ERAT this candidate was admitted with
@@ -190,10 +209,37 @@ pub enum BrokerEvent {
         reason: String,
     },
     /// Spawned relay task reports failure -- broker should emit ConnectionFailed.
-    RelayFailed { attempt_key: String, reason: String },
+    RelayFailed {
+        attempt_key: String,
+        reason: String,
+        /// Whether the relay itself is to blame, and so should have the failure
+        /// counted against it.
+        ///
+        /// Several of these are raised by our own setup — no QUIC endpoint, no
+        /// attestation hash to present, no candidate at all — and say nothing
+        /// about the peer. Charging those to a relay would evict a perfectly
+        /// good one after three of our own stumbles.
+        relay_at_fault: bool,
+    },
 }
 
 impl ConnectionBroker {
+    /// Total relay candidates retained.
+    const MAX_RELAY_CANDIDATES: usize = 50;
+    /// Ceiling on how many of those any one introducer may account for.
+    ///
+    /// Set well below the total so a hostile friend forwarding self-minted
+    /// attestations cannot displace the relays we learned elsewhere, while
+    /// still leaving room for a friend that legitimately knows several.
+    const MAX_CANDIDATES_PER_INTRODUCER: usize = 8;
+    /// Consecutive failures before a relay candidate is dropped.
+    ///
+    /// More than one, because a working relay can fail transiently — it may be
+    /// briefly saturated, or restarting — and evicting on a single miss would
+    /// throw away good relays. Low enough that a fabricated entry, which fails
+    /// every time, is gone after a couple of attempts.
+    const MAX_CANDIDATE_FAILURES: u32 = 3;
+
     pub fn new(_rendezvous_url: String, event_tx: mpsc::Sender<BrokerEvent>) -> Self {
         Self {
             attempts: HashMap::new(),
@@ -275,6 +321,11 @@ impl ConnectionBroker {
         // a v2 punch request, so the broker starts directly at relay.
         let start_phase = AttemptPhase::FindRelay;
 
+        let relay_candidate = self.pick_relay_candidate();
+        let relay_addr = relay_candidate.map(|c| (c.ip, c.port));
+        let relay_attestation_hash = relay_candidate.map(|c| c.attestation_hash);
+        let relay_ember_hash = relay_candidate.and_then(|c| c.ember_hash);
+
         let attempt = ConnectionAttempt {
             transfer_id: transfer_id.to_string(),
             file_hash,
@@ -283,6 +334,7 @@ impl ConnectionBroker {
             phase: start_phase,
             started: now,
             phase_started: now,
+            relay: relay_addr,
         };
 
         info!(
@@ -292,10 +344,6 @@ impl ConnectionBroker {
 
         self.attempts.insert(attempt_key.clone(), attempt);
 
-        let relay_candidate = self.pick_relay_candidate();
-        let relay_addr = relay_candidate.map(|c| (c.ip, c.port));
-        let relay_attestation_hash = relay_candidate.map(|c| c.attestation_hash);
-        let relay_ember_hash = relay_candidate.and_then(|c| c.ember_hash);
         self.stats.relay_attempts = self.stats.relay_attempts.saturating_add(1);
         emit_event(
             &self.event_tx,
@@ -314,10 +362,15 @@ impl ConnectionBroker {
     }
 
     /// Called when a relay attempt fails.
-    pub async fn relay_failed(&mut self, attempt_key: &str, reason: &str) {
+    pub async fn relay_failed(&mut self, attempt_key: &str, reason: &str, relay_at_fault: bool) {
         if let Some(attempt) = self.attempts.remove(attempt_key) {
             debug!("Broker: relay failed for {attempt_key}: {reason}");
             self.stats.relay_failures = self.stats.relay_failures.saturating_add(1);
+            if relay_at_fault {
+                if let Some((ip, port)) = attempt.relay {
+                    self.penalise_relay_candidate(ip, port);
+                }
+            }
             emit_event(
                 &self.event_tx,
                 BrokerEvent::ConnectionFailed {
@@ -332,18 +385,67 @@ impl ConnectionBroker {
 
     /// Called when a relay succeeds.
     pub fn mark_succeeded(&mut self, attempt_key: &str, _method: ConnectionMethod) {
-        self.attempts.remove(attempt_key);
+        if let Some(attempt) = self.attempts.remove(attempt_key) {
+            if let Some((ip, port)) = attempt.relay {
+                // Clears the count rather than decrementing it: a relay that
+                // just carried a connection has proved itself, and occasional
+                // failures against a working relay should not accumulate into
+                // an eviction.
+                if let Some(c) = self
+                    .relay_candidates
+                    .iter_mut()
+                    .find(|c| c.ip == ip && c.port == port)
+                {
+                    c.failures = 0;
+                }
+            }
+        }
         self.stats.relay_successes = self.stats.relay_successes.saturating_add(1);
+    }
+
+    /// Charge a failed attempt to the relay that was tried, dropping it once it
+    /// has failed [`Self::MAX_CANDIDATE_FAILURES`] times in a row.
+    ///
+    /// This is what stops a fabricated attestation from capturing relay
+    /// selection. Anyone can sign a claim over an address they do not hold, and
+    /// such an entry looks *better* than a real relay to
+    /// [`Self::pick_relay_candidate`] — no sessions carried, freshly seen — so
+    /// before this, one peer forwarding a handful of them could take over every
+    /// choice, fail each time, and be chosen again straight away.
+    fn penalise_relay_candidate(&mut self, ip: Ipv4Addr, port: u16) {
+        let Some(idx) = self
+            .relay_candidates
+            .iter()
+            .position(|c| c.ip == ip && c.port == port)
+        else {
+            return;
+        };
+        self.relay_candidates[idx].failures =
+            self.relay_candidates[idx].failures.saturating_add(1);
+        let failures = self.relay_candidates[idx].failures;
+        if failures >= Self::MAX_CANDIDATE_FAILURES {
+            info!(
+                "Broker: dropping relay candidate {ip}:{port} after {failures} consecutive failures"
+            );
+            self.relay_candidates.remove(idx);
+        } else {
+            debug!("Broker: relay candidate {ip}:{port} now at {failures} consecutive failure(s)");
+        }
     }
 
     /// Add a relay-capable peer discovered via EPX. `expires_at_unix` must
     /// come from the verified `RelayAttestation` this candidate was
     /// admitted with (see `verify_relay_attestation` at the call site) ???
     /// it is the caller's job to have already checked the signature.
+    /// `introduced_by` is the peer that handed us this attestation, which is
+    /// *not* the relay it names — a friend forwards attestations it did not
+    /// sign. It exists only to bound one introducer's share of the list; see
+    /// [`Self::MAX_CANDIDATES_PER_INTRODUCER`].
     pub fn add_relay_candidate(
         &mut self,
         attestation: super::RelayAttestation,
         ember_hash: Option<[u8; 16]>,
+        introduced_by: Option<[u8; 16]>,
     ) {
         // Address, port, expiry and hash all come from the attestation rather
         // than from separate arguments: they are signed fields, so accepting
@@ -364,10 +466,49 @@ impl ConnectionBroker {
             existing.ember_hash = ember_hash;
             existing.last_seen = Instant::now();
             existing.expires_at_unix = expires_at_unix;
+            // `failures` deliberately survives a refresh. Gossip re-sends the
+            // same set every few ticks, so clearing it here would let a
+            // fabricated candidate wipe its own record faster than it can
+            // accumulate one and stay at the front of the queue for ever.
             return;
         }
-        const MAX_RELAY_CANDIDATES: usize = 50;
-        if self.relay_candidates.len() >= MAX_RELAY_CANDIDATES {
+        // A single introducer must not be able to own the list. Attestations
+        // are self-signed, so one peer can mint as many valid ones as it likes
+        // from throwaway keys; with only global oldest-first eviction it could
+        // refresh a full set every throttle interval and crowd out every relay
+        // learned first-hand, steering relayed transfers through addresses it
+        // chose. Capping its share keeps the rest of the list reachable.
+        if let Some(source) = introduced_by {
+            let mut theirs: Vec<usize> = self
+                .relay_candidates
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.introduced_by == Some(source))
+                .map(|(i, _)| i)
+                .collect();
+            while theirs.len() >= Self::MAX_CANDIDATES_PER_INTRODUCER {
+                // Evict this introducer's own oldest rather than refusing, so a
+                // friend whose relays genuinely rotate still stays current.
+                let oldest = theirs
+                    .iter()
+                    .copied()
+                    .min_by_key(|&i| self.relay_candidates[i].last_seen);
+                match oldest {
+                    Some(idx) => {
+                        self.relay_candidates.remove(idx);
+                        theirs = self
+                            .relay_candidates
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, c)| c.introduced_by == Some(source))
+                            .map(|(i, _)| i)
+                            .collect();
+                    }
+                    None => break,
+                }
+            }
+        }
+        if self.relay_candidates.len() >= Self::MAX_RELAY_CANDIDATES {
             // Evict oldest
             if let Some(oldest_idx) = self
                 .relay_candidates
@@ -385,6 +526,8 @@ impl ConnectionBroker {
             attestation_hash,
             attestation,
             ember_hash,
+            failures: 0,
+            introduced_by,
             last_seen: Instant::now(),
             relay_sessions: 0,
             expires_at_unix,
@@ -431,7 +574,11 @@ impl ConnectionBroker {
             .filter(|c| {
                 c.last_seen.elapsed() < RELAY_CANDIDATE_PICK_MAX_AGE && c.expires_at_unix > now_unix
             })
-            .min_by_key(|c| (c.relay_sessions, c.last_seen.elapsed().as_secs()))
+            // Failures rank ahead of everything else. A candidate that has just
+            // failed must not keep winning on "carried no sessions and seen
+            // most recently", which is precisely how a fabricated entry used to
+            // outrank a relay that demonstrably works.
+            .min_by_key(|c| (c.failures, c.relay_sessions, c.last_seen.elapsed().as_secs()))
     }
 
     /// Clean up expired attempts. Called periodically from the main loop.
@@ -446,7 +593,8 @@ impl ConnectionBroker {
         for key in expired {
             if self.attempts.contains_key(&key) {
                 info!("Broker: relay timed out for {key}");
-                self.relay_failed(&key, "timeout").await;
+                // The relay's account: it was asked and did not answer in time.
+                self.relay_failed(&key, "timeout", true).await;
             }
         }
 
@@ -634,9 +782,11 @@ mod tests {
         broker.add_relay_candidate(
             attestation(Ipv4Addr::new(1, 1, 1, 1), 4662, future_expiry),
             None,
+            None,
         );
         broker.add_relay_candidate(
             attestation(Ipv4Addr::new(2, 2, 2, 2), 4663, future_expiry),
+            None,
             None,
         );
         assert_eq!(broker.relay_candidate_count(), 2);
@@ -645,7 +795,7 @@ mod tests {
         // second one, and the stored credential is the newer attestation — not
         // the one the candidate was first seen with.
         let refreshed = attestation(Ipv4Addr::new(1, 1, 1, 1), 4662, future_expiry + 60);
-        broker.add_relay_candidate(refreshed.clone(), None);
+        broker.add_relay_candidate(refreshed.clone(), None, None);
         assert_eq!(broker.relay_candidate_count(), 2);
         let stored = broker
             .relay_candidates
@@ -674,13 +824,13 @@ mod tests {
         let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
 
         let expired = unix_now().saturating_sub(1);
-        broker.add_relay_candidate(attestation(Ipv4Addr::new(9, 9, 9, 9), 4662, expired), None);
+        broker.add_relay_candidate(attestation(Ipv4Addr::new(9, 9, 9, 9), 4662, expired), None, None);
         assert_eq!(broker.relay_candidate_count(), 1);
         assert!(broker.pick_relay_candidate().is_none());
 
         // A fresh, unexpired candidate is still pickable.
         let fresh = unix_now() + 600;
-        broker.add_relay_candidate(attestation(Ipv4Addr::new(8, 8, 8, 8), 4662, fresh), None);
+        broker.add_relay_candidate(attestation(Ipv4Addr::new(8, 8, 8, 8), 4662, fresh), None, None);
         let picked = broker.pick_relay_candidate();
         assert_eq!(picked.map(|c| c.ip), Some(Ipv4Addr::new(8, 8, 8, 8)));
     }
@@ -697,8 +847,8 @@ mod tests {
         let fresh = now + 600;
         let stale = now.saturating_sub(1);
 
-        broker.add_relay_candidate(attestation(Ipv4Addr::new(1, 1, 1, 1), 4662, fresh), None);
-        broker.add_relay_candidate(attestation(Ipv4Addr::new(2, 2, 2, 2), 4663, stale), None);
+        broker.add_relay_candidate(attestation(Ipv4Addr::new(1, 1, 1, 1), 4662, fresh), None, None);
+        broker.add_relay_candidate(attestation(Ipv4Addr::new(2, 2, 2, 2), 4663, stale), None, None);
 
         let offer = broker.gossipable_attestations(now);
         assert_eq!(offer.len(), 1);
@@ -715,12 +865,163 @@ mod tests {
         let fresh = now + 600;
 
         for i in 0..(crate::network::ember::MAX_RELAY_ATTESTATIONS as u8 + 5) {
-            broker.add_relay_candidate(attestation(Ipv4Addr::new(10, 0, 0, i), 4662, fresh), None);
+            broker.add_relay_candidate(attestation(Ipv4Addr::new(10, 0, 0, i), 4662, fresh), None, None);
         }
 
         assert_eq!(
             broker.gossipable_attestations(now).len(),
             crate::network::ember::MAX_RELAY_ATTESTATIONS
+        );
+    }
+
+    /// A fabricated attestation names an address its signer does not hold, and
+    /// used to look *better* than a working relay: no sessions carried, freshly
+    /// seen. Nothing recorded the outcome of using one, so the broker chose it
+    /// again on the next attempt and LowID relaying stalled behind a candidate
+    /// that could never complete a pinned handshake.
+    #[test]
+    fn a_relay_that_keeps_failing_stops_being_chosen_and_is_dropped() {
+        let (tx, _rx) = mpsc::channel(16);
+        let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
+        let fresh = unix_now() + 600;
+        let bogus = Ipv4Addr::new(203, 0, 113, 5);
+        let working = Ipv4Addr::new(198, 51, 100, 7);
+
+        // The working relay has carried traffic; the fabricated one has not,
+        // which is exactly why it wins on the session count alone.
+        broker.add_relay_candidate(attestation(working, 4662, fresh), None, None);
+        if let Some(c) = broker.relay_candidates.iter_mut().find(|c| c.ip == working) {
+            c.relay_sessions = 2;
+        }
+        broker.add_relay_candidate(attestation(bogus, 4662, fresh), None, None);
+
+        assert_eq!(
+            broker.pick_relay_candidate().map(|c| c.ip),
+            Some(bogus),
+            "precondition: an unused candidate is preferred"
+        );
+
+        // One failure is enough to send it behind the relay that works.
+        broker.penalise_relay_candidate(bogus, 4662);
+        assert_eq!(
+            broker.pick_relay_candidate().map(|c| c.ip),
+            Some(working),
+            "a failing candidate must not keep winning selection"
+        );
+
+        // And it is dropped rather than lingering to be retried for ever.
+        for _ in 1..ConnectionBroker::MAX_CANDIDATE_FAILURES {
+            broker.penalise_relay_candidate(bogus, 4662);
+        }
+        assert!(
+            !broker.relay_candidates.iter().any(|c| c.ip == bogus),
+            "a candidate that always fails must be evicted"
+        );
+        assert!(
+            broker.relay_candidates.iter().any(|c| c.ip == working),
+            "the working relay must survive"
+        );
+    }
+
+    /// Only the relay's own failures count against it. Several `RelayFailed`
+    /// events are raised by our own setup — no QUIC endpoint, no attestation
+    /// hash, no candidate — and blaming the peer for those would evict working
+    /// relays after three of our stumbles, shrinking the pool exactly when
+    /// LowID transfers need it.
+    #[tokio::test]
+    async fn our_own_setup_failures_do_not_count_against_a_relay() {
+        let (tx, _rx) = mpsc::channel(16);
+        let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
+        let ip = Ipv4Addr::new(198, 51, 100, 3);
+        broker.add_relay_candidate(attestation(ip, 4662, unix_now() + 600), None, None);
+
+        for _ in 0..(ConnectionBroker::MAX_CANDIDATE_FAILURES + 2) {
+            broker.attempt_low_to_low(
+                "t-local",
+                [9u8; 16],
+                Ipv4Addr::new(10, 0, 0, 1),
+                4662,
+                NatType::Symmetric,
+                Some("5.6.7.8:9999".parse().unwrap()),
+            )
+            .await;
+            broker
+                .relay_failed("t-local:10.0.0.1:4662", "no QUIC endpoint", false)
+                .await;
+            // The source cooldown would refuse a second attempt otherwise.
+            broker.cooldowns.clear();
+        }
+
+        let candidate = broker.relay_candidates.iter().find(|c| c.ip == ip);
+        assert_eq!(
+            candidate.map(|c| c.failures),
+            Some(0),
+            "a relay must not be blamed for failures on our side"
+        );
+    }
+
+    /// Gossip re-sends the same set repeatedly, so a refresh must not be a way
+    /// to launder a failure record — otherwise a fabricated candidate resets
+    /// its count faster than it can earn one and never ages out.
+    #[test]
+    fn refreshing_a_candidate_does_not_clear_its_failures() {
+        let (tx, _rx) = mpsc::channel(16);
+        let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
+        let fresh = unix_now() + 600;
+        let ip = Ipv4Addr::new(203, 0, 113, 9);
+
+        broker.add_relay_candidate(attestation(ip, 4662, fresh), None, None);
+        broker.penalise_relay_candidate(ip, 4662);
+        broker.add_relay_candidate(attestation(ip, 4662, fresh + 60), None, None);
+
+        assert_eq!(
+            broker
+                .relay_candidates
+                .iter()
+                .find(|c| c.ip == ip)
+                .map(|c| c.failures),
+            Some(1)
+        );
+    }
+
+    /// Attestations are self-signed, so one peer can mint unlimited valid ones
+    /// from throwaway keys. With only global oldest-first eviction it could
+    /// refresh a full set every throttle interval and own the whole list,
+    /// steering relayed transfers through addresses of its choosing.
+    #[test]
+    fn one_introducer_cannot_crowd_out_the_whole_candidate_list() {
+        let (tx, _rx) = mpsc::channel(16);
+        let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
+        let fresh = unix_now() + 600;
+        let hostile = [0xAAu8; 16];
+
+        // Learned elsewhere — a swarm exchange, with no introducer recorded.
+        broker.add_relay_candidate(attestation(Ipv4Addr::new(1, 1, 1, 1), 4662, fresh), None, None);
+
+        for i in 0..40u8 {
+            broker.add_relay_candidate(
+                attestation(Ipv4Addr::new(10, 0, 0, i), 4662, fresh),
+                None,
+                Some(hostile),
+            );
+        }
+
+        let theirs = broker
+            .relay_candidates
+            .iter()
+            .filter(|c| c.introduced_by == Some(hostile))
+            .count();
+        assert_eq!(
+            theirs,
+            ConnectionBroker::MAX_CANDIDATES_PER_INTRODUCER,
+            "one introducer must not exceed its share"
+        );
+        assert!(
+            broker
+                .relay_candidates
+                .iter()
+                .any(|c| c.ip == Ipv4Addr::new(1, 1, 1, 1)),
+            "the first-hand candidate must survive the flood"
         );
     }
 

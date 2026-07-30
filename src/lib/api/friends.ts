@@ -94,6 +94,13 @@ export async function getBlockedFriends(): Promise<BlockedInfo[]> {
   return invoke('get_blocked_friends');
 }
 
+/** True when chat history is sealed because its encryption key could not be
+ *  recovered. Everything else in the app works; conversations read as
+ *  unavailable and sending fails until the key file is restored. */
+export async function isChatLocked(): Promise<boolean> {
+  return invoke('is_chat_locked');
+}
+
 export async function updateFriendNickname(userHashHex: string, nickname: string): Promise<void> {
   return invoke('update_friend_nickname', { userHashHex, nickname });
 }

@@ -242,6 +242,11 @@ impl LocalIndex {
         completed.alltime_accepted = pending.alltime_accepted;
         completed.alltime_transferred = pending.alltime_transferred;
         completed.complete_sources = pending.complete_sources;
+        // `set_friends_only_by_paths` deliberately accepts rows that are still
+        // hashing, so a restriction applied during that window has to survive
+        // completion or it is silently discarded at the moment the file becomes
+        // servable.
+        completed.friends_only = pending.friends_only;
         self.add_file_no_rebuild(completed.clone());
         Some(completed)
     }
@@ -850,6 +855,13 @@ fn preserve_runtime_state(existing: &FileInfo, file: &mut FileInfo) {
     file.shared = existing.shared;
     file.shared_kad = existing.shared_kad;
     file.shared_ed2k = existing.shared_ed2k;
+    // Carried for the same reason as `shared`, and more urgently: a rediscovered
+    // row is built with `friends_only: false`, so dropping it here silently
+    // republishes a restricted file to the open network — the watcher firing or
+    // the user reloading a folder is enough. known.met keeps the flag, so the
+    // restriction reappears at the next restart, which makes the exposure
+    // intermittent and near-invisible rather than obvious.
+    file.friends_only = existing.friends_only;
 }
 
 fn tokenize(s: &str) -> Vec<String> {

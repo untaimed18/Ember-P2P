@@ -2245,6 +2245,7 @@
       let u1: (() => void) | null = null;
       let u2: (() => void) | null = null;
       let u3: (() => void) | null = null;
+      let u4: (() => void) | null = null;
       try {
         u1 = await listen<{ phase: string; count: number }>(
           'shared-files-changed', () => { if (mounted) debouncedRefresh(); }
@@ -2273,12 +2274,32 @@
           () => { if (mounted) scanTruncated = true; },
         );
         if (destroyed) { u1(); u2(); u3(); return; }
-        unlisteners.push(u1, u2, u3);
+        // "Sent" only ever meant the invitation reached the network task. The
+        // recipient's answer arrives here, and a refusal was going unreported
+        // entirely — nothing in the app listened for this event — so a friend
+        // who has unsolicited contact turned off looked identical to one who
+        // accepted.
+        u4 = await listen<{ user_hash: string; file_name?: string; accepted: boolean; throttled?: boolean }>(
+          'ember:file-offer-ack', (event) => {
+            if (!mounted || event.payload?.accepted !== false) return;
+            // A throttled offer is not a refusal: the recipient's client
+            // turned it away before anyone saw it, so saying they declined
+            // would put words in their mouth.
+            toastWarning(
+              event.payload?.throttled === true
+                ? m.library_offer_throttled()
+                : m.library_offer_declined(),
+            );
+          },
+        );
+        if (destroyed) { u1(); u2(); u3(); u4(); return; }
+        unlisteners.push(u1, u2, u3, u4);
       } catch (e) {
         console.warn('library: failed to register file-system event listeners', e);
         if (u1) u1();
         if (u2) u2();
         if (u3) u3();
+        if (u4) u4();
       }
     })();
 

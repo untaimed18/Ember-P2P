@@ -305,6 +305,12 @@
     background: var(--bg-secondary);
     border-bottom: 1px solid var(--border);
     overflow-x: auto;
+    /* Explicit, and not merely tidiness. Setting only `overflow-x` leaves
+       `overflow-y` at `visible`, and CSS then computes `visible` to `auto`
+       whenever the other axis is not visible — so the strip grew its own
+       vertical scrollbar the moment anything inside it exceeded the box by a
+       fraction of a pixel, which the active tab's indicator did by exactly 1px. */
+    overflow-y: hidden;
     scrollbar-width: thin;
     flex-shrink: 0;
   }
@@ -339,9 +345,14 @@
     font-size: 12.5px;
     font-family: inherit;
     cursor: pointer;
+    /* Share the strip rather than each claiming a fixed width and pushing the
+       rest out of view. The dock is only ~420px wide, so fixed 180px tabs
+       started scrolling at three conversations; now they narrow and ellipsize
+       first, and scrolling is the last resort once they hit a width where the
+       name and controls stop being usable. */
+    flex: 1 1 auto;
     max-width: 180px;
-    min-width: 0;
-    flex-shrink: 0;
+    min-width: 96px;
     position: relative;
     transition: background var(--transition-fast), color var(--transition-fast);
   }
@@ -362,7 +373,10 @@
     position: absolute;
     left: 0;
     right: 0;
-    bottom: -1px;
+    /* Inside the box, not 1px past it. Overhanging the strip's bottom edge is
+       what pushed the container into vertical overflow, and `overflow-y: hidden`
+       would now clip half of a 2px bar anyway. */
+    bottom: 0;
     height: 2px;
     background: var(--accent);
   }

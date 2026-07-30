@@ -579,6 +579,44 @@ pub async fn run_friend_session_over_transport(
                                         }).await;
                                     }
                                 }
+                                // Mirrors the arm in `upload.rs`. Without it this
+                                // loop dropped relay offers into the catch-all
+                                // below, and since there is one session per pair
+                                // keyed by Ember hash, whichever side dialled
+                                // never learned the other's relays. Attestations
+                                // then flowed one way only — in exactly the
+                                // isolated-pair case the gossip exists to serve.
+                                (OP_EMULEPROT, super::messages::OP_EMBER_EXT) => {
+                                    match super::messages::parse_ember_ext(&payload) {
+                                        Some((super::messages::EMBER_EXT_RELAY_OFFER, body)) => {
+                                            // Parsed here, verified in the network
+                                            // loop that owns the broker: a
+                                            // forwarded attestation is only bytes
+                                            // until its own signature checks out.
+                                            let attestations =
+                                                crate::network::ember::parse_relay_attestation_block(body);
+                                            if !attestations.is_empty() {
+                                                let _ = session_ul_event_tx.send(UploadEvent {
+                                                    transfer_id: String::new(),
+                                                    kind: UploadEventKind::EmberRelayOffer {
+                                                        ember_hash: peer_ember_hash,
+                                                        attestations,
+                                                    },
+                                                }).await;
+                                            }
+                                        }
+                                        // A sub-type this build predates. Ignoring
+                                        // it is the whole point of the envelope.
+                                        Some((other, _)) => debug!(
+                                            "Friend {} sent unknown OP_EMBER_EXT sub-type {other:#04x}",
+                                            hex::encode(peer_ember_hash)
+                                        ),
+                                        None => debug!(
+                                            "Friend {} sent an empty OP_EMBER_EXT payload",
+                                            hex::encode(peer_ember_hash)
+                                        ),
+                                    }
+                                }
                                 (OP_EMULEPROT, OP_EMBER_KEEPALIVE) => {}
                                 _ => {
                                     debug!("Friend session ignoring proto=0x{proto:02X} op=0x{opcode:02X} from {addr}");
