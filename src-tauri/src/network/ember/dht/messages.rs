@@ -52,6 +52,16 @@ pub struct DhtMessage {
     /// omitted in encrypted sessions where we already know it).
     pub sender_pub_key: Option<[u8; 32]>,
     pub payload: DhtPayload,
+    /// Per-frame Ed25519 signature over every preceding byte.
+    ///
+    /// Never read after construction, and deliberately so: [`decode_message`]
+    /// verifies it (and the `sender_id == BLAKE3(pubkey)[..16]` binding)
+    /// against the raw wire bytes *before* building this struct, bailing on
+    /// failure. A `DhtMessage` therefore only ever exists in verified form,
+    /// and re-checking here would invite a caller to treat verification as
+    /// its own responsibility. The builders leave it zeroed for
+    /// [`encode_message`] to fill.
+    #[allow(dead_code)]
     pub signature: [u8; 64],
 }
 

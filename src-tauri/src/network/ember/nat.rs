@@ -50,14 +50,13 @@ impl Default for NatType {
 }
 
 impl NatType {
-    pub fn is_punchable(&self) -> bool {
-        matches!(
-            self,
-            NatType::Open | NatType::FullCone | NatType::RestrictedCone | NatType::PortRestricted
-        )
-    }
-
     /// Whether a hole-punch between two NAT types is likely to succeed.
+    ///
+    /// Retained as the reference definition of punch compatibility and
+    /// covered by this module's tests. The live friend-connect gate is a
+    /// narrower `!= Symmetric` check on our own type alone, since we learn
+    /// the peer's type only after the punch request is already in flight.
+    #[allow(dead_code)]
     pub fn can_punch_with(&self, other: &NatType) -> bool {
         match (self, other) {
             (NatType::Open, _) | (_, NatType::Open) => true,
@@ -125,9 +124,10 @@ impl NatInfo {
     /// port. This is a deliberate optimistic guess — we don't know the
     /// NAT mapping for sure, but a HighID + open TCP almost always
     /// means a cone NAT (or no NAT) rather than symmetric. Without this
-    /// fallback the broker refuses to attempt hole-punch
-    /// (`is_punchable() == false`), so every low-to-low connect goes
-    /// straight to the relay path even on perfectly punchable links.
+    /// fallback `external_addr` stays `None`, which fails the
+    /// `Some(ext_addr)` requirement guarding the friend hole-punch in
+    /// `friend_connect::connect_friend_with_fallback`, so every connect
+    /// goes straight to the relay path even on perfectly punchable links.
     ///
     /// `local_udp_port` is our own bound KAD UDP port; eMule uses the
     /// same port for inbound and the actual NAT mapping is usually
@@ -268,10 +268,10 @@ fn build_nat_info_from_results(
             // requires a STUN CHANGE-REQUEST test (asking a server to
             // reply from a different IP/port) which this prober doesn't
             // send. `PortRestricted` is used as the conservative default
-            // for "consistent port, filtering unknown" — `is_punchable()`
-            // already treats it the same as the friendlier cone types, so
-            // hole-punch strategy selection isn't affected by not
-            // producing `FullCone`/`RestrictedCone` here.
+            // for "consistent port, filtering unknown" — the punch gate
+            // only rejects `Symmetric`, so this is treated the same as the
+            // friendlier cone types and hole-punch strategy selection
+            // isn't affected by not producing `FullCone`/`RestrictedCone`.
             info!(
                 "NAT probe: port-restricted or better NAT (consistent port {})",
                 external_addr.port()

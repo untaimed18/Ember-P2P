@@ -18,10 +18,6 @@ pub const ALPHA: usize = 5;
 pub const ID_BITS: usize = 128;
 pub const MAX_CONTACTS_PER_RESPONSE: usize = 20;
 
-/// Republish intervals
-pub const KEYWORD_REPUBLISH_SECS: u64 = 12 * 3600;
-pub const SOURCE_REPUBLISH_SECS: u64 = 2 * 3600;
-
 /// Contact liveness
 pub const CONTACT_TIMEOUT_SECS: i64 = 600;
 pub const MAX_FAILED_QUERIES: u8 = 3;
@@ -61,10 +57,6 @@ impl EmberNodeId {
 
     pub fn to_hex(&self) -> String {
         hex::encode(self.0)
-    }
-
-    pub fn is_zero(&self) -> bool {
-        self.0 == [0u8; 16]
     }
 }
 

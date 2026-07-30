@@ -89,10 +89,6 @@ impl RoutingTable {
         }
     }
 
-    pub fn local_id(&self) -> &EmberNodeId {
-        &self.local_id
-    }
-
     pub fn total_contacts(&self) -> usize {
         self.buckets.iter().map(|b| b.contacts.len()).sum()
     }
@@ -341,6 +337,10 @@ impl RoutingTable {
     }
 
     /// Get a contact by node ID, if it exists in the routing table.
+    ///
+    /// Exercised only by this module's tests; the engine reaches contacts
+    /// through `find_closest` on the hot paths.
+    #[allow(dead_code)]
     pub fn get_contact(&self, node_id: &EmberNodeId) -> Option<&EmberContact> {
         let bucket_idx = match self.local_id.bucket_index(node_id) {
             Some(idx) => idx,
@@ -352,17 +352,6 @@ impl RoutingTable {
         self.buckets[bucket_idx]
             .find(&node_id)
             .map(|pos| &self.buckets[bucket_idx].contacts[pos])
-    }
-
-    /// Return bucket indices that need refreshing (no activity for `threshold_secs`).
-    pub fn stale_buckets(&self, threshold_secs: i64) -> Vec<usize> {
-        let now = chrono::Utc::now().timestamp();
-        self.buckets
-            .iter()
-            .enumerate()
-            .filter(|(_, b)| !b.contacts.is_empty() && (now - b.last_activity) > threshold_secs)
-            .map(|(i, _)| i)
-            .collect()
     }
 
     /// Pick non-empty bucket indices to refresh, stalest first, capped at

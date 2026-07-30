@@ -36,7 +36,10 @@ pub struct DhtRecord {
     pub signature: [u8; 64],
     /// Ed25519 public key of the publisher.
     pub publisher_key: [u8; 32],
-    /// When this record was stored locally.
+    /// When this record was stored locally. Retained for diagnostics and
+    /// `Debug` output; expiry and replication are driven by `expires_at`
+    /// and `last_republished` rather than by store time.
+    #[allow(dead_code)]
     pub stored_at: Instant,
     /// When this record expires.
     pub expires_at: Instant,
@@ -165,6 +168,10 @@ impl DhtStore {
     /// Retrieve all records for a key (including any that have lapsed but not
     /// yet been swept by [`Self::expire`]). Prefer [`Self::get_live`] on the
     /// serving path.
+    ///
+    /// Only this module's tests call it, precisely because they need to
+    /// observe pre-sweep state that `get_live` deliberately hides.
+    #[allow(dead_code)]
     pub fn get(&self, key: &[u8; 16]) -> Option<&Vec<DhtRecord>> {
         self.entries.get(key)
     }

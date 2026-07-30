@@ -67,11 +67,14 @@ impl DhtProtection {
         }
     }
 
+    /// Count of frames refused by the rate limiter. Read by this module's
+    /// tests; kept for the diagnostics surface to report drops.
+    #[allow(dead_code)]
     pub fn dropped_rate_limited(&self) -> u64 {
         self.dropped_rate
     }
 
-    /// Returns 	rue when the frame should be processed.
+    /// Returns true when the frame should be processed.
     pub fn allow_message(&mut self, ip: IpAddr, msg_type: u8) -> bool {
         let now = Instant::now();
         self.maybe_trim(now);

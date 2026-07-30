@@ -176,6 +176,12 @@ impl SignedRecord {
     }
 
     /// Verify this record's signature against the embedded publisher key.
+    ///
+    /// The live paths never need this: `from_wire` and `from_value_blob`
+    /// both verify before handing back a record, so anything parsed is
+    /// already checked. Kept as the standalone predicate those tests
+    /// assert through.
+    #[allow(dead_code)]
     pub fn verify(&self) -> bool {
         if let Some(pk) = crypto::verifying_key_from_bytes(&self.publisher_key) {
             crypto::verify(&pk, &self.data, &self.signature)

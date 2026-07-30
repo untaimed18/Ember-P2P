@@ -65,6 +65,10 @@ pub enum SearchType {
 #[derive(Debug, Clone)]
 pub struct SearchResultRecord {
     pub data: Vec<u8>,
+    /// Which node returned this record. Recorded for provenance in
+    /// diagnostics and `Debug` output; callers trust the record's own
+    /// publisher signature rather than the peer that relayed it.
+    #[allow(dead_code)]
     pub from_node: EmberNodeId,
 }
 

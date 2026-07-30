@@ -47,10 +47,6 @@ impl EmberObservedIpVotes {
         }
         None
     }
-
-    pub fn vote_count(&self, addr: &SocketAddr) -> usize {
-        self.votes.get(addr).map(|s| s.len()).unwrap_or(0)
-    }
 }
 
 fn reporter_net24(ip: IpAddr) -> Option<[u8; 3]> {
