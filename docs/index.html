@@ -702,6 +702,7 @@
       <a href="#download">Download</a>
       <a href="#releases">Releases</a>
       <a href="#epx">EPX</a>
+      <a href="#friends">Friends</a>
       <a href="#faq">FAQ</a>
       <a href="https://github.com/untaimed18/Ember-P2P" target="_blank" rel="noopener" class="gh-link">
         <svg width="18" height="18" viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
@@ -738,6 +739,7 @@
     <span class="toc-heading">Friends</span>
     <a href="#friends" class="toc-link">Ember Friends</a>
     <a href="#friends-features" class="toc-link toc-child">Features</a>
+    <a href="#friends-encryption" class="toc-link toc-child">E2E Encryption</a>
     <a href="#friends-privacy" class="toc-link toc-child">Privacy</a>
   </div>
 
@@ -792,7 +794,7 @@
     </div>
 
     <p>Ember is not a fork or reskin of eMule. It is a complete reimplementation of the eMule protocol stack in safe Rust, paired with a lightweight Tauri + Svelte shell. It speaks the same KAD wire protocol as eMule 0.50a and compatible clients (aMule, eMule Xtreme, etc.), participates in the same network, finds the same sources, and respects the same credit system. On first launch Ember can seed a community <code>server.met</code> from emule-security.org; you connect to KAD and ED2K servers when you choose (or enable optional auto-connect in Settings).</p>
-    <p>Ember also introduces <a href="#epx">EPX (Ember Peer Exchange)</a>, an Ember-exclusive extension that accelerates source discovery between Ember peers without affecting compatibility with other clients.</p>
+    <p>Ember also introduces <a href="#epx">EPX (Ember Peer Exchange)</a> for faster source discovery between Ember peers, and an Ember-exclusive <a href="#friends">Friends</a> system with <strong>end-to-end encrypted</strong> chat, Noise-secured sessions, and privacy-preserving Friend Codes &mdash; all invisible to non-Ember clients.</p>
   </section>
 
   <hr>
@@ -824,7 +826,7 @@
       <div class="hl-card">
         <div class="hl-icon">&#x1F6E1;</div>
         <h4>Security &amp; Privacy</h4>
-        <p>RC4 protocol obfuscation, IP filtering with automatic updates and configurable incoming filter for VPN compatibility, private IP blocking, path traversal protection, and strict CSP headers.</p>
+        <p>End-to-end friend chat encryption, signed anti-rollback updates, RC4 protocol obfuscation, IP filtering with automatic updates, private IP blocking, confirmed deep links, and strict CSP headers.</p>
       </div>
       <div class="hl-card">
         <div class="hl-icon">&#x26A1;</div>
@@ -844,7 +846,7 @@
       <div class="hl-card">
         <div class="hl-icon">&#x1F465;</div>
         <h4>Ember Friends</h4>
-        <p>Add other Ember users as friends by sharing your Friend ID. Ember finds them instantly through its rendezvous server. Once mutual, enjoy real-time online status, direct chat, remote file browsing, and priority upload slots.</p>
+        <p>Share a Friend Code, connect through the rendezvous server, then chat end-to-end encrypted over Noise-secured sessions. Mutual friends also get remote browsing, friends-only shares, file offers, priority uploads, and transfers that can work without HighID.</p>
       </div>
     </div>
   </section>
@@ -857,7 +859,7 @@
 
     <div class="download-box">
       <img src="icon.png" alt="Ember" width="80" height="80" style="border-radius: 16px; margin-bottom: 16px; box-shadow: 0 4px 16px rgba(0,0,0,0.12);">
-      <h3>Get Ember 1.2.1</h3>
+      <h3>Get Ember 1.3.4</h3>
       <p>The latest release is available on GitHub for Windows 10 and Windows 11.</p>
       <div class="btn-group">
         <a href="https://github.com/untaimed18/Ember-P2P/releases/latest" class="btn btn-primary" target="_blank" rel="noopener">
@@ -904,6 +906,10 @@
         <strong>Share &amp; Download</strong><br>
         <span style="color: var(--text-secondary)">Add folders to your library, search with Global / Server / KAD methods, open <code>ed2k://</code> links, and start downloading. Ember handles multi-source transfers, queue management, and source discovery automatically.</span>
       </li>
+      <li>
+        <strong>Add Friends (optional)</strong><br>
+        <span style="color: var(--text-secondary)">Open the Friends page, share your <strong>Friend Code</strong>, and add theirs. Once mutual and online, you get end-to-end encrypted chat, remote file browsing, and priority upload slots. See <a href="#friends">Friends</a>.</span>
+      </li>
     </ol>
 
     <div class="callout">
@@ -925,7 +931,7 @@
       <li><strong>NAT Traversal</strong> &mdash; UPnP automatic port mapping, firewall detection, KAD buddy relay for LowID peers, and EPX peer-relay (ERAT) for LowID&harr;LowID paths when attestations allow.</li>
       <li><strong>STUN Port Keep-Alive</strong> &mdash; Periodic STUN plus a TCP hold from your listen port keeps NAT mappings alive and advertises the discovered public TCP/UDP ports for High ID. Designed for CGNAT and full-cone NAT when UPnP is unavailable; auto-suspends on symmetric or unstable remapping.</li>
       <li><strong>Protocol Obfuscation</strong> &mdash; RC4-based TCP and UDP header encryption to help with ISP throttling.</li>
-      <li><strong>Deep Links</strong> &mdash; Opens <code>ed2k://</code> URIs and <code>.emulecollection</code> files from the OS (including while Ember is already running).</li>
+      <li><strong>Deep Links</strong> &mdash; Opens <code>ed2k://</code> URIs and <code>.emulecollection</code> files from the OS (including while Ember is already running). Incoming links require <strong>confirm / review</strong> before opening, and pending links can be reviewed later.</li>
     </ul>
 
     <h3>Transfers</h3>
@@ -949,12 +955,16 @@
 
     <h3>Social</h3>
     <ul>
-      <li><strong>Ember Friends</strong> &mdash; Ember-exclusive friend system powered by a rendezvous server for instant discovery. Add other Ember users by their Friend ID, exchange friend requests, and once mutual enjoy real-time online status, direct chat, remote file browsing, and priority upload slots. See the <a href="#friends">Friends section</a> for details.</li>
+      <li><strong>Ember Friends</strong> &mdash; Ember-exclusive friend system powered by a rendezvous server. Share a <strong>v2 Friend Code</strong>, exchange mutual requests, then enjoy real-time online status, remote file browsing, friends-only shares, file offers, priority upload slots, durable offline chat, and <strong>end-to-end encrypted</strong> messaging. See the <a href="#friends">Friends section</a> for details.</li>
+      <li><strong>E2E Friend Chat</strong> &mdash; Mutual-friend messages use static X25519 ECDH + AEAD end-to-end encryption after session setup. The chat UI shows an <strong>Encrypted</strong> badge; plaintext fallbacks are rejected. Conversation history is encrypted in the local database, and outbound messages queue until the friend is reachable again.</li>
+      <li><strong>Noise-Secured Friend Sessions</strong> &mdash; Friend connections use <strong>Noise IK</strong> secure streams with Ed25519 proof-of-possession before chat, browse, offers, and verified friend privileges unlock. Friend file transfers can also run over the same secure path when ordinary HighID/callback routes are unavailable.</li>
       <li><strong>Credits &amp; SecIdent</strong> &mdash; RSA-based Secure Identification prevents credit theft. Upload priority follows the standard credit ratio formula.</li>
     </ul>
 
     <h3>Security</h3>
     <ul>
+      <li><strong>Signed Anti-Rollback Updates</strong> &mdash; In-app updates are cryptographically signed and gated by security epochs, so installs only advance when the signed epoch allows it.</li>
+      <li><strong>Safer File Opens</strong> &mdash; Deep links require confirm / review; Library drag-and-drop shared folders ask for a system folder-picker confirmation; media and upload paths pin approved handles to avoid path-swap races.</li>
       <li><strong>IP Filtering</strong> &mdash; Load ipfilter.dat / ipfilter.zip with automatic update support. Incoming connection filtering is off by default because VPN IP ranges commonly appear in ipfilter.dat hosting blocks, silently blocking legitimate peers. Outbound filtering remains active regardless of this setting.</li>
       <li><strong>Anti-Leech Filter</strong> &mdash; Reject incoming connections from known leech client patterns (customizable regex list in Settings).</li>
       <li><strong>Private IP Blocking</strong> &mdash; Prevents connections to reserved IP ranges.</li>
@@ -969,7 +979,7 @@
       <li><strong>Close to System Tray</strong> &mdash; Keep Ember running in the tray when the window is closed (configurable in Settings).</li>
       <li><strong>Backup &amp; Restore</strong> &mdash; Settings &gt; Backup saves your whole profile to a single passphrase-encrypted <code>.emberbackup</code> file: identity and SecIdent keys, upload credits, settings, shared-folder list, known files, friends, chat history, transfer list, server and Kad contacts, IP filter, and learned spam data. The files you share and part-finished downloads are <em>not</em> included, so a backup stays small. Encryption is mandatory because the archive contains your private keys, and a lost passphrase cannot be recovered. Your identity keys are unwrapped from Windows DPAPI into the encrypted archive and re-wrapped for whichever Windows account restores them, so a restore on a new machine keeps your user hash, credits and friendships instead of silently rotating them. Restores are prepared immediately and applied while Ember next starts (the files being replaced are in use while it runs); the replaced originals are kept in a <code>pre-restore-&lt;timestamp&gt;</code> folder beside them, and a pending restore can be discarded from the same screen before it is applied. A restore that has sat waiting for more than a month is dropped rather than applied on top of the profile you have been using since; the backup file is untouched, so you can simply import it again. Two things to expect after restoring onto a <em>different</em> machine: shared and download folders need re-approving in Settings, and if the backup carried the database without <code>chat-history.key</code>, existing chat history stays sealed.</li>
       <li><strong>Statistics</strong> &mdash; Session and cumulative transfer statistics, connection uptime, and network health indicators.</li>
-      <li><strong>Automatic Updates</strong> &mdash; Ember checks for new versions on launch and installs cryptographically signed updates in-app with one click. You can also check manually under Settings &gt; About.</li>
+      <li><strong>Automatic Updates</strong> &mdash; Ember checks for new versions on launch and installs cryptographically signed, anti-rollback updates in-app with one click. You can also check manually under Settings &gt; About.</li>
       <li><strong>Languages</strong> &mdash; Full UI localization for English, Spanish, French, Brazilian Portuguese, German, and Simplified Chinese, with a Settings language picker and system-language detection.</li>
       <li><strong>GeoIP</strong> &mdash; Country identification for connected peers via bundled MaxMind DB.</li>
     </ul>
@@ -1045,9 +1055,9 @@ peer_count    (u16 LE)
     <p>Ember includes a built-in friend system that works exclusively between Ember users. It is powered by a separate cryptographic identity called the <strong>Ember Hash</strong> (also known as your <strong>Friend ID</strong>), which is distinct from the standard ed2k <code>user_hash</code> used for protocol operations and credits.</p>
 
     <h3>How it works</h3>
-    <p>Each Ember client generates a unique 16-byte Ember Hash on first launch. This hash serves as your <strong>Friend ID</strong> &mdash; share it with someone and they can find you on the network instantly.</p>
-    <p>Friend discovery is powered by a lightweight <strong>rendezvous server</strong>. When you connect, Ember registers your presence (a SHA-256 hash of your Friend ID &mdash; never the raw ID) with the server. When you search for a friend, Ember queries the server for their hashed ID and gets back their IP and port for a direct connection. The entire lookup takes about 100ms.</p>
-    <p>Once a friend is found, Ember opens a direct TCP connection for the friend request. After both sides accept, a persistent session is established for chat, file browsing, and priority uploads.</p>
+    <p>Each Ember client generates a unique 16-byte Ember Hash on first launch. Share a <strong>v2 Friend Code</strong> (shown on the Friends page) with someone so they can find you on the network. Friend Codes carry the identity needed for privacy-preserving rendezvous lookup without exposing a long-lived raw hash in casual sharing.</p>
+    <p>Friend discovery is powered by a lightweight <strong>rendezvous server</strong>. When you connect, Ember registers presence using hashed capabilities (never your raw Friend ID in the clear). When you search for a friend, Ember queries the server and gets back an IP and port for a direct connection. Adding or accepting a friend forces a presence refresh so discovery does not wait on the normal heartbeat interval.</p>
+    <p>Once a friend is found, Ember opens a direct TCP connection and establishes a <strong>Noise IK</strong> secure stream with Ed25519 proof-of-possession. After both sides accept the friend request, chat, file browsing, file offers, friends-only shares, and priority uploads unlock on that secured session. When both friends are behind difficult NAT, Ember can still move friend file traffic over the secure session (and optional peer relay) without waiting for HighID.</p>
 
     <div class="callout-info callout">
       <p><strong>Ember-only:</strong> The friend system is completely invisible to non-Ember clients. It uses a separate identity hash, a dedicated rendezvous server, and dedicated protocol tags that other eMule clients silently ignore.</p>
@@ -1055,17 +1065,34 @@ peer_count    (u16 LE)
 
     <h3 id="friends-features">Features</h3>
     <ul>
-      <li><strong>Add by Friend ID</strong> &mdash; Share your Friend ID with another user (displayed on the Friends page) and add theirs. Ember finds them through the rendezvous server and sends a friend request.</li>
-      <li><strong>Mutual Friend Requests</strong> &mdash; The recipient sees an incoming request notification on the Friends page and can accept or reject it. Chat, file browsing, and priority upload features only activate once both sides have accepted.</li>
-      <li><strong>Real-Time Online Status</strong> &mdash; Ember detects when a friend comes online and shows a live online/offline indicator on their card.</li>
-      <li><strong>Direct Messaging</strong> &mdash; Send and receive chat messages with mutual friends through a slide-out sidebar. Messages are stored locally for conversation history.</li>
+      <li><strong>v2 Friend Codes</strong> &mdash; Share a Friend Code from the Friends page instead of only a raw Friend ID. Codes support privacy-preserving pairwise presence so mutual chat and browse can unlock once both sides have added each other.</li>
+      <li><strong>Mutual Friend Requests</strong> &mdash; The recipient sees an incoming request on the Friends page and can accept or reject it. Chat, file browsing, offers, and priority upload features only activate once both sides have accepted <strong>and</strong> a secure friend session is established.</li>
+      <li><strong>Real-Time Online Status</strong> &mdash; Ember detects when a friend comes online and shows a live online/offline indicator on their card. The Friends page also surfaces when you are not currently discoverable on the rendezvous network.</li>
+      <li><strong>End-to-End Encrypted Chat</strong> &mdash; Send and receive messages with mutual friends through a slide-out sidebar. After session setup, messages are encrypted end-to-end; the UI shows an <strong>Encrypted</strong> badge. Outbound messages queue locally and retry when the friend reconnects. See <a href="#friends-encryption">E2E Encryption</a>.</li>
       <li><strong>Remote File Browsing</strong> &mdash; Browse a mutual friend&rsquo;s shared file library while they are online and start downloads directly from the browse results.</li>
+      <li><strong>Friends-Only Shares</strong> &mdash; Mark Library files as friends-only so they stay out of public search and only mutual friends can request them.</li>
+      <li><strong>Friend File Offers</strong> &mdash; Push a specific shared file to a mutual friend from the Friends page. Offers appear as actionable notifications the recipient can accept or decline.</li>
+      <li><strong>Friend Transfers Without HighID</strong> &mdash; Mutual-friend downloads can use the Noise-secured friend session (and optional Ember peer relay) when ordinary HighID or callback paths are unavailable&mdash;useful when both sides are behind difficult NAT.</li>
       <li><strong>Priority Upload Slots</strong> &mdash; Mutual friends automatically receive priority in your upload queue, giving them faster access to your shared files.</li>
-      <li><strong>Discoverable Banner</strong> &mdash; The Friends page shows a confirmation banner when your Friend ID is registered and discoverable on the network.</li>
+      <li><strong>Friend Block List</strong> &mdash; Block a Friend ID so future requests, chat, browse, and offers from that identity are rejected. Existing mutual friendships with that identity are removed when you block.</li>
+      <li><strong>Optional Friend Relaying</strong> &mdash; Help friends connect (Settings) lets your client advertise willingness to assist other Ember peers with LowID&harr;LowID paths when attestations allow. You can turn this off if you prefer not to relay.</li>
+      <li><strong>Discoverable Banner</strong> &mdash; The Friends page shows a confirmation banner when your identity is registered and discoverable, and warns when presence registration failed so friends may not find you.</li>
     </ul>
 
+    <h3 id="friends-encryption">E2E Encryption</h3>
+    <p>Friend chat is designed so the rendezvous server and any on-path observer never see message plaintext after a secure session is up.</p>
+    <ul>
+      <li><strong>Noise IK sessions</strong> &mdash; Friend connections negotiate a Noise_IK secure stream authenticated with Ed25519 proof-of-possession before chat, browse, offer, and friends-only privileges unlock.</li>
+      <li><strong>End-to-end chat crypto</strong> &mdash; Messages use static X25519 ECDH + AEAD. After session setup, plaintext chat fallbacks are rejected. Outbound messages that cannot be delivered stay queued and are retried on reconnect.</li>
+      <li><strong>Encrypted local history</strong> &mdash; Conversation history is encrypted at rest in the local database.</li>
+      <li><strong>Clear UI signals</strong> &mdash; The chat UI shows an <strong>Encrypted</strong> badge when the secure channel is active, and reconnect-oriented errors when encryption or the friend session fails.</li>
+    </ul>
+    <div class="callout">
+      <p><strong>Note:</strong> EPX source exchange and Ember mesh peer discovery can unlock earlier from HELLO hash&harr;pubkey binding between Ember peers. Friend privileges (chat, browse, offers, friends-only shares, verified requests) still require a secure friend session / proof-of-possession.</p>
+    </div>
+
     <h3 id="friends-privacy">Privacy</h3>
-    <p>The rendezvous server stores presence as a SHA-256 hash of your Friend ID (never the raw ID), paired with IP and port. Registration is pubkey-bound and signature-checked so entries cannot be spoofed with a stolen hash alone. Entries expire automatically after 5 minutes without a heartbeat. Between Ember peers, the Ember Hash is exchanged via the private <code>OP_EMBER_HELLO</code> / <code>OP_EMBER_HELLOANSWER</code> handshake (with Ed25519 proof-of-possession on TCP) &mdash; not via the legacy EmuleInfo path used for ordinary eMule metadata.</p>
+    <p>The rendezvous server stores presence as hashed capabilities derived from your Friend identity (never the raw Friend ID in the clear), paired with IP and port. Registration is pubkey-bound and signature-checked so entries cannot be spoofed with a stolen hash alone. Entries expire automatically after 5 minutes without a heartbeat. Between Ember peers, the Ember Hash is exchanged via the private <code>OP_EMBER_HELLO</code> / <code>OP_EMBER_HELLOANSWER</code> handshake (with Ed25519 proof-of-possession on TCP) &mdash; not via the legacy EmuleInfo path used for ordinary eMule metadata.</p>
   </section>
 
   <hr>
@@ -1183,6 +1210,8 @@ peer_count    (u16 LE)
         <tr><td>Database</td><td>SQLite via rusqlite</td></tr>
         <tr><td>Networking</td><td>Tokio async runtime</td></tr>
         <tr><td>Friend Discovery</td><td>Rendezvous server (Axum on Fly.io)</td></tr>
+        <tr><td>Friend Sessions</td><td>Noise IK + Ed25519 PoP</td></tr>
+        <tr><td>Friend Chat Crypto</td><td>X25519 ECDH + AEAD (E2E)</td></tr>
         <tr><td>GeoIP</td><td>MaxMind DB (dbip-country-lite)</td></tr>
       </tbody>
     </table>
@@ -1280,7 +1309,15 @@ npm run tauri build</code></pre>
         How do Friends work? Can I add non-Ember users?
         <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
       </button>
-      <div class="faq-a">Friends are an Ember-exclusive feature. Each Ember client has a unique Friend ID (shown on the Friends page) that you share with other Ember users. Add their Friend ID, and Ember instantly finds them through its rendezvous server and sends a friend request. Once both sides accept, the friendship becomes mutual and activates online status, chat, file browsing, and priority uploads. Non-Ember clients do not have a Friend ID and cannot participate in the friend system.</div>
+      <div class="faq-a">Friends are an Ember-exclusive feature. Share a <strong>v2 Friend Code</strong> from the Friends page with another Ember user. Ember finds them through its rendezvous server and sends a friend request. Once both sides accept and a secure Noise session is established, mutual friends unlock online status, <strong>end-to-end encrypted</strong> chat, remote file browsing, friends-only shares, file offers, priority uploads, and transfers that can work without HighID. You can also block a Friend ID to reject future contact. Non-Ember clients do not have a Friend ID / Friend Code and cannot participate.</div>
+    </div>
+
+    <div class="faq-item">
+      <button class="faq-q" onclick="this.parentElement.classList.toggle('open')">
+        Is friend chat end-to-end encrypted?
+        <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="faq-a">Yes. Mutual-friend sessions use Noise IK secure streams with Ed25519 proof-of-possession. Chat messages then use static X25519 ECDH + AEAD end-to-end encryption; plaintext chat fallbacks are rejected after session setup. The chat UI shows an <strong>Encrypted</strong> badge when the secure channel is active. Outbound messages queue until the friend is reachable again, and conversation history is encrypted in the local database. The rendezvous server only helps with discovery &mdash; it never sees message plaintext.</div>
     </div>
 
     <div class="faq-item">
@@ -1304,7 +1341,7 @@ npm run tauri build</code></pre>
         How does Ember update itself?
         <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
       </button>
-      <div class="faq-a">Ember checks for a newer version automatically on launch and shows a non-blocking notification when one is available. You can install it in-app with one click &mdash; no need to download installers manually &mdash; and Ember restarts into the new version. You can also check anytime under Settings &gt; About. Every release is cryptographically signed, and Ember verifies the signature before installing.</div>
+      <div class="faq-a">Ember checks for a newer version automatically on launch and shows a non-blocking notification when one is available. You can install it in-app with one click &mdash; no need to download installers manually &mdash; and Ember restarts into the new version. You can also check anytime under Settings &gt; About. Every release is cryptographically signed, and Ember verifies the signature before installing. Updates are also gated by signed <strong>security epochs</strong> (anti-rollback), so installs only advance when the signed epoch allows it.</div>
     </div>
 
     <div class="faq-item">
@@ -1330,6 +1367,324 @@ npm run tauri build</code></pre>
   <section id="releases">
     <h2>Release History</h2>
     <p>Official Ember releases for Windows. Notes mirror the <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">GitHub Releases</a> changelog style. Ember can also update itself in-app when a signed release is published.</p>
+
+    <article class="release" id="release-1-3-4">
+      <div class="release-header">
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.3.4" target="_blank" rel="noopener">Ember v1.3.4</a></h3>
+        <time class="release-date" datetime="2026-07-31">July 31, 2026</time>
+      </div>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.3.4" target="_blank" rel="noopener"><code>v1.3.4</code></a></p>
+      <div class="release-notes">
+        <h4>What&rsquo;s Changed</h4>
+
+        <h5>Backup &amp; Restore</h5>
+        <ul>
+          <li><strong>Move Ember to a New PC</strong> &mdash; Settings &gt; Backup writes your whole profile to one passphrase-encrypted <code>.emberbackup</code> file and restores it on another machine or after a reinstall. Your identity, secure-identification keys and upload credits come across, so your standing on the network survives the move</li>
+          <li><strong>What It Covers</strong> &mdash; Identity and SecIdent keys, credits, settings, shared-folder list, known files, friends, chat history, transfer list, server and Kad contacts, IP filter, and learned spam data. The files you share and part-finished downloads stay out, so the backup stays small</li>
+          <li><strong>Always Encrypted</strong> &mdash; The archive contains your private keys, so a passphrase is required rather than optional, and Windows-bound key material is re-wrapped for whichever account restores it. A lost passphrase cannot be recovered</li>
+          <li><strong>Safe Restores</strong> &mdash; A restore is prepared immediately and applied while Ember next starts, because the files it replaces are in use while Ember runs. The replaced originals are kept in a <code>pre-restore</code> folder, and a pending restore can be discarded before it is applied</li>
+        </ul>
+
+        <h5>Transfers</h5>
+        <ul>
+          <li><strong>Stop All and Cancel All</strong> &mdash; Both now sit beside Pause All and Resume All in the toolbar&rsquo;s More menu. With the Filter box narrowed they act only on the downloads you can see, and the confirmation says which filter it matched</li>
+          <li><strong>Bulk Actions on Finished Downloads</strong> &mdash; Completed and failed rows can be selected like active ones and removed from the list together, instead of one right-click at a time. Your files are kept; only the list entries go</li>
+          <li><strong>Clearer Selection</strong> &mdash; Each bulk button reports how many rows it would affect and greys out when none apply, so a mixed selection cannot silently do nothing</li>
+        </ul>
+
+        <h5>Search</h5>
+        <ul>
+          <li><strong>Copy eD2K Links</strong> &mdash; Copy the link for one result, for every ticked result, or for the whole list at once, from the right-click menu, the selection bar, or Ctrl+C. No need to start a download just to get its link</li>
+        </ul>
+
+        <h5>Fixes</h5>
+        <ul>
+          <li>Ember no longer looks like an eMule misreporting its version. The MuleInfo packet carried a real version byte where eMule expects a sentinel, which matched what anti-leecher mods treat as a spoofed client and could cost users upload slots or credit score</li>
+        </ul>
+
+        <p class="full-changelog">
+          <strong>Full Changelog</strong>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.3.3...v1.3.4" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.3.3...v1.3.4</a>
+        </p>
+      </div>
+    </article>
+
+    <article class="release" id="release-1-3-3">
+      <div class="release-header">
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.3.3" target="_blank" rel="noopener">Ember v1.3.3</a></h3>
+        <time class="release-date" datetime="2026-07-29">July 29, 2026</time>
+      </div>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.3.3" target="_blank" rel="noopener"><code>v1.3.3</code></a></p>
+      <div class="release-notes">
+        <h4>What&rsquo;s Changed</h4>
+
+        <h5>Friends</h5>
+        <ul>
+          <li><strong>Friends-Only Shares</strong> &mdash; Mark Library files as friends-only so they stay out of public search and only mutual friends can request them. Non-friends are refused at the protocol layer</li>
+          <li><strong>Friend File Offers</strong> &mdash; Push a specific shared file to a mutual friend from the Friends page. Offers appear as actionable notifications the recipient can accept or decline, with rate limits and expiry</li>
+          <li><strong>Friend Transfers Without HighID</strong> &mdash; Mutual-friend downloads can use the Noise-secured friend session when ordinary HighID or callback paths are unavailable. Ember can also discover optional peer relays through friend gossip for harder NAT cases</li>
+          <li><strong>Friend Block List</strong> &mdash; Block a Friend ID so future requests, chat, browse, and offers from that identity are rejected. Blocking also removes any existing mutual friendship with that identity</li>
+          <li><strong>Durable Offline Chat Queue</strong> &mdash; Outbound friend messages stay queued across reconnects and app restarts, then retry when the friend session is back. Undeliverable messages surface as failed instead of hanging forever</li>
+          <li><strong>Discoverability Clarity</strong> &mdash; The Friends page warns when you are not currently discoverable on the rendezvous network, and friend cards can show when a peer is online but not reachable for a direct connection</li>
+          <li><strong>Optional Friend Relaying</strong> &mdash; Help friends connect (Settings) controls whether your client advertises willingness to assist LowID&harr;LowID paths. Turn it off if you prefer not to relay for others</li>
+          <li><strong>Friend Chat Polish</strong> &mdash; Clearer conversation grouping, day separators, and tab scrolling in the chat dock</li>
+        </ul>
+
+        <h5>Fixes</h5>
+        <ul>
+          <li>Friends-only share flags are preserved across Library rescans and resume paths, and enforced for in-progress downloads&mdash;not only fresh requests</li>
+          <li>Friend relay discovery works in both directions on secure friend sessions, with safer candidate caps and clearer failure attribution so good relays are not dropped for target-side refusals</li>
+          <li>Friend file-offer handling is harder to spam, and friend-connect hints no longer mis-attribute progress to the wrong peer</li>
+        </ul>
+
+        <p class="full-changelog">
+          <strong>Full Changelog</strong>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.3.2...v1.3.3" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.3.2...v1.3.3</a>
+        </p>
+      </div>
+    </article>
+
+    <article class="release" id="release-1-3-2">
+      <div class="release-header">
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.3.2" target="_blank" rel="noopener">Ember v1.3.2</a></h3>
+        <time class="release-date" datetime="2026-07-26">July 26, 2026</time>
+      </div>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.3.2" target="_blank" rel="noopener"><code>v1.3.2</code></a></p>
+      <div class="release-notes">
+        <h4>What&rsquo;s Changed</h4>
+
+        <h5>Reliability</h5>
+        <ul>
+          <li>Ember no longer fails to start when a shared or download folder&rsquo;s filesystem identity has changed &mdash; for example a folder that was deleted and recreated, or a re-imaged drive. The affected folder is <strong>revoked</strong> instead and can be re-approved from Settings, so a stale record can never keep the app from launching</li>
+          <li>Unreadable folder-approval state is quarantined rather than treated as fatal</li>
+          <li><strong>Panics are now written to <code>ember.log</code></strong>, so a crash during startup records its cause instead of closing silently</li>
+        </ul>
+
+        <h5>Friends</h5>
+        <ul>
+          <li>Friend downloads reconnect after <strong>both</strong> clients restart &mdash; a rediscovered friend&rsquo;s address is reseeded into your existing download sources</li>
+          <li><strong>Friend cards redesigned</strong>: one compact row per friend, presence shown once, and secondary actions (Browse, Reconnect, Copy Friend ID, Remove) collected in an overflow menu with the Friend ID and last address</li>
+          <li><strong>Friend browse redesigned</strong>: download controls are clearly visible and a filter box narrows a large shared library</li>
+          <li>Far fewer interruptions &mdash; no toast when a friend comes online or goes offline, since the card already shows it. Actionable notices (behind a firewall, needs a newer Ember) still appear</li>
+        </ul>
+
+        <h5>Transfers &amp; Statistics</h5>
+        <ul>
+          <li><strong>Known Clients</strong> now shows a friend&rsquo;s nickname, last address, country, and last-seen instead of just a name</li>
+          <li>Statistics: <strong>File Requests</strong> protocol overhead is now actually measured &mdash; it previously always read zero</li>
+        </ul>
+
+        <h5>Interface</h5>
+        <ul>
+          <li><strong>Fits laptop screens</strong>: the sidebar auto-collapses on narrower windows, the status bar and Transfers columns compact, and the Library folder drawer overlays instead of squeezing the file table. 4K layouts are unchanged</li>
+          <li>The default window is now 1400&times;900 so the app fits without scrolling on a 16&Prime; laptop</li>
+          <li>Unread chats show as a <strong>blue dot</strong> rather than an orange count</li>
+          <li>KAD page: removed the redundant Ember peers and EPX sources tiles (both remain in the status bar)</li>
+        </ul>
+
+        <p class="full-changelog">
+          <strong>Full Changelog</strong>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.3.1...v1.3.2" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.3.1...v1.3.2</a>
+        </p>
+      </div>
+    </article>
+
+    <article class="release" id="release-1-3-1">
+      <div class="release-header">
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.3.1" target="_blank" rel="noopener">Ember v1.3.1</a></h3>
+        <time class="release-date" datetime="2026-07-25">July 25, 2026</time>
+      </div>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.3.1" target="_blank" rel="noopener"><code>v1.3.1</code></a></p>
+      <div class="release-notes">
+        <h4>What's Changed</h4>
+
+        <h5>Friends</h5>
+        <ul>
+          <li>Fix one-sided Add Friend when both peers are online: friend-code <strong>intro presence</strong> lets you find someone before mutual pairwise capabilities exist</li>
+          <li>Force a rendezvous presence refresh on add/accept so discovery doesn&rsquo;t wait ~2 minutes</li>
+          <li>Clearer &ldquo;not found&rdquo; messaging when the peer is offline or still needs to add you back</li>
+        </ul>
+
+        <h5>Ember / EPX</h5>
+        <ul>
+          <li>Unlock EPX and Ember mesh peer discovery on HELLO <strong>hash&harr;pubkey binding</strong> (legacy PoP is disabled and was blocking StatusBar EPX / KAD Ember peer count)</li>
+          <li>Friend privileges (chat, browse, verified requests) still require secure friend session / PoP</li>
+        </ul>
+
+        <p class="full-changelog">
+          <strong>Full Changelog</strong>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.3.0...v1.3.1" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.3.0...v1.3.1</a>
+        </p>
+      </div>
+    </article>
+
+    <article class="release" id="release-1-3-0">
+      <div class="release-header">
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.3.0" target="_blank" rel="noopener">Ember v1.3.0</a></h3>
+        <time class="release-date" datetime="2026-07-25">July 25, 2026</time>
+      </div>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.3.0" target="_blank" rel="noopener"><code>v1.3.0</code></a></p>
+      <div class="release-notes">
+        <h4>What's New</h4>
+        <p>Security and Friends-focused release: end-to-end friend chat, hardened sessions and updater, safer file opens, and a batch of Library / EPX / connectivity fixes since v1.2.3. <strong>Please report any issues you have with these features.</strong></p>
+        <ul>
+          <li>Friend chat is <strong>end-to-end encrypted</strong> (static X25519 ECDH + AEAD); plaintext chat fallbacks are rejected after session setup</li>
+          <li>Chat UI shows an <strong>Encrypted</strong> badge and clearer reconnect-oriented errors when encryption fails</li>
+          <li>Friend sessions use <strong>Noise IK</strong> secure streams, with chat history encrypted in the local database</li>
+          <li><strong>v2 Friend Codes</strong> and privacy-preserving rendezvous capabilities (pairwise presence); Friends page explains how mutual chat/browse unlocks</li>
+          <li><strong>Signed anti-rollback updater</strong> with security epochs &mdash; installs only advance when the signed epoch allows it</li>
+          <li>Deep links require <strong>confirm / review</strong> before opening (pending links can be reviewed later)</li>
+          <li>Library drag-and-drop shared folders asks you to <strong>confirm in a system folder picker</strong> before sharing</li>
+          <li>Queued downloads that exceed the safety budget are <strong>quarantined</strong> (not deleted), with an in-app notice</li>
+          <li>Corrupted / unreadable ban&ndash;reputation policy prompts an explicit <strong>acknowledge &amp; reset</strong> before networking continues</li>
+          <li>Default window size is <strong>1920&times;1200</strong> on first launch</li>
+          <li>Secure updater treats a missing update manifest or signature (<strong>HTTP 404</strong>) as &ldquo;no update,&rdquo; so checks don&rsquo;t fail while release assets are still publishing</li>
+          <li>First-run / Settings IP filter download uses the live <strong><code>ipfilter.zip</code></strong> mirror (same as Security) and persists the enable preference</li>
+        </ul>
+
+        <h4>What's Fixed</h4>
+
+        <h5>Library &amp; media</h5>
+        <ul>
+          <li>Library activity, collections, media playback, and bulk actions persist and clear busy state correctly</li>
+          <li>Media serve no longer reopens files by path after approval (TOCTOU); reads stay on the approved handle</li>
+        </ul>
+
+        <h5>Friends, EPX &amp; transfers</h5>
+        <ul>
+          <li><code>EmuleInfo</code> no longer clears Ember identity during EPX auth</li>
+          <li>AICH trust is scoped to the local file hash; AICH upload requests use the pinned open handle</li>
+          <li>Oversized UDP exchanges are refused; ERAT trailer space is reserved; UDP ingest is rate-limited</li>
+          <li>Attestation expiry is honored; reserved EPX versions are rejected; mesh discovery requires PoP</li>
+          <li>Friend / Ember upload-queue priority flags reset correctly across sessions (no sticky queue boost)</li>
+          <li>Archive recovery hashing opens the recovery file handle-safe instead of reopening by path</li>
+          <li>Upload / completion paths pin approved handles so path-swap races can&rsquo;t slip through</li>
+        </ul>
+
+        <h5>Connectivity &amp; rendezvous</h5>
+        <ul>
+          <li>NAT TCP mappings are discovered over <strong>TCP</strong>, not inferred from UDP STUN readings</li>
+          <li>Friend punch no longer fail-opens on legacy proof v3 during v4 sessions; rendezvous filters legacy entries on v4 polls</li>
+          <li>Mailbox delivery is page-cached with <strong>idempotent replay</strong> so a crash mid-page can&rsquo;t permanently skip messages</li>
+          <li>Rendezvous / friend flows stay compatible across protocol v3 and v4 without breaking stock eMule traffic</li>
+        </ul>
+
+        <h5>Updater, deep links &amp; setup</h5>
+        <ul>
+          <li>Install stays offered when a verified pending update is retained after the native updater clears pending state</li>
+          <li>Deferred deep links survive handler remounts without duplicate reopen</li>
+          <li>Windows shared-folder prepare no longer deletes an opened directory entry on path/type mismatch</li>
+          <li>Missing translation for invalid terminal deep links (<code>deeplink_terminal_invalid</code>)</li>
+        </ul>
+
+        <p class="full-changelog">
+          <strong>Full Changelog</strong>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.2.3...v1.3.0" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.2.3...v1.3.0</a>
+        </p>
+      </div>
+    </article>
+
+    <article class="release" id="release-1-2-3">
+      <div class="release-header">
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.2.3" target="_blank" rel="noopener">Ember v1.2.3</a></h3>
+        <time class="release-date" datetime="2026-07-22">July 22, 2026</time>
+      </div>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.2.3" target="_blank" rel="noopener"><code>v1.2.3</code></a></p>
+      <div class="release-notes">
+        <h4>What's New</h4>
+        <p>Connectivity fix for STUN/NATMAP keep-alive: the remapped public TCP port is advertised again, and LowID sessions reconnect so the eD2k server learns it. Please report any issues you have with this feature.</p>
+        <ul>
+          <li>When STUN keep-alive confirms a remapped public <strong>TCP port</strong> while you are still <strong>LowID</strong>, Ember reconnects to the eD2k server (with a 60s cooldown) so the server can retry HighID connect-back with the corrected port</li>
+        </ul>
+
+        <h4>What's Fixed</h4>
+        <ul>
+          <li>STUN keep-alive again <strong>advertises</strong> the twin-probe&rsquo;s public TCP port (stability-gated: corroborated immediately, or after two matching readings) instead of always mirroring the configured listen port &mdash; HighID / public port status can improve behind full-cone NAT and CGNAT</li>
+          <li>A remapped TCP port discovered <strong>after</strong> login is no longer stuck unused on an already-connected LowID session</li>
+        </ul>
+
+        <p class="full-changelog">
+          <strong>Full Changelog</strong>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.2.2...v1.2.3" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.2.2...v1.2.3</a>
+        </p>
+      </div>
+    </article>
+
+    <article class="release" id="release-1-2-2">
+      <div class="release-header">
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.2.2" target="_blank" rel="noopener">Ember v1.2.2</a></h3>
+        <time class="release-date" datetime="2026-07-21">July 21, 2026</time>
+      </div>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.2.2" target="_blank" rel="noopener"><code>v1.2.2</code></a></p>
+      <div class="release-notes">
+        <h4>What's New</h4>
+        <p>Reliability-focused release: Library sharing and large-collection workflows, download source counting, Settings save hangs, relay/friend connects, and KAD publish validation.</p>
+        <ul>
+          <li>Library shows a clear warning when a shared folder hits the <strong>100,000-file</strong> per-folder indexing cap</li>
+          <li><strong>Settings</strong> / <strong>Security</strong> report whether saves, <code>nodes.dat</code>, and IP filter updates were <strong>applied live</strong>, <strong>deferred</strong>, or need a <strong>restart</strong></li>
+          <li>Collection <strong>create / load</strong> uses native OS dialogs (exports are no longer forced into shared/download folders)</li>
+          <li><code>ed2k://</code> links and collection opens are <strong>persisted</strong> until successfully handled, so they survive relaunches and setup-wizard restarts</li>
+        </ul>
+
+        <h4>What's Fixed</h4>
+
+        <h5>Library</h5>
+        <ul>
+          <li>Stale <strong>pending share / priority intents</strong> no longer silently re-share or flip priority after a rehash</li>
+          <li>Share, unshare, and priority changes persist more safely (with rollback) and apply <strong>hash-wide</strong> across identical copies</li>
+          <li>Bulk share / unshare / priority actions work on <strong>large selections</strong> (batched IPC)</li>
+          <li><strong>Remove missing</strong> keeps clearing until the scan is actually finished (no leftover missing rows after the 10k batch limit)</li>
+          <li>Large collections: <strong>Download All</strong> queues in chunks instead of failing wholesale, with skip / oversize / failure feedback</li>
+          <li><strong>Top Uploads</strong> de-dupes by hash, shows <strong>total uploaded</strong>, and explains unattributed older history when only aggregate totals exist</li>
+          <li>Keyboard shortcuts work again with the collections panel open; blocked correctly during stop-hash confirmation</li>
+          <li>In-app media playback uses a scoped <strong><code>ember-media</code></strong> protocol that re-checks shared/download roots per request</li>
+          <li>Duplicate library copies no longer force unnecessary rehashes of non-canonical paths</li>
+        </ul>
+
+        <h5>Downloads &amp; Sources</h5>
+        <ul>
+          <li>Ephemeral <strong>callback / push-grant ports</strong> are session-only &mdash; they no longer inflate per-download <strong>source counts</strong> across relaunches</li>
+          <li>Resume and reasks prefer <strong>dialable</strong> listening ports and skip undialable ephemerals</li>
+          <li><strong>Max download file size</strong> aligned to the ED2K wire limit (<strong>593 GiB</strong>); large-file part-count / hashset handling no longer truncates into bogus values</li>
+          <li><strong>MultiPacket</strong> parsing more tolerant of peer extended-request variants</li>
+        </ul>
+
+        <h5>Sharing &amp; Settings</h5>
+        <ul>
+          <li>Saving Settings no longer <strong>hangs</strong> behind long library hash/scans when shared folders change (folder reconcile runs in the background)</li>
+          <li>Removing a shared folder cancels in-progress scans under that root sooner</li>
+          <li>Clearer save / download outcome messaging when a live network apply must wait for restart</li>
+        </ul>
+
+        <h5>Relay, Rendezvous &amp; Friends</h5>
+        <ul>
+          <li>Friend <strong>relay tickets</strong> hardened (v3 candidate polling, quota / reservation cleanup, legacy v2 cursor sweep) for more reliable LowID friend connects</li>
+          <li><strong>Browse friend</strong> cancels and correlates by request ID &mdash; stale or swapped results no longer land in the wrong dialog</li>
+          <li>Friend sessions close/evict cleanly; relay tickets are limited to <strong>manually known friends</strong></li>
+          <li>STUN keep-alive no longer overrides your configured <strong>TCP listen port</strong> in Hello / advertising (UDP mapping stays UDP-only)</li>
+        </ul>
+
+        <h5>KAD &amp; Protocol</h5>
+        <ul>
+          <li>KAD <strong>keyword publishes</strong> without a filename, size, or tags are rejected (no more empty junk served back to searchers)</li>
+          <li>Published source entries with <strong>UDP port 0</strong> fall back to the packet&rsquo;s real source port (eMule-compatible)</li>
+          <li>Safer <code>.part.met</code> save-path guard cleanup after downloads are removed</li>
+        </ul>
+
+        <h5>Search &amp; UI</h5>
+        <ul>
+          <li><strong>Backspace</strong> no longer deletes a hovered saved search &mdash; only <strong>Delete</strong> removes recent entries</li>
+          <li>Deep-link handling no longer double-applies or drops links across restarts / HMR</li>
+          <li>Setup wizard reports deferred / failed live apply for <code>nodes.dat</code> and IP filter more clearly</li>
+          <li>Library table rows support <strong>Enter</strong> / <strong>Space</strong> keyboard activation; assorted i18n gaps filled</li>
+        </ul>
+
+        <p class="full-changelog">
+          <strong>Full Changelog</strong>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.2.1...v1.2.2" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.2.1...v1.2.2</a>
+        </p>
+      </div>
+    </article>
 
     <article class="release" id="release-1-2-1">
       <div class="release-header">
