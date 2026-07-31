@@ -932,6 +932,7 @@
     <ul>
       <li><strong>Multi-Source Downloads</strong> &mdash; Download from multiple peers simultaneously with part-level hash verification, automatic source rotation, and queue management.</li>
       <li><strong>Transfer Monitoring</strong> &mdash; Real-time progress bars, per-source detail drawers, upload tracking, health indicators, and archive recovery.</li>
+      <li><strong>Bulk Transfer Actions</strong> &mdash; Tick rows (or use the header checkbox) to pause, resume, stop or cancel many downloads at once, or use the Pause / Resume / Stop / Cancel All commands in the toolbar's More menu. Completed and failed rows can be selected the same way and removed from the list together; the files themselves are kept.</li>
       <li><strong>Upload Speed Sense (USS)</strong> &mdash; Optionally adjusts upload speed from network latency to reduce congestion (requires an upload speed limit).</li>
       <li><strong>AICH</strong> &mdash; Advanced Intelligent Corruption Handling for part-level hash verification and recovery.</li>
     </ul>
@@ -941,6 +942,7 @@
       <li><strong>Advanced Search</strong> &mdash; Global, Server, and KAD keyword search with multi-tab results plus type, size, source, and extension filters.</li>
       <li><strong>Spam Detection</strong> &mdash; Built-in spam detection with balanced and aggressive profiles. Configurable spam threshold and automatic result hiding.</li>
       <li><strong>Library Management</strong> &mdash; Virtual-scrolling tables that handle thousands of files. Sort, filter, bulk-edit priorities, scan for missing files, copy all eD2K links for the current view, and create collections.</li>
+      <li><strong>Copy eD2K Links from Search</strong> &mdash; Copy the link for one result, for every ticked result, or for the whole result list at once, from the context menu, the selection toolbar, or Ctrl+C.</li>
       <li><strong>In-App Media Player</strong> &mdash; Play supported audio and video from the Library detail drawer, with Open Externally still available.</li>
       <li><strong>Comments &amp; Ratings</strong> &mdash; Add metadata to your shared files for other peers to see.</li>
     </ul>
@@ -965,6 +967,7 @@
       <li><strong>First-Time Setup Wizard</strong> &mdash; Guided configuration on first launch: nickname, download folder, ports, speed limits, optional KAD auto-connect, and theme.</li>
       <li><strong>Clean UI</strong> &mdash; Modern, responsive interface with real-time transfer monitoring and inline search filtering.</li>
       <li><strong>Close to System Tray</strong> &mdash; Keep Ember running in the tray when the window is closed (configurable in Settings).</li>
+      <li><strong>Backup &amp; Restore</strong> &mdash; Settings &gt; Backup saves your whole profile to a single passphrase-encrypted <code>.emberbackup</code> file: identity and SecIdent keys, upload credits, settings, shared-folder list, known files, friends, chat history, transfer list, server and Kad contacts, IP filter, and learned spam data. The files you share and part-finished downloads are <em>not</em> included, so a backup stays small. Encryption is mandatory because the archive contains your private keys, and a lost passphrase cannot be recovered. Your identity keys are unwrapped from Windows DPAPI into the encrypted archive and re-wrapped for whichever Windows account restores them, so a restore on a new machine keeps your user hash, credits and friendships instead of silently rotating them. Restores are prepared immediately and applied while Ember next starts (the files being replaced are in use while it runs); the replaced originals are kept in a <code>pre-restore-&lt;timestamp&gt;</code> folder beside them, and a pending restore can be discarded from the same screen before it is applied. Two things to expect after restoring onto a <em>different</em> machine: shared and download folders need re-approving in Settings, and if the backup carried the database without <code>chat-history.key</code>, existing chat history stays sealed.</li>
       <li><strong>Statistics</strong> &mdash; Session and cumulative transfer statistics, connection uptime, and network health indicators.</li>
       <li><strong>Automatic Updates</strong> &mdash; Ember checks for new versions on launch and installs cryptographically signed updates in-app with one click. You can also check manually under Settings &gt; About.</li>
       <li><strong>Languages</strong> &mdash; Full UI localization for English, Spanish, French, Brazilian Portuguese, German, and Simplified Chinese, with a Settings language picker and system-language detection.</li>
@@ -1238,6 +1241,14 @@ npm run tauri build</code></pre>
         <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
       </button>
       <div class="faq-a">Yes. Ember speaks the same KAD wire protocol as eMule 0.50a and compatible clients (aMule, eMule Xtreme, etc.). It participates in the same network, finds the same sources, and respects the same credit system. Connect to KAD and/or an ED2K server from the app (or enable optional auto-connect in Settings). The EPX extension is only activated between Ember peers and is silently ignored by other clients.</div>
+    </div>
+
+    <div class="faq-item">
+      <button class="faq-q" onclick="this.parentElement.classList.toggle('open')">
+        How do I move Ember to a new PC without losing my credits?
+        <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="faq-a">Use Settings &gt; Backup. Choose a passphrase, create the backup, copy the single <code>.emberbackup</code> file across, then restore it on the new machine from the same screen and restart when prompted. Your user hash, SecIdent keys, upload credits, friends, known files and settings all come across, which is what keeps your standing on the network. The files you share are not in the backup, so copy those separately and re-add the folders in Settings &gt; Library &mdash; folders always need re-approving on a new machine. Keep the backup somewhere safe: it contains your private keys, and a lost passphrase cannot be recovered.</div>
     </div>
 
     <div class="faq-item">

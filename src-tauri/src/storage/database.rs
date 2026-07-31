@@ -13,6 +13,11 @@ use crate::types::*;
 
 const MAX_PEERS_ROWS: i64 = 10_000;
 const MAX_DOWNLOAD_HISTORY_ROWS: i64 = 5_000;
+/// Highest `schema_version` this build knows how to open. Opening a newer
+/// database, or restoring a backup taken from one, would invite subtle
+/// corruption (missing columns, renamed tables, changed semantics), so both
+/// paths refuse instead. Bump this when introducing a new migration.
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 25;
 const CHAT_KEY_FILE: &str = "chat-history.key";
 const CHAT_CIPHERTEXT_PREFIX: &str = "EMBRCHAT1:";
 const CHAT_UNAVAILABLE_TEXT: &str = "[Message unavailable]";
@@ -86,7 +91,11 @@ impl Database {
         }
     }
 
-    fn open_at(db_path: &std::path::Path) -> anyhow::Result<Self> {
+    /// Open (or create) a database at an explicit path, running migrations.
+    ///
+    /// `pub(crate)` so callers that already know the path can use it without a
+    /// Tauri handle, notably the backup round-trip test.
+    pub(crate) fn open_at(db_path: &std::path::Path) -> anyhow::Result<Self> {
         // Repair ACLs before SQLite touches the main file or its WAL/SHM
         // sidecars. A prior ACL-hardening bug could leave those sidecars with
         // an empty DACL, in which case `Connection::open` fails before the
@@ -444,16 +453,13 @@ impl Database {
             .unwrap_or(0);
 
         // Refuse to run against a database that was last opened by a newer
-        // Ember build. Silently running would invite subtle data corruption
-        // (missing columns, renamed tables, semantic changes). Bump this
-        // when introducing a new migration.
-        const MAX_SUPPORTED_VERSION: i64 = 25;
-        if version > MAX_SUPPORTED_VERSION {
+        // Ember build.
+        if version > MAX_SUPPORTED_SCHEMA_VERSION {
             anyhow::bail!(
                 "Database schema version {version} is newer than this Ember build supports \
-                 (max {MAX_SUPPORTED_VERSION}). The database was likely written by a more \
-                 recent version of Ember. Install that version to access this data; refusing \
-                 to start to avoid corruption."
+                 (max {MAX_SUPPORTED_SCHEMA_VERSION}). The database was likely written by a \
+                 more recent version of Ember. Install that version to access this data; \
+                 refusing to start to avoid corruption."
             );
         }
 
@@ -1054,6 +1060,39 @@ impl Database {
             tx.commit()?;
         }
 
+        Ok(())
+    }
+
+    /// `schema_version` recorded in the open database.
+    pub fn schema_version(&self) -> i64 {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
+    }
+
+    /// Write a consistent, self-contained copy of the live database to `dest`.
+    ///
+    /// `VACUUM INTO` runs inside a read transaction and produces a single file
+    /// with no WAL sidecar, which is what a backup needs: copying `ember.db`
+    /// by hand while the app is running captures a file whose newest
+    /// committed rows are still only in `ember.db-wal`.
+    pub fn snapshot_to(&self, dest: &std::path::Path) -> anyhow::Result<()> {
+        // SQLite refuses to overwrite an existing target.
+        if dest.exists() {
+            std::fs::remove_file(dest)?;
+        }
+        let dest_str = dest
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Snapshot path is not valid UTF-8"))?;
+        {
+            let conn = self.conn.lock();
+            conn.execute("VACUUM INTO ?1", params![dest_str])?;
+        }
+        crate::security::restrict_file_permissions(dest);
         Ok(())
     }
 

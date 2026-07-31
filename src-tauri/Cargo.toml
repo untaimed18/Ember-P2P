@@ -119,6 +119,7 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 # `sha2` version already uses — 0.13 upgrades to `digest` 0.11 and would
 # pull in a second, incompatible hashing stack.
 hkdf = "0.12"
+argon2 = "0.5"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

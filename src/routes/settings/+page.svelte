@@ -23,6 +23,17 @@
   import { goto } from '$app/navigation';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { relaunch } from '@tauri-apps/plugin-process';
+  import {
+    discardPendingRestore,
+    exportBackup,
+    importBackup,
+    pendingRestoreStatus,
+    previewBackup,
+    type BackupPreview,
+    type PendingRestoreStatus,
+    type RestoreSummary,
+  } from '$lib/api/backup';
+  import { formatSize } from '$lib/utils';
   import type { AppSettings, SpamStats, DownloadHistoryStats } from '$lib/types';
   import { onMount, untrack } from 'svelte';
   import { theme, applyTheme, type Theme } from '$lib/stores/theme';
@@ -159,6 +170,167 @@
   let restarting = $state(false);
   let pendingRestartReason = $state('');
 
+  // --- Backup / restore ---
+  // A restore cannot be applied while the app is running (SQLite holds the
+  // database open, and identity/config are already in memory), so the backend
+  // stages it and the swap happens during the next launch. That makes the
+  // restart part of the operation rather than an optional follow-up.
+  let backupPassphrase = $state('');
+  let backupPassphraseConfirm = $state('');
+  let backupBusy = $state(false);
+  let backupMessage: string | null = $state(null);
+  let backupIsError = $state(false);
+  let restorePassphrase = $state('');
+  let restoreSource: string | null = $state(null);
+  let restorePreview: BackupPreview | null = $state(null);
+  let restoreStaged: RestoreSummary | null = $state(null);
+  let pendingRestore: PendingRestoreStatus | null = $state(null);
+
+  function showBackupMsg(msg: string, isError: boolean) {
+    backupMessage = msg;
+    backupIsError = isError;
+  }
+
+  async function refreshPendingRestore() {
+    try {
+      pendingRestore = await pendingRestoreStatus();
+    } catch (e) {
+      // Only a status read; a failure here must not make the section unusable.
+      console.error('Pending-restore check failed:', e);
+    }
+  }
+
+  // Lazily checked the first time the Backup section is opened (or on load if
+  // it is the active one), matching how the Security section defers its own
+  // snapshot. A staged restore survives restarts, so this has to be shown
+  // whenever the user comes back - not just after the import that created it.
+  let pendingRestoreChecked = false;
+  $effect(() => {
+    if (activeSection !== 'backup' || pendingRestoreChecked) return;
+    pendingRestoreChecked = true;
+    void refreshPendingRestore();
+  });
+
+  async function handleDiscardPendingRestore() {
+    if (backupBusy) return;
+    backupBusy = true;
+    try {
+      await discardPendingRestore();
+      pendingRestore = null;
+      restoreStaged = null;
+      showBackupMsg(m.settings_backup_pending_discarded(), false);
+    } catch (e) {
+      showBackupMsg(translateError(e, m.settings_backup_restore_failed()), true);
+    } finally {
+      backupBusy = false;
+    }
+  }
+
+  function clearRestoreState() {
+    restoreSource = null;
+    restorePreview = null;
+    restorePassphrase = '';
+  }
+
+  async function handleExportBackup() {
+    if (backupBusy) return;
+    if (backupPassphrase !== backupPassphraseConfirm) {
+      showBackupMsg(m.settings_backup_passphrase_mismatch(), true);
+      return;
+    }
+    let dest: string | null = null;
+    try {
+      const { save } = await import('@tauri-apps/plugin-dialog');
+      dest = await save({
+        defaultPath: `ember-backup-${new Date().toISOString().slice(0, 10)}.emberbackup`,
+        filters: [{ name: m.settings_backup_file_kind(), extensions: ['emberbackup'] }],
+      });
+    } catch (e) {
+      showBackupMsg(translateError(e, m.settings_backup_export_failed()), true);
+      return;
+    }
+    if (!dest) return;
+    // Not every platform's save dialog appends the filter's extension, and the
+    // backend insists on it. Adding it here beats rejecting the user's choice.
+    if (!dest.toLowerCase().endsWith('.emberbackup')) dest = `${dest}.emberbackup`;
+    backupBusy = true;
+    showBackupMsg(m.settings_backup_exporting(), false);
+    try {
+      const summary = await exportBackup(dest, backupPassphrase);
+      backupPassphrase = '';
+      backupPassphraseConfirm = '';
+      showBackupMsg(
+        m.settings_backup_export_done({
+          files: summary.files,
+          size: formatSize(summary.bytes),
+          path: summary.path,
+        }),
+        false,
+      );
+    } catch (e) {
+      showBackupMsg(translateError(e, m.settings_backup_export_failed()), true);
+    } finally {
+      backupBusy = false;
+    }
+  }
+
+  async function handlePickBackupFile() {
+    try {
+      const { open } = await import('@tauri-apps/plugin-dialog');
+      const selected = await open({
+        multiple: false,
+        directory: false,
+        filters: [{ name: m.settings_backup_file_kind(), extensions: ['emberbackup'] }],
+      });
+      if (typeof selected === 'string') {
+        restoreSource = selected;
+        restorePreview = null;
+        backupMessage = null;
+      }
+    } catch (e) {
+      showBackupMsg(translateError(e, m.settings_backup_restore_failed()), true);
+    }
+  }
+
+  /** Decrypt and describe the chosen backup without touching anything, so the
+   *  user can see what they are about to overwrite before committing. */
+  async function handlePreviewBackup() {
+    if (backupBusy || !restoreSource) return;
+    backupBusy = true;
+    showBackupMsg(m.settings_backup_reading(), false);
+    try {
+      restorePreview = await previewBackup(restoreSource, restorePassphrase);
+      backupMessage = null;
+      if (restorePreview.schema_too_new) {
+        showBackupMsg(m.settings_backup_schema_too_new(), true);
+      }
+    } catch (e) {
+      restorePreview = null;
+      showBackupMsg(translateError(e, m.settings_backup_restore_failed()), true);
+    } finally {
+      backupBusy = false;
+    }
+  }
+
+  async function handleImportBackup() {
+    if (backupBusy || !restoreSource) return;
+    backupBusy = true;
+    showBackupMsg(m.settings_backup_restoring(), false);
+    try {
+      restoreStaged = await importBackup(restoreSource, restorePassphrase);
+      clearRestoreState();
+      backupMessage = null;
+      await refreshPendingRestore();
+      showRestoreRestartPrompt = true;
+    } catch (e) {
+      showBackupMsg(translateError(e, m.settings_backup_restore_failed()), true);
+    } finally {
+      backupBusy = false;
+    }
+  }
+
+  let showRestoreRestartPrompt = $state(false);
+
   let historyClearMsg: string | null = $state(null);
   let historyStats: DownloadHistoryStats | null = $state(null);
   let historyStatsLoading = $state(false);
@@ -257,7 +429,7 @@
   let spamStatsLoading = $state(false);
   let spamStatsError: string | null = $state(null);
   let spamResetting = $state(false);
-  type SettingsSection = 'general' | 'downloads' | 'bandwidth' | 'network' | 'security' | 'friends' | 'search' | 'about';
+  type SettingsSection = 'general' | 'downloads' | 'bandwidth' | 'network' | 'security' | 'friends' | 'search' | 'backup' | 'about';
   let activeSection: SettingsSection = $state('general');
 
   const sections: SettingsSection[] = [
@@ -268,6 +440,7 @@
     'security',
     'friends',
     'search',
+    'backup',
     'about',
   ];
 
@@ -280,6 +453,7 @@
       case 'security': return m.settings_section_security();
       case 'friends': return m.settings_section_friends();
       case 'search': return m.settings_section_search();
+      case 'backup': return m.settings_section_backup();
       case 'about': return m.settings_section_about();
     }
   }
@@ -1289,6 +1463,12 @@
                   <circle cx="8.5" cy="8.5" r="5.5"/>
                   <line x1="12.5" y1="12.5" x2="17" y2="17"/>
                 </svg>
+              {:else if section === 'backup'}
+                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="2.5" y="4" width="15" height="4" rx="1"/>
+                  <path d="M4 8v7.5c0 .6.4 1 1 1h10c.6 0 1-.4 1-1V8"/>
+                  <line x1="8" y1="11.5" x2="12" y2="11.5"/>
+                </svg>
               {:else if section === 'about'}
                 <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                   <circle cx="10" cy="10" r="7.5"/>
@@ -2107,6 +2287,141 @@
         </div>
       </section>
 
+      <!-- Backup & Restore -->
+      <section class="card" class:hidden={activeSection !== 'backup'}>
+        <div class="card-header">
+          <span class="card-icon">&#128190;</span>
+          <div>
+            <h3>{m.settings_section_backup()}</h3>
+            <p class="card-desc">{m.settings_backup_desc()}</p>
+          </div>
+        </div>
+        <div class="card-body">
+          {#if pendingRestore?.pending}
+            <div class="field pending-restore" role="status">
+              <span class="field-label">{m.settings_backup_pending_title()}</span>
+              <span class="hint">
+                {m.settings_backup_pending_message({
+                  files: pendingRestore.files,
+                  version: pendingRestore.app_version,
+                  when: new Date(pendingRestore.staged_at * 1000).toLocaleString(),
+                })}
+              </span>
+              <div class="action-row">
+                <button class="action-btn" onclick={performRestart} disabled={backupBusy}>
+                  {m.settings_restart_now()}
+                </button>
+                <button class="danger" onclick={handleDiscardPendingRestore} disabled={backupBusy}>
+                  {m.settings_backup_pending_discard()}
+                </button>
+              </div>
+            </div>
+          {/if}
+          <div class="field">
+            <span class="field-label">{m.settings_backup_contents_label()}</span>
+            <span class="hint">{m.settings_backup_contents_hint()}</span>
+            <span class="hint">{m.settings_backup_excludes_hint()}</span>
+          </div>
+
+          <div class="field">
+            <label for="backup-passphrase">{m.settings_backup_passphrase_label()}</label>
+            <span class="hint">{m.settings_backup_passphrase_hint()}</span>
+            <input
+              id="backup-passphrase"
+              type="password"
+              autocomplete="new-password"
+              bind:value={backupPassphrase}
+              placeholder={m.settings_backup_passphrase_placeholder()}
+            />
+          </div>
+          <div class="field">
+            <label for="backup-passphrase-confirm">{m.settings_backup_passphrase_confirm_label()}</label>
+            <input
+              id="backup-passphrase-confirm"
+              type="password"
+              autocomplete="new-password"
+              bind:value={backupPassphraseConfirm}
+            />
+          </div>
+          <div class="action-row">
+            <button
+              class="action-btn"
+              onclick={handleExportBackup}
+              disabled={backupBusy || backupPassphrase.length === 0}
+            >{m.settings_backup_export()}</button>
+          </div>
+
+          <!-- Hidden while a restore is staged: importing a second one is
+               refused by the backend, so the banner's Restart / Discard pair
+               is the only sensible next step. -->
+          <div class="field" class:hidden={pendingRestore?.pending}>
+            <span class="field-label">{m.settings_backup_restore_label()}</span>
+            <span class="hint">{m.settings_backup_restore_hint()}</span>
+            <div class="action-row">
+              <button class="action-btn" onclick={handlePickBackupFile} disabled={backupBusy}>
+                {m.settings_backup_choose_file()}
+              </button>
+            </div>
+            {#if restoreSource}
+              <span class="hint backup-path" title={restoreSource}>{restoreSource}</span>
+              <label for="restore-passphrase">{m.settings_backup_restore_passphrase_label()}</label>
+              <input
+                id="restore-passphrase"
+                type="password"
+                autocomplete="current-password"
+                bind:value={restorePassphrase}
+              />
+              <div class="action-row">
+                <button
+                  class="action-btn"
+                  onclick={handlePreviewBackup}
+                  disabled={backupBusy || restorePassphrase.length === 0}
+                >{m.settings_backup_inspect()}</button>
+                {#if restorePreview && !restorePreview.schema_too_new}
+                  <button class="danger" onclick={handleImportBackup} disabled={backupBusy}>
+                    {m.settings_backup_restore_now()}
+                  </button>
+                {/if}
+                <button class="action-btn" onclick={clearRestoreState} disabled={backupBusy}>
+                  {m.common_cancel()}
+                </button>
+              </div>
+            {/if}
+            {#if restorePreview}
+              <div class="backup-preview">
+                <div class="spam-stat">
+                  <span>{m.settings_backup_preview_created()}</span>
+                  <strong>{new Date(restorePreview.created_at * 1000).toLocaleString()}</strong>
+                </div>
+                <div class="spam-stat">
+                  <span>{m.settings_backup_preview_version()}</span>
+                  <strong>{restorePreview.app_version}</strong>
+                </div>
+                <div class="spam-stat">
+                  <span>{m.settings_backup_preview_files()}</span>
+                  <strong>{restorePreview.files.length}</strong>
+                </div>
+                <div class="spam-stat">
+                  <span>{m.settings_backup_preview_size()}</span>
+                  <strong>{formatSize(restorePreview.total_bytes)}</strong>
+                </div>
+                <div class="spam-stat">
+                  <span>{m.settings_backup_preview_identity()}</span>
+                  <strong>{restorePreview.includes_identity ? m.common_yes() : m.common_no()}</strong>
+                </div>
+              </div>
+              <span class="hint">{m.settings_backup_restore_warning()}</span>
+            {/if}
+          </div>
+
+          {#if backupMessage}
+            <span class="hint" style={backupIsError ? 'color: var(--danger)' : 'color: var(--success)'}>
+              {backupMessage}
+            </span>
+          {/if}
+        </div>
+      </section>
+
       <!-- About & Updates -->
       <section class="card" class:hidden={activeSection !== 'about'}>
         <div class="card-header">
@@ -2243,6 +2558,23 @@
   cancelLabel={m.settings_restart_later()}
   onconfirm={performRestart}
   oncancel={dismissRestartPrompt}
+/>
+
+<!--
+  The staged restore is only applied while nothing has the database, config or
+  identity open, which means during startup. Restarting now is therefore the
+  normal path; declining just defers the swap to the next launch.
+-->
+<ConfirmDialog
+  bind:open={showRestoreRestartPrompt}
+  title={m.settings_backup_restore_staged_title()}
+  message={m.settings_backup_restore_staged_message({
+    files: restoreStaged?.staged.length ?? 0,
+    version: restoreStaged?.app_version ?? '',
+  })}
+  confirmLabel={m.settings_restart_now()}
+  cancelLabel={m.settings_restart_later()}
+  onconfirm={performRestart}
 />
 
 <ConfirmDialog
@@ -2470,7 +2802,8 @@
     to   { opacity: 1; transform: translateY(0); }
   }
 
-  .card.hidden {
+  .card.hidden,
+  .field.hidden {
     display: none;
   }
 
@@ -3307,6 +3640,28 @@
   .spam-stat strong {
     font-size: 15px;
     color: var(--text-primary);
+  }
+
+  .backup-preview {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    gap: 8px;
+    margin-top: 8px;
+  }
+
+  .pending-restore {
+    border: 1px solid var(--warning);
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--warning) 10%, transparent);
+    padding: 10px;
+  }
+
+  .backup-path {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--font-mono, monospace);
   }
 
   .history-grid {

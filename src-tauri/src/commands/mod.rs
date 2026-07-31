@@ -1,3 +1,4 @@
+pub mod backup;
 pub mod collections;
 pub mod comments;
 pub mod deeplink;

@@ -106,6 +106,19 @@
       ],
     },
     {
+      title: () => m.shortcuts_section_search(),
+      shortcuts: [
+        { keys: ['Ctrl', 'C'], label: () => m.shortcuts_search_copy_links() },
+      ],
+    },
+    {
+      title: () => m.shortcuts_section_transfers(),
+      shortcuts: [
+        { keys: ['↑ / ↓'], label: () => m.shortcuts_transfers_navigate() },
+        { keys: ['Delete'], label: () => m.shortcuts_transfers_delete() },
+      ],
+    },
+    {
       title: () => m.shortcuts_section_chat(),
       shortcuts: [
         { keys: ['Ctrl', '/'], label: () => m.shortcuts_toggle_chat() },

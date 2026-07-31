@@ -1325,6 +1325,18 @@
 
   let visibleActiveDownloadIds = $derived.by(() => new Set(filteredActiveDownloads.map((t) => t.id)));
 
+  // Every row the user can currently click or tick, in render order: the
+  // active rows followed by the completed/failed ones (which only exist on
+  // screen while that section is expanded). Selection, shift-ranges and
+  // arrow-key navigation all walk this list so finished rows can be picked
+  // in bulk and removed, instead of one right-click at a time.
+  let filteredSelectableDownloads = $derived.by(() =>
+    completedCollapsed
+      ? filteredActiveDownloads
+      : [...filteredActiveDownloads, ...filteredCompletedDownloads]
+  );
+  let visibleSelectableDownloadIds = $derived.by(() => new Set(filteredSelectableDownloads.map((t) => t.id)));
+
   let selectedTransfer = $derived.by(() => {
     if (selectedDownloadIds.length !== 1) return null;
     return allDownloads.find((t) => t.id === selectedDownloadIds[0]) ?? null;
@@ -1334,7 +1346,7 @@
 
   function resolveLastClickedDlIndex(): number {
     if (!lastClickedDlId) return -1;
-    return filteredActiveDownloads.findIndex((t) => t.id === lastClickedDlId);
+    return filteredSelectableDownloads.findIndex((t) => t.id === lastClickedDlId);
   }
 
   let preClickSelection: string[] | null = null;
@@ -1347,13 +1359,13 @@
     }
     lastRowClickTime = now;
 
-    const idx = filteredActiveDownloads.indexOf(t);
+    const idx = filteredSelectableDownloads.indexOf(t);
     const lastIdx = resolveLastClickedDlIndex();
     if (e.shiftKey && lastIdx >= 0) {
       e.preventDefault();
       const lo = Math.min(lastIdx, idx);
       const hi = Math.max(lastIdx, idx);
-      const rangeIds = filteredActiveDownloads.slice(lo, hi + 1).map((x) => x.id);
+      const rangeIds = filteredSelectableDownloads.slice(lo, hi + 1).map((x) => x.id);
       const merged = new Set([...selectedDownloadIds, ...rangeIds]);
       selectedDownloadIds = [...merged];
     } else if (e.ctrlKey || e.metaKey) {
@@ -1370,12 +1382,12 @@
   }
 
   function toggleDlCheck(t: Transfer, shiftKey: boolean) {
-    const idx = filteredActiveDownloads.indexOf(t);
+    const idx = filteredSelectableDownloads.indexOf(t);
     const lastIdx = resolveLastClickedDlIndex();
     if (shiftKey && lastIdx >= 0 && lastIdx !== idx) {
       const lo = Math.min(lastIdx, idx);
       const hi = Math.max(lastIdx, idx);
-      const rangeIds = filteredActiveDownloads.slice(lo, hi + 1).map((x) => x.id);
+      const rangeIds = filteredSelectableDownloads.slice(lo, hi + 1).map((x) => x.id);
       const merged = new Set([...selectedDownloadIds, ...rangeIds]);
       selectedDownloadIds = [...merged];
     } else {
@@ -1388,27 +1400,27 @@
     lastClickedDlId = t.id;
   }
 
-  let allActiveDlChecked = $derived(
-    filteredActiveDownloads.length > 0 &&
-    filteredActiveDownloads.every((t) => selectedDlIdSet.has(t.id))
+  let allVisibleDlChecked = $derived(
+    filteredSelectableDownloads.length > 0 &&
+    filteredSelectableDownloads.every((t) => selectedDlIdSet.has(t.id))
   );
-  let someActiveDlChecked = $derived(
-    filteredActiveDownloads.some((t) => selectedDlIdSet.has(t.id))
+  let someVisibleDlChecked = $derived(
+    filteredSelectableDownloads.some((t) => selectedDlIdSet.has(t.id))
   );
   let selectAllDownloadsCheckbox: HTMLInputElement | undefined = $state(undefined);
   $effect(() => {
     if (selectAllDownloadsCheckbox) {
       selectAllDownloadsCheckbox.indeterminate =
-        someActiveDlChecked && !allActiveDlChecked;
+        someVisibleDlChecked && !allVisibleDlChecked;
     }
   });
 
   function toggleDlCheckAll() {
-    if (allActiveDlChecked) {
-      const visibleIds = new Set(filteredActiveDownloads.map((t) => t.id));
+    if (allVisibleDlChecked) {
+      const visibleIds = visibleSelectableDownloadIds;
       selectedDownloadIds = selectedDownloadIds.filter((id) => !visibleIds.has(id));
     } else {
-      const merged = new Set([...selectedDownloadIds, ...filteredActiveDownloads.map((t) => t.id)]);
+      const merged = new Set([...selectedDownloadIds, ...filteredSelectableDownloads.map((t) => t.id)]);
       selectedDownloadIds = [...merged];
     }
   }
@@ -1418,11 +1430,30 @@
     lastClickedDlId = null;
   }
 
-  function transfersForBatchAction(): Transfer[] {
-    return selectedDownloadIds
-      .map((id) => allDownloads.find((x) => x.id === id))
-      .filter((x): x is Transfer => x !== undefined);
+  function isFinished(t: Transfer): boolean {
+    return t.status === 'completed' || t.status === 'failed';
   }
+
+  // A selection can now mix live and finished rows, so each batch button
+  // reports how many rows it would actually touch and disables itself when
+  // that count is zero — clicking "Resume" on a selection of finished
+  // downloads should look inert, not silently do nothing.
+  //
+  // This recomputes on every progress flush, so it resolves ids through a map
+  // rather than scanning `allDownloads` per selected row: a large selection on
+  // a long list would otherwise cost thousands of comparisons a second.
+  let selectedBatchTransfers = $derived.by(() => {
+    if (selectedDownloadIds.length === 0) return [];
+    const byId = new Map(allDownloads.map((t) => [t.id, t] as const));
+    return selectedDownloadIds
+      .map((id) => byId.get(id))
+      .filter((t): t is Transfer => t !== undefined);
+  });
+  let selectedPausableCount = $derived(selectedBatchTransfers.filter((t) => canPause(t)).length);
+  let selectedResumableCount = $derived(selectedBatchTransfers.filter((t) => canResume(t)).length);
+  let selectedStoppableCount = $derived(selectedBatchTransfers.filter((t) => canStop(t)).length);
+  let selectedCancellableCount = $derived(selectedBatchTransfers.filter((t) => !isFinished(t)).length);
+  let selectedFinishedCount = $derived(selectedBatchTransfers.filter((t) => isFinished(t)).length);
   // Helper that prefers the EWMA-smoothed `liveSpeed` rate used for row
   // cells, falling back to the raw `t.speed` value from the backend. Sort
   // and totals need to agree with what the user sees in each row; using
@@ -1928,28 +1959,105 @@
   }
 
   async function handleBatchPauseDownloads() {
-    const ids = transfersForBatchAction().filter((t) => canPause(t)).map((t) => t.id);
+    const ids = selectedBatchTransfers.filter((t) => canPause(t)).map((t) => t.id);
     await runBatchPerId(ids, (id) => pauseTransfer(id), m.transfers_batch_label_paused());
   }
 
   async function handleBatchResumeDownloads() {
-    const ids = transfersForBatchAction().filter((t) => canResume(t)).map((t) => t.id);
+    const ids = selectedBatchTransfers.filter((t) => canResume(t)).map((t) => t.id);
     await runBatchPerId(ids, (id) => resumeTransfer(id), m.transfers_batch_label_resumed());
   }
 
   async function handleBatchStopDownloads() {
-    const ids = transfersForBatchAction().filter((t) => canStop(t)).map((t) => t.id);
+    const ids = selectedBatchTransfers.filter((t) => canStop(t)).map((t) => t.id);
     await runBatchPerId(ids, (id) => stopTransfer(id), m.transfers_batch_label_stopped());
   }
 
-  let confirmBatchCancel = $state({ open: false, ids: [] as string[], count: 0 });
+  /** Drop finished rows from the list. Same contract as the single-row
+   *  "Remove from List" action: the file on disk is left alone, only the
+   *  transfer record goes away, so this needs no confirmation. Rows leave
+   *  the table immediately and come back if the backend refuses. */
+  async function removeTransfersBatch(ids: string[]): Promise<void> {
+    if (!ids.length) return;
+    const idSet = new Set(ids);
+    const byId = new Map($transfers.map((t) => [t.id, t.file_name] as const));
+    let snapshots: Transfer[] = [];
+    transfers.update((list) => {
+      snapshots = list.filter((x) => idSet.has(x.id));
+      return list.filter((x) => !idSet.has(x.id));
+    });
+    for (const id of idSet) {
+      markDownloadRemoved(id);
+      speedHistory.delete(id);
+    }
+    selectedDownloadIds = selectedDownloadIds.filter((id) => !idSet.has(id));
+    if (lastClickedDlId && idSet.has(lastClickedDlId)) lastClickedDlId = null;
+    const failed: { id: string; name: string; error: string }[] = [];
+    for (const id of ids) {
+      try {
+        await removeTransfer(id);
+      } catch (e: unknown) {
+        failed.push({ id, name: byId.get(id) ?? '', error: toErrorMsg(e) });
+      }
+    }
+    if (failed.length) {
+      const failedIds = new Set(failed.map((f) => f.id));
+      for (const id of failedIds) clearDownloadRemoved(id);
+      transfers.update((list) => {
+        const existing = new Set(list.map((x) => x.id));
+        const toRestore = snapshots.filter((s) => failedIds.has(s.id) && !existing.has(s.id));
+        return toRestore.length ? [...list, ...toRestore] : list;
+      });
+    }
+    summarizeBatchResult(m.transfers_batch_label_removed(), ids.length, failed);
+  }
+
+  async function handleBatchRemoveDownloads() {
+    await removeTransfersBatch(selectedBatchTransfers.filter((t) => isFinished(t)).map((t) => t.id));
+  }
+
+  let confirmBatchCancel = $state({
+    open: false,
+    ids: [] as string[],
+    count: 0,
+    // Finished rows caught up in the same gesture: they can't be cancelled,
+    // so they're removed from the list once the cancels go through.
+    removeIds: [] as string[],
+    // Non-empty when the command was scoped by the filter box, so the prompt
+    // can say which subset is about to disappear.
+    filter: '',
+  });
 
   function handleBatchCancelDownloads() {
-    const ids = transfersForBatchAction()
-      .filter((t) => t.status !== 'completed' && t.status !== 'failed')
-      .map((t) => t.id);
+    const ids = selectedBatchTransfers.filter((t) => !isFinished(t)).map((t) => t.id);
     if (!ids.length) return;
-    confirmBatchCancel = { open: true, ids, count: ids.length };
+    confirmBatchCancel = { open: true, ids, count: ids.length, removeIds: [], filter: '' };
+  }
+
+  /** Rows a global "...All" command applies to. A narrowed filter box scopes
+   *  them: an "all" that reaches rows the user cannot see is how people lose
+   *  downloads they meant to keep. */
+  function globalDownloadTargets(): Transfer[] {
+    return transferFilter.trim() ? filteredActiveDownloads : activeDownloads;
+  }
+
+  async function handleStopAll() {
+    const ids = globalDownloadTargets().filter((t) => canStop(t)).map((t) => t.id);
+    if (!ids.length) { showInfo(m.transfers_nothing_to_stop()); return; }
+    await runBatchPerId(ids, (id) => stopTransfer(id), m.transfers_batch_label_stopped());
+  }
+
+  function handleCancelAll() {
+    const targets = globalDownloadTargets();
+    const ids = targets.filter((t) => !isFinished(t)).map((t) => t.id);
+    if (!ids.length) { showInfo(m.transfers_nothing_to_cancel()); return; }
+    confirmBatchCancel = {
+      open: true,
+      ids,
+      count: ids.length,
+      removeIds: [],
+      filter: transferFilter.trim(),
+    };
   }
 
   // --- Splitter ---
@@ -2728,7 +2836,7 @@
   });
 
   $effect.pre(() => {
-    const visible = visibleActiveDownloadIds;
+    const visible = visibleSelectableDownloadIds;
     const next = selectedDownloadIds.filter((id) => visible.has(id));
     if (next.length !== selectedDownloadIds.length) {
       selectedDownloadIds = next;
@@ -2761,20 +2869,27 @@
   const target = e.target as HTMLElement | null;
   const inEditable = target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
   if (inEditable || ctxMenu || knownCtxMenu || confirmCancel.open || confirmBan.open || confirmClearCompleted || confirmBatchCancel.open || confirmRecover.open) return;
-  if (filteredActiveDownloads.length === 0) return;
+  if (filteredSelectableDownloads.length === 0) return;
   const currentId = selectedDownloadIds[selectedDownloadIds.length - 1];
-  const idx = currentId ? filteredActiveDownloads.findIndex((t) => t.id === currentId) : -1;
+  const idx = currentId ? filteredSelectableDownloads.findIndex((t) => t.id === currentId) : -1;
   if (e.key === 'ArrowDown') {
-    const next = filteredActiveDownloads[Math.min(filteredActiveDownloads.length - 1, idx + 1)];
+    const next = filteredSelectableDownloads[Math.min(filteredSelectableDownloads.length - 1, idx + 1)];
     if (next) { selectedDownloadIds = [next.id]; lastClickedDlId = next.id; e.preventDefault(); }
   } else if (e.key === 'ArrowUp') {
-    const next = filteredActiveDownloads[Math.max(0, idx < 0 ? 0 : idx - 1)];
+    const next = filteredSelectableDownloads[Math.max(0, idx < 0 ? 0 : idx - 1)];
     if (next) { selectedDownloadIds = [next.id]; lastClickedDlId = next.id; e.preventDefault(); }
   } else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedDownloadIds.length > 0) {
-    // Match the explicit UI control: prompt, don't just vaporize rows.
-    const ids = [...selectedDownloadIds];
-    confirmBatchCancel = { open: true, ids, count: ids.length };
     e.preventDefault();
+    const cancelIds = selectedBatchTransfers.filter((t) => !isFinished(t)).map((t) => t.id);
+    const removeIds = selectedBatchTransfers.filter((t) => isFinished(t)).map((t) => t.id);
+    if (cancelIds.length === 0) {
+      // Nothing live in the selection, so this is the Remove action —
+      // which the footer button also performs without a prompt.
+      void removeTransfersBatch(removeIds);
+      return;
+    }
+    // Match the explicit UI control: prompt, don't just vaporize rows.
+    confirmBatchCancel = { open: true, ids: cancelIds, count: cancelIds.length, removeIds, filter: '' };
   }
 }} />
 
@@ -2848,6 +2963,10 @@
           <div class="toolbar-more-menu" role="menu">
             <button type="button" role="menuitem" onclick={(e) => { handlePauseAll(); (e.currentTarget.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open'); }}>{m.transfers_pause_all()}</button>
             <button type="button" role="menuitem" onclick={(e) => { handleResumeAll(); (e.currentTarget.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open'); }}>{m.transfers_resume_all()}</button>
+            {#if activeDownloads.length > 0}
+              <button type="button" role="menuitem" onclick={(e) => { handleStopAll(); (e.currentTarget.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open'); }}>{m.transfers_stop_all()}</button>
+              <button type="button" role="menuitem" class="menu-danger" onclick={(e) => { handleCancelAll(); (e.currentTarget.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open'); }}>{m.transfers_cancel_all()}</button>
+            {/if}
             {#if hasCompletedDl}
               <button type="button" role="menuitem" onclick={(e) => { confirmClearCompleted = true; (e.currentTarget.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open'); }}>{m.transfers_clear_completed()}</button>
             {/if}
@@ -2873,7 +2992,7 @@
               <input
                 type="checkbox"
                 bind:this={selectAllDownloadsCheckbox}
-                checked={allActiveDlChecked}
+                checked={allVisibleDlChecked}
                 onchange={toggleDlCheckAll}
                 aria-label={m.transfers_select_all_aria()}
                 title={m.transfers_select_all_aria()}
@@ -3090,8 +3209,20 @@
             </tr>
             {#if !completedCollapsed}
             {#each filteredCompletedDownloads as t (t.id)}
-              <tr class="dl-row completed-row {t.status}" oncontextmenu={(e) => onCtx(e, t, 'completed')}>
-                <td class="col-dl-check"></td>
+              <tr
+                class="dl-row completed-row {t.status}"
+                class:selected={selectedDlIdSet.has(t.id)}
+                onclick={(e) => onDownloadRowClick(e, t)}
+                oncontextmenu={(e) => onCtx(e, t, 'completed')}
+              >
+                <td class="col-dl-check">
+                  <input
+                    type="checkbox"
+                    checked={selectedDlIdSet.has(t.id)}
+                    onclick={(e) => { e.stopPropagation(); toggleDlCheck(t, e.shiftKey); }}
+                    aria-label={m.transfers_select_row({ name: t.file_name })}
+                  />
+                </td>
                 {#each visibleDownloadColumns as column (column.key)}
                   {#if column.key === 'file_name'}
                     <td class="name-cell" title={t.file_name}><bdi dir="auto">{t.file_name}</bdi></td>
@@ -3176,10 +3307,15 @@
           <strong>{m.transfers_selected_count({ count: selectedDownloadCount })}</strong>
         </div>
         <div class="selection-actions">
-          <button class="tb-btn" onclick={handleBatchPauseDownloads} title={m.transfers_batch_pause_title()}>{m.common_pause()}</button>
-          <button class="tb-btn" onclick={handleBatchResumeDownloads} title={m.transfers_batch_resume_title()}>{m.common_resume()}</button>
-          <button class="tb-btn" onclick={handleBatchStopDownloads} title={m.transfers_batch_stop_title()}>{m.common_stop()}</button>
-          <button class="tb-btn danger-outline" onclick={handleBatchCancelDownloads} title={m.transfers_batch_cancel_title()}>{m.common_cancel()}</button>
+          <button class="tb-btn" disabled={selectedPausableCount === 0} onclick={handleBatchPauseDownloads} title={m.transfers_batch_pause_title()}>{m.common_pause()}</button>
+          <button class="tb-btn" disabled={selectedResumableCount === 0} onclick={handleBatchResumeDownloads} title={m.transfers_batch_resume_title()}>{m.common_resume()}</button>
+          <button class="tb-btn" disabled={selectedStoppableCount === 0} onclick={handleBatchStopDownloads} title={m.transfers_batch_stop_title()}>{m.common_stop()}</button>
+          <button class="tb-btn danger-outline" disabled={selectedCancellableCount === 0} onclick={handleBatchCancelDownloads} title={m.transfers_batch_cancel_title()}>{m.common_cancel()}</button>
+          {#if selectedFinishedCount > 0}
+            <button class="tb-btn" onclick={handleBatchRemoveDownloads} title={m.transfers_batch_remove_title()}>
+              {m.transfers_batch_remove({ count: selectedFinishedCount })}
+            </button>
+          {/if}
           <button class="tb-btn" onclick={clearDlSelection} title={m.transfers_batch_clear_title()}>{m.common_clear()}</button>
         </div>
       </div>
@@ -3195,8 +3331,14 @@
           <button class="tb-btn" disabled={!canPause(selectedTransfer)} onclick={() => runSelectedAction('pause')}>{m.common_pause()}</button>
           <button class="tb-btn" disabled={!canResume(selectedTransfer)} onclick={() => runSelectedAction('resume')}>{m.common_resume()}</button>
           <button class="tb-btn" disabled={!canStop(selectedTransfer)} onclick={() => runSelectedAction('stop')}>{m.common_stop()}</button>
-          <button class="tb-btn" onclick={() => runSelectedAction('sources')}>{m.transfers_find_sources()}</button>
+          <button class="tb-btn" disabled={isFinished(selectedTransfer)} onclick={() => runSelectedAction('sources')}>{m.transfers_find_sources()}</button>
           <button class="tb-btn" disabled={!canPreview(selectedTransfer)} title={canPreview(selectedTransfer) ? undefined : m.transfers_preview_not_ready()} onclick={() => runSelectedAction('preview')}>{m.transfers_preview()}</button>
+          {#if isFinished(selectedTransfer)}
+            {@const finishedId = selectedTransfer.id}
+            <button class="tb-btn" onclick={() => removeTransfersBatch([finishedId])} title={m.transfers_batch_remove_title()}>
+              {m.transfers_ctx_remove_from_list()}
+            </button>
+          {/if}
         </div>
       </div>
     {:else}
@@ -4144,11 +4286,18 @@
 <ConfirmDialog
   bind:open={confirmBatchCancel.open}
   title={m.transfers_confirm_batch_cancel_title()}
-  message={confirmBatchCancel.count === 1 ? m.transfers_confirm_batch_cancel_one() : m.transfers_confirm_batch_cancel_other({ count: confirmBatchCancel.count })}
+  message={confirmBatchCancel.removeIds.length > 0
+    ? m.transfers_confirm_batch_cancel_mixed({ count: confirmBatchCancel.count, removed: confirmBatchCancel.removeIds.length })
+    : confirmBatchCancel.filter
+      ? m.transfers_confirm_batch_cancel_filtered({ count: confirmBatchCancel.count, filter: confirmBatchCancel.filter })
+      : confirmBatchCancel.count === 1
+        ? m.transfers_confirm_batch_cancel_one()
+        : m.transfers_confirm_batch_cancel_other({ count: confirmBatchCancel.count })}
   confirmLabel={m.transfers_confirm_batch_cancel_label()}
   danger={true}
   onconfirm={async () => {
     const ids = confirmBatchCancel.ids; const idSet = new Set(ids);
+    const removeIds = confirmBatchCancel.removeIds;
     let snapshots: Transfer[] = [];
     // Optimistic remove — same rationale as single cancel above.
     transfers.update((list) => {
@@ -4163,6 +4312,7 @@
     lastClickedDlId = null;
     try {
       await cancelTransfersBatch(ids);
+      await removeTransfersBatch(removeIds);
       requestAnimationFrame(() => {
         (document.querySelector('.filter-input') as HTMLInputElement | null)?.focus();
       });
@@ -4336,6 +4486,14 @@
   }
   .toolbar-more-menu button:hover {
     background: var(--bg-hover);
+  }
+  /* Cancel All deletes partial data — colour it like the other destructive
+     controls so it doesn't read as another harmless "all" command. */
+  .toolbar-more-menu button.menu-danger {
+    color: var(--danger);
+  }
+  .toolbar-more-menu button.menu-danger:hover {
+    background: color-mix(in srgb, var(--danger) 14%, transparent);
   }
   .pane-content {
     flex: 1;

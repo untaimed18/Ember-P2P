@@ -1,6 +1,6 @@
 <script lang="ts">
   import SearchBar from '$lib/components/SearchBar.svelte';
-  import { searchFiles, cancelSearch, findNotes, publishNote, markSpam, markNotSpam, explainSpamResult, getDownloadHistory, removeDownloadHistoryEntry, type SearchMethod } from '$lib/api/search';
+  import { searchFiles, cancelSearch, findNotes, publishNote, markSpam, markNotSpam, explainSpamResult, getDownloadHistory, removeDownloadHistoryEntry, formatEd2kLink, formatEd2kLinks, type SearchMethod } from '$lib/api/search';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import { getSettings } from '$lib/api/settings';
   import { getEmberDiagnostics } from '$lib/api/ember';
@@ -27,7 +27,7 @@
   import { get } from 'svelte/store';
   import { listen } from '@tauri-apps/api/event';
   import type { SearchResult, SpamExplanation } from '$lib/types';
-  import { formatSize, formatSpeed } from '$lib/utils';
+  import { formatSize, formatSpeed, copyToClipboard } from '$lib/utils';
   import { addToast } from '$lib/stores/toast';
   import * as m from '$lib/paraglide/messages';
   import { translateError, degradedReasonText } from '$lib/i18n';
@@ -197,7 +197,8 @@
   // "Close Tab". Skip confirmation for empty / non-destructive cases.
   type ConfirmAction =
     | { kind: 'clear-results' }
-    | { kind: 'close-tab'; tab: SearchTab };
+    | { kind: 'close-tab'; tab: SearchTab }
+    | { kind: 'copy-all-links'; results: SearchResult[] };
   let pendingConfirm: ConfirmAction | null = $state(null);
   let confirmOpen = $state(false);
   let confirmTitle = $state('');
@@ -1710,6 +1711,8 @@
       performClearResults();
     } else if (action.kind === 'close-tab') {
       void performCloseSearchTab(action.tab);
+    } else if (action.kind === 'copy-all-links') {
+      void copyLinksFor(action.results);
     }
   }
 
@@ -1756,6 +1759,93 @@
   function clearChecked() {
     checkedKeys = new Set();
     lastCheckedKey = null;
+  }
+
+  // --- eD2K links ---
+  // Copying links is how a search result gets shared or handed to another
+  // client, so it works on one row, on the ticked rows, and on the whole
+  // filtered list — the same three scopes the library offers.
+
+  /** Above this many links, ask first: some apps take a long time to paste
+   *  a list this size. Mirrors the library's threshold. */
+  const COPY_ALL_LINKS_CONFIRM_AT = 5_000;
+  let copyingLinks = $state(false);
+
+  /** Results that can actually produce a link, deduplicated by hash. A hit
+   *  still waiting on its hash has nothing to copy. */
+  function linkableResults(results: SearchResult[]): SearchResult[] {
+    const seen = new Set<string>();
+    const out: SearchResult[] = [];
+    for (const r of results) {
+      const h = r.file.hash?.trim();
+      if (!h || seen.has(h)) continue;
+      seen.add(h);
+      out.push(r);
+    }
+    return out;
+  }
+
+  async function copyResultLink(result: SearchResult) {
+    if (!result.file.hash?.trim()) {
+      addToast('error', m.error_transfers_invalid_file_hash());
+      return;
+    }
+    try {
+      const link = await formatEd2kLink(result.file.name, result.file.size, result.file.hash);
+      if (!(await copyToClipboard(link))) {
+        addToast('error', m.search_copy_failed());
+        return;
+      }
+      addToast('success', m.search_copied_link_one());
+    } catch (e: unknown) {
+      addToast('error', translateError(e, m.search_copy_failed()));
+    }
+  }
+
+  async function copyLinksFor(results: SearchResult[]) {
+    if (copyingLinks) return;
+    const targets = linkableResults(results);
+    if (targets.length === 0) {
+      addToast('warning', m.search_copy_none());
+      return;
+    }
+    copyingLinks = true;
+    try {
+      const text = await formatEd2kLinks(
+        targets.map((r) => ({ name: r.file.name, size: r.file.size, hash: r.file.hash })),
+      );
+      if (!(await copyToClipboard(text))) {
+        addToast('error', m.search_copy_failed());
+        return;
+      }
+      addToast('success', targets.length === 1
+        ? m.search_copied_link_one()
+        : m.search_copied_links_other({ count: targets.length }));
+    } catch (e: unknown) {
+      addToast('error', translateError(e, m.search_copy_failed()));
+    } finally {
+      copyingLinks = false;
+    }
+  }
+
+  function copyCheckedLinks() {
+    void copyLinksFor(filteredResults.filter((r) => checkedKeys.has(resultKey(r))));
+  }
+
+  function requestCopyAllLinks() {
+    const targets = linkableResults(filteredResults);
+    if (targets.length === 0) {
+      addToast('warning', m.search_copy_none());
+      return;
+    }
+    if (targets.length < COPY_ALL_LINKS_CONFIRM_AT) {
+      void copyLinksFor(targets);
+      return;
+    }
+    pendingConfirm = { kind: 'copy-all-links', results: targets };
+    confirmTitle = m.search_copy_all_confirm_title();
+    confirmMessage = m.search_copy_all_confirm({ count: targets.length.toLocaleString() });
+    confirmOpen = true;
   }
 
   async function downloadChecked() {
@@ -1903,6 +1993,19 @@
   if (e.key === 'Escape') {
     if (contextMenu) { closeContextMenu(); e.preventDefault(); }
     else if (selectedResultKey) { selectedResultKey = null; e.preventDefault(); }
+    return;
+  }
+  // Ctrl+C copies the ticked results' links, or the whole filtered list when
+  // nothing is ticked. Skipped while text is selected or focus is in a field,
+  // so the normal copy still works in the query box.
+  if ((e.ctrlKey || e.metaKey) && (e.key === 'c' || e.key === 'C')) {
+    const target = e.target as HTMLElement | null;
+    if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) return;
+    if (confirmOpen || !(window.getSelection()?.isCollapsed ?? true)) return;
+    if (filteredResults.length === 0) return;
+    e.preventDefault();
+    if (checkedCount > 0) copyCheckedLinks();
+    else requestCopyAllLinks();
   }
 }} />
 
@@ -2281,6 +2384,12 @@
             {/each}
           </div>
         </details>
+        <button
+          class="ghost copy-links-btn"
+          disabled={copyingLinks || filteredResults.length === 0}
+          title={m.search_copy_all_links_title()}
+          onclick={requestCopyAllLinks}
+        >{m.search_copy_all_links()}</button>
         <button class="ghost clear-results-btn" onclick={requestClearResults}>{m.search_clear_results()}</button>
       </div>
     </div>
@@ -2289,6 +2398,9 @@
         <span class="bulk-count">{m.search_bulk_selected({ count: checkedCount })}</span>
         <button class="bulk-download-btn" onclick={downloadChecked} disabled={bulkDownloadPending}>
           {bulkDownloadPending ? m.search_downloading_ellipsis() : (checkedCount === 1 ? m.search_bulk_download_one() : m.search_bulk_download_other({ count: checkedCount }))}
+        </button>
+        <button class="ghost bulk-copy-btn" onclick={copyCheckedLinks} disabled={copyingLinks} title={m.search_bulk_copy_links_title()}>
+          {checkedCount === 1 ? m.search_bulk_copy_link_one() : m.search_bulk_copy_links_other({ count: checkedCount })}
         </button>
         <button class="ghost bulk-clear-btn" onclick={clearChecked} title={m.search_clear_selection_title()}>{m.search_clear_selection()}</button>
         {#if bulkDownloadMessage}
@@ -2556,6 +2668,10 @@
         {#if checkedCount > 1}
           <button role="menuitem" onclick={() => { downloadChecked(); closeContextMenu(); }}>{m.search_ctx_download_selected({ count: checkedCount })}</button>
         {/if}
+        <button role="menuitem" onclick={() => { if (contextMenu) void copyResultLink(contextMenu.result); closeContextMenu(); }}>{m.search_ctx_copy_link()}</button>
+        {#if checkedCount > 1}
+          <button role="menuitem" onclick={() => { copyCheckedLinks(); closeContextMenu(); }}>{m.search_ctx_copy_selected_links({ count: checkedCount })}</button>
+        {/if}
         <button role="menuitem" onclick={() => { if (contextMenu) showFileDetails(contextMenu.result); closeContextMenu(); }}>{m.search_ctx_details()}</button>
         {#if downloadHistoryMap[contextMenu.result.file.hash]}
           <button
@@ -2701,9 +2817,13 @@
   bind:open={confirmOpen}
   title={confirmTitle}
   message={confirmMessage}
-  confirmLabel={pendingConfirm?.kind === 'close-tab' ? m.search_confirm_close_tab_btn() : m.search_confirm_clear_btn()}
+  confirmLabel={pendingConfirm?.kind === 'close-tab'
+    ? m.search_confirm_close_tab_btn()
+    : pendingConfirm?.kind === 'copy-all-links'
+      ? m.search_copy_all_confirm_btn()
+      : m.search_confirm_clear_btn()}
   cancelLabel={m.search_confirm_keep()}
-  danger={true}
+  danger={pendingConfirm?.kind !== 'copy-all-links'}
   onconfirm={handleConfirm}
   oncancel={handleConfirmCancel}
 />
@@ -3217,9 +3337,21 @@
     cursor: not-allowed;
   }
 
-  .bulk-clear-btn {
+  .bulk-clear-btn,
+  .bulk-copy-btn {
     font-size: 12px;
     padding: 5px 10px;
+  }
+
+  .copy-links-btn {
+    font-size: 12px;
+    padding: 4px 10px;
+  }
+
+  .copy-links-btn:disabled,
+  .bulk-copy-btn:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
   }
 
   :global(tr.row-checked td) {

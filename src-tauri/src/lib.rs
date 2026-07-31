@@ -360,6 +360,19 @@ pub fn run() {
                 let _ = window.set_title(&title);
             }
 
+            // Swap in a restore staged by `import_backup` before anything
+            // opens the files it replaces. Once the database is open and the
+            // identity is cached in memory, replacing them underneath is not
+            // something that can be done safely.
+            match storage::paths::ensure_data_dir_with_app(&app_handle) {
+                Ok(dir) => {
+                    if let Err(e) = commands::backup::apply_pending_restore(&dir) {
+                        tracing::error!("Failed to apply the staged restore: {e}");
+                    }
+                }
+                Err(e) => tracing::error!("Failed to prepare the data dir: {e}"),
+            }
+
             let db = Arc::new(
                 Database::new(&app_handle).map_err(|e| {
                     tracing::error!("Failed to initialize database: {e}");
@@ -1226,6 +1239,11 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::backup::export_backup,
+            commands::backup::preview_backup,
+            commands::backup::import_backup,
+            commands::backup::pending_restore_status,
+            commands::backup::discard_pending_restore,
             commands::search::search_files,
             commands::search::cancel_search,
             commands::search::find_notes,
