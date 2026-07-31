@@ -76,6 +76,23 @@ const KDF_MAX_M_COST: u32 = 262_144;
 const KDF_MAX_T_COST: u32 = 16;
 const KDF_MAX_P_COST: u32 = 8;
 
+/// How long a staged restore may wait before a launch refuses to apply it.
+///
+/// The hazard is applying a restore the user has moved on from, and elapsed
+/// time is the only signal that survives the case that creates it: a build
+/// without this feature ignores `restore-pending/` entirely and leaves no
+/// evidence of having run, so a later upgrade cannot otherwise tell whether
+/// its staged restore is from this morning or from last spring.
+///
+/// This is checked at startup only, so a session left running for weeks is
+/// never affected. Reaching a launch a month after staging means either that
+/// intervening launches could not apply it, or that the user has not restarted
+/// in a month while the Backup screen showed the restore waiting - stale
+/// either way. Discarding is also the cheap direction: the backup file still
+/// exists and re-importing is two clicks, where applying it late overwrites a
+/// profile and is recoverable only by hand from `pre-restore-*`.
+const STAGED_RESTORE_MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60;
+
 const MIN_PASSPHRASE_LEN: usize = 10;
 const MAX_PASSPHRASE_LEN: usize = 1024;
 const MAX_PATH_LEN: usize = 4 * 1024;
@@ -1199,6 +1216,22 @@ pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<Option<PathBuf>
         }
     };
 
+    // A marker without a timestamp (an older staging run) is not judged on age.
+    let age_secs = chrono::Utc::now()
+        .timestamp()
+        .saturating_sub(pending.staged_at);
+    if pending.staged_at > 0 && age_secs > STAGED_RESTORE_MAX_AGE_SECS {
+        tracing::error!(
+            "Discarding a staged restore from a backup made by Ember {}: it was prepared {} days \
+             ago and is too old to apply safely over the profile in use since. Import the backup \
+             again from Settings > Backup if it is still what you want.",
+            pending.source_app_version,
+            age_secs / 86_400
+        );
+        let _ = std::fs::remove_dir_all(&staging);
+        return Ok(None);
+    }
+
     // The build that staged this restore accepted its schema; the build now
     // applying it may be an older one the user reinstalled in between.
     // Installing a database it cannot open would leave Ember unable to start at
@@ -1525,7 +1558,7 @@ mod tests {
         std::fs::write(dir.join("config.json"), b"live").unwrap();
         let pending = PendingRestore {
             version: FORMAT_VERSION,
-            staged_at: 0,
+            staged_at: chrono::Utc::now().timestamp(),
             source_app_version: "1.3.3".to_string(),
             schema_version: 1,
             files: vec!["config.json".to_string()],
@@ -1542,6 +1575,33 @@ mod tests {
             std::fs::read(preserved.join("config.json")).unwrap(),
             b"live"
         );
+        assert!(!staging.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_staged_restore_left_for_a_month_is_discarded_rather_than_applied() {
+        let dir = scratch("stale-restore");
+        let staging = staging_dir(&dir);
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("config.json"), b"restored").unwrap();
+        std::fs::write(dir.join("config.json"), b"live").unwrap();
+        let pending = PendingRestore {
+            version: FORMAT_VERSION,
+            staged_at: chrono::Utc::now().timestamp() - (STAGED_RESTORE_MAX_AGE_SECS + 86_400),
+            source_app_version: "1.3.3".to_string(),
+            schema_version: 1,
+            files: vec!["config.json".to_string()],
+        };
+        std::fs::write(
+            staging.join(STAGING_MARKER),
+            serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+
+        assert!(apply_pending_restore(&dir).unwrap().is_none());
+        // The profile in use wins, and the staged copies do not linger.
+        assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), b"live");
         assert!(!staging.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
