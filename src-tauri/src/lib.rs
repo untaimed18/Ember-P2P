@@ -595,6 +595,7 @@ pub fn run() {
                 identity: identity.clone(),
                 config: Arc::new(RwLock::new(config)),
                 settings_save_lock: Arc::new(tokio::sync::Mutex::new(())),
+                restore_import_lock: Arc::new(tokio::sync::Mutex::new(())),
                 local_index: local_index.clone(),
                 bandwidth_limiter: bandwidth_limiter.clone(),
                 transfer_manager: transfer_manager.clone(),
@@ -747,7 +748,6 @@ pub fn run() {
 
             let index_clone = local_index.clone();
             let shared_folders = settings.shared_folders.clone();
-            let startup_scan_cursors = settings.shared_folder_scan_cursors.clone();
             let startup_scanning = scanning_count.clone();
             let startup_scan_coordination = scan_coordination.clone();
             let csf = cached_shared_files.clone();
@@ -760,7 +760,7 @@ pub fn run() {
                     info!("Indexed 0 files from 0 shared folders");
                     return;
                 }
-                let _coordination_guard = startup_scan_coordination.lock().await;
+                let coordination_guard = startup_scan_coordination.clone().lock_owned().await;
 
                 struct StartupScanGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
                 impl Drop for StartupScanGuard {
@@ -769,7 +769,7 @@ pub fn run() {
                     }
                 }
                 startup_scanning.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let _scan_guard = StartupScanGuard(startup_scanning.clone());
+                let scan_guard = StartupScanGuard(startup_scanning.clone());
                 let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 startup_cancel_flags.write().await.insert("__startup__".to_string(), cancel_flag.clone());
 
@@ -777,9 +777,13 @@ pub fn run() {
                     .iter()
                     .map(|folder| {
                         let f = folder.clone();
-                        let cursor = startup_scan_cursors
-                            .get(&crate::search::index::normalize_path_key(folder))
-                            .cloned();
+                        // A persisted cursor describes a partial live scan.
+                        // Startup begins with an empty index, so resuming at a
+                        // later page would make every earlier page disappear
+                        // until another full cycle completes. Start each cold
+                        // scan at the first page; successful startup persists
+                        // a fresh cursor for the next live reload.
+                        let cursor: Option<String> = None;
                         (
                             folder.clone(),
                             tokio::task::spawn_blocking(move || {
@@ -890,6 +894,113 @@ pub fn run() {
                 all_discovered.retain(|file| {
                     commands::sharing::file_in_shared_folders(&file.path, &current_shared_folders)
                 });
+                // A cursor page is intentionally partial. On a cold start the
+                // index is empty, so retain previously completed pages from
+                // known.met while the first page is rediscovered; otherwise a
+                // large share (>100k files) loses every non-first-page row
+                // until the user manually triggers enough reloads to cycle it
+                // back in.
+                if startup_cursor_updates.values().any(Option::is_some) {
+                    let mut known_paths = all_discovered
+                        .iter()
+                        .map(|file| crate::search::index::normalize_path_key(&file.path))
+                        .collect::<std::collections::HashSet<_>>();
+                    let hydration_records = known_list.all_records().cloned().collect::<Vec<_>>();
+                    let hydration_folders = current_shared_folders.clone();
+                    let hydration_paths = known_paths.clone();
+                    let hydrated_records = tokio::task::spawn_blocking(move || {
+                        hydration_records
+                            .into_iter()
+                            .filter(|record| {
+                                if record.file_path.is_empty()
+                                    || hydration_paths.contains(
+                                        &crate::search::index::normalize_path_key(
+                                            &record.file_path,
+                                        ),
+                                    )
+                                    || !commands::sharing::file_in_shared_folders(
+                                        &record.file_path,
+                                        &hydration_folders,
+                                    )
+                                {
+                                    return false;
+                                }
+                                let metadata = match std::fs::symlink_metadata(&record.file_path)
+                                {
+                                    Ok(metadata)
+                                        if metadata.file_type().is_file()
+                                            && !metadata.file_type().is_symlink() =>
+                                    {
+                                        metadata
+                                    }
+                                    _ => return false,
+                                };
+                                let modified_at = metadata
+                                    .modified()
+                                    .ok()
+                                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                                    .map(|duration| duration.as_secs() as i64)
+                                    .unwrap_or(0);
+                                metadata.len() == record.file_size
+                                    && modified_at == record.modified_at
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .await
+                    .unwrap_or_default();
+                    for record in hydrated_records {
+                        let record_path_key =
+                            crate::search::index::normalize_path_key(&record.file_path);
+                        if record.file_path.is_empty()
+                            || !commands::sharing::file_in_shared_folders(
+                                &record.file_path,
+                                &current_shared_folders,
+                            )
+                            || known_paths.contains(&record_path_key)
+                        {
+                            continue;
+                        }
+                        known_paths.insert(record_path_key);
+                        let hash = hex::encode(record.file_hash);
+                        let extension = std::path::Path::new(&record.file_path)
+                            .extension()
+                            .map(|extension| extension.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        let folder = std::path::Path::new(&record.file_path)
+                            .parent()
+                            .map(|parent| parent.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        all_discovered.push(crate::types::FileInfo {
+                            id: hash.clone(),
+                            name: record.file_name.clone(),
+                            path: record.file_path.clone(),
+                            size: record.file_size,
+                            hash,
+                            aich_hash: record.aich_hash.clone(),
+                            extension,
+                            modified_at: record.modified_at,
+                            priority: storage::known_files::priority_u8_to_str(
+                                record.upload_priority,
+                            )
+                            .to_string(),
+                            requests: 0,
+                            accepted: 0,
+                            bytes_transferred: 0,
+                            alltime_requests: record.all_time_requested,
+                            alltime_accepted: record.all_time_accepted,
+                            alltime_transferred: record.all_time_transferred,
+                            complete_sources: record.complete_sources,
+                            folder,
+                            shared: storage::share_intent::effective_shared(
+                                &record.file_hash,
+                                record.is_shared,
+                            ),
+                            friends_only: record.friends_only,
+                            shared_kad: false,
+                            shared_ed2k: false,
+                        });
+                    }
+                }
 
                 let (folder_priorities, pending_share_states, pending_file_priorities) = {
                     let state = startup_app.state::<AppState>();
@@ -977,12 +1088,14 @@ pub fn run() {
                         "file_name": file.name,
                     }));
 
+                    let mut hash_task = tokio::task::spawn_blocking(move || {
+                        FileIndexer::hash_file_cancellable(std::path::Path::new(&file_path), &cf)
+                    });
                     let hash_result = tokio::time::timeout(
                         std::time::Duration::from_secs(300),
-                        tokio::task::spawn_blocking(move || {
-                            FileIndexer::hash_file_cancellable(std::path::Path::new(&file_path), &cf)
-                        }),
-                    ).await;
+                        &mut hash_task,
+                    )
+                    .await;
 
                     match hash_result {
                         Ok(Ok(Ok((
@@ -1099,14 +1212,60 @@ pub fn run() {
                             idx.remove_file_by_id(&file_temp_id);
                         }
                         Err(_) => {
-                            // Leave the pending entry so a later reload/retry can
-                            // finish hashing; dropping it made slow/cloud files
-                            // disappear from the share list after one timeout.
+                            // Transfer the owned scan lease to a reaper rather
+                            // than waiting inline for a potentially stuck
+                            // filesystem read. This preserves serialization
+                            // without wedging the startup scan task itself.
+                            cancel_flag.store(
+                                true,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
                             tracing::warn!(
-                                "Startup hash timed out for {} (file may be on cloud storage or locked); leaving pending for retry",
+                                "Startup hash timed out for {}; cancelling this scan so it can retry safely",
                                 file.name
                             );
-                            page_complete = false;
+                            {
+                                let mut idx = index_clone.write().await;
+                                idx.remove_pending_files();
+                                idx.rebuild();
+                            }
+                            commands::sharing::refresh_file_cache(&index_clone, &csf).await;
+                            let _ = reconcile_shared_files(&net_tx).await;
+                            let reaper_cancel_flags = startup_cancel_flags.clone();
+                            let reaper_cancel_flag = cancel_flag.clone();
+                            let timed_out_name = file.name.clone();
+                            let reaper = tokio::spawn(async move {
+                                let _coordination_guard = coordination_guard;
+                                let _scan_guard = scan_guard;
+                                if let Err(error) = hash_task.await {
+                                    tracing::warn!(
+                                        "Timed-out startup hash task for {timed_out_name} failed while draining: {error}"
+                                    );
+                                }
+                                let mut flags = reaper_cancel_flags.write().await;
+                                if flags
+                                    .get("__startup__")
+                                    .is_some_and(|current| {
+                                        std::sync::Arc::ptr_eq(current, &reaper_cancel_flag)
+                                    })
+                                {
+                                    flags.remove("__startup__");
+                                }
+                            });
+                            startup_app
+                                .state::<AppState>()
+                                .register_background_scan(reaper)
+                                .await;
+                            let _ = startup_app.emit(
+                                "file-hash-progress",
+                                serde_json::json!({
+                                    "current": hashed,
+                                    "total": total_to_hash,
+                                    "file_name": "",
+                                    "done": true,
+                                }),
+                            );
+                            return;
                         }
                     }
                 }
@@ -1146,7 +1305,7 @@ pub fn run() {
                     }
                 }
 
-                drop(_scan_guard);
+                drop(scan_guard);
                 startup_cancel_flags.write().await.remove("__startup__");
                 if !reconcile_shared_files(&net_tx).await {
                     tracing::warn!("Startup shared-file reconciliation failed");

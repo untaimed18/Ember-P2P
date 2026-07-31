@@ -45,6 +45,10 @@ pub struct AppState {
     /// Serializes each read/modify/persist/commit settings transaction so
     /// concurrent commands cannot overwrite one another with stale clones.
     pub settings_save_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes staging and deletion of a pending profile restore. The
+    /// staging directory is intentionally stable so startup can find it, so
+    /// overlapping imports must never write into it concurrently.
+    pub restore_import_lock: Arc<tokio::sync::Mutex<()>>,
     pub local_index: Arc<RwLock<LocalIndex>>,
     pub bandwidth_limiter: Arc<BandwidthLimiter>,
     pub transfer_manager: Arc<RwLock<TransferManager>>,

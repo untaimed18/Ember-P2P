@@ -23,16 +23,9 @@ fn reusable_secure_friend_session(existing: &EmberSessionHandle, peer_pk: &[u8; 
     existing.is_fresh() && existing.is_secure_v2() && existing.peer_ember_pubkey() == *peer_pk
 }
 
-/// Result from a successfully established friend session: the outbound sender
-/// so the caller can immediately send packets before the loop consumes them.
+/// Result from a successfully established friend session.
 pub struct FriendSessionHandle {
-    pub outbound_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     pub session_id: u64,
-    /// The friend's PoP-verified Ed25519 identity public key for this
-    /// session — see `EmberSessionHandle::peer_ember_pubkey`. Callers use
-    /// this together with their own Ed25519 secret to encrypt outbound
-    /// `OP_EMBER_CHAT_MSG` payloads via `ember::crypto::encrypt_chat_for_peer`.
-    pub peer_ember_pubkey: [u8; 32],
 }
 
 /// Establishes a persistent outbound friend session. Performs the full
@@ -230,9 +223,7 @@ pub async fn run_friend_session_over_transport(
                 drop(reader);
                 drop(writer);
                 return Ok(FriendSessionHandle {
-                    outbound_tx: existing.tx.clone(),
                     session_id: existing.session_id(),
-                    peer_ember_pubkey: existing.peer_ember_pubkey(),
                 });
             }
         }
@@ -257,9 +248,7 @@ pub async fn run_friend_session_over_transport(
                     hex::encode(peer_ember_hash)
                 );
                 let reused = FriendSessionHandle {
-                    outbound_tx: existing.tx.clone(),
                     session_id: existing.session_id(),
-                    peer_ember_pubkey: existing.peer_ember_pubkey(),
                 };
                 // Drop the secure registration for the unused handle by
                 // closing it so revocation index / shutdown stay consistent.
@@ -333,9 +322,7 @@ pub async fn run_friend_session_over_transport(
         .await;
 
     let handle = FriendSessionHandle {
-        outbound_tx,
         session_id: ember_session_handle.session_id(),
-        peer_ember_pubkey: peer_pk,
     };
 
     let session_ember_sessions = ember_sessions.clone();
@@ -490,7 +477,8 @@ pub async fn run_friend_session_over_transport(
                                     }).await;
                                 }
                                 (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) => {
-                                    let nick = std::str::from_utf8(&payload).unwrap_or("").to_string();
+                                    let nick =
+                                        crate::security::normalize_inbound_friend_nickname(&payload);
                                     // `verified` is the session-scoped
                                     // `ember_hash_binding_verified`
                                     // flag set during session setup.
@@ -501,7 +489,11 @@ pub async fn run_friend_session_over_transport(
                                     // for peers that didn't advertise
                                     // a pubkey it falls back to the
                                     // offline BLAKE3 binding check.
-                                    info!("Received friend request on outbound friend session from {} (nick='{}', verified={ember_hash_binding_verified})", addr, nick);
+                                    debug!(
+                                        "Received friend request on outbound friend session from {} (nickname_chars={}, verified={ember_hash_binding_verified})",
+                                        addr,
+                                        nick.chars().count()
+                                    );
                                     let _ = session_ul_event_tx.send(UploadEvent {
                                         transfer_id: String::new(),
                                         kind: UploadEventKind::EmberFriendRequest {

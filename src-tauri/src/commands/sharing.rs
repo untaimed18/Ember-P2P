@@ -1336,9 +1336,9 @@ pub async fn add_shared_folder(
         .insert(cancel_key.clone(), cancel_flag.clone());
 
     let scan_handle = tokio::spawn(async move {
-        let _coordination_guard = scan_coordination.lock().await;
+        let coordination_guard = scan_coordination.clone().lock_owned().await;
         scanning.fetch_add(1, Ordering::Relaxed);
-        let _scan_guard = ScanGuard(scanning.clone());
+        let scan_guard = ScanGuard(scanning.clone());
 
         let discover_path = canonical_str.clone();
         let discovery = match tokio::task::spawn_blocking(move || {
@@ -1465,11 +1465,12 @@ pub async fn add_shared_folder(
                 }),
             );
 
+            let mut hash_task = tokio::task::spawn_blocking(move || {
+                FileIndexer::hash_file_cancellable(std::path::Path::new(&file_path), &cf)
+            });
             let hash_result = tokio::time::timeout(
                 std::time::Duration::from_secs(300),
-                tokio::task::spawn_blocking(move || {
-                    FileIndexer::hash_file_cancellable(std::path::Path::new(&file_path), &cf)
-                }),
+                &mut hash_task,
             )
             .await;
 
@@ -1569,11 +1570,54 @@ pub async fn add_shared_folder(
                     index.remove_file_by_id(&file_temp_id);
                 }
                 Err(_) => {
-                    // Leave the pending entry so a later reload/retry can
-                    // finish hashing; dropping it here made slow/cloud files
-                    // disappear from the share list after one timeout.
-                    warn!("Hash timed out after 5 min for {} (file may be on cloud storage or locked); leaving pending for retry", file.name);
-                    page_complete = false;
+                    // Dropping a JoinHandle does not stop `spawn_blocking`.
+                    // Hand the owned scan lease to a reaper instead of
+                    // awaiting an uninterruptible filesystem read here. The
+                    // next scan stays serialized until the worker actually
+                    // exits, while this task can finish its cancellation
+                    // cleanup and return promptly.
+                    cancel_flag.store(true, Ordering::Relaxed);
+                    warn!(
+                        "Hash timed out after 5 min for {}; cancelling this scan so it can retry safely",
+                        file.name
+                    );
+                    {
+                        let mut index = local_index.write().await;
+                        index.remove_pending_files_under(std::slice::from_ref(&canonical_str));
+                        index.rebuild();
+                    }
+                    refresh_file_cache(&local_index, &file_cache).await;
+                    reconcile_shared_files_best_effort(&network_tx).await;
+                    let reaper_cancel_flags = cancel_flags.clone();
+                    let reaper_key = cancel_key.clone();
+                    let reaper_flag = cancel_flag.clone();
+                    let timed_out_name = file.name.clone();
+                    let reaper = tokio::spawn(async move {
+                        let _coordination_guard = coordination_guard;
+                        let _scan_guard = scan_guard;
+                        if let Err(error) = hash_task.await {
+                            tracing::warn!(
+                                "Timed-out hash task for {timed_out_name} failed while draining: {error}"
+                            );
+                        }
+                        remove_cancel_flag_if_current(
+                            &reaper_cancel_flags,
+                            &reaper_key,
+                            &reaper_flag,
+                        )
+                        .await;
+                    });
+                    app.state::<AppState>().register_background_scan(reaper).await;
+                    let _ = app.emit(
+                        "file-hash-progress",
+                        serde_json::json!({
+                            "current": hashed_count,
+                            "total": total_to_hash,
+                            "file_name": "",
+                            "done": true,
+                        }),
+                    );
+                    return;
                 }
             }
         }
@@ -1648,7 +1692,7 @@ pub async fn add_shared_folder(
                 "done": true,
             }),
         );
-        drop(_scan_guard);
+        drop(scan_guard);
     });
 
     // Track the scan so shutdown can wait for it (and abort it after the grace
@@ -2457,10 +2501,10 @@ pub async fn reload_shared_files(
     }
 
     let scan_handle = tokio::spawn(async move {
-        let _reload_flight = reload_flight;
-        let _coordination_guard = scan_coordination.lock().await;
+        let reload_flight_guard = reload_flight;
+        let coordination_guard = scan_coordination.clone().lock_owned().await;
         scanning.fetch_add(1, Ordering::Relaxed);
-        let _scan_guard = ScanGuard(scanning.clone());
+        let scan_guard = ScanGuard(scanning.clone());
 
         let (mut discovered, discovery_truncated, discovery_cursor_updates): (
             Vec<FileInfo>,
@@ -2606,11 +2650,12 @@ pub async fn reload_shared_files(
                 }),
             );
 
+            let mut hash_task = tokio::task::spawn_blocking(move || {
+                FileIndexer::hash_file_cancellable(std::path::Path::new(&file_path), &cf)
+            });
             let hash_result = tokio::time::timeout(
                 std::time::Duration::from_secs(300),
-                tokio::task::spawn_blocking(move || {
-                    FileIndexer::hash_file_cancellable(std::path::Path::new(&file_path), &cf)
-                }),
+                &mut hash_task,
             )
             .await;
 
@@ -2708,11 +2753,53 @@ pub async fn reload_shared_files(
                     index.remove_file_by_id(&file_temp_id);
                 }
                 Err(_) => {
-                    // Leave the pending entry so a later reload/retry can
-                    // finish hashing; dropping it here made slow/cloud files
-                    // disappear from the share list after one timeout.
-                    warn!("Hash timed out after 5 min for {} (file may be on cloud storage or locked); leaving pending for retry", file.name);
-                    page_complete = false;
+                    // Keep the scan and reload leases in a reaper until the
+                    // blocking worker exits. Awaiting it inline can wedge the
+                    // whole scan task on an uninterruptible cloud/filesystem
+                    // read; releasing it now would allow overlapping hashes.
+                    cancel_flag.store(true, Ordering::Relaxed);
+                    warn!(
+                        "Hash timed out after 5 min for {}; cancelling this reload so it can retry safely",
+                        file.name
+                    );
+                    {
+                        let mut index = local_index.write().await;
+                        index.remove_pending_files_under(&reloaded_folders);
+                        index.rebuild();
+                    }
+                    refresh_file_cache(&local_index, &file_cache).await;
+                    reconcile_shared_files_best_effort(&network_tx).await;
+                    let reaper_cancel_flags = cancel_flags.clone();
+                    let reaper_key = reload_key.clone();
+                    let reaper_flag = cancel_flag.clone();
+                    let timed_out_name = file.name.clone();
+                    let reaper = tokio::spawn(async move {
+                        let _reload_flight = reload_flight_guard;
+                        let _coordination_guard = coordination_guard;
+                        let _scan_guard = scan_guard;
+                        if let Err(error) = hash_task.await {
+                            tracing::warn!(
+                                "Timed-out reload hash task for {timed_out_name} failed while draining: {error}"
+                            );
+                        }
+                        remove_cancel_flag_if_current(
+                            &reaper_cancel_flags,
+                            &reaper_key,
+                            &reaper_flag,
+                        )
+                        .await;
+                    });
+                    app.state::<AppState>().register_background_scan(reaper).await;
+                    let _ = app.emit(
+                        "file-hash-progress",
+                        serde_json::json!({
+                            "current": hashed_count,
+                            "total": total_to_hash,
+                            "file_name": "",
+                            "done": true,
+                        }),
+                    );
+                    return;
                 }
             }
         }
@@ -2785,7 +2872,7 @@ pub async fn reload_shared_files(
                 "done": true,
             }),
         );
-        drop(_scan_guard);
+        drop(scan_guard);
     });
 
     // Track the reload scan so shutdown can wait for / abort it before the

@@ -3843,9 +3843,8 @@ impl UploadHandler {
             let mut buf_w = tokio::io::BufWriter::new(raw_w);
 
             let mut secure_peer: Option<super::secure_stream::SecurePeerIdentity> = None;
-            let (reader, writer): (StreamReader, StreamWriter) = if let Some(
-                expected_ember_hash,
-            ) = req.secure_friend_ember_hash
+            let (reader, writer): (StreamReader, StreamWriter) = if let Some(expected_ember_hash) =
+                req.secure_friend_ember_hash
             {
                 let secure = super::secure_stream::initiate(
                     Box::new(buf_r),
@@ -4804,10 +4803,11 @@ impl UploadHandler {
                 // Membership is checked *before* consuming the expectation: a
                 // friend removed between our request and their dial must leave
                 // the entry for the sweep to expire, not silently burn it.
-                let expecting_friend = {
-                    let cbs = self.pending_kad_callbacks.lock().await;
-                    cbs.contains_key(&key)
-                } && self.friend_hashes.read().await.contains(&peer.ember_hash);
+                let expecting_friend =
+                    {
+                        let cbs = self.pending_kad_callbacks.lock().await;
+                        cbs.contains_key(&key)
+                    } && self.friend_hashes.read().await.contains(&peer.ember_hash);
                 let friend_callback_file = if expecting_friend {
                     let now = chrono::Utc::now().timestamp();
                     let mut cbs = self.pending_kad_callbacks.lock().await;
@@ -5644,7 +5644,16 @@ impl UploadHandler {
             last_part_request = std::time::Instant::now();
             let tid = uuid::Uuid::new_v4().to_string();
             transfer_id = Some(tid.clone());
-            if let Some(resolved) = self.resolve_upload_file(&fh, PeerFileAccess { ember_hash: peer_ember_hash, secure_v2_authenticated }).await {
+            if let Some(resolved) = self
+                .resolve_upload_file(
+                    &fh,
+                    PeerFileAccess {
+                        ember_hash: peer_ember_hash,
+                        secure_v2_authenticated,
+                    },
+                )
+                .await
+            {
                 total_size = resolved.size;
                 let _ = self
                     .upload_event_tx
@@ -9397,7 +9406,7 @@ impl UploadHandler {
                             "Ignoring self-addressed OP_EMBER_FRIEND_REQ from {peer_addr}"
                         );
                     } else if let Some(eh) = peer_ember_hash {
-                        let nick = std::str::from_utf8(&payload).unwrap_or("").to_string();
+                        let nick = crate::security::normalize_inbound_friend_nickname(&payload);
                         // `verified` requires the strong PoP signal
                         // from the reactive challenge-response state
                         // machine. The earlier code also accepted
@@ -9411,9 +9420,9 @@ impl UploadHandler {
                         // Binding is still tracked separately for the
                         // log line below.
                         let verified = secure_v2_authenticated;
-                        info!(
-                            "Received friend request from {peer_addr} (nick='{}', hash={}, verified={verified}, pop={}, binding={ember_hash_binding_verified})",
-                            nick, hex::encode(eh), verified,
+                        debug!(
+                            "Received friend request from {peer_addr} (nickname_chars={}, hash={}, verified={verified}, pop={}, binding={ember_hash_binding_verified})",
+                            nick.chars().count(), hex::encode(eh), verified,
                         );
                         let _ = self.upload_event_tx.send(UploadEvent {
                             transfer_id: String::new(),

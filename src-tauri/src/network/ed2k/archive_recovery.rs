@@ -1,5 +1,6 @@
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::sharing::manager::TransferControl;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -30,22 +31,27 @@ const MAX_RECOVERY_ENTRIES: usize = 10_000;
 const MAX_DECOMPRESSION_RATIO: u64 = 200;
 const RECOVERY_WALL_TIME: std::time::Duration = std::time::Duration::from_secs(120);
 
-struct RecoveryBudget {
+struct RecoveryBudget<'a> {
     started: std::time::Instant,
     output_bytes: u64,
     entries: usize,
+    cancelled: &'a AtomicBool,
 }
 
-impl RecoveryBudget {
-    fn new() -> Self {
+impl<'a> RecoveryBudget<'a> {
+    fn new(cancelled: &'a AtomicBool) -> Self {
         Self {
             started: std::time::Instant::now(),
             output_bytes: 0,
             entries: 0,
+            cancelled,
         }
     }
 
     fn check(&self, control: Option<&TransferControl>) -> anyhow::Result<()> {
+        if self.cancelled.load(Ordering::Acquire) {
+            anyhow::bail!("archive recovery cancelled");
+        }
         if control.is_some_and(TransferControl::is_cancelled) {
             anyhow::bail!("archive recovery cancelled");
         }
@@ -87,6 +93,7 @@ pub fn recover_archive(
     output_dir: &Path,
     allowed_roots: &[String],
     control: Option<&TransferControl>,
+    cancelled: &AtomicBool,
 ) -> anyhow::Result<PathBuf> {
     if filled_ranges.is_empty() {
         anyhow::bail!("no filled ranges available for recovery");
@@ -165,7 +172,7 @@ pub fn recover_archive(
 
     let (_, mut input) =
         crate::security::filesystem::open_existing_approved(part_path, allowed_roots, false)?;
-    let mut budget = RecoveryBudget::new();
+    let mut budget = RecoveryBudget::new(cancelled);
     budget.check(control)?;
 
     let result: anyhow::Result<usize> = match ext.as_str() {
@@ -387,6 +394,8 @@ fn recover_zip(
                     uncompressed_size,
                     method,
                     crc32,
+                    budget,
+                    control,
                 )?
             } else {
                 true
@@ -672,14 +681,18 @@ fn validate_zip_crc(
     uncompressed_size: u32,
     method: u16,
     expected_crc: u32,
+    budget: &RecoveryBudget,
+    control: Option<&TransferControl>,
 ) -> anyhow::Result<bool> {
     input.seek(SeekFrom::Start(offset))?;
     let limited = input.take(size as u64);
     let actual_crc = match method {
-        0 => crc32_reader_limited(limited, uncompressed_size as u64)?,
+        0 => crc32_reader_limited(limited, uncompressed_size as u64, budget, control)?,
         8 => crc32_reader_limited(
             flate2::read::DeflateDecoder::new(limited),
             uncompressed_size as u64,
+            budget,
+            control,
         )?,
         // Recovery preserves unsupported methods verbatim, but cannot verify
         // their uncompressed CRC without a decoder.
@@ -688,11 +701,17 @@ fn validate_zip_crc(
     Ok(actual_crc == expected_crc)
 }
 
-fn crc32_reader_limited(mut reader: impl Read, expected_size: u64) -> anyhow::Result<u32> {
+fn crc32_reader_limited(
+    mut reader: impl Read,
+    expected_size: u64,
+    budget: &RecoveryBudget,
+    control: Option<&TransferControl>,
+) -> anyhow::Result<u32> {
     let mut hasher = crc32fast::Hasher::new();
     let mut buf = [0u8; 64 * 1024];
     let mut total = 0u64;
     loop {
+        budget.check(control)?;
         let n = reader.read(&mut buf)?;
         if n == 0 {
             break;
@@ -1154,6 +1173,7 @@ mod tests {
             &root,
             &allowed,
             None,
+            &AtomicBool::new(false),
         )
         .expect("recover verified entry");
         let archive = zip::ZipArchive::new(std::fs::File::open(&recovered).unwrap()).unwrap();
@@ -1166,6 +1186,7 @@ mod tests {
             &root,
             &allowed,
             None,
+            &AtomicBool::new(false),
         );
         assert!(
             denied.is_err(),
@@ -1190,6 +1211,7 @@ mod tests {
             &root,
             &allowed,
             Some(&control),
+            &AtomicBool::new(false),
         )
         .is_err());
         let _ = std::fs::remove_dir_all(base);

@@ -1696,7 +1696,7 @@ impl Ed2kDownload {
                 }
                 (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) if super::LEGACY_FRIEND_AUTH_ENABLED => {
                     if let Some(eh) = peer_ember_hash {
-                        let nick = std::str::from_utf8(&pl).unwrap_or("").to_string();
+                        let nick = crate::security::normalize_inbound_friend_nickname(&pl);
                         // `verified` requires PoP (Ed25519 challenge-
                         // response). Binding-only is replayable — a
                         // peer who learned a victim's public
@@ -1707,9 +1707,11 @@ impl Ed2kDownload {
                         // accepts, so this never permanently marks a
                         // legitimate friend unverified.
                         let verified = ember_auth_verified;
-                        info!(
-                            "Received early friend request from {} (nick='{}', verified={verified}, pop={}, binding={ember_hash_binding_verified})",
-                            self.source_addr, nick, ember_auth_verified
+                        debug!(
+                            "Received early friend request from {} (nickname_chars={}, verified={verified}, pop={}, binding={ember_hash_binding_verified})",
+                            self.source_addr,
+                            nick.chars().count(),
+                            ember_auth_verified
                         );
                         let _ = event_tx
                             .send(DownloadEvent::EmberFriendRequest {
@@ -1902,8 +1904,7 @@ impl Ed2kDownload {
                                                     // the ephemeral socket port so this
                                                     // is a dialable download-source
                                                     // endpoint.
-                                                    let friend_port = if initial_caps.tcp_port > 0
-                                                    {
+                                                    let friend_port = if initial_caps.tcp_port > 0 {
                                                         initial_caps.tcp_port
                                                     } else {
                                                         self.source_addr.port()
@@ -2352,7 +2353,9 @@ impl Ed2kDownload {
                     }
                 }
                 // Ember-only; gated on `peer_is_ember` + PoP (see upload.rs).
-                (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE) if peer_is_ember && ember_hash_binding_verified => {
+                (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE)
+                    if peer_is_ember && ember_hash_binding_verified =>
+                {
                     self.sx_overhead.record_download((6 + payload.len()) as u64);
                     if epx_packets_received >= crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION
                     {
@@ -2401,7 +2404,7 @@ impl Ed2kDownload {
                     if super::LEGACY_FRIEND_AUTH_ENABLED && peer_is_ember =>
                 {
                     if let Some(eh) = peer_ember_hash {
-                        let nick = std::str::from_utf8(&payload).unwrap_or("").to_string();
+                        let nick = crate::security::normalize_inbound_friend_nickname(&payload);
                         // Prefer the full PoP signal over the
                         // binding-only fallback. Both flags are set in
                         // the OP_EMBER_HELLO arms above / in the
@@ -4148,7 +4151,8 @@ impl Ed2kDownload {
                             if super::LEGACY_FRIEND_AUTH_ENABLED && peer_is_ember =>
                         {
                             if let Some(eh) = peer_ember_hash {
-                                let nick = std::str::from_utf8(&payload).unwrap_or("").to_string();
+                                let nick =
+                                    crate::security::normalize_inbound_friend_nickname(&payload);
                                 // By the time we reach the data loop
                                 // the peer's Ember-Hello + PoP has
                                 // usually completed in an earlier

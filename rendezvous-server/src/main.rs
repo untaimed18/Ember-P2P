@@ -18,7 +18,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         ConnectInfo, DefaultBodyLimit, Path, State,
     },
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::IntoResponse,
     routing::{delete, get, post},
     Json, Router,
@@ -35,6 +35,11 @@ const MAX_HTTP_CONNECTIONS: usize = 256;
 const RESERVED_HEALTH_CONNECTIONS: usize = 16;
 const HTTP_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// A body can make byte-level progress forever, so the idle timeout alone
+/// cannot bound permit ownership. This covers request parsing and handlers;
+/// WebSocket upgrades complete their HTTP request immediately and retain their
+/// separate relay lifetime rules.
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn http_path_admitted(reserve_only: bool, path: &str) -> bool {
     !reserve_only || path == "/health"
@@ -691,6 +696,14 @@ const RELAY_SESSION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// peer2 joins, this timeout is no longer consulted — so it does not
 /// need to scale with the bandwidth/duration changes above.
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Once both peers are bridged, retain the relay only while it carries
+/// application traffic. This is deliberately longer than the pre-bridge
+/// window so legitimate transfers can pause briefly, but it releases shared
+/// admission capacity long before the 30-minute absolute ceiling.
+const RELAY_BRIDGE_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+/// A downstream WebSocket or relay inbox must never hold a relay task inside
+/// a forwarding await long enough to bypass its idle and absolute deadlines.
+const RELAY_FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
 /// A pre-upgrade reservation is short-lived and is rolled back if Axum never
 /// invokes the upgrade callback (client disconnect / failed handshake).
 const RELAY_UPGRADE_RESERVATION_TIMEOUT: Duration = Duration::from_secs(15);
@@ -871,7 +884,7 @@ impl RelayQueueSender {
             len,
             armed: true,
         };
-        self.sender.send(frame).await.map_err(|_| ())?;
+        self.sender.try_send(frame).map_err(|_| ())?;
         reservation.armed = false;
         Ok(())
     }
@@ -3872,7 +3885,14 @@ async fn run_peer1_loop(
             data = peer1_inbox_rx.recv() => {
                 match data {
                     Some(bytes) => {
-                        if socket.send(Message::Binary(axum::body::Bytes::from(bytes))).await.is_err() {
+                        if !matches!(
+                            tokio::time::timeout(
+                                RELAY_FORWARD_TIMEOUT,
+                                socket.send(Message::Binary(axum::body::Bytes::from(bytes))),
+                            )
+                            .await,
+                            Ok(Ok(()))
+                        ) {
                             break;
                         }
                     }
@@ -3909,9 +3929,19 @@ async fn bridge_relay(
     role: RelayRole,
     deadline: Instant,
 ) {
+    let bridge_idle_timeout = tokio::time::sleep(RELAY_BRIDGE_IDLE_TIMEOUT);
+    tokio::pin!(bridge_idle_timeout);
     loop {
         tokio::select! {
             _ = tokio::time::sleep_until(deadline.into()) => {
+                break;
+            }
+            _ = &mut bridge_idle_timeout => {
+                info!(
+                    "relay session {} timed out after {:?} without bridged traffic",
+                    &session_id[..8.min(session_id.len())],
+                    RELAY_BRIDGE_IDLE_TIMEOUT
+                );
                 break;
             }
             msg = socket.recv() => {
@@ -3932,6 +3962,9 @@ async fn bridge_relay(
                         if peer1_inbox_tx.send(data.to_vec()).await.is_err() {
                             break;
                         }
+                        bridge_idle_timeout
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + RELAY_BRIDGE_IDLE_TIMEOUT);
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     _ => {}
@@ -3948,9 +3981,19 @@ async fn bridge_relay(
                         if total_bytes.load(Ordering::Relaxed) > RELAY_BANDWIDTH_CAP_BYTES {
                             break;
                         }
-                        if socket.send(Message::Binary(axum::body::Bytes::from(bytes))).await.is_err() {
+                        if !matches!(
+                            tokio::time::timeout(
+                                RELAY_FORWARD_TIMEOUT,
+                                socket.send(Message::Binary(axum::body::Bytes::from(bytes))),
+                            )
+                            .await,
+                            Ok(Ok(()))
+                        ) {
                             break;
                         }
+                        bridge_idle_timeout
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + RELAY_BRIDGE_IDLE_TIMEOUT);
                     }
                     None => break,
                 }
@@ -4324,20 +4367,45 @@ async fn main() {
                             async move {
                                 let path = request.uri().path().to_owned();
                                 if !http_path_admitted(reserve_only, &path) {
-                                    return Ok::<_, std::convert::Infallible>(
-                                        hyper::Response::builder()
-                                            .status(StatusCode::SERVICE_UNAVAILABLE)
-                                            .body(axum::body::Body::from("reserved for health"))
-                                            .expect("static HTTP response is valid"),
-                                    );
+                                    let response = hyper::Response::builder()
+                                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                                        .header("connection", "close")
+                                        .body(axum::body::Body::from("reserved for health"))
+                                        .expect("static HTTP response is valid");
+                                    return Ok::<_, std::convert::Infallible>(response);
                                 }
                                 let mut request = request.map(axum::body::Body::new);
                                 request.extensions_mut().insert(ConnectInfo(peer_addr));
-                                Ok::<_, std::convert::Infallible>(
-                                    app.oneshot(request)
-                                        .await
-                                        .expect("axum router is infallible"),
+                                let mut response = match tokio::time::timeout(
+                                    HTTP_REQUEST_TIMEOUT,
+                                    app.oneshot(request),
                                 )
+                                .await
+                                {
+                                    Ok(response) => {
+                                        response.expect("axum router is infallible")
+                                    }
+                                    Err(_) => hyper::Response::builder()
+                                        .status(StatusCode::REQUEST_TIMEOUT)
+                                        .header("connection", "close")
+                                        .body(axum::body::Body::from(
+                                            "request processing timed out",
+                                        ))
+                                        .expect("static HTTP response is valid"),
+                                };
+                                // Admission is per TCP connection. Close
+                                // ordinary HTTP/1.1 responses so a client
+                                // cannot retain one of the finite permits
+                                // indefinitely with cheap keep-alive traffic.
+                                // A successful WebSocket upgrade owns its
+                                // liveness through the relay/session loops.
+                                if response.status() != StatusCode::SWITCHING_PROTOCOLS {
+                                    response.headers_mut().insert(
+                                        "connection",
+                                        HeaderValue::from_static("close"),
+                                    );
+                                }
+                                Ok::<_, std::convert::Infallible>(response)
                             }
                         },
                     );
@@ -4345,23 +4413,20 @@ async fn main() {
                         stream,
                         HTTP_IDLE_TIMEOUT,
                     ));
-                    let mut builder = hyper_util::server::conn::auto::Builder::new(
-                        hyper_util::rt::TokioExecutor::new(),
-                    );
+                    // This listener deliberately serves HTTP/1.1 only. A
+                    // single HTTP/2 connection can carry endless control
+                    // frames and many streams while holding one admission
+                    // permit; HTTP/1.1 lets the per-request deadline bound a
+                    // slow body and leaves upgraded WebSockets to relay-level
+                    // liveness limits.
+                    let mut builder = hyper::server::conn::http1::Builder::new();
                     builder
-                        .http1()
                         .timer(hyper_util::rt::TokioTimer::new())
                         .header_read_timeout(HTTP_HEADER_TIMEOUT)
                         .max_buf_size(32 * 1024);
-                    builder
-                        .http2()
-                        .timer(hyper_util::rt::TokioTimer::new())
-                        .max_concurrent_streams(64)
-                        .max_pending_accept_reset_streams(16)
-                        .keep_alive_interval(Some(Duration::from_secs(15)))
-                        .keep_alive_timeout(Duration::from_secs(10));
                     if let Err(error) = builder
-                        .serve_connection_with_upgrades(io, service)
+                        .serve_connection(io, service)
+                        .with_upgrades()
                         .await
                     {
                         debug!("HTTP connection from {peer_addr} closed: {error}");

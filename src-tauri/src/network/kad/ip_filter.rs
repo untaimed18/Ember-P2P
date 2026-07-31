@@ -5,6 +5,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::Serialize;
 use tracing::{info, warn};
 
+/// Text-format limits shared by the streaming loaders and their preflight
+/// validator. Keeping one definition prevents a file from being accepted at
+/// import time and then loading as an empty filter.
+const MAX_TEXT_FILTER_LINE_BYTES: usize = 8 * 1024;
+const MAX_TEXT_FILTER_LINES: usize = 5_000_000;
+
 #[derive(Debug)]
 struct IpRange {
     start: u32,
@@ -213,6 +219,13 @@ impl IpFilter {
         self.ranges_ready = true;
     }
 
+    /// Keep enabled filters fail-closed after a readable-but-empty load. This
+    /// is used by startup validation; normal imports reject zero-range files
+    /// before they can replace a live filter.
+    pub fn mark_ranges_not_ready(&mut self) {
+        self.ranges_ready = false;
+    }
+
     pub fn ranges_ready(&self) -> bool {
         self.ranges_ready
     }
@@ -299,15 +312,13 @@ impl IpFilter {
                 return None;
             }
         };
-        const MAX_LINE_BYTES: usize = 8 * 1024; // 8 KiB per line.
-        const MAX_LINES: usize = 5_000_000; // hard cap on parsed entries.
         let mut reader = std::io::BufReader::new(file);
         let mut new_ranges = Vec::new();
         let mut count = 0usize;
         let mut overlong_drops = 0usize;
         let mut io_failed = false;
         let mut raw_line = Vec::new();
-        for lineno in 0..MAX_LINES {
+        for lineno in 0..MAX_TEXT_FILTER_LINES {
             raw_line.clear();
             // Read raw bytes rather than `BufRead::lines()`: the latter
             // hard-errors (and this loop used to abort entirely) on the
@@ -331,7 +342,7 @@ impl IpFilter {
             if read == 0 {
                 break; // EOF
             }
-            if raw_line.len() > MAX_LINE_BYTES {
+            if raw_line.len() > MAX_TEXT_FILTER_LINE_BYTES {
                 overlong_drops += 1;
                 continue;
             }
@@ -350,7 +361,7 @@ impl IpFilter {
         }
         if overlong_drops > 0 {
             warn!(
-                "ipfilter.dat: dropped {overlong_drops} lines longer than {MAX_LINE_BYTES} bytes"
+                "ipfilter.dat: dropped {overlong_drops} lines longer than {MAX_TEXT_FILTER_LINE_BYTES} bytes"
             );
         }
         // Mid-file I/O failure: keep the previous range list rather than
@@ -486,6 +497,22 @@ impl IpFilter {
 
     pub fn range_count(&self) -> usize {
         self.blocked_ranges.len()
+    }
+
+    /// Serialize the active ranges into the canonical text format used by
+    /// `ipfilter.dat`. Binary `.p2b` imports must be converted before they
+    /// replace that stable startup path; otherwise the next launch would
+    /// dispatch their bytes to the text parser and lose every range.
+    pub fn canonical_dat_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(self.blocked_ranges.len().saturating_mul(48));
+        for range in &self.blocked_ranges {
+            let start = Ipv4Addr::from(range.start);
+            let end = Ipv4Addr::from(range.end);
+            bytes.extend_from_slice(
+                format!("{start} - {end} , 000 , Ember imported range\n").as_bytes(),
+            );
+        }
+        bytes
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -679,8 +706,6 @@ impl IpFilter {
                 return None;
             }
         };
-        const MAX_LINE_BYTES: usize = 8 * 1024; // 8 KiB per line.
-        const MAX_LINES: usize = 5_000_000; // hard cap on parsed entries.
         let mut reader = std::io::BufReader::new(file);
 
         let mut new_ranges = Vec::new();
@@ -688,7 +713,7 @@ impl IpFilter {
         let mut overlong_drops = 0usize;
         let mut io_failed = false;
         let mut raw_line = Vec::new();
-        for lineno in 0..MAX_LINES {
+        for lineno in 0..MAX_TEXT_FILTER_LINES {
             raw_line.clear();
             // Lossy byte-level read, not `BufRead::lines()` — see
             // `load_dat_file` for why a single non-UTF8 byte must not abort
@@ -707,7 +732,7 @@ impl IpFilter {
             if read == 0 {
                 break; // EOF
             }
-            if raw_line.len() > MAX_LINE_BYTES {
+            if raw_line.len() > MAX_TEXT_FILTER_LINE_BYTES {
                 overlong_drops += 1;
                 continue;
             }
@@ -722,7 +747,7 @@ impl IpFilter {
             }
         }
         if overlong_drops > 0 {
-            warn!(".p2p file: dropped {overlong_drops} lines longer than {MAX_LINE_BYTES} bytes");
+            warn!(".p2p file: dropped {overlong_drops} lines longer than {MAX_TEXT_FILTER_LINE_BYTES} bytes");
         }
         if io_failed {
             return None;
@@ -954,7 +979,16 @@ pub fn count_valid_entries(data: &[u8], ext_hint: &str) -> usize {
 /// only ever accepts PeerGuardian-style lines.
 fn count_text_entries(data: &[u8], try_dat_format: bool) -> usize {
     let mut count = 0;
-    for raw_line in data.split(|&b| b == b'\n') {
+    // `read_until` in the loaders includes the newline in its byte count and
+    // only examines the first `MAX_TEXT_FILTER_LINES` records. Match both
+    // details exactly so preflight cannot accept entries the real load drops.
+    for raw_line in data
+        .split_inclusive(|&b| b == b'\n')
+        .take(MAX_TEXT_FILTER_LINES)
+    {
+        if raw_line.len() > MAX_TEXT_FILTER_LINE_BYTES {
+            continue;
+        }
         // Lossy decoding matches the tolerance real ipfilter.dat downloads
         // need (non-UTF8 bytes occasionally show up in description fields);
         // a strict UTF-8 requirement here would make this validator
@@ -1441,6 +1475,22 @@ mod tests {
     }
 
     #[test]
+    fn preflight_rejects_entries_the_loader_drops_for_line_length() {
+        let mut data = b"1.2.3.4 - 1.2.3.4 , 0 , ".to_vec();
+        data.extend(vec![b'x'; MAX_TEXT_FILTER_LINE_BYTES]);
+        data.push(b'\n');
+
+        // This text is syntactically a valid range, but the streaming loader
+        // drops it because the raw line exceeds its 8 KiB cap. Preflight must
+        // make the identical decision so a live filter cannot be replaced by
+        // an empty one.
+        assert_eq!(count_valid_entries(&data, "dat"), 0);
+
+        data.extend_from_slice(b"8.8.8.8 - 8.8.8.8 , 0 , valid\n");
+        assert_eq!(count_valid_entries(&data, "dat"), 1);
+    }
+
+    #[test]
     fn test_count_valid_entries_p2p_format() {
         let data = b"Some List:1.0.0.0-1.0.0.255\nAnother:2.0.0.0-2.255.255.255\n";
         assert_eq!(count_valid_entries(data, "p2p"), 2);
@@ -1459,5 +1509,29 @@ mod tests {
         data.extend_from_slice(&10u32.to_be_bytes());
         assert_eq!(count_valid_entries(&data, "p2b"), 1);
         assert_eq!(count_valid_entries(b"not a p2b file", "p2b"), 0);
+    }
+
+    #[test]
+    fn canonical_dat_bytes_preserve_p2b_ranges_across_restart() {
+        let source = unique_temp_path("source.p2b");
+        let persisted = unique_temp_path("ipfilter.dat");
+        let mut data = Vec::new();
+        data.extend_from_slice(b"\xff\xff\xff\xffP2B");
+        data.push(1);
+        data.extend_from_slice(b"binary\0");
+        data.extend_from_slice(&u32::from(Ipv4Addr::new(8, 8, 8, 0)).to_be_bytes());
+        data.extend_from_slice(&u32::from(Ipv4Addr::new(8, 8, 8, 255)).to_be_bytes());
+        std::fs::write(&source, data).unwrap();
+
+        let mut imported = IpFilter::new(true, false);
+        assert_eq!(imported.load_from_file(&source), Some(1));
+        std::fs::write(&persisted, imported.canonical_dat_bytes()).unwrap();
+
+        let mut restarted = IpFilter::new(true, false);
+        assert_eq!(restarted.load_from_file(&persisted), Some(1));
+        assert!(restarted.is_blocked(Ipv4Addr::new(8, 8, 8, 8)));
+
+        let _ = std::fs::remove_file(source);
+        let _ = std::fs::remove_file(persisted);
     }
 }

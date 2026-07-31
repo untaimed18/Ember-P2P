@@ -376,9 +376,10 @@ fn encrypt_stream(
 /// Decrypt `src` into `dest`, verifying order, completeness and the header.
 fn decrypt_stream(src: &Path, dest: &Path, passphrase: &str) -> Result<(), String> {
     let io = |e: std::io::Error| coded_ctx("backup_corrupt_archive", "Failed to read backup", e);
-    let mut input = std::io::BufReader::new(std::fs::File::open(src).map_err(|e| {
-        coded_ctx("backup_invalid_source", "Failed to open the backup file", e)
-    })?);
+    let mut input =
+        std::io::BufReader::new(std::fs::File::open(src).map_err(|e| {
+            coded_ctx("backup_invalid_source", "Failed to open the backup file", e)
+        })?);
 
     let mut magic = [0u8; 8];
     input
@@ -545,15 +546,38 @@ fn decrypt_stream(src: &Path, dest: &Path, passphrase: &str) -> Result<(), Strin
 /// directory so it inherits the restricted ACL and shares a volume with the
 /// database snapshot.
 fn temp_dir_in(data_dir: &Path, tag: &str) -> Result<PathBuf, String> {
-    let dir = data_dir.join(format!(
-        ".{tag}-{}-{}",
-        std::process::id(),
-        chrono::Utc::now().timestamp_millis()
-    ));
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| coded_ctx("backup_export_failed", "Failed to create a temp directory", e))?;
-    crate::security::restrict_file_permissions(&dir);
-    Ok(dir)
+    std::fs::create_dir_all(data_dir).map_err(|e| {
+        coded_ctx(
+            "backup_export_failed",
+            "Failed to create a temp directory",
+            e,
+        )
+    })?;
+    for _ in 0..8 {
+        let dir = data_dir.join(format!(
+            ".{tag}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => {
+                crate::security::restrict_file_permissions(&dir);
+                return Ok(dir);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(coded_ctx(
+                    "backup_export_failed",
+                    "Failed to create a temp directory",
+                    error,
+                ));
+            }
+        }
+    }
+    Err(coded(
+        "backup_export_failed",
+        "Failed to allocate a unique temp directory",
+    ))
 }
 
 /// Build the plaintext zip: `manifest.json` plus one entry per present file.
@@ -575,11 +599,7 @@ fn build_archive(
         let bytes = if spec.database {
             let snapshot = scratch.join("ember.db.snapshot");
             db.snapshot_to(&snapshot).map_err(|e| {
-                coded_ctx(
-                    "backup_export_failed",
-                    "Failed to snapshot the database",
-                    e,
-                )
+                coded_ctx("backup_export_failed", "Failed to snapshot the database", e)
             })?;
             let bytes = std::fs::read(&snapshot)
                 .map_err(|e| coded_ctx("backup_export_failed", "Failed to read the snapshot", e))?;
@@ -978,7 +998,14 @@ pub async fn pending_restore_status(app: tauri::AppHandle) -> Result<PendingRest
 /// Throw away a staged restore. The staged copies are re-wrapped secrets and
 /// database contents, so they are deleted rather than left lying around.
 #[tauri::command]
-pub async fn discard_pending_restore(app: tauri::AppHandle) -> Result<(), String> {
+pub async fn discard_pending_restore(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    // The import command writes into this same stable directory. Holding the
+    // shared guard prevents a discard from deleting an import halfway through
+    // staging and lets the next startup trust the marker's file set.
+    let _restore_import_guard = state.restore_import_lock.lock().await;
     let staging = staging_dir(&paths::resolve_data_dir_with_app(&app));
     if !staging.exists() {
         return Ok(());
@@ -1034,9 +1061,15 @@ pub async fn preview_backup(
 #[tauri::command]
 pub async fn import_backup(
     app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
     source_path: String,
     passphrase: String,
 ) -> Result<RestoreSummary, String> {
+    // `restore-pending` has a fixed name because startup must discover it
+    // before the runtime state is initialized. Serialize the full staging
+    // transaction so independent IPC calls cannot interleave files or delete
+    // one another's incomplete directory.
+    let _restore_import_guard = state.restore_import_lock.lock().await;
     let source = validate_source(&source_path)?;
     let data_dir = paths::resolve_data_dir_with_app(&app);
     let passphrase = Zeroizing::new(passphrase);
@@ -1727,7 +1760,8 @@ mod tests {
             zip.write_all(bytes).unwrap();
         }
         zip.start_file(MANIFEST_NAME, options).unwrap();
-        zip.write_all(&serde_json::to_vec(manifest).unwrap()).unwrap();
+        zip.write_all(&serde_json::to_vec(manifest).unwrap())
+            .unwrap();
         zip.finish().unwrap();
         zip_path
     }
@@ -1883,7 +1917,10 @@ mod tests {
             "the database snapshot must be in the archive"
         );
         assert!(
-            manifest.files.iter().any(|f| f.name == "identity.json" && f.rewrap),
+            manifest
+                .files
+                .iter()
+                .any(|f| f.name == "identity.json" && f.rewrap),
             "identity.json must be marked for re-wrapping"
         );
         let archive = root.join("profile.emberbackup");
@@ -1898,7 +1935,8 @@ mod tests {
         // could not read, nor the plaintext where the container did not encrypt.
         let raw = std::fs::read(&archive).unwrap();
         assert!(
-            !raw.windows(identity_plaintext.len()).any(|w| w == identity_plaintext),
+            !raw.windows(identity_plaintext.len())
+                .any(|w| w == identity_plaintext),
             "the identity must not be readable in the archive bytes"
         );
 
@@ -1944,8 +1982,9 @@ mod tests {
         );
 
         // The restored database opens and reports the schema it was taken at.
-        let restored_db = crate::storage::database::Database::open_at(&restore_dir.join("ember.db"))
-            .expect("open restored database");
+        let restored_db =
+            crate::storage::database::Database::open_at(&restore_dir.join("ember.db"))
+                .expect("open restored database");
         assert_eq!(
             restored_db.schema_version(),
             crate::storage::database::MAX_SUPPORTED_SCHEMA_VERSION

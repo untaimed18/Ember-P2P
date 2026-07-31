@@ -1,8 +1,9 @@
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
 use tracing::{debug, info, warn};
-use walkdir::WalkDir;
 
 use crate::network::ed2k::aich::compute_aich_root;
 use crate::network::ed2k::hash::{ed2k_hash_file, hash_file_combined_cancellable};
@@ -32,13 +33,12 @@ impl FileIndexer {
     }
 
     /// Discover one deterministic page of a directory. The indexer keeps a
-    /// bounded page in memory but walks through the directory to collect a
-    /// wraparound page after `cursor`, so repeated scans eventually cover files
-    /// beyond the old fixed 100k prefix.
+    /// bounded, globally sorted page in memory. Cursor pages advance strictly
+    /// forward; once the end is reached, a later scan resets to the beginning.
     pub fn discover_directory_page(dir: &str, cursor: Option<&str>) -> DiscoveryResult {
         let mut files = Vec::new();
-        let mut wraparound = Vec::new();
-        let mut eligible_count = 0usize;
+        let mut truncated = false;
+        let mut saw_before_cursor = false;
         let path = Path::new(dir);
 
         if !path.exists() || !path.is_dir() {
@@ -54,92 +54,140 @@ impl FileIndexer {
         // shared, never walk into it (config, identity, known.met, …).
         let data_dir = crate::storage::paths::resolve_data_dir();
         let data_canon = data_dir.canonicalize().unwrap_or(data_dir);
+        if let Ok(root_canon) = path.canonicalize() {
+            if root_canon == data_canon || root_canon.starts_with(&data_canon) {
+                warn!("Refusing to discover the application data directory: {dir}");
+                return DiscoveryResult {
+                    files,
+                    truncated: false,
+                    next_cursor: None,
+                };
+            }
+        }
 
         info!("Discovering files in: {dir}");
 
-        for entry in WalkDir::new(path)
-            .follow_links(false)
-            // Cursor comparisons use normalized full paths, so traversal must
-            // use the same ordering. Sorting only basenames can cycle between
-            // DFS directory groups and permanently starve later paths.
-            .sort_by(|left, right| {
-                normalize_path_key(&left.path().to_string_lossy())
-                    .cmp(&normalize_path_key(&right.path().to_string_lossy()))
-            })
-            .into_iter()
-            .filter_entry(|e| {
-                if e.path_is_symlink() {
-                    return false;
-                }
-                #[cfg(target_os = "windows")]
-                {
-                    use std::os::windows::fs::MetadataExt;
-                    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-                    if let Ok(meta) = e.metadata() {
-                        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                            return false;
+        // `WalkDir::sort_by` sorts siblings, not the complete DFS traversal:
+        // on Windows `a\\child` may arrive before sibling `a0`, even though
+        // `a0` sorts first by our cursor key. A best-first directory queue
+        // produces a globally ordered stream, making an early page cutoff
+        // safe without dropping files between cursor pages.
+        let mut pending: BinaryHeap<Reverse<(String, std::path::PathBuf, bool)>> =
+            BinaryHeap::new();
+        let enqueue_children =
+            |directory: &Path,
+             pending: &mut BinaryHeap<Reverse<(String, std::path::PathBuf, bool)>>| {
+                let entries = match std::fs::read_dir(directory) {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        warn!("Failed to read shared directory {}: {error}", directory.display());
+                        return;
+                    }
+                };
+                for entry in entries {
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(error) => {
+                            warn!("Failed to enumerate {}: {error}", directory.display());
+                            continue;
                         }
+                    };
+                    let entry_path = entry.path();
+                    let file_type = match entry.file_type() {
+                        Ok(file_type) => file_type,
+                        Err(error) => {
+                            warn!("Failed to inspect {}: {error}", entry_path.display());
+                            continue;
+                        }
+                    };
+                    if file_type.is_symlink() {
+                        continue;
                     }
-                }
-                if let Ok(canon) = e.path().canonicalize() {
-                    if canon == data_canon || canon.starts_with(&data_canon) {
-                        return false;
-                    }
-                }
-                if e.file_type().is_dir() {
-                    // Skip sensitive basenames (.ssh, AppData, temp, …) even
-                    // when nested under an allowed share root — see
-                    // `sharing::SENSITIVE_DIR_NAMES`.
-                    let name = e.file_name().to_string_lossy();
-                    return !crate::sharing::is_sensitive_dir_name(&name);
-                }
-                true
-            })
-            .filter_map(|e| match e {
-                Ok(entry) => Some(entry),
-                Err(e) => {
-                    warn!("WalkDir error: {e}");
-                    None
-                }
-            })
-        {
-            if entry.file_type().is_file() {
-                let name = entry.file_name().to_string_lossy();
-                // Skip temporary/partial download files
-                if name.ends_with(".part")
-                    || name.ends_with(".part.met")
-                    || name.ends_with(".met.tmp")
-                    || (name.starts_with('.') && name.ends_with(".tmp"))
-                    || name.ends_with(".migration-tmp")
-                    || name.ends_with(".bak")
-                {
-                    continue;
-                }
-                match Self::discover_file(entry.path()) {
-                    Ok(info) => {
-                        eligible_count = eligible_count.saturating_add(1);
-                        let key = normalize_path_key(&info.path);
-                        if cursor.is_none_or(|value| key.as_str() > value) {
-                            if files.len() < MAX_DISCOVERED_FILES {
-                                debug!("Discovered: {}", info.name);
-                                files.push(info);
+                    #[cfg(target_os = "windows")]
+                    {
+                        use std::os::windows::fs::MetadataExt;
+                        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+                        if let Ok(metadata) = entry.metadata() {
+                            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                                continue;
                             }
-                        } else if wraparound.len() < MAX_DISCOVERED_FILES {
-                            wraparound.push(info);
                         }
                     }
-                    Err(e) => {
-                        warn!("Failed to discover {}: {e}", entry.path().display());
+                    if file_type.is_dir() {
+                        if crate::sharing::is_sensitive_dir_name(
+                            &entry.file_name().to_string_lossy(),
+                        ) {
+                            continue;
+                        }
+                        if let Ok(canonical) = entry_path.canonicalize() {
+                            if canonical == data_canon || canonical.starts_with(&data_canon) {
+                                continue;
+                            }
+                        }
+                        let mut key = normalize_path_key(&entry_path.to_string_lossy());
+                        key.push(std::path::MAIN_SEPARATOR);
+                        pending.push(Reverse((key, entry_path, true)));
+                    } else if file_type.is_file() {
+                        let key = normalize_path_key(&entry_path.to_string_lossy());
+                        pending.push(Reverse((key, entry_path, false)));
                     }
+                }
+            };
+        enqueue_children(path, &mut pending);
+
+        while let Some(Reverse((_key, entry_path, is_directory))) = pending.pop() {
+            if is_directory {
+                enqueue_children(&entry_path, &mut pending);
+                continue;
+            }
+            let name = entry_path
+                .file_name()
+                .map(|name| name.to_string_lossy())
+                .unwrap_or_default();
+            // Skip temporary/partial download files.
+            if name.ends_with(".part")
+                || name.ends_with(".part.met")
+                || name.ends_with(".met.tmp")
+                || (name.starts_with('.') && name.ends_with(".tmp"))
+                || name.ends_with(".migration-tmp")
+                || name.ends_with(".bak")
+            {
+                continue;
+            }
+            match Self::discover_file(&entry_path) {
+                Ok(info) => {
+                    let key = normalize_path_key(&info.path);
+                    if cursor.is_none_or(|value| key.as_str() > value) {
+                        if files.len() < MAX_DISCOVERED_FILES {
+                            debug!("Discovered: {}", info.name);
+                            files.push(info);
+                        } else {
+                            // The priority queue guarantees this is the next
+                            // global path after the returned page.
+                            truncated = true;
+                            break;
+                        }
+                    } else {
+                        // Never mix paths before the current cursor into this
+                        // page: doing so makes the persisted cursor move
+                        // backward and cycles pages. Keep the page partial so
+                        // callers preserve prior index rows until the cursor
+                        // explicitly resets after the end of the traversal.
+                        saw_before_cursor = true;
+                    }
+                }
+                Err(error) => {
+                    warn!("Failed to discover {}: {error}", entry_path.display());
                 }
             }
         }
 
-        if files.len() < MAX_DISCOVERED_FILES {
-            let remaining = MAX_DISCOVERED_FILES - files.len();
-            files.extend(wraparound.into_iter().take(remaining));
+        // A non-initial page necessarily omits all entries before its cursor.
+        // Keep that reload partial even when the post-cursor tail is shorter
+        // than the page size, so reconciliation never deletes earlier pages.
+        if cursor.is_some() && saw_before_cursor {
+            truncated = true;
         }
-        let truncated = eligible_count > files.len();
         let next_cursor = truncated
             .then(|| files.last().map(|file| normalize_path_key(&file.path)))
             .flatten();

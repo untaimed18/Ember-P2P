@@ -8,7 +8,7 @@ use zip::ZipArchive;
 
 use crate::app_state::AppState;
 use crate::commands::errors::{await_reply, bounded_send, coded, coded_ctx, CMD_REPLY_TIMEOUT};
-use crate::network::kad::ip_filter::{count_valid_entries, IpFilterStats};
+use crate::network::kad::ip_filter::{count_valid_entries, IpFilter, IpFilterStats};
 use crate::network::NetworkCommand;
 
 const CMD_TIMEOUT: std::time::Duration = CMD_REPLY_TIMEOUT;
@@ -822,35 +822,17 @@ pub async fn import_ipfilter_file(
                 }
             }
         }
-        if canonical
+        let extension = canonical
             .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_lowercase())
-            != Some("dat".to_string())
-            && canonical
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.to_lowercase())
-                != Some("txt".to_string())
-            && canonical
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.to_lowercase())
-                != Some("gz".to_string())
-            && canonical
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.to_lowercase())
-                != Some("zip".to_string())
-            && canonical
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.to_lowercase())
-                != Some("p2p".to_string())
-        {
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase());
+        if !matches!(
+            extension.as_deref(),
+            Some("dat" | "txt" | "gz" | "zip" | "p2p" | "p2b")
+        ) {
             return Err(coded(
                 "security_invalid_ipfilter_file_type",
-                "IP filter file must be a .dat, .txt, .gz, .zip, or .p2p file",
+                "IP filter file must be a .dat, .txt, .gz, .zip, .p2p, or .p2b file",
             ));
         }
         Ok(canonical)
@@ -931,6 +913,68 @@ pub async fn import_ipfilter_file(
                     e,
                 )
             })?;
+            Ok::<(std::path::PathBuf, usize), String>((dest, entry_count))
+        })
+        .await
+        .map_err(|e| coded_ctx("security_task_failed", "Task failed", e))??
+    } else if ext == "p2b" {
+        // The runtime loader dispatches by extension, but its durable startup
+        // path is always `ipfilter.dat`. Convert binary PeerGuardian data here
+        // so a deferred live reload still leaves restart-safe text on disk.
+        let metadata = tokio::fs::metadata(&path).await.map_err(|e| {
+            coded_ctx(
+                "security_failed_to_stat_file",
+                "Failed to read file metadata",
+                e,
+            )
+        })?;
+        if metadata.len() > MAX_RESPONSE_BYTES as u64 {
+            return Err(coded_ctx(
+                "security_ipfilter_file_too_large",
+                "IP filter file is too large",
+                format!(
+                    "{} bytes exceeds the {} MiB limit",
+                    metadata.len(),
+                    MAX_RESPONSE_BYTES / (1024 * 1024)
+                ),
+            ));
+        }
+        let data_dir = crate::storage::paths::resolve_data_dir_with_app(&app);
+        tokio::fs::create_dir_all(&data_dir).await.map_err(|e| {
+            coded_ctx(
+                "security_failed_to_create_data_dir",
+                "Failed to create data dir",
+                e,
+            )
+        })?;
+        let dest = data_dir.join("ipfilter.dat");
+        let src = path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut filter = IpFilter::new(true, false);
+            let entry_count = match filter.load_from_file(&src) {
+                Some(n @ 1..) => n,
+                Some(0) => {
+                    return Err(coded(
+                        "security_ipfilter_no_valid_entries",
+                        "Selected file does not contain any valid IP filter entries — keeping the existing filter",
+                    ));
+                }
+                None => {
+                    return Err(coded(
+                        "security_ipfilter_no_valid_entries",
+                        "Selected file does not contain any valid IP filter entries — keeping the existing filter",
+                    ));
+                }
+            };
+            crate::security::atomic_write(&dest, &filter.canonical_dat_bytes(), false).map_err(
+                |e| {
+                    coded_ctx(
+                        "security_failed_to_write_ipfilter",
+                        "Failed to write ipfilter.dat",
+                        e,
+                    )
+                },
+            )?;
             Ok::<(std::path::PathBuf, usize), String>((dest, entry_count))
         })
         .await

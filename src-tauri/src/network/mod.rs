@@ -434,7 +434,7 @@ fn suspend_stun_keepalive(state: &mut NetworkState, reason: &'static str) {
     state.stun_ka_tcp_candidate_port = None;
     state.stun_ka_tcp_stable_hits = 0;
     revert_stun_advertise_to_settings(state);
-    info!(
+    debug!(
         "STUN keepalive auto-suspended ({reason}); advertising Settings ports TCP {} / UDP {}",
         state.tcp_port, state.udp_port
     );
@@ -843,10 +843,7 @@ async fn reseed_friend_endpoint(
     // learned from a prior HELLO+hash↔pubkey check this session.
     let user_hash = match peer_user_hash.filter(|h| *h != [0u8; 16]) {
         Some(uh) => {
-            credit_manager
-                .write()
-                .await
-                .set_ember_hash(uh, ember_hash);
+            credit_manager.write().await.set_ember_hash(uh, ember_hash);
             uh
         }
         None => match credit_manager
@@ -884,9 +881,7 @@ async fn reseed_friend_endpoint(
     let mut file_hashes = std::collections::HashSet::new();
     for (file_hash, old_ip, old_port) in &relocated {
         file_hashes.insert(*file_hash);
-        state
-            .dead_sources
-            .remove(0, u32::from(*old_ip), *old_port);
+        state.dead_sources.remove(0, u32::from(*old_ip), *old_port);
         state
             .dead_sources
             .remove_for_file(file_hash, u32::from(*old_ip), *old_port);
@@ -1217,10 +1212,7 @@ fn sign_local_relay_attestation(
         .connection_broker
         .as_ref()
         .and_then(|b| b.quic_endpoint())?;
-    if relay_port == 0
-        || relay_ip.is_multicast()
-        || crate::security::is_special_use_v4(relay_ip)
-    {
+    if relay_port == 0 || relay_ip.is_multicast() || crate::security::is_special_use_v4(relay_ip) {
         return None;
     }
     let now_unix = std::time::SystemTime::now()
@@ -2134,8 +2126,7 @@ fn friend_xfer_send_decision(
 
     let previous_attempts = match attempts.get(&(friend, file_hash)) {
         Some(existing) => {
-            if now.saturating_duration_since(existing.sent_at).as_secs()
-                < FRIEND_XFER_COOLDOWN_SECS
+            if now.saturating_duration_since(existing.sent_at).as_secs() < FRIEND_XFER_COOLDOWN_SECS
             {
                 return FriendXferSendDecision::Cooldown;
             }
@@ -2289,8 +2280,10 @@ async fn request_friend_transfer(
     );
     match transport {
         FriendXferTransport::ConnectBack { .. } => {
-            state.friend_xfer_stats.connect_back_requested =
-                state.friend_xfer_stats.connect_back_requested.saturating_add(1)
+            state.friend_xfer_stats.connect_back_requested = state
+                .friend_xfer_stats
+                .connect_back_requested
+                .saturating_add(1)
         }
         FriendXferTransport::Punch { .. } => {
             state.friend_xfer_stats.punch_requested =
@@ -2502,33 +2495,44 @@ async fn flush_pending_chat(
         // A mark that silently failed left the row queued, so the next session
         // with this friend sent the same message again and they saw it twice.
         // We cannot un-send it, so log loudly rather than discarding the result.
-        match tokio::task::spawn_blocking(move || {
+        let marked_delivered = match tokio::task::spawn_blocking(move || {
             db_mark.set_chat_delivery(id, crate::storage::database::CHAT_DELIVERED)
         })
         .await
         {
-            Ok(Ok(0)) => tracing::warn!(
-                "Chat message {id} to {hash_hex} was sent but matched no row to mark \
-                 delivered; it may be re-sent on the next session"
-            ),
-            Ok(Err(e)) => tracing::warn!(
-                "Chat message {id} to {hash_hex} was sent but could not be marked \
-                 delivered ({e}); it may be re-sent on the next session"
-            ),
-            Err(e) => tracing::warn!(
-                "Chat message {id} to {hash_hex} was sent but the marking task failed \
-                 ({e}); it may be re-sent on the next session"
-            ),
-            Ok(Ok(_)) => {}
+            Ok(Ok(_n @ 1..)) => true,
+            Ok(Ok(0)) => {
+                tracing::warn!(
+                    "Chat message {id} to {hash_hex} was sent but matched no row to mark \
+                     delivered; it may be re-sent on the next session"
+                );
+                false
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    "Chat message {id} to {hash_hex} was sent but could not be marked \
+                     delivered ({e}); it may be re-sent on the next session"
+                );
+                false
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Chat message {id} to {hash_hex} was sent but the marking task failed \
+                     ({e}); it may be re-sent on the next session"
+                );
+                false
+            }
+        };
+        if marked_delivered {
+            let _ = app_handle.emit(
+                "ember:chat-delivery",
+                serde_json::json!({
+                    "user_hash": hash_hex,
+                    "id": id,
+                    "delivery": "delivered",
+                }),
+            );
         }
-        let _ = app_handle.emit(
-            "ember:chat-delivery",
-            serde_json::json!({
-                "user_hash": hash_hex,
-                "id": id,
-                "delivery": "delivered",
-            }),
-        );
     }
 }
 
@@ -2794,26 +2798,19 @@ async fn maybe_escalate_to_friend_transfer(
     // A dead end is parked too, not just a live request. Both cases keep the
     // row visible and both stop the caller's dead-source bookkeeping; they
     // differ only in what the row says and whether anything is outstanding.
-    let unreachable = match request_friend_transfer(
-        state,
-        pending,
-        transfer_id,
-        friend,
-        file_hash,
-    )
-    .await
-    {
-        FriendXferRequestOutcome::Sent => false,
-        FriendXferRequestOutcome::NoTransport(reason) => {
-            info!(
-                "No transport to offer friend {} for {}: {reason:?}",
-                hex::encode(friend),
-                hex::encode(file_hash)
-            );
-            true
-        }
-        FriendXferRequestOutcome::Refused => return false,
-    };
+    let unreachable =
+        match request_friend_transfer(state, pending, transfer_id, friend, file_hash).await {
+            FriendXferRequestOutcome::Sent => false,
+            FriendXferRequestOutcome::NoTransport(reason) => {
+                info!(
+                    "No transport to offer friend {} for {}: {reason:?}",
+                    hex::encode(friend),
+                    hex::encode(file_hash)
+                );
+                true
+            }
+            FriendXferRequestOutcome::Refused => return false,
+        };
 
     if let Some(pfs) = state.per_file_sources.get_mut(transfer_id) {
         if unreachable {
@@ -2920,7 +2917,12 @@ mod friend_transfer_tests {
     const FILE_1: [u8; 16] = [0x11; 16];
     const FILE_2: [u8; 16] = [0x22; 16];
 
-    fn attempt(transfer_id: &str, nonce: [u8; 16], sent_at: Instant, attempts: u32) -> FriendXferAttempt {
+    fn attempt(
+        transfer_id: &str,
+        nonce: [u8; 16],
+        sent_at: Instant,
+        attempts: u32,
+    ) -> FriendXferAttempt {
         FriendXferAttempt {
             transfer_id: transfer_id.to_string(),
             nonce,
@@ -3055,12 +3057,7 @@ mod friend_transfer_tests {
         // Symmetric NAT re-maps per destination, so the port we register is not
         // the port the friend would arrive on.
         assert_eq!(
-            ok(
-                Some(4670),
-                ember::nat::NatType::Symmetric,
-                Some(addr),
-                true
-            ),
+            ok(Some(4670), ember::nat::NatType::Symmetric, Some(addr), true),
             Err(NoTransportReason::SymmetricNat)
         );
     }
@@ -3288,7 +3285,12 @@ mod friend_transfer_tests {
                 {
                     attempts.insert(
                         (FRIEND_A, file),
-                        attempt(&format!("t{index}"), [index as u8; 16], now, previous_attempts + 1),
+                        attempt(
+                            &format!("t{index}"),
+                            [index as u8; 16],
+                            now,
+                            previous_attempts + 1,
+                        ),
                     );
                 }
             }
@@ -4258,6 +4260,51 @@ async fn try_connect_server(
     Ok((conn, addr))
 }
 
+/// Persist a chat-history row before it is exposed as delivered to the UI.
+///
+/// Wire delivery and SQLite durability are distinct operations, but claiming
+/// a message is delivered before the latter succeeds creates history entries
+/// that vanish after reload. Callers therefore await this helper before
+/// emitting their corresponding chat event or acknowledging the IPC request.
+async fn persist_chat_history_message(
+    db: Arc<Database>,
+    user_hash: String,
+    direction: &'static str,
+    message: String,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || db.insert_chat_message(&user_hash, direction, &message))
+        .await
+        .map_err(|error| format!("Chat history persistence task failed: {error}"))?
+        .map(|_| ())
+        .map_err(|error| format!("Failed to persist chat history: {error}"))
+}
+
+/// Create a durable outbox row before handing a chat packet to a session
+/// writer. The row makes a failed writer handoff recoverable on the next
+/// session instead of leaving a peer-visible message with no local history.
+async fn queue_outbound_chat_message(
+    db: Arc<Database>,
+    user_hash: String,
+    message: String,
+) -> Result<i64, String> {
+    tokio::task::spawn_blocking(move || db.insert_pending_chat_message(&user_hash, &message))
+        .await
+        .map_err(|error| format!("Chat outbox persistence task failed: {error}"))?
+        .map_err(|error| format!("Failed to persist chat outbox row: {error}"))
+}
+
+/// Mark an outbox row delivered only after its packet was accepted by the
+/// current live session's writer queue.
+async fn mark_outbound_chat_delivered(db: Arc<Database>, message_id: i64) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        db.set_chat_delivery(message_id, crate::storage::database::CHAT_DELIVERED)
+    })
+    .await
+    .map_err(|error| format!("Chat delivery persistence task failed: {error}"))?
+    .map(|_| ())
+    .map_err(|error| format!("Failed to mark chat delivered: {error}"))
+}
+
 /// Handle an inbound Ember friend request, shared by the download-side and
 /// upload-side session event loops so the approval / auto-confirm / queue
 /// policy can't drift between the two ingress paths (it previously lived as two
@@ -4296,14 +4343,20 @@ async fn process_inbound_friend_request(
         Failed(String),
     }
 
+    // Every wire ingress should already pass a bounded nickname, but keep the
+    // durable/logging choke point defensive for future callers as well.
+    let nickname = crate::security::sanitize_inbound_friend_nickname(nickname);
     let hash_hex = hex::encode(req_hash);
     info!(
-        "Processing inbound friend request from {} (nick='{}', ip={}:{}, verified={verified})",
-        hash_hex, nickname, peer_ip, peer_port
+        "Processing inbound friend request from {} (nickname_chars={}, ip={}:{}, verified={verified})",
+        hash_hex,
+        nickname.chars().count(),
+        peer_ip,
+        peer_port
     );
     let db_q = db.clone();
     let h_q = hash_hex.clone();
-    let n_q = nickname.to_string();
+    let n_q = nickname.clone();
     let ip_q = peer_ip.to_string();
     let peer_pubkey_q = peer_pubkey;
     let db_outcome = tokio::task::spawn_blocking(move || {
@@ -4419,7 +4472,7 @@ async fn process_inbound_friend_request(
             );
         }
         FriendRequestDbOutcome::Queued => {
-            info!("Queuing friend request from {} for user approval", hash_hex);
+            debug!("Queuing friend request from {} for user approval", hash_hex);
             let _ = app_handle.emit(
                 "ember:friend-request",
                 serde_json::json!({
@@ -10524,10 +10577,17 @@ fn apply_network_settings(
             let default_path = state.data_dir.join("ipfilter.dat");
             if default_path.exists() {
                 match state.ip_filter.load_from_file(&default_path) {
-                    Some(n) => info!(
+                    Some(n @ 1..) => info!(
                         "Loaded {n} IP filter entries on enable ({} ranges after merge)",
                         state.ip_filter.range_count()
                     ),
+                    Some(0) => {
+                        warn!(
+                            "ipfilter.dat contained no valid ranges on enable; leaving fail-closed until a successful reload"
+                        );
+                        state.ip_filter.mark_ranges_not_ready();
+                        load_ready = false;
+                    }
                     None => {
                         warn!(
                             "Failed to read ipfilter.dat on enable; leaving fail-closed until a successful reload"
@@ -11804,8 +11864,7 @@ pub async fn start_network(
     cleanup_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     /// How often the queued-chat expiry sweep runs. The age ceiling it enforces
     /// is measured in days, so this only has to be small relative to that.
-    const CHAT_EXPIRY_SWEEP_INTERVAL: std::time::Duration =
-        std::time::Duration::from_secs(60 * 60);
+    const CHAT_EXPIRY_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
     // `None` so the first cleanup tick sweeps, clearing anything left queued by
     // a previous run before the user has a chance to look at it.
     let mut last_chat_expiry_sweep: Option<std::time::Instant> = None;
@@ -12070,7 +12129,7 @@ pub async fn start_network(
             // run with enabled+empty blacklist (R3).
             let ranges_ready = if ipf_enabled && ipfilter_path.exists() {
                 match filter.load_from_file(&ipfilter_path) {
-                    Some(n) => {
+                    Some(n @ 1..) => {
                         info!(
                             "Loaded IP filter: enabled={}, block_private={}, ranges={}",
                             filter.is_enabled(),
@@ -12078,6 +12137,14 @@ pub async fn start_network(
                             n,
                         );
                         true
+                    }
+                    Some(0) => {
+                        filter.mark_ranges_not_ready();
+                        warn!(
+                            "IP filter at {} contained no valid ranges; leaving the enabled filter fail-closed until a successful reload",
+                            ipfilter_path.display()
+                        );
+                        false
                     }
                     None => {
                         warn!(
@@ -12371,10 +12438,11 @@ pub async fn start_network(
                     }
                     Err(e) => {
                         warn!("Deferred disk load task panicked: {e}");
-                        // Clear fail-closed gate so KAD/peer paths are not
-                        // permanently blackholed for the session.
+                        // A failed deferred read must not turn an enabled
+                        // filter into an intentional empty one. Keep the
+                        // peer paths fail-closed until a successful reload.
                         if state.ip_filter.is_enabled() {
-                            state.ip_filter.mark_ranges_ready();
+                            state.ip_filter.mark_ranges_not_ready();
                             state
                                 .ip_filter
                                 .update_shared_snapshot(&state.shared_ip_filter);
@@ -15258,24 +15326,32 @@ pub async fn start_network(
                                 *last_msg == cleaned
                                     && now.saturating_sub(*last_at) <= EMBER_CHAT_DEDUP_WINDOW_SECS
                             });
-                        state
-                            .recent_ember_chat
-                            .insert(chat_eh, (cleaned.clone(), now));
                         if !is_dup {
-                            let db2 = db.clone();
-                            let h2 = hash_hex.clone();
-                            let msg2 = cleaned.clone();
-                            tokio::task::spawn_blocking(move || {
-                                if let Err(e) = db2.insert_chat_message(&h2, "received", &msg2) {
-                                    tracing::warn!("Failed to persist received chat message: {e}");
+                            match persist_chat_history_message(
+                                db.clone(),
+                                hash_hex.clone(),
+                                "received",
+                                cleaned.clone(),
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    state
+                                        .recent_ember_chat
+                                        .insert(chat_eh, (cleaned.clone(), now));
+                                    let _ = app_handle.emit("ember:chat-message", serde_json::json!({
+                                        "user_hash": hash_hex,
+                                        "message": cleaned,
+                                        "direction": "received",
+                                        "timestamp": now,
+                                    }));
                                 }
-                            });
-                            let _ = app_handle.emit("ember:chat-message", serde_json::json!({
-                                "user_hash": hash_hex,
-                                "message": cleaned,
-                                "direction": "received",
-                                "timestamp": now,
-                            }));
+                                Err(error) => {
+                                    warn!(
+                                        "Received chat message was not emitted because history persistence failed: {error}"
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -36633,14 +36709,9 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::GetKnownClientsSnapshot { tx } => {
-            let snap = known_clients_snapshot(
-                credit_manager,
-                friend_hashes,
-                upload_queue,
-                geoip,
-                &db,
-            )
-            .await;
+            let snap =
+                known_clients_snapshot(credit_manager, friend_hashes, upload_queue, geoip, &db)
+                    .await;
             let _ = tx.send(snap);
         }
 
@@ -36808,8 +36879,10 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::ReloadIpFilter { path, tx } => {
-            // Persist the imported filter to ipfilter.dat so it loads on
-            // next startup, then parse on a blocking-pool thread.
+            // Validate imports from a private staged copy, then atomically
+            // persist compatible startup bytes. This keeps startup and the
+            // live filter coherent even if an external source file is
+            // replaced while an import is in progress.
             //
             // IMPORTANT: leave `state.ip_filter` in place for the entire
             // await. The network `select!` still drains UDP/TCP while we
@@ -36822,7 +36895,11 @@ async fn handle_command_inner(
             let block_private = state.ip_filter.blocks_private();
             let load_path = default_path.clone();
             let loaded = tokio::task::spawn_blocking(move || -> Result<IpFilter, String> {
-                if path != load_path {
+                const MAX_IMPORTED_IPFILTER_BYTES: u64 = 50 * 1024 * 1024;
+                let mut staged_path = None;
+                let mut staged_bytes = None;
+                let mut imported_p2b = false;
+                let parse_path = if path != load_path {
                     // Defense in depth: `import_ipfilter_file` (the only
                     // caller that can supply an arbitrary local path)
                     // enforces this same limit before sending this
@@ -36831,7 +36908,6 @@ async fn handle_command_inner(
                     // caller too. Stat-and-reject here so this command
                     // can never be tricked into copying an unbounded
                     // file into ipfilter.dat regardless of caller.
-                    const MAX_IMPORTED_IPFILTER_BYTES: u64 = 50 * 1024 * 1024;
                     match std::fs::metadata(&path) {
                         Ok(meta) if meta.len() > MAX_IMPORTED_IPFILTER_BYTES => {
                             warn!(
@@ -36845,32 +36921,89 @@ async fn handle_command_inner(
                                 MAX_IMPORTED_IPFILTER_BYTES / (1024 * 1024)
                             ));
                         }
-                        Ok(_) => {
-                            if let Err(e) = std::fs::copy(&path, &load_path) {
-                                warn!("Failed to persist IP filter to {:?}: {}", load_path, e);
-                                return Err(format!("Failed to persist imported IP filter: {e}"));
-                            }
-                            info!("Persisted imported IP filter to {:?}", load_path);
-                        }
+                        Ok(_) => {}
                         Err(e) => {
                             warn!("Failed to stat IP filter import path {:?}: {}", path, e);
                             return Err(format!("Failed to read imported IP filter: {e}"));
                         }
                     }
-                }
+                    let bytes = std::fs::read(&path)
+                        .map_err(|error| format!("Failed to read imported IP filter: {error}"))?;
+                    if bytes.len() as u64 > MAX_IMPORTED_IPFILTER_BYTES {
+                        return Err(format!(
+                            "Imported IP filter exceeds the {} MiB limit",
+                            MAX_IMPORTED_IPFILTER_BYTES / (1024 * 1024)
+                        ));
+                    }
+                    let extension = path
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .map(|extension| extension.to_ascii_lowercase());
+                    let extension = match extension.as_deref() {
+                        Some("p2b") => "p2b",
+                        Some("p2p") => "p2p",
+                        _ => "dat",
+                    };
+                    imported_p2b = extension == "p2b";
+                    let staged = load_path.with_file_name(format!(
+                        ".ipfilter-stage-{}-{}.{}",
+                        std::process::id(),
+                        uuid::Uuid::new_v4(),
+                        extension
+                    ));
+                    crate::security::atomic_write(&staged, &bytes, false).map_err(|error| {
+                        format!("Failed to stage imported IP filter: {error}")
+                    })?;
+                    staged_path = Some(staged.clone());
+                    staged_bytes = Some(bytes);
+                    staged
+                } else {
+                    path.clone()
+                };
                 let mut fresh = IpFilter::new(enabled, block_private);
-                match fresh.load_from_file(&load_path) {
-                    Some(n) => {
-                        info!("ReloadIpFilter: parsed {n} ranges from {load_path:?}");
-                        Ok(fresh)
+                let range_count = match fresh.load_from_file(&parse_path) {
+                    Some(n @ 1..) => n,
+                    Some(0) => {
+                        if let Some(staged) = staged_path.as_ref() {
+                            let _ = std::fs::remove_file(staged);
+                        }
+                        warn!(
+                            "ReloadIpFilter: refusing zero-range filter from {:?}; keeping the previous filter",
+                            path
+                        );
+                        return Err("IP filter contains no valid ranges".into());
                     }
                     None => {
+                        if let Some(staged) = staged_path.as_ref() {
+                            let _ = std::fs::remove_file(staged);
+                        }
                         warn!(
-                            "ReloadIpFilter: failed to read {load_path:?}; keeping the previous filter"
+                            "ReloadIpFilter: failed to read {path:?}; keeping the previous filter"
                         );
-                        Err("Failed to parse IP filter".into())
+                        return Err("Failed to parse IP filter".into());
                     }
+                };
+                if let (Some(staged), Some(bytes)) = (staged_path, staged_bytes) {
+                    // `ipfilter.dat` is always loaded as text on startup.
+                    // Preserve `.p2p` text verbatim, but convert `.p2b`
+                    // binary input into canonical eMule text before it
+                    // replaces that stable path.
+                    let persisted_bytes = if imported_p2b {
+                        fresh.canonical_dat_bytes()
+                    } else {
+                        bytes
+                    };
+                    let persist_result =
+                        crate::security::atomic_write(&load_path, &persisted_bytes, false);
+                    let _ = std::fs::remove_file(&staged);
+                    if let Err(error) = persist_result {
+                        warn!("Failed to persist IP filter to {:?}: {}", load_path, error);
+                        return Err(format!("Failed to persist imported IP filter: {error}"));
+                    }
+                    info!("Persisted imported IP filter to {:?}", load_path);
                 }
+                info!("ReloadIpFilter: parsed {range_count} ranges from {path:?}");
+                Ok(fresh)
             })
             .await;
             let result = match loaded {
@@ -36981,11 +37114,18 @@ async fn handle_command_inner(
                     let loaded = tokio::task::spawn_blocking(move || {
                         let mut fresh = IpFilter::new(true, block_private);
                         match fresh.load_from_file(&default_path) {
-                            Some(n) => {
+                            Some(n @ 1..) => {
                                 info!(
                                     "SetIpFilterEnabled: parsed {n} ranges from {default_path:?}"
                                 );
                                 Some(fresh)
+                            }
+                            Some(0) => {
+                                fresh.mark_ranges_not_ready();
+                                warn!(
+                                    "ipfilter.dat contained no valid ranges while enabling the filter; leaving fail-closed until a successful reload"
+                                );
+                                None
                             }
                             None => {
                                 warn!(
@@ -38008,10 +38148,7 @@ async fn handle_command_inner(
             drop(sessions);
             match result {
                 Ok(()) => {
-                    info!(
-                        "Offered {hash_hex} to friend {}",
-                        hex::encode(friend_eh)
-                    );
+                    info!("Offered {hash_hex} to friend {}", hex::encode(friend_eh));
                     let _ = tx.send(Ok(()));
                 }
                 Err(_) => {
@@ -38619,7 +38756,6 @@ async fn handle_command_inner(
             } else if !friend_hashes.read().await.contains(&friend_eh) {
                 let _ = tx.send(Err("Can only chat with friends".into()));
             } else {
-                let sessions = state.ember_sessions.read().await;
                 // Only reuse the session if it's actually fresh (see
                 // `EmberSessionHandle::is_fresh`). A stale entry's mpsc
                 // channel is usually still open — its receiver lives in a
@@ -38629,10 +38765,14 @@ async fn handle_command_inner(
                 // would see `Ok(())` for a message that's actually lost.
                 // Falling through to the reconnect branch instead gives
                 // the message a real chance of delivery.
-                if let Some(sender) = sessions
-                    .get(&friend_eh)
-                    .filter(|h| h.is_fresh() && h.is_secure_v2())
-                {
+                let sender = {
+                    let sessions = state.ember_sessions.read().await;
+                    sessions
+                        .get(&friend_eh)
+                        .filter(|h| h.is_fresh() && h.is_secure_v2())
+                        .cloned()
+                };
+                if let Some(sender) = sender {
                     // Every friend session's `EmberSessionHandle` carries
                     // the peer's PoP-verified Ed25519 pubkey (see its doc
                     // comment), so encryption is always possible for a
@@ -38662,45 +38802,83 @@ async fn handle_command_inner(
                                 let _ = tx.send(Err("Can only chat with friends".into()));
                                 return;
                             }
+                            let hash_hex = hex::encode(friend_eh);
+                            let pending_id = match queue_outbound_chat_message(
+                                db.clone(),
+                                hash_hex,
+                                message.clone(),
+                            )
+                            .await
+                            {
+                                Ok(id) => id,
+                                Err(error) => {
+                                    warn!(
+                                        "Refusing to hand off chat without a durable outbox row: {error}"
+                                    );
+                                    let _ = tx.send(Err(error));
+                                    return;
+                                }
+                            };
                             match sender.tx.try_send(packet) {
                                 Ok(()) => {
-                                    let hash_hex = hex::encode(friend_eh);
-                                    let db2 = db.clone();
-                                    let msg2 = message.clone();
-                                    tokio::task::spawn_blocking(move || {
-                                        if let Err(e) =
-                                            db2.insert_chat_message(&hash_hex, "sent", &msg2)
-                                        {
-                                            tracing::warn!(
-                                                "Failed to persist sent chat message: {e}"
+                                    match mark_outbound_chat_delivered(db.clone(), pending_id).await {
+                                        Ok(()) => {
+                                            let _ = app_handle.emit(
+                                                "ember:chat-message",
+                                                serde_json::json!({
+                                                    "user_hash": hex::encode(friend_eh),
+                                                    "message": message,
+                                                    "direction": "sent",
+                                                    "timestamp": chrono::Utc::now().timestamp(),
+                                                }),
                                             );
+                                            let _ = tx.send(Ok(()));
                                         }
-                                    });
-                                    let _ = app_handle.emit(
-                                        "ember:chat-message",
-                                        serde_json::json!({
-                                            "user_hash": hex::encode(friend_eh),
-                                            "message": message,
-                                            "direction": "sent",
-                                            "timestamp": chrono::Utc::now().timestamp(),
-                                        }),
-                                    );
-                                    let _ = tx.send(Ok(()));
+                                        Err(error) => {
+                                            warn!(
+                                                "Sent chat message remains queued because delivery persistence failed: {error}"
+                                            );
+                                            let _ = tx.send(Err(format!(
+                                                "ChatAlreadyQueued:{pending_id}"
+                                            )));
+                                        }
+                                    }
                                 }
                                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                    let _ = tx.send(Err("Connection channel full".into()));
+                                    let _ = tx.send(Err(format!(
+                                        "ChatAlreadyQueued:{pending_id}"
+                                    )));
                                 }
                                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                    let _ = tx.send(Err("Connection to friend closed".into()));
+                                    let _ = tx.send(Err(format!(
+                                        "ChatAlreadyQueued:{pending_id}"
+                                    )));
                                 }
                             }
                         }
                     }
                 } else {
-                    drop(sessions);
+                    // Queue before initiating a connection. The successful
+                    // `EmberFriendConnected` event flushes this durable row;
+                    // sending a separate direct copy after connect races that
+                    // flush and can duplicate the chat packet.
+                    let queued_hash = hex::encode(friend_eh);
+                    let queued_id =
+                        match queue_outbound_chat_message(db.clone(), queued_hash, message.clone())
+                            .await
+                        {
+                            Ok(id) => id,
+                            Err(error) => {
+                                warn!(
+                                    "Refusing to auto-connect chat without a durable outbox row: {error}"
+                                );
+                                let _ = tx.send(Err(error));
+                                return;
+                            }
+                        };
+                    let _ = tx.send(Err(format!("ChatAlreadyQueued:{queued_id}")));
                     if state.outbound_session_tasks.contains_key(&friend_eh) {
-                        let _ =
-                            tx.send(Err("Connecting to friend, please retry in a moment".into()));
+                        debug!("Chat remains queued while an existing friend connection attempt finishes");
                     } else {
                         let db2 = db.clone();
                         let hash_hex = hex::encode(friend_eh);
@@ -38729,9 +38907,7 @@ async fn handle_command_inner(
                                 let sessions_clone = state.ember_sessions.clone();
                                 let ul_tx = ul_event_tx.clone();
                                 let fh = friend_hashes.clone();
-                                let app2 = app_handle.clone();
                                 let db3 = db.clone();
-                                let msg = message.clone();
                                 let ul_tx2 = ul_event_tx.clone();
                                 let rv_url = settings.rendezvous_url.clone();
                                 let nat_ctx = state.friend_nat_context.clone();
@@ -38764,74 +38940,26 @@ async fn handle_command_inner(
                                     )
                                     .await
                                     {
-                                        Ok(handle) => {
+                                        Ok(_handle) => {
                                             if !fh.read().await.contains(&friend_eh) {
-                                                let _ = tx
-                                                    .send(Err("Can only chat with friends".into()));
+                                                debug!(
+                                                    "Friend was removed while auto-connecting queued chat"
+                                                );
                                                 let _ = ul_tx2.send(upload_server::UploadEvent {
                                                     transfer_id: String::new(),
                                                     kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
                                                 }).await;
                                                 return;
                                             }
-                                            match crate::network::ember::crypto::encrypt_chat_for_peer(
-                                                &ed25519_secret_key,
-                                                &handle.peer_ember_pubkey,
-                                                msg.as_bytes(),
-                                            ) {
-                                                None => {
-                                                    let _ = tx.send(Err("ChatEncryptFailed".into()));
-                                                }
-                                                Some(envelope) => {
-                                                    let mut packet =
-                                                        Vec::with_capacity(6 + envelope.len());
-                                                    packet.push(OP_EMULEPROT);
-                                                    let size = (1 + envelope.len()) as u32;
-                                                    packet.extend_from_slice(&size.to_le_bytes());
-                                                    packet.push(ed2k::messages::OP_EMBER_CHAT_MSG);
-                                                    packet.extend_from_slice(&envelope);
-                                                    if handle.outbound_tx.try_send(packet).is_ok() {
-                                                        let hash_hex = hex::encode(friend_eh);
-                                                        let msg_for_db = msg.clone();
-                                                        let db_for_msg = db3.clone();
-                                                        tokio::task::spawn_blocking(move || {
-                                                            if let Err(e) = db_for_msg
-                                                                .insert_chat_message(
-                                                                    &hash_hex,
-                                                                    "sent",
-                                                                    &msg_for_db,
-                                                                )
-                                                            {
-                                                                tracing::warn!(
-                                                                    "Failed to persist sent chat message: {e}"
-                                                                );
-                                                            }
-                                                        });
-                                                        let _ = app2.emit(
-                                                            "ember:chat-message",
-                                                            serde_json::json!({
-                                                                "user_hash": hex::encode(friend_eh),
-                                                                "message": msg,
-                                                                "direction": "sent",
-                                                                "timestamp": chrono::Utc::now().timestamp(),
-                                                            }),
-                                                        );
-                                                        let _ = tx.send(Ok(()));
-                                                    } else {
-                                                        let _ = tx.send(Err(
-                                                            "Failed to send on new connection".into(),
-                                                        ));
-                                                    }
-                                                }
-                                            }
+                                            // `EmberFriendConnected` flushes
+                                            // the already-queued row. Do not
+                                            // send another direct packet here.
                                         }
                                         Err(e) => {
                                             debug!(
                                                 "Auto-connect for chat to {} failed: {e}",
                                                 hex::encode(friend_eh)
                                             );
-                                            let _ =
-                                                tx.send(Err(format!("Auto-connect failed: {e}")));
                                             // Stored IP is dead — clear it so the
                                             // next chat attempt skips the
                                             // multi-second TCP timeout against
@@ -38867,7 +38995,7 @@ async fn handle_command_inner(
                                     db_for_clear.clear_friend_address(&hash_hex_clear)
                                 })
                                 .await;
-                                let _ = tx.send(Err("Invalid friend IP address".into()));
+                                debug!("Queued chat cannot use stored invalid friend IP address");
                             }
                         } else {
                             let rv_url = settings.rendezvous_url.clone();
@@ -38884,9 +39012,6 @@ async fn handle_command_inner(
                             let sess = state.ember_sessions.clone();
                             let ultx = ul_event_tx.clone();
                             let fh = friend_hashes.clone();
-                            let app2 = app_handle.clone();
-                            let db3 = db.clone();
-                            let msg = message.clone();
                             let ultx2 = ul_event_tx.clone();
                             let nat_ctx = state.friend_nat_context.clone();
                             state
@@ -38928,84 +39053,31 @@ async fn handle_command_inner(
                                         )
                                         .await
                                         {
-                                            Ok(handle) => {
+                                            Ok(_handle) => {
                                                 if !fh.read().await.contains(&friend_eh) {
-                                                    let _ = tx.send(Err(
-                                                        "Can only chat with friends".into(),
-                                                    ));
+                                                    debug!(
+                                                        "Friend was removed while rendezvous-connecting queued chat"
+                                                    );
                                                     let _ = ultx2.send(upload_server::UploadEvent {
                                                         transfer_id: String::new(),
                                                         kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
                                                     }).await;
                                                     return;
                                                 }
-                                                match crate::network::ember::crypto::encrypt_chat_for_peer(
-                                                    &ed25519_secret_key,
-                                                    &handle.peer_ember_pubkey,
-                                                    msg.as_bytes(),
-                                                ) {
-                                                    None => {
-                                                        let _ = tx.send(Err("ChatEncryptFailed".into()));
-                                                    }
-                                                    Some(envelope) => {
-                                                        let mut packet =
-                                                            Vec::with_capacity(6 + envelope.len());
-                                                        packet.push(OP_EMULEPROT);
-                                                        let size = (1 + envelope.len()) as u32;
-                                                        packet.extend_from_slice(&size.to_le_bytes());
-                                                        packet.push(ed2k::messages::OP_EMBER_CHAT_MSG);
-                                                        packet.extend_from_slice(&envelope);
-                                                        if handle.outbound_tx.try_send(packet).is_ok()
-                                                        {
-                                                            let hash_hex = hex::encode(friend_eh);
-                                                            let msg_for_db = msg.clone();
-                                                            let db_for_msg = db3.clone();
-                                                            tokio::task::spawn_blocking(move || {
-                                                                if let Err(e) = db_for_msg
-                                                                    .insert_chat_message(
-                                                                        &hash_hex,
-                                                                        "sent",
-                                                                        &msg_for_db,
-                                                                    )
-                                                                {
-                                                                    tracing::warn!(
-                                                                        "Failed to persist sent chat message: {e}"
-                                                                    );
-                                                                }
-                                                            });
-                                                            let _ = app2.emit(
-                                                                "ember:chat-message",
-                                                                serde_json::json!({
-                                                                    "user_hash": hex::encode(friend_eh),
-                                                                    "message": msg,
-                                                                    "direction": "sent",
-                                                                    "timestamp": chrono::Utc::now().timestamp(),
-                                                                }),
-                                                            );
-                                                            let _ = app2.emit(
-                                                                "ember:friend-online",
-                                                                serde_json::json!({
-                                                                    "user_hash": hex::encode(friend_eh),
-                                                                }),
-                                                            );
-                                                            let _ = tx.send(Ok(()));
-                                                        } else {
-                                                            let _ = tx.send(Err(
-                                                                "Failed to send on new connection"
-                                                                    .into(),
-                                                            ));
-                                                        }
-                                                    }
-                                                }
+                                                // `EmberFriendConnected`
+                                                // flushes the durable outbox
+                                                // row created before this
+                                                // connection attempt.
                                             }
                                             Err(e) => {
-                                                let _ =
-                                                    tx.send(Err(format!("Could not connect: {e}")));
+                                                debug!(
+                                                    "Queued chat rendezvous connection failed: {e}"
+                                                );
                                             }
                                         }
                                     }
                                     _ => {
-                                        let _ = tx.send(Err("Friend is offline".into()));
+                                        debug!("Queued chat friend is offline");
                                     }
                                 }
                                 // Always release the outbound-task slot

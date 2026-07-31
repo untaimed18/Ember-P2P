@@ -532,7 +532,24 @@ pub async fn download_collection_files(
             let persisted = mgr.get_transfer(&transfer_id).cloned().unwrap_or(transfer);
             (active_now, persisted)
         };
-        super::transfers::persist_transfer(&state, &persisted_transfer).await;
+        if let Err(error) = super::transfers::persist_transfer(&state, &persisted_transfer).await {
+            // The transfer has not reached the network worker yet. Remove the
+            // transient manager entry so startup can never mistake a future
+            // partial file for an orphan after a failed database write.
+            let promoted = {
+                let mut mgr = state.transfer_manager.write().await;
+                mgr.remove(&transfer_id)
+            };
+            if !promoted.is_empty() {
+                super::transfers::start_promoted_downloads(&state, &promoted).await;
+            }
+            tracing::warn!(
+                "Skipping collection entry '{}': could not persist transfer before start: {error}",
+                file.name
+            );
+            failed_count += 1;
+            continue;
+        }
         let _ = app.emit("transfer-started", &persisted_transfer);
 
         if active_now && !add_paused {
@@ -579,7 +596,14 @@ pub async fn download_collection_files(
                     let mgr = state.transfer_manager.read().await;
                     mgr.get_transfer(&transfer_id).cloned()
                 } {
-                    super::transfers::persist_transfer(&state, &failed).await;
+                    if let Err(persist_error) =
+                        super::transfers::persist_transfer(&state, &failed).await
+                    {
+                        tracing::error!(
+                            "Failed to persist collection network-start failure for {}: {persist_error}",
+                            transfer_id
+                        );
+                    }
                     let _ = app.emit("transfer-failed", &failed);
                 }
                 failed_count += 1;
@@ -625,7 +649,14 @@ pub async fn download_collection_files(
                     let mgr = state.transfer_manager.read().await;
                     mgr.get_transfer(&transfer_id).cloned()
                 } {
-                    super::transfers::persist_transfer(&state, &failed).await;
+                    if let Err(persist_error) =
+                        super::transfers::persist_transfer(&state, &failed).await
+                    {
+                        tracing::error!(
+                            "Failed to persist collection discovery-start failure for {}: {persist_error}",
+                            transfer_id
+                        );
+                    }
                     let _ = app.emit("transfer-failed", &failed);
                 }
                 failed_count += 1;

@@ -4739,7 +4739,7 @@ async fn download_parts_from_source(
             }
             (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) if super::LEGACY_FRIEND_AUTH_ENABLED => {
                 if let (Some(eh), Some(ref etx)) = (peer_ember_hash, &event_tx) {
-                    let nick = std::str::from_utf8(&payload).unwrap_or("").to_string();
+                    let nick = crate::security::normalize_inbound_friend_nickname(&payload);
                     // `verified = true` iff either:
                     //   * the peer completed Ed25519 PoP on this
                     //     session via `perform_ember_auth_buffered`
@@ -4755,7 +4755,12 @@ async fn download_parts_from_source(
                     // ever proving private-key possession. Binding
                     // is still logged for diagnostics.
                     let verified = ember_auth_verified;
-                    info!("Received early friend request from source {} (nick='{}', verified={verified}, pop={}, binding={ember_hash_binding_verified})", _src_idx, nick, ember_auth_verified);
+                    debug!(
+                        "Received early friend request from source {} (nickname_chars={}, verified={verified}, pop={}, binding={ember_hash_binding_verified})",
+                        _src_idx,
+                        nick.chars().count(),
+                        ember_auth_verified
+                    );
                     let _ = etx
                         .send(DownloadEvent::EmberFriendRequest {
                             ember_hash: eh,
@@ -5460,12 +5465,17 @@ async fn download_parts_from_source(
             && opcode == OP_EMBER_FRIEND_REQ
         {
             if let (Some(eh), Some(ref etx)) = (peer_ember_hash, &event_tx) {
-                let nick = std::str::from_utf8(&_payload).unwrap_or("").to_string();
+                let nick = crate::security::normalize_inbound_friend_nickname(&_payload);
                 // PoP-only `verified` (see early-friend-request site
                 // for rationale: binding-only would accept a replayed
                 // pubkey+hash pair).
                 let verified = ember_auth_verified;
-                info!("Received friend request from source {} during file-status-wait (nick='{}', verified={verified}, pop={}, binding={ember_hash_binding_verified})", _src_idx, nick, ember_auth_verified);
+                debug!(
+                    "Received friend request from source {} during file-status-wait (nickname_chars={}, verified={verified}, pop={}, binding={ember_hash_binding_verified})",
+                    _src_idx,
+                    nick.chars().count(),
+                    ember_auth_verified
+                );
                 let _ = etx
                     .send(DownloadEvent::EmberFriendRequest {
                         ember_hash: eh,
@@ -7841,12 +7851,17 @@ async fn download_parts_from_source(
                         if super::LEGACY_FRIEND_AUTH_ENABLED && hello_caps.is_ember =>
                     {
                         if let (Some(eh), Some(ref etx)) = (peer_ember_hash, &event_tx) {
-                            let nick = std::str::from_utf8(&payload).unwrap_or("").to_string();
+                            let nick = crate::security::normalize_inbound_friend_nickname(&payload);
                             // PoP-only `verified` (see early-friend-request
                             // site for rationale). Binding tracked
                             // separately for the log line.
                             let verified = ember_auth_verified;
-                            info!("Received runtime friend request from source {} (nick='{}', verified={verified}, pop={}, binding={ember_hash_binding_verified})", _src_idx, nick, ember_auth_verified);
+                            debug!(
+                                "Received runtime friend request from source {} (nickname_chars={}, verified={verified}, pop={}, binding={ember_hash_binding_verified})",
+                                _src_idx,
+                                nick.chars().count(),
+                                ember_auth_verified
+                            );
                             let _ = etx
                                 .send(DownloadEvent::EmberFriendRequest {
                                     ember_hash: eh,

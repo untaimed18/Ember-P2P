@@ -455,9 +455,7 @@ pub const MAX_FETCH_URL_LEN: usize = 2048;
 /// (the pin only proves *which* host you reached, not that the bytes
 /// weren't modified in flight). Users who paste a custom http:// URL
 /// into the IP filter import field get a clear "https only" error.
-pub async fn validate_fetch_url(
-    url: &str,
-) -> Result<(String, String, Vec<std::net::SocketAddr>), String> {
+fn parse_fetch_url(url: &str) -> Result<(String, String, u16), String> {
     let url = url.trim();
     if url.is_empty() {
         return Err("URL is empty".into());
@@ -465,36 +463,39 @@ pub async fn validate_fetch_url(
     if url.len() > MAX_FETCH_URL_LEN {
         return Err(format!("URL exceeds {MAX_FETCH_URL_LEN} bytes",));
     }
-    let url_lower = url.to_ascii_lowercase();
-    if !url_lower.starts_with("https://") {
-        return Err("Only https:// URLs are allowed".into());
-    }
-
-    let scheme_port: u16 = 443;
-    let scheme_str = "https://";
-
-    let host_part = url_lower.strip_prefix("https://").unwrap_or("");
-    let raw_authority = host_part.split('/').next().unwrap_or("");
+    let raw_authority = url
+        .split_once("://")
+        .map(|(_, rest)| {
+            rest.split(['/', '?', '#'])
+                .next()
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
     if raw_authority.contains('@') {
         return Err("URLs with userinfo (user:pass@host) are not allowed".into());
     }
-    let authority = raw_authority;
-
-    let host = if authority.starts_with('[') {
-        authority
-            .split(']')
-            .next()
-            .unwrap_or("")
-            .trim_start_matches('[')
-            .to_lowercase()
-    } else {
-        authority.split(':').next().unwrap_or("").to_lowercase()
-    };
-
-    if host.is_empty() {
-        return Err("URL has no host".into());
+    let parsed = reqwest::Url::parse(url).map_err(|error| format!("Invalid URL: {error}"))?;
+    if parsed.scheme() != "https" {
+        return Err("Only https:// URLs are allowed".into());
     }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "URL has no host".to_string())?
+        .to_string();
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| "URL has no usable port".to_string())?;
+    Ok((parsed.to_string(), host, port))
+}
 
+pub async fn validate_fetch_url(
+    url: &str,
+) -> Result<(String, String, Vec<std::net::SocketAddr>), String> {
+    // Parse once through `Url` so the normalized/punycode host is the exact
+    // value used for DNS lookup, reqwest's resolver pin, and the final request.
+    // Raw Unicode hostnames otherwise validate one key and connect under a
+    // different IDNA key, bypassing DNS pinning.
+    let (normalized_url, host, url_port) = parse_fetch_url(url)?;
     if host == "localhost" {
         return Err("URLs pointing to private/loopback addresses are blocked".into());
     }
@@ -511,30 +512,6 @@ pub async fn validate_fetch_url(
         }
     }
 
-    let original_after_scheme = &url[scheme_str.len()..];
-    let path_and_rest = original_after_scheme
-        .find('/')
-        .map(|i| &original_after_scheme[i..])
-        .unwrap_or("");
-    let normalized_url = format!("{}{}{}", scheme_str, authority, path_and_rest);
-
-    let url_port = if authority.starts_with('[') {
-        authority
-            .rsplit(']')
-            .next()
-            .and_then(|rest| rest.strip_prefix(':'))
-            .and_then(|p| p.parse::<u16>().ok())
-            .unwrap_or(scheme_port)
-    } else if authority.matches(':').count() == 1 {
-        authority
-            .split(':')
-            .nth(1)
-            .and_then(|p| p.parse::<u16>().ok())
-            .unwrap_or(scheme_port)
-    } else {
-        scheme_port
-    };
-
     let mut resolved_addrs = Vec::new();
 
     if let Ok(ipv4) = host.parse::<std::net::Ipv4Addr>() {
@@ -548,15 +525,19 @@ pub async fn validate_fetch_url(
             url_port,
         ));
     } else {
-        let lookup_host = host.clone();
-        let lookup_addr = format!("{lookup_host}:{scheme_port}");
-        let resolved = tokio::task::spawn_blocking(move || {
-            std::net::ToSocketAddrs::to_socket_addrs(&lookup_addr.as_str())
-                .map(|addrs| addrs.collect::<Vec<_>>())
-        })
+        // `spawn_blocking(ToSocketAddrs)` cannot be cancelled: a resolver
+        // that accepts queries but never answers leaves a blocking worker
+        // occupied after every caller timeout. Use Tokio's cancellable lookup
+        // future with an explicit deadline instead.
+        const DNS_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        let addrs = tokio::time::timeout(
+            DNS_LOOKUP_TIMEOUT,
+            tokio::net::lookup_host((host.as_str(), url_port)),
+        )
         .await
-        .map_err(|e| format!("DNS lookup failed: {e}"))?;
-        let addrs = resolved.map_err(|e| format!("DNS lookup failed: {e}"))?;
+        .map_err(|_| "DNS lookup timed out".to_string())?
+        .map_err(|e| format!("DNS lookup failed: {e}"))?
+        .collect::<Vec<_>>();
         if addrs.is_empty() {
             return Err("URL hostname could not be resolved".into());
         }
@@ -1274,6 +1255,39 @@ pub fn sanitize_remote_text(text: &str, max_chars: usize) -> String {
         .to_string()
 }
 
+/// Maximum bytes inspected from an untrusted friend-request payload. The
+/// packet reader has a much larger framing limit for other message types, so
+/// friend-request handling must impose its own narrow bound before creating a
+/// display string, emitting an event, or writing a log/DB row.
+pub const MAX_INBOUND_FRIEND_NICKNAME_BYTES: usize = 256;
+pub const MAX_INBOUND_FRIEND_NICKNAME_CHARS: usize = 64;
+
+/// Normalize a friend-request nickname supplied as decoded text.
+///
+/// This keeps the request UI compatible with peers that send decorative
+/// Unicode while guaranteeing a compact, single-line display value.
+pub fn sanitize_inbound_friend_nickname(name: &str) -> String {
+    let cleaned = sanitize_remote_text(name, MAX_INBOUND_FRIEND_NICKNAME_CHARS);
+    if cleaned.is_empty() {
+        "Anonymous".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Normalize a wire-format friend-request nickname without scanning or
+/// allocating from an arbitrarily large payload.
+pub fn normalize_inbound_friend_nickname(payload: &[u8]) -> String {
+    let bounded = &payload[..payload.len().min(MAX_INBOUND_FRIEND_NICKNAME_BYTES)];
+    // A byte cap can land in the middle of a multibyte character. Preserve
+    // the valid prefix instead of discarding an otherwise legitimate name.
+    let name = match std::str::from_utf8(bounded) {
+        Ok(name) => name,
+        Err(error) => std::str::from_utf8(&bounded[..error.valid_up_to()]).unwrap_or(""),
+    };
+    sanitize_inbound_friend_nickname(name)
+}
+
 /// Sanitize free-form chat text from the local user before
 /// sending. Mirrors `sanitize_display_name` but preserves newlines
 /// (the chat textarea allows Shift+Enter), and does NOT default to
@@ -1364,6 +1378,37 @@ mod tests {
             "ملف عربي — קובץ עברי"
         );
         assert_eq!(sanitize_remote_text("a\u{0000}\nb\tc", 128), "abc");
+    }
+
+    #[test]
+    fn inbound_friend_nickname_is_bounded_before_storage_or_logging() {
+        let payload = vec![b'A'; MAX_INBOUND_FRIEND_NICKNAME_BYTES * 64];
+        let nickname = normalize_inbound_friend_nickname(&payload);
+        assert_eq!(nickname.chars().count(), MAX_INBOUND_FRIEND_NICKNAME_CHARS);
+        assert_eq!(
+            normalize_inbound_friend_nickname(b"Al\xE2\x80\xAEice"),
+            "Alice"
+        );
+        assert_eq!(normalize_inbound_friend_nickname(&[0xFF; 32]), "Anonymous");
+
+        let mut split_multibyte = vec![b'A'; MAX_INBOUND_FRIEND_NICKNAME_BYTES - 3];
+        split_multibyte.extend_from_slice("💬".as_bytes());
+        let normalized = normalize_inbound_friend_nickname(&split_multibyte);
+        assert_ne!(normalized, "Anonymous");
+        assert_eq!(
+            normalized.chars().count(),
+            MAX_INBOUND_FRIEND_NICKNAME_CHARS
+        );
+    }
+
+    #[test]
+    fn fetch_url_parser_uses_one_idna_host_for_validation_and_pinning() {
+        let (normalized, host, port) =
+            parse_fetch_url("https://bücher.example/path?source=test").unwrap();
+        assert_eq!(host, "xn--bcher-kva.example");
+        assert!(normalized.starts_with("https://xn--bcher-kva.example/"));
+        assert_eq!(port, 443);
+        assert!(parse_fetch_url("https://@example.com/").is_err());
     }
 
     #[test]

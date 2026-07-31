@@ -63,6 +63,8 @@ export interface ChatMessage {
 
 export interface ChatSendResult {
   delivery: ChatDelivery;
+  /** Durable row id for queued sends; null when the message was delivered live. */
+  id: number | null;
 }
 
 export async function getFriends(): Promise<FriendInfo[]> {

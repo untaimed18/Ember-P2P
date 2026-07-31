@@ -627,7 +627,20 @@ pub async fn send_chat_message(
     match await_reply(rx, "peers_no_response", "No response").await? {
         Ok(()) => Ok(ChatSendResult {
             delivery: "delivered".to_string(),
+            id: None,
         }),
+        // The network task persisted the message before attempting its live
+        // writer handoff. Avoid inserting a second identical outbox row.
+        Err(reason) if reason.starts_with("ChatAlreadyQueued:") => {
+            let id = reason
+                .strip_prefix("ChatAlreadyQueued:")
+                .and_then(|raw| raw.parse::<i64>().ok())
+                .ok_or_else(|| "Invalid queued chat message id".to_string())?;
+            Ok(ChatSendResult {
+                delivery: "queued".to_string(),
+                id: Some(id),
+            })
+        }
         Err(reason) if chat_failure_is_permanent(&reason) => Err(reason),
         Err(reason) => {
             // Every remaining failure means "we could not reach them right
@@ -637,13 +650,16 @@ pub async fn send_chat_message(
             // task means one place covers all of those paths.
             let db = state.db.clone();
             let friend_hex = canonical.clone();
-            tokio::task::spawn_blocking(move || db.insert_pending_chat_message(&friend_hex, &cleaned))
-                .await
-                .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
-                .map_err(|e| coded_ctx("peers_failed_queue_message", "Failed to queue message", e))?;
+            let queued_id = tokio::task::spawn_blocking(move || {
+                db.insert_pending_chat_message(&friend_hex, &cleaned)
+            })
+            .await
+            .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+            .map_err(|e| coded_ctx("peers_failed_queue_message", "Failed to queue message", e))?;
             tracing::info!("Queued chat message for offline friend {canonical}: {reason}");
             Ok(ChatSendResult {
                 delivery: "queued".to_string(),
+                id: Some(queued_id),
             })
         }
     }
@@ -654,6 +670,9 @@ pub struct ChatSendResult {
     /// `"delivered"` when the message reached a live session, `"queued"` when
     /// it was stored for the next time the friend is reachable.
     pub delivery: String,
+    /// Durable chat row id for queued sends. Lets the frontend reconcile a
+    /// delivery event that races the optimistic queued bubble.
+    pub id: Option<i64>,
 }
 
 /// Whether a chat send failure is worth retrying later.

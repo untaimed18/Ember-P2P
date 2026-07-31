@@ -121,22 +121,136 @@ pub(crate) fn emit_transfer_status(
     );
 }
 
-pub(crate) async fn persist_transfer(state: &AppState, transfer: &Transfer) {
+/// Persist a transfer before exposing it to the network worker or UI.
+///
+/// A transfer without a durable row is unsafe to start: after a restart the
+/// orphan sweep cannot distinguish its partial files from abandoned ones.
+pub(crate) async fn persist_transfer(state: &AppState, transfer: &Transfer) -> Result<(), String> {
     let db = state.db.clone();
-    let tid = transfer.id.clone();
+    let short_id = transfer_id_short(&transfer.id).to_string();
     let transfer = transfer.clone();
-    match tokio::task::spawn_blocking(move || db.save_transfer(&transfer)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::warn!(
-            "Failed to persist transfer {}: {e}",
-            transfer_id_short(&tid)
-        ),
-        Err(e) => tracing::warn!("Transfer persist task panicked: {e}"),
-    }
+    tokio::task::spawn_blocking(move || db.save_transfer(&transfer))
+        .await
+        .map_err(|e| {
+            tracing::warn!("Transfer persist task failed for {short_id}: {e}");
+            format!("Transfer persistence task failed: {e}")
+        })?
+        .map_err(|e| {
+            tracing::warn!("Failed to persist transfer {short_id}: {e}");
+            format!("Failed to persist transfer: {e}")
+        })
 }
 
 fn transfer_id_short(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
+}
+
+/// The eD2K download transport is IPv4-only. Normalize IPv4-mapped IPv6
+/// literals for callers that serialize socket addresses generically, but fail
+/// before admission for a pure IPv6 source rather than enqueueing an
+/// undialable transfer.
+fn normalize_primary_peer_ip(peer_ip: String) -> Result<String, String> {
+    if peer_ip.is_empty() {
+        return Ok(peer_ip);
+    }
+    match peer_ip
+        .parse::<std::net::IpAddr>()
+        .map_err(|_| coded("transfers_invalid_peer_ip", "Invalid peer IP"))?
+    {
+        std::net::IpAddr::V4(ip) => Ok(ip.to_string()),
+        std::net::IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map(|mapped| mapped.to_string())
+            .ok_or_else(|| {
+                coded(
+                    "transfers_invalid_peer_ip",
+                    "IPv6 primary sources are not supported",
+                )
+            }),
+    }
+}
+
+/// Remove a transfer that was admitted in memory but could not be made
+/// durable. No network work has started for this transfer yet, so cancelling
+/// it is safe; any newly eligible queued downloads are promoted immediately.
+async fn rollback_unpersisted_transfer(state: &AppState, transfer_id: &str) {
+    let promoted = {
+        let mut manager = state.transfer_manager.write().await;
+        manager.remove(transfer_id)
+    };
+    if !promoted.is_empty() {
+        start_promoted_downloads(state, &promoted).await;
+    }
+}
+
+fn verify_recovery_ranges(
+    part_path: &std::path::Path,
+    file_size: u64,
+    allowed_roots: &[String],
+    expected_file_hash: [u8; 16],
+    transfer_control: Option<&TransferControl>,
+    cancellation: &std::sync::atomic::AtomicBool,
+) -> anyhow::Result<Vec<(u64, u64)>> {
+    use md4::{Digest, Md4};
+    use std::io::{Read, Seek};
+
+    let is_cancelled = || {
+        cancellation.load(std::sync::atomic::Ordering::Acquire)
+            || transfer_control.is_some_and(TransferControl::is_cancelled)
+    };
+    if is_cancelled() {
+        anyhow::bail!("archive recovery cancelled");
+    }
+
+    let tracker = crate::network::ed2k::part_tracker::PartTracker::new(file_size, part_path);
+    let flags = tracker.verified_parts();
+    let hashes = tracker.part_hashes();
+    // Pin the .part through the approved Temp parent so a symlink swap after
+    // verify_existing_path cannot redirect recovery reads.
+    let (_, mut file) =
+        crate::security::filesystem::open_existing_approved(part_path, allowed_roots, false)?;
+    let mut ranges = Vec::new();
+    for (index, verified) in flags.into_iter().enumerate() {
+        if is_cancelled() {
+            anyhow::bail!("archive recovery cancelled");
+        }
+        if !verified {
+            continue;
+        }
+        let start = index as u64 * crate::network::ed2k::hash::PARTSIZE;
+        let end = (start + crate::network::ed2k::hash::PARTSIZE).min(file_size);
+        let Some(expected) = hashes.get(index) else {
+            // A single-part transfer can have no hashset. Only accept its
+            // range after a complete file-level ED2K verification.
+            if index == 0
+                && end == file_size
+                && crate::network::ed2k::hash::ed2k_hash_open_file(&mut file)?
+                    == hex::encode(expected_file_hash)
+            {
+                ranges.push((start, end));
+            }
+            continue;
+        };
+        file.seek(std::io::SeekFrom::Start(start))?;
+        let mut take = (&mut file).take(end - start);
+        let mut hasher = Md4::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            if is_cancelled() {
+                anyhow::bail!("archive recovery cancelled");
+            }
+            let read = take.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        let actual: [u8; 16] = hasher.finalize().into();
+        if &actual == expected {
+            ranges.push((start, end));
+        }
+    }
+    Ok(ranges)
 }
 
 async fn persist_transfer_status(state: &AppState, transfer_id: &str, status: &TransferStatus) {
@@ -472,11 +586,7 @@ pub async fn start_download(
     let expected_aich = crate::security::parse_expected_aich(expected_aich.as_deref())
         .map_err(|message| coded("transfers_invalid_expected_aich", message))?;
 
-    if !peer_ip.is_empty() {
-        peer_ip
-            .parse::<std::net::IpAddr>()
-            .map_err(|_| coded("transfers_invalid_peer_ip", "Invalid peer IP"))?;
-    }
+    let peer_ip = normalize_primary_peer_ip(peer_ip)?;
 
     // Parse + cheap-validate extra sources at the IPC boundary. Anything
     // that doesn't parse as `ip:port` with a non-zero IPv4/IPv6 host and
@@ -633,7 +743,14 @@ pub async fn start_download(
             .cloned()
             .unwrap_or_else(|| transfer.clone())
     };
-    persist_transfer(&state, &persisted_transfer).await;
+    if let Err(error) = persist_transfer(&state, &persisted_transfer).await {
+        rollback_unpersisted_transfer(&state, &transfer_id).await;
+        return Err(coded_ctx(
+            "transfers_start_download_failed",
+            "Failed to save download before starting it",
+            error,
+        ));
+    }
 
     let _ = app.emit("transfer-started", &persisted_transfer);
 
@@ -678,7 +795,12 @@ pub async fn start_download(
             let manager = state.transfer_manager.read().await;
             manager.get_transfer(&transfer_id).cloned()
         } {
-            persist_transfer(&state, &failed).await;
+            if let Err(persist_error) = persist_transfer(&state, &failed).await {
+                tracing::error!(
+                    "Failed to persist network-start failure for transfer {}: {persist_error}",
+                    transfer_id_short(&transfer_id)
+                );
+            }
             let _ = app.emit("transfer-failed", &failed);
         }
         return Err(coded_ctx(
@@ -1489,7 +1611,12 @@ pub async fn set_preview_priority(
         manager.get_transfer(&transfer_id).cloned()
     };
     if let Some(t) = transfer {
-        persist_transfer(&state, &t).await;
+        if let Err(error) = persist_transfer(&state, &t).await {
+            tracing::warn!(
+                "Failed to persist preview-priority change for transfer {}: {error}",
+                transfer_id_short(&t.id)
+            );
+        }
     }
     Ok(())
 }
@@ -1782,8 +1909,6 @@ pub async fn recover_archive(
     crate::security::filesystem::ensure_not_reparse(&canonical_temp)
         .map_err(|e| coded_ctx("transfers_temp_path_reparse", "Unsafe temp folder", e))?;
 
-    let pp = canonical_part.clone();
-    let archive_allowed = vec![dl_folder.clone()];
     let expected_file_hash = {
         let bytes = hex::decode(
             state
@@ -1805,98 +1930,87 @@ pub async fn recover_archive(
         hash.copy_from_slice(&bytes);
         hash
     };
-    let verified_ranges =
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(u64, u64)>> {
-            use md4::{Digest, Md4};
-            use std::io::{Read, Seek};
-            let tracker = crate::network::ed2k::part_tracker::PartTracker::new(file_size, &pp);
-            let flags = tracker.verified_parts();
-            let hashes = tracker.part_hashes();
-            // Pin the .part through the approved Temp parent so a symlink swap
-            // after verify_existing_path cannot redirect recovery reads.
-            let (_, mut file) = crate::security::filesystem::open_existing_approved(
-                &pp,
-                &archive_allowed,
-                false,
-            )?;
-            let mut ranges = Vec::new();
-            for (index, verified) in flags.into_iter().enumerate() {
-                if !verified {
-                    continue;
-                }
-                let start = index as u64 * crate::network::ed2k::hash::PARTSIZE;
-                let end = (start + crate::network::ed2k::hash::PARTSIZE).min(file_size);
-                let Some(expected) = hashes.get(index) else {
-                    // A single-part transfer can have no hashset. Only accept its
-                    // range after a complete file-level ED2K verification.
-                    if index == 0
-                        && end == file_size
-                        && crate::network::ed2k::hash::ed2k_hash_open_file(&mut file)?
-                            == hex::encode(expected_file_hash)
-                    {
-                        ranges.push((start, end));
-                    }
-                    continue;
-                };
-                file.seek(std::io::SeekFrom::Start(start))?;
-                let mut take = (&mut file).take(end - start);
-                let mut hasher = Md4::new();
-                let mut buffer = [0u8; 64 * 1024];
-                loop {
-                    let read = take.read(&mut buffer)?;
-                    if read == 0 {
-                        break;
-                    }
-                    hasher.update(&buffer[..read]);
-                }
-                let actual: [u8; 16] = hasher.finalize().into();
-                if &actual == expected {
-                    ranges.push((start, end));
-                }
-            }
-            Ok(ranges)
-        })
-        .await
-        .map_err(|e| {
-            coded_ctx(
-                "transfers_part_tracker_task_failed",
-                "PartTracker task failed",
-                e,
-            )
-        })?
-        .map_err(|e| {
-            coded_ctx(
-                "transfers_part_verify_failed",
-                "Part verification failed",
-                e,
-            )
-        })?;
-
-    if verified_ranges.is_empty() {
-        return Err(coded(
-            "transfers_no_parts_for_recovery",
-            "No completed parts available for recovery",
-        ));
-    }
-
     let fname = file_name.clone();
     let allowed_for_recovery = vec![dl_folder.clone()];
-    let recovery = tokio::task::spawn_blocking(move || {
+    let verification_allowed = allowed_for_recovery.clone();
+    let recovery_control = control.clone();
+    let recovery_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancellation_for_worker = recovery_cancel.clone();
+    enum ArchiveRecoveryJobError {
+        PartVerification(anyhow::Error),
+        NoVerifiedParts,
+        Recovery(anyhow::Error),
+    }
+    let mut recovery = tokio::task::spawn_blocking(move || {
+        // The semaphore belongs to the worker itself, not this IPC future.
+        // If the caller is dropped/cancelled, the JoinHandle detaches but the
+        // blocking job still retains exclusive recovery ownership until it
+        // actually exits.
         let _permit = permit;
+        let verified_ranges = verify_recovery_ranges(
+            &canonical_part,
+            file_size,
+            &verification_allowed,
+            expected_file_hash,
+            recovery_control.as_deref(),
+            cancellation_for_worker.as_ref(),
+        )
+        .map_err(ArchiveRecoveryJobError::PartVerification)?;
+        if verified_ranges.is_empty() {
+            return Err(ArchiveRecoveryJobError::NoVerifiedParts);
+        }
         crate::network::ed2k::archive_recovery::recover_archive(
             &canonical_part,
             &fname,
             &verified_ranges,
             &canonical_temp,
             &allowed_for_recovery,
-            control.as_deref(),
+            recovery_control.as_deref(),
+            cancellation_for_worker.as_ref(),
         )
+        .map_err(ArchiveRecoveryJobError::Recovery)
     });
-    let result = tokio::time::timeout(std::time::Duration::from_secs(130), recovery)
-        .await
-        .map_err(|_| coded("transfers_recovery_timed_out", "Archive recovery timed out"))?
-        .map_err(|e| coded_ctx("transfers_recovery_task_failed", "Recovery task failed", e))?
-        .map_err(|e| coded_ctx("transfers_recovery_failed", "Recovery failed", e))?;
+    let recovery_result =
+        match tokio::time::timeout(std::time::Duration::from_secs(130), &mut recovery).await {
+            Ok(result) => result,
+            Err(_) => {
+                // `spawn_blocking` cannot be aborted. Cancel the recovery-local
+                // flag and retain the semaphore permit in a reaper task until
+                // the worker exits, so a second recovery never overlaps this
+                // one and the live download control remains untouched.
+                recovery_cancel.store(true, std::sync::atomic::Ordering::Release);
+                tokio::spawn(async move {
+                    if let Err(error) = recovery.await {
+                        tracing::warn!("Timed-out archive recovery task failed while draining: {error}");
+                    }
+                });
+                return Err(coded(
+                    "transfers_recovery_timed_out",
+                    "Archive recovery timed out",
+                ));
+            }
+        };
+    let result = recovery_result
+        .map_err(|e| coded_ctx("transfers_recovery_task_failed", "Recovery task failed", e))?;
+    let result = match result {
+        Ok(result) => result,
+        Err(ArchiveRecoveryJobError::PartVerification(error)) => {
+            return Err(coded_ctx(
+                "transfers_part_verify_failed",
+                "Part verification failed",
+                error,
+            ));
+        }
+        Err(ArchiveRecoveryJobError::NoVerifiedParts) => {
+            return Err(coded(
+                "transfers_no_parts_for_recovery",
+                "No completed parts available for recovery",
+            ));
+        }
+        Err(ArchiveRecoveryJobError::Recovery(error)) => {
+            return Err(coded_ctx("transfers_recovery_failed", "Recovery failed", error));
+        }
+    };
 
     Ok(result.to_string_lossy().to_string())
 }
@@ -1919,5 +2033,16 @@ mod ipc_lifecycle_tests {
         assert!(budget_allows(0, MAX_PENDING_REMAINING_BYTES - 1, &[1],));
         assert!(!budget_allows(0, MAX_PENDING_REMAINING_BYTES - 1, &[2],));
         assert!(!budget_allows(0, u64::MAX, &[u64::MAX]));
+    }
+
+    #[test]
+    fn primary_source_rejects_pure_ipv6_before_admission() {
+        let error = normalize_primary_peer_ip("2001:db8::1".to_string())
+            .expect_err("pure IPv6 eD2K sources are unsupported");
+        assert!(error.contains("IPv6 primary sources are not supported"));
+        assert_eq!(
+            normalize_primary_peer_ip("::ffff:203.0.113.7".to_string()).unwrap(),
+            "203.0.113.7"
+        );
     }
 }

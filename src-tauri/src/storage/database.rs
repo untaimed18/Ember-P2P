@@ -2501,6 +2501,10 @@ impl Database {
         verified: bool,
     ) -> anyhow::Result<bool> {
         let mut conn = self.conn.lock();
+        // The network ingress normalizes this already, but keep the storage
+        // boundary bounded for future callers and migrations that bypass the
+        // live event path.
+        let nickname = crate::security::sanitize_inbound_friend_nickname(nickname);
         let now = chrono::Utc::now().timestamp();
         let tx = conn.transaction()?;
 
@@ -2898,7 +2902,14 @@ impl Database {
         let mut out = Vec::with_capacity(rows.len());
         let mut undecryptable = Vec::new();
         for (id, body, ts) in rows {
-            match Self::decrypt_chat_body(self.require_chat_key()?, id, friend_hash, "sent", ts, &body) {
+            match Self::decrypt_chat_body(
+                self.require_chat_key()?,
+                id,
+                friend_hash,
+                "sent",
+                ts,
+                &body,
+            ) {
                 Ok(plain) => out.push((id, plain, ts)),
                 // Cannot be sent and never will be, so record that rather than
                 // skipping it. Skipping left the row queued while
@@ -3042,14 +3053,8 @@ impl Database {
         };
         let mut messages = Vec::with_capacity(rows.len());
         for (id, direction, stored, timestamp, read, delivery) in rows {
-            match Self::decrypt_chat_body(
-                chat_key,
-                id,
-                friend_hash,
-                &direction,
-                timestamp,
-                &stored,
-            ) {
+            match Self::decrypt_chat_body(chat_key, id, friend_hash, &direction, timestamp, &stored)
+            {
                 Ok(message) => messages.push((id, direction, message, timestamp, read, delivery)),
                 Err(error) => {
                     tracing::warn!(

@@ -72,6 +72,10 @@
   let unlistenDelivery: UnlistenFn | null = null;
   let loadGen = 0;
   let msgIdCounter = 0;
+  // Delivery events can beat the IPC response that appends an optimistic
+  // queued bubble. Keep their durable row IDs briefly so that response can
+  // reconcile the bubble instead of leaving it permanently queued.
+  const earlyDeliveredIds = new Set<number>();
 
   const PAGE_SIZE = 100;
   let loadingOlder = $state(false);
@@ -122,6 +126,7 @@
       if (unlisten) { unlisten(); unlisten = null; }
       if (unlistenDelivery) { unlistenDelivery(); unlistenDelivery = null; }
       messages = [];
+      earlyDeliveredIds.clear();
       // Reset load state for the new conversation. Without this, the
       // previous tab's `loadError` (or stale `loading`/pagination flags)
       // is shown against the just-cleared (empty) message list during the
@@ -210,9 +215,8 @@
     if (gen !== loadGen) { fn(); return false; }
     unlisten = fn;
 
-    // Queued messages flush oldest-first, so each delivery notice clears the
-    // earliest still-waiting bubble. Matching on order rather than row id also
-    // covers the optimistically-appended bubble, which has no database id yet.
+    // Delivery notices carry the durable outbox row ID. Buffer an early notice
+    // until its optimistic queued bubble has been appended.
     try {
       const deliveryFn = await listen<{ user_hash: string; id: number; delivery: string }>(
         'ember:chat-delivery',
@@ -220,8 +224,11 @@
           if (gen !== loadGen) return;
           if (event.payload.user_hash !== hash) return;
           if (event.payload.delivery !== 'delivered') return;
-          const at = messages.findIndex((mm) => mm.direction === 'sent' && mm.delivery === 'queued');
-          if (at === -1) return;
+          const at = messages.findIndex((mm) => mm.id === event.payload.id);
+          if (at === -1) {
+            earlyDeliveredIds.add(event.payload.id);
+            return;
+          }
           const next = [...messages];
           next[at] = { ...next[at], delivery: 'delivered' };
           messages = next;
@@ -249,13 +256,40 @@
       if (messages.length === 0) {
         messages = snapshot;
       } else {
+        // Durable queued bubbles use their database row IDs. Prefer that
+        // identity over a content/timestamp signature so a retry snapshot can
+        // replace a stale queued bubble with the row's current delivery state.
+        const snapshotById = new Map(snapshot.map((row) => [row.id, row]));
+        const existingPositiveIds = new Set(
+          messages.filter((message) => message.id > 0).map((message) => message.id),
+        );
+        const reconciledLive = messages.map(
+          (message) => (message.id > 0 ? snapshotById.get(message.id) ?? message : message),
+        );
         const liveSig = new Set(
-          messages.map((m) => `${m.timestamp}|${m.direction}|${m.message}`),
+          reconciledLive
+            .filter((message) => message.id < 0)
+            .map((message) => `${message.timestamp}|${message.direction}|${message.message}`),
         );
         const filteredSnapshot = snapshot.filter(
-          (m) => !liveSig.has(`${m.timestamp}|${m.direction}|${m.message}`),
+          (message) =>
+            !existingPositiveIds.has(message.id)
+            && !liveSig.has(`${message.timestamp}|${message.direction}|${message.message}`),
         );
-        messages = [...filteredSnapshot, ...messages];
+        messages = [...filteredSnapshot, ...reconciledLive];
+      }
+      const earlyDeliveredInSnapshot = new Set(
+        snapshot
+          .filter((row) => earlyDeliveredIds.has(row.id))
+          .map((row) => row.id),
+      );
+      if (earlyDeliveredInSnapshot.size > 0) {
+        messages = messages.map((message) =>
+          earlyDeliveredInSnapshot.has(message.id) && message.delivery === 'queued'
+            ? { ...message, delivery: 'delivered' as const }
+            : message,
+        );
+        for (const id of earlyDeliveredInSnapshot) earlyDeliveredIds.delete(id);
       }
       scrollToBottom();
     } catch (e: unknown) {
@@ -382,14 +416,23 @@
       // nothing reached the peer. Append it here so the user sees what they
       // typed, marked as waiting, instead of an apparently-vanished message.
       if (result.delivery === 'queued' && h === friendHash) {
-        messages = [...messages, {
-          id: --msgIdCounter,
-          direction: 'sent' as const,
-          message: text,
-          timestamp: Math.floor(Date.now() / 1000),
-          read: true,
-          delivery: 'queued' as const,
-        }];
+        const durableId = result.id ?? --msgIdCounter;
+        const alreadyDelivered = result.id !== null && earlyDeliveredIds.delete(result.id);
+        const existing = messages.findIndex((message) => message.id === durableId);
+        if (existing === -1) {
+          messages = [...messages, {
+            id: durableId,
+            direction: 'sent' as const,
+            message: text,
+            timestamp: Math.floor(Date.now() / 1000),
+            read: true,
+            delivery: alreadyDelivered ? 'delivered' as const : 'queued' as const,
+          }];
+        } else if (alreadyDelivered && messages[existing].delivery === 'queued') {
+          const next = [...messages];
+          next[existing] = { ...next[existing], delivery: 'delivered' };
+          messages = next;
+        }
         scrollToBottom();
       }
       // Only clear the live editor if we're still viewing this friend — on a
