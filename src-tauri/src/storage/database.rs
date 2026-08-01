@@ -2970,28 +2970,49 @@ impl Database {
     /// one reconnects, so the conversation, the unsent badge and the queue
     /// itself could each hold a different view of the same row. One writer that
     /// every reader observes keeps them agreeing.
-    pub fn expire_stale_queued_chat(&self) -> anyhow::Result<usize> {
+    /// Returns the `(id, friend_hash)` of every row it abandoned, so the caller
+    /// can tell the UI which live bubbles to flip. Without that, an open
+    /// conversation keeps rendering an abandoned message as "queued" until it
+    /// is reloaded, even though the row on disk already says failed.
+    pub fn expire_stale_queued_chat(&self) -> anyhow::Result<Vec<(i64, String)>> {
         // Never while chat is locked. `pending_chat_messages` deliberately
         // refuses to flush *or* fail queued sends in that state, because a
         // restored key can still deliver them; abandoning them here would take
         // that back and mark as failed the very rows that recovery would have
         // rescued. The ceiling resumes applying once the key is back.
         if self.chat_key.is_none() {
-            return Ok(0);
+            return Ok(Vec::new());
         }
         let cutoff = chrono::Utc::now().timestamp() - CHAT_QUEUE_MAX_AGE_SECS;
         let conn = self.conn.lock();
-        let expired = conn.execute(
+        // Read the victims and update them under the same lock, so the ids
+        // reported are exactly the rows this sweep changed.
+        let expired: Vec<(i64, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, friend_hash FROM chat_messages \
+                 WHERE delivery = ?1 AND direction = 'sent' AND timestamp < ?2",
+            )?;
+            let rows = stmt
+                .query_map(params![CHAT_QUEUED, cutoff], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            rows
+        };
+        if expired.is_empty() {
+            return Ok(expired);
+        }
+        conn.execute(
             "UPDATE chat_messages SET delivery = ?1 \
              WHERE delivery = ?2 AND direction = 'sent' AND timestamp < ?3",
             params![CHAT_FAILED, CHAT_QUEUED, cutoff],
         )?;
-        if expired > 0 {
-            tracing::info!(
-                "Gave up on {expired} chat message(s) queued longer than {} days",
-                CHAT_QUEUE_MAX_AGE_SECS / 86_400
-            );
-        }
+        tracing::info!(
+            "Gave up on {} chat message(s) queued longer than {} days",
+            expired.len(),
+            CHAT_QUEUE_MAX_AGE_SECS / 86_400
+        );
         Ok(expired)
     }
 
@@ -3475,7 +3496,10 @@ mod tests {
                 ],
             )
             .expect("seed stale queued");
-        assert_eq!(locked.expire_stale_queued_chat().expect("sweep"), 0);
+        assert!(locked
+            .expire_stale_queued_chat()
+            .expect("sweep")
+            .is_empty());
         assert_eq!(
             row_count(
                 &locked,
@@ -3512,7 +3536,10 @@ mod tests {
             .expect("seed fresh");
         }
 
-        assert_eq!(db.expire_stale_queued_chat().expect("sweep"), 1);
+        // The abandoned rows come back so the caller can flip the live bubbles.
+        let expired = db.expire_stale_queued_chat().expect("sweep");
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].1, "aa");
 
         // Both views agree afterwards: one row still queued, one abandoned.
         assert_eq!(
@@ -3533,7 +3560,10 @@ mod tests {
         assert_eq!(counts, vec![("aa".to_string(), 1)]);
 
         // Idempotent: a second sweep finds nothing left to abandon.
-        assert_eq!(db.expire_stale_queued_chat().expect("sweep again"), 0);
+        assert!(db
+            .expire_stale_queued_chat()
+            .expect("sweep again")
+            .is_empty());
     }
 
     /// The check the network loop runs before queueing is only an early-out.

@@ -2405,6 +2405,25 @@ fn friend_xfer_inbound_status(
     ed2k::messages::XFER_STATUS_ACCEPTED
 }
 
+/// Tell the UI about outbound chat the age ceiling just abandoned.
+///
+/// The `failed` bubble state already exists in the frontend, but nothing used
+/// to reach it live: the sweep wrote `CHAT_FAILED` straight to SQLite, so an
+/// open conversation kept showing the message as "queued" until it was
+/// reloaded. Mirrors the `delivered` emit in `mark_chat_delivered`.
+fn emit_chat_delivery_failed(app_handle: &tauri::AppHandle, expired: &[(i64, String)]) {
+    for (id, friend_hash) in expired {
+        let _ = app_handle.emit(
+            "ember:chat-delivery",
+            serde_json::json!({
+                "user_hash": friend_hash,
+                "id": id,
+                "delivery": "failed",
+            }),
+        );
+    }
+}
+
 /// Decide how to answer a friend's `OP_EMBER_XFER_REQ`, returning the
 /// `XFER_STATUS_*` code to ack with. Accepting commits us to dialing them.
 /// Replay outbound chat that was queued while a friend was unreachable.
@@ -2442,16 +2461,27 @@ async fn flush_pending_chat(
         // over-age messages may still go out — but refusing to flush at all
         // would hold back every legitimate queued message over a transient
         // database error, which is the worse outcome of the two.
-        if let Err(e) = db_read.expire_stale_queued_chat() {
-            tracing::warn!(
-                "Could not expire over-age queued chat before flushing to \
-                 {hash_for_read}; the age limit is unenforced this round: {e}"
-            );
-        }
-        db_read.pending_chat_messages(&hash_for_read, MAX_FLUSH_PER_SESSION)
+        let expired = match db_read.expire_stale_queued_chat() {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(
+                    "Could not expire over-age queued chat before flushing to \
+                     {hash_for_read}; the age limit is unenforced this round: {e}"
+                );
+                Vec::new()
+            }
+        };
+        (
+            expired,
+            db_read.pending_chat_messages(&hash_for_read, MAX_FLUSH_PER_SESSION),
+        )
     })
     .await
     .ok()
+    .map(|(expired, pending)| {
+        emit_chat_delivery_failed(app_handle, &expired);
+        pending
+    })
     .and_then(|r| r.ok())
     .unwrap_or_default();
 
@@ -20249,11 +20279,12 @@ pub async fn start_network(
                 {
                     last_chat_expiry_sweep = Some(std::time::Instant::now());
                     let db_expire = db.clone();
-                    if let Ok(Err(e)) =
-                        tokio::task::spawn_blocking(move || db_expire.expire_stale_queued_chat())
-                            .await
+                    match tokio::task::spawn_blocking(move || db_expire.expire_stale_queued_chat())
+                        .await
                     {
-                        debug!("Queued-chat expiry sweep failed: {e}");
+                        Ok(Ok(expired)) => emit_chat_delivery_failed(&app_handle, &expired),
+                        Ok(Err(e)) => debug!("Queued-chat expiry sweep failed: {e}"),
+                        Err(e) => debug!("Queued-chat expiry sweep panicked: {e}"),
                     }
                 }
 

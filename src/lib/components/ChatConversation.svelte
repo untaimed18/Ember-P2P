@@ -235,14 +235,21 @@
         (event) => {
           if (gen !== loadGen) return;
           if (event.payload.user_hash !== hash) return;
-          if (event.payload.delivery !== 'delivered') return;
+          // `failed` arrives when the backend's age sweep abandons a queued
+          // message; without it the bubble reads "queued" for the whole
+          // session even though the row on disk has already given up.
+          const delivery = event.payload.delivery;
+          if (delivery !== 'delivered' && delivery !== 'failed') return;
           const at = messages.findIndex((mm) => mm.id === event.payload.id);
           if (at === -1) {
-            earlyDeliveredIds.add(event.payload.id);
+            // The early-arrival buffer is a delivered-only reconciliation; an
+            // abandoned row is already `failed` in the DB, so a later load
+            // renders it correctly without help.
+            if (delivery === 'delivered') earlyDeliveredIds.add(event.payload.id);
             return;
           }
           const next = [...messages];
-          next[at] = { ...next[at], delivery: 'delivered' };
+          next[at] = { ...next[at], delivery };
           messages = next;
         },
       );
