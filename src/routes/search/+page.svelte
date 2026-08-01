@@ -295,17 +295,21 @@
   ];
 
   let filterType = $state('');
-  let filterMinSize = $state('');
+  // The four numeric filters are bound to `<input type="number">`, which Svelte
+  // coerces to `number` (or `null` when the box is empty) — declaring them as
+  // strings made every `!== ''` test true for a cleared field and made them
+  // fail to round-trip through `localStorage`.
+  let filterMinSize = $state<number | null>(null);
   let filterMinUnit = $state(1024 * 1024);
-  let filterMaxSize = $state('');
+  let filterMaxSize = $state<number | null>(null);
   let filterMaxUnit = $state(1024 * 1024 * 1024);
   let filterExtension = $state('');
-  let filterMinSources = $state('');
+  let filterMinSources = $state<number | null>(null);
   // Client-side "complete sources" minimum. Unlike Min Sources (sent to the
   // remote node as a FT_SOURCES constraint), there is no standard eD2k search
   // tag for complete-source counts, so this filters the results we already
   // received (the count arrives on each hit as `file.complete_sources`).
-  let filterMinComplete = $state('');
+  let filterMinComplete = $state<number | null>(null);
   let hideSpam = $state<boolean>(true);
   /** True when the hit is only from the shared library (not merged with KAD/Server/UDP/Notes). */
   function isLocalOnlySearchResult(r: SearchResult): boolean {
@@ -507,7 +511,10 @@
   ]);
   const VALID_SIZE_UNITS = new Set<number>(SIZE_UNITS.map((u) => u.value));
   const VALID_FILE_TYPES = new Set<string>(FILE_TYPES.map((t) => t.value));
-  let prefsRestored = false;
+  // Must be reactive: the persistence $effect below early-returns on this, and
+  // a plain `let` would leave that run with zero tracked dependencies, so the
+  // effect would never fire again and preferences would never be written.
+  let prefsRestored = $state(false);
 
   function loadPersistedPrefs() {
     try {
@@ -531,10 +538,10 @@
       if (typeof p.filterExtension === 'string' && p.filterExtension.length <= 16) {
         filterExtension = p.filterExtension;
       }
-      if (typeof p.filterMinSize === 'string' && p.filterMinSize.length <= 24) {
+      if (typeof p.filterMinSize === 'number' && Number.isFinite(p.filterMinSize)) {
         filterMinSize = p.filterMinSize;
       }
-      if (typeof p.filterMaxSize === 'string' && p.filterMaxSize.length <= 24) {
+      if (typeof p.filterMaxSize === 'number' && Number.isFinite(p.filterMaxSize)) {
         filterMaxSize = p.filterMaxSize;
       }
       if (typeof p.filterMinUnit === 'number' && VALID_SIZE_UNITS.has(p.filterMinUnit)) {
@@ -543,10 +550,10 @@
       if (typeof p.filterMaxUnit === 'number' && VALID_SIZE_UNITS.has(p.filterMaxUnit)) {
         filterMaxUnit = p.filterMaxUnit;
       }
-      if (typeof p.filterMinSources === 'string' && p.filterMinSources.length <= 8) {
+      if (typeof p.filterMinSources === 'number' && Number.isFinite(p.filterMinSources)) {
         filterMinSources = p.filterMinSources;
       }
-      if (typeof p.filterMinComplete === 'string' && p.filterMinComplete.length <= 8) {
+      if (typeof p.filterMinComplete === 'number' && Number.isFinite(p.filterMinComplete)) {
         filterMinComplete = p.filterMinComplete;
       }
       if (p.columnVis && typeof p.columnVis === 'object') {
@@ -904,13 +911,13 @@
     // number of active filters.
     const ext = filterExtension.trim().toLowerCase().replace(/^\./, '');
     const hasExt = ext.length > 0;
-    const minParsed = filterMinSize !== '' ? parseFloat(filterMinSize) * filterMinUnit : NaN;
+    const minParsed = filterMinSize !== null ? filterMinSize * filterMinUnit : NaN;
     const minBytes = Number.isFinite(minParsed) && minParsed > 0 ? minParsed : 0;
-    const maxParsed = filterMaxSize !== '' ? parseFloat(filterMaxSize) * filterMaxUnit : NaN;
+    const maxParsed = filterMaxSize !== null ? filterMaxSize * filterMaxUnit : NaN;
     const maxBytes = Number.isFinite(maxParsed) && maxParsed > 0 ? maxParsed : 0;
-    const minSrcParsed = filterMinSources !== '' ? parseInt(filterMinSources, 10) : NaN;
+    const minSrcParsed = filterMinSources !== null ? Math.trunc(filterMinSources) : NaN;
     const minSrc = Number.isFinite(minSrcParsed) && minSrcParsed > 0 ? minSrcParsed : 0;
-    const minCompleteParsed = filterMinComplete !== '' ? parseInt(filterMinComplete, 10) : NaN;
+    const minCompleteParsed = filterMinComplete !== null ? Math.trunc(filterMinComplete) : NaN;
     const minComplete = Number.isFinite(minCompleteParsed) && minCompleteParsed > 0 ? minCompleteParsed : 0;
     const hasType = !!filterType;
     const spamHidden = hideSpam;
@@ -1147,9 +1154,9 @@
     // eMule/backend: Program clears the local type filter so Arc/Iso hits
     // from a Pro-wire search remain visible. Keep Arc/Iso as client filters.
     filterType = searchFileType === 'Pro' ? '' : searchFileType;
-    const parsedMinSize = filterMinSize !== '' ? parseFloat(filterMinSize) * filterMinUnit : undefined;
-    const parsedMaxSize = filterMaxSize !== '' ? parseFloat(filterMaxSize) * filterMaxUnit : undefined;
-    const parsedMinAvail = filterMinSources !== '' ? parseInt(filterMinSources, 10) : undefined;
+    const parsedMinSize = filterMinSize !== null ? filterMinSize * filterMinUnit : undefined;
+    const parsedMaxSize = filterMaxSize !== null ? filterMaxSize * filterMaxUnit : undefined;
+    const parsedMinAvail = filterMinSources !== null ? Math.trunc(filterMinSources) : undefined;
     // Reject NaN *and* Infinity (e.g. "1e400") and negatives — `Number.isFinite`
     // excludes both, unlike the previous `!isNaN` which let Infinity through.
     const searchFilterSnapshot: import('$lib/api/search').SearchFilters = {
@@ -1262,14 +1269,23 @@
   async function stopSearch(tabId?: string) {
     const t = tabId != null ? get(searchTabs).find((tab) => tab.id === tabId) ?? null : activeTab;
     if (!t?.isSearching) return;
-    clearSearchTimeoutForRequest(t.requestId);
+    const stoppedId = t.requestId;
+    clearSearchTimeoutForRequest(stoppedId);
     try {
-      await cancelSearch(t.requestId);
+      await cancelSearch(stoppedId);
     } catch (e) {
       console.error('Failed to cancel search:', e);
     }
-    patchSearchTabByRequestId(t.requestId, (tab) => ({
+    // Same discard protocol as `performClearResults`: the backend answers a
+    // cancel by resolving the pending `search_files` oneshot with everything it
+    // collected so far, so without rotating the id that payload merges into the
+    // tab the user just stopped. Results already shown are kept — this is Stop,
+    // not Clear.
+    searchInvokeSettled.add(stoppedId);
+    clearPendingSearchResults(stoppedId);
+    patchSearchTabByRequestId(stoppedId, (tab) => ({
       ...tab,
+      requestId: newSearchNonce(),
       isSearching: false,
       progress: null,
     }));
@@ -1513,11 +1529,11 @@
 
   function clearFilters() {
     filterType = '';
-    filterMinSize = '';
-    filterMaxSize = '';
+    filterMinSize = null;
+    filterMaxSize = null;
     filterExtension = '';
-    filterMinSources = '';
-    filterMinComplete = '';
+    filterMinSources = null;
+    filterMinComplete = null;
     filterColumn = 'all';
     clearFilterText();
   }
@@ -1960,11 +1976,11 @@
 
   let hasActiveFilters = $derived(
     filterType !== '' ||
-    filterMinSize !== '' ||
-    filterMaxSize !== '' ||
+    filterMinSize !== null ||
+    filterMaxSize !== null ||
     filterExtension !== '' ||
-    filterMinSources !== '' ||
-    filterMinComplete !== '' ||
+    filterMinSources !== null ||
+    filterMinComplete !== null ||
     filterText !== ''
   );
 
@@ -1978,11 +1994,11 @@
 
   let advancedFilterCount = $derived(
     (filterColumn !== 'all' && filterText !== '' ? 1 : 0) +
-    (filterMinSize !== '' ? 1 : 0) +
-    (filterMaxSize !== '' ? 1 : 0) +
+    (filterMinSize !== null ? 1 : 0) +
+    (filterMaxSize !== null ? 1 : 0) +
     (filterExtension !== '' ? 1 : 0) +
-    (filterMinSources !== '' ? 1 : 0) +
-    (filterMinComplete !== '' ? 1 : 0) +
+    (filterMinSources !== null ? 1 : 0) +
+    (filterMinComplete !== null ? 1 : 0) +
     // Default is hide-spam on; count only when the user opted out.
     (!hideSpam ? 1 : 0)
   );

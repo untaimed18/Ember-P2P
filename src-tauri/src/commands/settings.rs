@@ -98,6 +98,7 @@ pub(crate) fn persist_with_root_transaction(
 const BACKEND_OWNED_SETTINGS_FIELDS: &[&str] = &[
     "shared_folders",
     "default_shared_folder_seeded",
+    "folder_priorities",
     "pending_share_states",
     "pending_file_priorities",
     "shared_folder_scan_cursors",
@@ -1762,6 +1763,9 @@ mod tests {
         authoritative.shared_folders = vec!["/trusted/share".into()];
         authoritative.default_shared_folder_seeded = true;
         authoritative
+            .folder_priorities
+            .insert("/trusted/share".into(), "high".into());
+        authoritative
             .pending_share_states
             .insert("/trusted/share/pending.bin".into(), false);
         authoritative
@@ -1783,6 +1787,10 @@ mod tests {
             serde_json::json!(false),
         );
         object.insert(
+            "folder_priorities".into(),
+            serde_json::json!({"/renderer/injected": "low"}),
+        );
+        object.insert(
             "pending_share_states".into(),
             serde_json::json!({"/renderer/injected/file": true}),
         );
@@ -1802,6 +1810,7 @@ mod tests {
             merged.default_shared_folder_seeded,
             authoritative.default_shared_folder_seeded
         );
+        assert_eq!(merged.folder_priorities, authoritative.folder_priorities);
         assert_eq!(
             merged.pending_share_states,
             authoritative.pending_share_states

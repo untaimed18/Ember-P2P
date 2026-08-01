@@ -298,7 +298,16 @@ export async function installUpdate(): Promise<void> {
     return;
   }
   installInFlight = true;
-  updater.update((s) => ({ ...s, phase: 'downloading', downloaded: 0, total: null, error: null }));
+  // Clear `dismissed` here: dismissing the "available" card must not silently
+  // suppress the "ready" / "error" card for a user who then installs anyway.
+  updater.update((s) => ({
+    ...s,
+    phase: 'downloading',
+    downloaded: 0,
+    total: null,
+    error: null,
+    dismissed: false,
+  }));
   let downloaded = 0;
   let total: number | null = null;
   try {

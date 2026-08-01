@@ -17,12 +17,16 @@
 
   let showNotes = $state(false);
 
+  // Every phase that renders a dismiss control must honour `dismissed`;
+  // `ready` and `error` both show "Later" and an ×, so leaving them
+  // unconditionally visible made those buttons inert.
   const visible = $derived(
-    (!$updater.dismissed && $updater.phase === 'available') ||
+    (!$updater.dismissed &&
+      ($updater.phase === 'available' ||
+        $updater.phase === 'ready' ||
+        ($updater.phase === 'error' && $updater.version !== null))) ||
       $updater.phase === 'downloading' ||
-      $updater.phase === 'installing' ||
-      $updater.phase === 'ready' ||
-      ($updater.phase === 'error' && $updater.version !== null),
+      $updater.phase === 'installing',
   );
 
   const percent = $derived(

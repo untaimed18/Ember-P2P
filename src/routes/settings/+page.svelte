@@ -36,6 +36,7 @@
   import { formatSize } from '$lib/utils';
   import type { AppSettings, SpamStats, DownloadHistoryStats } from '$lib/types';
   import { onMount, untrack } from 'svelte';
+  import { beforeNavigate } from '$app/navigation';
   import { theme, applyTheme, type Theme } from '$lib/stores/theme';
   import { emberDevToolsEnabled } from '$lib/stores/devTools';
   import {
@@ -526,6 +527,9 @@
       })
       .catch((e) => { loadError = translateError(e, m.settings_load_failed()); });
 
+    // Only covers window close/reload. In-app routing is guarded by the
+    // `beforeNavigate` hook below, which is the path a desktop user actually
+    // takes (the sidebar navigates with `goto`).
     const handleBeforeUnload = (e: BeforeUnloadEvent) => {
       if (hasUnsavedChanges) e.preventDefault();
     };
@@ -1121,6 +1125,41 @@
   let hasUnsavedChanges = $derived(
     (settings ? JSON.stringify(settings) !== originalSettings : false) || antileechDraftDirty
   );
+
+  // In-app routing (the sidebar uses `goto`) would otherwise discard pending
+  // edits with no prompt — `beforeunload` never fires for it. `nav.cancel()`
+  // must be called synchronously, so confirm out-of-band and re-issue the
+  // navigation once the user agrees.
+  let leaveConfirmOpen = $state(false);
+  let pendingLeaveHref: string | null = null;
+  let leaveConfirmed = false;
+
+  beforeNavigate((nav) => {
+    if (leaveConfirmed || !hasUnsavedChanges) return;
+    // A document unload is already covered by `beforeunload`, and `goto` could
+    // not re-issue it anyway. This covers both `leave` and link navigations to
+    // non-SvelteKit routes, which are also flagged `willUnload`.
+    if (nav.willUnload) return;
+    const to = nav.to?.url;
+    if (!to) return;
+    // Hash/query navigation within the same route (the skip-to-content link)
+    // isn't leaving the form, so there is nothing to discard.
+    if (to.pathname === nav.from?.url.pathname) return;
+    nav.cancel();
+    pendingLeaveHref = to.href;
+    leaveConfirmOpen = true;
+  });
+
+  function confirmLeaveWithoutSaving() {
+    const href = pendingLeaveHref;
+    pendingLeaveHref = null;
+    if (!href) return;
+    leaveConfirmed = true;
+    void goto(href).catch((e) => {
+      leaveConfirmed = false;
+      console.error('Navigation after discarding settings failed:', e);
+    });
+  }
 
   async function loadAntileech() {
     antileechMessage = null;
@@ -2603,6 +2642,16 @@
   confirmLabel={m.settings_antileech_restore_confirm()}
   danger={true}
   onconfirm={confirmResetAntileech}
+/>
+
+<ConfirmDialog
+  bind:open={leaveConfirmOpen}
+  title={m.settings_unsaved_leave_title()}
+  message={m.settings_unsaved_leave_message()}
+  confirmLabel={m.settings_unsaved_leave_confirm()}
+  danger={true}
+  onconfirm={confirmLeaveWithoutSaving}
+  oncancel={() => { pendingLeaveHref = null; }}
 />
 
 <!--

@@ -66,6 +66,12 @@
     // Esc — close the dock. Allowed even from inputs because users
     // press it instinctively to dismiss overlays.
     if (e.key === 'Escape') {
+      // An open modal owns Escape. Those handlers sit on the dialog element and
+      // let the event bubble to this window listener, so without this guard one
+      // press both dismisses the dialog and collapses the dock behind it.
+      if (typeof document !== 'undefined' && document.querySelector('[aria-modal="true"]')) {
+        return;
+      }
       e.preventDefault();
       closeDock();
       return;

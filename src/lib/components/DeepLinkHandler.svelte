@@ -2,7 +2,6 @@
   // Survive DeepLinkHandler remount (wizard dismiss / locale reload). Instance
   // Sets would reset and auto-open the same durable queue entry again.
   export const completedDeepLinkIds = new Set<string>();
-  export const failedDeepLinkIds = new Set<string>();
   export const deferredDeepLinkIds = new Set<string>();
 </script>
 
@@ -42,7 +41,6 @@
   type HandleResult = 'done' | 'defer' | 'fail';
 
   const completedIds = completedDeepLinkIds;
-  const failedIds = failedDeepLinkIds;
   const deferredIds = deferredDeepLinkIds;
 
   // Parse the `|`-delimited body of an ed2k link, dropping the trailing empty
@@ -270,9 +268,7 @@
         if (deferredChanged) syncDeferredCount();
 
         const links = pending.filter(
-          (link) =>
-            !failedIds.has(link.id) &&
-            (!deferredIds.has(link.id) || link.id === reviewRequestedId),
+          (link) => !deferredIds.has(link.id) || link.id === reviewRequestedId,
         );
         for (const link of links) {
           if (destroyed) break;
@@ -283,15 +279,15 @@
             if (result === 'done') {
               if (deferredIds.delete(link.id)) syncDeferredCount();
               completedIds.add(link.id);
-            } else if (result === 'defer') {
-              // Keep the durable entry without automatically reopening it.
-              // Continue so one dismissed link cannot starve later entries.
+            } else {
+              // 'defer' (user dismissed) and 'fail' (usually transient — a busy
+              // network task, a timed-out command) are both parked: the durable
+              // entry is kept and surfaced in the pending banner so Review can
+              // retry it, but it is not reopened automatically. Continue so one
+              // parked link cannot starve later entries. A 'fail' has already
+              // shown its own error toast inside `handlePayload`.
               deferredIds.add(link.id);
               syncDeferredCount();
-              continue;
-            } else {
-              if (reviewingDeferred && deferredIds.delete(link.id)) syncDeferredCount();
-              failedIds.add(link.id);
               continue;
             }
           }
@@ -389,7 +385,7 @@
     padding: 10px 12px 10px 14px;
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
-    background: var(--surface-raised);
+    background: var(--bg-secondary);
     color: var(--text-primary);
     box-shadow: var(--shadow-md);
     font-size: 13px;

@@ -252,6 +252,11 @@
 
     // Brief pause so the user can see the green checkmarks
     await new Promise(r => setTimeout(r, 900));
+    // Hand the guard back to `saving` rather than dropping it: both flags being
+    // false through the final read-modify-write re-enables the Finish button
+    // mid-flight, and a second `finish()` can then write `setup_complete: false`
+    // after this one has written `true`.
+    saving = true;
     downloading = false;
 
     // `download_ipfilter` persists `ip_filter_enabled` and bumps the revision.
@@ -263,6 +268,7 @@
       latest = await getSettings();
     } catch (e) {
       saveError = translateError(e, m.settings_save_failed());
+      saving = false;
       return;
     }
 
@@ -279,9 +285,11 @@
       // If this second save fails the wizard will show again — annoying but
       // safe. Surface the error.
       saveError = translateError(e, m.settings_save_failed());
+      saving = false;
       return;
     }
 
+    saving = false;
     relaunching = true;
     try {
       await new Promise(r => setTimeout(r, 600));

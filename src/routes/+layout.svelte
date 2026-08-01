@@ -576,7 +576,7 @@
     padding: 24px;
     border: 1px solid var(--danger);
     border-radius: var(--radius-lg);
-    background: var(--surface-raised);
+    background: var(--bg-secondary);
     box-shadow: var(--shadow-lg);
   }
 

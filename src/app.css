@@ -799,6 +799,10 @@ h4 { font-size: 14px; font-weight: 600; color: var(--text-primary); }
   line-height: 1.5;
   overflow-wrap: anywhere;
   word-break: break-word;
+  /* Callers build multi-field messages with embedded newlines (the deep-link
+     download prompt lists name / size / hash on separate lines); without this
+     they collapse into one run-on string. */
+  white-space: pre-line;
 }
 .confirm-dialog .dialog-actions {
   display: flex;

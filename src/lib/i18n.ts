@@ -222,7 +222,11 @@ const messageFns = m as unknown as Record<string, MessageFn | undefined>;
 function translateCode(code: string, context: string | undefined): string | undefined {
   const fn = messageFns[`error_${code}`];
   if (typeof fn !== 'function') return undefined;
-  return context !== undefined ? fn({ detail: context }) : fn();
+  // Always pass the argument object. Paraglide compiles a `{detail}` message to
+  // `${i?.detail}` with no default for its inputs parameter, so calling it bare
+  // renders the literal string "undefined" — and a handful of backend sites
+  // emit these codes through the context-free `coded()`.
+  return fn({ detail: context ?? '' });
 }
 
 /**

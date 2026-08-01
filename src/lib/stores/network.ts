@@ -192,6 +192,12 @@ export async function initNetworkStore() {
     registered.push(await listen<string>('network-status', (event) => {
       const status = narrowNetworkStatus(event.payload);
       if (!status) return;
+      // Some `network-error` emitters are transient and have no matching
+      // "resolved" event — notably the KAD bootstrap warning after 5 failed
+      // attempts, which recovers on its own. A successful connect is the only
+      // recovery signal available, so clear the banner here. Fatal errors leave
+      // the network disconnected and so are unaffected.
+      if (status === 'connected') networkError.set(null);
       lastEventUpdate = Date.now();
       lastNetworkUpdate = lastEventUpdate;
       networkStats.update((s) => {
@@ -348,7 +354,10 @@ export async function initNetworkStore() {
     }));
   } catch (e) {
     for (const u of registered) u();
-    initialized = false;
+    // Only relinquish the flag if this init still owns the store; a later init
+    // may already have taken over after a cleanup, and clearing it then would
+    // let a third init register a duplicate set of listeners.
+    if (myEpoch === storeEpoch) initialized = false;
     throw e;
   }
   if (myEpoch !== storeEpoch) {

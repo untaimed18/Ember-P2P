@@ -50,13 +50,18 @@
   }
 
   $effect(() => {
+    // Read `value` before the early return. Svelte re-collects dependencies on
+    // every run, so bailing out first would drop `value` from the dependency
+    // set and the effect would never run again — leaving the field frozen
+    // against external writes (speed-test "Apply recommended", Discard).
+    const next = value;
     if (internalUpdate) {
       internalUpdate = false;
       return;
     }
-    if (value !== lastSyncedValue) {
-      lastSyncedValue = value;
-      syncFromBytes(value);
+    if (next !== lastSyncedValue) {
+      lastSyncedValue = next;
+      syncFromBytes(next);
     }
   });
 

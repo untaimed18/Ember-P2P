@@ -163,7 +163,9 @@
   .close-overlay {
     position: fixed;
     inset: 0;
-    z-index: 10000;
+    /* Above the splash (100000): a close request during a slow or wedged
+       startup must still be answerable, otherwise the app can't be quit. */
+    z-index: 100001;
     display: grid;
     place-items: center;
     background: var(--overlay-bg);

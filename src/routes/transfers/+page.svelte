@@ -803,9 +803,11 @@
       knownClientsLoaded = true;
       knownClientsFailCount = 0;
       // Force-refresh Trust badges each poll so manual bans / score
-      // changes appear without leaving the tab.
+      // changes appear without leaving the tab. Only the displayed slice is
+      // fetched — the badge is rendered per rendered row, and the full ledger
+      // can hold tens of thousands of records.
       void refreshReputations(
-        knownClients.map((k) => k.user_hash),
+        displayedKnownClients.map((k) => k.user_hash),
         true,
       );
     } catch (e) {
@@ -833,6 +835,8 @@
   let reputationMap = $state<Record<string, PeerReputationInfo | null>>({});
   let reputationInFlight = new Set<string>();
 
+  const REPUTATION_FETCH_CONCURRENCY = 16;
+
   async function refreshReputations(hashes: string[], force = false) {
     // Skip hashes currently in flight. Non-null cache entries are
     // re-fetched when `force` is set (Known Clients poll) so score /
@@ -843,15 +847,24 @@
     );
     if (targets.length === 0) return;
     for (const h of targets) reputationInFlight.add(h);
-    const results = await Promise.all(
-      targets.map(async (h) => {
-        try {
-          return [h, await getPeerReputation(h)] as const;
-        } catch {
-          return [h, null] as const;
-        }
-      }),
-    );
+    // Chunked rather than one flat `Promise.all`: each call takes a slot in the
+    // backend's bounded network command channel, so an unbounded fan-out over a
+    // large credit ledger starves unrelated commands into "Network busy".
+    const results: (readonly [string, PeerReputationInfo | null])[] = [];
+    for (let i = 0; i < targets.length; i += REPUTATION_FETCH_CONCURRENCY) {
+      const chunk = targets.slice(i, i + REPUTATION_FETCH_CONCURRENCY);
+      results.push(
+        ...(await Promise.all(
+          chunk.map(async (h) => {
+            try {
+              return [h, await getPeerReputation(h)] as const;
+            } catch {
+              return [h, null] as const;
+            }
+          }),
+        )),
+      );
+    }
     // Always clear in-flight markers — an early unmount return used to
     // leak hashes permanently blocked from future fetches.
     for (const [h] of results) reputationInFlight.delete(h);

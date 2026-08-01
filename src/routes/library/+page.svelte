@@ -53,9 +53,14 @@
   import { inertBackground, trapTabKey } from '$lib/a11y';
   import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
 
-  let folders: string[] = $state([]);
-  let folderPriorities: Record<string, string> = $state({});
-  let files: FileInfo[] = $state([]);
+  // All three are replace-only — never mutated in place — so `$state.raw`
+  // avoids building a deep proxy with a signal per property. That matters here:
+  // the backend scan cap is 100,000 files, and the filter/sort chain reads
+  // several fields per row on every pass. If you ever need an in-place edit,
+  // switch back to `$state` rather than mutating these.
+  let folders: string[] = $state.raw([]);
+  let folderPriorities: Record<string, string> = $state.raw({});
+  let files: FileInfo[] = $state.raw([]);
   let aggregateStats = $state<TransferStats | null>(null);
   let scanning = $state(false);
   let scanTruncated = $state(false);
@@ -614,7 +619,11 @@
         if (selectedPath && !present.has(selectedPath)) selectedPath = null;
       }
     } catch (e) {
-      if (mounted && e instanceof Error && e.message !== 'timeout') {
+      // Tauri rejects `invoke()` with the raw `Result::Err` payload — a plain
+      // string for these commands, never an Error. Only the local watchdog
+      // above throws an Error, and only with the message 'timeout', so testing
+      // for `instanceof Error` here would swallow every real backend failure.
+      if (mounted && !(e instanceof Error && e.message === 'timeout')) {
         console.error('Failed to load shared files:', e);
         // Surface the failure in the UI banner only when there is no data to
         // show (initial load / fully-empty library); a transient failure of a
@@ -1653,6 +1662,23 @@
     return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
   }
 
+  /**
+   * True when the event came from a control with its own Enter/Space
+   * activation. Table rows stop propagation before the document handler runs,
+   * so this only ever excludes non-row targets — without it, `preventDefault`
+   * on the row shortcuts suppresses the browser's synthesized click and no
+   * button or link on the page can be activated by keyboard while a row is
+   * selected.
+   */
+  function isActivationTarget(el: EventTarget | null): boolean {
+    return (
+      el instanceof HTMLElement &&
+      !!el.closest(
+        'button, a[href], summary, [role="button"], [role="menuitem"], [role="tab"], [role="option"]',
+      )
+    );
+  }
+
   async function deleteSelectedFile() {
     const f = selectedFile;
     if (!f) return;
@@ -1792,7 +1818,7 @@
     }
 
     // Enter on the selected row opens the file.
-    if (e.key === 'Enter' && selectedFile) {
+    if (e.key === 'Enter' && selectedFile && !isActivationTarget(e.target)) {
       e.preventDefault();
       void openSharedFile(selectedFile.path);
       return;
@@ -1815,7 +1841,7 @@
     }
 
     // Space toggles the check on the selected row.
-    if (e.key === ' ' && selectedFile) {
+    if (e.key === ' ' && selectedFile && !isActivationTarget(e.target)) {
       e.preventDefault();
       toggleCheck(selectedFile.path, false);
       return;

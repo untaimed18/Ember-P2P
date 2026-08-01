@@ -1,6 +1,7 @@
 import { writable, get } from 'svelte/store';
 import { listen } from '@tauri-apps/api/event';
 import type { UnlistenFn } from '@tauri-apps/api/event';
+import { isAppVisible } from '$lib/utils';
 import {
   getFriendRequests,
   getOnlineFriends,
@@ -196,7 +197,9 @@ export async function initFriendsStore() {
         // `unreadCounts` would leave a phantom badge until the
         // tab loses focus and is reactivated. `ChatConversation`
         // separately marks the message read on the backend.
-        if (get(activeChatHash) === hash) return;
+        // A mounted conversation in a hidden/minimized window is NOT being
+        // read, so it must still raise a badge.
+        if (isAppVisible() && get(activeChatHash) === hash) return;
         unreadCounts.update((m) => {
           const next = new Map(m);
           next.set(hash, (next.get(hash) || 0) + 1);

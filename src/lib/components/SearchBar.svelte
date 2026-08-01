@@ -150,6 +150,9 @@
       }
     }
     if (e.key === 'Enter') {
+      // Auto-repeat would open a tab and fire a backend search per repeat,
+      // with no cap on either.
+      if (e.repeat) return;
       submit(value);
     }
   }

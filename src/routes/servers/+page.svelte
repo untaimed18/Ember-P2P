@@ -951,7 +951,10 @@
       {#if logMessages.length === 0}
         <span class="log-placeholder">{m.servers_log_placeholder()}</span>
       {:else}
-        {#each logMessages as msg (msg)}
+        <!-- Unkeyed on purpose: the list is append-only and two identical
+             lines can share a second-resolution timestamp, which Svelte 5
+             treats as a duplicate key and throws on (in production too). -->
+        {#each logMessages as msg}
           <div class="log-line"><bdi dir="auto">{msg}</bdi></div>
         {/each}
       {/if}

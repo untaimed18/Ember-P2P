@@ -140,8 +140,15 @@
         clearTimeout(browseTimeout);
         // Defensive: treat missing/invalid `files` as empty rather than
         // crashing the dialog if the backend ever emits a malformed payload.
+        // De-duplicate by hash before rendering: the sharer's index is keyed
+        // by path, so two copies of one file under a shared folder arrive as
+        // two entries with the same hash — and the table keys on hash, which
+        // Svelte 5 turns into a thrown error on collision.
         files = Array.isArray(event.payload.files)
-          ? event.payload.files.slice(0, MAX_BROWSE_FILES)
+          ? [...new Map(event.payload.files.map((f) => [f.hash, f])).values()].slice(
+              0,
+              MAX_BROWSE_FILES,
+            )
           : [];
         loading = false;
         // Successful result terminates this browse generation; a

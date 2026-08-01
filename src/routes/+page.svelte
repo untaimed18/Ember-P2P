@@ -188,7 +188,9 @@
         const raw = c.status === 'rejected'
           ? (c as PromiseRejectedResult).reason
           : (s as PromiseRejectedResult).reason;
-        const msg = raw instanceof Error ? raw.message : String(raw);
+        // `String(raw)` would print the backend's coded JSON envelope verbatim;
+        // `toErrMsg` unwraps and localizes it.
+        const msg = toErrMsg(raw, m.error_operation_failed());
         // Only surface the banner if we don't already have data to show; a
         // transient failure mid-session shouldn't stomp a healthy list.
         if (wasEmpty) kadError = msg;

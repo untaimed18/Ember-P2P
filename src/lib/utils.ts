@@ -13,8 +13,23 @@ export function formatBytes(bytes: number): string {
     val /= 1024;
     i++;
   }
+  // toFixed(1) rounds anything >= 1023.95 up to "1024.0", so carry into the
+  // next unit rather than printing "1024 KB" just below the 1 MB boundary.
+  if (val >= 1023.95 && i < units.length - 1) {
+    val /= 1024;
+    i++;
+  }
   const formatted = val.toFixed(1);
   return `${formatted.endsWith('.0') ? formatted.slice(0, -2) : formatted} ${units[i]}`;
+}
+
+/**
+ * True when the app window is actually on screen. Used to decide whether the
+ * user can be considered to have *seen* something (e.g. an incoming chat
+ * message) rather than merely having the relevant view mounted.
+ */
+export function isAppVisible(): boolean {
+  return typeof document === 'undefined' || document.visibilityState === 'visible';
 }
 
 /** Alias for formatBytes -- used in file-size contexts. */

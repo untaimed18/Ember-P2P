@@ -1,4 +1,5 @@
 <script lang="ts">
+  import * as m from '$lib/paraglide/messages';
   // eMule-style chunked upload "Up Status" bar. Each ED2K part is drawn as a
   // segment in one of three states, mirroring eMule's
   // `CUploadListCtrl::DrawUpStatusBar`:
@@ -118,8 +119,8 @@
   <div class="parts-fill" style="background: {background};"></div>
   <span class="parts-text">{pct.toFixed(1)}%</span>
   <span class="sr-only"
-    >{servedCount}/{count} parts sent{peerOnlyCount > 0
-      ? `, ${peerOnlyCount} already on peer`
+    >{m.transfers_parts({ have: servedCount, total: count })}{peerOnlyCount > 0
+      ? `, ${m.transfers_parts_peer({ peer: peerOnlyCount })}`
       : ''}</span
   >
 </div>

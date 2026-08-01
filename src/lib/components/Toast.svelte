@@ -52,7 +52,10 @@
     position: fixed;
     top: 12px;
     right: 12px;
-    z-index: 9999;
+    /* Above the modal overlay tier (10000). A toast raised while a dialog is
+       open is usually reporting that dialog's action failing, so it must not
+       render behind the scrim. */
+    z-index: 10001;
     display: flex;
     flex-direction: column;
     gap: 8px;
@@ -80,7 +83,9 @@
     justify-content: center;
     flex-shrink: 0;
   }
-  .toast-msg { flex: 1; line-height: 1.35; }
+  /* Backend error strings carry hashes and full Windows paths; without
+     min-width:0 a flex item won't shrink below its min-content width. */
+  .toast-msg { flex: 1; min-width: 0; line-height: 1.35; overflow-wrap: anywhere; }
   .toast-close {
     display: inline-flex;
     align-items: center;

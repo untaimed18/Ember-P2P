@@ -2371,7 +2371,7 @@
     min-width: 18px;
     height: 18px;
     border-radius: 9px;
-    background: var(--bg-elevated);
+    background: var(--bg-tertiary);
     color: var(--text-muted);
     font-size: 10px;
     font-weight: 700;

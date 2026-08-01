@@ -7,6 +7,7 @@
   import { getDraft, setDraft, clearDraft } from '$lib/stores/chatTabs';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
+  import { isAppVisible } from '$lib/utils';
 
   // The backend rejects chat messages whose UTF-8 encoding exceeds this many
   // bytes (`peers.rs`); the textarea `maxlength` only bounds characters, so we
@@ -203,7 +204,10 @@
           if (event.payload.direction === 'sent' || wasPinned) {
             scrollToBottom();
           }
-          if (event.payload.direction === 'received') {
+          // Only acknowledge what the user can actually see. A mounted
+          // conversation in a minimized window would otherwise mark the
+          // message read and suppress its badge, losing it entirely.
+          if (event.payload.direction === 'received' && isAppVisible()) {
             markAsRead();
           }
         }
@@ -379,6 +383,17 @@
       console.warn('markMessagesRead failed:', e);
     }
   }
+
+  // Messages that arrived while the window was hidden were deliberately left
+  // unread; clear them once the user actually comes back to the conversation.
+  $effect(() => {
+    if (typeof document === 'undefined') return;
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') void markAsRead();
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', onVisibilityChange);
+  });
 
   function scrollToBottom() {
     requestAnimationFrame(() => {
