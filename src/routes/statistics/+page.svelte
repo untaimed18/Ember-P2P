@@ -105,7 +105,12 @@
 
   onMount(() => {
     loadStats();
-    refreshInterval = setInterval(loadStats, 2000);
+    // Skip while hidden, matching the shared stats poll and the KAD page: two
+    // IPC round-trips every 2s is pure waste behind a minimized window.
+    refreshInterval = setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+      loadStats();
+    }, 2000);
     tickInterval = setInterval(() => tickCounter++, 1000);
     return () => {
       unmounted = true;

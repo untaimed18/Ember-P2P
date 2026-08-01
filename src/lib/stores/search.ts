@@ -260,6 +260,12 @@ function validCount(raw: unknown): number {
 
 function flushSearchResults() {
   flushScheduled = false;
+  // Cancel rather than merely forget. `search-complete` calls this
+  // synchronously, and an already-queued frame would otherwise survive with no
+  // tracked handle — escaping `cleanupSearchStore`'s `cancelAnimationFrame`,
+  // which exists precisely to stop a stale flush refilling cleared tabs.
+  if (flushRaf !== null && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(flushRaf);
+  if (flushTimeout !== null) clearTimeout(flushTimeout);
   flushRaf = null;
   flushTimeout = null;
   if (pendingByRequest.size === 0) return;

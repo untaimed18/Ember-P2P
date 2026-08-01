@@ -904,7 +904,8 @@ pub struct AppSettings {
     /// Per-source part hash failure retry rounds during data transfer (default 3)
     #[serde(default = "default_download_part_retry_rounds")]
     pub download_part_retry_rounds: u32,
-    /// Maximum download file size in GiB (default 4096 ≈ 4 TiB; large-file paths use 64-bit offsets)
+    /// Maximum download file size in GiB (1–593; default 593 — the ed2k
+    /// part-count ceiling, see `ed2k_download_limits`)
     #[serde(default = "default_max_download_file_size_gib")]
     pub max_download_file_size_gib: u32,
     /// Max seconds to wait for a keyword/global search to finish (30–600; default 120).

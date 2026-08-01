@@ -138,10 +138,16 @@
           info.aich,
         );
         if (!destroyed) {
+          // Use the previewed name, not the re-parsed raw one: `preview.name`
+          // has been through `sanitize_remote_text` (which strips bidi
+          // overrides), and it is the exact string the user just approved in
+          // the confirmation dialog. `parseEd2kLink` does no sanitizing, and
+          // toasts have no bidi isolation.
+          const displayName = preview.name ?? info.name;
           toastSuccess(
             res.already_queued
-              ? m.search_already_queued_name({ name: info.name })
-              : m.search_queued_name({ name: info.name }),
+              ? m.search_already_queued_name({ name: displayName })
+              : m.search_queued_name({ name: displayName }),
           );
         }
       } else if (preview.kind === 'server') {

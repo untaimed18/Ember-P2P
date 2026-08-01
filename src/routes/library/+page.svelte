@@ -39,7 +39,7 @@
   import { networkStats } from '$lib/stores/network';
   import { formatSize, copyToClipboard as writeClipboard } from '$lib/utils';
   import type { FileInfo, MediaMetadata } from '$lib/types';
-  import { onMount, tick } from 'svelte';
+  import { onMount, tick, untrack } from 'svelte';
   import { fly } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
 
@@ -109,6 +109,16 @@
   /** In-app play requests: bump `mediaPlayId` with the target path. */
   let mediaPlayId = $state(0);
   let mediaPlayPath: string | null = $state(null);
+  // A play request belongs to the selection it was issued for. The player is
+  // wrapped in `{#key selectedPath}`, so every selection change remounts it with
+  // no memory of having already consumed this id — leaving the request set would
+  // restart the file from 0:00 the next time it is merely selected.
+  $effect(() => {
+    const path = selectedPath;
+    untrack(() => {
+      if (mediaPlayPath !== null && mediaPlayPath !== path) mediaPlayPath = null;
+    });
+  });
   /** Bumped to pause the in-app player (e.g. before Open Externally). */
   let playerStopToken = $state(0);
 
@@ -151,6 +161,10 @@
 
   async function handleDownloadAll() {
     if (!loadedCollection || downloadingCollection) return;
+    // Snapshot the entries up front: `loadedCollection` is live `$state` that
+    // the Close button can null out, or the deep-link handoff can replace with
+    // a different collection, while the batched enqueue is awaiting.
+    const entries = loadedCollection.files.slice();
     downloadingCollection = true;
     try {
       // The backend deliberately bounds each enqueue transaction to 200
@@ -162,10 +176,10 @@
       let oversize = 0;
     let failed = 0;
       let firstError: unknown = null;
-      for (let start = 0; start < loadedCollection.files.length; start += batchSize) {
+      for (let start = 0; start < entries.length; start += batchSize) {
         try {
           const result = await downloadCollectionFiles(
-            loadedCollection.files.slice(start, start + batchSize),
+            entries.slice(start, start + batchSize),
           );
           queued += result.queuedCount;
           skipped += result.skippedCount;
@@ -210,7 +224,7 @@
         toastWarning(m.library_copy_all_none());
         return;
       }
-      const text = await formatEd2kLinks(files);
+      const text = await formatEd2kLinksChunked(files);
       if (!(await writeClipboard(text))) {
         toastError(m.library_copy_failed());
         return;
@@ -700,6 +714,23 @@
   /** Soft confirm when copying a very large link list to the clipboard. */
   const COPY_ALL_LINKS_CONFIRM_AT = 5_000;
 
+  // The backend rejects any single `format_ed2k_links` call over
+  // MAX_ED2K_LINK_BATCH (50,000) while the library scan cap is 100,000, so an
+  // unchunked call makes "Copy All Links" fail outright on exactly the
+  // libraries the button is most useful for. The backend joins with '\n' and
+  // emits no trailing newline, so joining chunks reproduces the same output.
+  const ED2K_LINK_IPC_BATCH = 10_000;
+  async function formatEd2kLinksChunked(
+    entries: Array<{ name: string; size: number; hash: string }>,
+  ): Promise<string> {
+    if (entries.length <= ED2K_LINK_IPC_BATCH) return formatEd2kLinks(entries);
+    const parts: string[] = [];
+    for (let start = 0; start < entries.length; start += ED2K_LINK_IPC_BATCH) {
+      parts.push(await formatEd2kLinks(entries.slice(start, start + ED2K_LINK_IPC_BATCH)));
+    }
+    return parts.join('\n');
+  }
+
   let copyingAllLibraryLinks = $state(false);
 
   let filteredHashedFiles = $derived.by(() => {
@@ -730,7 +761,7 @@
     }
     copyingAllLibraryLinks = true;
     try {
-      const text = await formatEd2kLinks(
+      const text = await formatEd2kLinksChunked(
         targets.map((f) => ({ name: f.name, size: f.size, hash: f.hash }))
       );
       if (!(await writeClipboard(text))) {
@@ -769,7 +800,8 @@
     }
   }
 
-  async function handleSetFolderPriority(path: string, priority: string) {
+  async function handleSetFolderPriority(path: string, priority: string, el?: HTMLSelectElement) {
+    const previous = folderPriorities[path] ?? '';
     try {
       error = null;
       const count = await setFolderPriority(path, priority);
@@ -785,7 +817,14 @@
       }
       await refresh();
     } catch (e: unknown) {
-      if (mounted) error = toErr(e);
+      if (mounted) {
+        error = toErr(e);
+        // Svelte only rewrites a one-way `value={...}` when the expression
+        // itself changes; it never reconciles against the DOM. `folderPriorities`
+        // is untouched on failure, so without this the select would keep showing
+        // the rejected choice permanently — a later refresh doesn't clear it.
+        if (el) el.value = previous;
+      }
     }
   }
 
@@ -967,10 +1006,11 @@
     for (const f of files) if (checkedPaths.has(f.path) && f.hash && f.shared) n++;
     return n;
   });
-  // Selections persist across filter changes, but bulk actions only operate on
-  // rows currently in `sortedFiles` (see getCheckedFiles). Count how many
-  // checked files exist in the library yet are hidden by the active filter so
-  // the bulk bar can warn rather than silently acting on a subset.
+  // Selections persist across filter changes and bulk actions operate on the
+  // whole selection, not just the visible rows (see getCheckedFiles, which
+  // filters `files`, not `sortedFiles`). Count how many checked files are
+  // hidden by the active filter so the bulk bar can say so and offer to
+  // reveal them — the destructive paths report the true total either way.
   let checkedHiddenCount = $derived.by(() => {
     if (!hasActiveLibraryFilters || checkedPaths.size === 0) return 0;
     const visible = new Set(sortedFiles.map((f) => f.path));
@@ -1200,7 +1240,7 @@
         seen.add(f.hash);
         files.push({ name: f.name, size: f.size, hash: f.hash });
       }
-      const text = await formatEd2kLinks(files);
+      const text = await formatEd2kLinksChunked(files);
       if (!(await writeClipboard(text))) {
         toastError(m.library_copy_failed());
         return;
@@ -1711,7 +1751,7 @@
           seen.add(f.hash);
           files.push({ name: f.name, size: f.size, hash: f.hash });
         }
-        const text = await formatEd2kLinks(files);
+        const text = await formatEd2kLinksChunked(files);
         if (!(await writeClipboard(text))) {
           toastError(m.library_copy_failed());
           return;
@@ -2786,7 +2826,7 @@
               aria-label={m.library_folder_priority_title()}
               value={folderPriorities[folder] ?? ''}
               onclick={(e) => e.stopPropagation()}
-              onchange={(e) => { e.stopPropagation(); handleSetFolderPriority(folder, (e.currentTarget as HTMLSelectElement).value); }}
+              onchange={(e) => { e.stopPropagation(); handleSetFolderPriority(folder, e.currentTarget.value, e.currentTarget); }}
             >
               <option value="">{m.library_folder_priority_default()}</option>
               <option value="verylow">{m.library_priority_verylow()}</option>

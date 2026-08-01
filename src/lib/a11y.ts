@@ -28,6 +28,11 @@ export function inertBackground(overlay: Element | null | undefined): () => void
     const parent = node.parentElement;
     for (const sibling of Array.from(parent.children)) {
       if (sibling === node) continue;
+      // Transient status surfaces stay reachable. A toast raised while a dialog
+      // is open is usually reporting that dialog's own action failing, so
+      // inerting it would leave the message visible but undismissable — and a
+      // sticky toast (duration 0) would stay stuck for the dialog's lifetime.
+      if (sibling.hasAttribute('data-a11y-no-inert')) continue;
       const count = inertRefCounts.get(sibling) ?? 0;
       // Leave a pre-existing `inert` we didn't set (count 0 + attribute
       // already present) untouched so we never clear someone else's inert.

@@ -117,7 +117,11 @@
     loadSortPrefs();
     sortPrefsLoaded = true;
     refresh();
-    const interval = setInterval(refresh, 5000);
+    // Skip while hidden, matching the shared stats poll and the KAD page.
+    const interval = setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+      refresh();
+    }, 5000);
 
     const unlisteners: Array<() => void> = [];
     let destroyed = false;
@@ -377,11 +381,26 @@
     confirmRemoveAll = true;
   }
 
+  // Each removeServer() takes a slot in the backend's bounded network command
+  // channel and triggers a synchronous server.met re-serialization there, so an
+  // unbounded fan-out over a large imported list can surface "Network busy" on
+  // an operation that should simply succeed.
+  const REMOVE_SERVER_CONCURRENCY = 8;
+  async function removeServersBounded(list: ServerInfo[]) {
+    const results: PromiseSettledResult<unknown>[] = [];
+    for (let i = 0; i < list.length; i += REMOVE_SERVER_CONCURRENCY) {
+      results.push(
+        ...(await Promise.allSettled(
+          list.slice(i, i + REMOVE_SERVER_CONCURRENCY).map((s) => removeServer(s.ip, s.port)),
+        )),
+      );
+    }
+    return results;
+  }
+
   async function doRemoveAll() {
     error = null;
-    const results = await Promise.allSettled(
-      [...servers].map(s => removeServer(s.ip, s.port))
-    );
+    const results = await removeServersBounded([...servers]);
     const removed = results.filter((r) => r.status === 'fulfilled').length;
     const failedCount = results.filter((r) => r.status === 'rejected').length;
     selectedServer = null;
@@ -512,9 +531,7 @@
 
   async function doRemoveSelected(toRemove: ServerInfo[]) {
     error = null;
-    const results = await Promise.allSettled(
-      toRemove.map(s => removeServer(s.ip, s.port))
-    );
+    const results = await removeServersBounded(toRemove);
     const count = results.filter((r) => r.status === 'fulfilled').length;
     const failedCount = results.filter((r) => r.status === 'rejected').length;
     selectedServers = new Set();
@@ -1190,6 +1207,16 @@
     align-items: center;
     gap: 6px;
     white-space: nowrap;
+    /* Names come from a remotely downloaded server.met and are capped at 4096
+       chars backend-side, which is far past what this column can show. Clamp
+       like .desc-cell rather than letting one hostile entry stretch the table. */
+    max-width: 260px;
+  }
+
+  .name-cell bdi {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .server-icon {

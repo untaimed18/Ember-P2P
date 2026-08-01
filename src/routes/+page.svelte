@@ -288,7 +288,7 @@
         await kadBootstrapClients();
         toastSuccess(m.kad_bootstrap_from_known());
       }
-      bootstrapOpen = false;
+      closeBootstrap();
       // Kick an immediate refresh so new contacts show quickly.
       void refresh();
     } catch (e: unknown) {
@@ -303,7 +303,13 @@
   let bootstrapHostInput: HTMLInputElement | undefined = $state();
   let bootstrapUrlInput: HTMLInputElement | undefined = $state();
 
+  let bootstrapReturnFocus: HTMLElement | null = null;
+
   function openBootstrap(mode: 'ip' | 'url' | 'clients' = 'ip') {
+    // `inertBackground` blurs the trigger, so record it before opening to give
+    // keyboard users somewhere to land on close (the shared dialogs all do this).
+    const active = typeof document !== 'undefined' ? document.activeElement : null;
+    bootstrapReturnFocus = active instanceof HTMLElement && active !== document.body ? active : null;
     bootstrapMode = mode;
     bootstrapOpen = true;
     // Give the DOM a tick to mount the modal, then move focus so keyboard
@@ -313,8 +319,20 @@
         if (!mounted) return;
         if (mode === 'ip') bootstrapHostInput?.focus();
         else if (mode === 'url') bootstrapUrlInput?.focus();
+        // 'clients' mode has neither input. Without this the overlay never
+        // receives focus, and since its onkeydown is the only handler, Escape
+        // and Ctrl+Enter would be dead until the user clicked or tabbed in.
+        else bootstrapOverlay?.focus();
       }, 0);
     });
+  }
+
+  function closeBootstrap() {
+    bootstrapOpen = false;
+    const el = bootstrapReturnFocus;
+    bootstrapReturnFocus = null;
+    // Deferred so `inertBackground`'s cleanup strips `inert` before the refocus.
+    if (el) requestAnimationFrame(() => { if (document.contains(el)) el.focus(); });
   }
 
   // K30: cancel an active search from the row-level action button. We
@@ -866,7 +884,10 @@
       aria-busy={bootstrapPending}
       tabindex="-1"
       onkeydown={(e) => {
-        if (e.key === 'Escape') { bootstrapOpen = false; return; }
+        // Matches the Cancel button: dismissing mid-request would strand
+        // `bootstrapPending` (cleared only in handleBootstrap's finally), so a
+        // reopen would show a spinner and a disabled submit for up to 90s.
+        if (e.key === 'Escape') { if (!bootstrapPending) closeBootstrap(); return; }
         if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && !bootstrapPending) {
           e.preventDefault();
           void handleBootstrap();
@@ -894,7 +915,7 @@
       <div class="modal-content bootstrap-modal">
         <div class="modal-header">
           <h3 id="kad-bootstrap-title">{m.kad_bootstrap_modal_title()}</h3>
-          <button class="modal-close" aria-label={m.common_close()} onclick={() => (bootstrapOpen = false)}>×</button>
+          <button class="modal-close" aria-label={m.common_close()} disabled={bootstrapPending} onclick={closeBootstrap}>×</button>
         </div>
         <div class="modal-body">
           <div class="bootstrap-tabs" role="tablist">
@@ -972,7 +993,7 @@
           {/if}
         </div>
         <div class="modal-footer">
-          <button class="ghost" onclick={() => (bootstrapOpen = false)} disabled={bootstrapPending}>{m.common_cancel()}</button>
+          <button class="ghost" onclick={closeBootstrap} disabled={bootstrapPending}>{m.common_cancel()}</button>
           <button
             class="primary"
             onclick={handleBootstrap}

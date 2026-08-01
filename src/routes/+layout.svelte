@@ -30,7 +30,7 @@
     acknowledgeSecurityPolicyReset,
     getSecurityPolicyState,
   } from '$lib/api/security';
-  import { clearAllToasts, toastWarning } from '$lib/stores/toast';
+  import { clearAllToasts, toastError, toastWarning } from '$lib/stores/toast';
   import { emberDevToolsEnabled } from '$lib/stores/devTools';
   import { takePendingDownloadOverflowNotice } from '$lib/api/transfers';
   import type { AppSettings } from '$lib/types';
@@ -116,12 +116,16 @@
         setAppSettings(await getSettings());
       } catch (e) {
         console.error('Failed to persist close-to-tray preference:', e);
+        // "Remember my choice" silently not sticking means the user is asked
+        // again next launch with no idea why.
+        toastError(translateError(e, m.settings_save_failed()));
       }
     }
     try {
       await hideToTray();
     } catch (e) {
       console.error('Failed to hide window to tray:', e);
+      toastError(translateError(e, m.error_operation_failed()));
     }
   }
 
@@ -132,12 +136,14 @@
         setAppSettings(await getSettings());
       } catch (e) {
         console.error('Failed to persist exit-on-close preference:', e);
+        toastError(translateError(e, m.settings_save_failed()));
       }
     }
     try {
       await quitApp();
     } catch (e) {
       console.error('Failed to quit Ember:', e);
+      toastError(translateError(e, m.error_operation_failed()));
     }
   }
 
@@ -445,7 +451,6 @@
     </main>
     <StatusBar />
   </div>
-  <Toast />
   {#if initialized && !initError && !showWizard}
     <!-- Non-blocking auto-update banner, driven by the shared updater store. -->
     <UpdateNotice />
@@ -462,6 +467,11 @@
   -->
   <ChatDock />
 </div>
+
+<!-- Outside `.app-shell` so `CloseAppDialog`'s inert walk, which inerts the
+     whole shell, can't reach it. `.app-shell` sets no transform or filter, so
+     it is not a containing block for the toast's `position: fixed`. -->
+<Toast />
 
 <CloseAppDialog
   bind:open={showCloseDialog}

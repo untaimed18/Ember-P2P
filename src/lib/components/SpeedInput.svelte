@@ -70,7 +70,15 @@
     const raw = target.value;
     const num = parseFloat(raw);
     internalUpdate = true;
-    if (isNaN(num) || num <= 0) {
+    if (num < 0) {
+      // `min="0"` only constrains the spinner; a typed "-50" still arrives here.
+      // A negative rate is not a request to remove the cap, so hold the previous
+      // value — blur re-renders the canonical display.
+      displayValue = raw;
+      internalUpdate = false;
+      return;
+    }
+    if (isNaN(num) || num === 0) {
       displayValue = raw;
       value = 0;
     } else {
@@ -135,7 +143,7 @@
       value={displayValue}
       oninput={handleInput}
       onfocus={() => (focused = true)}
-      onblur={() => (focused = false)}
+      onblur={() => { focused = false; syncFromBytes(value); }}
       class="speed-number"
       placeholder="0"
       aria-label={label || undefined}

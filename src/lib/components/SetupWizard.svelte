@@ -141,14 +141,20 @@
     }, 180);
   }
 
+  let folderError = $state('');
+
   async function pickFolder() {
+    folderError = '';
     try {
       const selected = await open({ directory: true, multiple: false, title: m.wizard_pick_folder_dialog_title() });
+      // A user cancel resolves to null and is handled by this check, so the
+      // catch below only ever sees a real plugin/permission failure — which
+      // previously made the Browse button look simply dead.
       if (selected && typeof selected === 'string') {
         downloadFolder = selected;
       }
-    } catch {
-      // User cancelled the dialog or plugin error — no action needed.
+    } catch (e) {
+      folderError = translateError(e, m.settings_folder_picker_generic_error());
     }
   }
 
@@ -430,6 +436,9 @@
               <input id="dl-folder" type="text" bind:value={downloadFolder} class="text-input folder-input" readonly />
               <button type="button" class="browse-btn" onclick={pickFolder}>{m.wizard_folder_browse()}</button>
             </div>
+            {#if folderError}
+              <p class="save-error">{folderError}</p>
+            {/if}
           </div>
         </div>
 

@@ -1786,7 +1786,9 @@
         case 'clear_completed': confirmClearCompleted = true; return;
         case 'copy_link': {
           const link = await formatEd2kLink(t.file_name, t.total_size, t.file_hash);
-          await navigator.clipboard.writeText(link);
+          // Via the helper, not `navigator.clipboard` directly: WebView2 can
+          // deny the async clipboard API, and the helper falls back to execCommand.
+          if (!(await copyToClipboard(link))) transferError = m.search_copy_failed();
           break;
         }
         case 'paste_link': {
@@ -2529,7 +2531,9 @@
       setColumnWidth(table, columnKey, startWidth + (moveEvent.clientX - startX));
     };
     const onUp = () => {
-      persistColumnWidths(table);
+      // End the drag before persisting, matching the splitter's `onUp`: a
+      // localStorage failure here would otherwise strand the handlers with the
+      // body stuck in `col-resize` and text selection disabled.
       document.body.style.cursor = previousCursor;
       document.body.style.userSelect = previousUserSelect;
       window.removeEventListener('mousemove', onMove);
@@ -2537,6 +2541,11 @@
       window.removeEventListener('blur', onUp);
       columnDragCleanup = null;
       activeColumnResize = null;
+      try {
+        persistColumnWidths(table);
+      } catch (e) {
+        console.warn('transfers: failed to persist column widths', e);
+      }
     };
 
     window.addEventListener('mousemove', onMove);
@@ -2753,6 +2762,10 @@
     if (t.status === 'stopped') {
       pauseSourceRefreshKey = '';
       untrack(() => {
+        // `activeDownloads` is a fresh array on every progress flush, so this
+        // effect re-runs at frame rate while any download is moving. Without
+        // this guard the clear re-allocates and re-dirties readers every frame.
+        if (expandedSources.length === 0 && !loadingSources) return;
         expandedSources = [];
         sourceDetailRequestId += 1;
         loadingSources = false;
@@ -2865,7 +2878,7 @@
 <svelte:document onclick={onDocClick} onkeydown={(e) => {
   if (e.key === 'Escape') {
     if (ctxMenu) { closeCtx(); e.preventDefault(); }
-    if (knownCtxMenu) { closeKnownCtx(); e.preventDefault(); }
+    else if (knownCtxMenu) { closeKnownCtx(); e.preventDefault(); }
     else if (columnMenu) { closeColumnMenu(); e.preventDefault(); }
     else {
       const openMore = document.querySelector('.toolbar-more[open]') as HTMLDetailsElement | null;

@@ -184,10 +184,18 @@
           // message. Compare the content tuple against the recent tail (a
           // small window avoids wrongly collapsing two genuinely-identical
           // messages sent seconds apart).
+          // Inbound only. Two upload-listener routes can surface the same peer
+          // message, which is what this guard is for — but the outbound echo has
+          // a single emit site, so deduping it can only ever collapse two
+          // genuinely distinct messages that share a whole-second timestamp.
+          // `handleSend` deliberately renders nothing for a delivered message
+          // and relies on this echo, so a collapsed one is lost until reload.
           const sig = `${event.payload.timestamp}|${event.payload.direction}|${event.payload.message}`;
-          const isDuplicate = messages
-            .slice(-5)
-            .some((mm) => `${mm.timestamp}|${mm.direction}|${mm.message}` === sig);
+          const isDuplicate =
+            event.payload.direction === 'received' &&
+            messages
+              .slice(-5)
+              .some((mm) => `${mm.timestamp}|${mm.direction}|${mm.message}` === sig);
           if (isDuplicate) return;
           const wasPinned = isPinnedToBottom();
           const next = [...messages, {

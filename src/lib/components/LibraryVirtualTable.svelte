@@ -272,12 +272,21 @@
     return result;
   }
 
-  function persistWidths() { localStorage.setItem(STORAGE_WIDTHS, JSON.stringify(colWidths)); }
+  // Guarded like the `safeGet` reads above. `persistWidths` runs from the
+  // resize mouseup before the drag listeners are removed, so an unguarded throw
+  // there would strand the drag with the body stuck in `col-resize`.
+  function persistWidths() {
+    try {
+      localStorage.setItem(STORAGE_WIDTHS, JSON.stringify(colWidths));
+    } catch { /* storage unavailable — a lost column width is not worth failing on */ }
+  }
   function persistSetup() {
-    localStorage.setItem(STORAGE_HIDDEN, JSON.stringify(
-      orderedColumns.filter(c => colHidden[c.key]).map(c => c.key)
-    ));
-    localStorage.setItem(STORAGE_ORDER, JSON.stringify(colOrder));
+    try {
+      localStorage.setItem(STORAGE_HIDDEN, JSON.stringify(
+        orderedColumns.filter(c => colHidden[c.key]).map(c => c.key)
+      ));
+      localStorage.setItem(STORAGE_ORDER, JSON.stringify(colOrder));
+    } catch { /* storage unavailable */ }
   }
 
   let orderedColumns = $derived.by(() => {

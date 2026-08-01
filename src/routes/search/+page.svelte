@@ -7,7 +7,6 @@
   import { startDownload } from '$lib/api/transfers';
   import { transfers } from '$lib/stores/transfers';
   import type { Transfer } from '$lib/types';
-  import { fade } from 'svelte/transition';
   import { appSettings } from '$lib/stores/settings';
   import {
     activeSearchTabId,
@@ -73,6 +72,9 @@
   let historyFetchGen = 0;
   const historyHashGen = new Map<string, number>();
   const HISTORY_BATCH_LIMIT = 5_000;
+  /** Consecutive failed flushes, bounding the retry loop below. */
+  let historyFetchFailures = 0;
+  const HISTORY_MAX_RETRIES = 3;
 
   async function flushHistoryFetch() {
     historyFetchTimer = null;
@@ -96,6 +98,7 @@
       if (Object.keys(fresh).length > 0) {
         downloadHistoryMap = { ...downloadHistoryMap, ...fresh };
       }
+      historyFetchFailures = 0;
     } catch (e) {
       console.error('Failed to fetch download history:', e);
       // Failed batch — forget the "already fetched" mark so they retry next cycle.
@@ -105,9 +108,16 @@
         // without the stale-gen filter rejecting its results.
         if (historyHashGen.get(h) === myGen) historyHashGen.delete(h);
       }
+      // Nothing else re-queues these: `queueHistoryFetch` only runs when the
+      // result list or transfer state changes, so after a finished search the
+      // badges would stay blank for good. Bounded so a persistently failing
+      // history DB can't turn this into a hot poll.
+      if (++historyFetchFailures <= HISTORY_MAX_RETRIES) {
+        for (const h of batch) historyPendingHashes.add(h);
+      }
     } finally {
-      if (remaining && !destroyed && !historyFetchTimer) {
-        historyFetchTimer = setTimeout(flushHistoryFetch, 0);
+      if (!destroyed && !historyFetchTimer && (remaining || historyPendingHashes.size > 0)) {
+        historyFetchTimer = setTimeout(flushHistoryFetch, remaining ? 0 : 1_000);
       }
     }
   }
@@ -272,6 +282,7 @@
   let publishSuccess = $state(true);
   let spamExplainLoading = $state(false);
   let spamExplainError: string | null = $state(null);
+  let notesError: string | null = $state(null);
   let spamExplainPending = $state<Record<string, boolean>>({});
   let spamExplainErrors = $state<Record<string, string>>({});
   let spamTooltipKey = $state<string | null>(null);
@@ -448,10 +459,22 @@
     }
   }
 
-  function isFilteredByText(result: SearchResult): boolean {
-    if (!filterText.trim()) return false;
+  // One reused collator instead of an implicit per-comparison one from
+  // `String.prototype.localeCompare`, which allocates on every call during a
+  // sort over thousands of rows. Default options, so ordering is unchanged.
+  const sortCollator = new Intl.Collator();
 
-    const tokens = filterText.trim().split(/\s+/).filter(t => t !== '' && t !== '-');
+  // Parsed once per filter-text change rather than once per result row:
+  // `isFilteredByText` runs inside `filteredResults`, which re-derives on every
+  // streamed batch, so the split and its regex were being re-run per row.
+  let filterTokens = $derived.by(() => {
+    const t = filterText.trim();
+    if (!t) return [] as string[];
+    return t.split(/\s+/).filter((s) => s !== '' && s !== '-');
+  });
+
+  function isFilteredByText(result: SearchResult): boolean {
+    const tokens = filterTokens;
     if (tokens.length === 0) return false;
 
     // Sources column: numeric equality (and optional >= with leading `>`),
@@ -940,19 +963,19 @@
       let cmp = 0;
       switch (sortField) {
         case 'name':
-          cmp = (a.clean_name || a.file.name).localeCompare(b.clean_name || b.file.name);
+          cmp = sortCollator.compare(a.clean_name || a.file.name, b.clean_name || b.file.name);
           break;
         case 'size':
           cmp = a.file.size - b.file.size;
           break;
         case 'type':
-          cmp = resultType(a).localeCompare(resultType(b));
+          cmp = sortCollator.compare(resultType(a), resultType(b));
           break;
         case 'sources':
           cmp = a.availability - b.availability;
           break;
         case 'origin':
-          cmp = (a.result_origin || '').localeCompare(b.result_origin || '');
+          cmp = sortCollator.compare(a.result_origin || '', b.result_origin || '');
           break;
         case 'length':
           cmp = (a.media?.duration ?? 0) - (b.media?.duration ?? 0);
@@ -964,16 +987,16 @@
           cmp = (a.file.complete_sources ?? 0) - (b.file.complete_sources ?? 0);
           break;
         case 'codec':
-          cmp = (a.media?.codec ?? '').localeCompare(b.media?.codec ?? '');
+          cmp = sortCollator.compare(a.media?.codec ?? '', b.media?.codec ?? '');
           break;
         case 'artist':
-          cmp = (a.media?.artist ?? '').localeCompare(b.media?.artist ?? '');
+          cmp = sortCollator.compare(a.media?.artist ?? '', b.media?.artist ?? '');
           break;
         case 'album':
-          cmp = (a.media?.album ?? '').localeCompare(b.media?.album ?? '');
+          cmp = sortCollator.compare(a.media?.album ?? '', b.media?.album ?? '');
           break;
         case 'title':
-          cmp = (a.media?.title ?? '').localeCompare(b.media?.title ?? '');
+          cmp = sortCollator.compare(a.media?.title ?? '', b.media?.title ?? '');
           break;
       }
       return sortDir === 'asc' ? cmp : -cmp;
@@ -1275,6 +1298,11 @@
       await cancelSearch(stoppedId);
     } catch (e) {
       console.error('Failed to cancel search:', e);
+      // The backend `try_send`s the cancel, so a full command channel drops it.
+      // Since we rotate the requestId below regardless, a silently-failed cancel
+      // means the search keeps running server-side while every result it finds
+      // is discarded — the user should know the stop didn't reach the network.
+      addToast('warning', m.search_stop_failed());
     }
     // Same discard protocol as `performClearResults`: the backend answers a
     // cancel by resolving the pending `search_files` oneshot with everything it
@@ -1303,6 +1331,7 @@
     spamExplainLoading = true;
     spamExplainError = null;
     notes = [];
+    notesError = null;
     noteRating = 0;
     noteComment = '';
     publishMessage = '';
@@ -1320,6 +1349,11 @@
         notes = loadedNotes;
       } catch (e: unknown) {
         console.error('Failed to load notes:', e);
+        // Otherwise a timed-out KAD lookup is indistinguishable from a file
+        // that genuinely has no notes.
+        if (requestId === notesRequestId && selectedResult?.file.hash === fileHash) {
+          notesError = translateError(e, m.search_failed_load_notes());
+        }
       } finally {
         if (requestId === notesRequestId && selectedResult?.file.hash === fileHash) {
           loadingNotes = false;
@@ -2193,7 +2227,7 @@
             </button>
             {#if showSpamHelp}
               <div class="filter-help-popover" role="tooltip">
-                {#if spamHiddenCount > 0}
+                {#if hideSpam && spamHiddenCount > 0}
                   {m.search_spam_hidden_count({ count: spamHiddenCount })}
                 {:else}
                   {m.search_spam_hidden_none()}
@@ -2505,7 +2539,6 @@
             class:history-cancelled-row={!result.result_origin?.includes('Local') && downloadHistoryMap[result.file.hash] === 'cancelled'}
             oncontextmenu={(e) => showContextMenu(e, result)}
             ondblclick={() => { if (!blockingDl) download(result); }}
-            in:fade={{ duration: 140 }}
           >
             <td class="col-check">
               <input
@@ -2791,6 +2824,8 @@
           <h4>{m.search_notes_comments()}</h4>
           {#if loadingNotes}
             <p class="hint">{m.search_loading_notes()}</p>
+          {:else if notesError}
+            <p class="error-msg">{notesError}</p>
           {:else if notes.length === 0}
             <p class="hint">{m.search_no_notes()}</p>
           {:else}
@@ -3772,6 +3807,9 @@
     padding: 6px 0;
     border-bottom: 1px solid var(--border);
     font-size: 13px;
+    /* Peer-supplied and up to 4096 chars; without this an unbroken run turns
+       the details panel into a horizontal scroller. */
+    overflow-wrap: anywhere;
   }
 
   .publish-note {

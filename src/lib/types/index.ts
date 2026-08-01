@@ -564,7 +564,7 @@ export interface AppSettings {
   multisource_retry_rounds: number;
   /** Per-source part hash failure retries during transfer (1–20) */
   download_part_retry_rounds: number;
-  /** Max download size in GiB (1–16384; default 4096 ≈ 4 TiB) */
+  /** Max download size in GiB (1–593; default 593, the ed2k part-count ceiling) */
   max_download_file_size_gib: number;
   /** Global search / find-sources / find-notes timeout in seconds (30–600) */
   search_timeout_secs: number;

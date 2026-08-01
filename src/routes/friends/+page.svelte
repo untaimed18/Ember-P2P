@@ -8,7 +8,8 @@
   import { listen } from '@tauri-apps/api/event';
   import { fade, fly } from 'svelte/transition';
   import { flip } from 'svelte/animate';
-  import { toastWarning } from '$lib/stores/toast';
+  import { toastError, toastWarning } from '$lib/stores/toast';
+  import { copyToClipboard } from '$lib/utils';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
   import {
@@ -401,7 +402,9 @@
     // side effect. This avoids double event handling when the page is open.
     listen<{ user_hash: string }>('ember:friend-confirmed', () => {
       if (destroyed) return;
-      loadFriends();
+      // Background rediscovery sweeps fire this every few minutes; that is not
+      // a reason to clear an error the user is currently reading.
+      loadFriends(false);
     }).then(fn => { if (destroyed) fn(); else unlistenFns.push(fn); })
       .catch((e) => console.error('friends: failed to register ember:friend-confirmed listener', e));
 
@@ -482,14 +485,16 @@
   }
 
   let loadFriendsSeq = 0;
-  async function loadFriends() {
+  /** `clearError` is false for background-event-driven reloads, which must not
+   *  wipe a failure message the user is still reading. */
+  async function loadFriends(clearError = true) {
     if (destroyed) return;
     // Guard against overlapping loads (mount + 'ember:friend-confirmed' event,
     // or rapid events) resolving out of order and clobbering newer data with a
     // stale snapshot. Only the most recent invocation commits its result.
     const seq = ++loadFriendsSeq;
     loading = true;
-    error = null;
+    if (clearError) error = null;
     try {
       const list = await getFriends();
       if (destroyed || seq !== loadFriendsSeq) return;
@@ -662,7 +667,9 @@
       // Push the rename through to any open chat tab so the strip
       // and the conversation header don't keep the old nickname.
       renameChatTab(hash, nick || hash.slice(0, 8) + '\u2026');
-      editingHash = null;
+      // Blur-to-save means the user may already be renaming a different friend
+      // by the time this resolves; only close the editor if it is still ours.
+      if (editingHash === hash) editingHash = null;
     } catch (e: unknown) {
       error = toErr(e);
     } finally {
@@ -719,26 +726,27 @@
     e.stopPropagation();
   }
 
+  // Both go through `copyToClipboard` for its execCommand fallback (WebView2
+  // can deny the async clipboard API) and report failure — silently doing
+  // nothing is a bad outcome for the main "share my Ember ID" action.
   async function copyHash(hash: string) {
-    try {
-      await navigator.clipboard.writeText(hash);
-      clearTimeout(copyTimer);
-      copiedHash = hash;
-      copyTimer = setTimeout(() => (copiedHash = null), 1500);
-    } catch {
-      // Clipboard API may be blocked
+    if (!(await copyToClipboard(hash))) {
+      toastError(m.kad_clipboard_unavailable());
+      return;
     }
+    clearTimeout(copyTimer);
+    copiedHash = hash;
+    copyTimer = setTimeout(() => (copiedHash = null), 1500);
   }
 
   async function copyMyHash() {
-    try {
-      await navigator.clipboard.writeText(myHash);
-      clearTimeout(myHashCopyTimer);
-      myHashCopied = true;
-      myHashCopyTimer = setTimeout(() => (myHashCopied = false), 1500);
-    } catch {
-      // Clipboard API may be blocked
+    if (!(await copyToClipboard(myHash))) {
+      toastError(m.kad_clipboard_unavailable());
+      return;
     }
+    clearTimeout(myHashCopyTimer);
+    myHashCopied = true;
+    myHashCopyTimer = setTimeout(() => (myHashCopied = false), 1500);
   }
 
 </script>
@@ -773,7 +781,7 @@
 <div class="page-header">
   <h2>{m.nav_friends()}</h2>
   <div class="header-actions">
-    <button class="ghost" onclick={loadFriends}>{m.common_refresh()}</button>
+    <button class="ghost" onclick={() => loadFriends()}>{m.common_refresh()}</button>
   </div>
 </div>
 

@@ -378,6 +378,9 @@
       await refreshHistoryStats();
     } catch (e) {
       historyClearMsg = m.settings_history_clear_failed({ error: translateError(e) });
+      // Without a timeout the failure text outlives the page, where the
+      // success text clears after 3s — so a failure ends up looking permanent.
+      trackedTimeout(() => { historyClearMsg = null; }, 6000);
     }
   }
 
@@ -634,6 +637,24 @@
         };
       }
     }
+    // `bind:value` on `<input type="number">` yields `null` for an empty box,
+    // and the clamp helpers below map that to the field's factory default —
+    // silently persisting 4662 for a port the user only meant to retype, and
+    // popping the restart prompt for an edit they never made. Reject instead.
+    const numericFields = [
+      'tcp_port', 'udp_port', 'max_upload_speed', 'max_download_speed',
+      'max_concurrent_downloads', 'max_concurrent_uploads', 'max_sources_per_file',
+      'max_connections', 'download_queue_wait_secs', 'multisource_retry_rounds',
+      'download_part_retry_rounds', 'max_download_file_size_gib',
+      'search_timeout_secs', 'max_friends',
+    ] as const;
+    const numericValues = s as unknown as Record<string, unknown>;
+    for (const key of numericFields) {
+      const v = numericValues[key];
+      if (v === null || v === undefined || (typeof v === 'number' && !Number.isFinite(v))) {
+        return { error: m.settings_validation_number_empty(), adjusted: false };
+      }
+    }
     let adjusted = false;
     // Thin wrappers around the shared clamp helpers that additionally flag
     // `adjusted` when the clamped result differs from what was actually
@@ -781,8 +802,23 @@
           }
         }
       } while (friendTogglePersistPending);
-    } catch {
-      // Optimistic UI already updated; full Save can still persist.
+    } catch (e) {
+      // These are privacy controls, and the wire-level gates in the network
+      // task read its own copy of the settings, which is only refreshed by a
+      // successful `update_settings`. A swallowed failure therefore doesn't
+      // just fail to survive a restart — the toggle never takes effect at all,
+      // while the optimistic store keeps reporting it as on. Roll back.
+      const persisted = await getSettings().catch(() => null);
+      if (persisted) {
+        setAppSettings(persisted);
+        if (settings) {
+          settings.friend_require_approval = persisted.friend_require_approval;
+          settings.friend_chat_disabled = persisted.friend_chat_disabled;
+          settings.friend_browse_disabled = persisted.friend_browse_disabled;
+          settings.settings_revision = persisted.settings_revision;
+        }
+      }
+      showSaveMsg(translateError(e, m.settings_save_failed()), true, 6000);
     } finally {
       friendTogglePersistInFlight = false;
       if (friendTogglePersistPending) {
@@ -1360,9 +1396,16 @@
     values: string[],
     current: string,
     select: (value: string) => void,
+    // Committing a language reloads the whole app, so for that group arrows
+    // must only move focus. The cards are real <button>s, so Enter and Space
+    // still commit natively via onclick.
+    focusOnly = false,
   ) {
     let nextIndex: number;
-    const currentIndex = Math.max(0, values.indexOf(current));
+    // Track the focused card rather than the selected value; with `focusOnly`
+    // the selection doesn't move, so using it would make arrows bounce.
+    const focusedValue = (event.currentTarget as HTMLElement).dataset.radioValue;
+    const currentIndex = Math.max(0, values.indexOf(focusedValue ?? current));
     switch (event.key) {
       case 'ArrowRight':
       case 'ArrowDown':
@@ -1383,7 +1426,7 @@
     }
     event.preventDefault();
     const next = values[nextIndex];
-    select(next);
+    if (!focusOnly) select(next);
     const group = (event.currentTarget as HTMLElement).closest('[role="radiogroup"]');
     requestAnimationFrame(() => {
       const radios = group?.querySelectorAll<HTMLElement>('[role="radio"]') ?? [];
@@ -1608,6 +1651,7 @@
                     languageRadioValues,
                     followingSystem ? 'system' : currentLocale,
                     (value) => value === 'system' ? pickSystemLocale() : pickLocale(value as Locale),
+                    true,
                   )}
               >
                 <span class="behavior-icon" aria-hidden="true">
@@ -1638,6 +1682,7 @@
                       languageRadioValues,
                       followingSystem ? 'system' : currentLocale,
                       (value) => value === 'system' ? pickSystemLocale() : pickLocale(value as Locale),
+                      true,
                     )}
                 >
                   {#if localeFlagSrc(loc)}
@@ -2632,7 +2677,6 @@
   confirmLabel={m.settings_history_clear_confirm()}
   danger={true}
   onconfirm={confirmClearHistory}
-  oncancel={() => { pendingHistoryClear = null; }}
 />
 
 <ConfirmDialog
