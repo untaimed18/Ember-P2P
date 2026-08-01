@@ -859,7 +859,7 @@
 
     <div class="download-box">
       <img src="icon.png" alt="Ember" width="80" height="80" style="border-radius: 16px; margin-bottom: 16px; box-shadow: 0 4px 16px rgba(0,0,0,0.12);">
-      <h3>Get Ember 1.3.4</h3>
+      <h3>Get Ember 1.3.5</h3>
       <p>The latest release is available on GitHub for Windows 10 and Windows 11.</p>
       <div class="btn-group">
         <a href="https://github.com/untaimed18/Ember-P2P/releases/latest" class="btn btn-primary" target="_blank" rel="noopener">
@@ -1367,6 +1367,86 @@ npm run tauri build</code></pre>
   <section id="releases">
     <h2>Release History</h2>
     <p>Official Ember releases for Windows. Notes mirror the <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">GitHub Releases</a> changelog style. Ember can also update itself in-app when a signed release is published.</p>
+
+    <article class="release" id="release-1-3-5">
+      <div class="release-header">
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.3.5" target="_blank" rel="noopener">Ember v1.3.5</a></h3>
+        <time class="release-date" datetime="2026-08-01">August 1, 2026</time>
+      </div>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.3.5" target="_blank" rel="noopener"><code>v1.3.5</code></a></p>
+      <div class="release-notes">
+        <h4>What&rsquo;s Changed</h4>
+
+        <p>A reliability release. Ember 1.3.5 is the result of a full audit of the app, and it fixes a number of faults that were quiet by nature &mdash; settings that did not apply, messages that were never shown, and a library that could stop indexing without saying so.</p>
+
+        <h5>Library &amp; Sharing</h5>
+        <ul>
+          <li><strong>One Slow File No Longer Empties Your Library</strong> &mdash; A file that took more than five minutes to hash used to cancel the whole scan and discard everything not yet indexed, and it happened again on every launch, so files were silently missing from your share. Large files on a network share, an external drive or OneDrive are now left for a later attempt while the rest of the scan carries on</li>
+          <li><strong>Adding a Folder Cannot Wedge</strong> &mdash; A file whose read never returned could hold the scan lock for the rest of the session, blocking every later folder add or reload and delaying shutdown. The wait no longer holds anything</li>
+          <li><strong>Copy All Links on Large Libraries</strong> &mdash; Copying every link failed outright above 50,000 files. It is now sent in batches</li>
+          <li><strong>Honest Scan Warnings</strong> &mdash; The &ldquo;only the first 100,000 files were indexed&rdquo; notice appeared on ordinary reloads of any large folder. It now only appears when that limit was genuinely reached</li>
+          <li><strong>Excluded Files Stay Excluded</strong> &mdash; Part-finished downloads, Ember&rsquo;s own temporary and backup files, and anything inside its data folder could return to your share through the known-files list. They no longer can</li>
+          <li><strong>Failures Are Visible</strong> &mdash; When the library failed to load, it rendered as an empty library with an invitation to add a folder. It now reports the error</li>
+        </ul>
+
+        <h5>Friends &amp; Chat</h5>
+        <ul>
+          <li><strong>Privacy Toggles Take Effect</strong> &mdash; Turning off incoming chat or browsing did nothing at all when the save failed: the switch stayed on, and the setting never reached the network. The switch now reverts and the failure is reported</li>
+          <li><strong>No More Missing Messages</strong> &mdash; Sending the same text twice in quick succession delivered both but only ever showed one, and the second stayed invisible until the conversation was reopened</li>
+          <li><strong>Queued Messages Reach Their Friend</strong> &mdash; A message typed while a friend was offline could stay marked queued indefinitely after they came back, if the reconnect reused a connection that was already open</li>
+          <li><strong>Abandoned Messages Say So</strong> &mdash; A queued message Ember has given up on now shows as failed instead of reading &ldquo;queued&rdquo; for the rest of the session</li>
+          <li><strong>Unread Badges While Minimised</strong> &mdash; Messages that arrived with the window minimised were marked read and raised no badge, so they were easy to miss entirely</li>
+          <li><strong>Browsing a Friend</strong> &mdash; A friend sharing two copies of one file could blank the browse window</li>
+        </ul>
+
+        <h5>Transfers</h5>
+        <ul>
+          <li><strong>Archive Recovery Works Again on Large Files</strong> &mdash; Recovery of a part-finished archive ran out of time before it began on anything multi-gigabyte, which is exactly the case it exists for</li>
+          <li><strong>Lighter Known Clients Tab</strong> &mdash; Trust badges issued one lookup per credit record every few seconds, which on a mature client list meant thousands at once and could crowd out other work</li>
+        </ul>
+
+        <h5>Search</h5>
+        <ul>
+          <li><strong>Preferences Are Saved</strong> &mdash; Search method, filters, sort order and column choices were never written to disk and reset on every launch</li>
+          <li><strong>Stop Actually Stops</strong> &mdash; Results kept arriving in a search that had been stopped, and a stop that failed to reach the network said nothing</li>
+          <li><strong>Held Enter</strong> &mdash; Holding or repeatedly pressing Enter opened an unbounded number of searches and tabs</li>
+          <li><strong>Notes</strong> &mdash; A failed notes lookup was indistinguishable from a file that genuinely has none</li>
+        </ul>
+
+        <h5>Settings</h5>
+        <ul>
+          <li><strong>Unsaved Changes Are Protected</strong> &mdash; Clicking away to another page discarded pending edits without asking</li>
+          <li><strong>Empty Number Fields</strong> &mdash; Clearing a box and saving quietly stored that field&rsquo;s factory default, including the listening ports, and could prompt a restart for a change never made</li>
+          <li><strong>Choosing a Language</strong> &mdash; Arrow keys committed a language and restarted the app mid-selection, so the list could not be browsed from the keyboard</li>
+          <li><strong>Bandwidth Fields</strong> &mdash; After typing in a speed box, Apply Recommended and Discard no longer updated what was shown, so the value saved was not the value on screen</li>
+        </ul>
+
+        <h5>Security</h5>
+        <ul>
+          <li><strong>Fail Closed on Durable State</strong> &mdash; Closes silent data loss from unsaved transfers, mixed backup restores, and chat that vanished after a reload, and bounds resource exhaustion in rendezvous admission, relays, and oversized friend requests</li>
+          <li><strong>Stricter URL Checks</strong> &mdash; The rejection of credentials embedded in a URL could be sidestepped by omitting the slashes after <code>https:</code>, which would let a download link display a trusted host while fetching from another. IPv6 addresses are also handled properly again</li>
+          <li><strong>Deep Links</strong> &mdash; An <code>ed2k://</code> link that failed once stopped every later link from being handled for the rest of the session, and the confirmation prompt now shows the file name, size and hash on separate lines rather than running them together</li>
+          <li><strong>Archive Recovery Limits</strong> &mdash; A deliberately crafted archive could keep recovery scanning past its own time limit and ignore a cancel</li>
+          <li><strong>Relay Stability</strong> &mdash; Live relay sessions were torn down by ordinary congestion rather than waiting for it to clear</li>
+        </ul>
+
+        <h5>Fixes</h5>
+        <ul>
+          <li>Two crashes that blanked a page outright: repeated lines in the server log, and duplicate entries in a friend&rsquo;s file list</li>
+          <li>Error notifications appeared behind the dialog whose failure they were reporting, so the message was invisible at the moment it mattered</li>
+          <li>The &ldquo;TCP port already in use&rdquo; warning disappeared a few seconds after appearing, while uploads stayed broken</li>
+          <li>Later on the update notice did nothing once an update had downloaded or failed, leaving the banner on screen until restart</li>
+          <li>A security notice was unreadable in the light theme, and several error messages ended in the word &ldquo;undefined&rdquo;</li>
+          <li>Re-selecting a played audio or video file restarted it from the beginning without being asked</li>
+          <li>A folder priority the app rejected stayed on screen as though it had been applied</li>
+        </ul>
+
+        <p class="full-changelog">
+          <strong>Full Changelog</strong>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.3.4...v1.3.5" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.3.4...v1.3.5</a>
+        </p>
+      </div>
+    </article>
 
     <article class="release" id="release-1-3-4">
       <div class="release-header">
