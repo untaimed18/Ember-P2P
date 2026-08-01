@@ -817,6 +817,18 @@
           settings.friend_browse_disabled = persisted.friend_browse_disabled;
           settings.settings_revision = persisted.settings_revision;
         }
+        // Move the baseline with it. If the revision advanced out from under us
+        // (both retries lost the race), a baseline still holding the old
+        // revision would make `hasUnsavedChanges` permanently true — enabling
+        // Save with nothing edited and popping the leave guard on every exit.
+        if (originalSettings) {
+          const baseline = JSON.parse(originalSettings) as AppSettings;
+          baseline.friend_require_approval = persisted.friend_require_approval;
+          baseline.friend_chat_disabled = persisted.friend_chat_disabled;
+          baseline.friend_browse_disabled = persisted.friend_browse_disabled;
+          baseline.settings_revision = persisted.settings_revision;
+          originalSettings = JSON.stringify(baseline);
+        }
       }
       showSaveMsg(translateError(e, m.settings_save_failed()), true, 6000);
     } finally {

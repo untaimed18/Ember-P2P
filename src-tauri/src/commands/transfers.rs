@@ -1970,8 +1970,22 @@ pub async fn recover_archive(
         )
         .map_err(ArchiveRecoveryJobError::Recovery)
     });
+    // This ceiling used to wrap `recover_archive` alone, so 130s sat just above
+    // its 120s internal budget. Verification now runs inside the same blocking
+    // job and MD4-hashes every verified part before recovery's clock even
+    // starts, so on a multi-gigabyte archive the old constant expired during
+    // verification and recovery became unreachable for exactly the large
+    // partials it exists to salvage. Give verification its own allowance,
+    // derived from the file size at a deliberately pessimistic floor throughput.
+    const VERIFY_FLOOR_BYTES_PER_SEC: u64 = 20 * 1024 * 1024;
+    let verify_allowance = std::time::Duration::from_secs(
+        (file_size / VERIFY_FLOOR_BYTES_PER_SEC).clamp(30, 15 * 60),
+    );
+    let job_timeout = verify_allowance
+        + crate::network::ed2k::archive_recovery::RECOVERY_WALL_TIME
+        + std::time::Duration::from_secs(10);
     let recovery_result =
-        match tokio::time::timeout(std::time::Duration::from_secs(130), &mut recovery).await {
+        match tokio::time::timeout(job_timeout, &mut recovery).await {
             Ok(result) => result,
             Err(_) => {
                 // `spawn_blocking` cannot be aborted. Cancel the recovery-local

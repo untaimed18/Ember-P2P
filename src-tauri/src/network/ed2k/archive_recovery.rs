@@ -29,7 +29,10 @@ const MAX_RECOVERY_OUTPUT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const MAX_RECOVERY_ENTRY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_RECOVERY_ENTRIES: usize = 10_000;
 const MAX_DECOMPRESSION_RATIO: u64 = 200;
-const RECOVERY_WALL_TIME: std::time::Duration = std::time::Duration::from_secs(120);
+/// Wall-clock ceiling for `recover_archive` itself. Exposed so the IPC caller
+/// can size its own timeout as this plus a verification allowance, rather than
+/// hardcoding a number that silently stops covering both phases.
+pub(crate) const RECOVERY_WALL_TIME: std::time::Duration = std::time::Duration::from_secs(120);
 
 struct RecoveryBudget<'a> {
     started: std::time::Instant,

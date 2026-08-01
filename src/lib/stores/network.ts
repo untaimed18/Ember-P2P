@@ -52,6 +52,8 @@ export const networkStats = writable<NetworkStats>({
 });
 
 export const networkError = writable<string | null>(null);
+/** Whether the current `networkError` is one a successful connect resolves. */
+let networkErrorIsTransient = false;
 export type ServerStatus = 'connected' | 'connecting' | 'disconnected';
 export const serverStatus = writable<ServerStatus>('disconnected');
 const KNOWN_SERVER_STATUSES = new Set<ServerStatus>(['connected', 'connecting', 'disconnected']);
@@ -192,12 +194,15 @@ export async function initNetworkStore() {
     registered.push(await listen<string>('network-status', (event) => {
       const status = narrowNetworkStatus(event.payload);
       if (!status) return;
-      // Some `network-error` emitters are transient and have no matching
-      // "resolved" event — notably the KAD bootstrap warning after 5 failed
-      // attempts, which recovers on its own. A successful connect is the only
-      // recovery signal available, so clear the banner here. Fatal errors leave
-      // the network disconnected and so are unaffected.
-      if (status === 'connected') networkError.set(null);
+      // The KAD bootstrap warning has no matching "resolved" event and recovers
+      // on its own, so a successful connect is the only signal to clear it. It
+      // marks itself `transient` for exactly this reason — the port-in-use
+      // warning also fires during startup and must NOT be cleared, or it would
+      // vanish seconds after appearing while uploads stay broken all session.
+      if (status === 'connected' && networkErrorIsTransient) {
+        networkErrorIsTransient = false;
+        networkError.set(null);
+      }
       lastEventUpdate = Date.now();
       lastNetworkUpdate = lastEventUpdate;
       networkStats.update((s) => {
@@ -309,10 +314,14 @@ export async function initNetworkStore() {
       }
       lastUpnpMapped = mapped;
     }));
-    registered.push(await listen<{ message: string }>('network-error', (event) => {
+    registered.push(await listen<{ message: string; transient?: boolean }>('network-error', (event) => {
       const message = typeof event.payload?.message === 'string' ? event.payload.message : '';
       if (!message) return;
       lastEventUpdate = Date.now();
+      // Only a transient error may be auto-cleared by a later connect. The
+      // others ("TCP port already in use", UDP bind failure, task panic)
+      // describe conditions that outlive the bootstrap and must stay visible.
+      networkErrorIsTransient = event.payload?.transient === true;
       networkError.set(translateError(message, message));
     }));
     // Fatal network errors come directly from the network-task supervisor

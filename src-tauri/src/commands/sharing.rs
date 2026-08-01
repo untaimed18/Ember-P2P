@@ -1336,7 +1336,10 @@ pub async fn add_shared_folder(
         .insert(cancel_key.clone(), cancel_flag.clone());
 
     let scan_handle = tokio::spawn(async move {
-        let coordination_guard = scan_coordination.clone().lock_owned().await;
+        // Held for the whole scan and released when this task ends. Deliberately
+        // not handed to the hash-timeout drain: that drain can block indefinitely
+        // on a stuck read, which would wedge every later scan.
+        let _coordination_guard = scan_coordination.clone().lock_owned().await;
         scanning.fetch_add(1, Ordering::Relaxed);
         let scan_guard = ScanGuard(scanning.clone());
 
@@ -1570,54 +1573,32 @@ pub async fn add_shared_folder(
                     index.remove_file_by_id(&file_temp_id);
                 }
                 Err(_) => {
-                    // Dropping a JoinHandle does not stop `spawn_blocking`.
-                    // Hand the owned scan lease to a reaper instead of
-                    // awaiting an uninterruptible filesystem read here. The
-                    // next scan stays serialized until the worker actually
-                    // exits, while this task can finish its cancellation
-                    // cleanup and return promptly.
-                    cancel_flag.store(true, Ordering::Relaxed);
+                    // One slow file must not end the scan. Cancelling the whole
+                    // pass and dropping this folder's pending rows left every
+                    // file after this one un-indexed, and it recurred on every
+                    // retry because the queue is walked in a stable order.
+                    // Leave the row pending, mark the page incomplete so nothing
+                    // is reconciled away, and move on to the next file.
                     warn!(
-                        "Hash timed out after 5 min for {}; cancelling this scan so it can retry safely",
+                        "Hash timed out after 5 min for {} (file may be on cloud storage or locked); leaving pending for retry",
                         file.name
                     );
-                    {
-                        let mut index = local_index.write().await;
-                        index.remove_pending_files_under(std::slice::from_ref(&canonical_str));
-                        index.rebuild();
-                    }
-                    refresh_file_cache(&local_index, &file_cache).await;
-                    reconcile_shared_files_best_effort(&network_tx).await;
-                    let reaper_cancel_flags = cancel_flags.clone();
-                    let reaper_key = cancel_key.clone();
-                    let reaper_flag = cancel_flag.clone();
+                    page_complete = false;
+                    // Drain the abandoned blocking hash for its log line only,
+                    // holding no scan lease. Dropping a JoinHandle does not stop
+                    // `spawn_blocking`, and the read may be stuck in the kernel
+                    // where the cancel flag cannot reach it — handing the
+                    // coordination/scan guards to that wait would block every
+                    // later reload and stall shutdown for the rest of the session.
                     let timed_out_name = file.name.clone();
-                    let reaper = tokio::spawn(async move {
-                        let _coordination_guard = coordination_guard;
-                        let _scan_guard = scan_guard;
+                    tokio::spawn(async move {
                         if let Err(error) = hash_task.await {
                             tracing::warn!(
                                 "Timed-out hash task for {timed_out_name} failed while draining: {error}"
                             );
                         }
-                        remove_cancel_flag_if_current(
-                            &reaper_cancel_flags,
-                            &reaper_key,
-                            &reaper_flag,
-                        )
-                        .await;
                     });
-                    app.state::<AppState>().register_background_scan(reaper).await;
-                    let _ = app.emit(
-                        "file-hash-progress",
-                        serde_json::json!({
-                            "current": hashed_count,
-                            "total": total_to_hash,
-                            "file_name": "",
-                            "done": true,
-                        }),
-                    );
-                    return;
+                    continue;
                 }
             }
         }
@@ -2501,8 +2482,11 @@ pub async fn reload_shared_files(
     }
 
     let scan_handle = tokio::spawn(async move {
-        let reload_flight_guard = reload_flight;
-        let coordination_guard = scan_coordination.clone().lock_owned().await;
+        // Held for the whole reload and released when this task ends. Deliberately
+        // not handed to the hash-timeout drain: that drain can block indefinitely
+        // on a stuck read, which would wedge every later reload.
+        let _reload_flight_guard = reload_flight;
+        let _coordination_guard = scan_coordination.clone().lock_owned().await;
         scanning.fetch_add(1, Ordering::Relaxed);
         let scan_guard = ScanGuard(scanning.clone());
 
@@ -2753,53 +2737,31 @@ pub async fn reload_shared_files(
                     index.remove_file_by_id(&file_temp_id);
                 }
                 Err(_) => {
-                    // Keep the scan and reload leases in a reaper until the
-                    // blocking worker exits. Awaiting it inline can wedge the
-                    // whole scan task on an uninterruptible cloud/filesystem
-                    // read; releasing it now would allow overlapping hashes.
-                    cancel_flag.store(true, Ordering::Relaxed);
+                    // One slow file must not end the reload. Cancelling the whole
+                    // pass and dropping the reloaded folders' pending rows left
+                    // every file after this one un-indexed, and it recurred on
+                    // every retry because the queue is walked in a stable order.
+                    // Leave the row pending, mark the page incomplete so nothing
+                    // is reconciled away, and move on to the next file.
                     warn!(
-                        "Hash timed out after 5 min for {}; cancelling this reload so it can retry safely",
+                        "Hash timed out after 5 min for {} (file may be on cloud storage or locked); leaving pending for retry",
                         file.name
                     );
-                    {
-                        let mut index = local_index.write().await;
-                        index.remove_pending_files_under(&reloaded_folders);
-                        index.rebuild();
-                    }
-                    refresh_file_cache(&local_index, &file_cache).await;
-                    reconcile_shared_files_best_effort(&network_tx).await;
-                    let reaper_cancel_flags = cancel_flags.clone();
-                    let reaper_key = reload_key.clone();
-                    let reaper_flag = cancel_flag.clone();
+                    page_complete = false;
+                    // Drain the abandoned blocking hash for its log line only,
+                    // holding no lease. The read may be stuck in the kernel where
+                    // the cancel flag cannot reach it, and handing the reload /
+                    // coordination / scan guards to that wait would block every
+                    // later reload and stall shutdown for the rest of the session.
                     let timed_out_name = file.name.clone();
-                    let reaper = tokio::spawn(async move {
-                        let _reload_flight = reload_flight_guard;
-                        let _coordination_guard = coordination_guard;
-                        let _scan_guard = scan_guard;
+                    tokio::spawn(async move {
                         if let Err(error) = hash_task.await {
                             tracing::warn!(
                                 "Timed-out reload hash task for {timed_out_name} failed while draining: {error}"
                             );
                         }
-                        remove_cancel_flag_if_current(
-                            &reaper_cancel_flags,
-                            &reaper_key,
-                            &reaper_flag,
-                        )
-                        .await;
                     });
-                    app.state::<AppState>().register_background_scan(reaper).await;
-                    let _ = app.emit(
-                        "file-hash-progress",
-                        serde_json::json!({
-                            "current": hashed_count,
-                            "total": total_to_hash,
-                            "file_name": "",
-                            "done": true,
-                        }),
-                    );
-                    return;
+                    continue;
                 }
             }
         }

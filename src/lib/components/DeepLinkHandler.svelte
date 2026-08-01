@@ -21,6 +21,8 @@
   import { onMount } from 'svelte';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { goto } from '$app/navigation';
+  import { page } from '$app/stores';
+  import { get } from 'svelte/store';
   import { parseEd2kLink } from '$lib/api/search';
   import { startDownload } from '$lib/api/transfers';
   import { addServer, connectToServer, downloadServerMet } from '$lib/api/server';
@@ -32,7 +34,7 @@
     type DeepLinkPreview,
   } from '$lib/api/deeplink';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
-  import { presentIncomingCollection } from '$lib/stores/collection';
+  import { cancelIncomingCollection, presentIncomingCollection } from '$lib/stores/collection';
   import { toastSuccess, toastError } from '$lib/stores/toast';
   import { translateError } from '$lib/i18n';
   import * as m from '$lib/paraglide/messages';
@@ -188,6 +190,15 @@
         if (destroyed) return 'defer';
         const presented = presentIncomingCollection(coll);
         await goto('/library');
+        // A cancelled navigation resolves `goto` rather than rejecting it, so a
+        // page that blocks it (Settings' unsaved-changes guard) would leave us
+        // awaiting a presentation that can never happen — wedging `drain()` and
+        // silently dropping every later deep link this session. Confirm we
+        // actually landed, and park the link for Review if we did not.
+        if (get(page).url.pathname !== '/library') {
+          cancelIncomingCollection();
+          return 'defer';
+        }
         await presented;
         if (!destroyed) {
           toastSuccess(m.library_collection_loaded({ name: coll.name, count: coll.files.length }));

@@ -18393,8 +18393,14 @@ pub async fn start_network(
                     bootstrap_attempts += 1;
                     if bootstrap_attempts == 5 {
                         warn!("No peers found after {} bootstrap attempts", bootstrap_attempts);
+                        // `transient` tells the UI this one resolves on its own,
+                        // so a later Connected may clear it. The other emitters
+                        // (bind failures, port-in-use, task panic) describe
+                        // conditions that persist for the session and must stay
+                        // on screen even once KAD finishes bootstrapping.
                         let _ = app_handle.emit("network-error", serde_json::json!({
                             "message": "Unable to connect to the KAD network. Try downloading the latest nodes.dat from Settings > Network.",
+                            "transient": true,
                         }));
                     }
                 } else {

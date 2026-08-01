@@ -463,13 +463,19 @@ fn parse_fetch_url(url: &str) -> Result<(String, String, u16), String> {
     if url.len() > MAX_FETCH_URL_LEN {
         return Err(format!("URL exceeds {MAX_FETCH_URL_LEN} bytes",));
     }
+    // Reject anything that even looks like userinfo, before parsing. Splitting
+    // on a literal "://" misses the forms the url crate still accepts for
+    // special schemes — `https:user:pass@host/` and `https:/\/\user@host/` both
+    // resolve to `host` — which would let `https:trusted.example@attacker.tld/`
+    // read as the trusted host while fetching from the attacker. Skip the
+    // scheme, then any run of slashes or backslashes, and inspect what is left
+    // up to the path/query/fragment.
     let raw_authority = url
-        .split_once("://")
-        .map(|(_, rest)| {
-            rest.split(['/', '?', '#'])
-                .next()
-                .unwrap_or_default()
-        })
+        .split_once(':')
+        .map(|(_, rest)| rest.trim_start_matches(['/', '\\']))
+        .unwrap_or(url)
+        .split(['/', '\\', '?', '#'])
+        .next()
         .unwrap_or_default();
     if raw_authority.contains('@') {
         return Err("URLs with userinfo (user:pass@host) are not allowed".into());
@@ -478,10 +484,20 @@ fn parse_fetch_url(url: &str) -> Result<(String, String, u16), String> {
     if parsed.scheme() != "https" {
         return Err("Only https:// URLs are allowed".into());
     }
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| "URL has no host".to_string())?
-        .to_string();
+    // Belt and braces against any encoding the raw scan above does not model.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("URLs with userinfo (user:pass@host) are not allowed".into());
+    }
+    // `host_str()` keeps the brackets on an IPv6 literal, which would defeat the
+    // `Ipv6Addr` parses the private-address checks depend on. Take the parsed
+    // host so those checks see a bare address.
+    let host = match parsed.host() {
+        Some(url::Host::Ipv6(addr)) => addr.to_string(),
+        _ => parsed
+            .host_str()
+            .ok_or_else(|| "URL has no host".to_string())?
+            .to_string(),
+    };
     let port = parsed
         .port_or_known_default()
         .ok_or_else(|| "URL has no usable port".to_string())?;
@@ -1409,6 +1425,36 @@ mod tests {
         assert!(normalized.starts_with("https://xn--bcher-kva.example/"));
         assert_eq!(port, 443);
         assert!(parse_fetch_url("https://@example.com/").is_err());
+    }
+
+    /// Scanning the raw string for '@' only catches the forms that contain a
+    /// literal "://". The url crate accepts several that do not, and
+    /// re-serializes the credentials into the request, so the check has to run
+    /// against the parsed URL.
+    #[test]
+    fn fetch_url_parser_rejects_userinfo_without_a_literal_scheme_separator() {
+        for url in [
+            "https:user:pass@evil.example/ipfilter.zip",
+            "https:@evil.example/",
+            "https:/\\/\\user@evil.example/",
+            "https://trusted.example@evil.example/",
+        ] {
+            assert!(
+                parse_fetch_url(url).is_err(),
+                "expected userinfo rejection for {url}"
+            );
+        }
+    }
+
+    /// `host_str()` keeps the brackets on an IPv6 literal; the private-address
+    /// checks parse this value as an `Ipv6Addr`, so brackets would make both of
+    /// them dead code and let every IPv6 URL fall through to a DNS lookup.
+    #[test]
+    fn fetch_url_parser_returns_a_bare_ipv6_host() {
+        let (_, host, port) = parse_fetch_url("https://[2606:4700:4700::1111]/x").unwrap();
+        assert_eq!(host, "2606:4700:4700::1111");
+        assert_eq!(port, 443);
+        assert!(host.parse::<std::net::Ipv6Addr>().is_ok());
     }
 
     #[test]

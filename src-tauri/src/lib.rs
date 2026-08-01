@@ -760,7 +760,11 @@ pub fn run() {
                     info!("Indexed 0 files from 0 shared folders");
                     return;
                 }
-                let coordination_guard = startup_scan_coordination.clone().lock_owned().await;
+                // Held for the whole scan and released when this task ends. It is
+                // deliberately not handed to the hash-timeout drain: that drain
+                // can block indefinitely on a stuck read, and passing the lease
+                // to it would wedge every later reload.
+                let _coordination_guard = startup_scan_coordination.clone().lock_owned().await;
 
                 struct StartupScanGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
                 impl Drop for StartupScanGuard {
@@ -1212,60 +1216,34 @@ pub fn run() {
                             idx.remove_file_by_id(&file_temp_id);
                         }
                         Err(_) => {
-                            // Transfer the owned scan lease to a reaper rather
-                            // than waiting inline for a potentially stuck
-                            // filesystem read. This preserves serialization
-                            // without wedging the startup scan task itself.
-                            cancel_flag.store(
-                                true,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
+                            // One slow file must not end the scan. Cancelling the
+                            // whole pass here and dropping the pending rows made
+                            // every file after this one silently un-indexed, and
+                            // it recurred on every launch because the queue is
+                            // walked in a stable order — the same failure the
+                            // "leaving pending for retry" behaviour was written to
+                            // prevent. Leave the row pending, mark the page
+                            // incomplete so nothing is reconciled away, and move on.
                             tracing::warn!(
-                                "Startup hash timed out for {}; cancelling this scan so it can retry safely",
+                                "Startup hash timed out for {} (file may be on cloud storage or locked); leaving pending for retry",
                                 file.name
                             );
-                            {
-                                let mut idx = index_clone.write().await;
-                                idx.remove_pending_files();
-                                idx.rebuild();
-                            }
-                            commands::sharing::refresh_file_cache(&index_clone, &csf).await;
-                            let _ = reconcile_shared_files(&net_tx).await;
-                            let reaper_cancel_flags = startup_cancel_flags.clone();
-                            let reaper_cancel_flag = cancel_flag.clone();
+                            page_complete = false;
+                            // Drain the abandoned blocking hash for its log line
+                            // only. It must hold no scan lease: the read may be
+                            // stuck in the kernel where the cancel flag cannot
+                            // reach it, and holding the coordination/scan guards
+                            // across that wait would block every later reload and
+                            // stall shutdown for the rest of the session.
                             let timed_out_name = file.name.clone();
-                            let reaper = tokio::spawn(async move {
-                                let _coordination_guard = coordination_guard;
-                                let _scan_guard = scan_guard;
+                            tokio::spawn(async move {
                                 if let Err(error) = hash_task.await {
                                     tracing::warn!(
                                         "Timed-out startup hash task for {timed_out_name} failed while draining: {error}"
                                     );
                                 }
-                                let mut flags = reaper_cancel_flags.write().await;
-                                if flags
-                                    .get("__startup__")
-                                    .is_some_and(|current| {
-                                        std::sync::Arc::ptr_eq(current, &reaper_cancel_flag)
-                                    })
-                                {
-                                    flags.remove("__startup__");
-                                }
                             });
-                            startup_app
-                                .state::<AppState>()
-                                .register_background_scan(reaper)
-                                .await;
-                            let _ = startup_app.emit(
-                                "file-hash-progress",
-                                serde_json::json!({
-                                    "current": hashed,
-                                    "total": total_to_hash,
-                                    "file_name": "",
-                                    "done": true,
-                                }),
-                            );
-                            return;
+                            continue;
                         }
                     }
                 }

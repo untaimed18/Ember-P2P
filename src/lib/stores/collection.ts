@@ -42,3 +42,18 @@ export function markIncomingCollectionPresented(): void {
   // otherwise synchronous `set(null); set(next)` can collapse into one update.
   queueMicrotask(showNext);
 }
+
+/**
+ * Abandon the queued collection when the caller could not get the user to the
+ * Library page. Resolves the waiter so the deep-link drain is never left
+ * awaiting a presentation that will not happen — a blocked navigation would
+ * otherwise wedge the whole pipeline for the rest of the session.
+ */
+export function cancelIncomingCollection(): void {
+  if (!presenting) return;
+  const current = pending.shift();
+  presenting = false;
+  incomingCollection.set(null);
+  current?.resolve();
+  queueMicrotask(showNext);
+}
