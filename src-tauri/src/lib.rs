@@ -929,6 +929,20 @@ pub fn run() {
                                 {
                                     return false;
                                 }
+                                // Re-apply discovery's exclusions. Hydration
+                                // re-admits records without walking the tree, so
+                                // a record written before one of these rules
+                                // existed (the data-directory guard, `.bak`,
+                                // `.migration-tmp`) would otherwise come straight
+                                // back into the shared and announced index.
+                                let record_path = std::path::Path::new(&record.file_path);
+                                if crate::sharing::indexer::is_excluded_share_file_name(record_path)
+                                    || crate::sharing::indexer::is_excluded_share_location(
+                                        record_path,
+                                    )
+                                {
+                                    return false;
+                                }
                                 let metadata = match std::fs::symlink_metadata(&record.file_path)
                                 {
                                     Ok(metadata)
@@ -1258,9 +1272,12 @@ pub fn run() {
 
                 if !was_cancelled && page_complete {
                     let app_state = startup_app.state::<AppState>();
+                    // Startup always rescans page 1, so its cursor must never
+                    // move a reload's further-advanced cursor backward.
                     if let Err(error) = commands::sharing::persist_scan_cursors(
                         &app_state,
                         &startup_cursor_updates,
+                        true,
                     )
                     .await
                     {

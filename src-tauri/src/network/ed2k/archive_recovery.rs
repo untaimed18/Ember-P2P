@@ -296,10 +296,17 @@ fn recover_zip(
     let mut buf = [0u8; 4];
 
     // Scan filled ranges for ZIP local file headers
+    // Count iterations rather than testing `pos` alignment. The entry-skip
+    // paths below jump `pos` by an archive-controlled stride, so a crafted
+    // header chain can step past every 4096-aligned offset and never reach the
+    // budget check — which is the only place the wall clock and the caller's
+    // cancel flag are observed.
+    let mut steps: u32 = 0;
     for &(range_start, range_end) in filled {
         let mut pos = range_start;
         while pos + ZIP_LOCAL_HEADER_SIZE as u64 <= range_end {
-            if pos & 0x0fff == 0 {
+            steps = steps.wrapping_add(1);
+            if steps % 1024 == 0 {
                 budget.check(control)?;
             }
             input.seek(SeekFrom::Start(pos))?;
@@ -790,10 +797,15 @@ fn recover_rar(
     let mut buf = [0u8; 7];
     let mut copy_buf = vec![0u8; 64 * 1024];
 
+    // Iteration-counted, not `pos`-aligned: the skip strides below are
+    // archive-controlled and can step past every aligned offset, starving the
+    // only check that observes the wall clock and the cancel flag.
+    let mut steps: u32 = 0;
     for &(range_start, range_end) in filled {
         let mut pos = range_start;
         while pos + 7 <= range_end {
-            if pos & 0x0fff == 0 {
+            steps = steps.wrapping_add(1);
+            if steps % 1024 == 0 {
                 budget.check(control)?;
             }
             input.seek(SeekFrom::Start(pos))?;
@@ -983,10 +995,15 @@ fn recover_ace(
     let mut recovered = 0usize;
     let mut copy_buf = vec![0u8; 64 * 1024];
 
+    // Iteration-counted, not `pos`-aligned: the skip strides below are
+    // archive-controlled and can step past every aligned offset, starving the
+    // only check that observes the wall clock and the cancel flag.
+    let mut steps: u32 = 0;
     for &(range_start, range_end) in filled {
         let mut pos = range_start;
         while pos + 10 <= range_end {
-            if pos & 0x0fff == 0 {
+            steps = steps.wrapping_add(1);
+            if steps % 1024 == 0 {
                 budget.check(control)?;
             }
             input.seek(SeekFrom::Start(pos))?;

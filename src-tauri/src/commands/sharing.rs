@@ -1073,9 +1073,17 @@ pub(crate) async fn prune_pending_intents_for_hashed(state: &AppState) {
 /// Persist completed shared-folder discovery pages. Cursors are advanced only
 /// after the page has entered the in-memory index; if this save fails, a later
 /// scan may repeat a page but it can never skip files.
+/// `never_rewind` is for callers that deliberately rescan from the beginning
+/// (startup) rather than resuming. Their page-1 cursor is always behind a
+/// cursor a reload has advanced, so persisting it unconditionally would rewind
+/// progress on every launch — a folder past the file cap could then never be
+/// cycled through by anyone who restarts the app regularly. Pages advance in
+/// sorted order, so "further along" is just the greater normalized key. An
+/// explicit `None` still clears: it means the page reached the folder's end.
 pub(crate) async fn persist_scan_cursors(
     state: &AppState,
     updates: &std::collections::HashMap<String, Option<String>>,
+    never_rewind: bool,
 ) -> Result<(), String> {
     if updates.is_empty() {
         return Ok(());
@@ -1088,10 +1096,18 @@ pub(crate) async fn persist_scan_cursors(
     for (folder, cursor) in updates {
         match cursor {
             Some(value) => {
-                settings.shared_folder_scan_cursors.insert(
-                    crate::search::index::normalize_path_key(folder),
-                    value.clone(),
-                );
+                let key = crate::search::index::normalize_path_key(folder);
+                if never_rewind
+                    && settings
+                        .shared_folder_scan_cursors
+                        .get(&key)
+                        .is_some_and(|stored| stored.as_str() >= value.as_str())
+                {
+                    continue;
+                }
+                settings
+                    .shared_folder_scan_cursors
+                    .insert(key, value.clone());
             }
             None => {
                 settings
@@ -1618,7 +1634,7 @@ pub async fn add_shared_folder(
             let mut cursor_update = std::collections::HashMap::new();
             cursor_update.insert(canonical_str.clone(), discovery_next_cursor);
             let app_state = app.state::<AppState>();
-            if let Err(error) = persist_scan_cursors(&app_state, &cursor_update).await {
+            if let Err(error) = persist_scan_cursors(&app_state, &cursor_update, false).await {
                 warn!(
                     "Shared-folder page was indexed but its resume cursor was not saved: {error}"
                 );
@@ -2490,13 +2506,18 @@ pub async fn reload_shared_files(
         scanning.fetch_add(1, Ordering::Relaxed);
         let scan_guard = ScanGuard(scanning.clone());
 
-        let (mut discovered, discovery_truncated, discovery_cursor_updates): (
+        // `truncated` gates the user-facing cap warning; `partial` gates
+        // reconciliation. A resumed page is always partial but only rarely
+        // truncated, so they cannot share one flag.
+        let (mut discovered, discovery_truncated, discovery_partial, discovery_cursor_updates): (
             Vec<FileInfo>,
+            bool,
             bool,
             std::collections::HashMap<String, Option<String>>,
         ) = match tokio::task::spawn_blocking(move || {
             let mut files = Vec::new();
             let mut truncated = false;
+            let mut partial = false;
             let mut cursor_updates = std::collections::HashMap::new();
             for folder in &discovery_folders {
                 let key = crate::search::index::normalize_path_key(folder);
@@ -2505,10 +2526,11 @@ pub async fn reload_shared_files(
                     discovery_cursors.get(&key).map(String::as_str),
                 );
                 truncated |= result.truncated;
+                partial |= result.partial;
                 cursor_updates.insert(folder.clone(), result.next_cursor);
                 files.extend(result.files);
             }
-            (files, truncated, cursor_updates)
+            (files, truncated, partial, cursor_updates)
         })
         .await
         {
@@ -2577,8 +2599,8 @@ pub async fn reload_shared_files(
 
         let removed_fresh_hashes = {
             let mut index = local_index.write().await;
-            let before = (!discovery_truncated).then(|| index.all_files().to_vec());
-            index.reconcile_files_for_folders(&reloaded_folders, discovered, !discovery_truncated);
+            let before = (!discovery_partial).then(|| index.all_files().to_vec());
+            index.reconcile_files_for_folders(&reloaded_folders, discovered, !discovery_partial);
             before
                 .as_deref()
                 .map(|before| {
@@ -2786,7 +2808,7 @@ pub async fn reload_shared_files(
                 })
                 .collect::<std::collections::HashMap<_, _>>();
             let app_state = app.state::<AppState>();
-            if let Err(error) = persist_scan_cursors(&app_state, &cursor_updates).await {
+            if let Err(error) = persist_scan_cursors(&app_state, &cursor_updates, false).await {
                 warn!("Shared-folder scan page was indexed but its resume cursor was not saved: {error}");
             }
         }

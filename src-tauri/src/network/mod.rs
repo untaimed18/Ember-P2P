@@ -38988,9 +38988,30 @@ async fn handle_command_inner(
                                                 }).await;
                                                 return;
                                             }
-                                            // `EmberFriendConnected` flushes
-                                            // the already-queued row. Do not
-                                            // send another direct packet here.
+                                            // `EmberFriendConnected` flushes the
+                                            // already-queued row, so no direct
+                                            // packet is sent here. Emit it
+                                            // ourselves: `connect_friend_with_fallback`
+                                            // returns Ok *without* emitting when it
+                                            // reuses an existing session, which
+                                            // would otherwise leave the message
+                                            // queued indefinitely while the friend
+                                            // shows online. A redundant emit is safe
+                                            // — the flush is a no-op once the rows
+                                            // are marked delivered. The endpoint
+                                            // sentinels keep the handler's address
+                                            // update and source reseed out of it;
+                                            // that arm is gated on a real ip/port,
+                                            // and the dial already recorded them.
+                                            let _ = ul_tx2.send(upload_server::UploadEvent {
+                                                transfer_id: String::new(),
+                                                kind: upload_server::UploadEventKind::EmberFriendConnected {
+                                                    ember_hash: friend_eh,
+                                                    peer_user_hash: [0u8; 16],
+                                                    ip: std::net::Ipv4Addr::UNSPECIFIED,
+                                                    port: 0,
+                                                },
+                                            }).await;
                                         }
                                         Err(e) => {
                                             debug!(
@@ -39101,10 +39122,26 @@ async fn handle_command_inner(
                                                     }).await;
                                                     return;
                                                 }
-                                                // `EmberFriendConnected`
-                                                // flushes the durable outbox
-                                                // row created before this
-                                                // connection attempt.
+                                                // `EmberFriendConnected` flushes the
+                                                // durable outbox row created before
+                                                // this attempt. Emit it ourselves:
+                                                // the connect returns Ok *without*
+                                                // emitting when it reuses an existing
+                                                // session, which would leave the
+                                                // message queued while the friend
+                                                // shows online. A redundant emit is
+                                                // safe, and the endpoint sentinels
+                                                // keep the handler's address update
+                                                // and source reseed out of it.
+                                                let _ = ultx2.send(upload_server::UploadEvent {
+                                                    transfer_id: String::new(),
+                                                    kind: upload_server::UploadEventKind::EmberFriendConnected {
+                                                        ember_hash: friend_eh,
+                                                        peer_user_hash: [0u8; 16],
+                                                        ip: std::net::Ipv4Addr::UNSPECIFIED,
+                                                        port: 0,
+                                                    },
+                                                }).await;
                                             }
                                             Err(e) => {
                                                 debug!(

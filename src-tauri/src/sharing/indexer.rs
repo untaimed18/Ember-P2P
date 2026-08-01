@@ -17,10 +17,56 @@ const MAX_DISCOVERED_FILES: usize = 100_000;
 #[derive(Debug, Default)]
 pub struct DiscoveryResult {
     pub files: Vec<FileInfo>,
+    /// The folder holds more than `MAX_DISCOVERED_FILES`, so this page stopped
+    /// at the cap. This is the only condition worth telling the user about.
     pub truncated: bool,
+    /// This page does not represent the whole folder — either it hit the cap or
+    /// it resumed from a cursor and therefore skipped everything before it.
+    /// Callers must not reconcile (delete missing rows) against a partial page.
+    /// Kept separate from `truncated`: every resumed page omits its prefix, so
+    /// folding the two together raised the cap warning on ordinary reloads.
+    pub partial: bool,
     /// Normalized path after which the next bounded scan should continue.
-    /// `None` means this page covered the whole folder.
+    /// `None` means this page reached the end of the folder.
     pub next_cursor: Option<String>,
+}
+
+/// Names discovery refuses to share: partial downloads, their sidecars, and
+/// our own temp/backup files. Shared with the `known.met` hydration path, which
+/// re-admits records without walking the directory tree — a stale record
+/// written before one of these rules existed would otherwise come straight back
+/// into the shared index.
+pub fn is_excluded_share_file_name(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    name.ends_with(".part")
+        || name.ends_with(".part.met")
+        || name.ends_with(".met.tmp")
+        || (name.starts_with('.') && name.ends_with(".tmp"))
+        || name.ends_with(".migration-tmp")
+        || name.ends_with(".bak")
+}
+
+/// True when any component of `path` is a directory discovery refuses to
+/// descend into, or the path lives under our own data directory.
+pub fn is_excluded_share_location(path: &Path) -> bool {
+    for component in path.components() {
+        if let std::path::Component::Normal(name) = component {
+            if crate::sharing::is_sensitive_dir_name(&name.to_string_lossy()) {
+                return true;
+            }
+        }
+    }
+    let data_dir = crate::storage::paths::resolve_data_dir();
+    let data_canon = data_dir.canonicalize().unwrap_or(data_dir);
+    if let Ok(canonical) = path.canonicalize() {
+        if canonical == data_canon || canonical.starts_with(&data_canon) {
+            return true;
+        }
+    }
+    false
 }
 
 impl FileIndexer {
@@ -43,9 +89,13 @@ impl FileIndexer {
 
         if !path.exists() || !path.is_dir() {
             warn!("Directory does not exist or is not a directory: {dir}");
+            // `partial` so a folder that is temporarily unreachable (an
+            // unmounted drive) is never treated as an authoritative empty
+            // listing that reconciliation would delete every row against.
             return DiscoveryResult {
                 files,
                 truncated: false,
+                partial: true,
                 next_cursor: None,
             };
         }
@@ -57,9 +107,12 @@ impl FileIndexer {
         if let Ok(root_canon) = path.canonicalize() {
             if root_canon == data_canon || root_canon.starts_with(&data_canon) {
                 warn!("Refusing to discover the application data directory: {dir}");
+                // `partial`: this is a refusal, not an authoritative empty
+                // listing, so nothing should be reconciled away because of it.
                 return DiscoveryResult {
                     files,
                     truncated: false,
+                    partial: true,
                     next_cursor: None,
                 };
             }
@@ -140,18 +193,7 @@ impl FileIndexer {
                 enqueue_children(&entry_path, &mut pending);
                 continue;
             }
-            let name = entry_path
-                .file_name()
-                .map(|name| name.to_string_lossy())
-                .unwrap_or_default();
-            // Skip temporary/partial download files.
-            if name.ends_with(".part")
-                || name.ends_with(".part.met")
-                || name.ends_with(".met.tmp")
-                || (name.starts_with('.') && name.ends_with(".tmp"))
-                || name.ends_with(".migration-tmp")
-                || name.ends_with(".bak")
-            {
+            if is_excluded_share_file_name(&entry_path) {
                 continue;
             }
             match Self::discover_file(&entry_path) {
@@ -182,12 +224,14 @@ impl FileIndexer {
             }
         }
 
-        // A non-initial page necessarily omits all entries before its cursor.
-        // Keep that reload partial even when the post-cursor tail is shorter
-        // than the page size, so reconciliation never deletes earlier pages.
-        if cursor.is_some() && saw_before_cursor {
-            truncated = true;
-        }
+        // A non-initial page necessarily omits every entry before its cursor,
+        // so it can never be reconciled against — but that is not the cap being
+        // hit, and only the cap should advance the cursor or warn the user.
+        // Conflating them made every resumed page claim truncation, which both
+        // pinned the "only the first N files were indexed" banner on ordinary
+        // reloads and re-published a cursor for the page that finished the
+        // folder, costing an extra full re-walk before the cursor could reset.
+        let partial = truncated || (cursor.is_some() && saw_before_cursor);
         let next_cursor = truncated
             .then(|| files.last().map(|file| normalize_path_key(&file.path)))
             .flatten();
@@ -201,6 +245,7 @@ impl FileIndexer {
         DiscoveryResult {
             files,
             truncated,
+            partial,
             next_cursor,
         }
     }

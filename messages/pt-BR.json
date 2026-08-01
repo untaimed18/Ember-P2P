@@ -2039,6 +2039,7 @@
   "error_security_invalid_path": "Caminho inválido: {detail}",
   "error_security_invalid_start_ip": "Endereço IP inicial inválido",
   "error_security_ipfilter_no_valid_entries": "O arquivo baixado não contém entradas válidas de filtro de IP — mantendo o filtro existente",
+  "error_security_ipfilter_too_large": "O filtro de IP convertido é maior que {detail} MB — mantendo o filtro existente",
   "error_security_network_not_responding": "A rede não está respondendo (tempo esgotado)",
   "error_security_pattern_too_long": "Padrão anti-leech muito longo (máx. 1024 bytes)",
   "error_security_response_too_large": "Resposta muito grande",

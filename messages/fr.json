@@ -2039,6 +2039,7 @@
   "error_security_invalid_path": "Chemin invalide : {detail}",
   "error_security_invalid_start_ip": "Adresse IP de début invalide",
   "error_security_ipfilter_no_valid_entries": "Le fichier téléchargé ne contient aucune entrée de filtre IP valide — conservation du filtre existant",
+  "error_security_ipfilter_too_large": "Le filtre IP converti dépasse {detail} Mo — conservation du filtre existant",
   "error_security_network_not_responding": "Le réseau ne répond pas (délai expiré)",
   "error_security_pattern_too_long": "Motif anti-leech trop long (1024 octets max.)",
   "error_security_response_too_large": "Réponse trop volumineuse",

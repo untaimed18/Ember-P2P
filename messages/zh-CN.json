@@ -2033,6 +2033,7 @@
   "error_security_invalid_start_ip": "起始 IP 地址无效",
   "error_security_ipfilter_file_too_large": "IP 过滤器文件过大：{detail}",
   "error_security_ipfilter_no_valid_entries": "下载的文件不包含有效的 IP 过滤器条目 — 保留现有过滤器",
+  "error_security_ipfilter_too_large": "转换后的 IP 过滤器超过 {detail} MB — 保留现有过滤器",
   "error_security_network_not_responding": "网络无响应（超时）",
   "error_security_pattern_too_long": "反吸血规则过长（最多 1024 字节）",
   "error_security_range_not_found": "未找到要移除的匹配 IP 过滤范围",

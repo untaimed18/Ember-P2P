@@ -2129,6 +2129,7 @@
   "error_security_invalid_start_ip": "Invalid start IP address",
   "error_security_ipfilter_file_too_large": "IP filter file is too large: {detail}",
   "error_security_ipfilter_no_valid_entries": "Downloaded file does not contain any valid IP filter entries — keeping the existing filter",
+  "error_security_ipfilter_too_large": "The converted IP filter is larger than {detail} MB — keeping the existing filter",
   "error_security_network_not_responding": "Network not responding (timeout)",
   "error_security_pattern_too_long": "Anti-leech pattern too long (max 1024 bytes)",
   "error_security_range_not_found": "No matching IP filter range found to remove",

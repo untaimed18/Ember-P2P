@@ -966,15 +966,29 @@ pub async fn import_ipfilter_file(
                     ));
                 }
             };
-            crate::security::atomic_write(&dest, &filter.canonical_dat_bytes(), false).map_err(
-                |e| {
-                    coded_ctx(
-                        "security_failed_to_write_ipfilter",
-                        "Failed to write ipfilter.dat",
-                        e,
-                    )
-                },
-            )?;
+            // A .p2b record is 8 bytes plus a NUL-terminated name, but each
+            // range expands to a ~50-byte text line, so a 50 MiB input can
+            // canonicalize into hundreds of megabytes. This writes straight to
+            // the loader's default path, which skips the network handler's
+            // MAX_IMPORTED_IPFILTER_BYTES check, and the text loaders stop at
+            // MAX_TEXT_FILTER_LINES anyway — so anything past that would be
+            // written, re-read every launch, and silently ignored.
+            const MAX_IPFILTER_DAT_BYTES: usize = 50 * 1024 * 1024;
+            let canonical = filter.canonical_dat_bytes();
+            if canonical.len() > MAX_IPFILTER_DAT_BYTES {
+                return Err(coded_ctx(
+                    "security_ipfilter_too_large",
+                    "The converted filter is too large to store — keeping the existing filter",
+                    MAX_IPFILTER_DAT_BYTES / (1024 * 1024),
+                ));
+            }
+            crate::security::atomic_write(&dest, &canonical, false).map_err(|e| {
+                coded_ctx(
+                    "security_failed_to_write_ipfilter",
+                    "Failed to write ipfilter.dat",
+                    e,
+                )
+            })?;
             Ok::<(std::path::PathBuf, usize), String>((dest, entry_count))
         })
         .await

@@ -2117,6 +2117,7 @@
   "error_security_invalid_path": "Ruta no válida: {detail}",
   "error_security_invalid_start_ip": "Dirección IP inicial no válida",
   "error_security_ipfilter_no_valid_entries": "El archivo descargado no contiene ninguna entrada válida de filtro de IP — se conserva el filtro existente",
+  "error_security_ipfilter_too_large": "El filtro de IP convertido supera {detail} MB — se conserva el filtro existente",
   "error_security_network_not_responding": "La red no responde (tiempo de espera agotado)",
   "error_security_pattern_too_long": "Patrón anti-leech demasiado largo (máx. 1024 bytes)",
   "error_security_response_too_large": "Respuesta demasiado grande",

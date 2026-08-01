@@ -2039,6 +2039,7 @@
   "error_security_invalid_path": "Ungültiger Pfad: {detail}",
   "error_security_invalid_start_ip": "Ungültige Start-IP-Adresse",
   "error_security_ipfilter_no_valid_entries": "Heruntergeladene Datei enthält keine gültigen IP-Filtereinträge — der vorhandene Filter bleibt erhalten",
+  "error_security_ipfilter_too_large": "Der konvertierte IP-Filter ist größer als {detail} MB — der vorhandene Filter bleibt erhalten",
   "error_security_network_not_responding": "Netzwerk antwortet nicht (Zeitüberschreitung)",
   "error_security_pattern_too_long": "Anti-Leech-Muster zu lang (max. 1024 Byte)",
   "error_security_response_too_large": "Antwort zu groß",

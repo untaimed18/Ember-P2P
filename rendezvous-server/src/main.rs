@@ -884,7 +884,18 @@ impl RelayQueueSender {
             len,
             armed: true,
         };
-        self.sender.try_send(frame).map_err(|_| ())?;
+        // Bounded await, not `try_send`. The byte reservation above only binds
+        // for frames averaging 4 KiB or more; below that the channel's 64-frame
+        // capacity fills first, so `try_send` reported Full with most of the
+        // byte budget free. Every caller treats an error as fatal and tears the
+        // relay down, which turned ordinary backpressure — a peer sitting in a
+        // send for up to RELAY_FORWARD_TIMEOUT — into a dropped session. The
+        // timeout still keeps the goal this replaced `send().await` for: no
+        // relay task parks in a forwarding await indefinitely.
+        match tokio::time::timeout(RELAY_FORWARD_TIMEOUT, self.sender.send(frame)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) | Err(_) => return Err(()),
+        }
         reservation.armed = false;
         Ok(())
     }

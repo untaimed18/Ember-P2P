@@ -632,13 +632,19 @@ pub async fn send_chat_message(
         // The network task persisted the message before attempting its live
         // writer handoff. Avoid inserting a second identical outbox row.
         Err(reason) if reason.starts_with("ChatAlreadyQueued:") => {
+            // The prefix alone is the network task's assertion that the durable
+            // row exists, so an unparseable id is a reporting problem, not a
+            // send failure. Returning Err here would tell the user the message
+            // was lost while it is in fact queued for the next session.
             let id = reason
                 .strip_prefix("ChatAlreadyQueued:")
-                .and_then(|raw| raw.parse::<i64>().ok())
-                .ok_or_else(|| "Invalid queued chat message id".to_string())?;
+                .and_then(|raw| raw.parse::<i64>().ok());
+            if id.is_none() {
+                tracing::warn!("Queued chat reply carried an unparseable row id: {reason}");
+            }
             Ok(ChatSendResult {
                 delivery: "queued".to_string(),
-                id: Some(id),
+                id,
             })
         }
         Err(reason) if chat_failure_is_permanent(&reason) => Err(reason),
