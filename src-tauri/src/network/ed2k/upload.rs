@@ -1298,9 +1298,14 @@ pub enum UploadEventKind {
         relay_attestations: Vec<crate::network::ember::RelayAttestation>,
     },
     /// An Ember peer was detected (for peer discovery mesh bootstrap).
+    ///
+    /// `udp_port` is the peer's advertised eMule UDP port, or 0 when it never
+    /// advertised one. Ember's Noise transport rides the UDP socket, so that —
+    /// not `tcp_port` — is the address the DHT bridge can dial.
     EmberPeerDiscovered {
         ip: std::net::Ipv4Addr,
         tcp_port: u16,
+        udp_port: u16,
     },
     /// Incoming friend request from an Ember peer. `verified` carries
     /// the same semantics as the download-side variant in
@@ -5397,6 +5402,7 @@ impl UploadHandler {
                             kind: UploadEventKind::EmberPeerDiscovered {
                                 ip: v4,
                                 tcp_port: hello_caps.tcp_port,
+                                udp_port: hello_caps.udp_port,
                             },
                         })
                         .await;
@@ -9269,6 +9275,7 @@ impl UploadHandler {
                                                         kind: UploadEventKind::EmberPeerDiscovered {
                                                             ip: v4,
                                                             tcp_port: hello_caps.tcp_port,
+                                                            udp_port: hello_caps.udp_port,
                                                         },
                                                     })
                                                     .await;
@@ -9497,6 +9504,7 @@ impl UploadHandler {
                                                 kind: UploadEventKind::EmberPeerDiscovered {
                                                     ip: v4,
                                                     tcp_port: hello_caps.tcp_port,
+                                                    udp_port: hello_caps.udp_port,
                                                 },
                                             })
                                             .await;

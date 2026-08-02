@@ -1154,6 +1154,52 @@ fn kad_bridge_candidates(
         .collect()
 }
 
+/// Remember an Ember peer we met over eD2K but hold no Noise key for, so the
+/// bridge can reach it with a 2-RTT Noise_XX handshake.
+///
+/// A peer that advertised no UDP port is unreachable on the Ember transport,
+/// so it is dropped rather than stored under a port we'd never be able to
+/// dial. Otherwise this shares `record_known_ember_peer`'s TTL-and-LRU policy.
+fn record_ember_keyless_peer(
+    map: &mut HashMap<(Ipv4Addr, u16), std::time::Instant>,
+    ip: Ipv4Addr,
+    udp_port: u16,
+) -> bool {
+    if udp_port == 0 {
+        return false;
+    }
+    record_known_ember_peer(map, ip, udp_port)
+}
+
+/// Pick Ember peers to fold into the DHT with a Noise_XX bridge `PING`.
+///
+/// The counterpart to [`kad_bridge_candidates`], for peers learned from eD2K
+/// client-to-client sessions rather than KAD source tags. Anything we already
+/// hold a Noise key for is skipped so the cheaper 1-RTT IK path wins; the rest
+/// pay one extra round trip, which is the price of joining without KAD.
+/// Freshest first, same as the IK side.
+fn xx_bridge_candidates(
+    keyless: &HashMap<(Ipv4Addr, u16), std::time::Instant>,
+    noise_keys: &HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)>,
+    attempted: &HashSet<(Ipv4Addr, u16)>,
+    max: usize,
+) -> Vec<(Ipv4Addr, u16)> {
+    if max == 0 {
+        return Vec::new();
+    }
+    let mut candidates: Vec<(Ipv4Addr, u16, std::time::Instant)> = keyless
+        .iter()
+        .filter(|(key, _)| !attempted.contains(*key) && !noise_keys.contains_key(*key))
+        .map(|(key, seen)| (key.0, key.1, *seen))
+        .collect();
+    candidates.sort_by(|a, b| b.2.cmp(&a.2));
+    candidates
+        .into_iter()
+        .take(max)
+        .map(|(ip, port, _)| (ip, port))
+        .collect()
+}
+
 /// Drop expired entries from the noise-key cache. Called next to
 /// `prune_stale_ember_peers` so the two Ember-mesh caches stay in
 /// step on the same TTL.
@@ -5711,6 +5757,63 @@ mod tests {
         assert!(kad_bridge_candidates(&map, &empty, 0).is_empty());
     }
 
+    /// A peer we already hold a Noise key for must go through the 1-RTT IK
+    /// path. Letting it into the XX pass too would spend the tick's budget
+    /// dialing the same peer twice, once the slow way.
+    #[test]
+    fn xx_bridge_skips_peers_whose_noise_key_is_known() {
+        let mut keyless: HashMap<(Ipv4Addr, u16), std::time::Instant> = HashMap::new();
+        let mut keys: HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)> = HashMap::new();
+
+        let keyed = (Ipv4Addr::new(10, 0, 0, 1), 4672u16);
+        let bare = (Ipv4Addr::new(10, 0, 0, 2), 4672u16);
+        assert!(record_ember_keyless_peer(&mut keyless, keyed.0, keyed.1));
+        assert!(record_ember_keyless_peer(&mut keyless, bare.0, bare.1));
+        record_ember_noise_key(&mut keys, keyed.0, keyed.1, [0xAA; 32]);
+
+        let picked = xx_bridge_candidates(&keyless, &keys, &HashSet::new(), 8);
+        assert_eq!(picked, vec![bare]);
+    }
+
+    /// The bridge marks every peer it dials as attempted so it advances
+    /// through the cache; the XX pass has to honour that set too, or an
+    /// unreachable peer gets re-pinged on every maintenance tick forever.
+    #[test]
+    fn xx_bridge_honours_the_attempted_set_and_its_budget() {
+        let mut keyless: HashMap<(Ipv4Addr, u16), std::time::Instant> = HashMap::new();
+        let keys: HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)> = HashMap::new();
+
+        let a = (Ipv4Addr::new(10, 0, 0, 1), 4672u16);
+        let b = (Ipv4Addr::new(10, 0, 0, 2), 4672u16);
+        record_ember_keyless_peer(&mut keyless, a.0, a.1);
+        std::thread::sleep(std::time::Duration::from_micros(50));
+        record_ember_keyless_peer(&mut keyless, b.0, b.1);
+
+        // Freshest first, and the budget caps the batch.
+        assert_eq!(xx_bridge_candidates(&keyless, &keys, &HashSet::new(), 1), vec![b]);
+
+        let mut attempted = HashSet::new();
+        attempted.insert(b);
+        assert_eq!(xx_bridge_candidates(&keyless, &keys, &attempted, 8), vec![a]);
+
+        // A spent budget means no work, which is how the IK pass reserves it.
+        assert!(xx_bridge_candidates(&keyless, &keys, &HashSet::new(), 0).is_empty());
+    }
+
+    /// Ember rides the shared KAD UDP socket, so a peer that advertised no UDP
+    /// port has no address the bridge could dial. Recording it under port 0
+    /// would put an undialable entry in the cache and waste a ping budget slot.
+    #[test]
+    fn a_peer_without_a_udp_port_is_not_a_bridge_candidate() {
+        let mut keyless: HashMap<(Ipv4Addr, u16), std::time::Instant> = HashMap::new();
+        assert!(!record_ember_keyless_peer(
+            &mut keyless,
+            Ipv4Addr::new(10, 0, 0, 1),
+            0
+        ));
+        assert!(keyless.is_empty());
+    }
+
     #[test]
     fn record_ember_noise_key_evicts_oldest_at_capacity() {
         let mut map = HashMap::new();
@@ -7862,6 +7965,18 @@ struct NetworkState {
     /// `KNOWN_EMBER_PEER_TTL` so a long session can't unboundedly
     /// retain stale keys for peers that have rotated.
     ember_noise_keys: HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)>,
+    /// `(ip, udp_port)` of Ember peers met over an eD2K client-to-client
+    /// session (capability bit plus a verified `ember_hash` binding) for whom
+    /// we hold no Noise static key — the key only ever arrives on a KAD
+    /// `ember_npub` tag, and this peer was reached through a server-sourced
+    /// download or upload instead.
+    ///
+    /// They are still dialable: `EmberTransport::prepare_outgoing` falls back
+    /// to Noise_XX when no static key is supplied, costing one extra round
+    /// trip. That is what lets a KAD-less client still join the DHT. Keyed by
+    /// UDP port because the Noise transport rides the shared KAD UDP socket.
+    /// Bounded and pruned exactly like `known_ember_peers`.
+    ember_keyless_peers: HashMap<(Ipv4Addr, u16), std::time::Instant>,
     /// KAD-bridge bootstrap bookkeeping (slice 13): `(ip, port)` of every
     /// KAD-learned Ember peer the maintenance loop has already DHT-pinged
     /// this session, so the bridge moves through the `ember_noise_keys`
@@ -10446,6 +10561,7 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.ember_noise_keys.clear();
     state.ember_kad_bridge_attempted.clear();
     state.known_ember_peers.clear();
+    state.ember_keyless_peers.clear();
 
     // Cumulative dev-console counters: start each enable-session clean
     // (matching the session reset above). The live fields — session count,
@@ -11141,6 +11257,7 @@ pub async fn start_network(
         ember_payload_dirty: true,
         known_ember_peers: HashMap::new(),
         ember_noise_keys: HashMap::new(),
+        ember_keyless_peers: HashMap::new(),
         ember_kad_bridge_attempted: HashSet::new(),
         ember_udp_epx_rate: HashMap::new(),
         ember_diagnostics: EmberDiagnostics::default(),
@@ -14123,7 +14240,7 @@ pub async fn start_network(
                     handle_epx_sources(&mut state, &transfer_manager, &source_manager, &local_index, entries, aich_roots, ember_peers, relay_attestations, &format!("download {transfer_id}")).await;
                 }
 
-                if let DownloadEvent::EmberPeerDiscovered { ip, tcp_port } = event {
+                if let DownloadEvent::EmberPeerDiscovered { ip, tcp_port, udp_port } = event {
                     // Respect `block_private_ips` / filter ranges via
                     // `is_blocked_readonly` so LAN Ember peers are
                     // learnable when the user opts into private dialing.
@@ -14132,6 +14249,7 @@ pub async fn start_network(
                             state.stats.ember_peers = state.known_ember_peers.len() as u32;
                             state.ember_payload_dirty = true;
                         }
+                        record_ember_keyless_peer(&mut state.ember_keyless_peers, ip, udp_port);
                     }
                 }
 
@@ -15004,12 +15122,13 @@ pub async fn start_network(
                     handle_epx_sources(&mut state, &transfer_manager, &source_manager, &local_index, entries, aich_roots, ember_peers, relay_attestations, "upload").await;
                 }
 
-                if let UploadEventKind::EmberPeerDiscovered { ip, tcp_port } = event.kind {
+                if let UploadEventKind::EmberPeerDiscovered { ip, tcp_port, udp_port } = event.kind {
                     if !state.ip_filter.is_blocked_readonly(ip) {
                         if record_known_ember_peer(&mut state.known_ember_peers, ip, tcp_port) {
                             state.stats.ember_peers = state.known_ember_peers.len() as u32;
                             state.ember_payload_dirty = true;
                         }
+                        record_ember_keyless_peer(&mut state.ember_keyless_peers, ip, udp_port);
                     }
                 }
 
@@ -27310,14 +27429,19 @@ pub async fn start_network(
                 let pruned_before = state.known_ember_peers.len();
                 prune_stale_ember_peers(&mut state.known_ember_peers);
                 prune_stale_ember_noise_keys(&mut state.ember_noise_keys);
-                // The KAD-bridge "already attempted" set has no TTL of its
-                // own; bound it to the Noise-key cache it mirrors. Once a
-                // peer's key ages out (and is later re-learned) we want to
-                // be able to bridge-ping it again, and this also stops the
-                // set growing without limit over a long session.
-                state
-                    .ember_kad_bridge_attempted
-                    .retain(|key| state.ember_noise_keys.contains_key(key));
+                prune_stale_ember_peers(&mut state.ember_keyless_peers);
+                // The bridge's "already attempted" set has no TTL of its own;
+                // bound it to the two caches it mirrors. Once a peer ages out
+                // of both (and is later re-learned) we want to be able to
+                // bridge-ping it again, and this also stops the set growing
+                // without limit over a long session. Both caches must be
+                // consulted — retaining against the Noise keys alone would
+                // evict every Noise_XX peer immediately and re-ping it on the
+                // very next tick.
+                state.ember_kad_bridge_attempted.retain(|key| {
+                    state.ember_noise_keys.contains_key(key)
+                        || state.ember_keyless_peers.contains_key(key)
+                });
                 let pruned_after = state.known_ember_peers.len();
                 if pruned_after != pruned_before {
                     state.stats.ember_peers = pruned_after as u32;
@@ -30975,9 +31099,54 @@ async fn run_ember_maintenance(
                     .saturating_add(1);
             }
         }
+        // Same bootstrap, for peers met over an eD2K client-to-client session
+        // instead of a KAD source tag. Those carry no Noise key, so the
+        // transport negotiates Noise_XX (2-RTT) rather than IK — a peer with
+        // servers but no KAD would otherwise have no way into the DHT at all.
+        // Budgeted against whatever the IK pass left so one tick can't burst.
+        let xx_budget = EMBER_KAD_BRIDGE_MAX_PINGS.saturating_sub(result.kad_bridge_pings_sent);
+        let xx_candidates = xx_bridge_candidates(
+            &state.ember_keyless_peers,
+            &state.ember_noise_keys,
+            &state.ember_kad_bridge_attempted,
+            xx_budget,
+        );
+        let mut xx_sent = 0usize;
+        for (ip, port) in xx_candidates {
+            let addr = SocketAddr::new(IpAddr::V4(ip), port);
+            let (_wire_req_id, frame) = state.ember_dht.build_ping();
+            let sent = match state.ember_transport.prepare_outgoing(addr, None, &frame) {
+                ember::transport::OutgoingResult::Ready { packet }
+                | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+                    match socket.send_to(&packet, addr).await {
+                        Ok(_) => true,
+                        Err(e) => {
+                            debug!("Ember XX-bridge: ping to {addr} failed: {e}");
+                            false
+                        }
+                    }
+                }
+                ember::transport::OutgoingResult::Queued => true,
+                ember::transport::OutgoingResult::Error(e) => {
+                    debug!("Ember XX-bridge: transport error pinging {addr}: {e}");
+                    false
+                }
+            };
+            // Same one-shot policy as the IK pass: advance through the cache
+            // rather than retrying the same unreachable few every tick.
+            state.ember_kad_bridge_attempted.insert((ip, port));
+            if sent {
+                xx_sent += 1;
+                result.kad_bridge_pings_sent += 1;
+                state.ember_diagnostics.ember_dht_kad_bridge_pings = state
+                    .ember_diagnostics
+                    .ember_dht_kad_bridge_pings
+                    .saturating_add(1);
+            }
+        }
         if result.kad_bridge_pings_sent > 0 {
             debug!(
-                "Ember KAD-bridge: pinged {} KAD-learned peer(s) to seed the DHT",
+                "Ember bridge: pinged {} peer(s) to seed the DHT ({xx_sent} over Noise_XX)",
                 result.kad_bridge_pings_sent
             );
         }

@@ -419,9 +419,14 @@ pub enum DownloadEvent {
         relay_attestations: Vec<crate::network::ember::RelayAttestation>,
     },
     /// An Ember peer was detected (for peer discovery mesh bootstrap).
+    ///
+    /// `udp_port` is the peer's eMule UDP port from `OP_EMULEINFO`, or 0 when
+    /// it never advertised one. Ember's Noise transport rides the UDP socket,
+    /// so that — not `tcp_port` — is the address the DHT bridge can dial.
     EmberPeerDiscovered {
         ip: std::net::Ipv4Addr,
         tcp_port: u16,
+        udp_port: u16,
     },
     /// Legacy parser-only friend request. The network dispatcher drops this
     /// variant; secure v2 requests arrive as `UploadEventKind` instead.
@@ -1215,6 +1220,11 @@ impl Ed2kDownload {
         let mut peer_secure_ident_level: u8 = initial_caps.secure_ident_level;
         let mut peer_is_ember = initial_caps.is_ember;
         let mut peer_ember_hash: Option<[u8; 16]> = initial_caps.ember_hash;
+        // Latest UDP port the peer advertised via `OP_EMULEINFO`. Held for the
+        // session because `EmberPeerDiscovered` is emitted from the Ember-hello
+        // paths, which run in different match arms from the EmuleInfo parse.
+        // Stays 0 until (or unless) the peer advertises one.
+        let mut peer_udp_port: u16 = initial_caps.udp_port;
         // Ember-hello-derived state. Mirrors the `multi_source.rs`
         // binding-verification flow: we learn the peer's Ed25519
         // public key from `OP_EMBER_HELLO` / `OP_EMBER_HELLOANSWER`,
@@ -1335,6 +1345,9 @@ impl Ed2kDownload {
                     peer_caps.mod_version,
                 );
                 let peer_udp = peer_caps.udp_port;
+                if peer_udp > 0 {
+                    peer_udp_port = peer_udp;
+                }
                 peer_supports_large_files = peer_caps.supports_large_files;
                 peer_supports_multipacket = peer_caps.supports_multi_packet;
                 peer_supports_ext_multipacket = peer_caps.ext_multi_packet;
@@ -1391,6 +1404,9 @@ impl Ed2kDownload {
                 let mut peer_caps = initial_caps.clone();
                 merge_caps(&mut peer_caps, parse_emule_info(&payload2));
                 let peer_udp = peer_caps.udp_port;
+                if peer_udp > 0 {
+                    peer_udp_port = peer_udp;
+                }
                 peer_supports_large_files = peer_caps.supports_large_files;
                 peer_supports_multipacket = peer_caps.supports_multi_packet;
                 peer_supports_ext_multipacket = peer_caps.ext_multi_packet;
@@ -1590,6 +1606,9 @@ impl Ed2kDownload {
                     let mut peer_caps = initial_caps.clone();
                     merge_caps(&mut peer_caps, parse_emule_info(&pl));
                     let peer_udp = peer_caps.udp_port;
+                    if peer_udp > 0 {
+                        peer_udp_port = peer_udp;
+                    }
                     peer_supports_large_files = peer_caps.supports_large_files;
                     peer_supports_multipacket = peer_caps.supports_multi_packet;
                     peer_supports_ext_multipacket = peer_caps.ext_multi_packet;
@@ -1884,6 +1903,7 @@ impl Ed2kDownload {
                                                         .send(DownloadEvent::EmberPeerDiscovered {
                                                             ip: v4,
                                                             tcp_port: peer_tcp,
+                                                            udp_port: peer_udp_port,
                                                         })
                                                         .await;
                                                     mesh_discovered_emitted = true;
@@ -2024,6 +2044,7 @@ impl Ed2kDownload {
                         .send(DownloadEvent::EmberPeerDiscovered {
                             ip: v4,
                             tcp_port: peer_tcp,
+                            udp_port: peer_udp_port,
                         })
                         .await;
                     mesh_discovered_emitted = true;
@@ -2214,6 +2235,9 @@ impl Ed2kDownload {
                     let mut peer_caps = initial_caps.clone();
                     merge_caps(&mut peer_caps, parse_emule_info(&payload));
                     let peer_udp = peer_caps.udp_port;
+                    if peer_udp > 0 {
+                        peer_udp_port = peer_udp;
+                    }
                     peer_supports_large_files = peer_caps.supports_large_files;
                     // `is_ember` / `ember_hash` come from `OP_EMBER_HELLO` /
                     // `OP_EMBER_HELLOANSWER` only — see the identical
@@ -2503,6 +2527,7 @@ impl Ed2kDownload {
                                                     .send(DownloadEvent::EmberPeerDiscovered {
                                                         ip: v4,
                                                         tcp_port: peer_tcp,
+                                                        udp_port: peer_udp_port,
                                                     })
                                                     .await;
                                                 mesh_discovered_emitted = true;
@@ -2597,6 +2622,7 @@ impl Ed2kDownload {
                                                         .send(DownloadEvent::EmberPeerDiscovered {
                                                             ip: v4,
                                                             tcp_port: peer_tcp,
+                                                            udp_port: peer_udp_port,
                                                         })
                                                         .await;
                                                     mesh_discovered_emitted = true;
@@ -4252,6 +4278,7 @@ impl Ed2kDownload {
                                                                 DownloadEvent::EmberPeerDiscovered {
                                                                     ip: v4,
                                                                     tcp_port: peer_tcp,
+                                                                    udp_port: peer_udp_port,
                                                                 },
                                                             )
                                                             .await;

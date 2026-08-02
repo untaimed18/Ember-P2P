@@ -4933,6 +4933,7 @@ async fn download_parts_from_source(
                                                         .send(DownloadEvent::EmberPeerDiscovered {
                                                             ip: v4,
                                                             tcp_port: peer_tcp,
+                                                            udp_port: hello_caps.udp_port,
                                                         })
                                                         .await;
                                                     mesh_discovered_emitted = true;
@@ -5092,6 +5093,7 @@ async fn download_parts_from_source(
                         .send(DownloadEvent::EmberPeerDiscovered {
                             ip: v4,
                             tcp_port: peer_tcp,
+                            udp_port: hello_caps.udp_port,
                         })
                         .await;
                     mesh_discovered_emitted = true;
@@ -5570,6 +5572,7 @@ async fn download_parts_from_source(
                                                 .send(DownloadEvent::EmberPeerDiscovered {
                                                     ip: v4,
                                                     tcp_port: peer_tcp,
+                                                    udp_port: hello_caps.udp_port,
                                                 })
                                                 .await;
                                             mesh_discovered_emitted = true;
@@ -5650,6 +5653,7 @@ async fn download_parts_from_source(
                                                     .send(DownloadEvent::EmberPeerDiscovered {
                                                         ip: v4,
                                                         tcp_port: peer_tcp,
+                                                        udp_port: hello_caps.udp_port,
                                                     })
                                                     .await;
                                                 mesh_discovered_emitted = true;
