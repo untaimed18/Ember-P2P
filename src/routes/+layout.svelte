@@ -31,7 +31,6 @@
     getSecurityPolicyState,
   } from '$lib/api/security';
   import { clearAllToasts, toastError, toastWarning } from '$lib/stores/toast';
-  import { emberDevToolsEnabled } from '$lib/stores/devTools';
   import { takePendingDownloadOverflowNotice } from '$lib/api/transfers';
   import type { AppSettings } from '$lib/types';
   import { onMount } from 'svelte';
@@ -326,9 +325,6 @@
           if (!mounted) return;
 
           if (settings) {
-            // Seed the dev-console visibility store so the sidebar link
-            // reflects the saved preference from first paint.
-            emberDevToolsEnabled.set(!!settings.ember_dev_tools_enabled);
             setAppSettings(settings);
             if (!settings.setup_complete) {
               wizardSettings = settings;

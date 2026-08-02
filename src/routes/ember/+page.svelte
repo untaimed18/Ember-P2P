@@ -1,15 +1,13 @@
 <script lang="ts">
   /*
-   * User-facing "Ember Network" page. Unlike the developer panel at
-   * `/dev/ember` (routing-table inspection, manual seeding, DHT
-   * ping/find/publish harness forms), this page is the everyday surface:
-   * a single power switch for the Ember-native overlay plus an at-a-glance
-   * status read-out. The toggle persists through `update_settings` and the
-   * backend applies it live — turning it on kicks a rendezvous bootstrap so
-   * the node joins the DHT without a restart.
+   * User-facing "Ember Network" page: a single power switch for the
+   * Ember-native overlay plus an at-a-glance status read-out (routing
+   * contacts, in-flight searches, local store). The toggle persists through
+   * `update_settings` and the backend applies it live, though a node that
+   * starts with an empty routing table only fills it once the maintenance
+   * tick runs the KAD bridge — there is no central pool to fetch from.
    */
   import { onMount, untrack } from 'svelte';
-  import { goto } from '$app/navigation';
   import { getSettings, updateSettings } from '$lib/api/settings';
   import {
     getEmberDiagnostics,
@@ -17,7 +15,6 @@
     getEmberDhtSearches,
     getEmberDhtStore,
   } from '$lib/api/ember';
-  import { emberDevToolsEnabled } from '$lib/stores/devTools';
   import type {
     AppSettings,
     EmberDiagnostics,
@@ -203,8 +200,6 @@
         settings = s;
         enabled = s.ember_native_enabled;
         lastAppliedEnabled = s.ember_native_enabled;
-        // Keep the shared store in step with the freshest settings read.
-        emberDevToolsEnabled.set(!!s.ember_dev_tools_enabled);
       })
       .catch((e) => { loadError = m.ember_load_failed({ error: translateError(e) }); });
     refreshDiag();
@@ -492,19 +487,6 @@
     <h2>{m.ember_about_title()}</h2>
     <p class="about-text">{m.ember_about_text()}</p>
   </section>
-
-  <!-- Advanced (developer console) — shown only when opted in via Settings -->
-  {#if $emberDevToolsEnabled}
-    <section class="card advanced">
-      <div>
-        <h2>{m.ember_advanced_title()}</h2>
-        <p class="hint">{m.ember_advanced_desc()}</p>
-      </div>
-      <button type="button" class="ghost-btn" onclick={() => goto('/dev/ember')}>
-        {m.ember_advanced_link()}
-      </button>
-    </section>
-  {/if}
   </div>
 </div>
 
@@ -768,8 +750,7 @@
     min-width: 0;
   }
 
-  .copy-btn,
-  .ghost-btn {
+  .copy-btn {
     flex-shrink: 0;
     background: var(--bg-tertiary);
     border: 1px solid var(--border);
@@ -781,8 +762,7 @@
     transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
   }
 
-  .copy-btn:hover,
-  .ghost-btn:hover {
+  .copy-btn:hover {
     background: var(--bg-hover);
     color: var(--text-primary);
     border-color: var(--accent);
@@ -793,19 +773,6 @@
     color: var(--text-secondary);
     font-size: 13px;
     line-height: 1.6;
-  }
-
-  .advanced {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 16px;
-  }
-
-  .advanced .ghost-btn {
-    padding: 8px 14px;
-    font-size: 13px;
-    white-space: nowrap;
   }
 
   .banner {

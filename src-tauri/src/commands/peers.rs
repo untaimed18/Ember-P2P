@@ -1745,9 +1745,9 @@ fn parse_node_id16(label: &str, hex_str: &str) -> Result<[u8; 16], String> {
     Ok(k)
 }
 
-/// Snapshot the Ember DHT routing table. Developer/harness surface for
-/// the `/dev/ember` panel — shows which contacts the node has learned
-/// (from signed PING/PONG traffic) or been seeded with.
+/// Snapshot the Ember DHT routing table — the contacts this node has learned
+/// from signed PING/PONG traffic, or been seeded with. Backs the contacts
+/// table on the Ember Network page.
 #[tauri::command]
 pub async fn get_ember_dht_contacts(
     state: tauri::State<'_, AppState>,
@@ -1786,11 +1786,13 @@ pub async fn get_ember_dht_store(
     await_reply(rx, "peers_no_response", "No response").await
 }
 
-/// Manually seed an Ember DHT contact (harness/dev). Lets two nodes
-/// bootstrap each other before any live DHT traffic by pasting the
-/// peer's address, Ed25519 public key, and Noise public key (all
-/// shown on the other node's `/dev/ember` panel). The node ID is
-/// derived from the Ed25519 key.
+/// Manually seed an Ember DHT contact from a peer's address, Ed25519 public
+/// key, and Noise public key. The node ID is derived from the Ed25519 key.
+///
+/// No UI calls this today — the overlay bootstraps itself through the KAD
+/// bridge, peer exchange, and DHT gossip. It is kept as the one way to
+/// introduce two nodes directly, which is what a local multi-node test needs
+/// when neither can reach KAD.
 #[tauri::command]
 pub async fn add_ember_dht_contact(
     state: tauri::State<'_, AppState>,

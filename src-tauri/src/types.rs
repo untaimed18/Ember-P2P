@@ -974,16 +974,6 @@ pub struct AppSettings {
     /// renderer clear it would re-run the migration and override the user.
     #[serde(default)]
     pub ember_default_on_migrated: bool,
-    /// Reveal the Ember developer console (`/dev/ember`) in the UI: the
-    /// sidebar link and the "Advanced" button on the Ember Network page.
-    /// Off by default — the console exposes raw DHT harness forms (manual
-    /// `PING`/`FIND_NODE`/`STORE`/`FIND_VALUE`, seed-contact, run-maintenance)
-    /// and a routing-table view that ordinary users don't need. A curious
-    /// user (or us, for multi-node testing) can opt in from Settings →
-    /// Network without a special build. The `/dev/ember` route itself
-    /// always exists; this only governs whether the UI links to it.
-    #[serde(default)]
-    pub ember_dev_tools_enabled: bool,
     /// Whether this node will carry relay traffic for other peers.
     ///
     /// Relaying was previously implicit: any node with a public address and a
@@ -1411,7 +1401,6 @@ impl Default for AppSettings {
             // A fresh profile already starts on, so there is nothing for the
             // upgrade migration to do.
             ember_default_on_migrated: true,
-            ember_dev_tools_enabled: false,
             relay_for_peers: default_relay_for_peers(),
             max_relay_sessions: default_max_relay_sessions(),
             close_to_tray_behavior: default_close_to_tray_behavior(),

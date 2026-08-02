@@ -593,8 +593,6 @@ export interface AppSettings {
    *  On by default: the DHT bootstraps from other clients rather than a
    *  central pool, so it only works when ordinary profiles take part. */
   ember_native_enabled: boolean;
-  /** Advanced: reveal the Ember developer console (`/dev/ember`) links in the UI. */
-  ember_dev_tools_enabled: boolean;
   /** Whether this node carries relay traffic for other peers. Relaying is what
    *  lets two firewalled peers reach each other, so it defaults on, but it
    *  spends this node's uplink on strangers and is therefore a choice. */
