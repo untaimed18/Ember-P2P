@@ -995,6 +995,7 @@ pub fn run() {
                             size: record.file_size,
                             hash,
                             aich_hash: record.aich_hash.clone(),
+                            ember_file_hash: record.ember_file_hash.clone(),
                             extension,
                             modified_at: record.modified_at,
                             priority: storage::known_files::priority_u8_to_str(
