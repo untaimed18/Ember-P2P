@@ -18,6 +18,18 @@ const NODES_EMBER_VERSION: u8 = 1;
 ///     node_id(16) + addr_type(1) + ip(4 or 16) + port(2 BE) +
 ///     noise_pub(32) + ed25519_pub(32) + last_seen(i64 LE)
 pub fn save_nodes(path: &Path, contacts: &[EmberContact]) -> anyhow::Result<()> {
+    // Never trade a usable bootstrap file for an empty one. A table can be
+    // momentarily empty (startup, the transport toggled off, a network drop),
+    // and overwriting the file at that moment leaves the next launch with no
+    // way back into the network at all.
+    if contacts.is_empty() && path.exists() {
+        info!(
+            "Skipping Ember nodes save: routing table empty but {} already exists",
+            path.display()
+        );
+        return Ok(());
+    }
+
     // Build the full file in memory first, then commit via
     // `atomic_write`. The previous implementation did
     // `File::create -> write -> drop -> rename` without `sync_all`,
@@ -124,7 +136,16 @@ pub fn load_nodes(path: &Path) -> anyhow::Result<Vec<EmberContact>> {
             break;
         }
 
-        let last_seen = cursor.read_i64::<LittleEndian>().unwrap_or(0);
+        // The persisted timestamp records when the *previous* session last
+        // heard from this contact. It is deliberately not carried forward:
+        // `last_seen` is what marks a contact as proven, and a contact we
+        // have not spoken to since launch has proven nothing. Restoring it
+        // would make every entry look verified the moment it loads, so the
+        // staleness purge would delete the whole bootstrap set — before a
+        // single ping went out — for any restart after the stale threshold.
+        // Zero also sorts them first for liveness probing, which is exactly
+        // the order we want.
+        let _persisted_last_seen = cursor.read_i64::<LittleEndian>().unwrap_or(0);
 
         // Re-derive the node id from the persisted Ed25519 key rather than
         // trusting the on-disk `node_id`. If the file was tampered with (or
@@ -144,7 +165,7 @@ pub fn load_nodes(path: &Path) -> anyhow::Result<Vec<EmberContact>> {
             addr: SocketAddr::new(ip, port),
             noise_pub,
             ed25519_pub,
-            last_seen,
+            last_seen: 0,
             failed_queries: 0,
         });
     }
@@ -221,8 +242,18 @@ mod tests {
         assert_eq!(loaded[0].node_id, contacts[0].node_id);
         assert_eq!(loaded[0].addr, contacts[0].addr);
         assert_eq!(loaded[0].noise_pub, contacts[0].noise_pub);
-        assert_eq!(loaded[0].last_seen, contacts[0].last_seen);
         assert_eq!(loaded[2].node_id, contacts[2].node_id);
+        // A loaded contact has proven nothing yet this session, so it comes
+        // back unverified regardless of how recently the previous session
+        // heard from it. Carrying the timestamp forward would make the
+        // staleness purge delete the entire bootstrap set on any restart
+        // after the stale threshold, before a single ping was sent.
+        assert!(
+            contacts[0].last_seen > 0,
+            "the fixture must have a real timestamp for this to mean anything"
+        );
+        assert!(loaded.iter().all(|c| c.last_seen == 0));
+        assert!(loaded.iter().all(|c| !c.is_verified()));
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -5,6 +5,7 @@ pub mod observed;
 pub mod protection;
 pub mod publish;
 pub mod routing;
+pub mod scale;
 pub mod search;
 pub mod store;
 
@@ -22,9 +23,10 @@ pub const MAX_CONTACTS_PER_RESPONSE: usize = 20;
 pub const CONTACT_TIMEOUT_SECS: i64 = 600;
 pub const MAX_FAILED_QUERIES: u8 = 3;
 
-/// Subnet diversity limits
+/// Subnet diversity limit within one bucket. The global limit is not a
+/// constant: it scales with table occupancy, so see
+/// [`scale::NetworkScale::max_contacts_per_subnet_global`].
 pub const MAX_PER_SUBNET_PER_BUCKET: usize = 3;
-pub const MAX_PER_SUBNET_GLOBAL: usize = 20;
 
 /// 16-byte node ID derived from BLAKE3(Ed25519 public key).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -89,6 +91,18 @@ pub struct EmberContact {
 }
 
 impl EmberContact {
+    /// Whether we have actually heard from this contact, as opposed to only
+    /// having been told about it.
+    ///
+    /// A direct signed frame sets `last_seen`; gossip from `FOUND_NODE` /
+    /// `PEER_LIST` and entries read back from disk arrive with `last_seen == 0`
+    /// until they answer us. Contacts we have never reached are worth keeping
+    /// as leads, but they should not be preferred over proven ones when
+    /// seeding a lookup, answering a peer, or deciding what to persist.
+    pub fn is_verified(&self) -> bool {
+        self.last_seen > 0
+    }
+
     /// Subnet key (first 3 octets for IPv4, first 48 bits for IPv6).
     pub fn subnet_key(&self) -> u64 {
         match self.addr.ip() {

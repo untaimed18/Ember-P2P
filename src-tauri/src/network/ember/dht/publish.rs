@@ -26,7 +26,15 @@ pub const RECORD_TYPE_SOURCE: u8 = 0x02;
 
 /// Wire size of the trailing contact block a source record appends after
 /// its file name: ip(4) + tcp_port(2) + udp_port(2) + flags(1) + noise_pub(32).
-const SOURCE_CONTACT_WIRE_LEN: usize = 4 + 2 + 2 + 1 + 32;
+pub(super) const SOURCE_CONTACT_WIRE_LEN: usize = 4 + 2 + 2 + 1 + 32;
+
+/// Fixed-size prefix every record body carries before its file name:
+/// `record_type(1) + keyword_hash(16) + file_hash(16) + ember_file_hash(32)
+/// + file_size(8) + publisher_key(32) + timestamp(8) + name_len(2)`.
+///
+/// Shared so the readers in this module and in [`super::store`] cannot drift
+/// apart on where the name — and therefore the contact block — begins.
+pub(super) const RECORD_HEADER_LEN: usize = 1 + 16 + 16 + 32 + 8 + 32 + 8 + 2;
 
 /// DHT key under which a file's source records live: `BLAKE3(file_hash)[..16]`.
 ///
@@ -591,7 +599,7 @@ mod tests {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
         let local = EmberNodeId([0u8; 16]);
-        let mut rt = RoutingTable::new(local);
+        let mut rt = RoutingTable::new(local, false);
 
         for i in 1..=10u8 {
             let mut id = [0u8; 16];

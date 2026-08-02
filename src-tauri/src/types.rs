@@ -592,7 +592,8 @@ pub struct EmberDiagnostics {
     /// Total signed records held in the local Ember DHT store (gauge).
     #[serde(default)]
     pub ember_dht_stored_records: u32,
-    /// `STORE_RECORD` frames we accepted (verified + stored) this session.
+    /// Records we accepted (verified + stored) this session. Counted per
+    /// record rather than per frame, since a `STORE_BATCH` carries many.
     #[serde(default)]
     pub ember_dht_stores_received: u32,
     /// `FIND_VALUE` queries we received and answered this session.
@@ -638,8 +639,8 @@ pub struct EmberDiagnostics {
     #[serde(default)]
     pub ember_dht_source_records_found: u32,
     /// Ember DHT *keyword* records (re)published for our shared files this
-    /// session (slice 8): incremented once per keyword STORE attempt fanned
-    /// out by the publish tick.
+    /// session (slice 8): incremented once per file whose keyword records
+    /// have all been confirmed stored by a peer.
     #[serde(default)]
     pub ember_dht_keywords_published: u32,
     /// Slice 14: inbound Ember DHT frames dropped by per-IP rate limits.

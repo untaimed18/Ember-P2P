@@ -73,6 +73,10 @@ pub struct DhtInbound {
     /// The frame was a `STORE_ACK`; the `request_id` it answered (so the
     /// caller can resolve the matching publish query).
     pub store_ack_request_id: Option<u32>,
+    /// The frame was a `STORE_BATCH_ACK`: `(request_id, accepted bitmap)`.
+    pub store_batch_ack: Option<(u32, u64)>,
+    /// How many records an inbound `STORE_BATCH` contributed to our store.
+    pub batch_records_stored: u16,
     /// For a `FOUND_VALUE`, the `request_id` it answered plus the raw
     /// (still publisher-signed) record blobs it carried.
     pub found_value: Option<(u32, Vec<Vec<u8>>)>,
@@ -102,6 +106,17 @@ pub struct DhtInbound {
     pub proxy_store_forward: Option<(u32, SignedRecord)>,
 }
 
+/// What happened to one record offered to the local store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreOutcome {
+    Stored,
+    /// The same publisher signature arrived again inside the replay window.
+    Replay,
+    /// Failed verification, key binding, anti-reflection, proximity, or a
+    /// store capacity limit.
+    Rejected,
+}
+
 /// Owns our DHT identity, routing table, and local record store, and
 /// turns inbound frames into routing/store updates plus signed replies.
 pub struct EmberDht {
@@ -124,14 +139,18 @@ impl EmberDht {
     /// (`NodeIdentity::ed25519_secret_key`). Our node ID is
     /// `BLAKE3(ed25519_pub)[..16]`, identical to the `ember_hash`, so
     /// every Ember subsystem agrees on who we are.
-    pub fn new(ed25519_secret_key: [u8; 32]) -> Self {
+    pub fn new(ed25519_secret_key: [u8; 32], block_private_ips: bool) -> Self {
         let signing_key = crypto::signing_key_from_bytes(&ed25519_secret_key);
         let local_id = EmberNodeId(crypto::node_id_from_public_key(
             &signing_key.verifying_key(),
         ));
+        let mut store = DhtStore::new();
+        // The store ranks records by how responsible we are for their key
+        // when it has to free space.
+        store.set_local_id(local_id);
         Self {
-            routing: RoutingTable::new(local_id),
-            store: DhtStore::new(),
+            routing: RoutingTable::new(local_id, block_private_ips),
+            store,
             signing_key,
             local_id,
             next_request_id: 1,
@@ -167,6 +186,47 @@ impl EmberDht {
         &self.routing
     }
 
+    /// Purge contacts that have gone quiet, sparing any an in-flight search
+    /// still needs. See [`RoutingTable::remove_stale`].
+    pub fn remove_stale_contacts(
+        &mut self,
+        now: i64,
+        max_age_secs: i64,
+        in_use: &std::collections::HashSet<EmberNodeId>,
+    ) -> usize {
+        self.routing.remove_stale(now, max_age_secs, in_use)
+    }
+
+    /// Look up a contact by node ID.
+    pub fn contact_for(&self, node_id: &EmberNodeId) -> Option<&EmberContact> {
+        self.routing.get_contact(node_id)
+    }
+
+    /// Contacts worth persisting for the next session: proven, healthy, and
+    /// closest to home first. See
+    /// [`RoutingTable::export_bootstrap_contacts`].
+    pub fn bootstrap_contacts(&self, max: usize) -> Vec<EmberContact> {
+        self.routing.export_bootstrap_contacts(max)
+    }
+
+    /// Share the user's range IP filter with the routing table so blocked
+    /// addresses are refused on admission.
+    pub fn set_ip_filter(&mut self, filter: crate::network::kad::ip_filter::SharedIpFilter) {
+        self.routing.set_ip_filter(filter);
+    }
+
+    /// Hot-update the LAN/CGNAT admission policy, evicting contacts the new
+    /// policy rejects. Returns how many were dropped.
+    pub fn set_block_private_ips(&mut self, block_private: bool) -> usize {
+        self.routing.set_block_private_ips(block_private)
+    }
+
+    /// Re-apply the current IP policy to the whole table, for when the user
+    /// reloads `ipfilter.dat`.
+    pub fn evict_filtered_contacts(&mut self) -> usize {
+        self.routing.evict_filtered_contacts()
+    }
+
     /// Insert a contact directly (manual harness seeding). Returns
     /// `true` if it landed in a bucket, `false` if rejected (self,
     /// subnet-diversity limit) or only cached behind a full bucket.
@@ -184,11 +244,141 @@ impl EmberDht {
     /// be selective (`>= K_BUCKET_SIZE` known contacts), we only store keys we
     /// are plausibly close to, so a spammer cannot push unrelated records onto
     /// nodes that have no business holding them.
+    /// Apply the inbound-STORE acceptance rules to one record.
+    ///
+    /// Shared by `STORE_RECORD` and every record inside a `STORE_BATCH`, so
+    /// the two framings cannot drift into accepting different things.
+    fn accept_record(
+        &mut self,
+        key: [u8; 16],
+        record: Vec<u8>,
+        record_signature: [u8; 64],
+        from: SocketAddr,
+    ) -> StoreOutcome {
+        // Parse + verify the publisher-signed record, and bind the DHT key to
+        // the record's own content key so a publisher can't scatter a record
+        // under unrelated keys. `from_wire` verifies the Ed25519 signature;
+        // `DhtStore::store` checks it again (defence in depth) and enforces
+        // capacity.
+        let Some(parsed) = SignedRecord::from_wire(&record, record_signature) else {
+            return StoreOutcome::Rejected;
+        };
+
+        // Anti-reflection for source records: HighID / direct sources must
+        // claim the observed Noise sender IP so a peer cannot point
+        // downloaders at a third-party victim. Firewalled sources
+        // (`SOURCE_FLAG_FIREWALLED`) are exempt: they may be STORED by a
+        // HighID buddy (proxy path) or from a NAT mapping that differs from
+        // the STUN hint. Authorship is still bound by the publisher Ed25519
+        // signature; the record is not republished by storers (see
+        // `DhtStore::take_republish_batch`).
+        let source_ip_ok = match parsed.source_contact {
+            Some(sc) if sc.flags & SOURCE_FLAG_FIREWALLED != 0 => true,
+            Some(sc) => from.ip() == std::net::IpAddr::V4(sc.ip),
+            None => parsed.record_type != RECORD_TYPE_SOURCE,
+        };
+
+        // Slice 14: collapse identical STORE frames (same publisher
+        // signature) for a short window so a retransmit storm can't re-verify
+        // the same blob forever. Hourly republish still lands after the TTL.
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&parsed.publisher_key);
+        hasher.update(&record_signature);
+        let sig_key = *hasher.finalize().as_bytes();
+        let now_inst = Instant::now();
+        if self.store_sig_seen.len() > MAX_STORE_SIG_CACHE / 2 {
+            self.store_sig_seen
+                .retain(|_, t| now_inst.duration_since(*t) < STORE_SIG_REPLAY_TTL);
+        }
+        let is_replay = self
+            .store_sig_seen
+            .get(&sig_key)
+            .map(|t| now_inst.duration_since(*t) < STORE_SIG_REPLAY_TTL)
+            .unwrap_or(false);
+        if is_replay {
+            return StoreOutcome::Replay;
+        }
+
+        // A firewalled source's declared address is exempt from the bind
+        // above, so nothing vouches for it. Attribute the record to the peer
+        // that actually sent it, or one host can invent an address per record
+        // and take a whole key's source slots.
+        let attributed_ip = match parsed.source_contact {
+            Some(sc) if sc.flags & SOURCE_FLAG_FIREWALLED != 0 => match from.ip() {
+                std::net::IpAddr::V4(v4) => Some(v4),
+                std::net::IpAddr::V6(_) => None,
+            },
+            _ => None,
+        };
+
+        if key == parsed.keyword_hash
+            && source_ip_ok
+            && self.store_proximity_ok(&key)
+            && self.store.store_attributed(
+                key,
+                record,
+                record_signature,
+                parsed.publisher_key,
+                parsed.timestamp,
+                attributed_ip,
+            )
+        {
+            if self.store_sig_seen.len() < MAX_STORE_SIG_CACHE {
+                self.store_sig_seen.insert(sig_key, now_inst);
+            }
+            StoreOutcome::Stored
+        } else {
+            StoreOutcome::Rejected
+        }
+    }
+
+    /// Keep the store's abuse limits in step with the routing table, which is
+    /// where network size is observed.
+    fn sync_store_scale(&mut self) {
+        let scale = self.routing.scale();
+        self.store.set_scale(scale);
+    }
+
+    /// Whether we are one of the nodes responsible for holding `key`.
+    ///
+    /// This is Kademlia's actual question — am I among the k closest nodes to
+    /// this key? — answered against the contacts we know. It replaces a fixed
+    /// "close half of the ID space" rule, which rejected half of all keys
+    /// outright regardless of whether any closer node existed, and which
+    /// switched on the moment the table reached k contacts: exactly when a
+    /// small network's every node is still trivially among the k closest to
+    /// everything, so replication silently halved just as the network became
+    /// interesting.
+    ///
+    /// Knowing fewer than k contacts means we are among the k closest by
+    /// definition, so everything is stored.
     fn store_proximity_ok(&self, key: &[u8; 16]) -> bool {
-        if self.routing.total_contacts() < K_BUCKET_SIZE {
+        let key_id = EmberNodeId(*key);
+        let closest = self.routing.find_closest(&key_id, K_BUCKET_SIZE);
+        if closest.len() < K_BUCKET_SIZE {
             return true;
         }
-        DhtStore::should_store(&self.local_id, key)
+        let ours = self.local_id.distance(&key_id);
+        let kth = closest
+            .last()
+            .map(|c| c.node_id.distance(&key_id))
+            .unwrap_or(EmberNodeId([0xFF; 16]));
+        ours.0 <= kth.0
+    }
+
+    /// Contacts closest to `target`, minus the peer that asked.
+    ///
+    /// The asker is added to our table at the top of `handle_message`, and
+    /// its distance to itself is zero, so an unfiltered reply always led with
+    /// the one contact it definitely already has — spending a slot of a
+    /// response that is capped by both count and datagram size.
+    fn closest_excluding(&self, target: &EmberNodeId, asker: EmberNodeId) -> Vec<EmberContact> {
+        let mut closest = self
+            .routing
+            .find_closest(target, MAX_CONTACTS_PER_RESPONSE + 1);
+        closest.retain(|c| c.node_id != asker);
+        closest.truncate(MAX_CONTACTS_PER_RESPONSE);
+        closest
     }
 
     fn next_request_id(&mut self) -> u32 {
@@ -271,11 +461,118 @@ impl EmberDht {
     /// Build a signed `FIND_VALUE` frame querying for `keys`. The answer
     /// (`FOUND_VALUE`, or `FOUND_NODE` if the peer has no record) arrives
     /// via [`Self::handle_message`].
-    pub fn build_find_value(&mut self, keys: Vec<[u8; 16]>) -> (u32, Vec<u8>) {
+    ///
+    /// Keys past [`messages::MAX_FIND_VALUE_KEYS`] are dropped. A peer rejects
+    /// an over-long request at decode and answers nothing at all, so sending
+    /// one would cost the whole query timeout and return no contacts either;
+    /// callers pass keys most-selective-first, and the keywords dropped here
+    /// are still applied by the caller's own filename filter. Truncating is
+    /// therefore strictly better than letting a long query go unanswered.
+    pub fn build_find_value(&mut self, mut keys: Vec<[u8; 16]>) -> (u32, Vec<u8>) {
+        keys.truncate(messages::MAX_FIND_VALUE_KEYS);
         let request_id = self.next_request_id();
         let msg = messages::build_find_value(self.local_id, request_id, keys);
         let bytes = messages::encode_message(&msg, &self.signing_key, true);
         (request_id, bytes)
+    }
+
+    /// Build a signed `STORE_BATCH` carrying as many of `records` as fit one
+    /// unfragmented datagram.
+    ///
+    /// Returns the frame, its request id, and how many records it took, so
+    /// the caller can send the remainder in a following batch. Returns `None`
+    /// when `records` is empty or the first record alone is too large.
+    pub fn build_store_batch(
+        &mut self,
+        records: &[messages::BatchedRecord],
+    ) -> Option<(u32, Vec<u8>, usize)> {
+        let mut used = 1usize; // the record count byte
+        let mut taken = 0usize;
+        for rec in records.iter().take(messages::MAX_STORE_BATCH_RECORDS) {
+            let cost = messages::batched_record_wire_len(rec.record.len());
+            if used + cost > messages::MAX_UNFRAGMENTED_PAYLOAD {
+                // Stop at the first record that does not fit rather than
+                // skipping it: `taken` is a prefix length, and the caller
+                // relies on that to line the ack bitmap up with the records
+                // it queued. A record too large to ever fit is handled by the
+                // caller, which drops that one record and continues.
+                break;
+            }
+            used += cost;
+            taken += 1;
+        }
+        if taken == 0 {
+            return None;
+        }
+        let request_id = self.next_request_id();
+        let msg =
+            messages::build_store_batch(self.local_id, request_id, records[..taken].to_vec());
+        let bytes = messages::encode_message(&msg, &self.signing_key, true);
+        Some((request_id, bytes, taken))
+    }
+
+    /// Whether a record can ever be carried in a batch at all.
+    ///
+    /// A single `STORE_RECORD` accepts a larger body than a batch can hold,
+    /// so a record between the two limits would stall a batch forever. The
+    /// publisher uses this to skip such a record rather than let it block the
+    /// ones behind it.
+    pub fn record_fits_a_batch(record_len: usize) -> bool {
+        /// The leading record-count byte every batch payload carries.
+        const COUNT_BYTE: usize = 1;
+        COUNT_BYTE + messages::batched_record_wire_len(record_len)
+            <= messages::MAX_UNFRAGMENTED_PAYLOAD
+    }
+
+    /// Keep a copy of a record we are publishing, when this node is one of
+    /// those responsible for its key.
+    ///
+    /// Kademlia expects a publisher that is itself among the closest nodes to
+    /// a key to hold the record like any other storer. Publishing only ever
+    /// sends `STORE_RECORD` to *other* contacts, so without this the node that
+    /// is often nearest its own keys is the one node guaranteed not to serve
+    /// them. On a small network that is fatal: with two peers, each one's
+    /// records live exclusively on the other, and neither can answer a
+    /// `FIND_VALUE` for what it published itself.
+    ///
+    /// Returns whether the record was stored (false when we are not
+    /// responsible for the key, or the store rejected it).
+    ///
+    /// Uses the same responsibility test as the inbound `STORE_RECORD` path,
+    /// so a publisher holds its own record on exactly the keys it would hold
+    /// someone else's.
+    pub fn store_own_record(&mut self, record: &SignedRecord) -> bool {
+        if !self.store_proximity_ok(&record.keyword_hash) {
+            return false;
+        }
+        self.sync_store_scale();
+        self.store.store(
+            record.keyword_hash,
+            record.data.clone(),
+            record.signature,
+            record.publisher_key,
+            record.timestamp,
+        )
+    }
+
+    /// Blobs we already hold for `key`, in `FOUND_VALUE` wire form.
+    ///
+    /// A search only ever queries other nodes, so records in our own store are
+    /// invisible to our own lookups. That is wrong at any size — we may be the
+    /// closest node to the key — and on a small network it is the difference
+    /// between finding everything and finding nothing.
+    ///
+    /// `extra_keys` applies the same multi-keyword intersection a remote peer
+    /// would, so our own store answers a query exactly as another node's
+    /// would rather than contributing everything under the primary key and
+    /// relying on a downstream filter to clean up.
+    pub fn local_records(&self, key: &[u8; 16], extra_keys: &[[u8; 16]]) -> Vec<Vec<u8>> {
+        let mut keys = Vec::with_capacity(1 + extra_keys.len());
+        keys.push(*key);
+        keys.extend_from_slice(extra_keys);
+        intersect_find_value_records(&self.store, &keys)
+            .map(|(_key, blobs)| blobs)
+            .unwrap_or_default()
     }
 
     /// Sign a keyword record with our identity, ready to publish. The
@@ -451,6 +748,7 @@ impl EmberDht {
             }
         };
         out.sender_id = Some(msg.sender_id);
+        self.sync_store_scale();
 
         // Learn the sender as a contact. `sender_pub_key` is always
         // present because we decoded with `has_pub_key = true`; the
@@ -492,9 +790,7 @@ impl EmberDht {
             }
             DhtPayload::FindNode { target } => {
                 out.find_node_received = true;
-                let closest = self
-                    .routing
-                    .find_closest(&target, MAX_CONTACTS_PER_RESPONSE);
+                let closest = self.closest_excluding(&target, msg.sender_id);
                 let found = messages::build_found_node(self.local_id, msg.request_id, closest);
                 out.responses
                     .push(messages::encode_message(&found, &self.signing_key, true));
@@ -514,69 +810,59 @@ impl EmberDht {
                 record,
                 record_signature,
             } => {
-                // Parse + verify the publisher-signed record, and bind the
-                // DHT key to the record's own content key so a publisher
-                // can't scatter a record under unrelated keys. `from_wire`
-                // verifies the Ed25519 signature; `DhtStore::store` checks
-                // it again (defence in depth) and enforces capacity.
-                if let Some(parsed) = SignedRecord::from_wire(&record, record_signature) {
-                    // Anti-reflection for source records: HighID / direct
-                    // sources must claim the observed Noise sender IP so a
-                    // peer cannot point downloaders at a third-party victim.
-                    // Firewalled sources (`SOURCE_FLAG_FIREWALLED`) are exempt:
-                    // they may be STORED by a HighID buddy (proxy path) or from
-                    // a NAT mapping that differs from the STUN hint. Authorship
-                    // is still bound by the publisher Ed25519 signature; the
-                    // record is not republished by storers (see
-                    // `DhtStore::take_republish_batch`).
-                    let source_ip_ok = match parsed.source_contact {
-                        Some(sc) if sc.flags & SOURCE_FLAG_FIREWALLED != 0 => true,
-                        Some(sc) => from.ip() == std::net::IpAddr::V4(sc.ip),
-                        None => parsed.record_type != RECORD_TYPE_SOURCE,
-                    };
-                    // Slice 14: collapse identical STORE frames (same publisher
-                    // signature) for a short window so a retransmit storm can't
-                    // re-verify the same blob forever. Hourly republish still
-                    // lands after the TTL.
-                    let mut hasher = blake3::Hasher::new();
-                    hasher.update(&parsed.publisher_key);
-                    hasher.update(&record_signature);
-                    let sig_key = *hasher.finalize().as_bytes();
-                    let now_inst = Instant::now();
-                    if self.store_sig_seen.len() > MAX_STORE_SIG_CACHE / 2 {
-                        self.store_sig_seen
-                            .retain(|_, t| now_inst.duration_since(*t) < STORE_SIG_REPLAY_TTL);
-                    }
-                    let is_replay = self
-                        .store_sig_seen
-                        .get(&sig_key)
-                        .map(|t| now_inst.duration_since(*t) < STORE_SIG_REPLAY_TTL)
-                        .unwrap_or(false);
-                    if is_replay {
-                        out.store_replay_rejected = true;
-                    } else if key == parsed.keyword_hash
-                        && source_ip_ok
-                        && self.store_proximity_ok(&key)
-                        && self.store.store(
-                            key,
-                            record,
-                            record_signature,
-                            parsed.publisher_key,
-                            parsed.timestamp,
-                        )
-                    {
-                        if self.store_sig_seen.len() < MAX_STORE_SIG_CACHE {
-                            self.store_sig_seen.insert(sig_key, now_inst);
-                        }
+                match self.accept_record(key, record, record_signature, from) {
+                    StoreOutcome::Stored => {
                         out.stored_record = true;
                         let ack = messages::build_store_ack(self.local_id, msg.request_id, key);
                         out.responses
                             .push(messages::encode_message(&ack, &self.signing_key, true));
                     }
+                    StoreOutcome::Replay => out.store_replay_rejected = true,
+                    // A record that fails to parse/verify, whose key does not
+                    // match its content, or (for a non-firewalled source)
+                    // whose claimed IP doesn't match the sender, is dropped
+                    // with no ACK.
+                    StoreOutcome::Rejected => {}
                 }
-                // A record that fails to parse/verify, whose key does not
-                // match its content, or (for a non-firewalled source) whose
-                // claimed IP doesn't match the sender, is dropped with no ACK.
+            }
+            DhtPayload::StoreBatch { records } => {
+                // Identical acceptance rules to a single STORE, applied
+                // record by record: batching is a framing optimisation and
+                // must not become a way to store something a lone STORE
+                // could not.
+                // Report acceptance per record. The publisher retires a file
+                // only when the record carrying it actually landed, so a
+                // total would let one accepted record retire the whole batch.
+                let mut accepted = 0u64;
+                let mut stored = 0u16;
+                for (i, rec) in records.into_iter().enumerate() {
+                    match self.accept_record(rec.key, rec.record, rec.record_signature, from) {
+                        StoreOutcome::Stored => {
+                            accepted |= 1u64 << i;
+                            stored = stored.saturating_add(1);
+                        }
+                        StoreOutcome::Replay => {
+                            // A replay means we already hold this exact
+                            // record, which is what the publisher wanted, so
+                            // it counts as placed.
+                            accepted |= 1u64 << i;
+                            out.store_replay_rejected = true;
+                        }
+                        StoreOutcome::Rejected => {}
+                    }
+                }
+                out.stored_record = stored > 0;
+                out.batch_records_stored = stored;
+                // Always answer, even with nothing accepted: the publisher
+                // needs to tell "stored nothing" apart from "never arrived"
+                // so it can retry rather than assume the records are placed.
+                let ack =
+                    messages::build_store_batch_ack(self.local_id, msg.request_id, accepted);
+                out.responses
+                    .push(messages::encode_message(&ack, &self.signing_key, true));
+            }
+            DhtPayload::StoreBatchAck { accepted } => {
+                out.store_batch_ack = Some((msg.request_id, accepted));
             }
             DhtPayload::ProxyStore {
                 key,
@@ -611,9 +897,7 @@ impl EmberDht {
                 // the asker so both tables thicken without a FIND_NODE.
                 out.announce_peer_received = true;
                 Self::merge_gossip_contacts(&mut self.routing, &contacts, &mut out);
-                let closest = self
-                    .routing
-                    .find_closest(&msg.sender_id, MAX_CONTACTS_PER_RESPONSE);
+                let closest = self.closest_excluding(&msg.sender_id, msg.sender_id);
                 let peer_list =
                     messages::build_peer_list(self.local_id, msg.request_id, closest);
                 out.responses
@@ -761,15 +1045,34 @@ fn intersect_find_value_records(
         return None;
     }
 
-    let blobs: Vec<Vec<u8>> = filtered
-        .iter()
-        .map(|r| {
-            let mut b = Vec::with_capacity(r.data.len() + 64);
-            b.extend_from_slice(&r.data);
-            b.extend_from_slice(&r.signature);
-            b
-        })
-        .collect();
+    // Pack records until the reply would stop fitting a datagram. A key can
+    // legitimately hold far more records than one response can carry, and an
+    // oversized reply is dropped undecrypted by the receiver, so the node
+    // holding the most records for a popular key would otherwise be the one
+    // node that can never answer for it. A partial answer is always better:
+    // the searcher merges results across the peers it walks.
+    let mut used = 0usize;
+    let mut blobs: Vec<Vec<u8>> = Vec::new();
+    for r in &filtered {
+        if blobs.len() >= messages::MAX_FOUND_VALUE_RECORDS {
+            break;
+        }
+        let cost = 2 + r.data.len() + 64;
+        if used + cost > messages::MAX_FOUND_VALUE_RECORD_BYTES {
+            // Records vary in size, so keep scanning for a smaller one that
+            // still fits rather than stopping at the first oversized record.
+            continue;
+        }
+        used += cost;
+        let mut b = Vec::with_capacity(r.data.len() + 64);
+        b.extend_from_slice(&r.data);
+        b.extend_from_slice(&r.signature);
+        blobs.push(b);
+    }
+
+    if blobs.is_empty() {
+        return None;
+    }
     Some((primary, blobs))
 }
 
@@ -778,11 +1081,53 @@ mod tests {
     use super::*;
 
     fn dht(seed: u8) -> EmberDht {
-        EmberDht::new([seed; 32])
+        EmberDht::new([seed; 32], false)
     }
 
     fn addr(last: u8, port: u16) -> SocketAddr {
         SocketAddr::from(([10, 0, 0, last], port))
+    }
+
+    /// Publishing sends `STORE_RECORD` only to *other* contacts, so a node
+    /// that is itself responsible for a key used to be the one node that
+    /// could not answer a `FIND_VALUE` for its own record. With two peers
+    /// that means each one's records live solely on the other, and neither
+    /// side's search finds anything — which is exactly what a two-node test
+    /// produced before this.
+    #[test]
+    fn a_publisher_serves_its_own_record() {
+        let mut d = dht(3);
+        let record = d.build_keyword_record("holiday", [0x11; 16], [0x22; 32], 4096, "holiday.mkv");
+        let key = record.keyword_hash;
+
+        assert!(d.local_records(&key, &[]).is_empty(), "nothing stored yet");
+        assert!(d.store_own_record(&record), "we are responsible for this key");
+
+        let held = d.local_records(&key, &[]);
+        assert_eq!(held.len(), 1);
+        let mut expected = record.data.clone();
+        expected.extend_from_slice(&record.signature);
+        assert_eq!(held[0], expected, "served blob must be FOUND_VALUE-shaped");
+    }
+
+    /// The stored blob has to survive the same parse a searcher runs on
+    /// anything that arrives over the wire, or seeding a search from the
+    /// local store would hand it records it then silently discards.
+    #[test]
+    fn a_locally_served_record_round_trips_through_the_wire_parser() {
+        let mut d = dht(4);
+        let record = d.build_keyword_record("ember", [0xAB; 16], [0xCD; 32], 1234, "ember.iso");
+        assert!(d.store_own_record(&record));
+
+        let blob = d.local_records(&record.keyword_hash, &[]).remove(0);
+        let parsed = SignedRecord::from_value_blob(&blob).expect("blob must re-verify");
+        assert_eq!(
+            parsed.record_type,
+            super::super::publish::RECORD_TYPE_KEYWORD
+        );
+        assert_eq!(parsed.keyword_hash, record.keyword_hash);
+        assert_eq!(parsed.file_hash, [0xAB; 16]);
+        assert_eq!(parsed.file_name, "ember.iso");
     }
 
     #[test]
@@ -1003,6 +1348,260 @@ mod tests {
             }
         }
         assert!(engine.contact_count() <= before);
+    }
+
+    /// Batching is a framing change only: many records reach a peer in one
+    /// datagram, and each is subject to exactly the checks a lone STORE would
+    /// apply.
+    #[test]
+    fn a_store_batch_stores_every_record_and_fits_one_datagram() {
+        let mut a = dht(30);
+        let mut b = dht(31);
+        let a_noise = [0xAA; 32];
+        let b_noise = [0xBB; 32];
+        let a_addr = addr(30, 4672);
+        let b_addr = addr(31, 4672);
+
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let records: Vec<messages::BatchedRecord> = (0..12u8)
+            .map(|i| {
+                let rec = SignedRecord::keyword(
+                    &format!("word{i}"),
+                    [i; 16],
+                    [0u8; 32],
+                    100,
+                    "a-release-name.iso",
+                    &sk,
+                );
+                messages::BatchedRecord {
+                    key: rec.keyword_hash,
+                    record: rec.data.clone(),
+                    record_signature: rec.signature,
+                }
+            })
+            .collect();
+
+        // Drain the way the publisher does: as many datagrams as the byte
+        // budget requires, each one deliverable on its own.
+        let mut remaining = records.clone();
+        let mut frames = 0;
+        let mut acked_total = 0usize;
+        while !remaining.is_empty() {
+            let (rid, frame, taken) = a.build_store_batch(&remaining).expect("a batch");
+            assert!(taken > 0, "each batch must make progress");
+            assert!(
+                frame.len() + messages::TRANSPORT_OVERHEAD
+                    <= messages::MAX_UNFRAGMENTED_DATAGRAM,
+                "a batch must not fragment"
+            );
+            frames += 1;
+
+            let on_b = b.handle_message(&frame, a_addr, a_noise, 1000 + frames);
+            assert_eq!(on_b.batch_records_stored as usize, taken);
+            assert_eq!(on_b.responses.len(), 1, "exactly one ack per batch");
+
+            let on_a = a.handle_message(&on_b.responses[0], b_addr, b_noise, 2000 + frames);
+            let (ack_rid, accepted) = on_a.store_batch_ack.expect("ack decodes");
+            assert_eq!(ack_rid, rid);
+            // The ack names the accepted records positionally, so the set
+            // bits must be exactly the batch's records and no others.
+            assert_eq!(
+                accepted.count_ones() as usize,
+                taken,
+                "every record in this batch was stored, so every bit is set"
+            );
+            assert_eq!(
+                accepted >> taken,
+                0,
+                "no bit may be set past the batch's record count"
+            );
+            acked_total += accepted.count_ones() as usize;
+
+            remaining.drain(..taken);
+        }
+        assert!(frames > 1, "twelve records exceed one datagram");
+        assert_eq!(acked_total, records.len());
+        assert_eq!(b.store_stats().1, records.len());
+
+        // Every record is individually retrievable, so batching did not merge
+        // or lose any of them.
+        for rec in &records {
+            let (_frid, find) = a.build_find_value(vec![rec.key]);
+            let hit = b.handle_message(&find, a_addr, a_noise, 1002);
+            assert!(hit.find_value_hit, "each batched key must be servable");
+        }
+    }
+
+    /// A batch that overflows one datagram is split rather than sent whole
+    /// and silently dropped by the peer.
+    #[test]
+    fn an_oversized_batch_is_split_across_datagrams() {
+        let mut a = dht(32);
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[43u8; 32]);
+        let long_name = "x".repeat(200);
+        let records: Vec<messages::BatchedRecord> = (0..40u8)
+            .map(|i| {
+                let rec =
+                    SignedRecord::keyword(&format!("w{i}"), [i; 16], [0u8; 32], 1, &long_name, &sk);
+                messages::BatchedRecord {
+                    key: rec.keyword_hash,
+                    record: rec.data.clone(),
+                    record_signature: rec.signature,
+                }
+            })
+            .collect();
+
+        let (_rid, frame, taken) = a.build_store_batch(&records).expect("a batch");
+        assert!(taken < records.len(), "the batch must be split");
+        assert!(taken > 0, "and must still make progress");
+        assert!(
+            frame.len() + messages::TRANSPORT_OVERHEAD <= messages::MAX_UNFRAGMENTED_DATAGRAM
+        );
+    }
+
+    /// Responsibility is "am I among the k closest I know of", not a fixed
+    /// half of the key space. A node that knows fewer than k contacts is
+    /// among the k closest to everything, so it must hold every key — the old
+    /// half-space rule discarded about half of them on a coin flip.
+    #[test]
+    fn a_sparse_node_is_responsible_for_every_key() {
+        let mut d = dht(3);
+        for i in 0..256u32 {
+            let keyword = format!("keyword{i}");
+            let key = crate::network::ember::dht::search::keyword_hash(&keyword);
+            let record = d.build_keyword_record(&keyword, [1u8; 16], [0u8; 32], 10, "f.iso");
+            assert_eq!(record.keyword_hash, key);
+            assert!(
+                d.store_own_record(&record),
+                "a node knowing no contacts must hold {keyword}, on either side of its ID"
+            );
+            assert!(!d.local_records(&key, &[]).is_empty());
+        }
+    }
+
+    /// With a full table, a key that k known nodes are all closer to is not
+    /// ours to hold.
+    #[test]
+    fn a_well_connected_node_declines_keys_it_is_far_from() {
+        let mut d = dht(4);
+        let local = d.local_id();
+
+        // Fill the table with contacts clustered around a far corner of the
+        // key space, so keys near them are better served by them than by us.
+        // Distinct /24s so the routing table's diversity caps admit them all.
+        for i in 0..(K_BUCKET_SIZE as u8 + 4) {
+            let mut id = [0xFFu8; 16];
+            id[15] = i;
+            let contact = EmberContact {
+                node_id: EmberNodeId(id),
+                addr: SocketAddr::from(([80, i, 1, 1], 4672)),
+                noise_pub: [i; 32],
+                ed25519_pub: [i; 32],
+                last_seen: chrono::Utc::now().timestamp(),
+                failed_queries: 0,
+            };
+            let _ = d.add_contact(contact);
+        }
+        assert!(
+            d.routing.find_closest(&EmberNodeId([0xFF; 16]), K_BUCKET_SIZE).len()
+                >= K_BUCKET_SIZE,
+            "the table needs k contacts for proximity gating to engage"
+        );
+
+        // A key sitting right on that cluster: those contacts are all much
+        // closer to it than we are.
+        let mut far_key = [0xFFu8; 16];
+        far_key[15] = 0x01;
+        assert!(
+            !d.store_proximity_ok(&far_key),
+            "a key k closer nodes cover is not ours to hold"
+        );
+        // A key adjacent to our own ID is still ours.
+        assert!(d.store_proximity_ok(&local.0));
+    }
+
+    #[test]
+    fn a_full_found_value_frame_fits_a_datagram() {
+        // A key holding far more records than one reply can carry must still
+        // produce a deliverable answer. An oversized datagram is discarded by
+        // the receiver before decryption, so the sender sees a clean send and
+        // the searcher sees only a timeout.
+        let mut a = dht(26);
+        let mut b = dht(27);
+        let a_noise = [0xAA; 32];
+        let a_addr = addr(26, 4672);
+
+        let probe = a.build_keyword_record("linux", [0u8; 16], [0u8; 32], 1, "x.iso");
+        let key = probe.keyword_hash;
+
+        // Many distinct publishers, each with a long file name, all under one
+        // key — the shape a popular keyword takes on a healthy network.
+        let name = "a-fairly-long-release-file-name-for-sizing.iso";
+        for i in 0..80u8 {
+            let sk = ed25519_dalek::SigningKey::from_bytes(&[i.wrapping_add(1); 32]);
+            let rec = SignedRecord::keyword("linux", [i; 16], [0u8; 32], 1, name, &sk);
+            assert_eq!(rec.keyword_hash, key);
+            assert!(b.store.store(
+                key,
+                rec.data.clone(),
+                rec.signature,
+                rec.publisher_key,
+                rec.timestamp,
+            ));
+        }
+
+        let (_frid, find_bytes) = a.build_find_value(vec![key]);
+        let on_b = b.handle_message(&find_bytes, a_addr, a_noise, 1000);
+        assert!(on_b.find_value_hit, "the key is held and must be answered");
+        assert_eq!(on_b.responses.len(), 1);
+
+        let frame = &on_b.responses[0];
+        let datagram = frame.len() + messages::TRANSPORT_OVERHEAD;
+        assert!(
+            datagram <= crate::network::ember::transport::MAX_EMBER_DATAGRAM_BYTES,
+            "FOUND_VALUE datagram would be {datagram} bytes, over the transport cap"
+        );
+
+        // And it still round-trips with real records in it.
+        let on_a = a.handle_message(frame, addr(27, 4672), [0xBB; 32], 1001);
+        let (_rid, blobs) = on_a.found_value.expect("A should see a FOUND_VALUE");
+        assert!(!blobs.is_empty(), "a partial answer, not an empty one");
+        assert!(
+            blobs.len() < 80,
+            "the reply must be trimmed, not carry all 80"
+        );
+    }
+
+    #[test]
+    fn an_over_long_find_value_still_gets_answered() {
+        // A peer rejects a FIND_VALUE carrying more than MAX_FIND_VALUE_KEYS
+        // at decode and sends nothing back, so a long multi-keyword query
+        // would otherwise go unanswered by every node it reached.
+        let mut a = dht(24);
+        let mut b = dht(25);
+        let a_noise = [0xAA; 32];
+        let a_addr = addr(24, 4672);
+
+        let record = a.build_keyword_record("ubuntu", [9u8; 16], [0u8; 32], 4096, "ubuntu.iso");
+        let key = record.keyword_hash;
+        let (_rid, store_bytes) = a.build_store(key, record.data.clone(), record.signature);
+        assert!(b.handle_message(&store_bytes, a_addr, a_noise, 1000).stored_record);
+
+        let mut keys = vec![key];
+        for i in 0..(messages::MAX_FIND_VALUE_KEYS as u8 + 4) {
+            keys.push([i; 16]);
+        }
+        let (_frid, find_bytes) = a.build_find_value(keys);
+
+        let on_b = b.handle_message(&find_bytes, a_addr, a_noise, 1001);
+        assert!(
+            on_b.find_value_received,
+            "peer must be able to decode the request"
+        );
+        assert!(
+            on_b.find_value_hit,
+            "the primary key survives truncation and still hits"
+        );
     }
 
     #[test]

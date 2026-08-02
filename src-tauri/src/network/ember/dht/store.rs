@@ -6,12 +6,22 @@ use tracing::debug;
 use crate::network::ember::crypto;
 
 use super::publish::RECORD_TYPE_SOURCE;
-use super::EmberNodeId;
+use super::{scale, EmberNodeId};
 
 /// Maximum records per key (anti-spam).
 const MAX_RECORDS_PER_KEY: usize = 300;
 /// Maximum total keys stored.
 const MAX_KEYS: usize = 50_000;
+/// Ceiling on resident record bytes.
+///
+/// Key and per-key counts alone left the total unbounded: 50,000 keys times
+/// 300 records is far more than a desktop application should ever hold, and
+/// an attacker choosing keys can steer records at us deliberately. This is
+/// the limit that actually protects memory; when it is reached the least
+/// valuable records (furthest from our ID, then nearest expiry) are dropped
+/// rather than refusing the newcomer, so a full store still tracks the keys
+/// we are most responsible for.
+const MAX_STORE_BYTES: usize = 48 * 1024 * 1024;
 /// Default record TTL.
 const DEFAULT_RECORD_TTL: Duration = Duration::from_secs(24 * 3600);
 /// How far a record's signed creation timestamp may sit in the future before
@@ -41,6 +51,17 @@ pub struct DhtRecord {
     /// and `last_republished` rather than by store time.
     #[allow(dead_code)]
     pub stored_at: Instant,
+    /// The publisher's signed creation time, kept so a replayed older copy
+    /// cannot replace a newer one.
+    pub created_at: i64,
+    /// Address the per-IP source cap counts this record against, when it
+    /// should not be the one the record declares.
+    ///
+    /// A firewalled source record is exempt from the anti-reflection IP bind,
+    /// so its declared address is unverified and an attacker can invent a new
+    /// one per record — each getting a fresh quota. Those are attributed to
+    /// the peer we actually received them from instead.
+    pub attributed_ip: Option<std::net::Ipv4Addr>,
     /// When this record expires.
     pub expires_at: Instant,
     /// When we last (re)published this record to the closest nodes. Used by
@@ -57,12 +78,143 @@ pub struct DhtRecord {
 /// sources for the same file).
 pub struct DhtStore {
     entries: HashMap<[u8; 16], Vec<DhtRecord>>,
+    /// Current permissiveness of the abuse limits, refreshed from the routing
+    /// table. Defaults to the most permissive tier so a store used before the
+    /// scale is known never rejects a legitimate record.
+    scale: scale::NetworkScale,
+    /// Where the next republish scan resumes: the key to start at and how
+    /// many of its records the previous pass already took. `None` starts a
+    /// fresh pass. Keyed rather than positional, because the map's iteration
+    /// order reshuffles on every mutation.
+    republish_cursor: Option<([u8; 16], usize)>,
+    /// Running total of record body bytes, so the byte budget can be checked
+    /// without walking every key.
+    bytes: usize,
+    /// Our node ID, used to decide which records are least worth keeping when
+    /// the budget is reached. `None` until set, in which case eviction falls
+    /// back to expiry order alone.
+    local_id: Option<EmberNodeId>,
+    /// Resident-byte ceiling. A field rather than a constant so tests can
+    /// exercise eviction without signing tens of thousands of records.
+    byte_budget: usize,
 }
 
 impl DhtStore {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            scale: scale::NetworkScale::Bootstrap,
+            republish_cursor: None,
+            bytes: 0,
+            local_id: None,
+            byte_budget: MAX_STORE_BYTES,
+        }
+    }
+
+    /// Track how permissive the abuse limits should currently be.
+    pub fn set_scale(&mut self, scale: scale::NetworkScale) {
+        self.scale = scale;
+    }
+
+    /// Tell the store our node ID so it can rank records by responsibility
+    /// when the byte budget forces an eviction.
+    pub fn set_local_id(&mut self, local_id: EmberNodeId) {
+        self.local_id = Some(local_id);
+    }
+
+    /// Resident record bytes. The observable side of the byte budget, kept
+    /// for the tests that pin eviction and for diagnostics.
+    #[allow(dead_code)]
+    pub fn byte_len(&self) -> usize {
+        self.bytes
+    }
+
+    /// Shrink the byte ceiling so eviction can be exercised without signing
+    /// tens of thousands of records (Ed25519 verification dominates in a
+    /// debug build).
+    #[cfg(test)]
+    fn set_byte_budget_for_test(&mut self, budget: usize) {
+        self.byte_budget = budget;
+    }
+
+    /// Free space by dropping the records we are least responsible for.
+    ///
+    /// Ranking is by XOR distance from our own ID first — a record far from
+    /// us is one many other nodes are better placed to serve — and by nearest
+    /// expiry within that, so the drop costs the network as little as
+    /// possible.
+    /// `spare` is the key of a record we have just accepted; it is never
+    /// chosen as a victim, so `store` cannot report success for a record that
+    /// this call then throws away.
+    fn enforce_byte_budget(&mut self, spare: &[u8; 16]) {
+        if self.bytes <= self.byte_budget {
+            return;
+        }
+        // Free down to a low-water mark rather than to exactly the budget.
+        // Ranking the whole store is O(n log n), and trimming to the line
+        // would re-run it on every subsequent insert; with headroom it runs
+        // once per ~10% of capacity instead.
+        let target = self.byte_budget - self.byte_budget / 10;
+        let local = self.local_id;
+
+        // Rank keys, not individual records: every record under a key shares
+        // the key's distance, so the choice of which key to give up is the
+        // only one distance can decide. Expiry then picks the order within a
+        // key.
+        let mut ranked: Vec<([u8; 16], [u8; 16])> = self
+            .entries
+            .keys()
+            .filter(|key| *key != spare)
+            .map(|key| {
+                let distance = match local {
+                    Some(id) => {
+                        let mut d = [0u8; 16];
+                        for i in 0..16 {
+                            d[i] = id.0[i] ^ key[i];
+                        }
+                        d
+                    }
+                    None => [0u8; 16],
+                };
+                (*key, distance)
+            })
+            .collect();
+        // Furthest from us first: those are the keys other nodes are best
+        // placed to serve.
+        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let mut dropped = 0usize;
+        'keys: for (key, _) in ranked {
+            let Some(records) = self.entries.get_mut(&key) else {
+                continue;
+            };
+            while self.bytes > target {
+                // Within a key, give up whatever expires soonest — it is
+                // worth the least to the network.
+                let Some(soonest) = records
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, r)| r.expires_at)
+                    .map(|(i, _)| i)
+                else {
+                    break;
+                };
+                let victim = records.remove(soonest);
+                self.bytes = self.bytes.saturating_sub(victim.data.len());
+                dropped += 1;
+            }
+            if records.is_empty() {
+                self.entries.remove(&key);
+            }
+            if self.bytes <= target {
+                break 'keys;
+            }
+        }
+        if dropped > 0 {
+            debug!(
+                "DHT store over budget: dropped {dropped} record(s), now {} bytes",
+                self.bytes
+            );
         }
     }
 
@@ -89,6 +241,24 @@ impl DhtStore {
         signature: [u8; 64],
         publisher_key: [u8; 32],
         created_at: i64,
+    ) -> bool {
+        self.store_attributed(key, data, signature, publisher_key, created_at, None)
+    }
+
+    /// [`Self::store`], attributing the record to `attributed_ip` for the
+    /// per-IP source cap instead of the address it declares.
+    ///
+    /// Used for firewalled source records, whose declared address is exempt
+    /// from the anti-reflection bind and therefore unverified: without this
+    /// one host can invent a fresh address per record and claim a whole key.
+    pub fn store_attributed(
+        &mut self,
+        key: [u8; 16],
+        data: Vec<u8>,
+        signature: [u8; 64],
+        publisher_key: [u8; 32],
+        created_at: i64,
+        attributed_ip: Option<std::net::Ipv4Addr>,
     ) -> bool {
         if !verify_record_signature(&data, &signature, &publisher_key) {
             debug!(
@@ -127,30 +297,107 @@ impl DhtStore {
         let now = Instant::now();
         let expires_at = now + Duration::from_secs((ttl_secs - age) as u64);
         let incoming_ember = ember_digest_from_record_data(&data);
+        let incoming_file = file_hash_from_record_data(&data);
         let record = DhtRecord {
             data,
             signature,
             publisher_key,
             stored_at: now,
+            created_at,
+            attributed_ip,
             expires_at,
             last_republished: now,
         };
 
         let records = self.entries.entry(key).or_insert_with(Vec::new);
 
-        // Deduplicate: replace if same publisher already has a record for this key.
+        // Deduplicate on (publisher, file), not on publisher alone. A keyword
+        // key legitimately holds one record per file a publisher shares under
+        // that word, so matching on the publisher would make each new file
+        // overwrite the last and leave exactly one discoverable file per
+        // keyword per peer. For a source key every record already describes
+        // the same file, so adding the file hash changes nothing there.
+        //
         // Prefer a non-zero ember_file_hash over a later all-zero republish so
         // pre-upgrade zero digests do not clobber a real content hash.
-        if let Some(pos) = records
-            .iter()
-            .position(|r| r.publisher_key == publisher_key)
-        {
-            let existing_ember = ember_digest_from_record_data(&records[pos].data);
-            if existing_ember != [0u8; 32] && incoming_ember == [0u8; 32] {
+        if let Some(pos) = records.iter().position(|r| {
+            r.publisher_key == publisher_key && file_hash_from_record_data(&r.data) == incoming_file
+        }) {
+            // Never let an older copy displace a newer one. Records are
+            // public — anyone can harvest `data || signature` from a
+            // FOUND_VALUE — so without this an attacker could keep re-storing
+            // the oldest copy they had seen and pin a publisher's record to
+            // that copy's (earlier) expiry, or roll back its metadata.
+            if records[pos].created_at > created_at {
+                debug!(
+                    "Key {} already holds a newer record from this publisher, ignoring replay",
+                    hex::encode(key)
+                );
                 return true;
             }
+
+            let existing_ember = ember_digest_from_record_data(&records[pos].data);
+            if existing_ember != [0u8; 32] && incoming_ember == [0u8; 32] {
+                // Keep the richer digest, but still treat this as the
+                // republish it is: the publisher is alive and re-announcing,
+                // so the record's life should be extended. Previously this
+                // ACKed and did nothing, letting a publisher whose file has
+                // left the local index watch its record expire on schedule
+                // while every republish reported success.
+                records[pos].created_at = created_at;
+                records[pos].expires_at = expires_at;
+                records[pos].last_republished = now;
+                return true;
+            }
+            let old_len = records[pos].data.len();
+            let new_len = record.data.len();
             records[pos] = record;
+            debug_assert!(
+                self.bytes >= old_len,
+                "byte counter fell behind resident records"
+            );
+            self.bytes = self.bytes + new_len - old_len.min(self.bytes);
+            self.enforce_byte_budget(&key);
             return true;
+        }
+
+        // Note on publisher diversity: a per-sender cap on how many distinct
+        // publisher identities may be introduced under one key is tempting,
+        // but it would break replication. A storer legitimately re-publishes
+        // many different publishers' records to the nodes closest to a key,
+        // so "one sender introducing many publishers" is normal Kademlia
+        // behaviour rather than an attack signature. Publisher spam is bounded
+        // instead by MAX_RECORDS_PER_KEY, the byte budget, the per-IP source
+        // cap below, and the per-peer STORE rate limit.
+
+        // Per-IP cap on source records, mirroring KAD's MAX_SOURCES_PER_IP.
+        // A source record names an address to download from, so without this
+        // one host can claim to hold every copy of a file and crowd the real
+        // sources out of the answer.
+        //
+        // Counted against the attributed address where there is one, so a
+        // firewalled source — whose declared address nothing verifies —
+        // cannot buy a fresh quota per invented address.
+        let incoming_ip = record
+            .attributed_ip
+            .or_else(|| source_ip_from_record_data(&record.data));
+        if let Some(ip) = incoming_ip {
+            let max_per_ip = self.scale.max_sources_per_ip();
+            let same_ip = records
+                .iter()
+                .filter(|r| {
+                    r.attributed_ip
+                        .or_else(|| source_ip_from_record_data(&r.data))
+                        == Some(ip)
+                })
+                .count();
+            if same_ip >= max_per_ip {
+                debug!(
+                    "Key {} already has {same_ip} source record(s) attributed to {ip}, rejecting",
+                    hex::encode(key)
+                );
+                return false;
+            }
         }
 
         if records.len() >= MAX_RECORDS_PER_KEY {
@@ -161,7 +408,9 @@ impl DhtStore {
             return false;
         }
 
+        self.bytes += record.data.len();
         records.push(record);
+        self.enforce_byte_budget(&key);
         true
     }
 
@@ -193,12 +442,20 @@ impl DhtStore {
         let now = Instant::now();
         let mut total_removed = 0;
 
+        let mut freed = 0usize;
         self.entries.retain(|_, records| {
             let before = records.len();
-            records.retain(|r| r.expires_at > now);
+            records.retain(|r| {
+                let live = r.expires_at > now;
+                if !live {
+                    freed += r.data.len();
+                }
+                live
+            });
             total_removed += before - records.len();
             !records.is_empty()
         });
+        self.bytes = self.bytes.saturating_sub(freed);
 
         if total_removed > 0 {
             debug!("Expired {total_removed} DHT records");
@@ -220,9 +477,48 @@ impl DhtStore {
     ) -> Vec<(Vec<u8>, [u8; 64])> {
         let now = Instant::now();
         let mut out = Vec::new();
-        for records in self.entries.values_mut() {
-            for r in records.iter_mut() {
+        let ordered: Vec<[u8; 16]> = self.entries.keys().copied().collect();
+        let key_count = ordered.len();
+        if key_count == 0 {
+            self.republish_cursor = None;
+            return out;
+        }
+
+        // Resume at the key we stopped on, and at the record within it.
+        // Restarting from the beginning every pass meant that once more
+        // records were due than one batch could carry, the same prefix was
+        // replicated over and over and the tail was never reached.
+        //
+        // The resume point is a key rather than a position: `entries` is a
+        // HashMap whose iteration order reshuffles whenever it is mutated,
+        // and inbound stores, expiry and budget eviction mutate it constantly
+        // between ticks, so a saved index would point somewhere arbitrary.
+        let (start, mut skip_records) = match self.republish_cursor {
+            Some((key, idx)) => (
+                ordered.iter().position(|k| *k == key).unwrap_or(0),
+                // The key may have shrunk or vanished since we noted it.
+                idx,
+            ),
+            None => (0, 0),
+        };
+
+        for offset in 0..key_count {
+            let key = ordered[(start + offset) % key_count];
+            let Some(records) = self.entries.get_mut(&key) else {
+                skip_records = 0;
+                continue;
+            };
+            for (idx, r) in records.iter_mut().enumerate() {
+                // Only the key we resumed at has records already taken.
+                if idx < skip_records {
+                    continue;
+                }
                 if out.len() >= max {
+                    // Note the exact record to resume at. Recording only the
+                    // key would re-send this key's prefix on every call and,
+                    // under `force` (where everything is always due), never
+                    // reach the records past `max`.
+                    self.republish_cursor = Some((key, idx));
                     return out;
                 }
                 // Source records are never relayed by a third party: their
@@ -241,7 +537,10 @@ impl DhtStore {
                     out.push((r.data.clone(), r.signature));
                 }
             }
+            skip_records = 0;
         }
+        // The pass covered every key, so the next one starts fresh.
+        self.republish_cursor = None;
         out
     }
 
@@ -291,25 +590,48 @@ impl DhtStore {
         out.truncate(max);
         out
     }
-
-    /// Check if we are responsible for storing a key based on proximity.
-    /// A node stores a key if its distance to the key is within tolerance.
-    pub fn should_store(local_id: &EmberNodeId, key: &[u8; 16]) -> bool {
-        let key_id = EmberNodeId(*key);
-        let dist = local_id.distance(&key_id);
-        // Accept keys in the close half of the ID space (XOR MSB clear →
-        // `leading_bit_index < 127`). The previous `bit < 120` threshold
-        // required eight leading zero bits (~1/256 of keys) and rejected
-        // almost all legitimate STOREs once the table was large enough to
-        // enable proximity gating.
-        match dist.leading_bit_index() {
-            None => true,
-            Some(bit) => bit < 127,
-        }
-    }
 }
 
-/// Extract the Ember BLAKE3 digests from packed record bytes (`… || ember[32] || …`).
+/// The address a source record points at, or `None` for any other record
+/// type or a truncated body.
+///
+/// The contact block sits after the variable-length file name, so the offset
+/// has to be read out of the record rather than being a constant.
+fn source_ip_from_record_data(data: &[u8]) -> Option<std::net::Ipv4Addr> {
+    use super::publish::{RECORD_HEADER_LEN, SOURCE_CONTACT_WIRE_LEN};
+
+    if data.first() != Some(&RECORD_TYPE_SOURCE) || data.len() < RECORD_HEADER_LEN {
+        return None;
+    }
+    let name_len = u16::from_le_bytes([
+        data[RECORD_HEADER_LEN - 2],
+        data[RECORD_HEADER_LEN - 1],
+    ]) as usize;
+    let off = RECORD_HEADER_LEN.checked_add(name_len)?;
+    // The whole contact block, not just the four address bytes: a record
+    // truncated mid-block is one `SignedRecord::from_wire` rejects outright,
+    // and reading an address out of it here would disagree with that.
+    if data.len() < off + SOURCE_CONTACT_WIRE_LEN {
+        return None;
+    }
+    Some(std::net::Ipv4Addr::new(
+        data[off],
+        data[off + 1],
+        data[off + 2],
+        data[off + 3],
+    ))
+}
+
+/// The eD2K file hash embedded in a record body, at the fixed offset that
+/// follows `record_type` and `keyword_hash`. Zero when the body is truncated.
+fn file_hash_from_record_data(data: &[u8]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    if data.len() >= 33 {
+        out.copy_from_slice(&data[17..33]);
+    }
+    out
+}
+
 fn ember_digest_from_record_data(data: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     if data.len() >= 65 {
@@ -387,6 +709,324 @@ mod tests {
         let records = store.get(&key).unwrap();
         assert_eq!(records[0].data, d2); // updated
         assert_eq!(records[1].data, d3);
+    }
+
+    #[test]
+    fn one_publisher_keeps_a_record_per_file_under_a_keyword() {
+        // A keyword key holds one record per file sharing that word, so two
+        // files from the same peer must both survive. Deduplicating on the
+        // publisher alone left a peer with a single discoverable file per
+        // keyword, whichever it published last.
+        use super::super::publish::SignedRecord;
+
+        let mut store = DhtStore::new();
+        let sk = SigningKey::generate(&mut OsRng);
+
+        let first = SignedRecord::keyword("ubuntu", [0xA1; 16], [0u8; 32], 100, "ubuntu-24.iso", &sk);
+        let second =
+            SignedRecord::keyword("ubuntu", [0xB2; 16], [0u8; 32], 200, "ubuntu-22.iso", &sk);
+        assert_eq!(
+            first.keyword_hash, second.keyword_hash,
+            "both files live under the same keyword key"
+        );
+        assert_eq!(first.publisher_key, second.publisher_key);
+
+        let key = first.keyword_hash;
+        for rec in [&first, &second] {
+            assert!(store.store(
+                key,
+                rec.data.clone(),
+                rec.signature,
+                rec.publisher_key,
+                rec.timestamp,
+            ));
+        }
+
+        assert_eq!(store.total_records(), 2, "both files remain discoverable");
+
+        // Republishing the first file still replaces its own record rather
+        // than accumulating duplicates.
+        let refreshed =
+            SignedRecord::keyword("ubuntu", [0xA1; 16], [0u8; 32], 100, "ubuntu-24.iso", &sk);
+        assert!(store.store(
+            key,
+            refreshed.data.clone(),
+            refreshed.signature,
+            refreshed.publisher_key,
+            refreshed.timestamp,
+        ));
+        assert_eq!(store.total_records(), 2, "a republish is not a new record");
+    }
+
+    /// A source record names an address to download from. Without a per-IP
+    /// cap one host can claim to hold every copy of a file and crowd the
+    /// genuine sources out of the answer.
+    #[test]
+    fn one_address_cannot_claim_every_source_slot() {
+        use super::super::publish::{SignedRecord, SourceContact};
+        use std::net::Ipv4Addr;
+
+        let mut store = DhtStore::new();
+        store.set_scale(scale::NetworkScale::Established);
+        let file_hash = [0x77u8; 16];
+        let key = super::super::publish::source_key(&file_hash);
+        let squatter = Ipv4Addr::new(198, 51, 1, 9);
+
+        let mut accepted = 0;
+        for i in 0..10u8 {
+            let sk = SigningKey::from_bytes(&[i.wrapping_add(1); 32]);
+            let rec = SignedRecord::source(
+                file_hash,
+                [0u8; 32],
+                1,
+                "big.iso",
+                SourceContact {
+                    ip: squatter,
+                    tcp_port: 4662,
+                    udp_port: 4672,
+                    flags: 0,
+                    noise_pub: [i; 32],
+                },
+                &sk,
+            );
+            if store.store(key, rec.data.clone(), rec.signature, rec.publisher_key, rec.timestamp) {
+                accepted += 1;
+            }
+        }
+        assert_eq!(
+            accepted,
+            scale::NetworkScale::Established.max_sources_per_ip(),
+            "the cap must bound how many sources one address contributes"
+        );
+
+        // A different address is unaffected by the squatter's quota.
+        let sk = SigningKey::from_bytes(&[200u8; 32]);
+        let honest = SignedRecord::source(
+            file_hash,
+            [0u8; 32],
+            1,
+            "big.iso",
+            SourceContact {
+                ip: Ipv4Addr::new(198, 51, 2, 9),
+                tcp_port: 4662,
+                udp_port: 4672,
+                flags: 0,
+                noise_pub: [9u8; 32],
+            },
+            &sk,
+        );
+        assert!(
+            store.store(
+                key,
+                honest.data.clone(),
+                honest.signature,
+                honest.publisher_key,
+                honest.timestamp
+            ),
+            "a genuine source from another address must still be accepted"
+        );
+    }
+
+    /// Records are public, so anyone can harvest one from a FOUND_VALUE and
+    /// re-store it. An older copy must not displace a newer one, or a
+    /// publisher's record can be pinned to the older copy's earlier expiry.
+    #[test]
+    fn an_older_copy_cannot_displace_a_newer_record() {
+        use super::super::publish::SignedRecord;
+
+        let mut store = DhtStore::new();
+        let sk = SigningKey::generate(&mut OsRng);
+        let old = SignedRecord::keyword("ubuntu", [1u8; 16], [7u8; 32], 10, "old.iso", &sk);
+        let mut newer =
+            SignedRecord::keyword("ubuntu", [1u8; 16], [8u8; 32], 10, "new.iso", &sk);
+        // Same publisher and file, published later.
+        newer.timestamp = old.timestamp + 60;
+
+        let key = old.keyword_hash;
+        assert!(store.store(
+            key,
+            newer.data.clone(),
+            newer.signature,
+            newer.publisher_key,
+            newer.timestamp
+        ));
+        // Replaying the older copy must not take effect.
+        assert!(store.store(
+            key,
+            old.data.clone(),
+            old.signature,
+            old.publisher_key,
+            old.timestamp
+        ));
+
+        let held = store.get(&key).expect("record present");
+        assert_eq!(held.len(), 1);
+        assert_eq!(
+            held[0].created_at, newer.timestamp,
+            "the newer record must survive the replay"
+        );
+    }
+
+    /// A publisher whose file has left the local index republishes with a
+    /// zero digest. That is a genuine liveness signal, so it must extend the
+    /// record rather than being ACKed and discarded.
+    #[test]
+    fn a_zero_digest_republish_still_extends_the_record() {
+        use super::super::publish::SignedRecord;
+
+        let mut store = DhtStore::new();
+        let sk = SigningKey::generate(&mut OsRng);
+        let rich = SignedRecord::keyword("ubuntu", [1u8; 16], [9u8; 32], 10, "f.iso", &sk);
+        let key = rich.keyword_hash;
+        assert!(store.store(
+            key,
+            rich.data.clone(),
+            rich.signature,
+            rich.publisher_key,
+            rich.timestamp
+        ));
+        let first_expiry = store.get(&key).unwrap()[0].expires_at;
+
+        let mut bare = SignedRecord::keyword("ubuntu", [1u8; 16], [0u8; 32], 10, "f.iso", &sk);
+        bare.timestamp = rich.timestamp + 120;
+        assert!(store.store(
+            key,
+            bare.data.clone(),
+            bare.signature,
+            bare.publisher_key,
+            bare.timestamp
+        ));
+
+        let held = store.get(&key).expect("record present");
+        assert_eq!(held.len(), 1);
+        assert_eq!(
+            ember_digest_from_record_data(&held[0].data),
+            [9u8; 32],
+            "the richer digest is kept"
+        );
+        assert!(
+            held[0].expires_at > first_expiry,
+            "but the republish must still extend the record's life"
+        );
+    }
+
+    /// Key and per-key counts left total memory unbounded, and an attacker
+    /// can choose keys that land on us. The byte budget is the limit that
+    /// actually protects memory.
+    #[test]
+    fn the_store_stays_within_its_byte_budget() {
+        let mut store = DhtStore::new();
+        store.set_local_id(EmberNodeId([0u8; 16]));
+        let budget = 64 * 1024;
+        store.set_byte_budget_for_test(budget);
+
+        let body = vec![super::super::publish::RECORD_TYPE_KEYWORD; 1024];
+        let (sk, pk) = keypair();
+        let sig = sign(&sk, &body);
+        // Twice the budget's worth, so eviction has to run repeatedly.
+        let needed = (budget / body.len()) * 2;
+
+        for i in 0..needed {
+            let mut key = [0u8; 16];
+            key[0..8].copy_from_slice(&(i as u64).to_le_bytes());
+            store.store(key, body.clone(), sig, pk, now_ts());
+        }
+
+        assert!(
+            store.byte_len() <= budget,
+            "store held {} bytes, over the {budget} budget",
+            store.byte_len()
+        );
+        // Whatever we said we stored, we must actually still hold. Returning
+        // true for a record that eviction removed on the way out would have
+        // us ACK a replica the publisher does not have.
+        let mut key = [0u8; 16];
+        key[0..8].copy_from_slice(&((needed - 1) as u64).to_le_bytes());
+        assert!(
+            store.get_live(&key).len() == 1,
+            "the last accepted record must survive its own insert"
+        );
+        assert!(store.total_records() > 0, "eviction must not empty the store");
+
+        // Expiring records returns their bytes to the budget.
+        let before = store.byte_len();
+        store.expire();
+        assert!(store.byte_len() <= before);
+    }
+
+    /// Under `force` every record is always due, so a key holding more
+    /// records than one batch can carry would return the same prefix forever
+    /// and never reach its tail.
+    #[test]
+    fn a_forced_republish_reaches_the_tail_of_a_crowded_key() {
+        let mut store = DhtStore::new();
+        let key = [0x42u8; 16];
+        let total = 12usize;
+        for i in 0..total {
+            let sk = SigningKey::generate(&mut OsRng);
+            let pk = sk.verifying_key().to_bytes();
+            let data = vec![super::super::publish::RECORD_TYPE_KEYWORD, i as u8, 0, 0];
+            assert!(store.store(key, data.clone(), sign(&sk, &data), pk, now_ts()));
+        }
+        assert_eq!(store.get(&key).unwrap().len(), total);
+
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        for _ in 0..total {
+            if seen.len() == total {
+                break;
+            }
+            for (data, _sig) in store.take_republish_batch(Duration::from_secs(3600), 4, true) {
+                seen.insert(data);
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            total,
+            "a forced pass must eventually cover every record under one key"
+        );
+    }
+
+    /// With more records due than one batch can carry, restarting the scan
+    /// from the beginning each pass replicated the same prefix forever and
+    /// never reached the tail.
+    #[test]
+    fn republish_reaches_every_record_across_passes() {
+        let mut store = DhtStore::new();
+        let (sk, pk) = keypair();
+        let total = 20usize;
+        for i in 0..total {
+            // Keyword records: source records are deliberately not relayed by
+            // storers, so they would be skipped by this scan.
+            let data = vec![super::super::publish::RECORD_TYPE_KEYWORD, i as u8, 0, 0];
+            assert!(store.store(
+                [i as u8; 16],
+                data.clone(),
+                sign(&sk, &data),
+                pk,
+                now_ts()
+            ));
+        }
+
+        // Batches of 3 with a zero interval, so everything is always due. A
+        // scan that resumes where it left off covers all 20 in a handful of
+        // passes; one that restarts each time never gets past the first 3.
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        let mut passes = 0;
+        while seen.len() < total && passes < total {
+            for (data, _sig) in store.take_republish_batch(Duration::from_secs(0), 3, false) {
+                seen.insert(data);
+            }
+            passes += 1;
+        }
+        assert_eq!(
+            seen.len(),
+            total,
+            "every record must be republished, not just the first few (after {passes} passes)"
+        );
+        assert!(
+            passes <= total.div_ceil(3) + 1,
+            "coverage took {passes} passes, more than a fair scan needs"
+        );
     }
 
     #[test]
@@ -540,6 +1180,8 @@ mod tests {
             stored_at: Instant::now()
                 .checked_sub(Duration::from_secs(100))
                 .unwrap_or_else(Instant::now),
+            created_at: now_ts() - 100,
+            attributed_ip: None,
             expires_at: Instant::now()
                 .checked_sub(Duration::from_secs(1))
                 .unwrap_or_else(Instant::now),
@@ -573,21 +1215,6 @@ mod tests {
         ));
         let kept = &store.get(&key).unwrap()[0].data;
         assert_eq!(&kept[33..65], &good[33..65]);
-    }
-
-    #[test]
-    fn should_store_accepts_close_half_of_id_space() {
-        let local = EmberNodeId([0u8; 16]);
-        // MSB of XOR clear → close half → accept.
-        let mut close_key = [0u8; 16];
-        close_key[0] = 0x7F;
-        assert!(DhtStore::should_store(&local, &close_key));
-        // MSB of XOR set → far half → reject.
-        let mut far_key = [0u8; 16];
-        far_key[0] = 0x80;
-        assert!(!DhtStore::should_store(&local, &far_key));
-        // Identical key → distance zero → accept.
-        assert!(DhtStore::should_store(&local, &[0u8; 16]));
     }
 
     #[test]

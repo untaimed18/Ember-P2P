@@ -270,10 +270,22 @@ impl IterativeSearch {
             });
         }
 
-        // Re-sort and trim
+        // Re-sort and trim. One response can carry enough closer contacts to
+        // push an entry we are still waiting on past the cap, and trimming
+        // purely by distance would drop it: the search would then see no
+        // in-flight work and could declare itself complete while a response
+        // is genuinely outstanding, and `next_to_query` would undercount the
+        // in-flight total and exceed ALPHA. Entries awaiting a reply are kept
+        // regardless of rank, which bounds the list at K + ALPHA.
         self.shortlist
             .sort_by(|a, b| a.distance.0.cmp(&b.distance.0));
-        self.shortlist.truncate(K_BUCKET_SIZE);
+        if self.shortlist.len() > K_BUCKET_SIZE {
+            let mut kept = 0usize;
+            self.shortlist.retain(|e| {
+                kept += 1;
+                kept <= K_BUCKET_SIZE || e.state == NodeState::InFlight
+            });
+        }
 
         // Check convergence
         self.check_complete();
@@ -401,6 +413,43 @@ impl SearchManager {
         Some(id)
     }
 
+    /// Fold records we already hold locally into a fresh `FIND_VALUE`.
+    ///
+    /// The shortlist only ever contains *other* nodes, so a record in our own
+    /// store would otherwise never reach the search that is looking for it.
+    /// Attributed to `local_id` for provenance; callers verify the publisher
+    /// signature on every blob regardless of who supplied it.
+    pub fn seed_local_results(
+        &mut self,
+        search_id: u32,
+        local_id: EmberNodeId,
+        records: Vec<Vec<u8>>,
+    ) -> usize {
+        let Some(search) = self.searches.get_mut(&search_id) else {
+            return 0;
+        };
+        let mut added = 0;
+        for data in records {
+            if search.results.len() >= MAX_SEARCH_RESULTS {
+                break;
+            }
+            // The same key binding the wire path applies to FOUND_VALUE
+            // blobs. The store already refuses a record whose embedded key
+            // differs from the key it is filed under, so this should never
+            // reject anything; keeping the two paths identical means the
+            // invariant holds here even if that gate ever moves.
+            if data.len() < 17 + 64 || data[1..17] != search.target.0 {
+                continue;
+            }
+            search.results.push(SearchResultRecord {
+                data,
+                from_node: local_id,
+            });
+            added += 1;
+        }
+        added
+    }
+
     /// Get a mutable reference to an active search.
     pub fn get_mut(&mut self, search_id: u32) -> Option<&mut IterativeSearch> {
         self.searches.get_mut(&search_id)
@@ -479,6 +528,22 @@ impl SearchManager {
             .collect()
     }
 
+    /// Nodes that an unfinished search is still relying on.
+    ///
+    /// A lookup walks a shortlist of contacts; if the routing table drops one
+    /// mid-walk the search loses that branch and any records behind it. The
+    /// staleness purge consults this so table hygiene cannot sabotage a
+    /// lookup already in progress.
+    pub fn nodes_in_use(&self) -> HashSet<EmberNodeId> {
+        self.searches
+            .values()
+            .filter(|s| !s.complete)
+            .flat_map(|s| s.shortlist.iter())
+            .filter(|e| matches!(e.state, NodeState::Pending | NodeState::InFlight))
+            .map(|e| e.contact.node_id)
+            .collect()
+    }
+
     fn alloc_id(&mut self) -> Option<u32> {
         if self.searches.len() >= MAX_ACTIVE_SEARCHES {
             warn!(
@@ -523,7 +588,12 @@ pub fn compute_keyword_hashes(query: &str) -> Vec<([u8; 16], String)> {
         .collect();
 
     keywords.sort_by(|a, b| b.len().cmp(&a.len()));
-    keywords.dedup();
+    // Not `dedup()`: it only collapses adjacent equals, and sorting by length
+    // alone can leave two copies of a keyword separated by a same-length one.
+    // A duplicate would spend one of the few FIND_VALUE key slots on a key
+    // already being queried.
+    let mut seen = std::collections::HashSet::new();
+    keywords.retain(|k| seen.insert(k.clone()));
 
     keywords
         .into_iter()
@@ -576,9 +646,59 @@ mod tests {
     }
 
     #[test]
+    fn compute_keyword_hashes_drops_non_adjacent_duplicates() {
+        // "iso" repeats with a same-length word between the two copies, so
+        // sorting by length alone leaves them non-adjacent.
+        let hashes = compute_keyword_hashes("iso abc iso");
+        assert_eq!(hashes.len(), 2, "the repeated keyword is counted once");
+        assert_eq!(hashes.iter().filter(|(_, k)| k == "iso").count(), 1);
+    }
+
+    #[test]
+    fn a_shortlist_trim_never_drops_a_query_in_flight() {
+        // One peer can answer with a full K contacts, all closer than another
+        // peer we are still waiting on. Trimming the shortlist purely by
+        // distance would evict that outstanding entry, hiding it from the
+        // in-flight check and from ALPHA accounting.
+        let target = make_id(0x01);
+        let local = make_id(0x00);
+        let mut rt = RoutingTable::new(local, false);
+        let responder = make_contact(0xF0);
+        let still_waiting = make_contact(0xE0);
+        rt.add_contact(responder.clone());
+        rt.add_contact(still_waiting.clone());
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_node(target, &rt).expect("search slot");
+        let search = sm.get_mut(sid).unwrap();
+
+        let batch = search.next_to_query();
+        assert_eq!(batch.len(), 2, "both known contacts go out together");
+        let req_id = batch
+            .iter()
+            .find(|(c, _)| c.node_id == responder.node_id)
+            .map(|(_, r)| *r)
+            .expect("responder was queried");
+
+        // A full response, every contact closer to the target than either
+        // peer already on the shortlist.
+        let closer: Vec<EmberContact> = (2..=(K_BUCKET_SIZE as u8 + 1)).map(make_contact).collect();
+        assert_eq!(closer.len(), K_BUCKET_SIZE);
+        search.process_response(req_id, &responder.node_id, closer, vec![]);
+
+        let waiting = search
+            .shortlist
+            .iter()
+            .find(|e| e.contact.node_id == still_waiting.node_id)
+            .expect("the outstanding query must survive the trim");
+        assert_eq!(waiting.state, NodeState::InFlight);
+        assert!(!search.complete, "a reply is still outstanding");
+    }
+
+    #[test]
     fn search_manager_find_node() {
         let local = make_id(0);
-        let mut rt = RoutingTable::new(local);
+        let mut rt = RoutingTable::new(local, false);
         rt.add_contact(make_contact(0x80));
         rt.add_contact(make_contact(0x40));
         rt.add_contact(make_contact(0x20));
@@ -595,7 +715,7 @@ mod tests {
     #[test]
     fn search_converges() {
         let local = make_id(0);
-        let mut rt = RoutingTable::new(local);
+        let mut rt = RoutingTable::new(local, false);
         rt.add_contact(make_contact(0x80));
 
         let mut sm = SearchManager::new();
@@ -618,7 +738,7 @@ mod tests {
         // We only know B at the start; B points us at a much closer C;
         // the search must hop to C and then converge with both responded.
         let local = make_id(0x00);
-        let mut rt = RoutingTable::new(local);
+        let mut rt = RoutingTable::new(local, false);
         rt.add_contact(make_contact(0x80)); // B
 
         let target = make_id(0x01);
@@ -663,7 +783,7 @@ mod tests {
         // query; the driver relies on poll_complete to recognise this
         // instead of stalling until the overall timeout.
         let local = make_id(0x00);
-        let rt = RoutingTable::new(local);
+        let rt = RoutingTable::new(local, false);
         let mut sm = SearchManager::new();
         let sid = sm.start_find_node(make_id(0xFF), &rt).expect("search slot");
         let search = sm.get_mut(sid).unwrap();
@@ -676,7 +796,7 @@ mod tests {
     #[test]
     fn search_processes_value_results() {
         let local = make_id(0);
-        let mut rt = RoutingTable::new(local);
+        let mut rt = RoutingTable::new(local, false);
         rt.add_contact(make_contact(0x80));
 
         let target = make_id(0xFF);

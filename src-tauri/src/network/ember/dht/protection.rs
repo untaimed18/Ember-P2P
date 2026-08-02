@@ -1,55 +1,109 @@
-//! Per-IP rate limits for the Ember DHT.
+//! Rate limits for the Ember DHT.
 //!
 //! Transport-layer AEAD already rejects verbatim UDP replays; STORE
-//! signature replay collapse lives in [super::engine::EmberDht]. This
-//! module caps per-IP frame and STORE/PROXY_STORE rates once a Noise session is up.
+//! signature replay collapse lives in [super::engine::EmberDht]. This module
+//! caps per-address frame rates and per-peer STORE rates once a Noise session
+//! is up. STORE budgets are keyed on the peer's verified node ID where one is
+//! known, so peers sharing a NAT do not throttle each other.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
-use super::messages::{MSG_PROXY_STORE, MSG_STORE_RECORD};
+use super::messages::{MSG_PROXY_STORE, MSG_STORE_BATCH, MSG_STORE_RECORD};
 
 /// Sliding window for per-IP message counts.
 const MSG_WINDOW: Duration = Duration::from_secs(1);
 /// Max DHT frames accepted from one IP per [MSG_WINDOW].
 const MAX_MSGS_PER_WINDOW: u32 = 40;
-/// Sliding window for STORE floods.
+/// Sliding window for STORE floods. The per-peer budget within it is adaptive
+/// — see [`super::scale::NetworkScale::max_stores_per_minute`].
 const STORE_WINDOW: Duration = Duration::from_secs(60);
-/// Max STORE_RECORD / PROXY_STORE frames accepted from one IP per [STORE_WINDOW].
-const MAX_STORES_PER_WINDOW: u32 = 30;
 const MAX_IP_ENTRIES: usize = 10_000;
 
+/// A two-bucket approximation of a sliding window.
+///
+/// A single counter that resets wholesale is a *fixed* window, which lets a
+/// sender straddle the boundary and spend twice the limit in quick
+/// succession. Keeping the previous half-window's count and weighting it by
+/// how far into the current half we are removes that burst while staying O(1)
+/// in both time and space.
 #[derive(Debug, Default)]
 struct WindowCounter {
+    /// Requests counted in the current half-window.
     count: u32,
+    /// Requests counted in the half-window before it.
+    previous: u32,
+    /// Start of the current half-window.
     window_start: Option<Instant>,
 }
 
 impl WindowCounter {
     fn allow(&mut self, now: Instant, window: Duration, limit: u32) -> bool {
+        self.allow_n(now, window, limit, 1)
+    }
+
+    /// Charge `cost` units against the window at once, for a frame whose work
+    /// is proportional to something other than the frame itself.
+    fn allow_n(&mut self, now: Instant, window: Duration, limit: u32, cost: u32) -> bool {
+        let half = window / 2;
         match self.window_start {
+            Some(start) if now.duration_since(start) < half => {}
             Some(start) if now.duration_since(start) < window => {
-                if self.count >= limit {
-                    return false;
-                }
-                self.count = self.count.saturating_add(1);
-                true
+                // One half-window has elapsed: age the buckets.
+                self.previous = self.count;
+                self.count = 0;
+                self.window_start = Some(start + half);
             }
             _ => {
+                // Idle for a full window or longer: start clean.
+                self.previous = 0;
+                self.count = 0;
                 self.window_start = Some(now);
-                self.count = 1;
-                true
             }
         }
+
+        let start = self.window_start.expect("set above");
+        let elapsed = now.duration_since(start).min(half);
+        // Weight the previous half by how much of it still overlaps the
+        // trailing `window` we are approximating.
+        let carry_fraction = 1.0 - (elapsed.as_secs_f64() / half.as_secs_f64().max(f64::EPSILON));
+        let effective = self.count as f64 + self.previous as f64 * carry_fraction;
+
+        if effective + cost as f64 > limit as f64 {
+            return false;
+        }
+        self.count = self.count.saturating_add(cost);
+        true
     }
+
+    /// When this counter last saw traffic, for the idle-entry sweep.
+    fn last_activity(&self) -> Option<Instant> {
+        self.window_start
+    }
+}
+
+/// Who a STORE budget belongs to.
+///
+/// Preferring the cryptographic node ID over the address is something KAD
+/// cannot do, and it matters: peers behind one NAT would otherwise share a
+/// budget and throttle each other, while an attacker with many addresses got
+/// a fresh budget per address. The IP is used only until a peer's identity is
+/// known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StoreBudgetKey {
+    Node([u8; 16]),
+    Addr(IpAddr),
 }
 
 /// Flood gate consulted before EmberDht::handle_message.
 pub struct DhtProtection {
     msg_counters: HashMap<IpAddr, WindowCounter>,
-    store_counters: HashMap<IpAddr, WindowCounter>,
+    store_counters: HashMap<StoreBudgetKey, WindowCounter>,
     dropped_rate: u64,
+    /// STORE frames allowed per peer per [`STORE_WINDOW`], refreshed from the
+    /// routing table's view of network size.
+    max_stores: u32,
 }
 
 impl Default for DhtProtection {
@@ -64,7 +118,22 @@ impl DhtProtection {
             msg_counters: HashMap::new(),
             store_counters: HashMap::new(),
             dropped_rate: 0,
+            max_stores: super::scale::NetworkScale::Bootstrap.max_stores_per_minute(),
         }
+    }
+
+    /// Track how permissive the STORE budget should currently be.
+    pub fn set_scale(&mut self, scale: super::scale::NetworkScale) {
+        self.max_stores = scale.max_stores_per_minute();
+    }
+
+    /// Set the STORE budget directly.
+    ///
+    /// Every real budget is larger than the per-second frame cap, which would
+    /// otherwise fire first and mask the behaviour under test.
+    #[cfg(test)]
+    fn set_max_stores_for_test(&mut self, max: u32) {
+        self.max_stores = max;
     }
 
     /// Count of frames refused by the rate limiter. Read by this module's
@@ -75,7 +144,24 @@ impl DhtProtection {
     }
 
     /// Returns true when the frame should be processed.
-    pub fn allow_message(&mut self, ip: IpAddr, msg_type: u8) -> bool {
+    ///
+    /// `sender_id` is the peer's verified node ID when one is already known
+    /// for this address; the STORE budget is keyed on it in preference to the
+    /// address.
+    /// `store_records` is how many records the frame carries — one for a
+    /// single `STORE_RECORD`, the batch count for a `STORE_BATCH`. The store
+    /// budget is charged per record because that is what the work scales
+    /// with: every record costs two Ed25519 verifications regardless of how
+    /// many share a datagram. Charging per frame let a batch packed with the
+    /// smallest legal records buy roughly twenty times the admitted work of a
+    /// well-behaved publisher.
+    pub fn allow_message(
+        &mut self,
+        ip: IpAddr,
+        msg_type: u8,
+        sender_id: Option<[u8; 16]>,
+        store_records: u32,
+    ) -> bool {
         let now = Instant::now();
         self.maybe_trim(now);
 
@@ -94,17 +180,26 @@ impl DhtProtection {
             return false;
         }
 
-        if msg_type == MSG_STORE_RECORD || msg_type == MSG_PROXY_STORE {
-            if self.store_counters.len() >= MAX_IP_ENTRIES && !self.store_counters.contains_key(&ip)
+        if matches!(
+            msg_type,
+            MSG_STORE_RECORD | MSG_PROXY_STORE | MSG_STORE_BATCH
+        ) {
+            let budget_key = match sender_id {
+                Some(id) => StoreBudgetKey::Node(id),
+                None => StoreBudgetKey::Addr(ip),
+            };
+            if self.store_counters.len() >= MAX_IP_ENTRIES
+                && !self.store_counters.contains_key(&budget_key)
             {
                 self.dropped_rate = self.dropped_rate.saturating_add(1);
                 return false;
             }
-            let store_ok = self
-                .store_counters
-                .entry(ip)
-                .or_default()
-                .allow(now, STORE_WINDOW, MAX_STORES_PER_WINDOW);
+            let store_ok = self.store_counters.entry(budget_key).or_default().allow_n(
+                now,
+                STORE_WINDOW,
+                self.max_stores,
+                store_records.max(1),
+            );
             if !store_ok {
                 self.dropped_rate = self.dropped_rate.saturating_add(1);
                 return false;
@@ -117,14 +212,14 @@ impl DhtProtection {
     fn maybe_trim(&mut self, now: Instant) {
         if self.msg_counters.len() > MAX_IP_ENTRIES / 2 {
             self.msg_counters.retain(|_, c| {
-                c.window_start
+                c.last_activity()
                     .map(|s| now.duration_since(s) < MSG_WINDOW * 4)
                     .unwrap_or(false)
             });
         }
         if self.store_counters.len() > MAX_IP_ENTRIES / 2 {
             self.store_counters.retain(|_, c| {
-                c.window_start
+                c.last_activity()
                     .map(|s| now.duration_since(s) < STORE_WINDOW * 2)
                     .unwrap_or(false)
             });
@@ -143,20 +238,98 @@ mod tests {
         let mut p = DhtProtection::new();
         let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
         for _ in 0..MAX_MSGS_PER_WINDOW {
-            assert!(p.allow_message(ip, MSG_PING));
+            assert!(p.allow_message(ip, MSG_PING, None, 1));
         }
-        assert!(!p.allow_message(ip, MSG_PING));
+        assert!(!p.allow_message(ip, MSG_PING, None, 1));
         assert_eq!(p.dropped_rate_limited(), 1);
     }
 
     #[test]
     fn store_budget_independent_window() {
         let mut p = DhtProtection::new();
+        p.set_max_stores_for_test(5);
         let ip = IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9));
-        for _ in 0..(MAX_MSGS_PER_WINDOW - 1) {
-            assert!(p.allow_message(ip, MSG_PING));
+        for _ in 0..5 {
+            assert!(p.allow_message(ip, MSG_STORE_RECORD, None, 1));
         }
-        assert!(p.allow_message(ip, MSG_STORE_RECORD));
-        assert!(!p.allow_message(ip, MSG_STORE_RECORD));
+        assert!(!p.allow_message(ip, MSG_STORE_RECORD, None, 1));
+        // A batch counts against the same budget as a single store.
+        assert!(!p.allow_message(ip, MSG_STORE_BATCH, None, 1));
+        // Non-store traffic from the same peer is unaffected.
+        assert!(p.allow_message(ip, MSG_PING, None, 1));
+    }
+
+    /// Two instances behind one NAT must not eat each other's STORE budget.
+    /// Ember can tell them apart because their node IDs are bound to distinct
+    /// keypairs, which is a distinction KAD cannot make.
+    #[test]
+    fn peers_sharing_an_address_get_separate_store_budgets() {
+        let mut p = DhtProtection::new();
+        p.set_max_stores_for_test(5);
+        let ip = IpAddr::V4(Ipv4Addr::new(7, 7, 7, 7));
+
+        for _ in 0..5 {
+            assert!(p.allow_message(ip, MSG_STORE_RECORD, Some([1u8; 16]), 1));
+        }
+        assert!(
+            !p.allow_message(ip, MSG_STORE_RECORD, Some([1u8; 16]), 1),
+            "the first peer has spent its budget"
+        );
+        assert!(
+            p.allow_message(ip, MSG_STORE_RECORD, Some([2u8; 16]), 1),
+            "a different identity at the same address keeps its own budget"
+        );
+    }
+
+    /// A batch does N records' worth of signature verification for one frame,
+    /// so charging it as one frame let a densely packed batch buy many times
+    /// the admitted work of a well-behaved publisher.
+    #[test]
+    fn a_batch_is_charged_for_the_records_it_carries() {
+        let mut p = DhtProtection::new();
+        p.set_max_stores_for_test(10);
+        let ip = IpAddr::V4(Ipv4Addr::new(5, 5, 5, 5));
+
+        // One batch of eight spends eight units, not one.
+        assert!(p.allow_message(ip, MSG_STORE_BATCH, None, 8));
+        // Only two units remain, so a batch of three does not fit.
+        assert!(!p.allow_message(ip, MSG_STORE_BATCH, None, 3));
+        // But two single stores do.
+        assert!(p.allow_message(ip, MSG_STORE_RECORD, None, 1));
+        assert!(p.allow_message(ip, MSG_STORE_RECORD, None, 1));
+        assert!(!p.allow_message(ip, MSG_STORE_RECORD, None, 1));
+    }
+
+    /// A fixed window lets a sender spend twice the limit across a boundary.
+    #[test]
+    fn the_window_does_not_allow_a_double_burst_at_the_boundary() {
+        let mut c = WindowCounter::default();
+        let window = Duration::from_secs(60);
+        let limit = 10u32;
+        let t0 = Instant::now();
+
+        // Spend the whole budget late in the first window.
+        for _ in 0..limit {
+            assert!(c.allow(t0, window, limit));
+        }
+        assert!(!c.allow(t0, window, limit));
+
+        // Just past the halfway roll, most of the previous half still counts,
+        // so a fresh full burst must not be allowed.
+        let t1 = t0 + window / 2 + Duration::from_millis(10);
+        let mut allowed_after_roll = 0;
+        for _ in 0..limit {
+            if c.allow(t1, window, limit) {
+                allowed_after_roll += 1;
+            }
+        }
+        assert!(
+            allowed_after_roll < limit,
+            "a fixed window would have allowed a second full burst ({allowed_after_roll})"
+        );
+
+        // A full window of silence resets cleanly.
+        let t2 = t1 + window * 2;
+        assert!(c.allow(t2, window, limit));
     }
 }

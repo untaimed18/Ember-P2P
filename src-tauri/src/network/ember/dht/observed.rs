@@ -1,13 +1,34 @@
 //! Observed-IP voting for Ember DHT (slice 19).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::{Duration, Instant};
 
 pub const MIN_OBSERVED_IP_VOTES: usize = 3;
 
+/// How long a vote counts toward the quorum.
+///
+/// Without expiry the three-vote threshold was cumulative over the whole
+/// process lifetime rather than a statement about what peers see *now*, so a
+/// stale address stayed qualified indefinitely and a genuine address change
+/// could not displace it.
+const VOTE_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// Distinct reported addresses tracked at once. Every entry costs memory and
+/// a peer can report a different address on each reply, so the map is capped
+/// and the least-recently-updated entry is dropped.
+const MAX_TRACKED_ADDRS: usize = 64;
+
+#[derive(Debug, Default)]
+struct AddrVotes {
+    /// Reporter /24 → when it last voted for this address.
+    nets: HashMap<[u8; 3], Instant>,
+    last_update: Option<Instant>,
+}
+
 #[derive(Debug, Default)]
 pub struct EmberObservedIpVotes {
-    votes: HashMap<SocketAddr, HashSet<[u8; 3]>>,
+    votes: HashMap<SocketAddr, AddrVotes>,
     confirmed: Option<SocketAddr>,
 }
 
@@ -20,10 +41,16 @@ impl EmberObservedIpVotes {
         self.confirmed
     }
 
-    pub fn record_vote(
+    pub fn record_vote(&mut self, reported: SocketAddr, reporter: IpAddr) -> Option<SocketAddr> {
+        self.record_vote_at(reported, reporter, Instant::now())
+    }
+
+    /// `record_vote` with an explicit clock, so the expiry window is testable.
+    pub fn record_vote_at(
         &mut self,
         reported: SocketAddr,
         reporter: IpAddr,
+        now: Instant,
     ) -> Option<SocketAddr> {
         if !is_public_vote_addr(reported) {
             return None;
@@ -36,16 +63,55 @@ impl EmberObservedIpVotes {
             return None;
         };
 
-        let entry = self.votes.entry(reported).or_default();
-        entry.insert(net);
-        if entry.len() >= MIN_OBSERVED_IP_VOTES {
-            let newly = self.confirmed != Some(reported);
-            self.confirmed = Some(reported);
-            if newly {
-                return Some(reported);
+        self.prune(now);
+
+        if self.votes.len() >= MAX_TRACKED_ADDRS && !self.votes.contains_key(&reported) {
+            // Drop the least-recently-updated address to make room, so a peer
+            // reporting a fresh address on every reply cannot grow this map.
+            if let Some(oldest) = self
+                .votes
+                .iter()
+                .min_by_key(|(_, v)| v.last_update)
+                .map(|(k, _)| *k)
+            {
+                self.votes.remove(&oldest);
             }
         }
+
+        let entry = self.votes.entry(reported).or_default();
+        entry.nets.insert(net, now);
+        entry.last_update = Some(now);
+        let quorum = entry.nets.len() >= MIN_OBSERVED_IP_VOTES;
+
+        // Only a genuine transition counts. Re-assigning on every qualifying
+        // vote meant whichever address was voted for most recently won, so an
+        // attacker could displace a correct confirmation just by repeating
+        // themselves.
+        if quorum && self.confirmed != Some(reported) {
+            self.confirmed = Some(reported);
+            return Some(reported);
+        }
         None
+    }
+
+    /// Drop votes and addresses that have aged out.
+    fn prune(&mut self, now: Instant) {
+        self.votes.retain(|_, v| {
+            v.nets
+                .retain(|_, at| now.saturating_duration_since(*at) < VOTE_TTL);
+            !v.nets.is_empty()
+        });
+        // A confirmation only stands while its quorum does.
+        if let Some(addr) = self.confirmed {
+            let still_backed = self
+                .votes
+                .get(&addr)
+                .map(|v| v.nets.len() >= MIN_OBSERVED_IP_VOTES)
+                .unwrap_or(false);
+            if !still_backed {
+                self.confirmed = None;
+            }
+        }
     }
 }
 
@@ -148,5 +214,75 @@ mod tests {
         let target = addr(50, 4672);
         let link_local: IpAddr = "fe80::1".parse().unwrap();
         assert!(votes.record_vote(target, link_local).is_none());
+    }
+
+    /// Re-confirming on every qualifying vote let whichever address was voted
+    /// for most recently win, so a repeat vote could displace a correct
+    /// confirmation.
+    #[test]
+    fn only_a_genuine_transition_confirms() {
+        let mut votes = EmberObservedIpVotes::new();
+        let target = addr(50, 4672);
+        let now = Instant::now();
+
+        assert!(votes
+            .record_vote_at(target, reporter(203, 0, 1), now)
+            .is_none());
+        assert!(votes
+            .record_vote_at(target, reporter(198, 51, 1), now)
+            .is_none());
+        assert_eq!(
+            votes.record_vote_at(target, reporter(192, 0, 1), now),
+            Some(target),
+            "the third distinct /24 confirms"
+        );
+        assert_eq!(
+            votes.record_vote_at(target, reporter(203, 0, 1), now),
+            None,
+            "a repeat vote for the already-confirmed address is not a transition"
+        );
+        assert_eq!(votes.confirmed(), Some(target));
+    }
+
+    /// The quorum has to be contemporaneous: three votes spread across hours
+    /// say nothing about where we are reachable now.
+    #[test]
+    fn votes_expire_so_the_quorum_stays_current() {
+        let mut votes = EmberObservedIpVotes::new();
+        let target = addr(50, 4672);
+        let t0 = Instant::now();
+
+        votes.record_vote_at(target, reporter(203, 0, 1), t0);
+        votes.record_vote_at(target, reporter(198, 51, 1), t0);
+
+        // Long after the first two, a third vote must not complete a quorum
+        // with votes that have since aged out.
+        let later = t0 + VOTE_TTL + Duration::from_secs(1);
+        assert_eq!(
+            votes.record_vote_at(target, reporter(192, 0, 1), later),
+            None,
+            "stale votes must not count toward the quorum"
+        );
+        assert_eq!(votes.confirmed(), None);
+    }
+
+    /// A peer answering with a different address each time must not grow the
+    /// map without bound.
+    #[test]
+    fn the_vote_map_is_bounded() {
+        let mut votes = EmberObservedIpVotes::new();
+        let now = Instant::now();
+        for i in 0..(MAX_TRACKED_ADDRS as u16 * 3) {
+            let reported = SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::new(203, 0, 113, (i % 250) as u8 + 1),
+                4000 + i,
+            ));
+            votes.record_vote_at(reported, reporter(198, 51, 100), now);
+        }
+        assert!(
+            votes.votes.len() <= MAX_TRACKED_ADDRS,
+            "tracked {} addresses, above the cap",
+            votes.votes.len()
+        );
     }
 }

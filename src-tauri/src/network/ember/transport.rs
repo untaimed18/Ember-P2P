@@ -21,7 +21,18 @@ const NOISE_PATTERN_XX: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 const HEADER_LEN: usize = 3;
 
 /// Version byte for small Ember-native control payloads carried inside Noise.
-const CONTROL_VERSION: u8 = 1;
+///
+/// Control frames and DHT frames share one decrypted byte stream, and a
+/// payload is offered to the control decoder first, so the two leading bytes
+/// form a single namespace. This value must therefore never collide with
+/// [`EMBER_DHT_VERSION`](super::dht::EMBER_DHT_VERSION), which counts up from
+/// 1: a control version of 1 made `CONTROL_KIND_EXCHANGE_DATA` (4) alias
+/// `MSG_FOUND_NODE` (4), and since the exchange body has no fixed length every
+/// FOUND_NODE was decoded as an EPX payload and never reached the DHT, which
+/// silently stalled every iterative lookup after its first hop. 0xC1 sits far
+/// outside the range a DHT version will plausibly reach.
+/// `control_frames_never_alias_dht_frames` pins this.
+const CONTROL_VERSION: u8 = 0xC1;
 const CONTROL_KIND_PING: u8 = 1;
 const CONTROL_KIND_PONG: u8 = 2;
 /// Ask the peer to send its current EPX source/peer payload back over
@@ -381,7 +392,26 @@ pub struct EmberTransport {
     /// *different* valid handshake), so rejecting exact duplicates closes the
     /// "replayed init re-runs the handshake, re-emits its embedded payload, and
     /// resets the live session" vector. Pruned in [`Self::cleanup`].
-    recent_handshakes: HashMap<[u8; 32], Instant>,
+    recent_handshakes: HashMap<[u8; 32], RecentHandshake>,
+}
+
+/// A handshake initiation we have already processed.
+struct RecentHandshake {
+    seen_at: Instant,
+    /// Who sent it. A cached answer is only re-sent to the same address: an
+    /// honest retransmit always comes from there, while replaying to a
+    /// different address would turn us into a free reflector for a packet an
+    /// attacker captured.
+    from: SocketAddr,
+    /// The answer we produced, if the handshake got that far.
+    response: Option<Vec<u8>>,
+}
+
+/// Whether a handshake initiation is new, and if not, what we answered last
+/// time.
+enum HandshakeReplay {
+    Fresh { digest: [u8; 32] },
+    Seen { response: Option<Vec<u8>> },
 }
 
 impl EmberTransport {
@@ -395,35 +425,95 @@ impl EmberTransport {
         }
     }
 
-    /// Returns `true` if this exact handshake-initiation packet was processed
-    /// recently (a verbatim replay) and records its digest otherwise. See
-    /// [`Self::recent_handshakes`] for why a digest cache fully addresses the
-    /// replay threat for these packet types.
-    fn is_replayed_handshake(&mut self, data: &[u8]) -> bool {
-        let digest = *blake3::hash(data).as_bytes();
+    /// Classify a handshake-initiation packet against the replay cache.
+    ///
+    /// A verbatim repeat is either an attacker replaying a captured packet or
+    /// a peer that never received our answer and is retransmitting. Both look
+    /// identical on the wire, so rather than choosing, we re-send the answer
+    /// we already computed. That is safe — it is the same bytes the peer
+    /// should have received, and it re-runs no crypto and disturbs no live
+    /// session — and it unblocks the honest case, which previously stalled
+    /// for the full replay TTL before it could try again.
+    fn check_handshake_replay(
+        &mut self,
+        pkt_type: u8,
+        from: SocketAddr,
+        data: &[u8],
+    ) -> HandshakeReplay {
+        // The packet type is part of the identity. `process_incoming` strips
+        // the header before dispatching, so hashing the body alone puts
+        // IK_INIT and XX_MSG1 in one namespace — and snow accepts an
+        // over-long XX msg1, so an on-path attacker could re-send a captured
+        // IK_INIT tagged as XX_MSG1, seeding the entry with an XX msg2. The
+        // genuine initiator would then be answered with the wrong message
+        // type and stall for the whole replay window.
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&[pkt_type]);
+        hasher.update(data);
+        let digest = *hasher.finalize().as_bytes();
+
         let now = Instant::now();
-        if let Some(seen) = self.recent_handshakes.get(&digest) {
-            if now.duration_since(*seen) < HANDSHAKE_REPLAY_TTL {
-                return true;
+        if let Some(entry) = self.recent_handshakes.get(&digest) {
+            if now.duration_since(entry.seen_at) < HANDSHAKE_REPLAY_TTL {
+                return HandshakeReplay::Seen {
+                    // Only the original sender gets the answer back. Anyone
+                    // else replaying this packet gets silence, exactly as
+                    // before this cache learned to re-send.
+                    response: if entry.from == from {
+                        entry.response.clone()
+                    } else {
+                        None
+                    },
+                };
             }
         }
         if self.recent_handshakes.len() >= MAX_REPLAY_DIGESTS {
             if let Some(oldest) = self
                 .recent_handshakes
                 .iter()
-                .min_by_key(|(_, t)| **t)
+                .min_by_key(|(_, e)| e.seen_at)
                 .map(|(k, _)| *k)
             {
                 self.recent_handshakes.remove(&oldest);
             }
         }
-        self.recent_handshakes.insert(digest, now);
-        false
+        self.recent_handshakes.insert(
+            digest,
+            RecentHandshake {
+                seen_at: now,
+                from,
+                response: None,
+            },
+        );
+        HandshakeReplay::Fresh { digest }
+    }
+
+    /// Remember the answer we produced, so a retransmission of the same
+    /// initiation gets the same answer instead of silence.
+    fn remember_handshake_response(&mut self, digest: [u8; 32], response: Vec<u8>) {
+        if let Some(entry) = self.recent_handshakes.get_mut(&digest) {
+            entry.response = Some(response);
+        }
     }
 
     /// Check if a raw UDP packet is an Ember-encrypted packet.
+    ///
+    /// The packet-type byte is part of the test, not just the two magic
+    /// bytes. Obfuscated eD2K client-to-client datagrams begin with a byte
+    /// whose low bit is forced set followed by a random byte, so they collide
+    /// with the magic pair roughly once in 32k packets — and a collision here
+    /// means the packet is claimed by the Ember branch and dropped instead of
+    /// reaching the eD2K parser. Only six of the 256 type values are valid,
+    /// so requiring one makes that some forty times rarer at no cost, since
+    /// every genuine Ember packet carries one.
     pub fn is_ember_packet(data: &[u8]) -> bool {
-        data.len() >= HEADER_LEN && data[0] == EMBER_MAGIC[0] && data[1] == EMBER_MAGIC[1]
+        data.len() >= HEADER_LEN
+            && data[0] == EMBER_MAGIC[0]
+            && data[1] == EMBER_MAGIC[1]
+            && matches!(
+                data[2],
+                PKT_IK_INIT | PKT_IK_RESP | PKT_XX_MSG1 | PKT_XX_MSG2 | PKT_XX_MSG3 | PKT_TRANSPORT
+            )
     }
 
     /// Our Noise static public key (X25519).
@@ -563,7 +653,7 @@ impl EmberTransport {
             now.duration_since(created) < Duration::from_secs(30)
         });
         self.recent_handshakes
-            .retain(|_, t| now.duration_since(*t) < HANDSHAKE_REPLAY_TTL);
+            .retain(|_, e| now.duration_since(e.seen_at) < HANDSHAKE_REPLAY_TTL);
     }
 
     /// Remove an existing session for a peer (e.g., on disconnect).
@@ -716,12 +806,28 @@ impl EmberTransport {
     }
 
     fn handle_ik_init(&mut self, from: SocketAddr, data: &[u8]) -> IncomingResult {
-        // Reject verbatim replays before doing any crypto or, crucially, before
-        // re-emitting the embedded payload or replacing a live session.
-        if self.is_replayed_handshake(data) {
-            debug!("Dropping replayed IK_INIT from {from}");
-            return IncomingResult::Rejected;
-        }
+        // Do no crypto, re-emit no embedded payload, and replace no live
+        // session for a repeat. Answering with the response we already
+        // computed serves a peer whose copy was lost without giving a
+        // replaying attacker anything it did not already see on the wire.
+        let handshake_digest = match self.check_handshake_replay(PKT_IK_INIT, from, data) {
+            HandshakeReplay::Fresh { digest } => digest,
+            HandshakeReplay::Seen { response } => {
+                return match response {
+                    Some(packet) => {
+                        debug!("Re-sending cached IK response to {from}");
+                        IncomingResult::HandshakeResponse {
+                            to: from,
+                            packets: vec![packet],
+                        }
+                    }
+                    None => {
+                        debug!("Dropping replayed IK_INIT from {from}");
+                        IncomingResult::Rejected
+                    }
+                };
+            }
+        };
         let params = match NOISE_PATTERN_IK.parse::<snow::params::NoiseParams>() {
             Ok(p) => p,
             Err(_) => return IncomingResult::Rejected,
@@ -812,6 +918,8 @@ impl EmberTransport {
         } else {
             None
         };
+
+        self.remember_handshake_response(handshake_digest, resp_buf.clone());
 
         IncomingResult::HandshakeComplete {
             peer: from,
@@ -949,12 +1057,28 @@ impl EmberTransport {
             debug!("Ignoring XX msg1 from {from}: an initiator handshake is in flight");
             return IncomingResult::Rejected;
         }
-        // Reject verbatim replays (prevents repeated msg2 reflection from a
-        // single captured msg1).
-        if self.is_replayed_handshake(data) {
-            debug!("Dropping replayed XX msg1 from {from}");
-            return IncomingResult::Rejected;
-        }
+        // A repeat is either a replay or a peer that never got our msg2.
+        // Re-sending the msg2 we already produced serves the honest case and
+        // gives a replaying attacker nothing new, whereas dropping it stalled
+        // a legitimate retransmit for the whole replay TTL.
+        let handshake_digest = match self.check_handshake_replay(PKT_XX_MSG1, from, data) {
+            HandshakeReplay::Fresh { digest } => digest,
+            HandshakeReplay::Seen { response } => {
+                return match response {
+                    Some(packet) => {
+                        debug!("Re-sending cached XX msg2 to {from}");
+                        IncomingResult::HandshakeResponse {
+                            to: from,
+                            packets: vec![packet],
+                        }
+                    }
+                    None => {
+                        debug!("Dropping replayed XX msg1 from {from}");
+                        IncomingResult::Rejected
+                    }
+                };
+            }
+        };
         let params = match NOISE_PATTERN_XX.parse::<snow::params::NoiseParams>() {
             Ok(p) => p,
             Err(_) => return IncomingResult::Rejected,
@@ -1002,6 +1126,8 @@ impl EmberTransport {
             },
         );
         trace!("XX handshake msg2 sent to {from}");
+
+        self.remember_handshake_response(handshake_digest, resp_buf.clone());
 
         IncomingResult::HandshakeResponse {
             to: from,
@@ -1457,8 +1583,13 @@ mod tests {
         }
     }
 
+    /// A repeated initiation is either a replay or a peer whose copy of our
+    /// answer was lost. We cannot tell them apart, so we re-send the answer
+    /// we already produced: that unblocks the honest retransmit while giving
+    /// a replaying attacker only bytes it already saw. What must not happen
+    /// is re-emitting the embedded payload or disturbing the live session.
     #[test]
-    fn replayed_ik_init_is_dropped() {
+    fn a_replayed_ik_init_gets_the_cached_answer_and_nothing_else() {
         let (alice_priv, alice_pub) = make_keypair();
         let (bob_priv, bob_pub) = make_keypair();
         let mut alice = EmberTransport::new(alice_priv, alice_pub);
@@ -1471,18 +1602,37 @@ mod tests {
             _ => panic!("expected HandshakeStarted"),
         };
         // First copy completes the handshake and surfaces the embedded payload.
-        match bob.process_incoming(&init, alice_addr) {
+        let original_response = match bob.process_incoming(&init, alice_addr) {
             IncomingResult::HandshakeComplete {
-                decrypted_payload, ..
-            } => assert_eq!(decrypted_payload.as_deref(), Some(&b"req"[..])),
+                decrypted_payload,
+                packets_to_send,
+                ..
+            } => {
+                assert_eq!(decrypted_payload.as_deref(), Some(&b"req"[..]));
+                packets_to_send
+            }
             _ => panic!("expected HandshakeComplete"),
+        };
+
+        match bob.process_incoming(&init, alice_addr) {
+            IncomingResult::HandshakeResponse { packets, .. } => {
+                assert_eq!(
+                    packets, original_response,
+                    "the repeat must get exactly the answer we already sent"
+                );
+            }
+            _ => panic!("expected the cached answer to be re-sent"),
         }
-        // A verbatim replay must be dropped — it must NOT re-emit the payload or
-        // reset the freshly-established session.
-        assert!(matches!(
-            bob.process_incoming(&init, alice_addr),
-            IncomingResult::Rejected
-        ));
+
+        // The session Bob established on the first copy is untouched, so he
+        // can still encrypt to Alice on the fast path.
+        assert!(
+            matches!(
+                bob.prepare_outgoing(alice_addr, Some(&alice_pub), b"after"),
+                OutgoingResult::Ready { .. }
+            ),
+            "the replay must not have disturbed the live session"
+        );
     }
 
     #[test]
@@ -1629,6 +1779,122 @@ mod tests {
         assert_eq!(outcome.responses.len(), 1);
     }
 
+    /// The cached answer belongs to the peer that asked for it. Replaying a
+    /// captured initiation from somewhere else must not turn us into a free
+    /// reflector aimed at whatever address the attacker spoofed.
+    #[test]
+    fn a_cached_handshake_answer_only_goes_back_to_its_sender() {
+        let (alice_priv, alice_pub) = make_keypair();
+        let (bob_priv, bob_pub) = make_keypair();
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let victim_addr: SocketAddr = "9.9.9.9:9999".parse().unwrap();
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        let init = match alice.prepare_outgoing(bob_addr, Some(&bob_pub), b"req") {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            _ => panic!("expected HandshakeStarted"),
+        };
+        assert!(matches!(
+            bob.process_incoming(&init, alice_addr),
+            IncomingResult::HandshakeComplete { .. }
+        ));
+
+        // Same bytes, spoofed source: no answer, so nothing is reflected.
+        assert!(matches!(
+            bob.process_incoming(&init, victim_addr),
+            IncomingResult::Rejected
+        ));
+
+        // The genuine sender still gets its answer re-sent.
+        assert!(matches!(
+            bob.process_incoming(&init, alice_addr),
+            IncomingResult::HandshakeResponse { .. }
+        ));
+    }
+
+    /// The header is stripped before dispatch, so hashing the body alone put
+    /// IK and XX initiations in one namespace — and snow accepts an over-long
+    /// XX msg1, so a captured IK init could be re-sent tagged as XX to seed
+    /// the entry with the wrong answer and stall the real handshake.
+    #[test]
+    fn handshake_replay_entries_are_scoped_to_their_packet_type() {
+        let (alice_priv, alice_pub) = make_keypair();
+        let (bob_priv, bob_pub) = make_keypair();
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        let init = match alice.prepare_outgoing(bob_addr, Some(&bob_pub), b"req") {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            _ => panic!("expected HandshakeStarted"),
+        };
+
+        // The same body re-tagged as an XX msg1, as an on-path attacker would
+        // send it, seeding an entry whose cached answer is the wrong type.
+        let mut masquerade = init.clone();
+        masquerade[2] = PKT_XX_MSG1;
+        let _ = bob.process_incoming(&masquerade, alice_addr);
+
+        // The genuine IK init must still be processed on its own terms.
+        assert!(
+            matches!(
+                bob.process_incoming(&init, alice_addr),
+                IncomingResult::HandshakeComplete { .. }
+            ),
+            "an XX-tagged copy must not poison the IK entry"
+        );
+    }
+
+    /// Control frames and DHT frames share the decrypted byte stream, and the
+    /// control decoder gets first refusal, so no signed DHT frame may ever
+    /// parse as a control message. When it did, the aliased message type was
+    /// swallowed whole and its lookups stalled with no error anywhere.
+    #[test]
+    fn control_frames_never_alias_dht_frames() {
+        use crate::network::ember::dht::messages;
+
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let node_id = crate::network::ember::dht::EmberNodeId([0x11; 16]);
+
+        let observed: SocketAddr = "9.9.9.9:4672".parse().unwrap();
+        let frames = vec![
+            messages::build_ping(node_id, 1),
+            messages::build_pong(node_id, 2, observed),
+            messages::build_find_node(node_id, 3, node_id),
+            messages::build_found_node(node_id, 4, vec![]),
+            messages::build_find_value(node_id, 5, vec![[0x22; 16]]),
+            messages::build_store_record(node_id, 6, [0x33; 16], vec![0u8; 32], [0u8; 64]),
+            messages::build_store_ack(node_id, 7, [0x44; 16]),
+            messages::build_found_value(node_id, 8, [0x55; 16], vec![vec![0u8; 32]]),
+            messages::build_announce_peer(node_id, 9, vec![]),
+            messages::build_peer_list(node_id, 10, vec![]),
+            messages::build_proxy_store(node_id, 11, [0x66; 16], vec![0u8; 32], [0u8; 64]),
+            messages::build_proxy_store_ack(node_id, 12, [0x77; 16]),
+            messages::build_store_batch(
+                node_id,
+                13,
+                vec![messages::BatchedRecord {
+                    key: [0x88; 16],
+                    record: vec![0u8; 32],
+                    record_signature: [0u8; 64],
+                }],
+            ),
+            messages::build_store_batch_ack(node_id, 14, 0b1),
+        ];
+
+        for msg in frames {
+            let msg_type = msg.msg_type;
+            let encoded = messages::encode_message(&msg, &signing, true);
+            assert!(
+                EmberControlMessage::decode(&encoded).is_none(),
+                "DHT message type {msg_type:#04x} must not decode as a control frame"
+            );
+        }
+    }
+
     #[test]
     fn control_message_encode_decode_round_trip_all_variants() {
         let cases = [
@@ -1657,24 +1923,28 @@ mod tests {
         assert_eq!(EmberControlMessage::Ping { nonce: 7 }.encode().len(), 10);
         assert_eq!(EmberControlMessage::Pong { nonce: 7 }.encode().len(), 10);
         // A request is exactly version + kind.
-        assert_eq!(EmberControlMessage::ExchangeRequest.encode(), vec![1, 3]);
+        assert_eq!(
+            EmberControlMessage::ExchangeRequest.encode(),
+            vec![CONTROL_VERSION, CONTROL_KIND_EXCHANGE_REQUEST]
+        );
     }
 
     #[test]
     fn control_message_decode_rejects_malformed() {
+        const V: u8 = CONTROL_VERSION;
         // Wrong version.
         assert_eq!(
-            EmberControlMessage::decode(&[0, 1, 0, 0, 0, 0, 0, 0, 0, 0]),
+            EmberControlMessage::decode(&[V ^ 0xFF, 1, 0, 0, 0, 0, 0, 0, 0, 0]),
             None
         );
         // Ping/Pong with wrong length.
-        assert_eq!(EmberControlMessage::decode(&[1, 1, 0, 0]), None);
+        assert_eq!(EmberControlMessage::decode(&[V, 1, 0, 0]), None);
         // ExchangeRequest must have no trailing bytes.
-        assert_eq!(EmberControlMessage::decode(&[1, 3, 0xFF]), None);
+        assert_eq!(EmberControlMessage::decode(&[V, 3, 0xFF]), None);
         // Unknown kind.
-        assert_eq!(EmberControlMessage::decode(&[1, 0x7F]), None);
+        assert_eq!(EmberControlMessage::decode(&[V, 0x7F]), None);
         // Too short to carry version + kind.
-        assert_eq!(EmberControlMessage::decode(&[1]), None);
+        assert_eq!(EmberControlMessage::decode(&[V]), None);
     }
 
     /// `ExchangeRequest` and `ExchangeData` cross an established Noise

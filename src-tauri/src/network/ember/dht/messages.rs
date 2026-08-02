@@ -23,15 +23,70 @@ pub const MSG_PEER_LIST: u8 = 0x0A;
 pub const MSG_PROXY_STORE: u8 = 0x0B;
 /// Buddy → firewalled peer: accepted the proxy request (not a DHT STORE_ACK).
 pub const MSG_PROXY_STORE_ACK: u8 = 0x0C;
+/// Several records for one destination in a single frame.
+pub const MSG_STORE_BATCH: u8 = 0x0D;
+/// Answer to `STORE_BATCH`, reporting how many of its records were stored.
+pub const MSG_STORE_BATCH_ACK: u8 = 0x0E;
 
-/// Maximum DHT payload bytes (slice 19 wire hardening).
-pub const MAX_DHT_PAYLOAD: usize = 8192;
+/// Records one `STORE_BATCH` may carry.
+///
+/// This bounds the decode-side allocation and the width of the ack bitmap
+/// (one `u64`). It is not the binding limit in practice: the datagram budget
+/// caps a real batch at roughly twenty minimum-size records, so do not size
+/// anything against 64 expecting it to be reachable.
+pub const MAX_STORE_BATCH_RECORDS: usize = 64;
+
 /// Maximum keys in a FIND_VALUE request.
 pub const MAX_FIND_VALUE_KEYS: usize = 8;
 /// Maximum records in a FOUND_VALUE response.
 pub const MAX_FOUND_VALUE_RECORDS: usize = 300;
-/// Maximum STORE / PROXY_STORE record body size.
-pub const MAX_STORE_RECORD_BYTES: usize = 4096;
+
+/// Bytes a signed frame adds around its payload: the 22-byte header, the
+/// 32-byte sender public key, the 2-byte payload length, and the 64-byte
+/// signature.
+pub(crate) const FRAME_OVERHEAD: usize = HEADER_MIN_SIZE + 32 + 2 + 64;
+/// Bytes the Noise transport adds around a frame: 3-byte header, 8-byte
+/// nonce, 16-byte AEAD tag.
+pub(crate) const TRANSPORT_OVERHEAD: usize = 3 + 8 + 16;
+
+/// Largest payload that still yields a deliverable datagram.
+///
+/// A receiver drops anything over `MAX_EMBER_DATAGRAM_BYTES` before it is
+/// decrypted, so an oversized reply is built, encrypted, and sent looking
+/// entirely successful while the peer never sees it — the sender observes
+/// only a timeout. This is also the decode bound, so the limits on the two
+/// sides cannot drift apart. `a_full_found_value_frame_fits_a_datagram` pins
+/// the arithmetic.
+pub const MAX_DELIVERABLE_PAYLOAD: usize =
+    crate::network::ember::transport::MAX_EMBER_DATAGRAM_BYTES
+        - TRANSPORT_OVERHEAD
+        - FRAME_OVERHEAD;
+
+/// Maximum DHT payload bytes accepted on decode. Anything larger could not
+/// have reached us intact, since the transport drops oversized datagrams
+/// before decryption.
+pub const MAX_DHT_PAYLOAD: usize = MAX_DELIVERABLE_PAYLOAD;
+
+/// A UDP payload this size will not be IP-fragmented on ordinary paths.
+///
+/// Fragmented UDP is dropped outright by a fair number of consumer NATs and
+/// some ISPs, and a reply that never arrives is worse than a shorter one that
+/// does. The legacy KAD stack holds the same line with
+/// `UDP_KAD_MAXFRAGMENT` (1420); this is the Ember equivalent, applied to the
+/// responses whose size we actually choose.
+pub const MAX_UNFRAGMENTED_DATAGRAM: usize = 1400;
+
+/// Payload budget that keeps a signed frame inside
+/// [`MAX_UNFRAGMENTED_DATAGRAM`].
+pub const MAX_UNFRAGMENTED_PAYLOAD: usize =
+    MAX_UNFRAGMENTED_DATAGRAM - TRANSPORT_OVERHEAD - FRAME_OVERHEAD;
+
+/// Byte budget for the record blobs in a `FOUND_VALUE`, after its 16-byte key
+/// and 2-byte record count. Each blob also costs a 2-byte length prefix.
+pub const MAX_FOUND_VALUE_RECORD_BYTES: usize = MAX_DELIVERABLE_PAYLOAD - 16 - 2;
+/// Maximum STORE / PROXY_STORE record body size. Bounded by what can actually
+/// be delivered rather than a round number larger than the datagram cap.
+pub const MAX_STORE_RECORD_BYTES: usize = MAX_DELIVERABLE_PAYLOAD - 18;
 
 // Address type flags
 const ADDR_IPV4: u8 = 0x04;
@@ -63,6 +118,15 @@ pub struct DhtMessage {
     /// [`encode_message`] to fill.
     #[allow(dead_code)]
     pub signature: [u8; 64],
+}
+
+/// One record inside a [`DhtPayload::StoreBatch`], carrying exactly what a
+/// single `STORE_RECORD` would.
+#[derive(Debug, Clone)]
+pub struct BatchedRecord {
+    pub key: [u8; 16],
+    pub record: Vec<u8>,
+    pub record_signature: [u8; 64],
 }
 
 /// Payload variants for each message type.
@@ -98,6 +162,29 @@ pub enum DhtPayload {
     ProxyStoreAck {
         key: [u8; 16],
     },
+    /// Several records bound for the same node in one frame.
+    ///
+    /// Publishing a large library one datagram per (record, target) puts the
+    /// frame count in proportion to records, which both saturates the link
+    /// and trips the receiver's per-peer rate limit. Records destined for the
+    /// same peer travel together instead, so frame count scales with the
+    /// number of peers.
+    StoreBatch {
+        records: Vec<BatchedRecord>,
+    },
+    /// Which records of the matching `STORE_BATCH` were accepted, as a
+    /// bitmap over the batch's record positions (bit `i` = record `i`).
+    ///
+    /// A count alone is not enough. Acceptance is per record — the storer
+    /// re-evaluates proximity against its own table and applies its own
+    /// capacity limits — so a batch is routinely accepted in part. Reporting
+    /// only a total forced the publisher to treat "some landed" as "all
+    /// landed" and retire every file in the batch, including ones that were
+    /// never stored. [`MAX_STORE_BATCH_RECORDS`] is 64 so one `u64` covers a
+    /// full batch.
+    StoreBatchAck {
+        accepted: u64,
+    },
     FindValue {
         keys: Vec<[u8; 16]>,
     },
@@ -123,7 +210,27 @@ pub fn encode_message(
     signing_key: &ed25519_dalek::SigningKey,
     include_pub_key: bool,
 ) -> Vec<u8> {
-    let payload_bytes = encode_payload(&msg.payload);
+    let mut payload_bytes = encode_payload(&msg.payload);
+    // The length prefix is a u16 and the peer drops anything over the
+    // datagram cap, so an oversized payload used to be written with a
+    // truncated length and signed over the mismatch — a frame that is
+    // self-consistently wrong. Every encoder is bounded, so reaching this is
+    // a bug; clamp so the frame stays coherent and say so loudly.
+    if payload_bytes.len() > MAX_DELIVERABLE_PAYLOAD {
+        debug_assert!(
+            false,
+            "DHT payload of {} bytes exceeds the deliverable maximum {}",
+            payload_bytes.len(),
+            MAX_DELIVERABLE_PAYLOAD
+        );
+        tracing::error!(
+            "Ember DHT: truncating oversized {} payload ({} > {})",
+            msg.msg_type,
+            payload_bytes.len(),
+            MAX_DELIVERABLE_PAYLOAD
+        );
+        payload_bytes.truncate(MAX_DELIVERABLE_PAYLOAD);
+    }
     let payload_len = payload_bytes.len();
 
     let pub_key_bytes = if include_pub_key { 32 } else { 0 };
@@ -416,6 +523,61 @@ pub fn build_proxy_store_ack(
     }
 }
 
+/// Build a STORE_BATCH carrying several records for one destination.
+pub fn build_store_batch(
+    sender_id: EmberNodeId,
+    request_id: u32,
+    records: Vec<BatchedRecord>,
+) -> DhtMessage {
+    DhtMessage {
+        version: EMBER_DHT_VERSION,
+        msg_type: MSG_STORE_BATCH,
+        request_id,
+        sender_id,
+        sender_pub_key: None,
+        payload: DhtPayload::StoreBatch { records },
+        signature: [0u8; 64],
+    }
+}
+
+/// Build the reply to a STORE_BATCH, reporting which records were accepted.
+pub fn build_store_batch_ack(
+    sender_id: EmberNodeId,
+    request_id: u32,
+    accepted: u64,
+) -> DhtMessage {
+    DhtMessage {
+        version: EMBER_DHT_VERSION,
+        msg_type: MSG_STORE_BATCH_ACK,
+        request_id,
+        sender_id,
+        sender_pub_key: None,
+        payload: DhtPayload::StoreBatchAck { accepted },
+        signature: [0u8; 64],
+    }
+}
+
+/// How many bytes `record` costs inside a `STORE_BATCH`: the 16-byte key, the
+/// 2-byte length prefix, the body, and the 64-byte record signature.
+pub fn batched_record_wire_len(record_len: usize) -> usize {
+    16 + 2 + record_len + 64
+}
+
+/// Read a `STORE_BATCH` frame's declared record count without decoding it.
+///
+/// Lets the rate limiter charge for the work a frame implies before paying
+/// for the signature verifications that decoding it would cost. The value is
+/// unverified — `decode_payload` re-checks it against the actual body — so
+/// treat it only as an upper bound the sender is claiming.
+pub fn peek_store_batch_count(frame: &[u8]) -> Option<u32> {
+    // version(1) + msg_type(1) + request_id(4) + sender_id(16) + pubkey(32)
+    // + payload_len(2), then the payload's own leading count byte.
+    let offset = HEADER_MIN_SIZE + 32 + 2;
+    frame
+        .get(offset)
+        .map(|count| (*count as u32).min(MAX_STORE_BATCH_RECORDS as u32))
+}
+
 /// Build a FIND_VALUE request for one or more keys.
 pub fn build_find_value(
     sender_id: EmberNodeId,
@@ -486,6 +648,36 @@ fn encode_payload(payload: &DhtPayload) -> Vec<u8> {
             buf
         }
         DhtPayload::StoreAck { key } | DhtPayload::ProxyStoreAck { key } => key.to_vec(),
+        DhtPayload::StoreBatch { records } => {
+            let total: usize = records
+                .iter()
+                .map(|r| batched_record_wire_len(r.record.len()))
+                .sum();
+            let mut buf = Vec::with_capacity(1 + total);
+            // Both bounds below silently discard data if a caller exceeds
+            // them, and a caller has no way to notice. `EmberDht` respects
+            // both, so tripping either is a bug in a future caller.
+            debug_assert!(
+                records.len() <= MAX_STORE_BATCH_RECORDS,
+                "STORE_BATCH of {} records exceeds the {MAX_STORE_BATCH_RECORDS} maximum",
+                records.len()
+            );
+            debug_assert!(
+                records.iter().all(|r| r.record.len() <= u16::MAX as usize),
+                "a batched record body exceeds what its u16 length prefix can express"
+            );
+            let count = records.len().min(MAX_STORE_BATCH_RECORDS);
+            buf.write_u8(count as u8).unwrap();
+            for rec in records.iter().take(count) {
+                buf.extend_from_slice(&rec.key);
+                buf.write_u16::<LittleEndian>(rec.record.len() as u16)
+                    .unwrap();
+                buf.extend_from_slice(&rec.record);
+                buf.extend_from_slice(&rec.record_signature);
+            }
+            buf
+        }
+        DhtPayload::StoreBatchAck { accepted } => accepted.to_le_bytes().to_vec(),
         DhtPayload::FindValue { keys } => {
             let mut buf = Vec::with_capacity(1 + keys.len() * 16);
             buf.write_u8(keys.len() as u8).unwrap();
@@ -508,17 +700,32 @@ fn encode_payload(payload: &DhtPayload) -> Vec<u8> {
     }
 }
 
+/// Encode a contact list, bounded by both the declared count limit and a byte
+/// budget that keeps the resulting datagram from fragmenting.
+///
+/// A count limit alone is not enough: 20 IPv4 contacts encode to roughly 1740
+/// bytes, which fragments, and an IPv6 list is larger still. Contacts are
+/// already ordered closest-first, so trimming the tail drops the least useful
+/// entries.
 fn encode_contact_list(contacts: &[EmberContact]) -> Vec<u8> {
-    let count = contacts.len().min(MAX_CONTACTS_PER_RESPONSE);
-    let mut buf = Vec::with_capacity(1 + count * 85);
-    buf.write_u8(count as u8).unwrap();
+    let mut buf = Vec::with_capacity(1 + MAX_UNFRAGMENTED_PAYLOAD.min(1 + 20 * 100));
+    buf.write_u8(0).unwrap(); // placeholder, rewritten once the count is known
 
-    for contact in contacts.iter().take(count) {
+    let mut count = 0usize;
+    for contact in contacts.iter().take(MAX_CONTACTS_PER_RESPONSE) {
+        let before = buf.len();
         buf.extend_from_slice(&contact.node_id.0);
         encode_socket_addr(&contact.addr, &mut buf);
         buf.extend_from_slice(&contact.noise_pub);
         buf.extend_from_slice(&contact.ed25519_pub);
+        if buf.len() > MAX_UNFRAGMENTED_PAYLOAD {
+            buf.truncate(before);
+            break;
+        }
+        count += 1;
     }
+
+    buf[0] = count as u8;
     buf
 }
 
@@ -631,6 +838,63 @@ fn decode_payload(msg_type: u8, data: &[u8]) -> anyhow::Result<DhtPayload> {
                     record_signature,
                 })
             }
+        }
+        MSG_STORE_BATCH => {
+            if data.is_empty() {
+                anyhow::bail!("STORE_BATCH empty");
+            }
+            let count = data[0] as usize;
+            if count > MAX_STORE_BATCH_RECORDS {
+                anyhow::bail!(
+                    "STORE_BATCH count {count} exceeds max {MAX_STORE_BATCH_RECORDS}"
+                );
+            }
+            let mut records = Vec::with_capacity(count);
+            let mut offset = 1usize;
+            for _ in 0..count {
+                if offset + 16 + 2 > data.len() {
+                    anyhow::bail!("STORE_BATCH truncated in header");
+                }
+                let mut key = [0u8; 16];
+                key.copy_from_slice(&data[offset..offset + 16]);
+                offset += 16;
+                let record_len =
+                    u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+                offset += 2;
+                if record_len > MAX_STORE_RECORD_BYTES {
+                    anyhow::bail!(
+                        "STORE_BATCH record_len {record_len} exceeds max {MAX_STORE_RECORD_BYTES}"
+                    );
+                }
+                if offset + record_len + 64 > data.len() {
+                    anyhow::bail!("STORE_BATCH truncated in record body");
+                }
+                let record = data[offset..offset + record_len].to_vec();
+                offset += record_len;
+                let mut record_signature = [0u8; 64];
+                record_signature.copy_from_slice(&data[offset..offset + 64]);
+                offset += 64;
+                records.push(BatchedRecord {
+                    key,
+                    record,
+                    record_signature,
+                });
+            }
+            // Trailing bytes mean the frame is not what it claims to be.
+            if offset != data.len() {
+                anyhow::bail!("STORE_BATCH has {} trailing byte(s)", data.len() - offset);
+            }
+            Ok(DhtPayload::StoreBatch { records })
+        }
+        MSG_STORE_BATCH_ACK => {
+            if data.len() < 8 {
+                anyhow::bail!("STORE_BATCH_ACK too short");
+            }
+            let mut bits = [0u8; 8];
+            bits.copy_from_slice(&data[..8]);
+            Ok(DhtPayload::StoreBatchAck {
+                accepted: u64::from_le_bytes(bits),
+            })
         }
         MSG_STORE_ACK | MSG_PROXY_STORE_ACK => {
             if data.len() < 16 {
@@ -880,6 +1144,54 @@ mod tests {
         let mut encoded = encode_message(&ping, &sk, true);
         encoded.push(0xAB);
         assert!(decode_message(&encoded, true).is_err());
+    }
+
+    /// A reply that fragments is a reply many peers never receive, so the
+    /// contact list is bounded by bytes and not only by count.
+    #[test]
+    fn contact_lists_stay_inside_one_unfragmented_datagram() {
+        let (sk, id) = test_keypair();
+
+        for (label, make_addr) in [
+            (
+                "ipv4",
+                (|i: u8| SocketAddr::from(([80, 1, i, 1], 4672))) as fn(u8) -> SocketAddr,
+            ),
+            ("ipv6", |i: u8| {
+                SocketAddr::new(
+                    IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, i as u16 + 1)),
+                    4672,
+                )
+            }),
+        ] {
+            let contacts: Vec<EmberContact> = (0..MAX_CONTACTS_PER_RESPONSE as u8)
+                .map(|i| EmberContact {
+                    node_id: EmberNodeId([i; 16]),
+                    addr: make_addr(i),
+                    noise_pub: [i; 32],
+                    ed25519_pub: [i; 32],
+                    last_seen: 1,
+                    failed_queries: 0,
+                })
+                .collect();
+
+            let msg = build_found_node(id, 1, contacts);
+            let frame = encode_message(&msg, &sk, true);
+            let datagram = frame.len() + TRANSPORT_OVERHEAD;
+            assert!(
+                datagram <= MAX_UNFRAGMENTED_DATAGRAM,
+                "{label} FOUND_NODE datagram is {datagram} bytes and would fragment"
+            );
+
+            // Trimming must still leave a useful answer, and it must decode.
+            let decoded = decode_message(&frame, true).expect("frame decodes");
+            match decoded.payload {
+                DhtPayload::FoundNode { contacts } => {
+                    assert!(!contacts.is_empty(), "{label} reply must carry contacts");
+                }
+                other => panic!("expected FoundNode, got {other:?}"),
+            }
+        }
     }
 
     #[test]
