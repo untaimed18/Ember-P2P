@@ -2189,7 +2189,6 @@
   "error_settings_rendezvous_url_no_host": "URL Rendezvous должен содержать допустимый хост",
   "error_settings_rendezvous_url_not_https": "URL Rendezvous должен использовать HTTPS",
   "error_settings_rendezvous_url_too_long": "URL Rendezvous превышает {detail} байт",
-  "error_settings_rendezvous_bootstrap_pubkey_invalid": "Публичный ключ bootstrap для рандеву должен содержать 64 шестнадцатеричных символа",
   "error_settings_response_read_failed": "Не удалось прочитать тело ответа: {detail}",
   "error_settings_response_too_large": "Ответ слишком большой (Content-Length превышает лимит)",
   "error_settings_save_failed": "Сохранение не удалось: {detail}",

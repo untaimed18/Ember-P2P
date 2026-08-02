@@ -2189,7 +2189,6 @@
   "error_settings_rendezvous_url_no_host": "A URL de rendezvous deve ter um host válido",
   "error_settings_rendezvous_url_not_https": "A URL de rendezvous deve usar HTTPS",
   "error_settings_rendezvous_url_too_long": "A URL de rendezvous excede {detail} bytes",
-  "error_settings_rendezvous_bootstrap_pubkey_invalid": "Rendezvous bootstrap pubkey must be 64 hex characters",
   "error_settings_response_read_failed": "Falha ao ler o corpo da resposta: {detail}",
   "error_settings_response_too_large": "Resposta muito grande (Content-Length excede o limite)",
   "error_settings_save_failed": "Falha ao salvar: {detail}",

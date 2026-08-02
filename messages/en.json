@@ -58,7 +58,6 @@
   "nav_settings": "Settings",
   "nav_ember_network": "Ember Network",
   "nav_dev_ember": "Ember Dev",
-
   "ember_page_subtitle": "Ember's own end-to-end encrypted peer-to-peer overlay — a Noise-encrypted transport and Kademlia DHT that run independently of the eMule (KAD/eD2K) networks.",
   "ember_experimental": "Experimental",
   "ember_status_active": "Active",
@@ -126,7 +125,6 @@
   "ember_toggle_failed": "Couldn't change the Ember Network setting: {error}",
   "ember_load_failed": "Failed to load Ember Network status: {error}",
   "ember_stats_unavailable": "Live stats are unavailable — the network service isn't responding. The numbers below may be out of date.",
-
   "sidebar_aria_primary": "Primary",
   "sidebar_logo_title": "Go to KAD Network home",
   "sidebar_collapse": "Collapse sidebar (Ctrl+B)",
@@ -2191,7 +2189,6 @@
   "error_settings_rendezvous_url_no_host": "Rendezvous URL must have a valid host",
   "error_settings_rendezvous_url_not_https": "Rendezvous URL must use HTTPS",
   "error_settings_rendezvous_url_too_long": "Rendezvous URL exceeds {detail} bytes",
-  "error_settings_rendezvous_bootstrap_pubkey_invalid": "Rendezvous bootstrap pubkey must be 64 hex characters",
   "error_settings_response_read_failed": "Failed to read response body: {detail}",
   "error_settings_response_too_large": "Response too large (Content-Length exceeds limit)",
   "error_settings_save_failed": "Save failed: {detail}",

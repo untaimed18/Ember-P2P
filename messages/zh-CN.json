@@ -2189,7 +2189,6 @@
   "error_settings_rendezvous_url_no_host": "Rendezvous URL 必须有有效的主机名",
   "error_settings_rendezvous_url_not_https": "Rendezvous URL 必须使用 HTTPS",
   "error_settings_rendezvous_url_too_long": "Rendezvous URL 超过 {detail} 字节",
-  "error_settings_rendezvous_bootstrap_pubkey_invalid": "集合点引导公钥必须为 64 个十六进制字符",
   "error_settings_response_read_failed": "读取响应正文失败：{detail}",
   "error_settings_response_too_large": "响应过大（Content-Length 超出限制）",
   "error_settings_save_failed": "保存失败：{detail}",

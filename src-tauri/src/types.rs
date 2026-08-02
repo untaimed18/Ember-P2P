@@ -947,23 +947,33 @@ pub struct AppSettings {
     /// Rendezvous server URL for friend discovery
     #[serde(default = "default_rendezvous_url")]
     pub rendezvous_url: String,
-    /// Optional hex Ed25519 public key that must sign rendezvous `/bootstrap`
-    /// responses. Empty accepts any well-formed signature from the server's
-    /// advertised pubkey; the default pins the official Fly rendezvous
-    /// operator key. Set this to pin a known operator key (or clear it for
-    /// a private/self-hosted rendezvous).
-    #[serde(default = "default_rendezvous_bootstrap_pubkey")]
-    pub rendezvous_bootstrap_pubkey: String,
-    /// **Experimental**: enable the Ember-native Noise-encrypted UDP
-    /// transport alongside the existing eMule KAD/eD2K stack. When off
-    /// (default), Ember-magic UDP packets are dropped and the live
-    /// network task behaves exactly as before. When on, packets that
-    /// match `EmberTransport::is_ember_packet` are routed to the
-    /// Ember transport, which currently understands `Ping` / `Pong`
-    /// control messages only — a diagnostic surface for harness
-    /// validation, not a replacement for any user-facing feature.
-    #[serde(default)]
+    /// Join the Ember-native Noise-encrypted overlay — the UDP transport and
+    /// the Kademlia DHT — alongside the existing eMule KAD/eD2K stack.
+    ///
+    /// **On by default.** The DHT has no central bootstrap: a node finds its
+    /// first contacts through the KAD bridge, peer exchange, DHT gossip, and
+    /// its persisted contact file, so the overlay only works when ordinary
+    /// clients take part in it. When off, Ember-magic UDP packets are dropped
+    /// and the network task behaves exactly as it did before the overlay
+    /// existed.
+    ///
+    /// Turning this off is a supported choice and is remembered; see
+    /// [`Self::ember_default_on_migrated`] for how upgrades are handled.
+    #[serde(default = "default_true")]
     pub ember_native_enabled: bool,
+    /// One-shot marker for the upgrade that made [`Self::ember_native_enabled`]
+    /// default to on.
+    ///
+    /// Every config written while the overlay was opt-in stores an explicit
+    /// `false` that records the old default rather than a preference, so the
+    /// loader flips those once and sets this. Because it is only consulted
+    /// once, a user who turns the network off afterwards keeps that choice
+    /// across restarts.
+    ///
+    /// Backend-owned (see `BACKEND_OWNED_SETTINGS_FIELDS`): letting the
+    /// renderer clear it would re-run the migration and override the user.
+    #[serde(default)]
+    pub ember_default_on_migrated: bool,
     /// Reveal the Ember developer console (`/dev/ember`) in the UI: the
     /// sidebar link and the "Advanced" button on the Ember Network page.
     /// Off by default — the console exposes raw DHT harness forms (manual
@@ -1293,12 +1303,6 @@ pub(crate) fn default_rendezvous_url() -> String {
     "https://ember-rendezvous.fly.dev".to_string()
 }
 
-/// Official Ember rendezvous `/bootstrap` signing pubkey (Fly deploy).
-/// Bump this when rotating `EMBER_BOOTSTRAP_SIGNING_KEY` on the server.
-pub(crate) fn default_rendezvous_bootstrap_pubkey() -> String {
-    "cb97fe2a05177374cc36be50e1d8021189d1aeaff071274174237e1251c5467a".to_string()
-}
-
 fn default_spam_filter_profile() -> String {
     "balanced".to_string()
 }
@@ -1403,8 +1407,10 @@ impl Default for AppSettings {
             friend_session_encryption: true,
             max_friends: default_max_friends(),
             rendezvous_url: default_rendezvous_url(),
-            rendezvous_bootstrap_pubkey: default_rendezvous_bootstrap_pubkey(),
-            ember_native_enabled: false,
+            ember_native_enabled: true,
+            // A fresh profile already starts on, so there is nothing for the
+            // upgrade migration to do.
+            ember_default_on_migrated: true,
             ember_dev_tools_enabled: false,
             relay_for_peers: default_relay_for_peers(),
             max_relay_sessions: default_max_relay_sessions(),

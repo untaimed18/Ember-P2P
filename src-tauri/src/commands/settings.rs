@@ -102,6 +102,10 @@ const BACKEND_OWNED_SETTINGS_FIELDS: &[&str] = &[
     "pending_share_states",
     "pending_file_priorities",
     "shared_folder_scan_cursors",
+    // Clearing this from the renderer would re-run the Ember default-on
+    // migration on the next load and turn the network back on behind a user
+    // who had deliberately switched it off.
+    "ember_default_on_migrated",
 ];
 
 fn merge_renderer_settings(
@@ -401,18 +405,6 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
     // if an older config.json or hand edit turned it off.
     if !settings.friend_session_encryption {
         settings.friend_session_encryption = true;
-        changed = true;
-    }
-
-    // Pin the official rendezvous bootstrap signing key when using the
-    // default Fly URL and the field is still empty (upgrades / early builds
-    // that saved `""`). Self-hosted URLs are left alone.
-    let official_url = crate::types::default_rendezvous_url();
-    if settings.rendezvous_bootstrap_pubkey.trim().is_empty()
-        && settings.rendezvous_url.trim().eq_ignore_ascii_case(official_url.trim())
-    {
-        settings.rendezvous_bootstrap_pubkey =
-            crate::types::default_rendezvous_bootstrap_pubkey();
         changed = true;
     }
 
@@ -744,16 +736,6 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
             ));
         }
     }
-    let boot_pk = settings.rendezvous_bootstrap_pubkey.trim();
-    if !boot_pk.is_empty()
-        && (boot_pk.len() != 64 || !boot_pk.chars().all(|c| c.is_ascii_hexdigit()))
-    {
-        return Err(coded(
-            "settings_rendezvous_bootstrap_pubkey_invalid",
-            "Rendezvous bootstrap pubkey must be 64 hex characters",
-        ));
-    }
-
     for folder in &settings.shared_folders {
         let path = std::path::Path::new(folder);
         if path

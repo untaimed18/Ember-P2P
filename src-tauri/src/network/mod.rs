@@ -8121,11 +8121,6 @@ struct NetworkState {
     /// injection (`handle_epx_sources`) is async, so results are buffered
     /// here and drained on the next `ember_search_timer` tick.
     ember_pending_source_injections: Vec<([u8; 16], Vec<(Ipv4Addr, u16, u16, u8)>)>,
-    /// Set while a cold-start `/bootstrap` fetch task is running, so rapid
-    /// off→on toggles (or any future caller) can't dog-pile concurrent
-    /// HTTPS fetches at the rendezvous. The detached task releases it on
-    /// completion via an RAII guard; shared with that task by `Arc`.
-    ember_cold_bootstrap_in_flight: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// One in-flight iterative-lookup `FIND_NODE`, tracked by the network
@@ -10472,89 +10467,10 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     finish_request_id
 }
 
-/// Kick a cold-start Ember DHT bootstrap if (and only if) it's warranted:
-/// the native transport is enabled, the routing table is empty (no warm
-/// `nodes_ember.dat`, or it failed to load), and a rendezvous URL is
-/// configured. The actual `/bootstrap` fetch is an HTTPS round trip, so it
-/// runs in a detached task and hands the parsed contacts back to the
-/// network loop over `boot_tx`; the `ember_boot_rx` arm there seeds them
-/// and fires a self-lookup. Safe to call when not warranted — it just
-/// no-ops. Used both at startup and when the user toggles the network on
-/// at runtime, so a fresh node joins the DHT without a restart.
-///
-/// First-contact discovery otherwise comes from the KAD bridge (slice 13)
-/// while KAD is up; rendezvous covers Ember-on / KAD-off clients.
-fn maybe_spawn_ember_cold_bootstrap(
-    settings: &AppSettings,
-    state: &NetworkState,
-    boot_tx: &mpsc::Sender<Vec<ember::dht::EmberContact>>,
-    trigger: &'static str,
-) {
-    // Only warranted when the transport is on and the table is empty.
-    if !(settings.ember_native_enabled && state.ember_dht.contact_count() == 0) {
-        return;
-    }
-
-    let rv_url = settings.rendezvous_url.trim().to_string();
-    if rv_url.is_empty() {
-        return;
-    }
-    let pinned_pubkey = settings.rendezvous_bootstrap_pubkey.trim().to_string();
-
-    // In-flight guard, taken only after the cheap no-op checks above so an
-    // early return can never strand the flag set. `swap` is the atomic
-    // test-and-set: if it was already true, another fetch is running.
-    use std::sync::atomic::Ordering;
-    if state
-        .ember_cold_bootstrap_in_flight
-        .swap(true, Ordering::AcqRel)
-    {
-        debug!("Ember DHT cold bootstrap ({trigger}) skipped: one already in flight");
-        return;
-    }
-    let in_flight = state.ember_cold_bootstrap_in_flight.clone();
-
-    let boot_tx = boot_tx.clone();
-    tokio::spawn(async move {
-        // RAII release: clears the guard on every exit path (normal return,
-        // early return, or panic) so a future toggle can bootstrap again.
-        struct InFlightGuard(Arc<std::sync::atomic::AtomicBool>);
-        impl Drop for InFlightGuard {
-            fn drop(&mut self) {
-                self.0.store(false, std::sync::atomic::Ordering::Release);
-            }
-        }
-        let _guard = InFlightGuard(in_flight);
-
-        let expected = if pinned_pubkey.is_empty() {
-            None
-        } else {
-            Some(pinned_pubkey.as_str())
-        };
-        match ember::dht::bootstrap::fetch_bootstrap_nodes(&rv_url, expected).await {
-            Ok(nodes) => {
-                let contacts: Vec<ember::dht::EmberContact> =
-                    nodes.iter().filter_map(|n| n.to_contact()).collect();
-                if contacts.is_empty() {
-                    info!("Ember DHT cold bootstrap ({trigger}): rendezvous returned no usable nodes yet");
-                } else {
-                    info!(
-                        "Ember DHT cold bootstrap ({trigger}): fetched {} node(s) from rendezvous",
-                        contacts.len()
-                    );
-                    let _ = boot_tx.send(contacts).await;
-                }
-            }
-            Err(e) => debug!("Ember DHT cold bootstrap ({trigger}) fetch failed: {e}"),
-        }
-    });
-}
-
 fn apply_network_settings(
     state: &mut NetworkState,
     settings: &mut AppSettings,
     new_settings: AppSettings,
-    ember_boot_tx: &mpsc::Sender<Vec<ember::dht::EmberContact>>,
     app_handle: &tauri::AppHandle,
 ) {
     let stun_was_enabled = state.stun_keepalive_enabled;
@@ -10651,7 +10567,6 @@ fn apply_network_settings(
             .routing_table
             .set_block_private_ips(new_settings.block_private_ips);
     }
-    let ember_turned_on = !settings.ember_native_enabled && new_settings.ember_native_enabled;
     if settings.ember_native_enabled && !new_settings.ember_native_enabled {
         if let Some(request_id) = ember_disable_cleanup(state) {
             maybe_finish_active_search(state, app_handle, request_id);
@@ -10668,9 +10583,6 @@ fn apply_network_settings(
         new_settings.ember_native_enabled,
     );
     *settings = new_settings;
-    if ember_turned_on {
-        maybe_spawn_ember_cold_bootstrap(settings, state, ember_boot_tx, "settings-toggle");
-    }
 }
 
 pub async fn start_network(
@@ -11307,7 +11219,6 @@ pub async fn start_network(
         ember_download_source_searches: HashMap::new(),
         ember_source_search_state: HashMap::new(),
         ember_pending_source_injections: Vec::new(),
-        ember_cold_bootstrap_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
     // Seed the Ember DHT routing table from the last session's persisted
@@ -11333,19 +11244,11 @@ pub async fn start_network(
         debug!("No nodes_ember.dat found; Ember DHT routing table starts empty");
     }
 
-    // Cold-start DHT bootstrap (the native equivalent of fetching a fresh
-    // `nodes.dat`). When the routing table came up empty — a brand-new
-    // install, or a lost/corrupt `nodes_ember.dat` — and the transport is
-    // enabled, fetch a sample of live nodes from the rendezvous server's
-    // `/bootstrap` pool so we can join the DHT without any KAD involvement.
-    // The fetch is an HTTPS round trip, so it runs in a background task and
-    // hands the contacts back to the loop over `ember_boot_rx` instead of
-    // blocking startup. Warm starts skip this entirely. The same helper is
-    // reused when the user flips `ember_native_enabled` on at runtime (see
-    // the `UpdateSettings` handlers) so the toggle joins the DHT without a
-    // restart.
-    let (ember_boot_tx, mut ember_boot_rx) = mpsc::channel::<Vec<ember::dht::EmberContact>>(1);
-    maybe_spawn_ember_cold_bootstrap(&settings, &state, &ember_boot_tx, "startup");
+    // A table that comes up empty — brand-new install, or a lost/corrupt
+    // `nodes_ember.dat` — is refilled by the decentralized paths instead of a
+    // central pool: the KAD bridge harvests Ember peers from ordinary KAD
+    // source responses, and peer exchange plus DHT gossip take over from
+    // there. Nothing to kick off here; the maintenance tick drives it.
 
     // Seed active IP-reputation bans into the enforced set so a restart
     // does not leave a still-banned IP connectable until the first
@@ -12316,7 +12219,6 @@ pub async fn start_network(
                         &mut state,
                         &mut settings,
                         new_settings,
-                        &ember_boot_tx,
                         &app_handle,
                     );
                     state
@@ -13343,7 +13245,6 @@ pub async fn start_network(
                             &mut state,
                             &mut settings,
                             new_settings,
-                            &ember_boot_tx,
                             &app_handle,
                         );
                         state
@@ -27785,36 +27686,6 @@ pub async fn start_network(
                 }
             }
 
-            // Cold-start bootstrap contacts arrived from the rendezvous
-            // `/bootstrap` pool (see the startup fetch above). Seed them
-            // into the routing table, then kick a self-lookup so we
-            // discover our neighbourhood and the table fills out — the
-            // native equivalent of KAD's initial bootstrap lookup.
-            Some(contacts) = ember_boot_rx.recv() => {
-                let __panic_result = std::panic::AssertUnwindSafe(async {
-                let n = contacts.len();
-                let before = state.ember_dht.contact_count();
-                state.ember_dht.load_contacts(contacts);
-                let after = state.ember_dht.contact_count();
-                info!(
-                    "Ember DHT cold bootstrap: seeded {} of {} fetched node(s) (routing table {} → {})",
-                    after.saturating_sub(before), n, before, after,
-                );
-                if settings.ember_native_enabled && after > 0 {
-                    let self_id = state.ember_dht.local_id();
-                    if let Some(search_id) = state
-                        .ember_search
-                        .start_find_node(self_id, state.ember_dht.routing())
-                    {
-                        drive_ember_search(&udp_socket, &mut state, search_id).await;
-                    }
-                }
-                }).catch_unwind().await;
-                if let Err(__p) = __panic_result {
-                    error!("Network loop arm 'ember_boot_rx' panicked: {}", describe_panic(&*__p));
-                }
-            }
-
             _ = source_count_sync_timer.tick() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
                 let hashes = {
@@ -30617,6 +30488,86 @@ fn maybe_finish_ember_publish(state: &mut NetworkState, publish_id: u32) {
         .retain(|_, r| r.publish_id != publish_id);
 }
 
+/// Whether a library file may be advertised on the Ember DHT.
+///
+/// Scope is decided by `is_public_listable`, never by `shared` alone: a
+/// friends-only file is served to mutual friends over the friend path, and
+/// publishing it here would make it worldwide-discoverable — the same leak
+/// that predicate already prevents on the KAD and ed2k-server paths.
+///
+/// The BLAKE3 gate rides along because both publishers need it: an all-zero
+/// digest makes downloaders skip verification, and the record would carry
+/// those zeros until its republish interval elapsed.
+fn is_ember_publishable(file: &FileInfo) -> bool {
+    file.is_public_listable() && !file.hash.is_empty() && !file.ember_file_hash.is_empty()
+}
+
+#[cfg(test)]
+mod ember_publish_scope_tests {
+    use super::*;
+
+    fn public_share() -> FileInfo {
+        FileInfo {
+            id: "0123456789abcdef0123456789abcdef".to_string(),
+            name: "movie.mkv".to_string(),
+            path: "C:/Library/movie.mkv".to_string(),
+            size: 1024,
+            hash: "0123456789abcdef0123456789abcdef".to_string(),
+            aich_hash: String::new(),
+            ember_file_hash: "ab".repeat(32),
+            extension: "mkv".to_string(),
+            modified_at: 0,
+            priority: "normal".to_string(),
+            requests: 0,
+            accepted: 0,
+            bytes_transferred: 0,
+            alltime_requests: 0,
+            alltime_accepted: 0,
+            alltime_transferred: 0,
+            complete_sources: 0,
+            folder: String::new(),
+            shared: true,
+            friends_only: false,
+            shared_kad: false,
+            shared_ed2k: false,
+        }
+    }
+
+    /// Both Ember publishers used to test `shared` directly, which let a
+    /// friends-only file through as a source *and* a keyword record — the
+    /// exact leak `is_public_listable` exists to stop. It is worse here than
+    /// on the browse path: a DHT record is replicated to peers and outlives
+    /// the session that published it.
+    #[test]
+    fn a_friends_only_file_is_never_published_to_the_dht() {
+        let mut restricted = public_share();
+        restricted.friends_only = true;
+        assert!(!is_ember_publishable(&restricted));
+    }
+
+    #[test]
+    fn a_public_share_with_a_digest_is_published() {
+        assert!(is_ember_publishable(&public_share()));
+    }
+
+    #[test]
+    fn unshared_or_unhashed_files_are_skipped() {
+        let mut unshared = public_share();
+        unshared.shared = false;
+        assert!(!is_ember_publishable(&unshared));
+
+        // Without a BLAKE3 digest the record would tell downloaders to skip
+        // verification, and would carry that gap until its next republish.
+        let mut undigested = public_share();
+        undigested.ember_file_hash = String::new();
+        assert!(!is_ember_publishable(&undigested));
+
+        let mut unhashed = public_share();
+        unhashed.hash = String::new();
+        assert!(!is_ember_publishable(&unhashed));
+    }
+}
+
 /// Auto-publish Ember DHT source records for our shared files (slice 9 + 15).
 ///
 /// Runs on the 60-second publish tick, gated on `ember_native_enabled`
@@ -30694,12 +30645,7 @@ async fn maybe_publish_ember_sources(
         let files = idx.all_files();
         let mut ranked: Vec<(u64, usize)> = Vec::new();
         for (i, f) in files.iter().enumerate() {
-            if !f.shared || f.hash.is_empty() {
-                continue;
-            }
-            // Wait for slice-18 BLAKE3 before advertising; zeros skip verify
-            // on downloaders and would stick until the republish interval.
-            if f.ember_file_hash.is_empty() {
+            if !is_ember_publishable(f) {
                 continue;
             }
             let Some(hash) = hex::decode(&f.hash)
@@ -30858,10 +30804,7 @@ async fn maybe_publish_ember_keywords(
         let files = idx.all_files();
         let mut ranked: Vec<(u64, usize)> = Vec::new();
         for (i, f) in files.iter().enumerate() {
-            if !f.shared || f.hash.is_empty() {
-                continue;
-            }
-            if f.ember_file_hash.is_empty() {
+            if !is_ember_publishable(f) {
                 continue;
             }
             let Some(hash) = hex::decode(&f.hash)

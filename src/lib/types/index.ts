@@ -589,10 +589,9 @@ export interface AppSettings {
   max_friends: number;
   /** Rendezvous server URL for Ember friend discovery */
   rendezvous_url: string;
-  /** Optional hex Ed25519 pubkey that must sign `/bootstrap` responses.
-   *  Defaults to the official Ember rendezvous operator key. Clear for a self-hosted server. */
-  rendezvous_bootstrap_pubkey: string;
-  /** Experimental: enable the Ember-native Noise-encrypted UDP transport. */
+  /** Join the Ember-native Noise-encrypted overlay (UDP transport + DHT).
+   *  On by default: the DHT bootstraps from other clients rather than a
+   *  central pool, so it only works when ordinary profiles take part. */
   ember_native_enabled: boolean;
   /** Advanced: reveal the Ember developer console (`/dev/ember`) links in the UI. */
   ember_dev_tools_enabled: boolean;

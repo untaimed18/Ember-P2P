@@ -70,6 +70,34 @@ fn paths_likely_equal(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// One-shot upgrade that turns the Ember overlay on for profiles created while
+/// it was still opt-in.
+///
+/// Such a config stores `ember_native_enabled: false` because that was the
+/// default at the time, not because the user chose it. The overlay bootstraps
+/// from other clients rather than a central pool, so it is only useful when
+/// ordinary profiles take part — hence the flip. `ember_default_on_migrated`
+/// is what keeps it one-shot: once set, turning the network off is remembered
+/// across restarts.
+///
+/// Skipped entirely on a fresh install, where the default already applies.
+/// Returns whether the config needs saving.
+fn migrate_ember_default_on(settings: &mut AppSettings, config_existed: bool) -> bool {
+    if !config_existed || settings.ember_default_on_migrated {
+        return false;
+    }
+    if !settings.ember_native_enabled {
+        settings.ember_native_enabled = true;
+        info!(
+            "Joining the Ember Network for this profile: it is on by default from this \
+             version and the stored value predates that default. It can be turned off \
+             under Settings > Network."
+        );
+    }
+    settings.ember_default_on_migrated = true;
+    true
+}
+
 pub struct AppConfig {
     pub settings: AppSettings,
     config_path: PathBuf,
@@ -167,6 +195,8 @@ impl AppConfig {
             config_changed = true;
         }
 
+        config_changed |= migrate_ember_default_on(&mut settings, config_existed);
+
         // Migrate: old configs pointed download_folder directly at the user's
         // Downloads dir.  It should be a Ember subfolder so we don't pollute it.
         if !settings.download_folder.is_empty() {
@@ -261,5 +291,48 @@ impl AppConfig {
         crate::security::atomic_write(final_path, data.as_bytes(), true)?;
         info!("Config saved");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod ember_default_on_tests {
+    use super::*;
+
+    /// A config from the opt-in era stores `false` because that was the
+    /// default, not because anyone chose it. Leaving those profiles off would
+    /// starve the overlay of the very peers it bootstraps from.
+    #[test]
+    fn an_upgraded_profile_joins_the_network() {
+        let mut settings = AppSettings {
+            ember_native_enabled: false,
+            ember_default_on_migrated: false,
+            ..AppSettings::default()
+        };
+        assert!(migrate_ember_default_on(&mut settings, true));
+        assert!(settings.ember_native_enabled);
+        assert!(settings.ember_default_on_migrated);
+    }
+
+    /// The whole point of the marker: the flip happens once, so switching the
+    /// network off survives the next restart instead of being undone by the
+    /// same migration running again.
+    #[test]
+    fn turning_the_network_off_afterwards_is_remembered() {
+        let mut settings = AppSettings {
+            ember_native_enabled: false,
+            ember_default_on_migrated: true,
+            ..AppSettings::default()
+        };
+        assert!(!migrate_ember_default_on(&mut settings, true));
+        assert!(!settings.ember_native_enabled);
+    }
+
+    /// A fresh install already has the default applied, so the migration must
+    /// not claim the config changed and force a redundant save on first run.
+    #[test]
+    fn a_fresh_install_is_left_alone() {
+        let mut settings = AppSettings::default();
+        assert!(!migrate_ember_default_on(&mut settings, false));
+        assert!(settings.ember_native_enabled);
     }
 }
