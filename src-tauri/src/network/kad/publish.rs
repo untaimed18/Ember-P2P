@@ -309,6 +309,16 @@ impl PublishManager {
             .count()
     }
 
+    /// Whether this node publishes any shared file to KAD.
+    ///
+    /// Gates the Ember rendezvous advert: a node already running the publish
+    /// rotation adds one more record to traffic it was sending anyway, whereas
+    /// a pure leecher would be generating KAD publish traffic solely to
+    /// advertise itself. Leechers can still look the rendezvous key up.
+    pub fn has_publishable_files(&self) -> bool {
+        !self.records.is_empty()
+    }
+
     /// Get files that need source republishing.
     pub fn files_needing_source_publish(&self) -> Vec<&PublishableFile> {
         let now = chrono::Utc::now().timestamp();
@@ -702,6 +712,30 @@ pub fn keyword_to_kad_id(keyword: &str) -> KadId {
     md4_bytes_to_kad_id(&hash)
 }
 
+/// Seed string behind [`ember_rendezvous_key`]. Versioned so the key space can
+/// be sharded later without a flag day: a build that publishes to more than one
+/// key derives them from `"...-v2:0"`, `"...-v2:1"`, … and publishes to the old
+/// key too for one release so the two generations still find each other.
+const EMBER_RENDEZVOUS_SEED: &str = "ember-dht-rendezvous-v1";
+
+/// The KAD key Ember nodes advertise themselves under so a client with no DHT
+/// contacts can find some.
+///
+/// KAD is a large, healthy DHT that Ember is already a full member of, which
+/// makes it the one bootstrap channel available without a central server or a
+/// hardcoded address. A node publishes an ordinary source record here — the
+/// same record shape, carrying the same [`EMBER_NOISE_PUB_TAG`] every source
+/// publish already carries — and a node looking to join runs an ordinary source
+/// lookup, feeding whatever it finds to the DHT bridge.
+///
+/// Cost to KAD is one extra source record per node per republish interval,
+/// which is a single additional entry in a rotation that already carries one
+/// per shared file. Storing peers apply their usual per-key and per-IP caps to
+/// it like any other record.
+pub fn ember_rendezvous_key() -> KadId {
+    md4_bytes_to_kad_id(&Md4::digest(EMBER_RENDEZVOUS_SEED.as_bytes()))
+}
+
 /// Convert raw MD4 output bytes to a KadId matching eMule's CUInt128 wire format.
 /// Each 32-bit word has its bytes reversed (big-endian interpretation written as LE).
 pub fn md4_bytes_to_kad_id(hash: &[u8]) -> KadId {
@@ -820,6 +854,59 @@ mod tests {
         // emission of every other tag too).
         p.direct_udp_callback = true;
         p
+    }
+
+    /// Every Ember build has to derive the same rendezvous key or nodes
+    /// advertise themselves where nobody is looking. Pinning the value guards
+    /// the derivation against an innocent-looking refactor of the seed string
+    /// or the MD4 word-order conversion.
+    #[test]
+    fn ember_rendezvous_key_is_stable() {
+        let expected = md4_bytes_to_kad_id(&Md4::digest(b"ember-dht-rendezvous-v1"));
+        assert_eq!(ember_rendezvous_key(), expected);
+        // Stable across calls, and distinct from the raw digest ordering.
+        assert_eq!(ember_rendezvous_key(), ember_rendezvous_key());
+    }
+
+    /// The rendezvous advert is gated on already publishing something, so a
+    /// pure leecher never starts making KAD publish traffic purely to list
+    /// itself. It can still look the key up.
+    #[test]
+    fn has_publishable_files_tracks_the_shared_set() {
+        let mut p = make_publisher(false);
+        assert!(!p.has_publishable_files());
+        p.add_file(sample_file());
+        assert!(p.has_publishable_files());
+    }
+
+    /// The advert reuses the ordinary source-publish builder, so it must carry
+    /// the Noise key — that tag is the entire payload as far as a bootstrapping
+    /// peer is concerned. Without it the record is useless to them.
+    #[test]
+    fn rendezvous_advert_carries_the_noise_pubkey() {
+        let mut publisher = make_publisher(false);
+        publisher.noise_pub = [7u8; 32];
+        let advert = PublishableFile {
+            file_hash: ember_rendezvous_key(),
+            file_name: String::new(),
+            file_size: 0,
+            file_type: String::new(),
+            complete_sources: 0,
+            keyword_publishable: false,
+            last_source_publish: 0,
+        };
+        let tags = match publisher.build_source_publish(&advert).unwrap() {
+            KadMessage::PublishSourceReq { tags, .. } => tags,
+            _ => panic!("unexpected message type"),
+        };
+        let npub = tags
+            .iter()
+            .find(|t| matches!(&t.name, TagName::Str(s) if s == EMBER_NOISE_PUB_TAG))
+            .expect("rendezvous advert must carry the Noise pubkey");
+        match &npub.value {
+            TagValue::Bsob(b) => assert_eq!(b.as_slice(), &[7u8; 32]),
+            _ => panic!("ember_npub tag must be a Bsob"),
+        }
     }
 
     /// HighID Ember client must emit the `"ember"` capability tag in

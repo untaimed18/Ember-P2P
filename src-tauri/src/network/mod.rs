@@ -1154,6 +1154,33 @@ fn kad_bridge_candidates(
         .collect()
 }
 
+/// Learn Noise static keys from the sources a KAD search returned.
+///
+/// Every source record an Ember node publishes carries its Noise key, so any
+/// source lookup doubles as Ember peer discovery — which is what lets the DHT
+/// bridge dial those peers on the 1-RTT IK path. Cached under the peer's *UDP*
+/// port: Ember's transport rides the shared KAD UDP socket, so a source that
+/// advertised no UDP port can never be Ember-dialed and is skipped.
+fn harvest_ember_noise_keys(
+    noise_keys: &mut HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)>,
+    sources: &[KadSource],
+) {
+    for s in sources {
+        if s.ip.is_unspecified() || s.tcp_port == 0 || s.udp_port == 0 {
+            continue;
+        }
+        let Some(npub) = s.ember_noise_pub else {
+            continue;
+        };
+        if record_ember_noise_key(noise_keys, s.ip, s.udp_port, npub).is_some() {
+            debug!(
+                "Ignoring conflicting KAD ember_npub for {}:{} (first-seen key pinned until TTL)",
+                s.ip, s.udp_port
+            );
+        }
+    }
+}
+
 /// Remember an Ember peer we met over eD2K but hold no Noise key for, so the
 /// bridge can reach it with a 2-RTT Noise_XX handshake.
 ///
@@ -7977,6 +8004,16 @@ struct NetworkState {
     /// UDP port because the Noise transport rides the shared KAD UDP socket.
     /// Bounded and pruned exactly like `known_ember_peers`.
     ember_keyless_peers: HashMap<(Ipv4Addr, u16), std::time::Instant>,
+    /// Unix time of our last self-publish to the Ember rendezvous key, so it
+    /// republishes on the same cadence as any other source record. 0 = never.
+    ember_rendezvous_published_at: i64,
+    /// The in-flight rendezvous *lookup*, if any. Tracked separately from
+    /// download and UI source searches so its results can be harvested for
+    /// Noise keys and then discarded — nobody is waiting on them.
+    ember_rendezvous_search: Option<SearchId>,
+    /// Unix time the last rendezvous lookup started, to space out retries
+    /// while the routing table is still empty. 0 = never.
+    ember_rendezvous_looked_up_at: i64,
     /// KAD-bridge bootstrap bookkeeping (slice 13): `(ip, port)` of every
     /// KAD-learned Ember peer the maintenance loop has already DHT-pinged
     /// this session, so the bridge moves through the `ember_noise_keys`
@@ -8344,6 +8381,20 @@ const EMBER_MAINT_MAX_ANNOUNCE: usize = 2;
 /// reaches this size it's self-sustaining and the bridge goes quiet. One
 /// k-bucket's worth is plenty to seed iterative lookups + ongoing refresh.
 const EMBER_KAD_BRIDGE_UNTIL_CONTACTS: usize = ember::dht::K_BUCKET_SIZE;
+
+/// How often we re-advertise ourselves under the Ember rendezvous key.
+/// Deliberately the same 5 hours KAD itself uses for source records, so the
+/// entry is renewed just inside the `SOURCE_TTL_SECS` window storing peers
+/// enforce and we never ask them to hold it longer than a normal source.
+const EMBER_RENDEZVOUS_REPUBLISH_SECS: i64 = 5 * 3600;
+
+/// Minimum spacing between rendezvous *lookups*. The lookup only runs while
+/// the Ember routing table is below `EMBER_KAD_BRIDGE_UNTIL_CONTACTS`, but a
+/// node that genuinely cannot reach anyone would otherwise re-run a 45-second
+/// KAD source search every maintenance tick forever. Ten minutes keeps a
+/// stuck node's contribution to KAD search load negligible while still
+/// recovering within a reasonable time once peers do appear.
+const EMBER_RENDEZVOUS_LOOKUP_INTERVAL_SECS: i64 = 600;
 
 /// Max KAD-bridge `PING`s per maintenance cycle, so even a large KAD-learned
 /// peer cache can't burst the DHT with handshakes in one tick.
@@ -8891,22 +8942,7 @@ fn finalize_removed_searches_with_keyword_results(
             // callers do not treat capacity eviction as an empty success (S8).
             if let Some(entries) = preserved_results.get(sid) {
                 let all = extract_kad_sources(entries);
-                for s in &all {
-                    if !s.ip.is_unspecified() && s.tcp_port != 0 {
-                        if let Some(npub) = s.ember_noise_pub {
-                            // Cache under UDP port: Ember Noise runs on the
-                            // shared KAD UDP socket, not eMule TCP.
-                            if s.udp_port != 0 {
-                                let _ = record_ember_noise_key(
-                                    &mut state.ember_noise_keys,
-                                    s.ip,
-                                    s.udp_port,
-                                    npub,
-                                );
-                            }
-                        }
-                    }
-                }
+                harvest_ember_noise_keys(&mut state.ember_noise_keys, &all);
                 let sources: Vec<(String, u16)> = all
                     .into_iter()
                     .filter(|s| !is_self_source(s, state))
@@ -8917,6 +8953,20 @@ fn finalize_removed_searches_with_keyword_results(
                 let _ = tx.send(Err(
                     "Source search busy: KAD search capacity reached".to_string()
                 ));
+            }
+        }
+        // Ember rendezvous lookup: nobody is waiting on the result, the point
+        // is purely the Noise keys it carries. Clear the slot either way so a
+        // later tick can retry.
+        if state.ember_rendezvous_search == Some(*sid) {
+            state.ember_rendezvous_search = None;
+            if let Some(entries) = preserved_results.get(sid) {
+                // Skip our own advert, which every rendezvous lookup returns.
+                let peers: Vec<KadSource> = extract_kad_sources(entries)
+                    .into_iter()
+                    .filter(|s| !is_self_source(s, state))
+                    .collect();
+                harvest_ember_noise_keys(&mut state.ember_noise_keys, &peers);
             }
         }
         if let Some((_, tx)) = state.pending_notes_searches.remove(sid) {
@@ -8937,22 +8987,7 @@ fn finalize_removed_searches_with_keyword_results(
         if let Some((transfer_id, file_hash)) = state.download_source_searches.remove(sid) {
             if let Some(entries) = preserved_results.get(sid) {
                 let all = extract_kad_sources(entries);
-                for s in &all {
-                    if !s.ip.is_unspecified() && s.tcp_port != 0 {
-                        if let Some(npub) = s.ember_noise_pub {
-                            // Cache under UDP port: Ember Noise runs on the
-                            // shared KAD UDP socket, not eMule TCP.
-                            if s.udp_port != 0 {
-                                let _ = record_ember_noise_key(
-                                    &mut state.ember_noise_keys,
-                                    s.ip,
-                                    s.udp_port,
-                                    npub,
-                                );
-                            }
-                        }
-                    }
-                }
+                harvest_ember_noise_keys(&mut state.ember_noise_keys, &all);
                 let kad_sources: Vec<KadSource> = all
                     .into_iter()
                     .filter(|s| !is_self_source(s, state))
@@ -11258,6 +11293,9 @@ pub async fn start_network(
         known_ember_peers: HashMap::new(),
         ember_noise_keys: HashMap::new(),
         ember_keyless_peers: HashMap::new(),
+        ember_rendezvous_published_at: 0,
+        ember_rendezvous_search: None,
+        ember_rendezvous_looked_up_at: 0,
         ember_kad_bridge_attempted: HashSet::new(),
         ember_udp_epx_rate: HashMap::new(),
         ember_diagnostics: EmberDiagnostics::default(),
@@ -16514,27 +16552,7 @@ pub async fn start_network(
                         // completion handler so the native-dial cache fills
                         // regardless of which path (stream vs completion)
                         // sees a peer first.
-                        for s in &all {
-                            if !s.ip.is_unspecified() && s.tcp_port != 0 {
-                                if let Some(npub) = s.ember_noise_pub {
-                                    // Cache under UDP port: Ember Noise runs on
-                                    // the shared KAD UDP socket, not eMule TCP.
-                                    if s.udp_port != 0 {
-                                        if let Some(_pinned) = record_ember_noise_key(
-                                            &mut state.ember_noise_keys,
-                                            s.ip,
-                                            s.udp_port,
-                                            npub,
-                                        ) {
-                                            debug!(
-                                                "Ignoring conflicting KAD ember_npub for {}:{} (first-seen key pinned until TTL)",
-                                                s.ip, s.udp_port
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        harvest_ember_noise_keys(&mut state.ember_noise_keys, &all);
                         let kad_sources: Vec<KadSource> = all
                             .into_iter()
                             .filter(|s| !is_self_source(s, &state))
@@ -16786,41 +16804,40 @@ pub async fn start_network(
                             }
                         }
                         maybe_finish_active_search(&mut state, &app_handle, request_id);
+                    } else if state.ember_rendezvous_search == Some(sid) {
+                        // Ember rendezvous lookup. Its whole purpose is the
+                        // Noise keys the returned sources carry — the DHT bridge
+                        // picks them up on the next maintenance tick — so the
+                        // source list itself is discarded rather than injected
+                        // anywhere. Not a real file, so nothing wants it.
+                        state.ember_rendezvous_search = None;
+                        if let Some(search) = state.search_manager.get(&sid) {
+                            let all = extract_kad_sources(&search.results);
+                            let found = all.len();
+                            // Our own advert is always in these results — we put
+                            // it there. Drop it before caching, or the bridge
+                            // spends a ping dialing this node's own address.
+                            let peers: Vec<KadSource> = all
+                                .into_iter()
+                                .filter(|s| !is_self_source(s, &state))
+                                .collect();
+                            harvest_ember_noise_keys(&mut state.ember_noise_keys, &peers);
+                            debug!(
+                                "Ember rendezvous lookup finished: {found} advertised peer(s), \
+                                 {} after dropping self, {} dialable Noise key(s) cached",
+                                peers.len(),
+                                state.ember_noise_keys.len()
+                            );
+                        }
                     } else if let Some((_, tx)) = state.pending_source_searches.remove(&sid) {
                         let sources = if let Some(search) = state.search_manager.get(&sid) {
                             let all = extract_kad_sources(&search.results);
-                            // Learn each peer's Noise pubkey so `ember_ping_peer` can
-                            // dial its Ember-native UDP transport without needing the
-                            // harness to copy hex from devtools. We update the cache
-                            // *before* filtering self-sources because we want to learn
-                            // about peers from every search response, not just ones we
-                            // end up handing back to the caller.
-                            for s in &all {
-                                if !s.ip.is_unspecified() && s.tcp_port != 0 {
-                                    // Cache the Noise key under the peer's UDP
-                                    // port: Ember's Noise transport runs over
-                                    // UDP (the shared KAD socket), so every
-                                    // bridge/dial path must target udp_port,
-                                    // not the eMule TCP port. A peer that
-                                    // advertised no UDP port can't be Ember-
-                                    // dialed, so skip caching it.
-                                    if let Some(npub) = s.ember_noise_pub {
-                                        if s.udp_port != 0 {
-                                            if let Some(_pinned) = record_ember_noise_key(
-                                                &mut state.ember_noise_keys,
-                                                s.ip,
-                                                s.udp_port,
-                                                npub,
-                                            ) {
-                                                debug!(
-                                                    "Ignoring conflicting KAD ember_npub for {}:{} (first-seen key pinned until TTL)",
-                                                    s.ip, s.udp_port
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                            // Learn each peer's Noise pubkey so the DHT bridge can
+                            // dial its Ember-native UDP transport. Harvested
+                            // *before* filtering self-sources, because we want to
+                            // learn about peers from every search response, not
+                            // just the ones handed back to the caller.
+                            harvest_ember_noise_keys(&mut state.ember_noise_keys, &all);
                             let before = all.len();
                             let filtered: Vec<(String, u16)> = all
                                 .into_iter()
@@ -18169,6 +18186,18 @@ pub async fn start_network(
                                 }
                                 info!("StoreSource search {} completed: published to {} nodes ({} during lookup, {} at completion)",
                                     sid.0, total_published, already_published.len(), successful_peers);
+                            }
+                            if total_published == 0
+                                && file_hash == kad::publish::ember_rendezvous_key()
+                            {
+                                // Nobody stored the advert, so we are not listed.
+                                // `mark_source_published` above is a no-op for this
+                                // key (it is deliberately absent from the file set),
+                                // so clear our own timestamp instead — otherwise a
+                                // single failed attempt would leave this node
+                                // undiscoverable for a whole republish interval.
+                                state.ember_rendezvous_published_at = 0;
+                                debug!("Ember rendezvous: advert stored nowhere, will retry");
                             }
                         }
                     } else if let Some(note) = state.pending_note_publishes.remove(&sid) {
@@ -19803,6 +19832,67 @@ pub async fn start_network(
                                 state.publish_manager.buddy_id.is_some(),
                                 state.publish_manager.direct_udp_callback,
                             );
+                        }
+                    }
+                }
+
+                // Advertise ourselves under the Ember rendezvous key so a node
+                // with an empty DHT table can find us. Rides the same store
+                // slot budget and the same round-robin tick as shared-file
+                // publishes, and is skipped unless we are actually useful as a
+                // bootstrap contact:
+                //
+                //   * Ember on — otherwise we would not answer a DHT PING.
+                //   * Already publishing shared files — a node that makes no
+                //     KAD publish traffic today should not start making some
+                //     just to advertise itself; it can still *look up* the key.
+                //   * `build_source_publish` returns None for an unreachable
+                //     firewalled node, which is exactly who should not be
+                //     listed as a bootstrap contact.
+                let rendezvous_now = chrono::Utc::now().timestamp();
+                let rendezvous_due = settings.ember_native_enabled
+                    && state.publish_manager.has_publishable_files()
+                    && rendezvous_now.saturating_sub(state.ember_rendezvous_published_at)
+                        > EMBER_RENDEZVOUS_REPUBLISH_SECS;
+                if rendezvous_due && state.store_source_searches.len() < KADEMLIA_TOTAL_STORE_SRC {
+                    let key = kad::publish::ember_rendezvous_key();
+                    let already_publishing = state
+                        .store_source_searches
+                        .values()
+                        .any(|(hash, _)| *hash == key);
+                    if !already_publishing {
+                        // A synthetic record, deliberately never added to the
+                        // publish manager's file set: that set is mirrored from
+                        // the shared library, and a phantom entry there would
+                        // surface in share counts and reconcile passes.
+                        let advert = kad::publish::PublishableFile {
+                            file_hash: key,
+                            file_name: String::new(),
+                            file_size: 0,
+                            file_type: String::new(),
+                            complete_sources: 0,
+                            keyword_publishable: false,
+                            last_source_publish: 0,
+                        };
+                        if let Some(msg) = state.publish_manager.build_source_publish(&advert) {
+                            let closest = state
+                                .routing_table
+                                .find_closest_prefer_verified(&key, SEARCH_INITIAL_CONTACTS);
+                            if !closest.is_empty() {
+                                let sid = start_kad_search(
+                                    &mut state,
+                                    &app_handle,
+                                    key,
+                                    SearchType::StoreFile,
+                                    closest,
+                                );
+                                if sid != SearchId(0) {
+                                    state.ember_rendezvous_published_at = rendezvous_now;
+                                    state.source_publish_acks.insert(key, 0);
+                                    state.store_source_searches.insert(sid, (key, msg));
+                                    debug!("Ember rendezvous: advertising self under {key}");
+                                }
+                            }
                         }
                     }
                 }
@@ -27790,19 +27880,55 @@ pub async fn start_network(
 
             _ = ember_maintenance_timer.tick() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
-                // Background health loop. Skip entirely when the transport
-                // is off or the table is empty (nothing to refresh, ping,
-                // or republish). `force = false`: honour the staleness
-                // gates so steady-state churn stays low.
-                // Run when we have contacts to maintain, OR when the table is
-                // empty but we've learned Ember peers from KAD that the
-                // KAD-bridge (slice 13) can fold in to bootstrap it. Skipping
-                // an empty table with no KAD peers keeps idle nodes quiet.
+                // Background health loop. `force = false`: honour the
+                // staleness gates so steady-state churn stays low.
+                //
+                // Run when there are contacts to maintain, or when the table is
+                // empty but we hold something the bridge could bootstrap from —
+                // Ember peers learned from KAD source tags (dialed over Noise_IK)
+                // or from eD2K sessions (dialed over Noise_XX). An idle node with
+                // nothing to work with stays quiet.
                 if settings.ember_native_enabled
                     && (state.ember_dht.contact_count() > 0
-                        || !state.ember_noise_keys.is_empty())
+                        || !state.ember_noise_keys.is_empty()
+                        || !state.ember_keyless_peers.is_empty())
                 {
                     let _ = run_ember_maintenance(&udp_socket, &mut state, false).await;
+                }
+
+                // Nothing to bridge from means nobody has crossed our path yet.
+                // Ask KAD directly: other Ember nodes advertise themselves under
+                // a well-known key, and a plain source lookup there returns them
+                // with the Noise keys the bridge needs. Gated on the same table
+                // size the bridge uses, so this stops once we are self-sufficient
+                // and gossip takes over.
+                let rendezvous_now = chrono::Utc::now().timestamp();
+                if settings.ember_native_enabled
+                    && state.ember_dht.contact_count() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS
+                    && state.ember_rendezvous_search.is_none()
+                    && rendezvous_now.saturating_sub(state.ember_rendezvous_looked_up_at)
+                        > EMBER_RENDEZVOUS_LOOKUP_INTERVAL_SECS
+                {
+                    let key = kad::publish::ember_rendezvous_key();
+                    let closest = state
+                        .routing_table
+                        .find_closest_prefer_verified(&key, SEARCH_INITIAL_CONTACTS);
+                    // No KAD contacts means no way to run the lookup at all;
+                    // leave the timestamp alone so we retry as soon as KAD is up.
+                    if !closest.is_empty() {
+                        let sid = start_kad_search(
+                            &mut state,
+                            &app_handle,
+                            key,
+                            SearchType::FindSource { file_size: 0 },
+                            closest,
+                        );
+                        if sid != SearchId(0) {
+                            state.ember_rendezvous_search = Some(sid);
+                            state.ember_rendezvous_looked_up_at = rendezvous_now;
+                            debug!("Ember rendezvous: looking up {key} to seed an empty DHT table");
+                        }
+                    }
                 }
                 }).catch_unwind().await;
                 if let Err(__p) = __panic_result {
