@@ -16822,7 +16822,7 @@ pub async fn start_network(
                                 .filter(|s| !is_self_source(s, &state))
                                 .collect();
                             harvest_ember_noise_keys(&mut state.ember_noise_keys, &peers);
-                            debug!(
+                            info!(
                                 "Ember rendezvous lookup finished: {found} advertised peer(s), \
                                  {} after dropping self, {} dialable Noise key(s) cached",
                                 peers.len(),
@@ -18197,7 +18197,7 @@ pub async fn start_network(
                                 // single failed attempt would leave this node
                                 // undiscoverable for a whole republish interval.
                                 state.ember_rendezvous_published_at = 0;
-                                debug!("Ember rendezvous: advert stored nowhere, will retry");
+                                info!("Ember rendezvous: advert stored nowhere, will retry");
                             }
                         }
                     } else if let Some(note) = state.pending_note_publishes.remove(&sid) {
@@ -19890,7 +19890,11 @@ pub async fn start_network(
                                     state.ember_rendezvous_published_at = rendezvous_now;
                                     state.source_publish_acks.insert(key, 0);
                                     state.store_source_searches.insert(sid, (key, msg));
-                                    debug!("Ember rendezvous: advertising self under {key}");
+                                    // `info!`, not `debug!`: once per republish
+                                    // interval in steady state, and it is the
+                                    // only record that this node is discoverable
+                                    // by peers who have never met it.
+                                    info!("Ember rendezvous: advertising self under {key}");
                                 }
                             }
                         }
@@ -27926,7 +27930,7 @@ pub async fn start_network(
                         if sid != SearchId(0) {
                             state.ember_rendezvous_search = Some(sid);
                             state.ember_rendezvous_looked_up_at = rendezvous_now;
-                            debug!("Ember rendezvous: looking up {key} to seed an empty DHT table");
+                            info!("Ember rendezvous: looking up {key} to seed an empty DHT table");
                         }
                     }
                 }
