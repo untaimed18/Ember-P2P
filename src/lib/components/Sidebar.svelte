@@ -9,6 +9,7 @@
   import { totalUnread, toggleDock as toggleChatDock, chatDockOpen } from '$lib/stores/chatTabs';
   import * as m from '$lib/paraglide/messages';
   import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
+  import { navItems, NAV_SHORTCUT_LIMIT, type NavItem } from '$lib/navItems';
   import { onMount } from 'svelte';
 
   let aboutOpen = $state(false);
@@ -132,36 +133,6 @@
   // which required navigating there to notice activity.
   let totalUnreadChats = $derived($totalUnread);
 
-  type NavItem = {
-    href: string;
-    /** Function returning the localized label. We keep `label` as a
-     *  thunk (rather than a pre-resolved string) so the array can
-     *  remain a top-level `const` while still picking up locale
-     *  changes — Paraglide message functions read the current
-     *  locale on each call. */
-    label: () => string;
-    id: string;
-    /** Legacy URLs that should highlight this item (and short-circuit
-     *  re-navigation) until the route-level redirect fires. The KAD
-     *  view used to live at `/kad-network`; we keep the alias so the
-     *  sidebar doesn't flicker between "no item active" and "KAD
-     *  active" on the brief detour through the redirect stub. */
-    aliases?: string[];
-  };
-
-  const navItems: NavItem[] = [
-    { href: '/', label: () => m.nav_kad_network(), id: 'kad', aliases: ['/kad-network'] },
-    { href: '/servers', label: () => m.nav_ed2k_servers(), id: 'servers' },
-    { href: '/search', label: () => m.nav_search(), id: 'search' },
-    { href: '/transfers', label: () => m.nav_transfers(), id: 'transfers' },
-    { href: '/library', label: () => m.nav_library(), id: 'library' },
-    { href: '/friends', label: () => m.nav_friends(), id: 'friends' },
-    { href: '/ember', label: () => m.nav_ember_network(), id: 'ember' },
-    { href: '/statistics', label: () => m.nav_statistics(), id: 'statistics' },
-    { href: '/security', label: () => m.nav_security(), id: 'security' },
-    { href: '/settings', label: () => m.nav_settings(), id: 'settings' },
-  ];
-
   function isActive(item: NavItem, pathname: string): boolean {
     return pathname === item.href || (item.aliases?.includes(pathname) ?? false);
   }
@@ -238,7 +209,7 @@
     if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
     if (isTypingTarget(e.target)) return;
     const n = Number.parseInt(e.key, 10);
-    if (!Number.isFinite(n) || n < 1 || n > navItems.length) return;
+    if (!Number.isFinite(n) || n < 1 || n > Math.min(NAV_SHORTCUT_LIMIT, navItems.length)) return;
     e.preventDefault();
     navigateTo(navItems[n - 1].href);
   }
@@ -274,9 +245,9 @@
           href={item.href}
           class:active={isActive(item, $page.url.pathname)}
           aria-current={isActive(item, $page.url.pathname) ? 'page' : undefined}
-          aria-keyshortcuts={i < 9 ? `Alt+${i + 1}` : undefined}
+          aria-keyshortcuts={i < NAV_SHORTCUT_LIMIT ? `Alt+${i + 1}` : undefined}
           onclick={(e: MouseEvent) => navigate(e, item.href)}
-          title={i < 9 ? m.sidebar_nav_with_shortcut_title({ label: item.label(), n: i + 1 }) : item.label()}
+          title={i < NAV_SHORTCUT_LIMIT ? m.sidebar_nav_with_shortcut_title({ label: item.label(), n: i + 1 }) : item.label()}
         >
           <span class="nav-icon" aria-hidden="true">
             {#if item.id === 'kad'}

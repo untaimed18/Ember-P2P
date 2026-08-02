@@ -59,7 +59,13 @@
   let activeSince: number | null = null;
   let joinTimer: ReturnType<typeof setTimeout> | null = null;
   const DIAG_FAILURE_THRESHOLD = 3;
-  const JOINING_TIMEOUT_MS = 30_000;
+  // Long enough to span a couple of backend maintenance ticks (60s each),
+  // which is what actually drives the bridge that finds our first contacts.
+  // A shorter window used to be fine when joining kicked an immediate fetch
+  // from a central pool; without one, a fresh node can legitimately sit at
+  // zero contacts for a minute or two, and giving up at 30s made a healthy
+  // node look broken.
+  const JOINING_TIMEOUT_MS = 150_000;
 
   async function refreshDiag() {
     if (unmounted || inFlightDiag) return;

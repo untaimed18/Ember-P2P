@@ -4,6 +4,7 @@
   // Grouped by scope so users can quickly scan to the shortcuts that
   // apply to where they are in the app.
   import * as m from '$lib/paraglide/messages';
+  import { navItems, NAV_SHORTCUT_LIMIT } from '$lib/navItems';
   import IconX from './IconX.svelte';
   import { fade, scale } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
@@ -49,6 +50,18 @@
     return inertBackground(overlayEl);
   });
 
+  // Derived from the sidebar's own list rather than restated here: Alt+N is
+  // just an entry's position, so a hand-kept copy drifts the moment anything
+  // is inserted or reordered — which is exactly what happened when the Ember
+  // page was added in the middle and three rows started naming the wrong key.
+  // Entries past the shortcut limit are click-only and are left out.
+  const navShortcuts: Shortcut[] = navItems
+    .slice(0, NAV_SHORTCUT_LIMIT)
+    .map((item, i) => ({
+      keys: ['Alt', String(i + 1)],
+      label: () => m.shortcuts_jump_to({ page: item.label() }),
+    }));
+
   // Group/shortcut labels are stored as thunks so the table re-
   // renders in the active locale on each open without us needing
   // to rebuild the array on locale changes (locale changes
@@ -61,15 +74,7 @@
         { keys: ['?'], label: () => m.shortcuts_show_shortcuts() },
         { keys: ['F1'], label: () => m.shortcuts_show_shortcuts() },
         { keys: ['Ctrl', 'B'], label: () => m.shortcuts_toggle_sidebar() },
-        { keys: ['Alt', '1'], label: () => m.shortcuts_jump_kad() },
-        { keys: ['Alt', '2'], label: () => m.shortcuts_jump_servers() },
-        { keys: ['Alt', '3'], label: () => m.shortcuts_jump_search() },
-        { keys: ['Alt', '4'], label: () => m.shortcuts_jump_transfers() },
-        { keys: ['Alt', '5'], label: () => m.shortcuts_jump_library() },
-        { keys: ['Alt', '6'], label: () => m.shortcuts_jump_friends() },
-        { keys: ['Alt', '7'], label: () => m.shortcuts_jump_statistics() },
-        { keys: ['Alt', '8'], label: () => m.shortcuts_jump_security() },
-        { keys: ['Alt', '9'], label: () => m.shortcuts_jump_settings() },
+        ...navShortcuts,
       ],
     },
     {
