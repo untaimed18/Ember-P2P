@@ -10,7 +10,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // is only assumed to work.
 const messagesDir = process.env.EMBER_MESSAGES_DIR ?? join(root, "messages");
 const baseLocale = "en";
-const locales = ["en", "de", "es", "fr", "pt-BR", "zh-CN"];
+const locales = ["en", "de", "es", "fr", "pt-BR", "zh-CN", "it", "ru", "zh-TW"];
 
 /** Keys in file order, so duplicates survive to be counted. `JSON.parse`
  *  keeps only the last of a repeated key and would hide them. */
