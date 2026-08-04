@@ -21151,7 +21151,19 @@ pub async fn start_network(
                     let in_flight = state.ember_batch_publish.in_flight.len();
                     let unplaced = state.ember_publish_unplaced.len();
                     let pass = state.ember_publish_pass;
-                    if contacts > 0 || queued > 0 || pass.due > 0 {
+                    // An empty table short-circuits both publishers before
+                    // they count what is due, so the usual stats would print
+                    // a row of zeros that reads as "nothing to publish" when
+                    // the truth is "nowhere to publish it". Name that instead,
+                    // and never fall silent: a tick that does nothing is the
+                    // one worth reading.
+                    if contacts == 0 {
+                        info!(
+                            "Ember publish cycle: idle, routing table is empty so there is \
+                             nobody to publish to — queued={queued}, in-flight={in_flight}, \
+                             awaiting placement={unplaced}"
+                        );
+                    } else {
                         info!(
                             "Ember publish cycle: contacts={contacts} ({verified} verified), \
                              due={}, selected={}, awaiting placement={unplaced}, queued={queued}, \

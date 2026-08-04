@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 
-use tracing::{debug, trace};
+use tracing::{debug, info, trace};
 
 use crate::network::kad::ip_filter;
 
@@ -258,7 +258,13 @@ impl RoutingTable {
                 .retain(|c| c.node_id != node_id);
         }
         if removed > 0 {
-            debug!("Ember DHT: evicted {removed} contact(s) blocked by IP policy");
+            // info, not debug: this fires on filter reload and can empty a
+            // table that only had a handful of contacts to begin with, which
+            // looks exactly like "the overlay is dead" from the outside.
+            info!(
+                "Ember DHT: evicted {removed} contact(s) blocked by IP policy, {} left",
+                self.total_contacts()
+            );
         }
         removed
     }
